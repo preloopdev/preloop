@@ -6,7 +6,7 @@
 use preloop_gha_parser::secrets::ENGINE_PROVIDED_SECRETS;
 use preloop_gha_parser::{RunsOn, parse_workflow};
 use preloop_orchestrator::environment::{EnvironmentSpec, OFFICIAL_GOLDEN};
-use preloop_runner_server::config::ConfigFile;
+use preloop_runner_server::config::{ConfigFile, StartupConfig};
 use preloop_runner_server::github_app;
 use preloop_runner_server::runtime_scheduling::{job_matches_runner, unhostable_platform};
 use serde_json::{Value, json};
@@ -97,7 +97,11 @@ pub(super) struct Scan {
 /// Read one target: its checkout when it has one, else GitHub with the
 /// configured credential. A repository that cannot be read is skipped with a
 /// reason; it never fails the run.
-pub(super) async fn read_target(target: Target, config: &ConfigFile) -> Scan {
+pub(super) async fn read_target(
+    target: Target,
+    config: &ConfigFile,
+    startup: &StartupConfig,
+) -> Scan {
     if let Some(root) = target.checkout.clone() {
         let mut notes = Vec::new();
         let files = scan_checkout(&root, &mut notes);
@@ -118,7 +122,7 @@ pub(super) async fn read_target(target: Target, config: &ConfigFile) -> Scan {
             notes: Vec::new(),
         };
     };
-    match fetch_repo(config, &repo).await {
+    match fetch_repo(config, startup, &repo).await {
         Ok((files, notes)) => Scan {
             target,
             source: "github",
@@ -268,9 +272,10 @@ fn relative_path(root: &Path, path: &Path) -> String {
 /// the reason the repository was skipped.
 async fn fetch_repo(
     config: &ConfigFile,
+    startup: &StartupConfig,
     repo: &str,
 ) -> Result<(Vec<WorkflowFile>, Vec<String>), String> {
-    let token = github_token(config, repo).await?;
+    let token = github_token(config, startup, repo).await?;
     let client = preloop_runner_server::shared_http::github_client_builder()
         .user_agent("preloop-init")
         .build()
@@ -304,13 +309,14 @@ async fn fetch_repo(
 
 /// A token that can read `repo`'s files: the first configured App that can
 /// mint one for it, else the PAT. The token itself is never reported.
-async fn github_token(config: &ConfigFile, repo: &str) -> Result<String, String> {
+async fn github_token(
+    config: &ConfigFile,
+    startup: &StartupConfig,
+    repo: &str,
+) -> Result<String, String> {
     let read_only = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
     let mut app_failure = None;
-    // The startup configuration the credential sources are resolved from,
-    // read at this command boundary rather than below it.
-    let startup = preloop_runner_server::config::StartupConfig::from_env();
-    match github_app::load_from(config, &startup) {
+    match github_app::load_from(config, startup) {
         Ok(Some(apps)) => {
             for app in &apps.apps {
                 match github_app::get_or_mint_token(&github_api_base(), app, repo, &read_only).await

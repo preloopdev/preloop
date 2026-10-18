@@ -1925,16 +1925,22 @@ fn accepts_valid_assertion_claims() {
         now,
         serde_json::json!("http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token"),
     );
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url()).is_ok()
+    );
     // Base URL alone is also accepted.
     let claims = assertion_claims(now, serde_json::json!("http://127.0.0.1:9090"));
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url()).is_ok()
+    );
     // Array form.
     let claims = assertion_claims(
         now,
         serde_json::json!(["https://other.example", "http://127.0.0.1:9090"]),
     );
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url()).is_ok()
+    );
 }
 
 #[test]
@@ -1950,7 +1956,10 @@ fn rejects_expired_assertion() {
         "nbf": now - 600,
         "exp": now - 1,
     });
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
 }
 
 #[test]
@@ -1962,10 +1971,16 @@ fn rejects_wrong_audience() {
     let uri = oauth2_token_uri();
     // Assertion addressed to a different server must not validate here.
     let claims = assertion_claims(now, serde_json::json!("https://preloop.local/oauth"));
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
     // Missing aud is also rejected.
     let claims = serde_json::json!({"sub": "test-client", "nbf": now, "exp": now + 300});
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
 }
 
 #[test]
@@ -1981,7 +1996,10 @@ fn rejects_missing_exp_and_excessive_lifetime() {
         "aud": "http://127.0.0.1:9090",
         "nbf": now,
     });
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
     // Lifetime over the 600s cap.
     let claims = serde_json::json!({
         "sub": "test-client",
@@ -1989,7 +2007,10 @@ fn rejects_missing_exp_and_excessive_lifetime() {
         "nbf": now,
         "exp": now + 3600,
     });
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
     // Future-dated nbf beyond skew.
     let claims = serde_json::json!({
         "sub": "test-client",
@@ -1997,7 +2018,10 @@ fn rejects_missing_exp_and_excessive_lifetime() {
         "nbf": now + 3600,
         "exp": now + 3900,
     });
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
 }
 
 #[test]

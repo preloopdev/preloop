@@ -922,6 +922,14 @@ pub fn oauth2_token_uri() -> axum::http::Uri {
     "/runner/server/_apis/v1/oauth2/token".parse().unwrap()
 }
 
+/// The base URL those URIs are addressed to: the fallback an `AppState` with
+/// no public/runner URL resolved uses. `validate_client_assertion_claims` takes
+/// it as an argument (it no longer reads the process environment per call), so
+/// the claim fixtures and the callers here share this one value.
+pub fn assertion_base_url() -> &'static str {
+    "http://127.0.0.1:9090"
+}
+
 pub fn assertion_claims(now: i64, aud: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "sub": "test-client",

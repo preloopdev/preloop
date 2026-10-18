@@ -57,6 +57,7 @@ Releases before v0.27.0 predate the changelog.
   and the reasoning in `supply-chain/README.md`; run it locally as
   `just supply-chain-guard`, which compares the merge base of `origin/main` and
   `HEAD`. There is no override: the verdict follows from the diff.
+
 - **The file credential store is the default.** The engine token, GitHub App
   private key, PAT, and webhook secrets are written to `0600` files under
   `$PRELOOP_HOME/credentials` instead of the OS keychain. GitHub credentials

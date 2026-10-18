@@ -1372,9 +1372,13 @@ impl Session {
             }));
             return Ok(());
         }
+        // `github_app::load_from` resolves the App credential sources from the
+        // process environment: read them once, here at the boundary of the
+        // step that uses them, rather than once per repository below it.
+        let startup = preloop_runner_server::config::StartupConfig::from_env();
         let mut scans = Vec::new();
         for target in targets {
-            scans.push(workflows::read_target(target, &config).await);
+            scans.push(workflows::read_target(target, &config, &startup).await);
         }
         for scan in &scans {
             self.note(&workflows::describe(scan));
@@ -2678,7 +2682,6 @@ mod tests {
     #[test]
     fn non_interactive_run_requires_every_step_flag() {
         let session = Session {
-            config_path: std::path::PathBuf::from("config.toml"),
             interactive: false,
             json: true,
             yes: true,
@@ -2700,7 +2703,6 @@ mod tests {
     #[test]
     fn non_interactive_oci_without_a_reference_names_the_flag() {
         let session = Session {
-            config_path: std::path::PathBuf::from("config.toml"),
             interactive: false,
             json: false,
             yes: false,
@@ -2721,7 +2723,6 @@ mod tests {
     #[test]
     fn a_flag_from_another_kind_is_a_usage_error() {
         let session = Session {
-            config_path: std::path::PathBuf::from("config.toml"),
             interactive: false,
             json: false,
             yes: false,
