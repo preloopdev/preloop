@@ -1720,6 +1720,8 @@ mod tests {
             }],
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         let error = validate_spec(&spec).unwrap_err();
         assert!(
@@ -1742,6 +1744,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         assert!(validate_spec(&base()).is_ok());
         let mut restricted = base();
@@ -1870,6 +1874,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         }
     }
 

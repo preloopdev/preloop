@@ -65,6 +65,10 @@ pub const SMOLVM_IMAGE_MACHINE_BASELINE_DEVICES: usize = 9;
 /// `--volume` (virtiofs), per `--mount-socket` (virtio-vsock), and per extra
 /// `--disk`; [`MachineSpec`] cannot express an extra disk yet, so only the
 /// first two are counted.
+///
+/// A bare-path `--volume` ([`GuestVolume`]) is deliberately *not* counted: it
+/// is a directory on the machine's own storage disk, which the guest mounts
+/// from `/dev/vda`, not a virtiofs export with a virtio device of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DeclaredDevices {
     /// `--volume` host mounts, one virtiofs device each.
@@ -205,6 +209,105 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// A guest-local persistent directory on the machine's own disk.
+///
+/// smolvm's `--volume` takes two shapes: `host:guest[:ro]`, which is a
+/// virtiofs export of a host directory ([`VolumeMount`]), and a *bare guest
+/// path*, which smolvm turns into a directory on the machine's own storage
+/// disk rather than on its overlay root. The bare form is what a nested
+/// container runtime needs — overlayfs cannot back docker's `overlay2`
+/// driver, so `/var/lib/docker` on the overlay root degrades to
+/// `fuse-overlayfs` — and the directory persists across `stop`/`start` and
+/// into a branch, because the storage disk is copied copy-on-write.
+///
+/// A bare-path volume costs no virtio device: smolvm mounts it in the guest
+/// from a subdirectory of `/dev/vda` (measured at 1.30.1 on x86_64 Linux;
+/// `findmnt` reports `ext4 /dev/vda[/volumes/var-lib-docker-<hash>]`, not a
+/// virtiofs export), so it is deliberately absent from [`DeclaredDevices`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GuestVolume(PathBuf);
+
+impl GuestVolume {
+    /// Validate and construct a guest-local volume path.
+    pub fn new(value: impl Into<PathBuf>) -> Result<Self, VmError> {
+        let value = value.into();
+        if !value.is_absolute() {
+            return Err(VmError::InvalidSpec(format!(
+                "guest volume path must be absolute: {}",
+                value.display()
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    /// The guest path.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for GuestVolume {
+    type Error = VmError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<GuestVolume> for String {
+    fn from(value: GuestVolume) -> Self {
+        value.0.to_string_lossy().into_owned()
+    }
+}
+
+/// Guest-local state directories every pack-based machine gets by default.
+///
+/// These are the two paths docker and containerd must own to run their
+/// overlay-backed drivers. The default applies to machines booted from a
+/// golden pack (the golden itself and a direct create from its payload); a
+/// pack is also never a *builder*, which boots from the OCI image and must
+/// keep its container state in the overlay that `pack create` captures — a
+/// storage-disk directory is not packed, so putting the builder's
+/// `/var/lib/docker` on one would silently drop the bake's preloaded images.
+pub const DEFAULT_GUEST_VOLUMES: [&str; 2] = ["/var/lib/docker", "/var/lib/containerd"];
+
+/// Host override for [`DEFAULT_GUEST_VOLUMES`]: a comma-separated list of
+/// absolute guest paths, applied to pack-based machines that do not declare
+/// their own [`MachineSpec::guest_volumes`]. An empty value turns the default
+/// off (no guest-local volumes).
+pub const SMOLVM_GUEST_VOLUMES_ENV: &str = "PRELOOP_SMOLVM_GUEST_VOLUMES";
+
+/// Host override for the workload a pack-based machine is started with, on top
+/// of whatever entrypoint/cmd the pack itself carries.
+///
+/// Unset: [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. Empty: `None` — the pack's own
+/// entrypoint/cmd runs, which is the behaviour before systemd became the
+/// guest's PID 1 and the escape hatch for a golden whose image has no usable
+/// init. Any other value is the command, split on whitespace.
+pub const SMOLVM_WORKLOAD_INIT_ENV: &str = "PRELOOP_SMOLVM_WORKLOAD_INIT";
+
+/// Workload that runs a pack-based machine's systemd, giving the guest the
+/// hosted runner's init: `systemctl`, `journald`, `systemd-resolved` and
+/// docker's `systemd` cgroup driver all depend on PID 1 being systemd.
+///
+/// Applied as the `-- <COMMAND>` block of `machine create`, which overrides
+/// the pack's recorded entrypoint at launch. Measured at smolvm 1.30.1 on
+/// x86_64 Linux on cpane: `machine create --from <pack> --name t1 -- /sbin/init`
+/// then `machine start` leaves `ps -o pid,args -p 1` at `1 systemd /sbin/init`,
+/// `systemctl is-system-running` at `running`, and a
+/// `machine branch --freeze-source` child inherits it.
+pub const DEFAULT_SMOLVM_WORKLOAD_INIT: &str = "/sbin/init";
+
+/// systemd-resolved's stub listener address, the resolver a systemd guest
+/// should be pointed at so container DNS sees `/etc/hosts` names and
+/// systemd-resolved's synthesized `.localhost` names.
+///
+/// This is the *guest-side* resolver file's content, not necessarily the
+/// `--dns` flag: under smolvm's virtio-net backend the agent overwrites
+/// `/etc/resolv.conf` with the network gateway whatever `--dns` says, so the
+/// golden bake has to install this file (see [`resolved_guest_dns`]).
+pub const SYSTEMD_RESOLVED_STUB_DNS: &str = "127.0.0.53";
+
 /// Host Unix socket exposed at a fixed guest path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketMount {
@@ -295,19 +398,135 @@ pub struct MachineSpec {
     /// Enable Rosetta 2 x86_64 translation on Apple Silicon.
     #[serde(default)]
     pub rosetta: bool,
+    /// Guest-local persistent directories on the machine's own disk.
+    ///
+    /// Passed through as smolvm's bare-path `--volume` form, alongside (never
+    /// instead of) [`MachineSpec::volumes`]. Empty means "whatever the
+    /// provider's default is" — for smolvm, [`DEFAULT_GUEST_VOLUMES`] on a
+    /// pack-based machine; an explicit list replaces that default.
+    #[serde(default)]
+    pub guest_volumes: Vec<GuestVolume>,
+    /// Workload a *pack-based* machine runs, overriding the pack's own
+    /// entrypoint/cmd.
+    ///
+    /// `None` means "whatever the provider's default is" — for smolvm, the
+    /// [`SMOLVM_WORKLOAD_INIT_ENV`] switch and then
+    /// [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. Ignored for image machines, whose
+    /// workload handling (the keep-alive fallback for an image with no usable
+    /// startup command) is unchanged.
+    #[serde(default)]
+    pub workload_init: Option<Vec<String>>,
 }
 
 impl MachineSpec {
     /// The devices this spec adds to SmolVM's fixed launcher set.
     ///
     /// Counted from the spec because `machine start` carries no device flags:
-    /// see [`DeclaredDevices`].
+    /// see [`DeclaredDevices`]. Guest-local volumes cost no device, so they
+    /// are not part of the count.
     pub fn declared_devices(&self) -> DeclaredDevices {
         DeclaredDevices {
             volumes: self.volumes.len(),
             sockets: self.sockets.len(),
         }
     }
+
+    /// The guest-local volumes this machine's create command carries.
+    ///
+    /// An explicit [`MachineSpec::guest_volumes`] wins verbatim. Otherwise
+    /// `configured` (the [`SMOLVM_GUEST_VOLUMES_ENV`] value) replaces the
+    /// [`DEFAULT_GUEST_VOLUMES`] default, an empty value disables it, and
+    /// `is_pack` gates whether either applies at all: a pack-based machine is
+    /// the golden or a direct create from its payload, while the golden
+    /// *builder* boots the OCI image and must keep its container state inside
+    /// the overlay `pack create` captures.
+    pub fn resolve_guest_volumes(
+        explicit: &[GuestVolume],
+        configured: Option<&str>,
+        is_pack: bool,
+    ) -> Result<Vec<GuestVolume>, VmError> {
+        if !explicit.is_empty() {
+            return Ok(explicit.to_vec());
+        }
+        if !is_pack {
+            return Ok(Vec::new());
+        }
+        let list = configured.unwrap_or("").trim();
+        if configured.is_some() {
+            // An override, including an empty one (which turns the guest-local
+            // volumes off): parsed as the same comma-separated guest paths.
+            return if list.is_empty() {
+                Ok(Vec::new())
+            } else {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(GuestVolume::new)
+                    .collect()
+            };
+        }
+        DEFAULT_GUEST_VOLUMES
+            .iter()
+            .copied()
+            .map(GuestVolume::new)
+            .collect()
+    }
+
+    /// The workload command a pack-based machine is created with.
+    ///
+    /// An explicit [`MachineSpec::workload_init`] wins, then `configured` (the
+    /// [`SMOLVM_WORKLOAD_INIT_ENV`] value, where an empty value means "leave
+    /// the pack's entrypoint/cmd alone"), then
+    /// [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. `is_pack` gates all three: an image
+    /// machine keeps the existing keep-alive handling, and a pack's own
+    /// entrypoint is what a `None` result leaves in place.
+    pub fn resolve_workload_init(
+        explicit: Option<&[String]>,
+        configured: Option<&str>,
+        is_pack: bool,
+    ) -> Option<Vec<String>> {
+        if !is_pack {
+            return None;
+        }
+        if let Some(command) = explicit.filter(|command| !command.is_empty()) {
+            return Some(command.to_vec());
+        }
+        let value = configured.unwrap_or(DEFAULT_SMOLVM_WORKLOAD_INIT);
+        let command: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
+        (!command.is_empty()).then_some(command)
+    }
+}
+
+/// The `--dns` resolver a machine is launched with.
+///
+/// An explicit [`MachineSpec::dns`] always wins, and a machine with no
+/// networking never gains a resolver (`--dns` implies `--net` in smolvm).
+/// Otherwise, once a machine runs systemd as PID 1 its resolver should be
+/// systemd-resolved's stub, because that is what gives containers the hosted
+/// runner's view: `systemd-resolved` answers `/etc/hosts` names and
+/// synthesizes `.localhost`, so a user-defined network's embedded resolver
+/// (127.0.0.11 forwarding to the host's `/etc/resolv.conf` nameserver) reaches
+/// them.
+///
+/// This flag only reaches the guest on smolvm's TSI backend. With virtio-net
+/// the host overwrites the guest resolver with the network gateway whatever
+/// `--dns` says — measured at smolvm 1.30.1 on x86_64 Linux:
+/// `machine create --net --net-backend virtio-net --dns 127.0.0.53` boots with
+/// `SMOLVM_NETWORK_DNS=100.96.0.1` and `/etc/resolv.conf` `nameserver
+/// 100.96.0.1`. For virtio-net the stub is therefore installed from inside the
+/// guest (preloop's per-machine init rewrite, or the golden bake) and this
+/// function returns `None`.
+pub fn resolved_guest_dns(
+    spec_dns: Option<&str>,
+    network_enabled: bool,
+    backend: &str,
+    workload_init: bool,
+) -> Option<String> {
+    if let Some(dns) = spec_dns.map(str::trim).filter(|dns| !dns.is_empty()) {
+        return Some(dns.to_owned());
+    }
+    let want_stub = network_enabled && workload_init && backend == "tsi";
+    want_stub.then(|| SYSTEMD_RESOLVED_STUB_DNS.to_owned())
 }
 
 /// Observable VM state.
@@ -1399,6 +1618,13 @@ impl VmProvider for SmolVmProvider {
         } else {
             args.extend(["--image".into(), spec.image.clone()]);
         }
+        // A pack-based machine gets its workload from here (the systemd-as-PID-1
+        // switch); an image machine's workload handling stays below, untouched.
+        let workload_init = MachineSpec::resolve_workload_init(
+            spec.workload_init.as_deref(),
+            (self.env_lookup)(SMOLVM_WORKLOAD_INIT_ENV).as_deref(),
+            is_pack,
+        );
         args.extend([
             "--cpus".into(),
             spec.cpus.to_string(),
@@ -1429,8 +1655,13 @@ impl VmProvider for SmolVmProvider {
                 }
             }
         }
-        if let Some(dns) = &spec.dns {
-            args.extend(["--dns".into(), dns.clone()]);
+        if let Some(dns) = resolved_guest_dns(
+            spec.dns.as_deref(),
+            !matches!(spec.network, NetworkPolicy::Disabled),
+            public_only_net_backend(self.env_lookup),
+            workload_init.is_some(),
+        ) {
+            args.extend(["--dns".into(), dns]);
         }
         for mount in &spec.volumes {
             let mut value = format!("{}:{}", mount.host.display(), mount.guest.display());
@@ -1438,6 +1669,16 @@ impl VmProvider for SmolVmProvider {
                 value.push_str(":ro");
             }
             args.extend(["--volume".into(), value]);
+        }
+        // Guest-local volumes ride the same `--volume` flag in its bare-path
+        // form: the directory then lives on the machine's own disk instead of
+        // its overlay root, which is what an overlay2-backed dockerd needs.
+        for volume in MachineSpec::resolve_guest_volumes(
+            &spec.guest_volumes,
+            (self.env_lookup)(SMOLVM_GUEST_VOLUMES_ENV).as_deref(),
+            is_pack,
+        )? {
+            args.extend(["--volume".into(), volume.as_path().display().to_string()]);
         }
         if !spec.sockets.is_empty()
             && !*self
@@ -1474,6 +1715,17 @@ impl VmProvider for SmolVmProvider {
                     "sleep infinity".into(),
                 ]);
             }
+        } else if let Some(workload) = &workload_init {
+            // The pack's own entrypoint/cmd is overridden at launch with
+            // systemd, so the guest becomes a systemd host: `systemctl`,
+            // `journald`, `systemd-resolved` and docker's `systemd` cgroup
+            // driver all need PID 1 to be systemd. Nothing is baked into the
+            // pack — `machine create --from <pack> -- /sbin/init` was measured
+            // to leave `ps -p 1` at `/sbin/init` while the same pack without
+            // the block still boots its recorded entrypoint. Same positional
+            // rule as above: this block is last.
+            args.push("--".into());
+            args.extend(workload.iter().cloned());
         }
         self.exclusive_with_network("create", &args, &spec.network)
             .await?;
@@ -4145,6 +4397,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         let create_provider = provider.clone();
         let create = runtime.spawn(async move { create_provider.create(&spec).await });
@@ -4476,6 +4730,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         let create_error = provider.create(&spec).await.unwrap_err();
         assert!(
@@ -4585,6 +4841,8 @@ mod tests {
             }],
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
 
         let provider = SmolVmProvider::new(&binary).with_env_lookup(rejected);
@@ -4731,6 +4989,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         assert_eq!(super::DeclaredDevices::default().total(), 0);
         spec.volumes = vec![
@@ -4757,6 +5017,132 @@ mod tests {
             }
         );
         assert_eq!(spec.declared_devices().total(), 3);
+    }
+
+    /// A guest-local volume is a bare guest path, so a relative one can never
+    /// be expressed: `smolvm --volume` would read it as a host mount.
+    #[test]
+    fn guest_volume_paths_must_be_absolute() {
+        assert!(GuestVolume::new("/var/lib/docker").is_ok());
+        let relative = GuestVolume::new("var/lib/docker").unwrap_err();
+        assert!(
+            matches!(&relative, VmError::InvalidSpec(message) if message.contains("absolute")),
+            "{relative:?}"
+        );
+        assert_eq!(
+            GuestVolume::new("/var/lib/containerd").unwrap().as_path(),
+            Path::new("/var/lib/containerd")
+        );
+    }
+
+    /// The default guest-local volumes reach a pack-based machine (the golden
+    /// and a direct create from its payload) and only that: the OCI-image
+    /// builder must keep its container state inside the overlay the pack
+    /// captures.
+    #[test]
+    fn guest_volumes_default_to_the_runtime_state_dirs_for_pack_machines() {
+        let pack = |configured: Option<&str>| {
+            MachineSpec::resolve_guest_volumes(&[], configured, true)
+                .expect("valid")
+                .into_iter()
+                .map(|volume| volume.as_path().display().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pack(None),
+            vec![
+                "/var/lib/docker".to_owned(),
+                "/var/lib/containerd".to_owned()
+            ]
+        );
+        assert_eq!(
+            pack(Some("/var/lib/docker,/var/lib/containerd,/srv/state")),
+            vec![
+                "/var/lib/docker".to_owned(),
+                "/var/lib/containerd".to_owned(),
+                "/srv/state".to_owned()
+            ]
+        );
+        // An empty override is the documented off switch.
+        assert!(pack(Some("")).is_empty());
+        assert!(pack(Some("   ")).is_empty());
+        // An image machine gets none of the default ...
+        assert!(
+            MachineSpec::resolve_guest_volumes(&[], None, false)
+                .expect("valid")
+                .is_empty()
+        );
+        // ... but an explicit list is honoured wherever it is asked for.
+        let explicit = vec![GuestVolume::new("/srv/state").unwrap()];
+        assert_eq!(
+            MachineSpec::resolve_guest_volumes(&explicit, None, false).expect("valid"),
+            explicit
+        );
+        // A configured relative path is a typo, not a silent no-op.
+        let invalid =
+            MachineSpec::resolve_guest_volumes(&[], Some("/var/lib/docker,relative"), true)
+                .unwrap_err();
+        assert!(
+            matches!(&invalid, VmError::InvalidSpec(message) if message.contains("absolute")),
+            "{invalid:?}"
+        );
+    }
+
+    /// Pack-based machines run systemd as PID 1 by default, the override can
+    /// name another command, an empty override restores the pack's own
+    /// entrypoint, and image machines keep the existing keep-alive path.
+    #[test]
+    fn workload_init_defaults_to_systemd_for_pack_machines() {
+        let pack = |configured: Option<&str>| {
+            MachineSpec::resolve_workload_init(None, configured, true)
+                .expect("pack machines have a workload by default")
+        };
+        assert_eq!(pack(None), vec!["/sbin/init".to_owned()]);
+        assert_eq!(
+            pack(Some("/lib/systemd/systemd --system")),
+            vec!["/lib/systemd/systemd".to_owned(), "--system".to_owned()]
+        );
+        assert_eq!(
+            pack(Some("  /sbin/init  ")),
+            vec!["/sbin/init".to_owned()],
+            "surrounding whitespace is trimmed, not passed as an argument"
+        );
+        assert!(MachineSpec::resolve_workload_init(None, Some(""), true).is_none());
+        assert!(MachineSpec::resolve_workload_init(None, Some("   "), true).is_none());
+        // An explicit per-machine command wins over the host switch.
+        let explicit = vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()];
+        assert_eq!(
+            MachineSpec::resolve_workload_init(Some(&explicit), Some(""), true),
+            Some(explicit)
+        );
+        // Image machines never get one: their keep-alive handling is separate.
+        assert!(MachineSpec::resolve_workload_init(None, None, false).is_none());
+        assert!(
+            MachineSpec::resolve_workload_init(Some(&["/sbin/init".to_owned()]), None, false)
+                .is_none()
+        );
+    }
+
+    /// `--dns` only reaches a guest on the TSI backend, where a systemd guest
+    /// wants the resolved stub; an explicit value always wins, and a machine
+    /// with networking off never gains a resolver (`--dns` implies `--net`).
+    #[test]
+    fn resolved_guest_dns_is_the_stub_only_for_a_tsi_systemd_machine() {
+        assert_eq!(
+            resolved_guest_dns(None, true, "tsi", true),
+            Some("127.0.0.53".to_owned())
+        );
+        assert_eq!(resolved_guest_dns(None, true, "virtio-net", true), None);
+        assert_eq!(resolved_guest_dns(None, true, "tsi", false), None);
+        assert_eq!(resolved_guest_dns(None, false, "tsi", true), None);
+        assert_eq!(
+            resolved_guest_dns(Some("8.8.8.8"), true, "tsi", true),
+            Some("8.8.8.8".to_owned())
+        );
+        assert_eq!(
+            resolved_guest_dns(Some("  "), true, "virtio-net", true),
+            None
+        );
     }
 
     /// End to end through the provider: a `machine start` that reports IRQ
@@ -4823,6 +5209,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         provider.create(&spec).await.expect("create");
 

@@ -10,6 +10,22 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- **SmolVM guests boot systemd, with their container state on ext4.** A machine
+  created from a golden pack now runs `/sbin/init` as its workload, so the guest
+  has `systemctl`, `journald`, `systemd-resolved` and docker's `systemd` cgroup
+  driver instead of a workload container whose PID 1 is smolvm's reaper, and it
+  carries guest-local `/var/lib/docker` and `/var/lib/containerd` directories on
+  its own disk so dockerd picks `overlay2` rather than `fuse-overlayfs`.
+  `PRELOOP_SMOLVM_WORKLOAD_INIT` replaces the workload (an empty value restores
+  the pack's own entrypoint) and `PRELOOP_SMOLVM_GUEST_VOLUMES` the volume list
+  (an empty value disables it). Neither applies to an OCI-image machine, so the
+  bake's builder keeps its container state inside the overlay a pack captures.
+  Note that `--dns` cannot reach the guest's resolver on smolvm's virtio-net
+  backend — the agent writes the network gateway there — so a golden whose
+  containers must use `systemd-resolved` has to carry
+  `/etc/resolv.conf` = `nameserver 127.0.0.53` as a regular file and re-write it
+  per machine, because smolvm rewrites the file on every `machine start`.
+
 - **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
   the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
   release digest and GitHub artifact attestation. Pin a release with

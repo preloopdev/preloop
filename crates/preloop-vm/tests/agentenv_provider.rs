@@ -197,6 +197,8 @@ fn spec(name: &str, image: &str) -> MachineSpec {
         sockets: Vec::new(),
         dns: None,
         rosetta: false,
+        guest_volumes: Vec::new(),
+        workload_init: None,
     }
 }
 

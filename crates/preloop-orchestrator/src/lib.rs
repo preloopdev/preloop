@@ -3835,6 +3835,8 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
             .collect(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        guest_volumes: Vec::new(),
+        workload_init: None,
     };
     let unpacked: Result<(), OrchestratorError> = async {
         // Serialize the headroom check against the write that consumes it:
@@ -3997,6 +3999,8 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
             .collect(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        guest_volumes: Vec::new(),
+        workload_init: None,
     };
     provider.create(&spec).await?;
     provider.start(golden).await?;
@@ -4150,6 +4154,8 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
         sockets: Vec::new(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        guest_volumes: Vec::new(),
+        workload_init: None,
     };
     provider.create(&spec).await?;
     provider.start(&name).await?;
@@ -6812,6 +6818,8 @@ async fn provision_runner<P: VmProvider + 'static>(
                 .collect(),
             dns: config.dns.clone(),
             rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
@@ -11791,6 +11799,8 @@ fi"#,
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         let surviving = MachineName::new("lifecycle-test-golden").unwrap();
         let foreign = MachineName::new("foreign-vm").unwrap();
@@ -12354,6 +12364,8 @@ fi"#,
                 sockets: Vec::new(),
                 dns: None,
                 rosetta: false,
+                guest_volumes: Vec::new(),
+                workload_init: None,
             })
             .await
             .unwrap();
@@ -12426,6 +12438,8 @@ fi"#,
                 sockets: Vec::new(),
                 dns: None,
                 rosetta: false,
+                guest_volumes: Vec::new(),
+                workload_init: None,
             })
             .await
             .unwrap();
@@ -12583,6 +12597,8 @@ fi"#,
                     sockets: Vec::new(),
                     dns: None,
                     rosetta: false,
+                    guest_volumes: Vec::new(),
+                    workload_init: None,
                 })
                 .await
                 .unwrap();
