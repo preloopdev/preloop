@@ -32,6 +32,14 @@ jobs:
       - name: Drop PR-shipped cargo config
         run: rm -f .cargo/config .cargo/config.toml
 
+      # The guard is a script, so its cases are a script's cases: run them
+      # here, where a change to the guard is exercised before the step below
+      # decides anything. This is the only CI entry point for the suite --
+      # `justfile` and `ci.yml` are outside the policy set, so a recipe or a
+      # ci.yml step has to arrive in its own (non-policy) PR.
+      - name: Guard policy files (self-test)
+        run: bash supply-chain/tests/guard-policy-files.test.sh
+
       - name: Guard policy files
         if: github.event_name == 'pull_request'
         run: |

@@ -70,15 +70,14 @@ is_dependency_or_policy_file() {
   is_policy_file "$1" || is_dependency_manifest "$1"
 }
 
+# print_files <indent> <file>...
 print_files() {
-  # print_files <newline-separated list> [indent]
-  local list="$1"
-  local indent="${2:-    }"
+  local indent="$1"
+  shift
   local file
-  while IFS= read -r file; do
-    [[ -z "$file" ]] && continue
+  for file in "$@"; do
     printf '%s- %s\n' "$indent" "$file"
-  done <<<"$list"
+  done
 }
 
 if [[ $# -ne 2 || -z "${1:-}" || -z "${2:-}" ]]; then
@@ -109,30 +108,30 @@ fi
 
 diff_files="$(git diff --name-only "$merge_base" "$head")"
 
-dependency_or_policy_files=""
-other_files=""
-dependency_or_policy_count=0
-other_count=0
+# Classify every changed path into one of two arrays. Appending to an array is
+# amortized O(1), so a PR with tens of thousands of paths costs linear work (a
+# scalar `list="${list}${file}\n"` rebuilds the whole string per path, which is
+# quadratic over an attacker-controlled diff).
+dependency_or_policy_files=()
+other_files=()
 while IFS= read -r file; do
   [[ -z "$file" ]] && continue
   if is_dependency_or_policy_file "$file"; then
-    dependency_or_policy_files="${dependency_or_policy_files}${file}"$'\n'
-    dependency_or_policy_count=$((dependency_or_policy_count + 1))
+    dependency_or_policy_files+=("$file")
   else
-    other_files="${other_files}${file}"$'\n'
-    other_count=$((other_count + 1))
+    other_files+=("$file")
   fi
 done <<<"$diff_files"
 
 # One rule: dependency/policy files may ship with each other and with nothing
 # else. Both allowed combinations pass; the only failure is a mix.
-if [[ "$dependency_or_policy_count" -eq 0 ]]; then
+if [[ "${#dependency_or_policy_files[@]}" -eq 0 ]]; then
   echo "Policy file guard: OK (no policy or manifest files modified)"
   exit 0
 fi
-if [[ "$other_count" -eq 0 ]]; then
+if [[ "${#other_files[@]}" -eq 0 ]]; then
   echo "Dependency/policy PR detected: OK"
-  print_files "$dependency_or_policy_files"
+  print_files "    " "${dependency_or_policy_files[@]}"
   exit 0
 fi
 
@@ -140,9 +139,9 @@ cat >&2 <<EOF
 ERROR: this PR mixes dependency/policy files with other files.
 
   dependency/policy files changed:
-$(print_files "$dependency_or_policy_files")
+$(print_files "    " "${dependency_or_policy_files[@]}")
   other files changed:
-$(print_files "$other_files")
+$(print_files "    " "${other_files[@]}")
 
 What to do: split it. Put the dependency/policy changes in their own PR and
 merge that first, then rebase this branch on main and open the code PR -- the

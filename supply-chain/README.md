@@ -88,15 +88,27 @@ bash supply-chain/tests/guard-policy-files.test.sh
 
 ## What CI does
 
-`.github/workflows/supply-chain.yml`, job `supply-chain`, step
-`Guard policy files`, on `pull_request`:
+`.github/workflows/supply-chain.yml`, job `supply-chain`, on every push and
+pull request:
 
-1. checks out full history and drops any PR-shipped `.cargo/config*`;
-2. fetches the PR's base and head SHAs with `git fetch --no-tags origin
-   "$base" "$pr_head"`, and fails the step if the fetch fails;
+1. checks out full history, drops any PR-shipped `.cargo/config*`, and runs
+   `supply-chain/tests/guard-policy-files.test.sh`, so a change to the guard
+   meets its own cases before anything is judged by it. This step (not a
+   `justfile` recipe, not `ci.yml`) is the suite's only CI entry point: both of
+   those files are outside the policy set, so a local recipe for it arrives in
+   its own PR;
+2. on `pull_request`, fetches the PR's base and head SHAs with `git fetch
+   --no-tags origin "$base" "$pr_head"`, and fails the step if the fetch fails;
 3. runs `supply-chain/guard-policy-files.sh "$base" "$pr_head"`, which decides
    from the merge base, not from the synthetic merge commit the checkout left
    in `HEAD`.
+
+The guard runs from the pull request's own checkout, like every step in this
+workflow: it is a policy gate, not a sandbox. A diff that weakens the guard or
+this workflow is a policy diff like any other, and it is reviewed as one
+(`.github/CODEOWNERS` owns `/.github/workflows/`, the default rule owns
+`supply-chain/`), which is what enforces the rule; nothing inside the checkout
+can enforce it against itself.
 
 The rest of the workflow (`cargo vet --locked`, `cargo audit`, `cargo deny
 check all`, the Node externals audit, Node pin parity) runs on `main` pushes,
