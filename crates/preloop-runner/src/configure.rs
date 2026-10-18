@@ -74,8 +74,10 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
     // but the runner must reach it via the upstream LAN address during
     // configure (the loopback bridge is not yet running). Rewrite transparently.
     registration.service_url = http.rewrite_url(&registration.service_url).into_owned();
-    // The deprecations lookup is advisory and bounded: private GHES instances
-    // may require a credential, while offline configure must remain usable.
+    // The deprecations lookup is advisory and bounded: GitHub gates both
+    // schedule endpoints on an admin credential, so it uses
+    // `PRELOOP_GITHUB_TOKEN` when the deployment sets one and reports an
+    // unverified status otherwise, and an offline configure stays usable.
     warn_if_runner_version_deprecated(&http, &args.url).await;
     info!(
         "Registration successful, service URL: {}",
@@ -788,6 +790,13 @@ enum DeprecationNotice {
 /// Build the public GitHub-compatible deprecations URL for a registration
 /// target. Local HTTP control planes are intentionally skipped; GHES is
 /// expected to be HTTPS and uses the same `/api/v3` route family.
+///
+/// A target names a repository (`owner/repo`), an organization (`org` or
+/// `orgs/org` — the URL text GitHub's own "new runner" page uses), or, for
+/// GHES, the instance root. GitHub serves repository schedules under
+/// `/repos/{owner}/{repo}` and organization schedules under `/orgs/{org}`;
+/// an organization target routed to the repository route 404s, and a target
+/// this function cannot place returns `None` and skips the check.
 fn deprecation_url(target: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(target).ok()?;
     let host = parsed.host_str()?;
@@ -795,14 +804,22 @@ fn deprecation_url(target: &str) -> Option<String> {
         .path_segments()
         .map(|segments| segments.filter(|segment| !segment.is_empty()).collect())
         .unwrap_or_default();
+    // `https://github.com/orgs/acme` is the organization form of a github.com
+    // target, not a repository named `acme` under an owner named `orgs`.
+    let segments = match segments.as_slice() {
+        [scope, rest @ ..] if scope.eq_ignore_ascii_case("orgs") => rest.to_vec(),
+        _ => segments,
+    };
     let version = crate::PROTOCOL_COMPAT_VERSION;
+    let scope = match segments.as_slice() {
+        [owner, repo, ..] => format!("repos/{owner}/{repo}"),
+        [org] => format!("orgs/{org}"),
+        [] => String::new(),
+    };
     if host.eq_ignore_ascii_case("github.com") {
-        let [owner, repo, ..] = segments.as_slice() else {
-            return None;
-        };
-        return Some(format!(
-            "https://api.github.com/repos/{owner}/{repo}/actions/runners/deprecations/{version}"
-        ));
+        return (!scope.is_empty()).then(|| {
+            format!("https://api.github.com/{scope}/actions/runners/deprecations/{version}")
+        });
     }
     if parsed.scheme() != "https" {
         return None;
@@ -812,11 +829,6 @@ fn deprecation_url(target: &str) -> Option<String> {
     base.set_query(None);
     base.set_fragment(None);
     let base = base.as_str().trim_end_matches('/');
-    let scope = match segments.as_slice() {
-        [owner, repo, ..] => format!("repos/{owner}/{repo}"),
-        [org] => format!("orgs/{org}"),
-        [] => String::new(),
-    };
     let scope = (!scope.is_empty())
         .then_some(format!("{scope}/"))
         .unwrap_or_default();
@@ -826,12 +838,26 @@ fn deprecation_url(target: &str) -> Option<String> {
 }
 
 fn parse_deprecation_response(value: &serde_json::Value) -> DeprecationCheck {
+    // `runner_version` is the only field GitHub marks required and the only
+    // shape check that tells a schedule apart from an unrelated JSON body.
+    if value
+        .get("runner_version")
+        .and_then(|raw| raw.as_str())
+        .is_none()
+    {
+        return DeprecationCheck::Unverified("response is missing `runner_version`".to_owned());
+    }
+    // Both dates are `string | null`, and GitHub's own documented example
+    // ("Get runner version end-of-life schedule for a repository") omits
+    // `registration_deprecates_at` outright: absent and null both mean "no
+    // schedule set", not a malformed response. Only a supplied value that
+    // cannot be read as a timestamp leaves the lookup unverified.
     fn parse_field(
         value: &serde_json::Value,
         name: &str,
     ) -> std::result::Result<Option<chrono::DateTime<chrono::Utc>>, String> {
         let Some(raw) = value.get(name) else {
-            return Err(format!("response is missing `{name}`"));
+            return Ok(None);
         };
         if raw.is_null() {
             return Ok(None);
@@ -897,17 +923,38 @@ fn deprecation_notice(
     })
 }
 
+/// Credential the deprecation lookup presents, when the deployment provides
+/// one. Both of GitHub's schedule endpoints are authentication-gated — a bare
+/// GET answers `401 Requires authentication` even for a public repository — so
+/// without it the check can only ever report that it could not verify the
+/// pinned version. `PRELOOP_GITHUB_TOKEN` is the crate's existing GitHub API
+/// credential (the same variable `lint` resolves reusable workflows with); it
+/// needs `repo` (or `admin:org` for an organization target) to read a schedule.
+const DEPRECATION_TOKEN_ENV: &str = "PRELOOP_GITHUB_TOKEN";
+
 async fn warn_if_runner_version_deprecated(http: &HttpClient, target: &str) {
     let Some(url) = deprecation_url(target) else {
+        info!(
+            "skipping the runner deprecation check: `{target}` does not name a repository or \
+             organization scope"
+        );
         return;
     };
+    let token = std::env::var(DEPRECATION_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let auth = token.as_deref().map(|token| format!("Bearer {token}"));
     let check = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        http.get_json::<serde_json::Value>(&url),
+        http.get_json_optional_auth::<serde_json::Value>(&url, auth.as_deref()),
     )
     .await
     {
         Ok(Ok(value)) => parse_deprecation_response(&value),
+        Ok(Err(error)) if auth.is_none() => DeprecationCheck::Unverified(format!(
+            "{error:#} — set {DEPRECATION_TOKEN_ENV} to a token with runner access to check \
+             this target"
+        )),
         Ok(Err(error)) => DeprecationCheck::Unverified(format!("{error:#}")),
         Err(_) => DeprecationCheck::Unverified("lookup timed out".to_owned()),
     };
@@ -984,6 +1031,94 @@ mod deprecation_tests {
             )
         );
         assert!(deprecation_url("http://127.0.0.1:9191").is_none());
+    }
+
+    /// Organization targets take the `/orgs/{org}` route, in both the bare
+    /// (`github.com/acme`) and the `github.com/orgs/acme` form the "new runner"
+    /// page links to. Routing either at `/repos/…` 404s, so the check would
+    /// never fire for an organization's runners.
+    #[test]
+    fn deprecation_url_scopes_organization_targets() {
+        let expected = format!(
+            "https://api.github.com/orgs/acme/actions/runners/deprecations/{}",
+            crate::PROTOCOL_COMPAT_VERSION
+        );
+        assert_eq!(
+            deprecation_url("https://github.com/acme").unwrap(),
+            expected
+        );
+        assert_eq!(
+            deprecation_url("https://github.com/orgs/acme").unwrap(),
+            expected
+        );
+        assert_eq!(
+            deprecation_url("https://ghes.example/orgs/acme").unwrap(),
+            format!(
+                "https://ghes.example/api/v3/orgs/acme/actions/runners/deprecations/{}",
+                crate::PROTOCOL_COMPAT_VERSION
+            )
+        );
+        assert!(
+            deprecation_url("https://github.com").is_none(),
+            "a host with no scope has no schedule endpoint"
+        );
+    }
+
+    /// GitHub marks only `runner_version` required and omits
+    /// `registration_deprecates_at` from the documented example, so an absent
+    /// date means "no schedule set" — not a malformed reply that suppresses
+    /// the runtime warning.
+    #[test]
+    fn deprecation_parser_accepts_omitted_optional_dates() {
+        let documented = serde_json::json!({
+            "runner_version": "2.300.0",
+            "runtime_deprecates_at": "2026-09-01T00:00:00Z",
+        });
+        let DeprecationCheck::Known {
+            runtime_deprecates_at,
+            registration_deprecates_at,
+        } = parse_deprecation_response(&documented)
+        else {
+            panic!("a documented schedule payload must parse");
+        };
+        assert_eq!(
+            runtime_deprecates_at.unwrap().to_rfc3339(),
+            "2026-09-01T00:00:00+00:00"
+        );
+        assert!(registration_deprecates_at.is_none());
+
+        let nulled = serde_json::json!({
+            "runner_version": "2.300.0",
+            "runtime_deprecates_at": null,
+            "registration_deprecates_at": null,
+        });
+        assert_eq!(
+            parse_deprecation_response(&nulled),
+            DeprecationCheck::Known {
+                runtime_deprecates_at: None,
+                registration_deprecates_at: None,
+            }
+        );
+
+        let malformed = serde_json::json!({
+            "runner_version": "2.300.0",
+            "runtime_deprecates_at": "not a date",
+        });
+        assert!(
+            matches!(
+                parse_deprecation_response(&malformed),
+                DeprecationCheck::Unverified(reason) if reason.contains("runtime_deprecates_at")
+            ),
+            "a supplied but unreadable date must stay unverified"
+        );
+
+        assert!(
+            matches!(
+                parse_deprecation_response(&serde_json::json!({"message": "Not Found"})),
+                DeprecationCheck::Unverified(reason) if reason.contains("runner_version")
+            ),
+            "an unrelated JSON body is not a schedule"
+        );
     }
 }
 

@@ -64,9 +64,15 @@ Releases before v0.27.0 predate the changelog.
 - **RunnerPool external control-plane seams and runner-version freshness**:
   GitHub/GHES pools can keep a queue-free warm set with a fresh registration
   credential per VM and a caller-supplied teardown hook, while engine mode
-  retains queue demand and purge behavior. The runner advertises the
-  `versions.toml` `runner_version` pin everywhere and warns at configure time
-  when GitHub reports an approaching runtime deprecation.
+  retains queue demand and purge behavior. GitHub demand now validates like
+  engine demand does — at most 64 warm runners, a per-VM registration source,
+  and a mandatory `control_plane_hooks.runner_gone` adapter, because that hook
+  replaces the engine purge request that GitHub demand never sends — and the
+  engine purge path rejects a per-VM source it cannot authenticate with. The
+  runner advertises the `versions.toml` `runner_version` pin everywhere and
+  warns at configure time when GitHub reports an approaching runtime
+  deprecation, using `PRELOOP_GITHUB_TOKEN` for the schedule lookup that
+  GitHub gates on an admin credential.
 
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
