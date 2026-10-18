@@ -2387,6 +2387,11 @@ enum FunnelPublication {
     /// Nothing is Funnel-published there: plain Serve only serves the tailnet,
     /// which GitHub cannot reach.
     NotPublished,
+    /// A `--bg`-less `serve`/`funnel` session is up for this host:port. Its
+    /// config is what is public there while it lasts, and it is gone when that
+    /// command exits, so the persistent mounts cannot certify the name either
+    /// way.
+    ForegroundSession,
 }
 
 impl FunnelPublication {
@@ -2448,13 +2453,28 @@ fn read_public_url(input: &str, suggestion: Option<&UrlSuggestion>) -> UrlInput 
 /// The prompt for the URL question. Only a name Enter may safely accept is
 /// shown as a suggestion; a detected-but-unusable one is a hint, so the prompt
 /// keeps the safe default (blank = skip) and the help above says what is
-/// missing.
+/// missing. `WebhookPathAndOthers` says so in its own words: Funnel *does*
+/// publish the webhook path there, it just publishes other mounts with it, and
+/// "not published" would contradict both the help above and the operator's own
+/// `tailscale funnel status`.
 fn public_url_prompt(suggestion: Option<&UrlSuggestion>) -> String {
     match suggestion {
         Some(UrlSuggestion {
             url,
             funnel: FunnelPublication::WebhookPathOnly,
         }) => format!("    public URL [{url}] (Enter accepts; \"-\" skips, webhooks off): "),
+        Some(UrlSuggestion {
+            url,
+            funnel: FunnelPublication::WebhookPathAndOthers(_),
+        }) => {
+            format!("    public URL (blank = skip; {url} also publishes other paths, see above): ")
+        }
+        Some(UrlSuggestion {
+            url,
+            funnel: FunnelPublication::ForegroundSession,
+        }) => format!(
+            "    public URL (blank = skip; {url} has a foreground serve session, see above): "
+        ),
         Some(UrlSuggestion { url, .. }) => {
             format!("    public URL (blank = skip; {url} is not published by Funnel for GitHub): ")
         }
@@ -2493,6 +2513,22 @@ fn public_url_help(suggestion: Option<&UrlSuggestion>) -> Vec<String> {
                 "Tailscale applies Funnel to the whole host and port, so the webhook path cannot \
                  be public there alone (tailscale/tailscale#10234) — give it a dedicated \
                  hostname, check with `tailscale funnel status`, then re-run this step"
+                    .to_owned(),
+            );
+        }
+        Some(UrlSuggestion {
+            url,
+            funnel: FunnelPublication::ForegroundSession,
+        }) => {
+            lines.push(format!(
+                "this machine is on the tailnet as {url}, and a `tailscale serve`/`funnel` \
+                 command is running there without `--bg`:"
+            ));
+            lines.push(
+                "a foreground session is what serves this name while it runs, and it stops with \
+                 that command — so GitHub cannot rely on it, and the App's webhook needs a \
+                 background mount instead. Re-run the funnel command above with `--bg` (or exit \
+                 the foreground one), check with `tailscale funnel status`, then re-run this step"
                     .to_owned(),
             );
         }
@@ -2638,7 +2674,17 @@ fn tailnet_public_url(status: &Value) -> Option<String> {
 /// this host:port" flag and `Web` carries the mounted paths: without the first
 /// nothing there is public, and any shape this does not understand (an older
 /// or newer daemon) degrades to "not published" rather than a false claim.
+///
+/// A `--bg`-less `serve`/`funnel` session writes a *separate*, session-scoped
+/// config into `Foreground`, and the daemon consults those before the
+/// persistent one (`ServeConfig.FindWeb` prefers a foreground handler for the
+/// same host:port, and `HasFunnelForTarget` counts a foreground `AllowFunnel`
+/// entry as well). So anything `Foreground` says about this host:port is what
+/// is actually public — and only while the session lives.
 fn funnel_publication(funnel_status: &Value, host: &str) -> FunnelPublication {
+    if foreground_touches(funnel_status, host) {
+        return FunnelPublication::ForegroundSession;
+    }
     let allowed = funnel_status
         .get("AllowFunnel")
         .and_then(Value::as_object)
@@ -2690,6 +2736,28 @@ fn host_entry<'a>(map: &'a serde_json::Map<String, Value>, host: &str) -> Option
     map.iter()
         .find(|(key, _)| names_this_host_on_443(key))
         .map(|(_, value)| value)
+}
+
+/// Whether a `--bg`-less serve session in `funnel_status` configures `host` on
+/// 443 at all — in its mounts (`Web`) or in its `AllowFunnel` flag. Either one
+/// changes what is public there (see [`funnel_publication`]) and neither is
+/// durable, so nothing can be certified from the persistent config while such
+/// a session is up. A session on another host:port is a different address and
+/// is left alone.
+fn foreground_touches(funnel_status: &Value, host: &str) -> bool {
+    ["AllowFunnel", "Web"].iter().any(|key| {
+        funnel_status
+            .get("Foreground")
+            .and_then(Value::as_object)
+            .is_some_and(|sessions| {
+                sessions.values().any(|session| {
+                    session
+                        .get(*key)
+                        .and_then(Value::as_object)
+                        .is_some_and(|map| host_entry(map, host).is_some())
+                })
+            })
+    })
 }
 
 /// Check the URL GitHub will deliver webhooks to, and return it without a
@@ -3862,6 +3930,55 @@ mod tests {
                 FunnelPublication::NotPublished,
             ),
             (
+                // A `--bg`-less session of another serve/funnel command. Its
+                // handlers are consulted before the persistent ones for this
+                // host:port, so the persistent "webhook path only" is not what
+                // is public.
+                "a foreground session mounts another path on this host:port",
+                json!({
+                    "Web": one_key(format!("{host}:443"), json!({"Handlers": handlers.clone()})),
+                    "AllowFunnel": one_key(format!("{host}:443"), json!(true)),
+                    "Foreground": one_key("session-1".to_owned(), json!({
+                        "Web": one_key(format!("{host}:443"), json!({"Handlers": {
+                            "/api/v1/github/webhooks": {"Proxy": "http://127.0.0.1:9090/api/v1/github/webhooks"},
+                            "/": {"Proxy": "http://127.0.0.1:3000"},
+                        }})),
+                        "AllowFunnel": one_key(format!("{host}:443"), json!(true)),
+                    })),
+                }),
+                FunnelPublication::ForegroundSession,
+            ),
+            (
+                // The foreground session carries no Funnel flag of its own,
+                // but the persistent one already allows Funnel for this
+                // host:port and the foreground handlers serve it: those mounts
+                // are public too.
+                "a foreground mount here under the persistent Funnel flag",
+                json!({
+                    "Web": one_key(format!("{host}:443"), json!({"Handlers": handlers.clone()})),
+                    "AllowFunnel": one_key(format!("{host}:443"), json!(true)),
+                    "Foreground": one_key("session-1".to_owned(), json!({
+                        "Web": one_key(format!("{host}:443"), json!({"Handlers": {
+                            "/": {"Proxy": "http://127.0.0.1:3000"},
+                        }})),
+                    })),
+                }),
+                FunnelPublication::ForegroundSession,
+            ),
+            (
+                // Even a foreground publication of the webhook path alone is
+                // session-scoped: it is gone when that command exits, and the
+                // App's webhook needs an address that outlives it.
+                "a foreground Funnel publishes the webhook path by itself",
+                json!({
+                    "Foreground": one_key("session-1".to_owned(), json!({
+                        "Web": one_key(format!("{host}:443"), json!({"Handlers": handlers.clone()})),
+                        "AllowFunnel": one_key(format!("{host}:443"), json!(true)),
+                    })),
+                }),
+                FunnelPublication::ForegroundSession,
+            ),
+            (
                 "a shape this version does not write",
                 json!({"AllowFunnel": ["builder.tail1234.ts.net:443"]}),
                 FunnelPublication::NotPublished,
@@ -3871,6 +3988,23 @@ mod tests {
                 "no JSON object at all",
                 json!("denied"),
                 FunnelPublication::NotPublished,
+            ),
+            (
+                // A foreground session on another host:port is a different
+                // address: it changes nothing here, so the persistent verdict
+                // still stands.
+                "a foreground session on another host:port",
+                json!({
+                    "Web": one_key(format!("{host}:443"), json!({"Handlers": handlers.clone()})),
+                    "AllowFunnel": one_key(format!("{host}:443"), json!(true)),
+                    "Foreground": one_key("session-1".to_owned(), json!({
+                        "Web": one_key("other.tail1234.ts.net:443".to_owned(), json!({"Handlers": {
+                            "/": {"Proxy": "http://127.0.0.1:3000"},
+                        }})),
+                        "AllowFunnel": one_key("other.tail1234.ts.net:443".to_owned(), json!(true)),
+                    })),
+                }),
+                FunnelPublication::WebhookPathOnly,
             ),
         ] {
             assert_eq!(funnel_publication(&funnel, host), expected, "{what}");
@@ -3917,6 +4051,49 @@ mod tests {
         assert!(
             !help.contains("Enter accepts"),
             "an unsafe name must never be announced as accepted: {help}"
+        );
+        let prompt = public_url_prompt(Some(&suggestion));
+        assert!(prompt.contains("blank = skip"), "{prompt}");
+        assert!(
+            prompt.contains("also publishes other paths"),
+            "Funnel does publish the webhook path here; only the other mounts \
+             make it unusable: {prompt}"
+        );
+        assert!(
+            !prompt.contains("not published by Funnel"),
+            "the prompt must not contradict `tailscale funnel status`: {prompt}"
+        );
+
+        // A `--bg`-less session: Enter must not accept a publication that dies
+        // with that command, and the wording must say so instead of claiming
+        // nothing is published.
+        let foreground = tailnet_suggestion(
+            &status,
+            Some(&json!({
+                "Foreground": one_key("session-1".to_owned(), json!({
+                    "Web": one_key(format!("{host}:443"), json!({"Handlers": handlers.clone()})),
+                    "AllowFunnel": one_key(format!("{host}:443"), json!(true)),
+                })),
+            })),
+        )
+        .expect("still a hint");
+        assert_eq!(foreground.funnel, FunnelPublication::ForegroundSession);
+        assert_eq!(read_public_url("", Some(&foreground)), UrlInput::Skip);
+        let fg_prompt = public_url_prompt(Some(&foreground));
+        assert!(
+            fg_prompt.contains("foreground serve session"),
+            "{fg_prompt}"
+        );
+        assert!(
+            !fg_prompt.contains("not published by Funnel"),
+            "a foreground funnel does publish it: {fg_prompt}"
+        );
+        let fg_help = public_url_help(Some(&foreground)).join("\n");
+        assert!(fg_help.contains("foreground"), "{fg_help}");
+        assert!(fg_help.contains("--bg"), "{fg_help}");
+        assert!(
+            !fg_help.contains("no tailscale funnel publishes"),
+            "the help must name what is really wrong: {fg_help}"
         );
     }
 
