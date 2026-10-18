@@ -113,15 +113,20 @@ fn runner_volumes(
     // downloaded per runner (that is what the `--no-externals` configure flag
     // enforces). Artifact-based machines (packed golden and create-per-runner)
     // skip the mount: the packed artifact carries only the
-    // `<root>/externals -> /opt/preloop/bin/externals` symlink and every
-    // virtio device consumes one of libkrun's 11 x86_64 IRQ lines — the
-    // packed launcher is already the device-heaviest config (root + layers
-    // virtiofs + 2 disks + mounts + vsock + net + console), so a third mount
-    // pushes it past the budget and the golden fails to start
-    // (`RegisterNetDevice(IrqsExhausted)`). The real externals ride the
-    // `/opt/preloop/bin` bundle mount above, which is guaranteed complete:
-    // `ensure_host_externals` materializes it at pool warm and the
-    // fail-closed selection here refuses anything less.
+    // `<root>/externals -> /opt/preloop/bin/externals` symlink, and every
+    // virtio device a machine declares costs one MMIO IRQ line — the budget
+    // libkrun allocates one line per device from, and the budget an
+    // over-subscribed machine exhausts (`no more IRQs are available`, surfaced
+    // as `VmError::IrqExhausted`). Measured on x86_64 Linux at SmolVM 1.30.1:
+    // 19 lines (IRQ 5-23) since SmolVM 1.23.0, 11 before that, and 9 devices
+    // in an image machine's own launcher set (rootfs and layer virtiofs,
+    // storage and overlay disks, vsock, net, console). The packed launcher is
+    // the device-heaviest config preloop builds, so it keeps its two mounts
+    // (this bundle + the control bridge) and reaches node through the baked
+    // symlink rather than adding a third. The arm64/macOS ceiling has not been
+    // measured. The real externals ride the `/opt/preloop/bin` bundle mount
+    // above, which is guaranteed complete: `ensure_host_externals` materializes
+    // it at pool warm and the fail-closed selection here refuses anything less.
     if mount_externals {
         volumes.push(VolumeMount {
             host: config.externals_dir.join("externals"),
@@ -199,11 +204,12 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     relax_externals_permissions(&externals);
     // Artifact-based machines reach node through the baked symlink
     // `<root>/externals -> /opt/preloop/bin/externals` (the packed launcher
-    // has no IRQ headroom for a third virtiofs mount), so the runner bundle
-    // must expose the same externals. This must be a REAL directory, not a
-    // host symlink: virtiofs exports a symlink node verbatim and the guest
-    // kernel then resolves its target in the GUEST namespace, where
-    // `/var/lib/preloop/externals` does not exist — node would be missing.
+    // keeps its two virtiofs mounts instead of spending a third — see
+    // `runner_volumes`), so the runner bundle must expose the same externals.
+    // This must be a REAL directory, not a host symlink: virtiofs exports a
+    // symlink node verbatim and the guest kernel then resolves its target in
+    // the GUEST namespace, where `/var/lib/preloop/externals` does not exist —
+    // node would be missing.
     // The copy is attempted in place first; when the release directory is not
     // writable by this engine (unprivileged engine, root-owned release dir) an
     // engine-owned mirror bundle is published instead — see

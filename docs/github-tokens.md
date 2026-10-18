@@ -23,6 +23,15 @@ runner maps that built-in variable to the canonical
 `${{ secrets.GITHUB_TOKEN }}` expression; an uppercase `GITHUB_TOKEN` variable
 is not transmitted in the acquire response.
 
+At claim time, Preloop writes the same GitHub credential to `github_token` and
+`contextData.github.token`. Therefore `${{ secrets.GITHUB_TOKEN }}` and
+`${{ github.token }}` agree in runner-time `env:`, `with:`, and `run:` values,
+local composite-action inputs, job environment expressions, and container or
+service credentials. Acquire-time job `env:` values and reusable-workflow
+`secrets:` maps are filled after that claim patch as well. Local snapshot
+checkout intentionally replaces its default `token` input with the local
+engine credential; that transport credential is not the job's GitHub token.
+
 The **local HMAC JWT** is signed with a per-instance key persisted at
 `<state-dir>/hmac-key.bin` and carries `sub: preloop-job-<job-id>` plus
 `scp: Actions.Results:<plan-id>:<job-id>`. It authenticates against *the Preloop

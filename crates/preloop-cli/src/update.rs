@@ -71,17 +71,21 @@ fn is_https_downgrade(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
 }
 
 /// Minimum SmolVM release `preloop update` accepts as already compatible,
-/// compiled from `smolvm_min_version` in the workspace `versions.toml` (see
-/// `build.rs`; keep the two in sync).
+/// compiled from `smolvm_min_version` in the workspace `versions.toml` by
+/// `crates/preloop-vm/build.rs` (which the device-budget diagnostic in
+/// `preloop-vm` reads too, so one pin feeds both).
 ///
 /// The configured floor is the first release that satisfies all runtime
-/// invariants: packed-machine ownership preservation (v1.8.1) and
+/// invariants: packed-machine ownership preservation (v1.8.1),
 /// `machine fork --freeze-source` (v1.18.1), which preloop-vm passes on every
 /// fork so goldens keep a frozen reusable branch base instead of
-/// live-forking the source. Newer stable releases satisfy it without another
-/// code change.
+/// live-forking the source, and the x86_64 virtio device budget (v1.23.0,
+/// which raised libkrun's MMIO IRQ allocation for virtio devices from 11 to
+/// 19; below it preloop's mount-heavy machine shapes can exceed the budget
+/// and fail to start with `no more IRQs are available`). Newer stable
+/// releases satisfy it without another code change.
 static SMOLVM_MIN_COMPATIBLE_VERSION: LazyLock<Version> = LazyLock::new(|| {
-    Version::parse(SMOLVM_MIN_VERSION)
+    Version::parse(preloop_vm::SMOLVM_MIN_VERSION)
         .expect("smolvm_min_version in versions.toml must be a semver version")
 });
 
@@ -478,7 +482,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
         bail!(
             "SmolVM release {} is below configured minimum {}",
             release.tag_name,
-            SMOLVM_MIN_VERSION
+            preloop_vm::SMOLVM_MIN_VERSION
         );
     }
     let archive_name = format!("smolvm-{version}-{platform}.tar.gz");
@@ -1561,14 +1565,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         // Parse-check the floor constant; the loop below pins the concrete
         // versions that must pass or fail against it.
-        let _minimum = Version::parse(SMOLVM_MIN_VERSION).unwrap();
+        let _minimum = Version::parse(preloop_vm::SMOLVM_MIN_VERSION).unwrap();
         for (version, flag, expected) in [
-            ("1.18.1", "--mount-socket <HOST:GUEST>", true),
-            ("1.18.2", "--mount-socket <HOST:GUEST>", true),
-            ("1.18.0", "--mount-socket <HOST:GUEST>", false),
+            ("1.30.1", "--mount-socket <HOST:GUEST>", true),
+            ("1.30.2", "--mount-socket <HOST:GUEST>", true),
+            ("1.30.0", "--mount-socket <HOST:GUEST>", false),
+            ("1.23.6", "--mount-socket <HOST:GUEST>", false),
+            ("1.18.1", "--mount-socket <HOST:GUEST>", false),
             ("1.8.1", "--mount-socket <HOST:GUEST>", false),
-            ("1.16.1", "--mount-socket <HOST:GUEST>", false),
-            ("1.18.1", "--docker-socket", false),
+            ("1.30.1", "--docker-socket", false),
         ] {
             let executable = directory
                 .path()

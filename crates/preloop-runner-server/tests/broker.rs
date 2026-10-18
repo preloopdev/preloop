@@ -4184,3 +4184,230 @@ async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
         assert_eq!(body, expected.as_bytes());
     }
 }
+
+/// Installation token the stub GitHub App mints at claim in the
+/// `github_token_parity_*` tests. Shaped like a real `ghs_` installation token.
+const PARITY_MINTED_TOKEN: &str = "ghs_ParityMintedInstallationTokenAAAAAAAA";
+
+/// A broker whose GitHub App mints [`PARITY_MINTED_TOKEN`] for `owner/repo`.
+/// The guards hold the process-wide GitHub env lock and restore the env on drop.
+struct MintingBroker {
+    state: AppState,
+    app: Router,
+    _env: (
+        tokio::sync::MutexGuard<'static, ()>,
+        crate::state::TestEnvVar,
+        crate::state::TestEnvVar,
+    ),
+}
+
+async fn minting_broker(temp: &tempfile::TempDir) -> MintingBroker {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+    use axum::routing::{get, post};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let stub = Router::new()
+        .route(
+            "/app/installations",
+            get(|| async { Json(json!([{"id": 4242, "account": {"login": "owner"}}])) }),
+        )
+        .route(
+            "/app/installations/{installation_id}/access_tokens",
+            post(|| async {
+                Json(json!({"token": PARITY_MINTED_TOKEN, "expires_at": "2999-01-01T00:00:00Z"}))
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    let env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
+    let pat = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        private_key,
+        MintFailurePolicy::LocalJwt,
+    ));
+    let app = app(state.clone(), CancellationToken::new());
+    MintingBroker {
+        state,
+        app,
+        _env: (env_lock, api_url, pat),
+    }
+}
+
+/// The value `environmentVariables` carries for `name`: the literal once the
+/// server resolved it, or `${{ <expr> }}` when the runner evaluates it at step
+/// time.
+fn environment_entry(message: &Value, name: &str) -> Option<String> {
+    message["environmentVariables"]
+        .as_array()?
+        .iter()
+        .find_map(|token| {
+            let pair = token["map"].as_array()?.first()?;
+            if pair["Key"]["lit"].as_str()? != name {
+                return None;
+            }
+            match pair["Value"]["type"].as_u64()? {
+                0 => pair["Value"]["lit"].as_str().map(str::to_owned),
+                3 => pair["Value"]["expr"]
+                    .as_str()
+                    .map(|expr| format!("${{{{ {expr} }}}}")),
+                _ => None,
+            }
+        })
+}
+
+/// The claim put the minted token on the `github_token` secret variable and on
+/// the `github` context token, the two surfaces `secrets.GITHUB_TOKEN` and
+/// `github.token` read at step time.
+fn assert_claim_minted_token(message: &Value) {
+    assert_eq!(
+        wire_variable(message, "github_token"),
+        Some(PARITY_MINTED_TOKEN),
+        "the claim must mint into the `github_token` variable"
+    );
+    assert_eq!(
+        github_context_token(message).as_deref(),
+        Some(PARITY_MINTED_TOKEN),
+        "the claim must mint into the `github` context token"
+    );
+}
+
+/// Job-level `env:` reading `secrets.GITHUB_TOKEN` and `github.token`, in a job
+/// that also reads a stored secret. Acquire resolves the `secrets.*` env entries
+/// into literals, so the literal for `secrets.GITHUB_TOKEN` must be the minted
+/// token rather than the empty build-time placeholder.
+#[tokio::test]
+async fn github_token_parity_job_env_carries_the_minted_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let broker = minting_broker(&temp).await;
+    broker.state.secrets.write().repo.insert(
+        "owner/repo".to_owned(),
+        std::collections::BTreeMap::from([("DEPLOY_KEY".to_owned(), "deploy-value".to_owned())]),
+    );
+    request_json(
+        &broker.app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      VIA_SECRETS: ${{ secrets.GITHUB_TOKEN }}\n      VIA_GITHUB: ${{ github.token }}\n      DEPLOY: ${{ secrets.DEPLOY_KEY }}\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let acquired = acquire_queued_job(&broker.app, "parity-env-runner").await;
+    assert_claim_minted_token(&acquired);
+    assert_eq!(
+        environment_entry(&acquired, "VIA_SECRETS").as_deref(),
+        Some(PARITY_MINTED_TOKEN),
+        "job env `secrets.GITHUB_TOKEN` must equal the minted token"
+    );
+    assert_eq!(
+        environment_entry(&acquired, "VIA_GITHUB").as_deref(),
+        Some("${{ github.token }}"),
+        "job env `github.token` stays a runtime expression over the patched context"
+    );
+    assert_eq!(
+        environment_entry(&acquired, "DEPLOY").as_deref(),
+        Some("deploy-value"),
+        "the stored secret is still resolved into the job env"
+    );
+}
+
+/// Control: with no other stored secret, nothing is resolved at acquire, so a
+/// job env `secrets.GITHUB_TOKEN` stays an expression the runner evaluates
+/// against the claim-patched variables.
+#[tokio::test]
+async fn github_token_parity_job_env_without_other_secrets_stays_runtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let broker = minting_broker(&temp).await;
+    request_json(
+        &broker.app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      VIA_SECRETS: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let acquired = acquire_queued_job(&broker.app, "parity-control-runner").await;
+    assert_claim_minted_token(&acquired);
+    assert_eq!(
+        environment_entry(&acquired, "VIA_SECRETS").as_deref(),
+        Some("${{ secrets.GITHUB_TOKEN }}"),
+        "without a resolved sibling secret the env stays a runtime expression"
+    );
+}
+
+/// A reusable call's `secrets:` mapping reads `secrets.GITHUB_TOKEN` and
+/// `github.token` in the caller. The callee must receive the minted token under
+/// the mapped names, not an empty value.
+#[tokio::test]
+async fn github_token_parity_reusable_secrets_map_carries_the_minted_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let broker = minting_broker(&temp).await;
+    let callee_yaml = "on: workflow_call\njobs:\n  inner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo inner\n";
+    request_json(
+        &broker.app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  call:\n    uses: ./.github/workflows/callee.yml\n    secrets:\n      VIA_SECRETS: ${{ secrets.GITHUB_TOKEN }}\n      VIA_GITHUB: ${{ github.token }}\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {".github/workflows/callee.yml": callee_yaml},
+        }),
+    )
+    .await;
+    let acquired = acquire_queued_job(&broker.app, "parity-map-runner").await;
+    assert_claim_minted_token(&acquired);
+    assert_eq!(
+        wire_variable(&acquired, "VIA_SECRETS"),
+        Some(PARITY_MINTED_TOKEN),
+        "the mapped `secrets.GITHUB_TOKEN` must reach the callee as the minted token"
+    );
+    assert_eq!(
+        wire_variable(&acquired, "VIA_GITHUB"),
+        Some(PARITY_MINTED_TOKEN),
+        "the mapped `github.token` must reach the callee as the minted token"
+    );
+}
+
+/// `secrets: inherit` hands the callee the caller's whole scope. The callee's
+/// own `secrets.GITHUB_TOKEN` in job env must be the callee's minted token even
+/// though acquire resolves the inherited env entries.
+#[tokio::test]
+async fn github_token_parity_secrets_inherit_carries_the_minted_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let broker = minting_broker(&temp).await;
+    broker.state.secrets.write().repo.insert(
+        "owner/repo".to_owned(),
+        std::collections::BTreeMap::from([("OTHER".to_owned(), "inherited-value".to_owned())]),
+    );
+    let callee_yaml = "on: workflow_call\njobs:\n  inner:\n    runs-on: ubuntu-latest\n    env:\n      VIA_SECRETS: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - run: echo inner\n";
+    request_json(
+        &broker.app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  call:\n    uses: ./.github/workflows/callee.yml\n    secrets: inherit\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {".github/workflows/callee.yml": callee_yaml},
+        }),
+    )
+    .await;
+    let acquired = acquire_queued_job(&broker.app, "parity-inherit-runner").await;
+    assert_claim_minted_token(&acquired);
+    assert_eq!(
+        environment_entry(&acquired, "VIA_SECRETS").as_deref(),
+        Some(PARITY_MINTED_TOKEN),
+        "inherited job env `secrets.GITHUB_TOKEN` must equal the minted token"
+    );
+}
