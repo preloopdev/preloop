@@ -179,12 +179,18 @@ Attach an interactive DAP client to a run that was started with debugging enable
 
 ### preloop init
 
-Configure GitHub credentials, the golden image that every job forks from, and how the engine runs. In a terminal, `init` asks each of its four steps. Any flag answers its step without a prompt, so a fully specified command runs without prompting.
+Configure GitHub credentials, the golden image that every job forks from, workflow requirements, and how the engine runs. In a terminal, `init` asks each of its five steps. Any flag answers its step without a prompt, so a fully specified command runs without prompting.
 
 ```sh
 preloop init --auth none --golden official --mode none
 preloop init --probe --json
 ```
+
+The steps are credentials, golden, workflows, run mode, and preflight. The workflow step reads local `.github/workflows/*.yml|yaml` and `.github/actions/**/action.y*ml`; a `--repo` that is not the checkout is read through GitHub when its credential allows it. It never fails init because a repository cannot be read or a secret is missing.
+
+Its report lists every `secrets.NAME` / `secrets['NAME']` reference (excluding the engine-minted `GITHUB_TOKEN`), its file locations, and whether the name is configured globally, for the repository, or for an environment. In a terminal each missing UPPER_SNAKE name can be entered through a hidden prompt; otherwise the report prints the exact `preloop secret set NAME --repo OWNER/NAME` command. The `runs-on` table uses the engine's actual matching rules: base labels are `self-hosted`, `Linux`, and the host architecture; `ubuntu-latest`/`ubuntu-24.04` use the official golden, other `ubuntu-*` labels use the configured golden, and macOS/Windows labels require a matching external runner because the Linux pool cannot host them. Undeclared custom labels need a matching registered runner or an explicit `PRELOOP_RUNNER_LABELS` value.
+
+For `--auth app`, the stable URL must be an HTTPS, non-loopback URL that GitHub can reach. Tailscale Funnel, a Cloudflare **named** Tunnel (not a quick Tunnel, whose URL changes on restart), or a domain/reverse proxy are suitable; expose only `/api/v1/github/webhooks`. An existing `--public-url` or `PRELOOP_PUBLIC_URL` is used without asking. Blank means local-only App webhooks: pushes and pull requests will not start runs and PR checks will not report.
 
 | Flag | Description |
 |---|---|
@@ -195,10 +201,11 @@ preloop init --probe --json
 | `--token <TOKEN>` | Personal access token, with `--auth pat`. Falls back to `PRELOOP_GITHUB_PAT`. |
 | `--webhook-secret <SECRET>` | Webhook secret to store with the credential. |
 | `--org <NAME>` | Create the App under an organization, in the browser flow. |
-| `--public-url <URL>` | Public HTTPS URL. Enables webhook delivery on the App. |
+| `--public-url <URL>` | Stable HTTPS URL GitHub can reach. Enables App webhooks and PR checks; loopback and non-HTTPS URLs are rejected, and trailing slashes are removed. |
 | `--port <N>` | Loopback port for GitHub's redirect. `0` picks a free port. |
 | `--no-browser` | Print the App-creation URL instead of opening a browser. |
-| `--repo <OWNER/NAME>` | Repository to verify the credential against. Repeatable. |
+| `--repo <OWNER/NAME>` | Repository to verify and scan. Repeatable; without it, the current checkout's origin is used. |
+| `--no-secrets-scan` | Skip the workflow secret scan; the `runs-on` label report still runs. |
 | `--golden <official\|oci\|dockerfile\|file>` | Golden step. `official` is the packed official GitHub runner image. |
 | `--base-image <REF>` | OCI reference, with `--golden oci`. Pin it with `@sha256:…`. |
 | `--dockerfile <PATH>` | Dockerfile to build, with `--golden dockerfile`. Default `./Dockerfile`. |

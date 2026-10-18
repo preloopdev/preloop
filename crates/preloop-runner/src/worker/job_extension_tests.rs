@@ -1683,7 +1683,7 @@ fn decode_typed_value_preserves_arrays_nested_in_wire_dicts() {
                     {"k": "action", "v": "labeled"},
                     {"k": "label", "v": {
                         "t": 2,
-                        "d": [{"k": "name", "v": "dependency-migration"}]
+                        "d": [{"k": "name", "v": "dependencies"}]
                     }},
                     {"k": "pull_request", "v": {
                         "t": 2,
@@ -1691,7 +1691,7 @@ fn decode_typed_value_preserves_arrays_nested_in_wire_dicts() {
                             {"k": "labels", "v": {
                                 "t": 1,
                                 "a": [
-                                    {"t": 2, "d": [{"k": "name", "v": "dependency-migration"}]},
+                                    {"t": 2, "d": [{"k": "name", "v": "dependencies"}]},
                                     {"t": 2, "d": [{"k": "name", "v": "other"}]},
                                 ]
                             }}
@@ -1707,21 +1707,225 @@ fn decode_typed_value_preserves_arrays_nested_in_wire_dicts() {
     assert_eq!(decoded["event"]["action"], "labeled");
     assert_eq!(
         decoded["event"]["pull_request"]["labels"],
-        serde_json::json!([{"name": "dependency-migration"}, {"name": "other"}])
+        serde_json::json!([{"name": "dependencies"}, {"name": "other"}])
     );
 
-    // The whole labeled-event guard expression must now see the label list.
+    // The label list must be visible to a `contains(… .labels.*.name, …)`
+    // expression, which is how a labeled-event workflow branch reads it.
     let mut ctx = preloop_gha_expressions::Context::new();
     ctx.insert("github", decoded);
     assert_eq!(
         preloop_gha_expressions::eval_expression(
             "github.event.action == 'labeled' && \
-             github.event.label.name == 'dependency-migration' && \
-             contains(github.event.pull_request.labels.*.name, 'dependency-migration')",
+             github.event.label.name == 'dependencies' && \
+             contains(github.event.pull_request.labels.*.name, 'dependencies')",
             &ctx,
         )
         .expect("expression evaluates"),
         serde_json::json!(true),
-        "the dependency-migration guard expression must be true for this payload"
+        "a labeled-event expression must see the label list for this payload"
+    );
+}
+
+/// Token the claim mints in the runtime parity tests. Shaped like a real `ghs_`
+/// installation token.
+const CLAIM_MINTED_TOKEN: &str = "ghs_ClaimMintedInstallationTokenBBBBBBBBB";
+
+/// Replay a golden acquirejob payload through the claim the broker performs:
+/// `broker::apply_minted_token_to_message` stores the minted token as the
+/// `github_token` and `system.github.token` secret variables and as the
+/// `github` context token. The result is the message `job_runner::run_job`
+/// builds the job from.
+fn golden_claimed_message(scenario: &str, token: &str) -> serde_json::Value {
+    use preloop_gha_protocol::azdo::{PipelineContextData, VariableValue};
+
+    let mut message = load_golden_acquirejob(scenario).expect("golden acquirejob payload");
+    let mut context: std::collections::BTreeMap<String, PipelineContextData> =
+        serde_json::from_value(message["contextData"].clone()).expect("typed contextData");
+    if let Some(PipelineContextData::Dict(github)) = context.get_mut("github") {
+        github.insert(
+            "token".to_owned(),
+            PipelineContextData::String(token.to_owned()),
+        );
+    }
+    message["contextData"] = serde_json::to_value(&context).expect("encode contextData");
+    for name in ["github_token", "system.github.token"] {
+        message["variables"][name] =
+            serde_json::to_value(VariableValue::secret(token.to_owned())).expect("encode variable");
+    }
+    message
+}
+
+/// The job `job_runner::run_job` builds from a claimed message.
+fn claimed_job(message: &serde_json::Value) -> JobContext {
+    JobContext::new(
+        "job1".into(),
+        "job".into(),
+        message["variables"].clone(),
+        message["contextData"].clone(),
+    )
+}
+
+/// `secrets.GITHUB_TOKEN`, `github.token`, and the `github_token` variable all
+/// read the one claim-minted token on a golden-replayed job.
+#[test]
+fn claimed_golden_job_reads_one_token_through_secrets_and_github() {
+    let message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    let job = claimed_job(&message);
+    let ctx = job.build_expression_context();
+    for expression in ["secrets.GITHUB_TOKEN", "github.token"] {
+        assert_eq!(
+            preloop_gha_expressions::eval_expression(expression, &ctx)
+                .expect("expression evaluates")
+                .as_str(),
+            Some(CLAIM_MINTED_TOKEN),
+            "`{expression}` must read the claim-minted token"
+        );
+    }
+}
+
+/// Step `with:`, `env:` and `run:` values are evaluated by the runner against
+/// the claimed job, so each spelling of the token resolves to the minted value.
+#[test]
+fn claimed_golden_job_evaluates_step_values_to_the_minted_token() {
+    let message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    let job = claimed_job(&message);
+    let ctx = job.build_expression_context();
+    let cases = [
+        ("${{ secrets.GITHUB_TOKEN }}", CLAIM_MINTED_TOKEN.to_owned()),
+        ("${{ github.token }}", CLAIM_MINTED_TOKEN.to_owned()),
+        (
+            "echo ${{ secrets.GITHUB_TOKEN }}",
+            format!("echo {CLAIM_MINTED_TOKEN}"),
+        ),
+    ];
+    for (template, expected) in cases {
+        assert_eq!(
+            crate::worker::template::evaluate_template_strict(template, &ctx)
+                .expect("step value evaluates"),
+            expected,
+            "`{template}` must resolve to the claim-minted token"
+        );
+    }
+}
+
+/// The #650 path: a local composite action receives `token: ${{ secrets.GITHUB_TOKEN }}`
+/// as an input, and both the input and `github.token` inside the composite hold
+/// the claim-minted token.
+#[tokio::test]
+async fn composite_input_from_secrets_github_token_is_the_minted_token() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let action_dir = workspace.path().join(".github/actions/token-probe");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: token-probe\ninputs:\n  token:\n    required: true\nruns:\n  using: composite\n  steps:\n    - run: printf '%s' \"${{ inputs.token }}\" > input-token.txt\n      shell: bash\n    - run: printf '%s' \"${{ github.token }}\" > github-token.txt\n      shell: bash\n",
+    )
+    .unwrap();
+
+    let message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    let mut job = claimed_job(&message);
+    job.workspace = Some(workspace.path().to_string_lossy().to_string());
+    let mut ctx =
+        crate::worker::execution_context::StepContext::new(&mut job, "step".into(), "Step".into());
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let manifest = crate::worker::handlers::factory::load_action_manifest(&action_dir).unwrap();
+    crate::worker::handlers::composite::run_composite_action(
+        &manifest,
+        &action_dir,
+        &serde_json::json!({"token": "${{ secrets.GITHUB_TOKEN }}"}),
+        workspace.path().to_str().unwrap(),
+        &mut ctx,
+        rx,
+    )
+    .await
+    .expect("composite action runs");
+
+    for file in ["input-token.txt", "github-token.txt"] {
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(file)).unwrap(),
+            CLAIM_MINTED_TOKEN,
+            "{file} must hold the claim-minted token"
+        );
+    }
+}
+
+/// Job `env:` that the server left as an expression (no sibling secret was
+/// resolved at acquire) is materialized by the runner and evaluated against the
+/// claimed context before each step. `GITHUB_TOKEN` mirrors `github.token`.
+#[test]
+fn unresolved_job_env_token_evaluates_to_the_minted_token_at_step_time() {
+    let mut message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    message["environmentVariables"] = serde_json::json!([{
+        "type": 2,
+        "map": [
+            {
+                "Key": {"type": 0, "lit": "VIA_SECRETS"},
+                "Value": {"type": 3, "expr": "secrets.GITHUB_TOKEN"}
+            },
+            {
+                "Key": {"type": 0, "lit": "VIA_GITHUB"},
+                "Value": {"type": 3, "expr": "github.token"}
+            }
+        ]
+    }]);
+    let mut job = claimed_job(&message);
+    job.workspace = Some("_work/repo/repo".into());
+    inject_github_env(&mut job, &message);
+    assert_eq!(
+        job.env.get("GITHUB_TOKEN").map(String::as_str),
+        Some(CLAIM_MINTED_TOKEN),
+        "GITHUB_TOKEN mirrors the claim-minted github.token"
+    );
+
+    let ctx = job.build_expression_context();
+    for name in ["VIA_SECRETS", "VIA_GITHUB"] {
+        let raw = job
+            .env
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is materialized into the job env"));
+        assert_eq!(
+            crate::worker::template::evaluate_template_strict(raw, &ctx)
+                .expect("job env value evaluates"),
+            CLAIM_MINTED_TOKEN,
+            "job env `{name}` must evaluate to the claim-minted token"
+        );
+    }
+}
+
+/// `container:` and `services:` credentials are expression tokens the runner
+/// evaluates against the claimed job before the containers start.
+#[test]
+fn container_and_service_credentials_evaluate_to_the_minted_token() {
+    let message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    let job = claimed_job(&message);
+    let ctx = job.build_expression_context();
+    let container = serde_json::json!({
+        "image": "ghcr.io/owner/tools:latest",
+        "credentials": {
+            "username": "x-access-token",
+            "password": {"type": 3, "expr": "secrets.GITHUB_TOKEN"}
+        }
+    });
+    let service = serde_json::json!({
+        "image": "ghcr.io/owner/db:latest",
+        "credentials": {
+            "username": "x-access-token",
+            "password": {"type": 3, "expr": "github.token"}
+        }
+    });
+    let evaluated_container =
+        crate::worker::container_ops::evaluate_expression_tokens(&container, &ctx)
+            .expect("container credentials evaluate");
+    let evaluated_service =
+        crate::worker::container_ops::evaluate_expression_tokens(&service, &ctx)
+            .expect("service credentials evaluate");
+    assert_eq!(
+        evaluated_container["credentials"]["password"],
+        CLAIM_MINTED_TOKEN
+    );
+    assert_eq!(
+        evaluated_service["credentials"]["password"],
+        CLAIM_MINTED_TOKEN
     );
 }

@@ -100,6 +100,11 @@ path = "tests/recovery.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "mutation_targets"
+path = "tests/mutation_targets.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "runs_api"
 path = "tests/runs_api.rs"
 required-features = ["test-support"]

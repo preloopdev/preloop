@@ -99,6 +99,43 @@ fn engine_unreachable_context() -> String {
 
 const PRE_PUSH_HOOK: &str = r#"#!/usr/bin/env bash
 # pre-push hook: soft CI gate for preloop.
+#
+# Install per checkout:
+#   cp contrib/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# (or let `preloop run` offer it for you). contrib/pre-push mirrors this
+# string; a unit test fails if the two drift apart.
+#
+# What it does, on `git push origin <branch>`:
+#   1. Skips the gate when any commit being pushed carries [skip ci], exactly
+#      as the engine suppresses that push's CI run. Only the commits in this
+#      push are examined; a [skip ci] elsewhere in the branch's history (say,
+#      on main) is not this push's business.
+#   2. Otherwise runs `preloop run` (CI on the current tree), holding the push
+#      open while CI runs. The gate itself never pushes anything — git's own
+#      push proceeds with your commits once CI is green. For the checked-out
+#      branch's current commit only: other refs pass with a warning, because
+#      the tree CI would test is not the tree being pushed.
+#   3. CI green  -> exit 0; git pushes normally.
+#   4. CI red    -> exit 1. The push is aborted; the branch never reaches
+#      GitHub. `git push --no-verify` is the escape hatch: it skips the gate.
+#   5. No engine running -> the gate is skipped with a notice saying so, and
+#      the push proceeds: a soft gate must not brick `git push` when there is
+#      no engine to evaluate it. Unreachability is decided from preloop's own
+#      machine-readable marker, never from CI step output that mentions a
+#      network error.
+#
+# A workflow is always selected explicitly, because `preloop run` refuses to
+# guess when .github/workflows/ holds several files: PRELOOP_PREPUSH_WORKFLOW
+# (with optional PRELOOP_PREPUSH_JOB) picks one, else the repository's only
+# workflow is used, else the gate is skipped with a notice.
+#
+# Verdicts are cached per (remote, server, commit): a re-push of the same
+# commit reuses the recorded run's live terminal status instead of re-running
+# CI, and an interrupted hook resumes the run it already started.
+#
+# This is a SOFT gate: it is advisory per-machine. Anyone can push without the
+# hook (web UI, another machine). Server-side enforcement is a separate concern.
+
 set -euo pipefail
 
 # Chain a previously installed hook (another tool's), if any: run it first
@@ -133,21 +170,76 @@ zero_sha=0000000000000000000000000000000000000000
 head_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
 head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
 
+# No engine is running (or it is unreachable), so CI cannot be evaluated: skip
+# the gate loudly and let the push proceed. This is the normal state on a
+# laptop where nothing was started — it must never read as "CI failed".
+engine_not_running_note() {
+  echo "preloop: no preloop engine is running at ${endpoint} — CI gate skipped for this push" >&2
+  echo "preloop: start one to gate pushes on CI: 'preloop serve' (foreground) or 'preloop server install' (background service)" >&2
+}
+
+# Select the workflow to run, so `preloop run` is never invoked without one:
+# with several workflows in .github/workflows/ and no override, `run` refuses
+# with "specify a workflow with -f", and a soft gate must not block a push it
+# cannot evaluate.
+workflow_args=()
+resolve_workflow_args() {
+  if [[ -n "${PRELOOP_PREPUSH_WORKFLOW:-}" ]]; then
+    if [[ -n "${PRELOOP_PREPUSH_JOB:-}" ]]; then
+      workflow_args=(-f "$PRELOOP_PREPUSH_WORKFLOW" --job "$PRELOOP_PREPUSH_JOB")
+    else
+      workflow_args=(-f "$PRELOOP_PREPUSH_WORKFLOW")
+    fi
+    return 0
+  fi
+  local candidate found="" count=0
+  for candidate in .github/workflows/*.yml .github/workflows/*.yaml; do
+    if [[ -f "$candidate" ]]; then
+      count=$(( count + 1 ))
+      found="$candidate"
+    fi
+  done
+  if [[ $count -eq 0 ]]; then
+    echo "preloop: no workflow found under .github/workflows/ — CI gate skipped for this push" >&2
+    return 1
+  fi
+  if [[ $count -gt 1 ]]; then
+    echo "preloop: .github/workflows/ holds ${count} workflows — set PRELOOP_PREPUSH_WORKFLOW (optionally with PRELOOP_PREPUSH_JOB) to choose one; CI gate skipped for this push" >&2
+    return 1
+  fi
+  if [[ -n "${PRELOOP_PREPUSH_JOB:-}" ]]; then
+    workflow_args=(-f "$found" --job "$PRELOOP_PREPUSH_JOB")
+  else
+    workflow_args=(-f "$found")
+  fi
+  return 0
+}
+
 run_ci_or_resume() {
   local local_sha="$1" branch="$2" remote_sha="$3"
-  local log_range
-  # [skip ci] in any pushed commit bypasses the gate (mirrors preloop's
-  # server-side skip-label handling). A new branch carries an all-zero
-  # remote sha — log the single revision, not an invalid range.
+  local pushed
+  # [skip ci]: mirror the engine's push adapter
+  # (crates/preloop-runner-server/src/events/push.rs), which suppresses a run
+  # when *any* commit in the pushed batch carries a skip label — not only the
+  # tip. Only the commits actually being pushed are examined: on a new branch
+  # `git log "$local_sha"` walks every ancestor and would match an old
+  # [skip ci] on main that this push does not carry.
   if [[ "$remote_sha" == "$zero_sha" ]]; then
-    log_range="$local_sha"
+    # New remote ref: every commit not already on a remote.
+    pushed="$(git rev-list "$local_sha" --not --remotes 2>/dev/null || true)"
   else
-    log_range="${remote_sha}..$local_sha"
+    pushed="$(git rev-list "${remote_sha}..${local_sha}" 2>/dev/null || true)"
   fi
   # No pipe to grep -q here: under pipefail, grep's early exit SIGPIPEs
   # git log, the pipeline reports 141, and the bypass never fires.
-  if grep -qi '\[skip *ci\]' <<< "$(git log --format=%B "$log_range" 2>/dev/null)"; then
+  if [[ -n "$pushed" ]] && grep -qi '\[skip *ci\]' <<< "$(git log --no-walk --format=%B $pushed 2>/dev/null)"; then
     echo "preloop: [skip ci] found — pushing ${branch} without the CI gate"
+    return 0
+  fi
+
+  # A workflow must be picked before any engine contact: without one the gate
+  # cannot be evaluated, and a soft gate skips rather than blocks.
+  if ! resolve_workflow_args; then
     return 0
   fi
 
@@ -165,7 +257,7 @@ run_ci_or_resume() {
     set -e
     if [[ $status_rc -eq 0 ]]; then
       printf '%s\n' "$status_output"
-    elif grep -q "$ENGINE_UNREACHABLE_MARKER" "$status_err"; then
+    elif grep -q 'PRELOOP_UNREACHABLE' "$status_err"; then
       printf 'unreachable\n'
     else
       printf 'error\n'
@@ -183,12 +275,16 @@ run_ci_or_resume() {
           echo "preloop: cached CI verdict for ${local_sha:0:12}: success"
           return 0 ;;
         failure|cancelled|skipped)
-          echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+          echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push, or bypass the gate with 'git push --no-verify' (or rm $cache)" >&2
           return 1 ;;
+        unreachable)
+          engine_not_running_note
+          return 0 ;;
         in_progress|queued|pending)
           echo "preloop: run ${run_id} still in progress — waiting for CI before pushing ${branch}..."
           waited=0
           timeout_secs="${PRELOOP_HOOK_TIMEOUT_SECS:-3600}"
+          timed_out=1
           while (( waited < timeout_secs )); do
             sleep 15
             waited=$(( waited + 15 ))
@@ -198,34 +294,45 @@ run_ci_or_resume() {
                 echo "preloop: CI passed for ${branch}"
                 return 0 ;;
               failure|cancelled|skipped)
-                echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+                echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push, or bypass the gate with 'git push --no-verify' (or rm $cache)" >&2
                 return 1 ;;
               in_progress|queued|pending) ;;
               unreachable)
-                echo "preloop: cannot reach the engine to resume run ${run_id} — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+                engine_not_running_note
                 return 0 ;;
               error)
-                echo "preloop: cannot validate cached run ${run_id} — push aborted" >&2
-                return 1 ;;
+                # The engine answered but the run could not be resolved:
+                # re-evaluate the commit with a fresh CI run instead of
+                # blocking a push on a verdict we cannot trust.
+                echo "preloop: cannot validate cached run ${run_id} — running CI fresh" >&2
+                timed_out=0
+                break ;;
             esac
           done
-          echo "preloop: CI did not finish within ${timeout_secs}s — push aborted" >&2
-          return 1 ;;
+          if [[ $timed_out -eq 1 ]]; then
+            echo "preloop: CI is still running after ${timeout_secs}s — push aborted; raise PRELOOP_HOOK_TIMEOUT_SECS to wait longer, or bypass the gate with 'git push --no-verify'" >&2
+            return 1
+          fi ;;
         error)
           echo "preloop: cannot resolve run ${run_id} — running CI fresh" >&2 ;;
       esac
     fi
   fi
 
-  # Run CI. Fail open only on the machine-readable engine-unreachable marker
-  # emitted by preloop itself — never on CI step output that happens to
-  # mention a network error.
+  # Run CI. It is skipped — not failed — when the gate cannot be evaluated:
+  # no CLI binary, or no engine to talk to (decided from preloop's own
+  # machine-readable marker, never from CI step output that happens to
+  # mention a network error).
+  if ! command -v "$preloop_bin" >/dev/null 2>&1; then
+    echo "preloop: '${preloop_bin}' (PRELOOP_BIN) not found — CI gate skipped for this push" >&2
+    return 0
+  fi
   local log error_log run_pid run_status i
   log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-XXXXXX")"
   error_log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-error-XXXXXX")"
   echo "preloop: running CI on preloop before pushing ${branch} (this holds the push)..."
   set +e
-  "$preloop_bin" run >"$log" 2>"$error_log" &
+  "$preloop_bin" run "${workflow_args[@]}" >"$log" 2>"$error_log" &
   run_pid=$!
   # Record the run id as soon as the engine accepts it, so an interrupted
   # hook (Ctrl-C, crash) resumes the same run on the next push instead of
@@ -241,13 +348,13 @@ run_ci_or_resume() {
   wait "$run_pid"
   run_status=$?
   set -e
-  if grep -q "$ENGINE_UNREACHABLE_MARKER" "$error_log"; then
-    echo "preloop: engine unreachable — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+  if grep -q 'PRELOOP_UNREACHABLE' "$error_log"; then
     rm -f "$log" "$error_log"
+    engine_not_running_note
     return 0
   fi
   if [[ $run_status -ne 0 ]]; then
-    echo "preloop: CI failed for ${branch} — push aborted. Details:" >&2
+    echo "preloop: CI failed for ${branch} — push aborted; fix CI, or bypass the gate with 'git push --no-verify'. Details:" >&2
     tail -n 30 "$log" >&2
     tail -n 30 "$error_log" >&2
     rm -f "$log" "$error_log"
@@ -1306,7 +1413,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         control_origin: None,
         control_socket: None,
         control_upstream: None,
-        dns: Some(runner_dns()),
+        dns: runner_dns_for(vm_backend()?),
         registration_token_env: TOKEN_ENV.into(),
         labels: vec![
             "self-hosted".into(),
@@ -1901,6 +2008,20 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     Ok(())
 }
 
+/// The pool snapshot an engine starts from. `mode` is the one field with no
+/// per-field setter, and its default is `Warm`, so an on-demand engine must
+/// set it here or `preloop status` advertises a warm pool that does not exist.
+fn initial_pool_snapshot(pool_enabled: bool) -> preloop_observability::status::PoolSnapshot {
+    preloop_observability::status::PoolSnapshot {
+        mode: if pool_enabled {
+            preloop_observability::status::PoolMode::Warm
+        } else {
+            preloop_observability::status::PoolMode::OnDemand
+        },
+        ..Default::default()
+    }
+}
+
 async fn cmd_engine(
     args: ServeArgs,
     observability: preloop_observability::Observability,
@@ -1991,14 +2112,7 @@ async fn cmd_engine(
     // never shows a warm pool that is not configured; `desired` is filled
     // from the resolved config below.
     let pool_status = std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
-        preloop_observability::status::PoolSnapshot {
-            mode: if pool_enabled {
-                preloop_observability::status::PoolMode::Warm
-            } else {
-                preloop_observability::status::PoolMode::OnDemand
-            },
-            ..Default::default()
-        },
+        initial_pool_snapshot(pool_enabled),
     ));
     let pool_config = local_runner_pool_config(
         &home,
@@ -2679,7 +2793,7 @@ fn local_runner_pool_config(
         control_origin,
         control_socket,
         control_upstream,
-        dns: Some(runner_dns()),
+        dns: runner_dns_for(vm_backend()?),
         registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
         cpus,
@@ -2794,6 +2908,18 @@ fn runner_dns() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "8.8.8.8".to_owned())
+}
+
+/// The guest DNS resolver to request, if this backend takes one.
+///
+/// AgentENV sandboxes always use the node's resolver and refuse a per-sandbox
+/// `dns`, so the runner default is not sent to them: sending it fails every
+/// golden build and runner-pool start on that backend.
+fn runner_dns_for(backend: VmBackend) -> Option<String> {
+    match backend {
+        VmBackend::Smolvm => Some(runner_dns()),
+        VmBackend::Agentenv => None,
+    }
 }
 
 /// Resident memory an idle runner VM actually holds, in MiB.
@@ -3315,6 +3441,12 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // A hook that fails to install after the user accepted is a real
     // failure: report it instead of silently running ungated.
     maybe_offer_hook()?;
+    run_workflow(args).await
+}
+
+/// Everything `preloop run` does after the interactive hook offer: build the
+/// submission from the flags and the checkout, send it, and follow the run.
+async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
         .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
@@ -3414,7 +3546,6 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         repository: detect_repository(),
         git_ref: detect_git_ref(),
         workflow_path: Some(workflow_path.display().to_string()),
-        local_workspace: None,
         secrets,
         reusable_workflows,
         selected_jobs: args.job.into_iter().collect(),
@@ -5668,6 +5799,12 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
 
+    #[test]
+    fn runner_dns_is_requested_only_where_the_backend_can_honour_it() {
+        assert_eq!(runner_dns_for(VmBackend::Agentenv), None);
+        assert_eq!(runner_dns_for(VmBackend::Smolvm), Some(runner_dns()));
+    }
+
     fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {
         tokio::spawn(std::future::pending())
     }
@@ -7157,11 +7294,39 @@ mod tests {
         assert_eq!(args.run_id.as_deref(), Some("run-abc"));
     }
 
+    /// The hook `preloop run` installs and the copy shipped in
+    /// `contrib/pre-push` for manual installs must stay byte-identical, and
+    /// the script must grep for the literal marker the CLI emits: inside the
+    /// raw string the shell cannot see `ENGINE_UNREACHABLE_MARKER`, so a
+    /// rename there would silently turn the fail-open path into a failure.
+    #[test]
+    fn pre_push_hook_matches_contrib_and_the_marker() {
+        let contrib = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/pre-push"),
+        )
+        .expect("read contrib/pre-push");
+        assert_eq!(
+            PRE_PUSH_HOOK, contrib,
+            "contrib/pre-push must mirror the installed pre-push hook"
+        );
+        assert!(
+            PRE_PUSH_HOOK.contains(ENGINE_UNREACHABLE_MARKER),
+            "the hook must grep for the literal marker the CLI emits"
+        );
+        assert!(
+            !PRE_PUSH_HOOK.contains("$ENGINE_UNREACHABLE_MARKER"),
+            "the hook is installed verbatim: a Rust constant inside it would be an unbound shell variable"
+        );
+    }
+
     #[test]
     fn hook_lifecycle() {
         // All tests in this binary share one process working directory and
         // run in parallel threads; restore the original cwd so the tempdir
         // (and this test's `.git/`) cannot leak into other tests.
+        // The other cwd-changing test holds the same lock, so the two
+        // cannot swap directories under each other.
+        let _cwd_lock = crate::TEST_ENV_LOCK.blocking_lock();
         struct CwdGuard(std::path::PathBuf);
         impl Drop for CwdGuard {
             fn drop(&mut self) {
@@ -7244,6 +7409,141 @@ mod tests {
         std::fs::remove_file(".git/hooks/pre-push").unwrap();
         mark_hook_declined();
         assert!(hook_decided(), "should be decided after declining");
+    }
+
+    /// `preloop run` hands every flag, and every fact it derives from the
+    /// checkout, to the engine. Each field has a protocol default the engine
+    /// accepts without complaint, so a flag dropped while building the
+    /// submission (`--job`, `--secret`, `--no-merge`, …) still submits a run,
+    /// just the wrong one. The fake engine records the request body; the
+    /// checkout's `feature` branch is one commit past `main`, so the
+    /// changed-path and filter-branch derivations actually run.
+    #[tokio::test]
+    async fn run_submits_every_flag_and_derived_fact_to_the_engine() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("checkout");
+        let workflows = repo.join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let workflow_yaml = "name: ci\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        let reusable_yaml = "on: workflow_call\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo lint\n";
+        std::fs::write(workflows.join("ci.yml"), workflow_yaml).unwrap();
+        std::fs::write(workflows.join("reusable.yml"), reusable_yaml).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "--no-verify", "-m", "base"]);
+        git(&["switch", "-q", "-c", "feature"]);
+        std::fs::write(repo.join("change.txt"), "feature\n").unwrap();
+        git(&["add", "change.txt"]);
+        git(&["commit", "-q", "--no-verify", "-m", "feature"]);
+        let payload = tmp.path().join("payload.json");
+        std::fs::write(&payload, r#"{"pull_request":{"number":7}}"#).unwrap();
+
+        let submitted = std::sync::Arc::new(std::sync::OnceLock::<serde_json::Value>::new());
+        let recorder = std::sync::Arc::clone(&submitted);
+        let app = axum::Router::new().route(
+            "/api/v1/runs",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                async move {
+                    let _ = recorder.set(body);
+                    axum::Json(serde_json::json!({
+                        "run_id": "11111111-1111-1111-1111-111111111111",
+                        "run_number": 1,
+                        "queued_jobs": 1,
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let previous_url = std::env::var_os("PRELOOP_URL");
+        unsafe { std::env::set_var("PRELOOP_URL", &base) };
+        let cwd_guard = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&repo).unwrap();
+        let result = run_workflow(RunArgs {
+            file: Some(std::path::PathBuf::from("ci.yml")),
+            job: Some("build".to_owned()),
+            event: Some("pull_request".to_owned()),
+            payload: Some(payload),
+            base: Some("main".to_owned()),
+            message: None,
+            debug: true,
+            no_debug: false,
+            preserve_on_failure: false,
+            secrets: vec!["TOKEN=s3cret".to_owned()],
+            strict_secrets: false,
+            detach: true,
+            push: false,
+            create_pr: false,
+            pr_draft: true,
+            no_merge: true,
+        })
+        .await;
+        drop(cwd_guard);
+        match previous_url {
+            Some(previous) => unsafe { std::env::set_var("PRELOOP_URL", previous) },
+            None => unsafe { std::env::remove_var("PRELOOP_URL") },
+        }
+        result.expect("the run is submitted");
+
+        let body = submitted.get().expect("the engine received a submission");
+        let expected = serde_json::json!({
+            "workflow_yaml": workflow_yaml,
+            "event": "pull_request",
+            "payload": {"pull_request": {"number": 7}},
+            "repository": "local/checkout",
+            "git_ref": "refs/heads/feature",
+            "workflow_path": ".github/workflows/ci.yml",
+            "secrets": {"TOKEN": "s3cret"},
+            "reusable_workflows": {".github/workflows/reusable.yml": reusable_yaml},
+            "selected_jobs": ["build"],
+            "base_ref": "main",
+            "activity_type": "synchronize",
+            "changed_paths": ["change.txt"],
+            "changed_paths_known": true,
+            "filter_branch": "main",
+            "no_merge": true,
+            "preserve_on_failure": true,
+            "debug_on_failure": true,
+        });
+        for (field, want) in expected.as_object().unwrap() {
+            assert_eq!(body.get(field), Some(want), "submission field `{field}`");
+        }
+    }
+
+    /// An engine with the warm pool switched off reports `on_demand` from its
+    /// first status snapshot; the snapshot default is `warm`, which would
+    /// advertise idle capacity that does not exist.
+    #[test]
+    fn on_demand_engine_does_not_advertise_a_warm_pool() {
+        use preloop_observability::status::PoolMode;
+        assert!(matches!(
+            initial_pool_snapshot(false).mode,
+            PoolMode::OnDemand
+        ));
+        assert!(matches!(initial_pool_snapshot(true).mode, PoolMode::Warm));
     }
 
     /// A throwaway repository on `main` with a fixed identity, one tracked

@@ -14,6 +14,8 @@ Preloop gives each job a local runtime credential and, separately, an optional G
 
 The runtime JWT uses the key at `<state-dir>/hmac-key.bin` by default. `PRELOOP_HMAC_KEY` can provide a shared 32-byte key as 64 hexadecimal characters. Its job claims identify the job and its Results scope. GitHub rejects this JWT; it is never substituted for `GITHUB_TOKEN`.
 
+At claim time, Preloop writes the same GitHub credential to `github_token` and `contextData.github.token`. Therefore `${{ secrets.GITHUB_TOKEN }}` and `${{ github.token }}` agree in runner-time `env:`, `with:`, and `run:` values, local composite-action inputs, job environment expressions, and container or service credentials. Acquire-time job `env:` values and reusable-workflow `secrets:` maps are filled after that claim patch as well.
+
 `ACTIONS_ID_TOKEN_REQUEST_URL` is present only when the job has `id-token: write`. OIDC tokens are signed by Preloop and use the configured issuer, not GitHub's token service.
 
 ## What works with no GitHub token
@@ -33,7 +35,7 @@ A step that calls `api.github.com` directly—`gh`, `actions/github-script`, a P
 
 ## Local checkout behavior
 
-When the submission uses `PRELOOP_LOCAL_WORKSPACE`, the default checkout action is rewritten to the run's immutable snapshot endpoint. The engine pins the job's runtime JWT as the checkout token, so local checkout works even when `GITHUB_TOKEN` is empty.
+When the submission uses `PRELOOP_LOCAL_WORKSPACE`, the default checkout action is rewritten to the run's immutable snapshot endpoint. The engine pins the job's runtime JWT as the checkout token, so local checkout works even when `GITHUB_TOKEN` is empty. Local snapshot checkout intentionally replaces its default `token` input with the local engine credential; that transport credential is not the job's GitHub token.
 
 The rewrite applies only when checkout inputs are default-equivalent. A non-default repository, ref, `github-server-url`, `fetch-depth`, or `fetch-tags` keeps remote behavior. An explicit nonempty checkout `token` also keeps remote behavior; Preloop does not replace a credential the workflow explicitly supplied.
 

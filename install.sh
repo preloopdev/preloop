@@ -107,11 +107,14 @@ ensure_runtime() {
     smolvm_version="$("$smolvm_bin" --version 2>/dev/null | awk '{print $NF}')"
     [ -n "$smolvm_version" ] \
         || die "installed smolvm did not report a version"
-    # Mirror SMOLVM_MIN_VERSION in crates/preloop-cli/src/update.rs: the
-    # ownership-preserving runtime is the minimum this installer can rely on,
-    # and `preloop update --ensure-runtime` may be bypassed or regress.
-    smolvm_version_ge "$smolvm_version" "1.8.1" \
-        || die "installed smolvm $smolvm_version is older than the required 1.8.1"
+    # Mirror smolvm_min_version in versions.toml (compiled into preloop-vm and
+    # read by `preloop update --ensure-runtime`): the floor covers the
+    # ownership-preserving runtime, `machine fork --freeze-source`, and the
+    # x86_64 virtio device budget the packed golden needs. The check is
+    # independent because `--ensure-runtime` may be bypassed or regress.
+    smolvm_min_version="1.30.1"
+    smolvm_version_ge "$smolvm_version" "$smolvm_min_version" \
+        || die "installed smolvm $smolvm_version is older than the required $smolvm_min_version"
 
     # Keep custom-prefix installs self-contained and ahead of any incompatible
     # system smolvm already on PATH.

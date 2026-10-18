@@ -50,7 +50,7 @@ registry transfer fast and moves the unpacking deadline-free into the local
 bake:
 
 ```sh
-CRANE="$HOME/golden-bake/smolvm-1.18.1-linux-x86_64/agent-rootfs/usr/local/bin/crane"
+CRANE="$HOME/golden-bake/smolvm-1.30.1-linux-x86_64/agent-rootfs/usr/local/bin/crane"
 export DOCKER_CONFIG="$HOME/golden-bake/.docker"
 "$CRANE" pull \
   --platform linux/amd64 \
@@ -154,6 +154,18 @@ For a successful push, verify:
 
 Then update `GOLDEN_OCI_REF_X86_64` with the
 `latest-linux-amd64` manifest digest and run the golden tests.
+
+Bake with the release pinned in `smolvm_golden_version` (the workflows read it
+from `versions.toml`) and pin a digest only after that golden is confirmed to
+`machine stop` cleanly under the same host runtime the engine will use. The
+golden carries the guest agent of the SmolVM release it was baked with, and a
+newer host runtime given an older bake has been observed to leave the VM
+running with `running guest agent does not support safe shutdown; VM left
+unchanged; update the guest agent before retrying` — not yet explained (the
+`quiesced-shutdown-v1` capability exists in both releases' protocol crate), so
+the stop check, not the pin bump, decides when a digest may be updated. The
+recipe for the aarch64 artifact is the same shape (bake on an Apple Silicon
+host, publish), since hosted macOS cannot bake.
 
 ## Runtime verification
 
