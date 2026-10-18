@@ -1003,10 +1003,10 @@ fn github_callback() {}
     request_body = JsonValue,
     responses(
         (status = 201, description = "Session opened; `setup_url` carries the one-time link"),
-        (status = 400, description = "public_url, org, app_name, or repos is invalid, or the App duplicates one already configured"),
+        (status = 400, description = "public_url, org, app_name, or repos is invalid"),
         (status = 401, description = "Missing or invalid system token"),
         (status = 409, description = "This engine already has an App configured (pass `add`), or a setup is still in flight"),
-        (status = 500, description = "The engine's config could not be read or its credential store could not be opened")
+        (status = 500, description = "The engine's config could not be read, or its credential store could not be opened or holds credentials only for the life of the process (`PRELOOP_CREDENTIAL_STORE=memory`)")
     ),
     security(("native_bearer" = []))
 )]

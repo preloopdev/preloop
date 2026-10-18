@@ -115,7 +115,10 @@ Releases before v0.27.0 predate the changelog.
     reports the App id instead; `--add` still creates an additional App.
   - The engine checks that its config loads and its credential store can hold
     the key before GitHub creates anything, so a key that could not be stored
-    is reported before the App exists rather than after.
+    is reported before the App exists rather than after. A store selected with
+    `PRELOOP_CREDENTIAL_STORE=memory` is refused outright: it holds the key for
+    this process only, while the flow's next step is the restart that would
+    lose it.
   - A setup is refused when `--public-url` names an origin other than the
     engine's own `PRELOOP_PUBLIC_URL`, and plain `http` is refused outside
     loopback: the one-time link and GitHub's redirect carry the App's token and

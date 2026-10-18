@@ -22,7 +22,7 @@
 //! created.
 
 use crate::config::load_config_from;
-use crate::credential_store::{CredentialWriter, SecretString};
+use crate::credential_store::{CredentialStoreKind, CredentialWriter, SecretString, selected_kind};
 use crate::errors::ApiError;
 use crate::github_app_setup::{
     AppCredentials, FormPage, constant_time_eq, convert_manifest_code, creation_url, error_page,
@@ -609,6 +609,27 @@ async fn preflight_config(path: PathBuf, add: bool) -> Result<ConfigPreflight, S
         let config = load_config_from(&path).map_err(|error| format!("{error:#}"))?;
         // The same store selection the save will use, so a store that cannot
         // hold the key is reported before the App exists rather than after.
+        //
+        // `memory` can hold it, but not past this process: the config would
+        // keep a reference no later engine resolves, while the App exists on
+        // GitHub with a key nobody has — and a restart is exactly what this
+        // flow asks the operator to do next. Refuse before GitHub creates
+        // anything, and say why, rather than trade a working setup for an
+        // orphaned App.
+        if matches!(
+            selected_kind(config.credential_store.as_deref())
+                .map_err(|error| format!("{error:#}"))?,
+            CredentialStoreKind::Memory
+        ) {
+            return Err(
+                "hosted App setup needs a credential store that outlives the engine, but \
+                 PRELOOP_CREDENTIAL_STORE=memory keeps the App's key for this process only, so a \
+                 restart would leave the App on GitHub with no key this engine could load. Unset \
+                 it (or select file/os), then run the command again — nothing has been created on \
+                 GitHub yet"
+                    .to_owned(),
+            );
+        }
         CredentialWriter::for_config(&path, config.credential_store.as_deref())
             .map_err(|error| format!("{error:#}"))?;
         if add {
@@ -2227,6 +2248,36 @@ mod tests {
                 StatusCode::CREATED,
                 "--add still creates an additional App"
             );
+        }
+
+        #[tokio::test]
+        async fn a_process_lifetime_credential_store_is_refused_by_the_hosted_flow() {
+            let _env = pin_setup_env(None).await;
+            // The env lock `pin_setup_env` holds is what makes this safe: the
+            // store selection is process-wide, so no other test can resolve a
+            // store while this one has `memory` selected.
+            let _store = crate::state::TestEnvVar::set("PRELOOP_CREDENTIAL_STORE", "memory");
+            let (app, state, _temp) = engine("http://127.0.0.1:1").await;
+
+            let refused = send(&app, open_request(&state, json!({"public_url": PUBLIC}))).await;
+            assert_eq!(
+                refused.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a store that forgets the key at the restart the flow asks for is refused"
+            );
+            let body = text(refused).await;
+            assert!(body.contains("PRELOOP_CREDENTIAL_STORE=memory"), "{body}");
+            assert!(
+                body.contains("nothing has been created on GitHub yet"),
+                "the refusal has to say GitHub has not been told anything: {body}"
+            );
+
+            // The same request succeeds on a store that persists.
+            {
+                let _unset = crate::state::TestEnvVar::unset("PRELOOP_CREDENTIAL_STORE");
+                let allowed = send(&app, open_request(&state, json!({"public_url": PUBLIC}))).await;
+                assert_eq!(allowed.status(), StatusCode::CREATED);
+            }
         }
 
         #[tokio::test]

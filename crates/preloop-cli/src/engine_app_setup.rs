@@ -118,8 +118,14 @@ async fn wait_for_completion(engine: &str, session: &str) -> Result<()> {
                     .as_str()
                     .unwrap_or("the engine could not finish the App setup")
             ),
+            // The engine reports one `expired` for both ten-minute windows:
+            // the link was never opened, or the form was served but GitHub's
+            // approval never came back. Say both, and what an App that exists
+            // on GitHub anyway means — its key was never stored.
             "expired" => bail!(
-                "the setup link expired before it was used; run `preloop setup github --via app` again"
+                "the setup expired: the link was not opened, or the App was not approved on GitHub, \
+                 within ten minutes. If GitHub created the App, its private key was never stored — \
+                 delete it in its settings, then run `preloop setup github --via app` again"
             ),
             _ if state != announced => {
                 announced = state.to_owned();
