@@ -791,12 +791,14 @@ enum DeprecationNotice {
 /// target. Local HTTP control planes are intentionally skipped; GHES is
 /// expected to be HTTPS and uses the same `/api/v3` route family.
 ///
-/// A target names a repository (`owner/repo`), an organization (`org` or
-/// `orgs/org` — the URL text GitHub's own "new runner" page uses), or, for
-/// GHES, the instance root. GitHub serves repository schedules under
-/// `/repos/{owner}/{repo}` and organization schedules under `/orgs/{org}`;
-/// an organization target routed to the repository route 404s, and a target
-/// this function cannot place returns `None` and skips the check.
+/// A target names a repository (`owner/repo`), an organization (`org`, or the
+/// `orgs/org` form GitHub's own "new runner" page links to), an enterprise
+/// (`enterprises/name`), or, for GHES, the instance root. GitHub serves
+/// repository schedules under `/repos/{owner}/{repo}`, organization schedules
+/// under `/orgs/{org}`, and enterprise schedules under
+/// `/enterprises/{enterprise}`; a scoped target routed at the wrong family
+/// 404s, and a target this function cannot place returns `None` and skips the
+/// check.
 fn deprecation_url(target: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(target).ok()?;
     let host = parsed.host_str()?;
@@ -804,14 +806,15 @@ fn deprecation_url(target: &str) -> Option<String> {
         .path_segments()
         .map(|segments| segments.filter(|segment| !segment.is_empty()).collect())
         .unwrap_or_default();
-    // `https://github.com/orgs/acme` is the organization form of a github.com
-    // target, not a repository named `acme` under an owner named `orgs`.
-    let segments = match segments.as_slice() {
-        [scope, rest @ ..] if scope.eq_ignore_ascii_case("orgs") => rest.to_vec(),
-        _ => segments,
-    };
+    // `orgs/acme` and `enterprises/acme` are the URL text GitHub's own pages
+    // use for those scopes — not repositories named `acme` under owners named
+    // `orgs` or `enterprises`.
     let version = crate::PROTOCOL_COMPAT_VERSION;
     let scope = match segments.as_slice() {
+        [kind, name, ..] if kind.eq_ignore_ascii_case("orgs") => format!("orgs/{name}"),
+        [kind, name, ..] if kind.eq_ignore_ascii_case("enterprises") => {
+            format!("enterprises/{name}")
+        }
         [owner, repo, ..] => format!("repos/{owner}/{repo}"),
         [org] => format!("orgs/{org}"),
         [] => String::new(),
@@ -929,21 +932,63 @@ fn deprecation_notice(
 /// without it the check can only ever report that it could not verify the
 /// pinned version. `PRELOOP_GITHUB_TOKEN` is the crate's existing GitHub API
 /// credential (the same variable `lint` resolves reusable workflows with); it
-/// needs `repo` (or `admin:org` for an organization target) to read a schedule.
+/// needs `repo` (or `admin:org` / `manage_runners:enterprise` for the wider
+/// scopes) to read a schedule.
 const DEPRECATION_TOKEN_ENV: &str = "PRELOOP_GITHUB_TOKEN";
+
+/// GitHub API base the deployment declares for a non-`github.com` forge.
+///
+/// The same variable `lint` resolves reusable workflows through: a GHES or
+/// enterprise installation sets it once, and it is what makes a host
+/// recognisable as a GitHub-family API rather than an arbitrary origin.
+const GITHUB_API_URL_ENV: &str = "PRELOOP_GITHUB_API_URL";
+
+/// Whether [`DEPRECATION_TOKEN_ENV`] belongs on a request to `url`, and if not,
+/// why not.
+///
+/// `api.github.com` is where a `github.com` target's schedule lives. Every
+/// other host has to be declared via `GITHUB_API_URL_ENV`, because
+/// [`deprecation_url`] treats any scoped HTTPS target as a GHES API — and the
+/// registration target is operator-supplied, so it is equally capable of naming
+/// a plain control-plane origin. Handing the deployment's GitHub credential to
+/// a host that never claimed to be GitHub would put it in the wrong logs.
+fn credential_scope(url: &str, declared: Option<&str>) -> std::result::Result<(), String> {
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase));
+    let Some(host) = host else {
+        return Err("the lookup URL names no host".to_owned());
+    };
+    if host == "api.github.com" {
+        return Ok(());
+    }
+    let declared = declared
+        .and_then(|raw| reqwest::Url::parse(raw.trim()).ok())
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase));
+    match declared.as_deref() {
+        Some(declared) if declared == host => Ok(()),
+        _ => Err(format!(
+            "`{host}` is not `api.github.com` and does not match {GITHUB_API_URL_ENV}"
+        )),
+    }
+}
 
 async fn warn_if_runner_version_deprecated(http: &HttpClient, target: &str) {
     let Some(url) = deprecation_url(target) else {
         info!(
-            "skipping the runner deprecation check: `{target}` does not name a repository or \
-             organization scope"
+            "skipping the runner deprecation check: `{target}` does not name a repository, \
+             organization, or enterprise scope"
         );
         return;
     };
+    let credential = credential_scope(&url, std::env::var(GITHUB_API_URL_ENV).ok().as_deref());
     let token = std::env::var(DEPRECATION_TOKEN_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let auth = token.as_deref().map(|token| format!("Bearer {token}"));
+    let auth = match (&credential, token.as_deref()) {
+        (Ok(()), Some(token)) => Some(format!("Bearer {token}")),
+        _ => None,
+    };
     let check = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         http.get_json_optional_auth::<serde_json::Value>(&url, auth.as_deref()),
@@ -951,10 +996,16 @@ async fn warn_if_runner_version_deprecated(http: &HttpClient, target: &str) {
     .await
     {
         Ok(Ok(value)) => parse_deprecation_response(&value),
-        Ok(Err(error)) if auth.is_none() => DeprecationCheck::Unverified(format!(
-            "{error:#} — set {DEPRECATION_TOKEN_ENV} to a token with runner access to check \
-             this target"
-        )),
+        Ok(Err(error)) if auth.is_none() => {
+            let hint = match &credential {
+                Ok(()) => format!(
+                    "set {DEPRECATION_TOKEN_ENV} to a token with access to this target's \
+                     runner schedules"
+                ),
+                Err(why) => format!("{DEPRECATION_TOKEN_ENV} was not sent: {why}"),
+            };
+            DeprecationCheck::Unverified(format!("{error:#} — {hint}"))
+        }
         Ok(Err(error)) => DeprecationCheck::Unverified(format!("{error:#}")),
         Err(_) => DeprecationCheck::Unverified("lookup timed out".to_owned()),
     };
@@ -1014,6 +1065,59 @@ mod deprecation_tests {
             Some(DeprecationNotice::Unverified(reason)) if reason == "auth required"
         ));
     }
+
+    /// Enterprise targets take the `/enterprises/{enterprise}` route, the same
+    /// way `orgs/…` targets take the organization route.
+    #[test]
+    fn deprecation_url_scopes_enterprise_targets() {
+        assert_eq!(
+            deprecation_url("https://github.com/enterprises/acme").unwrap(),
+            format!(
+                "https://api.github.com/enterprises/acme/actions/runners/deprecations/{}",
+                crate::PROTOCOL_COMPAT_VERSION
+            )
+        );
+    }
+
+    /// The deployment's GitHub credential goes only to hosts that are a GitHub
+    /// API: `api.github.com` for a github.com target, and the host
+    /// `PRELOOP_GITHUB_API_URL` declares for everything else. A scoped GHES
+    /// URL on a host that never declared itself is indistinguishable from an
+    /// operator-supplied control-plane origin, so it is probed unauthenticated.
+    #[test]
+    fn deprecation_credential_is_scoped_to_github_api_hosts() {
+        assert_eq!(
+            credential_scope(
+                "https://api.github.com/repos/acme/project/actions/runners/deprecations/2.336.0",
+                None
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            credential_scope(
+                "https://ghes.example/api/v3/repos/acme/project/actions/runners/deprecations/2.336.0",
+                Some("https://ghes.example/api/v3")
+            ),
+            Ok(())
+        );
+        assert!(
+            credential_scope(
+                "https://ghes.example/api/v3/repos/acme/project/actions/runners/deprecations/2.336.0",
+                None
+            )
+            .is_err(),
+            "an undeclared host must not receive the credential"
+        );
+        assert!(
+            credential_scope(
+                "https://ghes.example/api/v3/repos/acme/project/actions/runners/deprecations/2.336.0",
+                Some("https://other-forge.example/api/v3")
+            )
+            .is_err(),
+            "a host that does not match the declared API host must not receive the credential"
+        );
+    }
+
     #[test]
     fn deprecation_url_scopes_github_repo_and_ghes_repo() {
         assert_eq!(

@@ -84,6 +84,15 @@ const TEARDOWN_RETRY_ATTEMPTS: u32 = 3;
 /// makes more than one round trip before the machine comes down regardless.
 const RUNNER_GONE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Ceiling on the external control plane's per-VM credential mint.
+///
+/// The mint is a caller-supplied admin API call, awaited while a slot is
+/// between machines. An unbounded await would leave that slot without a runner
+/// for as long as the remote connection stalls — and only a restart clears it,
+/// because shutdown is not the failure mode. Expiry is reported as a provision
+/// failure, which the slot already retries.
+const REGISTRATION_MINT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Debug marker contents written by the orchestrator when it parks a failed VM.
 pub const DEBUG_MARKER_IDLE: &str = "preserved";
 /// Debug marker contents written by `preloop shell` while a session is live.
@@ -7096,12 +7105,26 @@ async fn provision_runner<P: VmProvider + 'static>(
             (SecretSource::HostEnv(token_env.clone()), None)
         }
         RegistrationSource::PerVm(mint) => {
-            let token = mint.mint().await.map_err(|error| {
-                OrchestratorError::Pool(format!(
-                    "minting registration credential for {} failed: {error}",
-                    name.as_str()
-                ))
-            })?;
+            // Bounded like every other external control-plane call on this
+            // path: the adapter reaches an admin API, and a connection that
+            // stalls must surface as a provision failure the slot retries
+            // rather than a slot that never registers a runner.
+            let token = match tokio::time::timeout(REGISTRATION_MINT_TIMEOUT, mint.mint()).await {
+                Ok(Ok(token)) => token,
+                Ok(Err(error)) => {
+                    return Err(OrchestratorError::Pool(format!(
+                        "minting registration credential for {} failed: {error}",
+                        name.as_str()
+                    )));
+                }
+                Err(_) => {
+                    return Err(OrchestratorError::Pool(format!(
+                        "minting registration credential for {} timed out after {}s",
+                        name.as_str(),
+                        REGISTRATION_MINT_TIMEOUT.as_secs()
+                    )));
+                }
+            };
             let directory = config
                 .runner_key_dir
                 .clone()
