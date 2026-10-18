@@ -454,8 +454,13 @@ async fn reachable_uncached(
         Reply::Found(repository) => repository,
         Reply::Missing => return Err(repository_missing(owner, repo)),
     };
-    match github_get::<CommitSha>(state, owner, repo, &format!("repos/{owner}/{repo}/commits/{sha}"))
-        .await?
+    match github_get::<CommitSha>(
+        state,
+        owner,
+        repo,
+        &format!("repos/{owner}/{repo}/commits/{sha}"),
+    )
+    .await?
     {
         Reply::Found(found) if found.sha.eq_ignore_ascii_case(sha) => {}
         Reply::Found(_) => {

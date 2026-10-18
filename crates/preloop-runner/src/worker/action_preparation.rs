@@ -1073,7 +1073,7 @@ mod tests {
         .await
         .unwrap();
         let mut queue = queue.lock().await;
-        queue.all_step_log_content()
+        queue.all_step_log_content().unwrap()
     }
 
     /// The announcement reaches the Set up job log once, after the proxy lines and before
