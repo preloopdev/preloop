@@ -2,14 +2,22 @@
 
 GitHub sends each webhook **once**. A non-2xx response, a 10-second timeout,
 or a host that is not there produces a red row in the App's delivery history
-and nothing else — there is no automatic retry, ever. preloop's answer is a
-the durable boundary plus three repair layers, each covering a failure the previous
-one structurally cannot.
+and nothing else — GitHub does not automatically retry failed deliveries.
+Admins can manually redeliver from the delivery history while it is retained.
+Preloop's answer is a durable boundary plus three repair layers, each covering
+a failure the previous one structurally cannot.
 
 The durable boundary: the raw delivery is committed to `webhook_deliveries`
 **before** the handler answers `202`. A `202` therefore means "we own this
 payload", not "we received some bytes". Everything after that is preloop's
 problem, and everything below is how it gets fixed.
+
+Workers are woken, not only polled. A delivery that one node makes claimable (an
+enqueue, or an operator replay) wakes that node's worker at once. On Postgres the
+node also sends one `preloop_webhooks` notification after the commit, coalesced
+over 15 ms, so every other node's worker wakes too. A lost notification costs only
+latency: each worker re-reads the queue at least every five seconds. SQLite is
+single-node and wakes only its own worker.
 
 ## Failure modes and what handles them
 
@@ -21,7 +29,7 @@ problem, and everything below is how it gets fixed.
 | 4 | Phantom ack (restore from snapshot, corruption) | GitHub recorded success, no local row | **Delivery watchdog** (GUID join) |
 | 5 | Delayed / throttled delivery | Arrives minutes late | Delivery watchdog **grace window** |
 | 6 | GitHub API outage or rate limit mid-processing | Every queued delivery fails on the same dependency | **Circuit breaker** + parking |
-| 7 | No delivery ever generated | Nothing in the history to redeliver | No automatic repair; see `internal/opportunities.md` |
+| 7 | No delivery ever generated | Nothing in the history to redeliver | No automatic repair; operator intervention is required |
 | 8 | Silent misconfiguration (events narrowed, URL repointed) | Silence, indistinguishable from "no pushes" | **App health monitor** |
 | 9 | Payload older than GitHub's 3-day window | Redelivery impossible | **Local replay** (`preloop webhooks replay`) |
 
@@ -63,8 +71,11 @@ Invariants worth keeping:
 - Nothing is redelivered while the local store is unhealthy: replaying into a
   broken store loses the payload a second time and spends a finite
   redelivery opportunity doing it.
-- The poll is skipped while the breaker is open — during a GitHub outage the
-  poll would fail anyway.
+- Each App's poll is skipped while that App's breaker is open — during a GitHub
+  outage the poll would fail anyway. Apps have separate breakers, so one App's
+  rate limit does not stall the others. A pass that skips any App is not a
+  successful poll: the stale signal keeps aging until every App's history has
+  been read again, because the skipped App's deliveries are unwatched.
 - Per-GUID backoff (0, 5m, 15m, 1h, 6h) with a cap; a GUID that hits the cap
   stays **open** as a standing finding rather than disappearing.
 - An attempt is **claimed before the request**: the attempt count and the
@@ -102,6 +113,13 @@ misconfigured App on day one and nothing after. This re-reads `GET /app` and
 - delivery-URL drift against `PRELOOP_PUBLIC_URL`,
 - read errors — never rendered as a clean bill of health.
 
+An App whose own breaker is open is not re-read: its last verdict stays published
+until the breaker closes, while the other Apps are checked as normal. A held-back
+App never vanishes from the published list: with no earlier verdict (its breaker
+was open on the first pass) it is published as explicitly unchecked. Every verdict
+carries its own `checked_at`, and `app_config_checked_at` advances only when a
+pass checked every App — a reused verdict never looks freshly verified.
+
 GitHub exposes no API to change an App's event subscription, and no `active`
 flag on `/app/hook/config`: this layer pages a human, it cannot self-heal.
 
@@ -137,7 +155,7 @@ The operational snapshot (`GET /api/v1/status`, `/readyz`) carries:
 | `webhook_dead_letter` | Deliveries failed permanently |
 | `webhook_queue_stalled` | Oldest unprocessed delivery older than 15 minutes |
 | `github_unavailable` | Breaker open; deliveries parked, not failing |
-| `webhook_watchdog_stale` | No successful history poll in 30 minutes — lost deliveries would go unnoticed |
+| `webhook_watchdog_stale` | No poll of *every* App in 30 minutes — lost deliveries would go unnoticed |
 | `webhook_repairs_pending` | Redeliveries requested that have not arrived |
 | `webhook_config_drift` | App events, permissions or delivery URL wrong |
 
@@ -157,16 +175,17 @@ The operational snapshot (`GET /api/v1/status`, `/readyz`) carries:
 
 ## Durable state
 
-Migrations 9–11 (the repair-state history), both backends:
+The webhook tables are part of the current control-schema migration set in
+both SQLite and Postgres; the migration ledger uses stamped versions, not the
+old sequential labels. The durable records are:
 
 - `webhook_watchdog` — per-App history cursor, pagination continuation, and last-success timestamps.
 - `webhook_redeliveries` — repair records keyed by delivery GUID.
+See [Control database migrations](control-migrations.md) for the operator commands and ledger.
 
 ## Deliberately out of scope
 
 - **HA ingress gateway.** A second durable queue in front of preloop would buy
   2xx during host downtime and cost another failure domain. Build it only if
   "ack while preloop is down" is a requirement.
-- **Active-active preloop.** Instances diverge in memory today
-  (`docs/architecture.md` §State Model); that needs a shared-bus refactor
-  first.
+- **Complete active-active preloop.** Shared Postgres coordinates durable run/job state and queue wakeups across nodes, but live logs, debug sessions, and file-backed cache/artifact reservations remain node-local. Production routing must account for those surfaces; shared Postgres alone is not a complete active-active deployment.

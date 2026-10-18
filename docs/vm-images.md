@@ -418,7 +418,7 @@ separately) — and is consumed by the build:
 | Key                                                     | What it pins                                                                     | Bump when                                                               |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | `runner_version`                                        | Official `actions/runner` protocol target (currently `2.336.0`)                  | Upstream runner changes protocol surface                                |
-| `smolvm_min_version`                                    | SmolVM runtime floor `preloop update --ensure-runtime` accepts and upgrades from | A future SmolVM drops a capability preloop needs (rare, human-driven)   |
+| `smolvm_min_version`                                    | SmolVM runtime floor `preloop update --ensure-runtime` accepts and upgrades from | A SmolVM release becomes the first to satisfy a runtime invariant preloop depends on (fork freeze-source, packed ownership, the x86_64 virtio device budget) — rare, human-driven |
 | `smolvm_golden_version`                                 | SmolVM release the golden workflow builds with                                    | Upstream ships a newer stable (Renovate opens a bump PR, `smolvm-release-verify` gates it) |
 | `node20_externals_version` / `node24_externals_version` | Node runtimes the guest runner mounts for JavaScript actions (downloaded on the host, never baked into a golden) | A new runtime pin is needed |
 | `runner_image_docker_version` / `runner_image_buildx_version` | Docker CLI and Buildx baked into the standalone `preloop-runner` container image (`ci/runner.Dockerfile`) | The official `actions/runner` image moves |
@@ -452,6 +452,19 @@ must expose usable `/dev/kvm` access for the nested microVM smoke test and
 provide registry access for the pinned official runner image. Renovate
 auto-merges smolvm golden bumps once the verify check and `ci.yml` pass — the
 merge gate is Renovate's auto-merge, not branch protection.
+
+### The virtio device budget (IRQ lines)
+
+A microVM's device count is capped by libkrun's MMIO IRQ allocation: one line
+per virtio device. Measured on x86_64 Linux at SmolVM 1.30.1, the allocation
+is 19 lines (IRQ 5-23) since SmolVM 1.23.0 and was 11 before that; an image
+machine created with `--storage`/`--overlay` starts with 9 devices, and each
+`--volume`, `--mount-socket` or extra `--disk` costs one. The 20th device
+fails the boot with `krun_start_enter returned: -22 (EINVAL)` and `no more
+IRQs are available` — the same `EINVAL` shape as a held or corrupt disk
+image, which is why the engine classifies it (`VmError::IrqExhausted`) and
+reports the machine's declared inventory and the ceilings. The arm64/macOS
+ceiling has not been measured.
 
 `versions.toml` defines Preloop's compiled distribution defaults. It is not a
 per-install user configuration file. Operators select the image a golden is
@@ -656,6 +669,19 @@ the configured-image bake. The pool pulls the image once in a machine named
 not being adopted — check free disk (`PRELOOP_RUNNER_MIN_FREE_DISK_GB`,
 `PRELOOP_SKIP_DISK_PREFLIGHT`) and that the payload path the engine logs
 exists.
+- **The pool restarts forever and every start fails with
+`krun_start_enter returned: -22 (EINVAL)` plus `no more IRQs are available`**:
+the host ran out of MMIO IRQ lines for the machine's virtio devices. libkrun
+allocates one IRQ line per device; on x86_64 that is 19 lines (IRQ 5-23) on
+SmolVM >= 1.23.0 and 11 before it, with 9 devices in an image machine's own
+launcher set and one per `--volume`, `--mount-socket` or extra `--disk`.
+The engine classifies this failure (`VmError::IrqExhausted`) and the error
+names the machine's declared inventory, the SmolVM version in use, both
+ceilings, and the raw output. Restarting the pool cannot help; upgrade the
+host runtime to the compiled floor (`preloop update --ensure-runtime`) or
+start the machine with fewer mounts. The arm64/macOS ceiling has not been
+measured — the same failure there needs the same treatment but the numbers
+may differ.
 
 ### Building the official-runner-image golden on Apple Silicon
 

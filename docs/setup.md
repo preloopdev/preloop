@@ -6,13 +6,16 @@ secrets.
 
 ### Windows
 
-Windows users run Preloop under WSL2; the standalone runner release targets
-Linux and macOS, not native Windows. Inside WSL2, everything works like Linux:
+The engine's microVM pool requires Linux/KVM or macOS Apple Silicon. On
+Windows, run the engine under WSL2 with nested virtualization; the current
+standalone runner release artifacts target Linux and macOS, not native Windows.
+Inside WSL2, everything works like Linux:
 
 ```sh
-# Homebrew and npm install the same binaries (macOS and Linux/WSL2):
+# Homebrew, npm and mise install the same binaries (macOS and Linux/WSL2):
 brew install preloopdev/tap/preloop
 npm install -g @preloop-dev/cli
+mise use -g github:preloopdev/preloop
 
 # Or fetch the installer at a release tag, read it, then run it. It downloads
 # the release binaries and verifies the sha256 of each one.
@@ -55,7 +58,7 @@ and installs it into `~/.local/bin/preloop-runner` (or pass `--prefix <dir>`):
 
 - **Linux**: `x86_64` or `aarch64`
 - **macOS**: Apple Silicon (`aarch64`) or Intel (`x86_64`)
-- **Windows**: `x86_64` (standalone `.exe` via release downloads)
+- **Windows**: no native standalone-runner release artifact is currently published; use the Linux build under WSL2.
 
 Alternatively, download standalone platform binaries (`preloop-runner-<triple>`) and
 CycloneDX SBOMs (`preloop-runner_<triple>.cdx.json`) from the
@@ -164,8 +167,13 @@ preloop-runner remove --token <REMOVE_TOKEN>
 ## Quick start
 
 ```sh
-preloop init             # wizard: credentials, golden image, how to run
-preloop serve            # engine on 127.0.0.1:9090
+preloop init --mode none # configure without starting the engine
+preloop serve            # start the engine on 127.0.0.1:9090
+```
+
+Leave `preloop serve` running in this terminal. In a second terminal, run:
+
+```sh
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event push
 ```
@@ -181,8 +189,8 @@ capabilities without changing anything. Re-running reconfigures in place.
 The sections below are the same steps in depth — `preloop setup github`
 remains the credentials command that `init` calls.
 
-`preloop run` snapshots the local workspace (dirty changes included) so a run
- will run your workflows locally. It doesnt depends on what is pushed to GitHub or require you to create a commit locally.
+`preloop run` snapshots the local workspace (dirty changes included), so the
+run does not depend on what is pushed to GitHub or require a local commit.
 
 If you are running it as an always-on server, service install, every runtime
 knob, and how to expose it (tunnel, funnel, or your own domain)  is covered in
@@ -190,29 +198,36 @@ knob, and how to expose it (tunnel, funnel, or your own domain)  is covered in
 
 ## Connecting GitHub credentials
 
-Workflows reference GitHub (`${{ github.repository }}`, `GITHUB_TOKEN`,
-`secrets.*` etc) so the engine needs a credential. Two kinds are supported:
+Workflows can run without a GitHub credential when they do not need private
+resources or authenticated GitHub API calls. For jobs that do, the engine can
+provide a GitHub App installation token or a configured PAT. Public action
+archives may still require outbound network access even without a credential.
 
 | | GitHub App (recommended) | Fine-grained PAT |
 |---|---|---|
-| Token scope | Per-installation, narrows to the repos you pick | Repo/org scoped, expires on a schedule |
-| Token shape | `ghs_…` (installation), minted by the engine | `github_pat_…` |
+| Token scope | Per-repository installation token; permission requests may be narrowed to the App's grants | Repository-scoped server credential; not narrowed per job |
+| Token shape | `ghs_…` (installation), minted per job | `github_pat_…` |
 | Setup effort | Create app + install once | Generate once, rotate when it expires |
-| Best for | Teams, servers, anything long-running | Personal machines, quick starts |
+| Best for | Job API access and reliable Check Run reporting | Supported server-side API calls when an App cannot be installed |
 
-Classic (`ghp_…`) and OAuth (`gho_…`) tokens **work but are warned against**:
-they carry every scope the account has. The wizard refuses nothing but tells
-you what you are doing.
+Classic (`ghp_…`) and OAuth (`gho_…`) tokens are not recommended. A classic
+PAT's `X-OAuth-Scopes` are checked coarsely against the workflow's effective
+permissions when used as a job token; they are not narrowed per job. Fine-grained
+PATs normally have no introspection header and are withheld from jobs in that
+path. See [GitHub tokens](github-tokens.md) for the exact limitations.
 
-Decide first whether you need webhooks:
+Decide whether you need inbound webhooks:
 
-- Just running CI that talks to GitHub (checkout, `gh`, `GITHUB_TOKEN`,
-  API steps): create the App and stop there. No public address is needed;
-  you start runs yourself with `preloop run`.
-- Check runs on GitHub (the checks on commits and pull requests): you also
-  need webhooks, and webhooks need a publicly accessible HTTP address for
-  the engine. This applies to laptops too, not just servers: a tunnel from
-  your machine is enough.
+- To start a run, use `preloop run`; no public address or webhook is needed.
+  GitHub API steps and private checkouts still need a usable job credential,
+  and remote action downloads may need outbound network access.
+- For reliable published Check Runs, use a GitHub App with `checks: write`.
+  Reporting is outbound, so manual runs do not require a public address or
+  webhooks.
+- To start runs automatically from `push` or `pull_request` events, configure
+  webhook delivery with `--public-url`; GitHub needs a publicly reachable,
+  path-filtered ingress for the webhook endpoint. See
+  [self-hosting exposure options](self-hosting.md#5-exposure-options).
 
 The App and its webhook are one object; the webhook only adds GitHub's
 ability to call you. You can enable it later with `--public-url`, so
@@ -256,27 +271,15 @@ you*; everything outbound still works:
 | | webhooks off (default) | `--public-url` |
 |---|---|---|
 | What starts a run | you do: `preloop run`, `just submit-ci` | a `push`/`pull_request` on GitHub |
-| Private-repo checkout, `gh`, API steps | works — the App mints a token per job | same |
-| Check runs on the commit | published (outbound to GitHub) | same |
+| Private-repo checkout, `gh`, API steps | App installation token per job, subject to the App's grants. A PAT is used only for a PAT-configured job or the explicit `PRELOOP_GITHUB_APP_MINT_FAILURE=pat` fallback. Private reusable-workflow references require `PRELOOP_GITHUB_TOKEN` or `github.pat`. | Same credential behavior; `--public-url` only enables webhook delivery. A PAT is used only for a PAT-configured job or the explicit `PRELOOP_GITHUB_APP_MINT_FAILURE=pat` fallback. Private reusable-workflow references require `PRELOOP_GITHUB_TOKEN` or `github.pat`. |
+| Check runs on the commit | Reliable publishing requires an App installation token with `checks: write`; a PAT may not publish Check Runs. | Same: reliable publishing requires an App installation token with `checks: write`; `--public-url` does not change the job credential. |
 
-So a laptop setup is a complete CI system you trigger yourself. When you later
-get a reachable address — something like a tunnel is enough — point the App you
-already have at it:
-
-```sh
-cloudflared tunnel --url http://127.0.0.1:9090      # → https://xxx.trycloudflare.com
-preloop setup github --via app --public-url https://xxx.trycloudflare.com
-```
-
-For anything persistent, prefer a named tunnel: the `trycloudflare.com`
-address above changes every restart, which would leave the webhook URL
-pointing at a dead address. A named tunnel keeps a stable hostname:
-
-```sh
-cloudflared tunnel create preloop
-cloudflared tunnel route dns preloop ci.example.com
-cloudflared tunnel --url http://127.0.0.1:9090 run preloop
-```
+So a laptop setup can be triggered manually. To add webhooks later, put a
+path-filtering proxy in front of a tunnel and expose only
+`/api/v1/github/webhooks`; do not point a public tunnel directly at Preloop's
+port. See [the safe Cloudflare and reverse-proxy examples](self-hosting.md#5-exposure-options).
+For anything persistent, use a stable hostname and configure the webhook with
+that URL.
 
 Point the webhook at the stable hostname once:
 
@@ -292,17 +295,17 @@ checkbox, so an App created without `--public-url` needs that ticked once in
 its settings.
 
 Already have an App or your org blocks manifest creation? Create it by hand
-at <https://github.com/settings/apps/new> (name it, leave webhooks off,
-download the PEM), install it on the accounts whose repos you run at
-<https://github.com/apps/YOUR-APP/installations/new>, then:
+at [GitHub App settings](https://github.com/settings/apps/new) (name it, leave webhooks off,
+download the PEM), install it on the accounts whose repos you run at the
+[GitHub App installations page](https://github.com/apps/YOUR-APP/installations/new), then:
 
 ```sh
 preloop setup github --via app --app-id 123456 --pem-file app.pem
 preloop doctor --repo owner/repo
 ```
 
-Either way the engine mints a fresh installation token per job with no
-long-lived secret sits in the config.
+The engine mints a fresh installation token for each job. The App private key
+remains in the credential store; the config keeps only its reference.
 
 ### Option B — fine-grained PAT
 
@@ -321,12 +324,15 @@ one so this path opens the creation page and waits at a hidden prompt.
 `--no-browser` skips the opening; piping the token in (or setting
 `PRELOOP_GITHUB_PAT`) skips the prompt entirely, so automation is unaffected.
 
-Two things a PAT does not get you:
+Important PAT limitations:
 
-- **Check runs.** GitHub's checks API only accepts App installation tokens, so
-  a PAT-configured engine records check runs locally instead of publishing
-  them to the commit. Jobs still get the PAT as `GITHUB_TOKEN`, so checkout,
-  `gh`, and API steps work normally.
+- **Job tokens.** In the no-App path, a classic PAT is embedded only when its
+  `X-OAuth-Scopes` can be checked and it passes a coarse read/write admission
+  test. Fine-grained PATs normally lack that header and are withheld from jobs.
+  An App is the recommended way to mint repository-scoped job tokens.
+- **Check runs.** The server can attempt Check Run calls with its resolved
+  credential, but GitHub may reject a PAT. Use an App with `checks: write` for
+  reliable published checks.
 - **A webhook secret.** The App flow receives one from GitHub; here you create
   the webhook yourself (repository → Settings → Webhooks, pointed at
   `<public-url>/api/v1/github/webhooks`) and store its secret:
@@ -335,19 +341,21 @@ Two things a PAT does not get you:
   preloop setup github --via pat --webhook-secret "$(openssl rand -hex 32)"
   ```
 
-Create the PAT at <https://github.com/settings/personal-access-tokens/new>
-with **Repository access → Only select repositories** and the permissions the
-wizard prints. The checklist is derived from your own workflows' `permissions`
-blocks (union across `.github/workflows/*.yml`), so you can grant exactly what
-your pipelines use.
+Create the PAT at [GitHub personal access token settings](https://github.com/settings/personal-access-tokens/new)
+with **Repository access → Only select repositories**. The wizard's permission
+checklist is derived from your workflows' `permissions` blocks, but the runtime
+cannot introspect a fine-grained PAT's actual bounds; do not assume it will be
+injected as `GITHUB_TOKEN`.
 
 > **`id-token:` is not a PAT permission.** The engine is itself the OIDC
 > issuer for local runs (`${{ steps.oidc.outputs.jwt }}` is signed by the
 > engine), so workflows declaring `id-token: write` need no GitHub-side
 > permission for it.
 
-For orgs that gate app installations, a fine-grained PAT scoped to the org's
-repos is the supported fallback.
+For orgs that gate App installations, a fine-grained PAT can still be used for
+supported server-side API calls. The current job-token validation normally
+withholds it, so use a GitHub App when workflow steps need an authenticated
+`GITHUB_TOKEN`.
 
 ## Secrets
 
@@ -463,6 +471,13 @@ and its file copy is read even while a stale or corrupted OS entry stays
 readable. This keeps setup's file fallback readable without requiring the
 environment override to be removed.
 
+Stored secrets (`[secrets]` in `config.toml`) are sealed with a key that lives in
+the same credential store. If that key cannot be read, for example while the
+macOS login keychain is locked, startup fails and names what to unlock. Preloop
+never generates a replacement key over sealed secrets, since a new key cannot
+open them. A `secrets.key` file beside the config that disagrees with the store
+is renamed `secrets.key.orphan-<unix-ts>` rather than deleted.
+
 Fields:
 
 ```toml
@@ -536,21 +551,31 @@ default backend is **SQLite** at `<state dir>/preloop.db` zero config,
 correct for a single machine, and the right choice unless you have a reason
 to move off it.
 
-To use **Postgres**, point the engine at a database with `--store` or
-`PRELOOP_STORE_URL`:
+To use **Postgres**, initialize or upgrade its schema explicitly before
+starting the server:
+
+Configure `PRELOOP_STORE_URL` through a secret manager or protected environment before running these commands; do not put a live URL in shell history or command-line arguments.
 
 ```sh
-preloop serve --store 'postgres://user:password@host:5432/preloop?sslmode=require'
-# or, for systemd deployments:
-# Environment=PRELOOP_STORE_URL=postgres://…?sslmode=require
+preloop store migrate
+preloop store status
+preloop serve
 ```
 
+Fresh local SQLite stores are prepared by supported `preloop init`/`preloop run`
+paths. The server itself never initializes or upgrades a store; use
+`preloop store migrate` for existing or mismatched schemas. See
+[Control database migrations](control-migrations.md).
+
 - **`sqlite://<path>`**, a bare path, or nothing = SQLite (default).
-- **`postgres://…`** = the Postgres backend. It creates the same control
-  schema as SQLite (in a `control` schema) on first use and stamps the version
-  in `schema_meta`; a database whose `control` schema is at another version is
-  refused at startup — there is no in-place upgrade from a pre-`ControlBackend`
-  database, and its old tables are left untouched rather than read. Unlike
+  `preloop store migrate` initializes a fresh explicit store or upgrades it;
+  `preloop serve` only verifies the schema and refuses an incompatible version.
+- **`postgres://…`** = the Postgres backend, using the same embedded forward-only
+  refinery migrations as SQLite. Run `preloop store migrate --store '<URL>'`
+  to initialize or upgrade it; `preloop serve` verifies the migration ledger
+  and refuses an uninitialized or incompatible schema instead of migrating it.
+  `schema_meta` is not the version authority. A legacy pre-`ControlBackend`
+  database must be imported separately; its old tables are not read. Unlike
   SQLite, one Postgres database may be shared by several engine nodes: each
   node opens its own pools (`PRELOOP_PG_WRITERS` / `PRELOOP_PG_READERS`,
   default 16 connections each, plus one listener), transitions are conditional
@@ -799,13 +824,15 @@ accepts webhooks unattended); `--user` fits personal machines and dev boxes.
 
 ### Exposing the engine to GitHub
 
-`--public-url` is the address GitHub uses to deliver webhooks and link check
-runs. Without it (or with a loopback default), GitHub can't reach the engine —
-the service runs, but nothing ever triggers. Two ways to make it reachable:
+`--public-url` is GitHub-facing: it supplies the webhook URL and Check Run
+links. Without a reachable URL, GitHub cannot deliver webhook-triggered runs,
+but local `preloop run` still works and Check Run reporting is outbound.
+Keep Preloop bound to loopback and terminate TLS at a proxy that exposes only
+the webhook path (and any separately authenticated run pages). Do not publish
+the entire engine port. See [self-hosting exposure options](self-hosting.md#5-exposure-options).
 
-**Production — a domain.** You should definitely point a DNS record at the host and terminate TLS
-in front of the engine: a Caddy/nginx reverse proxy to `127.0.0.1:9090 and do a bunch of other security hardening stuff on your server. (or
-bind `0.0.0.0:9090` behind your own TLS). Register the App's webhook as
+**Production — a domain.** Point DNS at the host and terminate TLS in front
+of the loopback engine. Register the App's webhook as
 `https://ci.example.com/api/v1/github/webhooks` (gated by the webhook secret)
 and install with:
 
@@ -816,18 +843,11 @@ sudo preloop server install \
     --webhook-secret '…'
 ```
 
-**Trying it out use a tunnel.** No DNS record or inbound port needed:
-
-```sh
-cloudflared tunnel --url http://127.0.0.1:9090   # quick tunnel → https://xxx.trycloudflare.com
-ngrok http 9090
-tailscale funnel 9090
-```
-
-Re-run `preloop server install` with the tunnel URL as `--public-url` (or set
-`PRELOOP_PUBLIC_URL` in the service environment file and restart). Note that a
-quick tunnel's URL changes on every restart — for anything long-lived, use a
-named Cloudflare tunnel or the domain path above.
+**Trying it out with a tunnel.** A tunnel does not need an inbound port, but
+it must target a path-filtering proxy, not the engine directly. Follow the
+Cloudflare, Caddy, or nginx examples in
+[self-hosting](self-hosting.md#5-exposure-options), then set `--public-url`
+to the proxy's stable HTTPS hostname. Quick-tunnel URLs change on restart.
 
 ## Troubleshooting
 
@@ -839,8 +859,10 @@ named Cloudflare tunnel or the domain path above.
 - **A secret reads empty in a run** — check `preloop secret list` (was it
   scoped to another repo?) and whether the event was trusted (fork PRs get
   no stored secrets).
-- **Mint failure policy** — `mint_failure` decides what happens when App
-  minting fails: `local` (fall back to the local JWT), `error` (fail the
-  job), `pat` (fall back to the PAT).
+- **Mint failure policy** — `mint_failure` controls the job-token behavior
+  when App minting fails: `error` fails the job and `pat` explicitly falls
+  back to the static PAT. `local` is intended to leave the job without an App
+  token, but a later broker fallback can still supply a configured PAT. Remove
+  the PAT or use `error` if you need fail-closed behavior.
 
 [smolvm]: https://github.com/smol-machines/smolvm

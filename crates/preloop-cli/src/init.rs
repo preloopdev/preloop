@@ -1,7 +1,7 @@
 //! `preloop init` — one command that configures credentials, the golden every
 //! job forks from, and how the engine should run.
 //!
-//! Humans get a four-step wizard (only when stdin *and* stdout are TTYs);
+//! Humans get a five-step wizard (only when stdin *and* stdout are TTYs);
 //! agents get the same steps as flags plus `--json`, and
 //! `preloop init --probe --json` reports host capabilities without touching
 //! anything. Both paths resolve the same answers and write the same config:
@@ -30,6 +30,8 @@ use std::future::Future;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+mod workflows;
 
 /// Missing or invalid flag in a non-interactive run.
 pub(crate) const EXIT_USAGE: i32 = 2;
@@ -99,6 +101,7 @@ pub(crate) fn exit_code(error: &anyhow::Error) -> Option<i32> {
     error.downcast_ref::<InitError>().map(|error| error.code)
 }
 
+use preloop_orchestrator::environment::OFFICIAL_GOLDEN;
 use preloop_orchestrator::oci::{
     MANIFEST_ACCEPT, OciError, OciReference, get_manifest, host_arch_aliases, platform_matches_host,
 };
@@ -150,9 +153,14 @@ pub(crate) struct InitArgs {
     #[arg(long, value_name = "NAME")]
     pub org: Option<String>,
 
-    /// Public HTTPS URL of this engine; enables webhook delivery on the App.
+    /// Public HTTPS URL GitHub reaches this engine at (with --auth app): enables webhooks and PR checks. Must be https and not loopback.
     #[arg(long, value_name = "URL")]
     pub public_url: Option<String>,
+
+    /// Skip the secrets scan of the repositories' workflows. The runner-label
+    /// report still runs: it reads the same files and asks nothing.
+    #[arg(long)]
+    pub no_secrets_scan: bool,
 
     /// Port for the loopback listener GitHub redirects back to (0 = free port).
     #[arg(long, default_value_t = 0)]
@@ -438,7 +446,7 @@ impl Session {
                     "internal: no stored golden to keep — re-run `preloop init` and pick one"
                 )
             })?;
-            self.section(&format!("2/4 Golden: {} (kept)", decision.kind.as_str()));
+            self.section(&format!("2/5 Golden: {} (kept)", decision.kind.as_str()));
             self.note(&format!("kept: {}", decision.label));
             self.emit(json!({
                 "step": "golden",
@@ -449,12 +457,11 @@ impl Session {
         } else {
             self.configure_golden(&answers.golden).await?
         };
-        if !self.json {
-            println!(
-                "    3/4 Run mode: {}",
-                describe_mode(answers.mode, &decision.label)
-            );
-        }
+        self.workflow_step(&args, &decision).await?;
+        self.section(&format!(
+            "4/5 Run mode: {}",
+            describe_mode(answers.mode, &decision.label)
+        ));
         let preflight = self.preflight(&decision, answers.mode)?;
 
         // Re-read: the credentials step rewrote the file (or created it).
@@ -503,7 +510,7 @@ impl Session {
         let (auth, auth_unchanged) = self.ask_auth(args, config)?;
         let (golden, golden_unchanged) = self.ask_golden(args, config)?;
         let mode = if from_serve {
-            self.section("3/4 Run mode: none (configure only — this engine keeps running)");
+            self.section("4/5 Run mode: none (configure only — this engine keeps running)");
             RunMode::Configure
         } else {
             self.ask_mode(args)?
@@ -577,7 +584,7 @@ impl Session {
         args: &InitArgs,
         config: &ConfigFile,
     ) -> anyhow::Result<(AuthChoice, bool)> {
-        self.section("1/4 Credentials");
+        self.section("1/5 Credentials");
         if let Some(auth) = args.auth {
             self.note(&format!("using --auth {}", describe_auth(auth)));
             return Ok((auth, false));
@@ -615,7 +622,7 @@ impl Session {
         args: &InitArgs,
         config: &ConfigFile,
     ) -> anyhow::Result<(GoldenAnswer, bool)> {
-        self.section("2/4 Golden — the VM image every job forks from");
+        self.section("2/5 Golden — the VM image every job forks from");
         if let Some(kind) = args.golden {
             self.note(&format!("using --golden {}", kind.as_str()));
             reject_mismatched_flags(kind, args)?;
@@ -763,7 +770,7 @@ impl Session {
     }
 
     fn ask_mode(&mut self, args: &InitArgs) -> anyhow::Result<RunMode> {
-        self.section("3/4 Run mode — not persisted, chosen each run");
+        self.section("4/5 Run mode — not persisted, chosen each run");
         if let Some(mode) = args.mode {
             self.note(&format!("using --mode {}", mode.as_str()));
             return Ok(mode);
@@ -795,9 +802,15 @@ impl Session {
         config: &ConfigFile,
         args: &InitArgs,
     ) -> anyhow::Result<()> {
-        self.section("1/4 Credentials: (kept)");
+        self.section("1/5 Credentials: (kept)");
         let summary = credential_summary(config).unwrap_or_else(|| "none — local only".to_owned());
         self.note(&format!("kept: {summary}"));
+        if args.public_url.is_some() {
+            self.note(
+                "--public-url applies when the credential is created or changed; to point \
+                 the kept App's webhook at it: preloop setup github --via app --public-url <URL>",
+            );
+        }
         let verify = if args.repos.is_empty() {
             json!({"skipped": "no --repo"})
         } else {
@@ -816,7 +829,7 @@ impl Session {
         args: &InitArgs,
         auth: AuthChoice,
     ) -> anyhow::Result<()> {
-        self.section("1/4 Credentials:");
+        self.section("1/5 Credentials:");
         match auth {
             AuthChoice::None => {
                 self.note(
@@ -828,6 +841,21 @@ impl Session {
             AuthChoice::App => self.note("GitHub App"),
             AuthChoice::Pat => self.note("fine-grained PAT"),
         }
+        // The stable URL is asked only for an App: a PAT has no webhook to feed.
+        let stable_url = match auth {
+            AuthChoice::App => Some(self.public_url_answer(
+                args.public_url.as_deref(),
+                std::env::var("PRELOOP_PUBLIC_URL").ok().as_deref(),
+            )?),
+            _ => None,
+        };
+        let public_url = match &stable_url {
+            Some(answer) => answer.url.clone(),
+            None => args
+                .public_url
+                .as_deref()
+                .and_then(|raw| validate_public_url(raw).ok()),
+        };
         if !self.interactive {
             // The browser manifest flow waits for a redirect GitHub sends to a
             // local listener, and the PAT prompt reads a line from stdin:
@@ -864,7 +892,7 @@ impl Session {
             add: false,
             org: args.org.clone(),
             port: args.port,
-            public_url: args.public_url.clone(),
+            public_url,
             app_name: "preloop-local".to_owned(),
             no_browser: args.no_browser,
             webhook_secret: args.webhook_secret.clone(),
@@ -887,10 +915,14 @@ impl Session {
         let summary = credential_summary(&config).unwrap_or_else(|| "configured".to_owned());
         self.note(&format!("configured: {summary}"));
         let verified = self.verify_credentials(&config, args).await?;
+        let mut result = json!({"summary": summary, "verify": verified});
+        if let Some(answer) = &stable_url {
+            result["public_url"] = json!({"url": answer.url, "source": answer.source});
+        }
         self.emit(json!({
             "step": "credentials",
             "decision": match auth { AuthChoice::App => "app", _ => "pat" },
-            "result": {"summary": summary, "verify": verified},
+            "result": result,
             "log": log,
         }));
         Ok(())
@@ -966,10 +998,84 @@ impl Session {
         }
     }
 
+    /// The stable-URL answer for an App flow: `--public-url`, else a usable
+    /// `PRELOOP_PUBLIC_URL`, else one prompt on a terminal. Blank skips, and the
+    /// App is then created without a webhook.
+    fn public_url_answer(
+        &mut self,
+        flag: Option<&str>,
+        env: Option<&str>,
+    ) -> anyhow::Result<PublicUrlAnswer> {
+        if let Some(raw) = flag {
+            let url = validate_public_url(raw).map_err(usage_error)?;
+            return Ok(PublicUrlAnswer {
+                url: Some(url),
+                source: "flag",
+            });
+        }
+        if let Some(raw) = env.map(str::trim).filter(|raw| !raw.is_empty()) {
+            match validate_public_url(raw) {
+                Ok(url) => {
+                    self.note(&format!("using PRELOOP_PUBLIC_URL={url}"));
+                    return Ok(PublicUrlAnswer {
+                        url: Some(url),
+                        source: "env",
+                    });
+                }
+                Err(reason) => {
+                    self.note(&format!(
+                        "PRELOOP_PUBLIC_URL is not used for webhooks: {reason}"
+                    ));
+                }
+            }
+        }
+        if !self.interactive || self.yes {
+            self.note_no_public_url();
+            return Ok(PublicUrlAnswer {
+                url: None,
+                source: "skipped",
+            });
+        }
+        for line in PUBLIC_URL_EXPLAINER {
+            self.note(line);
+        }
+        loop {
+            let answer = self.read_line("    public URL (blank = skip, local only): ")?;
+            if answer.is_empty() {
+                self.note_no_public_url();
+                return Ok(PublicUrlAnswer {
+                    url: None,
+                    source: "skipped",
+                });
+            }
+            match validate_public_url(&answer) {
+                Ok(url) => {
+                    return Ok(PublicUrlAnswer {
+                        url: Some(url),
+                        source: "prompt",
+                    });
+                }
+                Err(reason) => {
+                    self.note(&format!(
+                        "{reason}; enter an https:// address, or leave it blank"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn note_no_public_url(&self) {
+        self.note(
+            "no public URL: the App gets no webhook, so pushes and pull requests will not \
+             start runs and PR checks will not report",
+        );
+        self.note("add one later with: preloop setup github --via app --public-url <URL>");
+    }
+
     // -- step 2: golden ---------------------------------------------------
 
     async fn configure_golden(&mut self, answer: &GoldenAnswer) -> anyhow::Result<GoldenDecision> {
-        self.section(&format!("2/4 Golden: {}", answer.kind.as_str()));
+        self.section(&format!("2/5 Golden: {}", answer.kind.as_str()));
         let decision = match answer.kind {
             GoldenChoice::Official => Ok(GoldenDecision {
                 kind: GoldenChoice::Official,
@@ -1201,6 +1307,237 @@ impl Session {
         })
     }
 
+    // -- step 3: workflows ------------------------------------------------
+
+    /// Step 3: the secrets and `runs-on` labels the repositories' workflows
+    /// need, checked against the engine's own rules. Nothing is stored here
+    /// unless the operator says so on a terminal, and a repository that cannot
+    /// be read is reported and skipped: it never fails the run.
+    async fn workflow_step(
+        &mut self,
+        args: &InitArgs,
+        golden: &GoldenDecision,
+    ) -> anyhow::Result<()> {
+        self.section("3/5 Workflows: secrets and runner labels");
+        let config = load_config().context("reading the engine config")?;
+        let checkout = workflows::checkout_root();
+        let origin = checkout
+            .as_ref()
+            .map(|_| crate::detect_repository())
+            .filter(|repo| !repo.starts_with("local/"));
+        let targets = workflows::targets(&args.repos, checkout.as_deref(), origin.as_deref());
+        if targets.is_empty() {
+            self.note(
+                "no repository in scope: run inside a git checkout, or pass --repo owner/name",
+            );
+            self.emit(json!({
+                "step": "secrets",
+                "decision": "none",
+                "result": {"targets": [], "secrets": [], "missing": [], "commands": []},
+            }));
+            self.emit(json!({
+                "step": "runner_labels",
+                "decision": "none",
+                "result": {"targets": [], "labels": [], "unparsed": [], "set": null},
+            }));
+            return Ok(());
+        }
+        let mut scans = Vec::new();
+        for target in targets {
+            scans.push(workflows::read_target(target, &config).await);
+        }
+        for scan in &scans {
+            self.note(&workflows::describe(scan));
+            for note in &scan.notes {
+                self.note(&format!("note: {note}"));
+            }
+        }
+        self.workflow_secrets(args, &config, &scans).await?;
+        let pool = workflows::Pool::new(
+            crate::runner_pool_labels(),
+            std::env::consts::ARCH,
+            golden.base_image.as_deref().unwrap_or(OFFICIAL_GOLDEN),
+        );
+        self.workflow_labels(&scans, &pool);
+        Ok(())
+    }
+
+    /// The secrets the workflows read, against the names the engine stores.
+    /// Missing ones are listed with the command that stores them; on a terminal
+    /// each can be set now, through the same hidden prompt as `preloop secret set`.
+    async fn workflow_secrets(
+        &mut self,
+        args: &InitArgs,
+        config: &ConfigFile,
+        scans: &[workflows::Scan],
+    ) -> anyhow::Result<()> {
+        if args.no_secrets_scan {
+            self.note("secrets: not scanned (--no-secrets-scan)");
+            self.emit(json!({
+                "step": "secrets",
+                "decision": "skipped",
+                "result": {"reason": "--no-secrets-scan"},
+            }));
+            return Ok(());
+        }
+        let (stored, stored_in) = Self::stored_secret_names(config).await;
+        let per_target: Vec<_> = scans
+            .iter()
+            .filter(|scan| scan.skipped.is_none())
+            .map(|scan| (scan, workflows::secret_rows(scan, &stored)))
+            .collect();
+        self.note(&format!("secrets (checked against the {stored_in}):"));
+        let mut json_secrets = Vec::new();
+        let mut all_rows = Vec::new();
+        let mut missing: Vec<(String, Option<String>)> = Vec::new();
+        for (scan, rows) in &per_target {
+            json_secrets.extend(workflows::secret_rows_json(scan, rows));
+            if rows.is_empty() {
+                self.note(&format!("{}: none read", workflows::target_name(scan)));
+                continue;
+            }
+            self.note(&format!("{}:", workflows::target_name(scan)));
+            let cells: Vec<Vec<String>> = rows
+                .iter()
+                .map(|row| {
+                    vec![
+                        row.name.clone(),
+                        workflows::places(&row.reads),
+                        row.status(),
+                    ]
+                })
+                .collect();
+            for line in workflows::table(&["SECRET", "READ IN", "CONFIGURED"], &cells) {
+                self.note(&format!("  {line}"));
+            }
+            missing.extend(
+                rows.iter()
+                    .filter(|row| row.scope.is_none())
+                    .map(|row| (row.name.clone(), scan.target.repo.clone())),
+            );
+            all_rows.extend(rows.iter().cloned());
+        }
+        if self.interactive && !missing.is_empty() {
+            let mut stored_now = Vec::new();
+            for pair in &missing {
+                let (name, repo) = pair;
+                if workflows::set_command(name, repo.as_deref()).is_none() {
+                    continue;
+                }
+                let scope = repo
+                    .as_deref()
+                    .map_or_else(|| "globally".to_owned(), |repo| format!("for {repo}"));
+                if !self.ask_bool(&format!("    set {name} {scope} now? [y/N] "), false)? {
+                    continue;
+                }
+                let command = github_setup::SecretCommand::Set {
+                    name: name.clone(),
+                    value: None,
+                    repo: repo.clone(),
+                    env: None,
+                };
+                match github_setup::cmd_secret(github_setup::SecretArgs { command }).await {
+                    Ok(()) => stored_now.push(pair.clone()),
+                    Err(error) => self.note(&format!("not set: {error:#}")),
+                }
+            }
+            missing.retain(|pair| !stored_now.contains(pair));
+        }
+        let commands: Vec<String> = missing
+            .iter()
+            .filter_map(|(name, repo)| workflows::set_command(name, repo.as_deref()))
+            .collect();
+        if !commands.is_empty() {
+            self.note("store the missing secrets with:");
+            for command in &commands {
+                self.note(&format!("  {command}"));
+            }
+        }
+        self.emit(json!({
+            "step": "secrets",
+            "decision": workflows::secrets_decision(&all_rows),
+            "result": {
+                "stored_in": stored_in,
+                "targets": workflows::targets_json(scans),
+                "secrets": json_secrets,
+                "missing": missing
+                    .iter()
+                    .map(|(name, repo)| json!({"name": name, "repo": repo}))
+                    .collect::<Vec<_>>(),
+                "commands": commands,
+            },
+        }));
+        Ok(())
+    }
+
+    /// The `runs-on` labels the workflows request, each with the verdict the
+    /// engine's own matching gives it on this host.
+    fn workflow_labels(&mut self, scans: &[workflows::Scan], pool: &workflows::Pool) {
+        let report = workflows::label_report(scans, pool);
+        if report.rows.is_empty() {
+            self.note("runner labels: none requested");
+        } else {
+            self.note(&format!("runner labels ({} distinct):", report.rows.len()));
+            let cells: Vec<Vec<String>> = report
+                .rows
+                .iter()
+                .map(|row| {
+                    vec![
+                        row.verdict.severity().to_owned(),
+                        row.label.clone(),
+                        workflows::places(&row.uses),
+                        workflows::verdict_message(row.verdict, &row.label, pool),
+                    ]
+                })
+                .collect();
+            for line in workflows::table(&["STATUS", "LABEL", "USED IN", "MEANING"], &cells) {
+                self.note(&format!("  {line}"));
+            }
+        }
+        for (path, error) in &report.unparsed {
+            self.note(&format!(
+                "could not parse {path} ({error}); its runs-on was not checked"
+            ));
+        }
+        let declare = workflows::declare_line(pool, &report);
+        if let Some(line) = &declare {
+            self.note(&format!(
+                "this host needs {line} where `preloop serve` runs (it adds to the base labels)"
+            ));
+        }
+        self.emit(json!({
+            "step": "runner_labels",
+            "decision": report.decision(),
+            "result": {
+                "pool": workflows::pool_json(pool),
+                "targets": workflows::targets_json(scans),
+                "labels": workflows::label_rows_json(&report, pool),
+                "unparsed": report
+                    .unparsed
+                    .iter()
+                    .map(|(path, error)| json!({"path": path, "error": error}))
+                    .collect::<Vec<_>>(),
+                "set": declare,
+            },
+        }));
+    }
+
+    /// The secret names the engine holds: the running engine's when it
+    /// answers, else the config file's, as `preloop secret list` reads them.
+    async fn stored_secret_names(config: &ConfigFile) -> (workflows::Stored, &'static str) {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            github_setup::api_list_secrets(None, None),
+        )
+        .await
+        {
+            Ok(Ok(github_setup::ApiOutcome::Applied(entries))) => {
+                (workflows::Stored::from_listing(&entries), "engine")
+            }
+            _ => (workflows::Stored::from_config(config), "config file"),
+        }
+    }
+
     // -- step 4: preflight ------------------------------------------------
 
     /// Check the host against the chosen golden.
@@ -1218,7 +1555,7 @@ impl Session {
     /// official image and per-job VM space; the same builder rule otherwise)
     /// and only ever warns — the engine warns about the unpack too.
     fn preflight(&mut self, decision: &GoldenDecision, mode: RunMode) -> anyhow::Result<Value> {
-        self.section("4/4 Preflight");
+        self.section("5/5 Preflight");
         let starting = matches!(mode, RunMode::Foreground | RunMode::Service);
         let data_root = preloop_vm::machine_data_root();
         let free = data_root.as_deref().and_then(|root| {
@@ -1709,6 +2046,64 @@ fn credential_summary(config: &ConfigFile) -> Option<String> {
         return Some(format!("GitHub Apps {ids}"));
     }
     config.github.pat().map(|_| "fine-grained PAT".to_owned())
+}
+
+/// The engine's public URL for webhooks, and where the answer came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicUrlAnswer {
+    url: Option<String>,
+    /// `flag`, `env`, `prompt`, or `skipped`.
+    source: &'static str,
+}
+
+/// Why the stable-URL question is asked, in the wizard's own words.
+const PUBLIC_URL_EXPLAINER: [&str; 4] = [
+    "PR status checks and push-triggered runs need GitHub to reach this engine at a stable",
+    "HTTPS URL. Use Tailscale Funnel, a Cloudflare *named* Tunnel (quick tunnels change on",
+    "restart and break the App's webhook), or your own domain behind a reverse proxy.",
+    "Expose only /api/v1/github/webhooks; everything else can stay private.",
+];
+
+/// Check the URL GitHub will deliver webhooks to, and return it without a
+/// trailing slash. Refused: anything but https, a loopback or `localhost` host
+/// (GitHub cannot reach those), credentials, a query, or a fragment. The error
+/// names the rule that failed.
+fn validate_public_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|error| format!("`{trimmed}` is not a URL ({error})"))?;
+    if url.scheme() != "https" {
+        return Err(format!(
+            "`{trimmed}` must start with https:// (GitHub delivers webhooks over HTTPS only)"
+        ));
+    }
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| format!("`{trimmed}` has no host name"))?;
+    let bare = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let loopback = bare == "localhost"
+        || bare.ends_with(".localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    if loopback {
+        return Err(format!(
+            "`{trimmed}` is a loopback address, which GitHub cannot reach"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("`{trimmed}` must not carry a username or password"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "`{trimmed}` must not have a query or fragment; the webhook path is added for you"
+        ));
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 /// The stored answer step 2 shows on a re-run, with the label to display and
@@ -2527,5 +2922,114 @@ mod tests {
         assert_eq!(a, short_hash(b"FROM scratch\n"));
         assert_eq!(a.len(), 24);
         assert_ne!(a, short_hash(b"FROM other\n"));
+    }
+
+    #[test]
+    fn public_url_is_https_public_and_normalized() {
+        assert_eq!(
+            validate_public_url("https://engine.example.com").unwrap(),
+            "https://engine.example.com"
+        );
+        assert_eq!(
+            validate_public_url(" https://engine.example.com/ ").unwrap(),
+            "https://engine.example.com"
+        );
+        assert_eq!(
+            validate_public_url("https://Engine.Example.com:443/preloop/").unwrap(),
+            "https://engine.example.com/preloop"
+        );
+        for refused in [
+            "http://engine.example.com",
+            "engine.example.com",
+            "https://",
+            "https://localhost:9090",
+            "https://api.localhost",
+            "https://127.0.0.1",
+            "https://0.0.0.0",
+            "https://[::1]",
+            "https://user:secret@engine.example.com",
+            "https://engine.example.com/?token=1",
+            "https://engine.example.com/#fragment",
+        ] {
+            assert!(
+                validate_public_url(refused).is_err(),
+                "{refused} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_public_url_question_never_prompts_without_a_terminal() {
+        let mut session = Session {
+            interactive: false,
+            json: true,
+            yes: false,
+            from_serve: false,
+        };
+        assert_eq!(
+            session.public_url_answer(None, None).unwrap(),
+            PublicUrlAnswer {
+                url: None,
+                source: "skipped"
+            }
+        );
+        // A loopback PRELOOP_PUBLIC_URL (the local-dev default) is not used.
+        assert_eq!(
+            session
+                .public_url_answer(None, Some("http://127.0.0.1:9090"))
+                .unwrap()
+                .source,
+            "skipped"
+        );
+        assert_eq!(
+            session
+                .public_url_answer(None, Some(" https://engine.example.com/ "))
+                .unwrap(),
+            PublicUrlAnswer {
+                url: Some("https://engine.example.com".to_owned()),
+                source: "env"
+            }
+        );
+        assert_eq!(
+            session
+                .public_url_answer(
+                    Some("https://flag.example.com/"),
+                    Some("https://env.example.com")
+                )
+                .unwrap(),
+            PublicUrlAnswer {
+                url: Some("https://flag.example.com".to_owned()),
+                source: "flag"
+            },
+            "the flag wins over the environment"
+        );
+    }
+
+    #[test]
+    fn an_invalid_public_url_flag_is_a_usage_error() {
+        let error = validate_public_url("http://engine.example.com")
+            .map_err(usage_error)
+            .unwrap_err();
+        assert_eq!(exit_code(&error), Some(EXIT_USAGE));
+        assert!(error.to_string().contains("https://"), "{error}");
+    }
+
+    #[test]
+    fn the_new_flags_parse() {
+        let args = InitArgs::try_parse_from([
+            "init",
+            "--no-secrets-scan",
+            "--public-url",
+            "https://engine.example.com",
+            "--repo",
+            "owner/name",
+        ])
+        .unwrap();
+        assert!(args.no_secrets_scan);
+        assert_eq!(
+            args.public_url.as_deref(),
+            Some("https://engine.example.com")
+        );
+        assert_eq!(args.repos, vec!["owner/name".to_owned()]);
     }
 }
