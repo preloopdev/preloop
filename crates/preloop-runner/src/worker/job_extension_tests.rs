@@ -389,7 +389,7 @@ fn inject_github_env_sets_core_vars() {
             }
         }),
     );
-    job.workspace = Some("_work/repo/repo".into());
+    job.workspace = Some("work/repo/repo".into());
 
     let msg = serde_json::json!({
         "contextData": {
@@ -653,7 +653,7 @@ fn inject_actions_env_from_system_vss_endpoint_data() {
         serde_json::json!({}),
         serde_json::json!({}),
     );
-    job.workspace = Some("_work/repo/repo".into());
+    job.workspace = Some("work/repo/repo".into());
 
     let msg = serde_json::json!({
         "resources": {
@@ -719,7 +719,7 @@ fn injects_job_environment_variables_from_acquire_payload() {
         serde_json::json!({}),
         serde_json::json!({}),
     );
-    job.workspace = Some("_work/repo/repo".into());
+    job.workspace = Some("work/repo/repo".into());
 
     let msg = serde_json::json!({
         "environmentVariables": [{
@@ -766,7 +766,7 @@ fn job_message_variables_do_not_leak_into_step_env() {
         serde_json::json!({}),
         serde_json::json!({}),
     );
-    job.workspace = Some("_work/repo/repo".into());
+    job.workspace = Some("work/repo/repo".into());
     let msg = serde_json::json!({
         "variables": {
             "system.github.token": {"value": "tok", "isSecret": true},
@@ -803,7 +803,7 @@ fn github_job_falls_back_to_context_when_variable_absent() {
         serde_json::json!({}),
         serde_json::json!({}),
     );
-    job.workspace = Some("_work/repo/repo".into());
+    job.workspace = Some("work/repo/repo".into());
     inject_github_env(
         &mut job,
         &serde_json::json!({
@@ -1522,7 +1522,7 @@ fn test_golden_acquirejob_payloads_parsing() {
             serde_json::json!({}),
             serde_json::json!({}),
         );
-        job.workspace = Some("_work/repo/repo".into());
+        job.workspace = Some("work/repo/repo".into());
         inject_github_env(&mut job, &msg);
 
         // GITHUB_REPOSITORY must be set and not empty (from contextData.github.repository)
@@ -1907,7 +1907,7 @@ fn unresolved_job_env_token_evaluates_to_the_minted_token_at_step_time() {
         ]
     }]);
     let mut job = claimed_job(&message);
-    job.workspace = Some("_work/repo/repo".into());
+    job.workspace = Some("work/repo/repo".into());
     inject_github_env(&mut job, &message);
     assert_eq!(
         job.env.get("GITHUB_TOKEN").map(String::as_str),
