@@ -110,39 +110,6 @@ pub fn adapter_for(event_name: &str) -> Option<&'static dyn EventAdapter> {
     }
 }
 
-/// All supported event names.
-pub fn all_event_names() -> &'static [&'static str] {
-    &[
-        "push",
-        "pull_request",
-        "pull_request_target",
-        "pull_request_review",
-        "workflow_dispatch",
-        "workflow_run",
-        "check_run",
-        "check_suite",
-        "repository_dispatch",
-        "create",
-        "delete",
-        "release",
-        "issues",
-        "issue_comment",
-        "discussion",
-        "discussion_comment",
-        "label",
-        "milestone",
-        "watch",
-        "fork",
-        "deployment",
-        "deployment_status",
-        "member",
-        "public",
-        "gollum",
-        "page_build",
-        "schedule",
-    ]
-}
-
 /// Build `EffectiveEvent` vec for events that use the repository default
 /// branch as the ref and `payload.action` as the activity type.
 /// Mirrors MessageController.cs:6287 (* default case).
@@ -180,6 +147,23 @@ pub fn make_default_branch_events(event_name: &str, payload: &Value) -> Vec<Effe
         payload: payload.clone(),
         upstream_workflow_names: vec![],
     }]
+}
+
+/// [skip ci] labels that suppress CI runs.
+///
+/// Source: Runner.Server/Controllers/MessageController.cs:6258-6259,6283-6285.
+pub(crate) const SKIP_CI_LABELS: &[&str] = &[
+    "[skip ci]",
+    "[ci skip]",
+    "[no ci]",
+    "[skip actions]",
+    "[actions skip]",
+    "***NO_CI***",
+];
+
+/// Whether a single commit message carries any skip-CI label.
+pub(crate) fn has_skip_label(message: &str) -> bool {
+    SKIP_CI_LABELS.iter().any(|label| message.contains(label))
 }
 
 #[cfg(test)]

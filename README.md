@@ -24,6 +24,7 @@ Preloop doesn't rely only on GitHub Webhooks to update the status of the CI. We 
 # Install (macOS/Linux), any one of:
 brew install preloopdev/tap/preloop   # Homebrew
 npm install -g @preloop-dev/cli       # npm, downloads the same release binaries
+mise use -g github:preloopdev/preloop # mise, downloads the same release archive
 
 # Or fetch the installer at a release tag, read it, then run it. It downloads
 # the release binaries and verifies the sha256 of each one.

@@ -854,7 +854,13 @@ type SnapshotInputs = crate::control::types::StatusInputs;
 async fn read_snapshot_inputs(state: &AppState) -> SnapshotInputs {
     match state
         .backend
-        .status_inputs(crate::runs::STALENESS_THRESHOLD)
+        // The runner tallies read "how many machines are dead", so the
+        // window is the session liveness the reaper prunes on. The sampler
+        // threshold used to be passed here, which made every runner mid-step
+        // count as stale on a fully busy pool.
+        .status_inputs(std::time::Duration::from_secs(
+            crate::distributed_task::DEAD_SESSION_LEASE_SECONDS,
+        ))
         .await
     {
         Ok(inputs) => inputs,
@@ -1197,8 +1203,8 @@ fn build_operational_snapshot_sync(
             idle: inputs.runner_idle,
             busy: inputs.runner_busy,
             stale: inputs.runner_stale,
-            max_poll_age_seconds: None,
-            max_lease_age_seconds: None,
+            max_poll_age_seconds: inputs.max_poll_age_seconds.map(|age| age as f64),
+            max_lease_age_seconds: inputs.max_lease_age_seconds.map(|age| age as f64),
             assignments: inputs.runner_assignments,
         },
         pool: pool_snapshot,
@@ -1869,6 +1875,19 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::github::run_webhook_queue_worker(webhook_worker_shared, webhook_worker_handle).await;
     });
+    // Hints from the other nodes: a delivery they make claimable wakes this
+    // worker now, not at its next tick. This node's own echo is dropped, since
+    // the handler that wrote the row already woke the worker.
+    if let (Some(hints), Some(origin)) = (
+        shared.state.backend.subscribe_webhook_wakes(),
+        shared.state.backend.event_origin(),
+    ) {
+        tokio::spawn(crate::control::wake::forward_webhook_wakes(
+            hints,
+            origin.to_owned(),
+            shared.state.webhook_queue_notify.clone(),
+        ));
+    }
 
     // Repair layers. None of them is on the request path, and each is
     // independently disable-able, so they are best-effort tasks rather than

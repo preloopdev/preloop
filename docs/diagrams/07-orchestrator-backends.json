@@ -11,7 +11,7 @@
   "id": "title",
   "x": 480,
   "y": 25,
-  "text": "preloop-orchestrator \u2014 Pluggable Backends",
+  "text": "Aspirational Backend Proposal",
   "fontSize": 28,
   "strokeColor": "#1e1e1e"
  },
@@ -20,7 +20,7 @@
   "id": "subtitle",
   "x": 380,
   "y": 60,
-  "text": "Three core Rust traits decouple state storage, authentication, and runner execution",
+  "text": "Future design sketch only \u2014 not the shipped backend model",
   "fontSize": 15,
   "strokeColor": "#757575"
  },

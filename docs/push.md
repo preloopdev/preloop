@@ -1,18 +1,20 @@
 # Pull requests without webhooks (submit-driven CI)
 
-Normally a PR's CI depends on GitHub delivering a webhook: push event → server creates the run. If GitHub's webhook pipeline is down,  **no runs get created at all.** CI goes dark even for merged PRs, and GitHub stops retrying missed deliveries after ~24h.
-
-The submit-driven flow inverts the dependency. **You submit the CI run to**  
-**the server directly; the server runs it; then — if you ask — it pushes the tested commit to GitHub and opens or updates the (draft) pull request.** GitHub is the *sink* for results, not the required *source* of triggers. PRs get
-created and checks get reported with **no webhook involved at any point**.
+Webhook-triggered CI depends on GitHub delivering the event. GitHub does not
+automatically retry failed webhook deliveries; an administrator can manually
+redeliver a retained delivery. The submit-driven flow lets you submit a run
+directly to Preloop, then optionally publish the tested commit and create or
+update a pull request. This avoids needing a webhook to start that particular
+run; publication and Check Run reporting still require GitHub access and
+credentials.
 
 ## The commands
 
 
 | Command                            | What it does                                                                        |
 | ---------------------------------- | ----------------------------------------------------------------------------------- |
-| `preloop run -f <workflow>`        | Run CI on the server. **Zero GitHub involvement** so it works during GitHub outages |
-| `preloop run --push -f <workflow>` | Same, then push the tested commit + create/update the PR + report checks            |
+| `preloop run -f <workflow>`        | Submit a run directly without a webhook trigger; GitHub access may still be needed for workflow or job operations |
+| `preloop run --push -f <workflow>` | Same, then push the tested commit + create/update the PR; publishing Check Runs requires a GitHub App with `checks: write` |
 | `preloop run --push --create-pr`   | Push-back **and** create a PR when the branch has none open                         |
 | `preloop push`                     | Replay push-back for the **most recent** run (idempotent so safe to re-run)         |
 | `preloop push <run_id>`            | Replay for a specific run                                                           |
@@ -30,7 +32,7 @@ open one
 ```
 1. work locally on branch feat/x        (dirty trees are snapshotted; see below)
 2. preloop run --push --create-pr
-3. server runs CI on your workspace snapshot        ← no GitHub needed
+3. server runs CI on your workspace snapshot; no webhook is needed to start the run, though workflow or job operations may still need GitHub access
 4. run reaches a terminal state (any conclusion)
 5. CLI pushes the tested commit: git push <sha>:refs/heads/feat/x
 6. no open PR? server creates one (draft) — or the push updated the PR
@@ -79,11 +81,11 @@ Check runs are reported through GitHub's Checks API and appear on the
 commit/PR: `queued` at submit → `in_progress` while running → `completed`
 with the conclusion. Two requirements:
 
-- **The server must have GitHub App credentials.** The Checks API rejects
-PATs (`403 You must authenticate via a GitHub App`). With App creds
-(`preloop setup github --via app`, or `PRELOOP_GITHUB_APP_ID` + PEM) checks
-pre-fill correctly; a PAT-only server still creates the PR but shows no
-checks.
+- **Use GitHub App credentials with `checks: write`.** This is the supported
+  configuration for Check Run reporting. The implementation may have other
+  token fallback paths, but do not rely on a static PAT as a substitute; a
+  PAT-only setup can leave checks unpublished even if commit or PR operations
+  succeed.
 - The check's details link uses `PRELOOP_PUBLIC_URL` (set it to the address
 GitHub viewers can reach; local-only servers show the summary text
 instead).
@@ -102,13 +104,13 @@ it only if you want the feature (the setup notes say exactly this).
 | **PR already open for the branch** | The push updates the branch; the PR follows; checks report on the new head                                                                                                                           |
 | **GitHub down at completion**      | Run already finished (results local). Push-back retries 1m → 5m → 15m, then tells you: `preloop push <run_id>` later                                                                                 |
 | **CLI interrupted mid-sync**       | The run keeps running; `preloop push <run_id>` resumes the publish step idempotently                                                                                                                 |
-| **Detached submit** (`--detach`)   | Submit returns immediately; run `preloop push` when you want to publish                                                                                                                              |
+| **Detached submit** (`--detach`)   | Submit returns immediately. If submitted with `--push`, the requested publish step still follows the run; otherwise publish later with `preloop push` |
 | **Dirty tree**                     | Snapshotted before CI and materialized only after a successful run; re-submit if the working tree changes before push                                                                                                                 |
 | **Branch diverged on GitHub**      | Refused: rebase your branch onto the remote (or reset to the tested commit) and re-submit                                                                                                            |
 | **Run failed**                     | Clean-tree push-back still publishes red checks; dirty-tree snapshots are not materialized after a failed run                                                                                   |
 | **New PRs as ready**               | `--pr-draft=false` — reviewers get notified on creation                                                                                                                                              |
-| **PAT-only server**                | Runs + PR creation work; check runs 403 (needs an App)                                                                                                                                               |
-| **No GitHub at all**               | Plain `preloop run` — CI completes, results in `preloop status` / `preloop logs`, nothing ever leaves your machine                                                                                   |
+| **PAT-only server**                | Some GitHub operations may work; configure an App with `checks: write` for reliable Check Run reporting |
+| **No webhook available**           | Plain `preloop run` can submit and report results locally; workflow loading, actions, or credentials may still require GitHub/network access. Nothing is published unless you request push-back. |
 | `**--sync` era flag**              | The flag was renamed: `--push` (and `preloop push`)                                                                                                                                                  |
 
 

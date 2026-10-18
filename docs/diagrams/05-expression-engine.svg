@@ -21,11 +21,11 @@
 <rect x="70" y="600" width="200" height="75" rx="10" fill="#a5d8ff" stroke="#4a9eed" stroke-width="2"/>
 <text x="170" y="633.4" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">env, inputs, outputs</text>
 <text x="170" y="652.1" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">context data lookups</text>
-<rect x="70" y="740" width="200" height="230" rx="10" fill="#ffc9c9" fill-opacity="0.3" stroke="#ef4444" stroke-width="1.5"/>
-<text x="170" y="833.6" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#ef4444" font-weight="600">Known Gaps</text>
-<text x="170" y="851.1" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#ef4444" font-weight="600">• no [a.b] bracket access</text>
-<text x="170" y="868.6" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#ef4444" font-weight="600">• no object filter &#x27;*&#x27;</text>
-<text x="170" y="886.1" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#ef4444" font-weight="600">• no &#x27;{{&#x27; escaping</text>
+<rect x="70" y="740" width="200" height="230" rx="10" fill="#d3f9d8" fill-opacity="0.3" stroke="#15803d" stroke-width="1.5"/>
+<text x="170" y="833.6" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">Supported Features</text>
+<text x="170" y="851.1" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">• bracket access [a.b]</text>
+<text x="170" y="868.6" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">• object filter &#x27;*&#x27;</text>
+<text x="170" y="886.1" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">• format &#x27;{{&#x27; / &#x27;}}&#x27; escaping</text>
 <rect x="330" y="110" width="570" height="570" rx="10" fill="#e5dbff" fill-opacity="0.25" stroke="#7c3aed" stroke-width="1.5"/>
 <text x="350" y="143.0" font-size="18" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="500">Engine Parsing &amp; Evaluation Pipeline</text>
 <rect x="360" y="180" width="230" height="80" rx="10" fill="#d0bfff" stroke="#7c3aed" stroke-width="2"/>

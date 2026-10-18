@@ -8,7 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
+  the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
+  release digest and GitHub artifact attestation. Pin a release with
+  `mise use -g github:preloopdev/preloop@<version>`. See the
+  [Quick start](README.md#quick-start).
+
+- **Dev tools pinned in `mise.toml`.** `mise install` provides zig, cargo-zigbuild,
+  ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
+  cargo-zigbuild match `release-runner.yml`.
+
+- **`preloop init` workflow readiness checks.** The five-step wizard can ask for
+  a stable HTTPS App webhook URL, scan local and configured repositories for
+  missing workflow secrets, and report every `runs-on` label against the
+  engine's actual pool rules. Use `--no-secrets-scan` to skip secret checks;
+  `--json` includes the URL, secret, and runner-label decisions.
+
 ### Changed
+
+- **SmolVM floor and golden pin move to 1.30.1** (`smolvm_min_version` and
+  `smolvm_golden_version` in `versions.toml`). The floor now also covers the
+  x86_64 virtio device budget SmolVM 1.23.0 raised to 19 MMIO IRQ lines, which
+  is what a packed golden with preloop's mounts needs; `preloop update
+  --ensure-runtime` upgrades any engine below it, and `install.sh` gates the
+  same release. The floor is compiled once, by `crates/preloop-vm/build.rs`,
+  and read by the updater. Raising the golden pin does not rebuild the
+  published golden: it is a digest-pinned OCI artifact, so a 1.30.1-baked
+  golden needs a bake, publish, and digest bump per `docs/build-goldens.md`.
+- **One dependency/policy PR, and nothing mixed into it.** A pull request may
+  ship `deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`,
+  `supply-chain/**`, and any `Cargo.toml` or `Cargo.lock` in the tree together —
+  one supply-chain CI run — but it fails if any of them is mixed with source,
+  docs, `CHANGELOG.md`, another workflow, the `justfile`, or any other file.
+  Code that needs a new dependency lands in a follow-up PR, rebased on `main`
+  after the dependency/policy PR merges. The rule now lives in
+  `supply-chain/guard-policy-files.sh` (same script CI runs), with the policy
+  and the reasoning in `supply-chain/README.md`; run it locally as
+  `just supply-chain-guard`, which compares the merge base of `origin/main` and
+  `HEAD`. There is no override: the verdict follows from the diff.
 
 - **The file credential store is the default.** The engine token, GitHub App
   private key, PAT, and webhook secrets are written to `0600` files under
@@ -34,6 +73,53 @@ Releases before v0.27.0 predate the changelog.
   settings → Permissions & events → grant Actions: read (installation must
   accept) → Webhooks → Edit → tick `workflow_job`.
 
+- **A microVM that runs out of IRQ lines says so.** When `machine start` fails
+  with libkrun's `no more IRQs are available` (the device budget x86_64
+  libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the
+  engine now reports `VmError::IrqExhausted` instead of passing smolvm's bare
+  `-22 (EINVAL)` through: the message names the machine's declared volume and
+  socket mounts on top of the launcher's fixed device set, the SmolVM version
+  in use, both x86_64 ceilings, and the remedy (upgrade to the floor or start
+  with fewer mounts), with the raw smolvm output appended. Previously this was
+  indistinguishable from a held or corrupt disk image, and the pool restarted
+  forever without naming the cause.
+
+- **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
+- **Job `env:` and reusable-call `secrets:` maps read the claim-minted `GITHUB_TOKEN`.**
+  Acquire resolved `${{ secrets.GITHUB_TOKEN }}` in a job's `env:` and in a
+  reusable call's `secrets:` map before the claim minted the token, so a job that
+  also read a stored secret received an empty value while `${{ github.token }}`
+  held the token. The claim now applies the minted token before the fill, so both
+  expressions read the same value. `secrets: inherit` is covered the same way.
+
+- **The GitHub App JWT breaker is partitioned by App id**: one App's rate
+  limit or outage no longer skips the webhook-health and delivery-watchdog
+  checks of the other Apps, and installation lookup, token minting, and App
+  reads now go through the breaker and the `app-auth` consumption counters.
+  A pass that skips an App behind its breaker no longer counts as a successful
+  watchdog poll, so `webhook_watchdog_stale` still fires while any App's
+  deliveries go unwatched; a held-back App stays visible in the health snapshot
+  as explicitly unchecked and keeps its own check time instead of inheriting
+  the pass's, and App JWT responses charge their advertised bytes to the
+  consumption counters.
+
+- **A locked credential store no longer replaces the config-secrets key.** Sealed
+  `[secrets]` values are opened with the key the credential store holds. When
+  that store was locked, the engine minted a new key over them, so every start
+  failed with `store envelope authentication failed`, and after unlocking it
+  failed with `config-secrets key conflict`. Preloop now refuses to mint while
+  sealed values exist and names what to unlock. A `secrets.key` that disagrees
+  with the store is settled by which key opens the sealed values, and the losing
+  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. A failed
+  background engine start now prints the engine's last log lines (#653).
+
+- **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
+  RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
+  extraction) flagged by `cargo audit`.
+- **Webhook deliveries wake every node's worker at once**: a delivery enqueued or
+  replayed on one node waited for the other nodes' five-second queue poll before
+  it was claimed. The committing node now sends one coalesced `preloop_webhooks`
+  notification after its commit, and each peer's worker wakes on it.
 - **A GitHub App's private key survives an OS keychain failure.** With
   `credential_store = "os"`, an unavailable keychain or a refused write now
   stores the credential in the file store, prints a warning naming the
@@ -60,6 +146,18 @@ Releases before v0.27.0 predate the changelog.
   re-check job liveness after action-reference resolution before signing
   bearerless download tickets.
 
+- **Local composite actions may call remote actions**: a workflow's local
+  composite (`uses: ./.github/actions/…`) that runs a remote action, such as
+  `dtolnay/rust-toolchain@stable`, was refused at download with HTTP 403
+  (`not declared in this run's workflow uses:`) because the declared-action
+  allowlist did not read local composite manifests. The engine now reads the
+  run's own commit for local composites, including the composites nested in
+  them, and admits their remote `uses:`. A run with a workspace snapshot reads
+  the snapshot; a GitHub-sourced run without one reads its own repository at
+  its head commit through the contents API, with a `contents: read`
+  installation token for that repository. A manifest that cannot be read still
+  fails closed, and every other action stays denied.
+
 - **Large replay step logs are retained** (#599): signed
   `/replay/results/*` uploads now accept bodies up to 64 MiB instead of
   inheriting Axum's 2 MiB default, so long failing steps remain available for
@@ -79,6 +177,11 @@ Releases before v0.27.0 predate the changelog.
   `contains(github.event.pull_request.labels.*.name, 'x')` always evaluated
   false and label-gated workflows never saw their labels.
 
+- **Partial merged job logs no longer hide step logs**: a failed temporary
+  log-file flush no longer produces an apparently complete but truncated
+  merged upload, and the logs endpoint falls back to the larger per-step
+  representation when one exists. This preserves mutation and other
+  heavy-step output after guest temporary-storage pressure.
 
 ## [0.34.4] - 2026-10-13
 
@@ -156,6 +259,28 @@ Releases before v0.27.0 predate the changelog.
   stops claiming while a half-open probe is in flight. A failed delivery is
   parked without spending an attempt only when GitHub is down or its own
   credential bucket is throttled, not whenever any bucket is.
+
+- **Pull-request runs read their workflows from the merge they check out**: a
+  webhook `pull_request` run on a merge preloop built itself took its workflow
+  files from the pull request head, so a workflow the base branch had changed
+  (and the head had not) ran its older copy, while GitHub's own `pull_request`
+  run executes the merge's copy. The files now come from that merge commit in
+  the engine's mirror; only a failed mirror read falls back to the head's copies,
+  with a warning. Check runs still report on the pull request head.
+
+- **A webhook worker is no longer parked for the whole merge poll under load**:
+  a pull-request delivery that waited for GitHub's test merge held its worker for
+  up to the 30-second budget, and every superseded head polled to the full
+  budget, so a burst of pushes (fork pull requests included) could occupy all
+  `PRELOOP_WEBHOOK_WORKERS` and stall every other webhook. At most a quarter of
+  the workers (and at least one) may probe GitHub's merge state at once, and at
+  most that many may wait between probes. A probe waits up to two seconds for a
+  permit; a delivery whose GitHub merge is already available still uses it once
+  it gets one, and otherwise builds the engine's merge, as the budget-expiry
+  fallback does. A delivery that finds no wait slot builds it at once. Each
+  permit and slot is released when its probe or wait ends, including on failure
+  or cancellation.
+
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
@@ -185,6 +310,21 @@ Releases before v0.27.0 predate the changelog.
   `storage.raw`, no registry row, invisible to `delete`), then the named
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
+- **GitHub App manifest registration is off by default and bound to its
+  browser**: `/api/v1/github/register` and `/api/v1/github/callback` return
+  `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`. The
+  registration page sets a signed, one-hour `preloop_app_manifest_state`
+  cookie, and the callback exchanges GitHub's one-time code only when the
+  echoed `state` matches that cookie, so a forged callback never reaches
+  GitHub. The credentials page is no longer cacheable, HTML-escapes every value
+  GitHub returns, shows the owning account to confirm, and hands the webhook
+  secret to `preloop setup github --via app --webhook-secret` rather than the
+  legacy `PRELOOP_WEBHOOK_SECRET` slot. That per-App secret — the first App's
+  included — verifies as the App itself, so a payload it signs is bound to the
+  App's installation coverage; only values no App claims keep the unbound
+  legacy signer. Refusals and failed code exchanges both answer with the same
+  uncachable, no-referrer page, and a request that cannot parse gets the
+  generic refusal rather than an extractor rejection.
 - **`PRELOOP_CREDENTIAL_STORE=memory` keeps credentials for the life of the
   process**: the env-selected backend handed each caller a fresh empty store,
   so a config write sealed `[secrets]` under a key stored in a store instance

@@ -24,8 +24,8 @@ fix it, and re-run until the workflow is green.
     `dapctl vars <ref>`, `dapctl eval <expr>`, `dapctl continue`
     (resume the job), `dapctl quit`.
 - REST API: `curl -H "Authorization: Bearer $PRELOOP_SYSTEM_TOKEN" ...`
-  - Run status/conclusion: GET http://127.0.0.1:9191/api/v1/runs/<RUN_ID>
-  - Full log: GET http://127.0.0.1:9191/api/v1/runs/<RUN_ID>/logs
+  - Run status/conclusion: `GET http://127.0.0.1:9191/api/v1/runs/<RUN_ID>`
+  - Full log: `GET http://127.0.0.1:9191/api/v1/runs/<RUN_ID>/logs`
 
 ## Task
 

@@ -15,7 +15,7 @@ status back to the repository.
 ### Supported events
 
 The webhook receiver understands every event the `EventAdapter` registry
-supports (`src/events/mod.rs`, `all_event_names()`):
+supports (`src/events/mod.rs`, `adapter_for`):
 
 
 | Tier                        | Events                                                                                                                                                                                      |
@@ -94,14 +94,15 @@ The system is configured using the following environment variables:
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
 | `PRELOOP_WEBHOOK_SECRET`            | Secret key configured on the GitHub App to verify payload signatures.                                                                        | `my-secure-webhook-secret`                 |
 | `PRELOOP_LOCAL_WORKSPACE`           | Path to a local Git worktree used for offline workflow loading and immutable local-source checkouts.                                         | `/path/to/my-repo`                         |
-| `PRELOOP_GITHUB_TOKEN`              | Fallback GitHub Personal Access Token for workflow retrieval and Check Run updates when no configured GitHub App is available. When no App is configured the PAT is also embedded as every non-fork job's `GITHUB_TOKEN`, but only when its OAuth scopes are introspected and don't exceed declared `permissions:`; otherwise it is withheld (`runs.rs`) or the run is refused. Prefer a GitHub App so tokens are minted least-privilege. | `ghp_...`                                  |
+| `PRELOOP_GITHUB_TOKEN`              | Static PAT for supported API calls, including remote workflow retrieval, private reusable-workflow resolution, changed-file lookups, and job `GITHUB_TOKEN` when no App is configured. A static PAT is not narrowed per job and is not a Check Runs credential. Prefer an App installation token with `checks: write` for Check Runs. | `github_pat_...`                           |
 | `PRELOOP_GITHUB_APPS_JSON`          | JSON array of additional registered Apps overriding `github.apps`; each entry: `app_id`, `pem`, optional `webhook_secret`/`installation_id`. | `[{"app_id":12345,"pem":"-----BEGIN..."}]` |
 | `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | Comma-separated creation-time event list for the App-manifest flow; defaults to `push,pull_request,check_run,workflow_job`.                 | `push,pull_request,check_run,workflow_job` |
+| `PRELOOP_ENABLE_APP_REGISTRATION` | Serves the App-manifest pages (`/api/v1/github/register`, `/api/v1/github/callback`). Off by default; both routes return `404`. Enable only to create an App from a browser, then turn it off (see section 7). | `1` |
 
 
 ### Security Best Practices
 
-- **Prefer a GitHub App over `PRELOOP_GITHUB_TOKEN`**: a static PAT cannot be narrowed per job, so it is embedded only when its classic OAuth scopes are introspected and don't exceed declared `permissions:`; a broader PAT refuses the run, and unverifiable bounds withhold the PAT (the job then runs with no `GITHUB_TOKEN` at all). A GitHub App mints least-privilege installation tokens per job.
+- **Prefer a GitHub App over `PRELOOP_GITHUB_TOKEN`**: App installation tokens can be scoped to the repository and effective job permissions. A static PAT is not narrowed per job. The implementation performs a coarse scope check for some classic PATs, but it is not an equivalent least-privilege boundary; do not configure a broad PAT as an App-mint-failure fallback.
 - **Git-Ignore Credentials**: Never check `.env`, `*.pem`, or `*.key` files into Git. These files are excluded in the root `.gitignore`.
 - **Production Key Management**: In production, do not write private keys or secrets to plaintext files on the server disk. Instead:
   - Load them directly into memory at runtime using a Secrets Manager (e.g. HashiCorp Vault, AWS Secrets Manager, or Kubernetes Secrets).
@@ -110,8 +111,6 @@ The system is configured using the following environment variables:
 ---
 
 ## 3. Webhook signature verification (`X-Hub-Signature-256`)
-
-<!-- Trigger Webhook Event Test 2026-07-01 13:38 -->
 
 `preloop` verifies that incoming webhooks are authentic:
 
@@ -133,6 +132,12 @@ commit SHA before retrieving workflow definitions. The branch ref remains in
 the submission for GitHub event context (`github.ref` and trigger filters), but
 the YAML is fetched from the commit SHA so a branch update cannot select a
 different workflow during delivery.
+
+For `pull_request` and `pull_request_review` runs the checked-out commit is the
+pull request's test merge, not its head, so the workflow files come from that
+merge, as they do for GitHub's own `pull_request` runs. When `preloop` builds
+the merge itself, the merge exists only in its mirror, and the files are read
+from there. Only if that read fails are the head's copies used, with a warning.
 
 1. **Local Filesystem (Offline/Dev Mode)**:
    If `PRELOOP_LOCAL_WORKSPACE` is configured, `preloop` reads the
@@ -167,15 +172,18 @@ current worktree.
 
 ## 5. GitHub Checks API Reporting
 
-The system maps the lifecycle of each job to a GitHub Check Run:
+When a GitHub App is configured with `checks: write`, the system maps each
+job's lifecycle to a GitHub Check Run:
 
 1. **Queued**: When a run is accepted, a check run is created via `POST /repos/{owner}/{repo}/check-runs` with status `queued`. The check run ID is recorded in `RunRecord.job_check_run_ids`.
 2. **In Progress**: When the runner fetches and starts the job, the status is updated to `in_progress`.
 3. **Completed**: When the runner finishes (or `preloop` reaps it due to timeout/lease expiration), the check run is updated to `completed` with the corresponding conclusion (`success`, `failure`, or `cancelled`).
 
-If neither a configured GitHub App nor `PRELOOP_GITHUB_TOKEN` is available,
-these requests are simulated in-memory and logged to the console, allowing
-fully offline execution.
+For reliable Check Run reporting, configure a GitHub App installation with
+`checks: write`. The engine's reporting path can consider available GitHub
+tokens, but a static PAT is not a substitute for the supported App-based
+configuration. Without suitable credentials or permissions, jobs may still
+run while Check Run publication fails or is unavailable.
 
 ---
 
@@ -205,7 +213,8 @@ Run the server with the environment variables set:
 ```sh
 export PRELOOP_WEBHOOK_SECRET="super-secret"
 export PRELOOP_LOCAL_WORKSPACE="/path/to/runner-watcher"
-export PRELOOP_GITHUB_TOKEN="ghp_optional_token_for_checks"
+# Optional static-token fallback for supported API and job-token paths; not a Check Runs credential.
+export PRELOOP_GITHUB_TOKEN="ghp_..."
 
 just serve
 ```
@@ -219,51 +228,45 @@ or trigger any other subscribed event. `preloop` will:
 - Fetch the workflows.
 - Match filters (branches, tags, paths).
 - Queue jobs for any registered runners matching `runs-on` labels.
-- Create check runs on GitHub.
+- Create Check Runs on GitHub when the GitHub App has `checks: write`.
 
 ---
 
 ## 7. GitHub App Registration and Installation
 
-`preloop` supports the official **GitHub App Manifest** flow to create an App. Creating the App and installing it are separate GitHub operations.
+`preloop` creates a GitHub App through the official **GitHub App Manifest** flow. Creating the App and installing it are separate GitHub operations.
 
-1. **Expose preloop at its final public HTTPS URL**:
- Start `preloop-runner-server` behind a publicly reachable HTTPS address, then open:
-  ```text
+On the engine host, run `preloop setup github --via app`. It opens a single-use loopback listener, so the private key and webhook secret never leave the machine, and it stores them against the App. Production should use this path.
+
+The engine can also serve the manifest itself. That path displays the credentials in a web page, so it is **off by default**: `/api/v1/github/register` and `/api/v1/github/callback` return `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`. Use it only for a remote engine that the command above cannot reach, and turn the flag off afterwards:
+
+1. **Enable the registration routes** by setting `PRELOOP_ENABLE_APP_REGISTRATION=1` on the engine and restarting it.
+2. **Expose preloop at its final public HTTPS URL**: start `preloop-runner-server` behind a publicly reachable HTTPS address, then open this page in the browser you will use to create the App:
+
+   ```text
    https://preloop.example.com/api/v1/github/register
-  ```
+   ```
+
+   The page sets an HTTP-only `preloop_app_manifest_state` cookie, valid for one hour and scoped to `/api/v1/github`, and gives GitHub the same token as its `state` parameter. Opening the page again replaces the cookie, so use the latest page.
 
    `localhost` is suitable for viewing the form, but GitHub cannot deliver webhook events or callback redirects to it. The manifest only includes webhook settings for non-local hosts.
-2. **Create the App from the manifest**:
- Click **Register App on GitHub**. GitHub opens its App-creation flow with preloop's redirect URL, webhook URL, default events, and default permissions pre-filled.
-3. **Capture the callback credentials**:
- After GitHub creates the App, it redirects to:
-  ```text
-   https://preloop.example.com/api/v1/github/callback?code=...
-  ```
+3. **Create the App from the manifest**: click **Register App on GitHub**. GitHub opens its App-creation flow with preloop's redirect URL, webhook URL, default events, and default permissions pre-filled.
+4. **Capture the callback credentials**: GitHub redirects the same browser to:
 
-   preloop exchanges the one-time code for an App ID, webhook secret, and private-key PEM, then displays them. Treat the PEM and webhook secret as credentials: store them in a secret manager and do not commit them.
-4. **Install the App**:
- In GitHub's App settings, install the newly created App on the target account or repository. Copy the installation ID from its installation settings URL, for example:
-  ```text
-   https://github.com/settings/installations/INSTALLATION_ID
-  ```
+   ```text
+   https://preloop.example.com/api/v1/github/callback?code=...&state=...
+   ```
 
-   The App cannot mint an installation access token until this step is complete.
-5. **Configure preloop and restart it**:
-  ```sh
-   export PRELOOP_WEBHOOK_SECRET="your-new-webhook-secret"
-   export PRELOOP_GITHUB_APP_ID="your-new-app-id"
-   export PRELOOP_GITHUB_APP_INSTALLATION_ID="your-installation-id"
-   export PRELOOP_GITHUB_APP_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----
-   ...
-   -----END PRIVATE KEY-----'
-   # Or: export PRELOOP_GITHUB_APP_PRIVATE_KEY_PATH=/secure/path/preloop-app.pem
-  ```
+   preloop exchanges the one-time code only when `state` matches the cookie in that browser, is signed by this engine, and has not expired. Otherwise it answers `400` and does not contact GitHub. The page then shows the App ID, the owning account, the webhook secret, the private-key PEM, and the command for the next step. Confirm that the owning account is the one you registered with. Treat the PEM and webhook secret as credentials: store them in a secret manager and do not commit them. The response is never cached, its URL is not sent in `Referer`, and the cookie is cleared.
+5. **Hand the credentials to the engine**: save the PEM to `./app.pem`, then run the command from the page on the engine host:
 
-   When these values are set, preloop signs a GitHub App JWT and exchanges it for a per-job installation access token scoped to the run's repository and to that job's effective `permissions:`. A job declaring no `permissions:` gets GitHub's restricted default (`contents`, `metadata`, `packages` at `read`), never the installation's full grant. If no App configuration is present at all, `PRELOOP_GITHUB_TOKEN` is the job token. If an App *is* configured but minting fails, `PRELOOP_GITHUB_APP_MINT_FAILURE` decides — `local` (the default) keeps the job on the local HMAC JWT rather than silently widening its authority to the PAT. See [GitHub Tokens](./github-tokens.md).
-6. **Confirm delivery and job credential use**:
-Push a commit or open a pull request. preloop verifies the webhook and queues matching jobs. The installed App's scoped token is supplied to the runner job. For remote workflow retrieval and GitHub Check Run reporting, preloop selects the configured GitHub App credentials; `PRELOOP_GITHUB_TOKEN` is used only as the fallback when no App is available. App-only deployments do not need to provide a PAT for these server-side calls.
+   ```sh
+   preloop setup github --via app --app-id <app-id> --pem-file ./app.pem --webhook-secret '<webhook-secret>'
+   ```
+
+   The secret is bound to this App's id. Do **not** set `PRELOOP_WEBHOOK_SECRET` for this App: the variable is the single default-App slot and cannot address a second App. Then unset `PRELOOP_ENABLE_APP_REGISTRATION` and restart the engine.
+6. **Install the App**: in GitHub's App settings, install the App on the target account or repository. No installation token can be minted until this step is complete. preloop finds the installation for each repository owner unless `PRELOOP_GITHUB_APP_INSTALLATION_ID` pins one.
+7. **Confirm delivery and job credential use**: push a commit or open a pull request. preloop verifies the webhook and queues matching jobs. With the App configured, preloop signs a GitHub App JWT and requests a per-job installation token scoped to the repository and effective `permissions:`. The granted installation permissions still bound what GitHub can mint; see [GitHub Tokens](./github-tokens.md) for permission narrowing and failure behavior. If no App is configured, `PRELOOP_GITHUB_TOKEN` may be used as the job token. If App minting fails, `PRELOOP_GITHUB_APP_MINT_FAILURE` selects the fallback: `error` fails the job and `pat` explicitly uses the static PAT. `local` is intended to leave the job without an App token, but a later broker fallback can still supply a configured PAT; use `error` or remove the PAT if you require fail-closed behavior. Private reusable-workflow references are resolved with `PRELOOP_GITHUB_TOKEN` or `github.pat`; without either, access to private reusable workflows may fail. App-only deployments do not need a PAT for server-side calls that do not require private reusable-workflow access. Prefer an App with `checks: write` for Check Run reporting, and do not treat a static PAT as a supported replacement.
 
 ---
 
@@ -271,33 +274,34 @@ Push a commit or open a pull request. preloop verifies the webhook and queues ma
 
 This section documents operational best practices, lessons learned, and real-world failure modes encountered during live deployments.
 
-### 8.1 `--public-url` Dual Purpose
+### 8.1 GitHub-facing URL
 
-The `--public-url` parameter supplied to `preloop serve` serves two distinct purposes:
+`--public-url` / `PRELOOP_PUBLIC_URL` is for GitHub: it sets the webhook
+address and the base used for Check Run links. Runner and job traffic uses
+`PRELOOP_RUNNER_URL` instead (loopback by default when no override is set).
+A local or private `--public-url` can make Check Run links unreachable to
+GitHub users, but it does not route guest traffic through that address. See
+[Self-hosting](self-hosting.md#5-exposure-options) for secure ingress examples.
 
-1. **In-VM Control Plane Endpoint**: Tells the ephemeral runner microVM inside SmolVM where to connect back to the control plane.
-2. **GitHub Check Run Links**: Forms the base URL for the `details_url` field sent to GitHub when registering check runs on PRs and commits (e.g. `https://preloop.preloop.dev/runs/<run_id>`).
+### 8.2 Tunnel failures
 
-**Pitfall**: Setting `--public-url` to a local LAN IP (e.g. `http://192.168.1.221:9090`) during local testing will cause GitHub check runs to be registered with non-routable local IP links on GitHub PRs. In production deployments, always set `--public-url` to your own public hostname.
+Cloudflare Error 1033 means the edge cannot reach the configured tunnel
+origin. This can interrupt inbound webhook delivery and make GitHub-facing
+links unavailable. With the current split between `PRELOOP_PUBLIC_URL` and
+`PRELOOP_RUNNER_URL`, a public-tunnel outage does not by itself break local
+runner artifact uploads. Point the tunnel at a path-filtering proxy; do not
+expose the engine port directly. See the Cloudflare example in
+[Self-hosting](self-hosting.md#5-exposure-options).
 
-### 8.2 Cloudflare Tunnel Configuration &amp; Error 1033
+### 8.3 GitHub App permission narrowing
 
-When routing public webhooks and check status requests through Cloudflare Tunnels (`preloop.preloop.dev`):
-
-- **Error 1033 (`Argo Tunnel error`)**: Occurs when Cloudflare's edge cannot communicate with the local `cloudflared` process, or when port `9090` is down or un-routable.
-- **Correct Tunnel Target**: The production named tunnel `preloop-prod` (`16cc97ea-e9d5-4723-875a-6de90f880b07`) must be run with explicit local target port 9090:
-  ```sh
-  cloudflared tunnel --url http://127.0.0.1:9090 run 16cc97ea-e9d5-4723-875a-6de90f880b07
-  ```
-- **Port Mismatches**: Running an unconfigured token or pointing `cloudflared` to a different port (e.g., `8787` or `8080`) breaks webhook delivery and causes in-VM runner artifact uploads to time out with HTTP 530.
-
-### 8.3 GitHub App Scope Clamping &amp; HTTP 422 Handling
-
-GitHub App token minting is strictly all-or-nothing:
-
-- Requesting any scope ungranted by the GitHub App installation causes GitHub's API to return `HTTP 422 Unprocessable Entity`.
-- **Automatic Clamping**: For unrequested default scopes (e.g. `packages: read`), `preloop` automatically clamps token requests to the installation's granted intersection (`contents: read`, `metadata: read`).
-- **Explicit Permissions**: Workflows declaring explicit `permissions:` blocks that exceed installation grants will intentionally fail loudly so missing permissions are never silently ignored.
+When GitHub rejects an installation-token request with `422`, Preloop reads the
+installation's grants, narrows the requested permissions, retries, and reports
+the permissions actually minted. This can also affect explicitly declared
+workflow permissions; a job may receive a weaker token than the YAML requests.
+Grant the App the permissions your workflows need, and check the reported
+permission set when a job depends on a write scope. If the retry fails, the
+configured `PRELOOP_GITHUB_APP_MINT_FAILURE` policy applies.
 
 ### 8.4 Cross-Compiled Runner Bundle &amp; `cargo clean`
 
@@ -315,58 +319,32 @@ located by searching the install prefix (`lib/preloop/runner/<triple>/`),
   ```sh
   cargo zigbuild -p preloop-runner --target aarch64-unknown-linux-gnu
   ```
-- 
 
-### 8.5 Skipping CI Runs
+### 8.5 Skipping CI runs
 
-To suppress CI for a push, include any of these labels anywhere in a commit message within the push batch (not just the head commit):
+GitHub supports commit-message markers such as `[skip ci]` to skip workflows
+triggered by `push` and `pull_request`. A skipped workflow creates no check run;
+if that check is required for merging, the pull request can remain blocked with
+the check pending. Use skip markers only when no required validation needs to
+run. For documentation-only changes, prefer workflow path filters so unrelated
+code jobs can be omitted while the Mintlify build, link, and accessibility
+checks still execute.
 
-- `[skip ci]`
-- `[ci skip]`
-- `[no ci]`
-- `[skip actions]`
-- `[actions skip]`
-- `***NO_CI***`
+### 8.6 Runner and public URL separation
 
-Example:
-
-```sh
-git commit -m "docs: update readme [skip ci]"
-git push
-```
-
-If **any** commit in a push batch contains a skip label, the entire push is suppressed — no jobs are queued and no check runs are created. This matches official GitHub Actions behavior.
-
-### 8.6 Guest Network Isolation, Origin Routing &amp; the Tunnel Hairpin
-
-Runner VMs run under `NetworkPolicy::PublicOnly` — guest egress can reach the public internet but the hypervisor's egress floor deliberately refuses guest→host private addresses (loopback or LAN IP; verified: guest curl to the host LAN URL hangs indefinitely). Guests reach the control plane through exactly one sanctioned path:
-
-1. **Runner transport** — the runner's own control-plane HTTP (connectionData, long-poll, broker) rides the mounted unix socket `/run/preloop-control/engine.sock` when `PRELOOP_CONTROL_SOCKET`/`PRELOOP_CONTROL_ORIGIN` are set (always set by the orchestrator when a control socket is configured).
-2. **Job-side programs** (`actions/checkout`'s git, `curl`, Node actions) only know URLs. The runner binds the advertised origin *inside the guest on loopback* and splices each accepted connection onto the socket (`preloop-runner/src/control_bridge.rs`). Blast radius: one host endpoint.
-
-#### The advertised origin decides everything
-
-The bridge only binds when the advertised origin is a loopback address the guest can bind. This makes `--public-url` carry a third, hidden role beyond in-VM runner config and GitHub check-run `details_url`: it selects the transport for *all* guest-side traffic.
+`PRELOOP_PUBLIC_URL` / `--public-url` is for GitHub-facing webhooks and Check
+Run links. Runner and job endpoints use `PRELOOP_RUNNER_URL` instead; the
+engine supplies a loopback default when no override is configured. Do not
+assume a public tunnel is part of the local runner's data path.
 
 
-| `--public-url`                       | Runner transport                                      | Job-side traffic                                | Tunnel dependency   |
-| ------------------------------------ | ----------------------------------------------------- | ----------------------------------------------- | ------------------- |
-| `http://127.0.0.1:9090` (dev)        | socket                                                | loopback bridge → socket                        | none                |
-| `http://<lan-ip>:9090`               | socket                                                | **blackholes** (LAN IP refused by egress floor) | —                   |
-| `https://preloop.preloop.dev` (prod) | **public internet → Cloudflare → argo tunnel → host** | same hairpin                                    | **hard dependency** |
 
-
-Consequences:
-
-- With the production hostname, *everything* guests do — registration, long-poll, artifact uploads, checkout fetches — physically leaves the host, traverses Cloudflare, and returns through the tunnel. A tunnel outage therefore breaks *local* CI: observed as `530 / error code: 1033` from in-VM `connectionData` fetches and as `actions/upload-artifact` timeouts.
-- The hostname also has to keep resolving publicly; `preloop.preloop.dev` TLS and DNS are load-bearing for local jobs in this mode.
-
-#### Resolution: the runner-facing origin is split from the public URL
+#### Endpoint details
 
 `preloop serve` now publishes two origins:
 
-- `**PRELOOP_PUBLIC_URL**` (`--public-url`) — GitHub-facing only. Used for check-run `details_url` links and anything GitHub must reach. No guest ever dials it.
-- `**PRELOOP_RUNNER_URL**` — every URL handed to runners and their jobs (connectionData `brokerUrl`, endpoint data `ResultsServiceUrl`/`CacheServerUrl`, Twirp signed blob/cache URLs, `system.github.launch_endpoint`, OIDC issuer, live-log ws feed). `serve` pins it to `http://127.0.0.1:<port>` by default, which routes over the mounted unix socket (`PRELOOP_CONTROL_SOCKET`) for the runner itself and via the in-guest loopback bridge (`control_bridge.rs`) for job-side TCP programs.
+- `PRELOOP_PUBLIC_URL` (`--public-url`) — GitHub-facing only. Used for Check Run `details_url` links and webhook delivery. No guest dials it.
+- `PRELOOP_RUNNER_URL` — runner and job endpoints, including broker, results/cache, signed blob, OIDC, and live-log URLs. It defaults to `http://127.0.0.1:<port>` when no override is configured; local runner traffic uses the mounted control socket and guest loopback bridge.
 
 Consequences:
 
@@ -374,4 +352,6 @@ Consequences:
 - A tunnel outage degrades webhook delivery/check-run UX, not in-VM CI execution.
 - **Remote runners** (runner on another machine, not the local smolvm pool): set `PRELOOP_RUNNER_URL=http://<host-reachable>:9090` — but note in-VM runners cannot reach LAN addresses under `PublicOnly` egress, so this override only works for runners outside the VM pool.
 
-A host-side reverse proxy cannot solve the hairpin by itself — the guest resolves public names over public DNS and `PublicOnly` egress means packets leave the host before a proxy could intercept them. Origin separation is the fix; DNS-pinning the public hostname to guest loopback with a local CA achieves the same effect at strictly higher complexity.
+Keep local runner traffic on the loopback default. Set a host-reachable
+`PRELOOP_RUNNER_URL` only for remote runners, and keep public tunnel ingress
+path-filtered.

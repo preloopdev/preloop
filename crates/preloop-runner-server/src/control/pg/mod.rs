@@ -37,6 +37,7 @@ mod trait_impl;
 mod webhooks;
 
 use super::types::ControlError;
+use std::sync::Arc;
 use tokio_postgres::{Client, NoTls};
 
 /// Writer connections per node (`PRELOOP_PG_WRITERS`, default 16).
@@ -154,7 +155,7 @@ impl Drop for Pooled<'_> {
 /// The PostgreSQL control backend: a writer pool for commands, a reader
 /// pool for queries, and the cross-node wake listener.
 pub(crate) struct PgBackend {
-    writers: Pool,
+    writers: Arc<Pool>,
     readers: Pool,
     pool_assignments_enabled: std::sync::atomic::AtomicBool,
     require_job_assignments: std::sync::atomic::AtomicBool,
@@ -176,6 +177,12 @@ pub(crate) struct PgBackend {
     /// Notifications that another node committed events to the outbox
     /// (payload: the writer's origin).
     event_wakes: tokio::sync::broadcast::Sender<String>,
+    /// Notifications that another node made webhook deliveries claimable
+    /// (payload: the writer's origin).
+    webhook_wakes: tokio::sync::broadcast::Sender<String>,
+    /// Set when this node makes webhook deliveries claimable; the webhook
+    /// notifier turns a burst of these into one hint for the other nodes.
+    webhook_dirty: Arc<tokio::sync::Notify>,
     /// This node process's id, stamped on every outbox row it writes.
     origin: String,
 }
@@ -194,9 +201,15 @@ impl PgBackend {
         let mut setup = connect_one(url, &origin).await?;
         ensure_schema(&mut setup).await?;
         drop(setup);
-        let writers = Pool::open(url, &origin, pool_size(WRITERS_ENV)).await?;
+        let writers = Arc::new(Pool::open(url, &origin, pool_size(WRITERS_ENV)).await?);
         let readers = Pool::open(url, &origin, pool_size(READERS_ENV)).await?;
         let wake_listener = super::wake::spawn_listener(url.to_owned());
+        let webhook_dirty = Arc::new(tokio::sync::Notify::new());
+        webhooks::spawn_webhook_notifier(
+            Arc::downgrade(&writers),
+            origin.clone(),
+            Arc::clone(&webhook_dirty),
+        );
         Ok(Self {
             writers,
             readers,
@@ -214,6 +227,8 @@ impl PgBackend {
             released_bindings: std::sync::atomic::AtomicU64::new(0),
             wakes: wake_listener.wakes,
             event_wakes: wake_listener.events,
+            webhook_wakes: wake_listener.webhooks,
+            webhook_dirty,
             origin,
         })
     }
