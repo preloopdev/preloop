@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **Log masking covers base64 alignment shifts.** A secret piped through
+  `base64` with a short prefix in front of it (`printf 'x%s' "$SECRET" |
+  base64`) no longer reaches a masked log. Masked log paths now redact
+  base64 encodings of a registered secret at any byte alignment, including
+  tokens that straddle 76-column wrapped lines and tokens split across write
+  chunks in server-side log persistence. Percent- and hex-encodings of such
+  a shifted payload are still not covered by this pass; register the exact
+  value when a workflow prints it that way.
+
 ### Added
 
 - **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or
