@@ -1112,6 +1112,10 @@ pub struct AppState {
     /// to one file for its whole life and cannot be retargeted underneath
     /// itself by a later environment change.
     pub config_path: PathBuf,
+    /// Engine-hosted GitHub App setup: the one live setup session, its
+    /// one-time link, and the browser-route rate limit. Node-local and
+    /// in-memory by design: a setup lasts minutes, and a restart ends it.
+    pub github_setup: Arc<crate::github_app_setup::session::SetupSessions>,
     /// `GITHUB_TOKEN` permissions ceiling loaded from the config file at
     /// startup. `None` (absent table) = no ceiling; today's behavior is
     /// unchanged. A config change takes effect on restart, like the other
@@ -1773,6 +1777,7 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             config_path,
+            github_setup: Arc::new(crate::github_app_setup::session::SetupSessions::new()),
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),
             execution_protection: config.execution_protection.clone(),

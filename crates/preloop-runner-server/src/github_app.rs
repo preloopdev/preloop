@@ -802,11 +802,47 @@ pub async fn candidate_apps_for_repo_inner(
 /// low-volume relative to App rate limits, so this lookup is not cached; the
 /// owner-granularity installation id it complements stays cached per App.
 pub async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str) -> bool {
+    app_covers_repository_on(&api_base(), app, repository).await
+}
+
+/// Whether the App built from raw `app_id`/`pem` is installed on
+/// `repository`, against an explicit API base.
+///
+/// The base is why this exists: [`app_covers_repository`] resolves
+/// `api.github.com` from the process environment, while an engine configured
+/// for GitHub Enterprise Server holds its API URL in `AppState::github_urls`.
+/// Fail-closed like the function it wraps: an unreadable key or a lookup that
+/// did not definitively answer reports "not installed".
+pub async fn app_covers_repository_at(
+    api_base: &str,
+    app_id: &str,
+    pem: &str,
+    repository: &str,
+) -> bool {
+    let app = match credentials_for(app_id, pem) {
+        Ok(app) => app,
+        Err(error) => {
+            warn!(
+                app_id,
+                error = format!("{error:#}"),
+                "cannot read the App key for an installation lookup"
+            );
+            return false;
+        }
+    };
+    app_covers_repository_on(api_base, &app, repository).await
+}
+
+/// [`app_covers_repository`] against an explicit API base.
+async fn app_covers_repository_on(
+    api_base: &str,
+    app: &GitHubAppCredentials,
+    repository: &str,
+) -> bool {
     let (owner, repo) = match split_repository(repository) {
         Ok(parts) => parts,
         Err(_) => return false,
     };
-    let api_base = api_base();
     let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
         Ok(jwt) => jwt,
         Err(_) => return false,
@@ -1528,8 +1564,10 @@ pub async fn verify_app_config(
     verify_app_config_at(&api_base(), app_id, pem, repo).await
 }
 
-/// [`verify_app_config`] against an explicit API base.
-async fn verify_app_config_at(
+/// [`verify_app_config`] against an explicit API base, for callers that hold
+/// a resolved GitHub API URL (`AppState::github_urls`) rather than the
+/// process environment, which is what `api_base` reads.
+pub async fn verify_app_config_at(
     api_base: &str,
     app_id: &str,
     pem: &str,

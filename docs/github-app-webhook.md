@@ -40,7 +40,7 @@ installation must accept the widened permission before delivery starts).
 `workflow_job` is subscribed for the runner-autoscaling signal, not for run
 triggers: no adapter projects it into a run yet, so the delivery worker logs
 `No adapter for event: workflow_job` and acknowledges the delivery without
-acting on it (`crates/preloop-runner-server/src/github.rs:4563`). Turning
+acting on it (`crates/preloop-runner-server/src/github.rs:4566`). Turning
 `queued` into pool demand is tracked in
 [#625](https://github.com/preloopdev/preloop/issues/625).
 

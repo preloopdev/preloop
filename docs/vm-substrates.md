@@ -72,19 +72,71 @@ orchestrator branches on it instead of assuming SmolVM's semantics.
 
 * **No host bind mounts** (`live_host_volumes: false`). AgentENV volumes are
   block devices (`aenv volume create`, attached as `--volume /guest=<vol>`);
-  there is no virtiofs/9p host-directory passthrough in the CLI or the HTTP
-  API. `MachineSpec::volumes` is therefore *materialized*: the host directory
-  is streamed in as one tar archive at start time, because `aenv upload`
-  rejects symlinks and does not preserve modes, and because one transfer beats
-  thousands of gRPC round trips. Fork clones inherit an already-unpacked
-  filesystem from the snapshot, so the cost lands on the golden only.
-  A read-only mount is approximated by stripping write bits in the guest;
-  that is weaker than virtiofs `:ro`, and there is no host directory behind it
-  to protect in the first place.
-  **Operational consequence:** keep `PRELOOP_RUNNER_BUNDLE` minimal. Pointing
-  it at a 1.5 GiB `target/release` makes every golden pay for the whole
-  directory (observed: golden preparation stalls for minutes), where SmolVM
-  would mount it for free.
+  there is no virtiofs/9p host-directory passthrough in the CLI or HTTP API.
+  Read-only `MachineSpec::volumes` entries are archived once into
+  content-addressed volumes named `preloop-runner-<12 hex>` and mounted by
+  name at sandbox start. The archive preserves file modes and symlinks, and
+  the mount is enforced read-only by the guest block device: uid 1001 and root
+  writes both fail with `EROFS`, while executable files remain executable.
+  Writable host mounts are refused; there is no silent tar fallback.
+* **A volume carries its own manifest.** The archive includes a synthetic
+  `.preloop-bundle.json` (never written to the host tree) naming the runner and
+  Node externals versions the tree was archived with, plus its file count and
+  byte total. It is part of the digest, so a version change publishes a new
+  volume. The engine also records the manifest, the host tree, and the creation
+  time in a local index beside its machine registry, because AgentENV cannot be
+  asked what is inside a volume without mounting it; `preloop volumes list`
+  answers from that index. Nothing in the manifest is time- or host-dependent:
+  the creation time lives only in the index.
+* **Two things never reach a guest.** A symlink whose target is absolute or
+  climbs out of the tree with `..` fails the archive, and set-user-ID,
+  set-group-ID and sticky bits are masked out of the archived modes. Both are
+  enforced while the archive is built; the mount flags themselves are AgentENV's
+  to decide, so `nosuid`/`nodev` are not something this backend can set.
+* **Fork bases cannot carry read-only volumes.** AgentENV 0.2.1 rejects a
+  snapshot of a sandbox with a read-only volume (`HTTP 500`, volume catalog
+  backing must enter `uploading`). The golden therefore stays volume-free and
+  the provider attaches the current content-addressed bundle volume when
+  starting each clone. This means a runner update creates a new volume rather
+  than requiring a golden rebuild.
+* **A remembered volume is revalidated, never trusted.** Each start re-derives
+  the tree's fingerprint (a metadata walk, not an archive) and re-checks that
+  the volume still exists before mounting it, so an in-place bundle update and a
+  `preloop volumes prune` are both noticed: the tree is archived again and, if
+  the volume is gone, populated again. Pruning therefore costs a repopulate, not
+  a failure — but it is still unsafe while a volume is being populated, since a
+  volume deleted between a populate's create and its first mount fails that
+  populate. Populates of different trees run in parallel; one tree populates
+  once, under its own lock.
+* **Superseded volumes are collected.** A bundle change publishes a new volume and
+  leaves the old one behind, because an unmounted volume may be about to be
+  mounted. The engine reclaims the leftovers itself — a pass after each populate
+  and every six hours, the timer starting with the engine rather than with the
+  first runner — keeping the volumes it published, anything a sandbox
+  mounts (AgentENV refuses those deletes), anything younger than the grace period
+  or without a recorded creation time, and the newest superseded volume for a
+  rollback (`PRELOOP_VOLUMES_KEEP_PREVIOUS`). Every deletion is logged at info
+  with its name, size and reason, and a volume AgentENV reports as something
+  other than `ready` is reclaimed once it is past the grace period — including
+  one this engine published and still remembers, since it refuses to mount such a
+  volume and would otherwise stay stuck on it, so a start stuck on a failed
+  volume can populate again. `preloop volumes gc [--dry-run]`
+  prints and runs the same plan; `PRELOOP_VOLUMES_GC=off` stops the automatic
+  passes. Ages come from the index (`$PRELOOP_HOME/agentenv-runner-volumes.json`)
+  and, for staging volumes, from `$PRELOOP_HOME/agentenv-volume-staging.json`,
+  whose records a populate writes before it creates its staging volume and
+  removes when it ends — so a pass can tell a populate in flight from a leftover
+  without taking the per-tree lock. A volume that a populate or a start claims
+  after the plan was built is left for the next pass rather than deleted. With
+  more than one engine on one server, an
+  idle volume another engine published can still be collected once it is past the
+  grace period: that engine revalidates the name it remembers before reuse and
+  repopulates (~1 minute) instead of failing.
+* **The bundle carries Node externals.** The engine mounts only the bundle at
+  `/opt/preloop/bin` and links `/home/runner/externals` to its `externals/`
+  subtree. A second mount at `/home/runner/externals` failed on AgentENV with
+  `failed to chown directory ... no such file or directory`, even when the
+  parent existed; the single-volume layout is the supported path.
 * **No host Unix-socket passthrough** (`socket_mounts: false`). A spec carrying
   `sockets` is rejected with an error naming the remedy. The engine therefore
   runs the guest control plane over TCP: `preloop serve` forces
@@ -190,7 +242,11 @@ under-provisioning or failing a spec that is merely smaller than the base.
 | `PRELOOP_AENV_BINARY` | path to the `aenv` executable (default: `aenv` on `PATH`) |
 | `PRELOOP_AENV_TTL_SECS` | sandbox TTL requested and re-armed (default 3600) |
 | `PRELOOP_RUNNER_URL` | must be guest-reachable on this backend (no socket relay) |
-| `PRELOOP_RUNNER_BUNDLE` | keep it small: it is copied into every golden |
+| `PRELOOP_RUNNER_BUNDLE` | host tree archived into a content-addressed read-only AgentENV volume; bundle changes create a new volume |
+| `PRELOOP_VOLUMES_GC` | `auto` (default) or `off`: collect superseded volumes after a populate and on a timer |
+| `PRELOOP_VOLUMES_KEEP_PREVIOUS` | superseded volumes kept for a rollback (default 1) |
+| `PRELOOP_VOLUMES_GC_GRACE_SECS` | grace period before a volume may be collected (default 3600) |
+| `PRELOOP_VOLUMES_GC_INTERVAL_SECS` | automatic pass period (default 21600; `0` disables it) |
 
 ## Prerequisites on the host
 

@@ -3,11 +3,13 @@
 The control schema is created and upgraded by **refinery 0.10** over the
 embedded migration sets in `migrations/{sqlite,postgres}`. `preloop serve`
 checks the applied migration ledger against the versions expected by this build
-and refuses an uninitialized or incompatible schema; it never applies
-migrations. Checksum validation is performed when migrations are applied, not
-as a full historical SQL audit on every server open. There is no
-down/rollback: refinery is forward-only, so rollback is a backup restore or a
-forward corrective migration.
+and refuses an incompatible schema; a serving process never migrates a store
+that already exists. The one thing it creates is a **brand-new** (absent or
+empty) local SQLite store, which it initializes through the embedded migration
+set so a fresh install serves with no extra step. Checksum validation is
+performed when migrations are applied, not as a full historical SQL audit on
+every server open. There is no down/rollback: refinery is forward-only, so
+rollback is a backup restore or a forward corrective migration.
 
 ## Ledger
 
@@ -76,16 +78,17 @@ structurally identical to a fresh run.
   does not apply migration SQL. Opening SQLite can create the database file
   (and parent directory) and normalize its permissions, so it is not a
   strictly read-only filesystem probe.
-- `preloop serve` **never** migrates: an uninitialized, older, newer or
-  divergent database refuses with `preloop store migrate` in the message. A
-  legacy store (`PRAGMA user_version` 11 / `schema_migrations`, or the
-  Postgres `public` legacy tables) refuses with
-  `preloop store import-legacy --source <old> --target <new>`.
-- Some local setup/start paths initialize a missing SQLite store through the
-  embedded migration set. Do not rely on every service-install or foreground
-  mode to do this: `preloop serve` does not migrate. Provision and upgrade
-  stores explicitly with `preloop store migrate`; existing stores are not
-  upgraded implicitly.
+- `preloop serve` initializes a **brand-new** local SQLite store (absent or
+  empty) through the embedded migration set, and otherwise **never** migrates:
+  an older, newer or divergent database refuses with `preloop store migrate`
+  in the message. A legacy store (`PRAGMA user_version` 11 /
+  `schema_migrations`, or the Postgres `public` legacy tables) refuses with
+  `preloop store import-legacy --source <old> --target <new>`. A Postgres
+  store is never initialized here.
+- Other local setup paths initialize a missing SQLite store the same way:
+  `preloop init` run in the foreground, and `preloop server install` (as the
+  service account). Provision and upgrade stores explicitly with
+  `preloop store migrate`; existing stores are not upgraded implicitly.
 
 ## CI
 

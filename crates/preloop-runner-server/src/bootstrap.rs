@@ -2112,14 +2112,19 @@ fn read_lock_record(file: &std::fs::File) -> std::io::Result<String> {
 pub enum EngineOrigin {
     /// Started in a terminal: `preloop serve`, or `preloop engine` run by hand.
     Foreground,
-    /// Spawned by a `preloop` client command that found no engine running.
+    /// Started with an explicit background marker (see [`ENGINE_ORIGIN_ENV`]),
+    /// as launchers that start the engine themselves set — including the
+    /// client-command auto-start that was removed in #658. The marker stays
+    /// honored so those launchers, and `serve.lock` records written by older
+    /// builds, still read correctly.
     Background,
     /// Started by systemd (`INVOCATION_ID` is set).
     Systemd,
 }
 
-/// Environment variable the CLI sets on the engine it autostarts, so that
-/// engine records itself as [`EngineOrigin::Background`].
+/// Environment variable a launcher sets on an engine it starts itself, so that
+/// engine records itself as [`EngineOrigin::Background`]. The CLI no longer
+/// autostarts an engine (#658) and so no longer sets it.
 pub const ENGINE_ORIGIN_ENV: &str = "PRELOOP_ENGINE_ORIGIN";
 
 impl EngineOrigin {
@@ -2151,9 +2156,9 @@ impl EngineOrigin {
 }
 
 /// [`EngineOrigin::current`] over explicit inputs, so both precedence rules can
-/// be tested. The explicit `background` marker wins: a client command started
-/// from inside a systemd unit inherits `INVOCATION_ID`, but the engine it
-/// autostarts is still a background engine.
+/// be tested. The explicit `background` marker wins: a process started from
+/// inside a systemd unit inherits `INVOCATION_ID`, but a launcher that marked
+/// it background is still recorded as such.
 fn origin_from(marker: Option<&str>, invoked_by_systemd: bool) -> EngineOrigin {
     if marker.map(str::trim) == Some(EngineOrigin::Background.as_str()) {
         EngineOrigin::Background
@@ -2347,7 +2352,7 @@ fn holder_message(holder: &LockHolder) -> String {
         .unwrap_or_default();
     let mut lines = vec![match holder.origin {
         EngineOrigin::Background => format!(
-            "a preloop engine is already running (pid {pid}{started}, in the background by a preloop command)"
+            "a preloop engine is already running (pid {pid}{started}, started in the background)"
         ),
         EngineOrigin::Systemd => format!(
             "a preloop engine is already running as a systemd service (preloop.service, pid {pid})"
@@ -2662,10 +2667,7 @@ mod tests {
                 )),
                 "{error}"
             );
-            assert!(
-                error.contains("in the background by a preloop command"),
-                "{error}"
-            );
+            assert!(error.contains("started in the background"), "{error}");
             assert!(
                 error.contains("It is serving http://127.0.0.1:9090"),
                 "{error}"
