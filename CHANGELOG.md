@@ -46,6 +46,17 @@ Releases before v0.27.0 predate the changelog.
   into the run mode it starts — foreground `serve`, or the installed service's
   environment — so Check Run links and the webhook health check use it.
 
+- **`docs/github-resiliency.md`** — the design for surviving an unreliable
+  GitHub: a source-agnostic `events` queue with per-delivery receipts, retry
+  by error class and an ingest spool, a processed-heads ledger (head *and*
+  base tip) that dedupes webhook / `preloop push` / reconciler events for the
+  same commit, an `ls-remote` reconciler as the correctness net, a locally
+  computed merge commit that jobs check out from the engine snapshot, a
+  GitHub-write outbox with check-state repair, and the delivery-watchdog
+  watermark fixes. No behavior change yet — deliverables land one PR at a
+  time. The design is verified against `public/main` @ `85e1fa168`; merged
+  mitigations that narrow a failure shape are called out inline.
+
 ### Changed
 
 - **SmolVM floor and golden pin move to 1.30.1** (`smolvm_min_version` and
