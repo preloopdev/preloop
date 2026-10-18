@@ -10,6 +10,64 @@ pub const DEBUG_SESSIONS_PATH: &str = "/api/v1/debug/sessions";
 pub const DEBUG_SESSION_VERDICT_SUFFIX: &str = "/verdict";
 pub const DEBUG_SESSION_CLOSE_SUFFIX: &str = "/close";
 
+/// How many webhook bodies may be buffered at once.
+///
+/// The body extractor reads the whole payload (up to the 32 MiB route limit)
+/// before the handler verifies the HMAC, so without a cap an unauthenticated
+/// caller turns the ingress into a memory amplifier: `N` concurrent uploads
+/// each hold a full body while the signature is still unchecked. Eight slots
+/// bound the transient cost at ~256 MiB; requests over the cap are shed with
+/// 503 instead of being queued, which would only move the same pressure
+/// behind an unbounded wait list. Shedding is the last-resort bound: GitHub
+/// does not retry a non-2xx on its own, so a shed delivery is recorded as
+/// failed and must be redelivered (GitHub's redelivery UI, or
+/// `preloop webhooks replay`).
+const MAX_CONCURRENT_WEBHOOK_UPLOADS: usize = 8;
+
+/// How long an admitted webhook request may hold its upload slot.
+///
+/// The slot cap alone would let eight stalled uploads — headers received, body
+/// never finished — pin every permit and answer legitimate deliveries 503, a
+/// self-DoS behind the gate. This budget releases the slot instead: a request
+/// still running after it is cut off with 408. It sits just above the
+/// handler's own 8 s ack budget (`WEBHOOK_ACK_BUDGET` in `github.rs`), so a
+/// legitimate slow store still completes, while a stalled peer cannot pin a
+/// slot. The timeout also cancels the handler's enqueue wait, so a delivery
+/// cut off mid-enqueue may not be persisted; GitHub records that delivery as
+/// failed and it can be redelivered.
+const WEBHOOK_REQUEST_BUDGET: Duration = Duration::from_secs(10);
+
+/// Try to take a webhook upload slot, or shed the request.
+///
+/// Load-shedding is deliberate: a bounded queue only moves the memory
+/// pressure to a slower moment. A shed delivery is recoverable rather than
+/// lost — it is recorded as failed and redelivered by hand (GitHub's UI or
+/// `preloop webhooks replay`), because GitHub does not retry an arbitrary
+/// non-2xx itself.
+fn reserve_webhook_upload_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, StatusCode> {
+    slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+/// Gate webhook body extraction; the permit is held until the response is
+/// produced, i.e. for as long as the buffered body (and the queued delivery
+/// record) is alive, and never longer than `WEBHOOK_REQUEST_BUDGET`.
+async fn limit_webhook_uploads(
+    State(slots): State<Arc<tokio::sync::Semaphore>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let _permit = reserve_webhook_upload_slot(&slots)?;
+    match tokio::time::timeout(WEBHOOK_REQUEST_BUDGET, next.run(request)).await {
+        Ok(response) => Ok(response),
+        Err(_) => Err(StatusCode::REQUEST_TIMEOUT),
+    }
+}
+
 /// Build the production server router without simulation endpoints.
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
     build_app(state, shutdown, None)
@@ -370,6 +428,10 @@ pub fn build_app(
             require_native_bearer,
         ));
 
+    // Shared by the webhook route's gate: see `limit_webhook_uploads`.
+    let webhook_upload_slots =
+        Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WEBHOOK_UPLOADS));
+
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -680,7 +742,18 @@ pub fn build_app(
                 // blindly. Set the limit above GitHub's ceiling so real
                 // deliveries pass and oversized input gets a deterministic
                 // 413 instead of a severed connection.
-                .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+                // …and bound how many of those bodies are buffered at once
+                // before the HMAC check, so the unauthenticated ingress
+                // cannot be used as a memory amplifier. Over-cap requests are
+                // shed with 503 — recoverable by redelivery, not retried on
+                // their own — and an admitted request is cut off after
+                // `WEBHOOK_REQUEST_BUDGET` so a stalled peer cannot pin a
+                // slot while legitimate deliveries queue up behind it.
+                .layer(middleware::from_fn_with_state(
+                    webhook_upload_slots.clone(),
+                    limit_webhook_uploads,
+                )),
         )
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
@@ -1244,5 +1317,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The webhook body is buffered before the HMAC is checked, so uploads
+    /// past the slot cap must be shed (503) instead of queued. Without the
+    /// gate the ninth request reaches the handler and answers 401, which this
+    /// test treats as a regression. Each staged body signals on its first
+    /// poll, so the test waits until the extractors actually hold the slots
+    /// rather than sleeping and hoping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn webhook_route_sheds_when_upload_slots_are_full() {
+        use futures::stream;
+        use std::task::Poll;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let router = app(state, CancellationToken::new());
+
+        let mut stalled = Vec::new();
+        let mut buffering = Vec::new();
+        for _ in 0..MAX_CONCURRENT_WEBHOOK_UPLOADS {
+            let router = router.clone();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            buffering.push(started_rx);
+            stalled.push(tokio::spawn(async move {
+                // A body that never yields a chunk keeps the extractor (and
+                // the permit) parked exactly like a slow upload; its first
+                // poll is the moment the extractor starts buffering.
+                let mut started_tx = Some(started_tx);
+                let body = Body::from_stream(stream::poll_fn(
+                    move |_cx| -> Poll<Option<Result<bytes::Bytes, std::io::Error>>> {
+                        if let Some(started_tx) = started_tx.take() {
+                            let _ = started_tx.send(());
+                        }
+                        Poll::Pending
+                    },
+                ));
+                let request = Request::post("/api/v1/github/webhooks")
+                    .header("x-github-event", "push")
+                    .body(body)
+                    .unwrap();
+                router
+                    .oneshot(request)
+                    .await
+                    .map(|response| response.status())
+            }));
+        }
+
+        // Wait until every staged upload holds a slot and its extractor is
+        // parked mid-body, so the probe below cannot race them.
+        let admitted = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join_all(buffering),
+        )
+        .await;
+
+        let probe = if admitted.is_ok() {
+            Some(
+                router
+                    .oneshot(
+                        Request::post("/api/v1/github/webhooks")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+            )
+        } else {
+            None
+        };
+
+        for task in stalled {
+            task.abort();
+            let _ = task.await;
+        }
+
+        assert!(
+            admitted.is_ok(),
+            "every staged upload must take a slot and start its body"
+        );
+        assert_eq!(probe, Some(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn webhook_upload_slots_refill_after_release() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let first = reserve_webhook_upload_slot(&slots).expect("first slot");
+        assert_eq!(
+            reserve_webhook_upload_slot(&slots).unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(first);
+        assert!(reserve_webhook_upload_slot(&slots).is_ok());
+    }
+
+    /// `--record-flows` must not buffer the webhook body ahead of the route's
+    /// own admission: the recorder reads whole bodies before any route layer
+    /// runs, so recording this path would undo the upload gate. Other routes
+    /// stay recorded.
+    #[tokio::test]
+    async fn flow_recording_skips_webhook_uploads() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let flows_path = temp.path().join("flows.jsonl");
+        state.inner.lock().await.flows_file = Some(std::fs::File::create(&flows_path).unwrap());
+
+        // `build_app` applies the recorder as its outermost layer; this router
+        // reproduces that wiring over stub handlers.
+        let router = Router::new()
+            .route("/api/v1/github/webhooks", post(|| async { "ignored" }))
+            .route("/healthz", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                record_flows_middleware,
+            ));
+
+        let webhook = Request::post("/api/v1/github/webhooks")
+            .body(Body::empty())
+            .unwrap();
+        let healthz = Request::get("/healthz").body(Body::empty()).unwrap();
+        for request in [webhook, healthz] {
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let recorded = std::fs::read_to_string(&flows_path).unwrap();
+        assert_eq!(recorded.lines().count(), 1, "recorded: {recorded}");
+        assert!(recorded.contains("\"/healthz\""), "recorded: {recorded}");
     }
 }

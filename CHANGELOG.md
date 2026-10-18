@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **Webhook ingress bounds and times out body uploads.** The GitHub webhook
+  route buffers at most eight request bodies (each up to the 32 MiB route
+  limit) at once, and sheds further requests with 503, so an unauthenticated
+  caller can no longer use the ingress as a memory amplifier before the HMAC
+  check. An admitted upload that stalls is cut off after 10 s with 408, so a
+  stalled peer cannot pin every slot and starve legitimate deliveries. A shed
+  or timed-out delivery is recoverable through redelivery (GitHub's redelivery
+  UI, or `preloop webhooks replay`). With `--record-flows`, the webhook body
+  is no longer buffered by the flow recorder ahead of the route's own
+  admission.
+
 ### Added
 
 - **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or
