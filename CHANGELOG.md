@@ -238,6 +238,24 @@ Releases before v0.27.0 predate the changelog.
   unavailable for the rest of the process. Platform revocation checks no longer
   apply; a CA added to the OS store is picked up on restart.
 
+- **A hung Git fetch can no longer freeze the engine.** Snapshot creation and
+  pull-request test merges ran `git fetch` — and every other Git command — from
+  the engine with no deadline. A forge that accepted the connection and then
+  stalled, or a credential helper such as osxkeychain or Git Credential
+  Manager waiting behind a keychain dialog, never returned; because the
+  checkout-cache fetch runs under that repository's cache lock, every later
+  submission for the same repository queued behind it until the engine
+  restarted. Every engine Git child now runs under a deadline — 60 s for ref,
+  config, and index plumbing, 15 min for whole-repository work (`add`,
+  `write-tree`, `fsck`, `archive`), 30 min for anything that reaches a remote —
+  and is killed when the deadline expires, which releases the cache lock with
+  it. Git's own terminal prompt was already disabled; the credential-helper
+  list is now cleared and both askpass programs are neutralised as well,
+  because `GIT_TERMINAL_PROMPT=0` alone does not stop a configured helper. The
+  error names the operation and the deadline (`git fetch remote checkout
+  snapshot timed out after 30m: killed the hung git process`) so a hang reads
+  differently from a failure.
+
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
   libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the
