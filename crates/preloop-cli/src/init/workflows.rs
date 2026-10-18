@@ -4,19 +4,19 @@
 //! workflow. `init` decides what to offer.
 
 use preloop_gha_parser::secrets::ENGINE_PROVIDED_SECRETS;
-use preloop_gha_parser::{RunsOn, parse_workflow};
+use preloop_gha_parser::{Job, RunsOn, Workflow, parse_workflow};
+use preloop_gha_protocol::expr_scan::find_expression_end;
 use preloop_orchestrator::environment::{EnvironmentSpec, OFFICIAL_GOLDEN};
 use preloop_runner_server::config::ConfigFile;
 use preloop_runner_server::github_app;
 use preloop_runner_server::runtime_scheduling::{job_matches_runner, unhostable_platform};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// The largest workflow or action file the scan reads.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
-/// How deep `.github/actions` is searched for `action.yml` files.
-const ACTION_DEPTH_LIMIT: usize = 8;
 /// Accept header that returns a file's bytes instead of its JSON envelope.
 const RAW_ACCEPT: &str = "application/vnd.github.raw";
 
@@ -193,7 +193,7 @@ fn scan_checkout(root: &Path, notes: &mut Vec<String>) -> Vec<WorkflowFile> {
             }
         }
     }
-    collect_actions(&root.join(".github/actions"), 0, &mut paths);
+    collect_actions(&root.join(".github/actions"), &mut paths);
     paths.sort();
     paths
         .into_iter()
@@ -224,10 +224,11 @@ fn is_action_file_name(name: &str) -> bool {
     matches!(name, "action.yml" | "action.yaml")
 }
 
-fn collect_actions(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > ACTION_DEPTH_LIMIT {
-        return;
-    }
+/// Every `action.yml` / `action.yaml` under `dir`, however deeply nested: the
+/// engine has no depth limit for composite actions, so a checkout scan and a
+/// GitHub scan of the same repository must not disagree about which ones run.
+/// Symlinked directories are not followed (`file_type` does not resolve them).
+fn collect_actions(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -237,7 +238,7 @@ fn collect_actions(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         };
         let path = entry.path();
         if kind.is_dir() {
-            collect_actions(&path, depth + 1, out);
+            collect_actions(&path, out);
         } else if kind.is_file() && is_action_file_name(&entry.file_name().to_string_lossy()) {
             out.push(path);
         }
@@ -266,10 +267,17 @@ fn relative_path(root: &Path, path: &Path) -> String {
 /// The workflow files and composite actions of `repo` on its default branch,
 /// read through the GitHub API with the configured credential. The error is
 /// the reason the repository was skipped.
+///
+/// A plain `owner/repo` name is required before any credential is loaded: the
+/// name is interpolated into the request URL below, so a value carrying URL
+/// delimiters would steer the token somewhere the caller never chose.
 async fn fetch_repo(
     config: &ConfigFile,
     repo: &str,
 ) -> Result<(Vec<WorkflowFile>, Vec<String>), String> {
+    if !preloop_runner_server::secrets_api::valid_repo_slug(repo) {
+        return Err(format!("`{repo}` is not a GitHub owner/repository name"));
+    }
     let token = github_token(config, repo).await?;
     let client = preloop_runner_server::shared_http::github_client_builder()
         .user_agent("preloop-init")
@@ -451,17 +459,29 @@ pub(super) struct SecretRead {
 
 /// Every secret the text reads, except the tokens the engine mints itself
 /// (`GITHUB_TOKEN` and friends are never stored, so never missing).
+///
+/// The engine reads a secret only where it evaluates an expression: inside a
+/// `${{ … }}` span, or in an `if:` value, which GitHub evaluates with or
+/// without the markers. A `secrets.NAME` in any other text — a comment, a
+/// prose string, a `run:` line quoting an example — is inert, so it is not
+/// reported. A `${{ … }}` span is read wherever it sits, even where a shell
+/// would call the line a comment: inside a `run:` block the engine
+/// substitutes it, and only a real YAML parse could tell the two apart.
 pub(super) fn secret_reads(path: &str, text: &str) -> Vec<SecretRead> {
+    let bodies = expression_bodies(text);
     let mut reads = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        if line.trim_start().starts_with('#') {
-            continue;
-        }
-        for name in names_read_on(line) {
-            if ENGINE_PROVIDED_SECRETS
-                .iter()
-                .any(|token| token.eq_ignore_ascii_case(name))
+    let mut line_start = 0;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let condition = is_condition_line(line);
+        for (offset, name) in names_read_on(line) {
+            if !condition
+                && !bodies
+                    .iter()
+                    .any(|body| body.contains(&(line_start + offset)))
             {
+                continue;
+            }
+            if is_engine_provided(name) {
                 continue;
             }
             reads.push(SecretRead {
@@ -470,16 +490,48 @@ pub(super) fn secret_reads(path: &str, text: &str) -> Vec<SecretRead> {
                 line: index + 1,
             });
         }
+        line_start += line.len();
     }
     reads
 }
 
-/// The names read on one line, in order: `secrets.NAME` and `secrets['NAME']`.
-/// `secrets` must start a word, so `mysecrets.X` and `my-secrets.X` do not match.
-fn names_read_on(line: &str) -> Vec<&str> {
+/// The byte ranges of the `${{ … }}` expression bodies in `text`, found with
+/// the scanner the parser and the runner share.
+fn expression_bodies(text: &str) -> Vec<Range<usize>> {
+    let mut bodies = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("${{") {
+        let body_start = from + offset + 3;
+        let Some(end) = find_expression_end(&text[body_start..]) else {
+            break;
+        };
+        bodies.push(body_start..body_start + end);
+        from = body_start + end + 2;
+    }
+    bodies
+}
+
+/// Whether `line` holds an `if:` value, which the engine reads as an
+/// expression with or without the `${{ }}` markers.
+fn is_condition_line(line: &str) -> bool {
+    let value = line.trim_start();
+    let value = value.strip_prefix("- ").unwrap_or(value).trim_start();
+    let Some(value) = value.strip_prefix("if:") else {
+        return false;
+    };
+    // `iffy:` and `if_me:` are other keys, and `if:secrets.X` is one scalar.
+    value.is_empty() || value.starts_with([' ', '\t', '\'', '"'])
+}
+
+/// The names read on one line, in order, each with the byte offset of the
+/// `secrets` that reads it: `secrets.NAME` and `secrets['NAME']`. The context
+/// is matched without regard to case, as the engine's expression evaluator
+/// resolves it, and must start a word, so `mysecrets.X` and `my-secrets.X` do
+/// not match.
+fn names_read_on(line: &str) -> Vec<(usize, &str)> {
     let mut names = Vec::new();
     let mut from = 0;
-    while let Some(offset) = line[from..].find("secrets") {
+    while let Some(offset) = find_ignore_case(&line[from..], "secrets") {
         let start = from + offset;
         let end = start + "secrets".len();
         from = end;
@@ -495,7 +547,41 @@ fn names_read_on(line: &str) -> Vec<&str> {
             Some(dotted) => identifier(dotted),
             None => bracketed(rest),
         };
-        names.extend(name);
+        names.extend(name.map(|name| (start, name)));
+    }
+    names
+}
+
+/// The offset of `needle` (ASCII) in `haystack`, ignoring ASCII case. Every
+/// byte of a match is ASCII, so the offset is a char boundary of `haystack`.
+fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    let needle = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// The tokens the engine mints per job: they are never stored, so never
+/// missing.
+fn is_engine_provided(name: &str) -> bool {
+    ENGINE_PROVIDED_SECRETS
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case(name))
+}
+
+/// The names one field's text reads: its `${{ … }}` expressions, or the whole
+/// text when it is an `if:` value.
+fn names_read_in(text: &str, whole: bool) -> Vec<&str> {
+    if whole {
+        return names_read_on(text)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+    }
+    let mut names = Vec::new();
+    for body in expression_bodies(text) {
+        names.extend(names_read_on(&text[body]).into_iter().map(|(_, name)| name));
     }
     names
 }
@@ -522,6 +608,14 @@ fn bracketed(rest: &str) -> Option<&str> {
     let after = inner[name.len()..].strip_prefix(quote)?.trim_start();
     after.starts_with(']').then_some(name)
 }
+
+/// The environments of the jobs that read one name, as they read it: `Some` of
+/// the environment a job declares, `None` for a read no job's fields carry (a
+/// composite action, a workflow that does not parse) or a job with no literal
+/// environment. The engine looks the environment tier up with each job's own
+/// `environment:` (`secret_provider.rs`), so no tier can be credited for a
+/// name no reading job can be matched to one.
+type ReadingEnvironments = BTreeSet<Option<String>>;
 
 /// The secret names the engine holds, by scope: names only, never values.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -589,18 +683,32 @@ impl Stored {
         stored
     }
 
-    /// Where `name` is stored for a job in `repo`: its environment (the most
-    /// specific tier), then repository, then global. Exact spelling, as the
-    /// engine matches it.
+    /// Where `name` is stored for a job of `repo` that declares no
+    /// environment: the repository tier, then global. Both reach every job, so
+    /// either one is a scope a read can always rely on.
     pub(super) fn scope_of(&self, name: &str, repo: Option<&str>) -> Option<String> {
+        self.scope_of_reads(name, repo, &ReadingEnvironments::new())
+    }
+
+    /// Where `name` is stored for the jobs in `repo` that read it.
+    ///
+    /// The repository tier and global are supplied to every job, so either one
+    /// makes the read ready. An environment tier is looked up with each job's
+    /// own `environment:` (`secret_provider.rs`), so it counts only when
+    /// `reading` — the environments of the jobs that read `name` — is
+    /// non-empty, every entry is a declared environment, and every one of them
+    /// holds the name. When only an environment tier holds it, this returns
+    /// `None` and [`Stored::environment_scope_of`] names the tier it is stored
+    /// in.
+    ///
+    /// Exact spelling, as the engine matches it.
+    pub(super) fn scope_of_reads(
+        &self,
+        name: &str,
+        repo: Option<&str>,
+        reading: &ReadingEnvironments,
+    ) -> Option<String> {
         if let Some(repo) = repo {
-            let environment = self
-                .env
-                .get(repo)
-                .and_then(|envs| envs.iter().find(|(_, names)| names.contains(name)));
-            if let Some((env, _)) = environment {
-                return Some(format!("environment {env} of {repo}"));
-            }
             if self
                 .repo
                 .get(repo)
@@ -608,8 +716,47 @@ impl Stored {
             {
                 return Some(format!("repository {repo}"));
             }
+            let holding = self.environments_holding(name, repo);
+            let mut environments: Vec<&str> = Vec::new();
+            let mut covered = !reading.is_empty();
+            for environment in reading {
+                match environment {
+                    Some(environment) => environments.push(environment),
+                    None => covered = false,
+                }
+            }
+            if covered
+                && environments
+                    .iter()
+                    .all(|environment| holding.contains(environment))
+            {
+                return Some(environment_scope(&environments, repo));
+            }
         }
         self.global.contains(name).then(|| "global".to_owned())
+    }
+
+    /// The environment tier `name` is stored in for `repo`, when no tier every
+    /// job receives holds it: `environment prod of o/r`.
+    pub(super) fn environment_scope_of(&self, name: &str, repo: &str) -> Option<String> {
+        let holding = self.environments_holding(name, repo);
+        if holding.is_empty() {
+            return None;
+        }
+        Some(environment_scope(&holding, repo))
+    }
+
+    /// Every environment of `repo` that holds `name`, in name order.
+    fn environments_holding(&self, name: &str, repo: &str) -> Vec<&str> {
+        self.env
+            .get(repo)
+            .map(|envs| {
+                envs.iter()
+                    .filter(|(_, names)| names.contains(name))
+                    .map(|(environment, _)| environment.as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// A stored name that differs from `name` only in letter case.
@@ -627,14 +774,28 @@ impl Stored {
     }
 }
 
+/// `environment prod of o/r`, or `environments prod, staging of o/r` when more
+/// than one holds the name. Callers pass a non-empty list.
+fn environment_scope(environments: &[&str], repo: &str) -> String {
+    if let [environment] = environments {
+        return format!("environment {environment} of {repo}");
+    }
+    format!("environments {} of {repo}", environments.join(", "))
+}
+
 /// One secret a target reads, and whether the engine holds it for that target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SecretRow {
     pub name: String,
     /// `path:line` of every read, sorted.
     pub reads: Vec<String>,
-    /// Where it is stored for this target; `None` when missing.
+    /// Where the engine stores it for the jobs of this target; `None` when
+    /// missing, or stored only where not every reading job reaches it.
     pub scope: Option<String>,
+    /// The environment tier that holds the name when `scope` is `None`: the
+    /// engine supplies it only to jobs that declare that environment, so the
+    /// read counts as missing.
+    pub environment_scope: Option<String>,
     /// The spelling the engine does hold, when only a case variant is stored.
     pub stored_as: Option<String>,
 }
@@ -644,6 +805,9 @@ impl SecretRow {
     pub(super) fn status(&self) -> String {
         if let Some(scope) = &self.scope {
             return scope.clone();
+        }
+        if let Some(environment) = &self.environment_scope {
+            return format!("MISSING (stored only in {environment})");
         }
         if let Some(stored) = &self.stored_as {
             return format!("MISSING (stored as {stored}; names match exactly)");
@@ -655,30 +819,140 @@ impl SecretRow {
     }
 }
 
+/// The environments of the jobs that read each secret of one workflow file,
+/// by name: `None` for a name no job's fields carry.
+///
+/// A composite action, or a workflow the parser rejects, has no jobs here, so
+/// nothing is attributed for it — the engine supplies a composite action's
+/// secrets through the job that calls it, which this scan cannot know.
+fn read_environments(path: &str, text: &str) -> BTreeMap<String, ReadingEnvironments> {
+    let mut by_name: BTreeMap<String, ReadingEnvironments> = BTreeMap::new();
+    if !is_workflow(path) {
+        return by_name;
+    }
+    let Ok(workflow) = parse_workflow(text) else {
+        return by_name;
+    };
+    // Workflow-level fields (`env:` and friends) reach every job: the engine
+    // merges the workflow environment into each job's, so their reads belong
+    // to every job.
+    let Some(shared) = workflow_fields_secret_names(&workflow) else {
+        return BTreeMap::new();
+    };
+    for job in workflow.jobs.values() {
+        let Some(names) = job_secret_names(job) else {
+            return BTreeMap::new();
+        };
+        let environment = job_environment(job);
+        for name in names.into_iter().chain(shared.iter().cloned()) {
+            by_name.entry(name).or_default().insert(environment.clone());
+        }
+    }
+    by_name
+}
+
+/// The literal `environment:` one job declares, as the engine reads it off the
+/// job to look the environment tier up: a scalar or a `name:` mapping. An
+/// expression resolves only at run time, so it is not literal.
+fn job_environment(job: &Job) -> Option<String> {
+    let name = match job.environment.as_ref() {
+        Some(Value::String(name)) => name,
+        Some(Value::Object(map)) => map.get("name").and_then(Value::as_str)?,
+        _ => return None,
+    };
+    let name = name.trim();
+    (!name.is_empty() && !name.contains("${{")).then(|| name.to_owned())
+}
+
+/// Every secret one parsed job reads: every string the job carries, with `if`
+/// values read as whole expressions, engine-minted tokens dropped. `None` when
+/// the job cannot be walked at all, which no environment may be credited for.
+fn job_secret_names(job: &Job) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    collect_secret_names(&serde_json::to_value(job).ok()?, false, &mut names);
+    Some(names)
+}
+
+/// The secrets a workflow's own fields (`env:`, `run-name:`, `concurrency:`)
+/// read, which every job of the workflow inherits.
+fn workflow_fields_secret_names(workflow: &Workflow) -> Option<BTreeSet<String>> {
+    let Value::Object(mut fields) = serde_json::to_value(workflow).ok()? else {
+        return None;
+    };
+    fields.remove("jobs");
+    let mut names = BTreeSet::new();
+    collect_secret_names(&Value::Object(fields), false, &mut names);
+    Some(names)
+}
+
+/// Every secret the strings of `value` read, with `if` values taken as whole
+/// expressions.
+fn collect_secret_names(value: &Value, condition: bool, names: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => names.extend(
+            names_read_in(text, condition)
+                .into_iter()
+                .filter(|name| !is_engine_provided(name))
+                .map(str::to_owned),
+        ),
+        Value::Array(items) => {
+            for item in items {
+                collect_secret_names(item, false, names);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                collect_secret_names(item, key == "if", names);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 /// The secrets one target reads, with where the engine stores each.
 pub(super) fn secret_rows(scan: &Scan, stored: &Stored) -> Vec<SecretRow> {
     let repo = scan.target.repo.as_deref();
     let mut reads: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut reading: BTreeMap<String, ReadingEnvironments> = BTreeMap::new();
     for file in &scan.files {
+        let environments = read_environments(&file.path, &file.text);
         for read in secret_reads(&file.path, &file.text) {
             reads
-                .entry(read.name)
+                .entry(read.name.clone())
                 .or_default()
                 .insert(format!("{}:{}", read.path, read.line));
+            let job_environments = environments.get(&read.name);
+            let reading = reading.entry(read.name).or_default();
+            match job_environments {
+                Some(job_environments) => reading.extend(job_environments.iter().cloned()),
+                // A read no job's fields carry: nothing can be credited.
+                None => {
+                    reading.insert(None);
+                }
+            }
         }
     }
     reads
         .into_iter()
         .map(|(name, places)| {
-            let scope = stored.scope_of(&name, repo);
-            let stored_as = match scope {
-                Some(_) => None,
-                None => stored.spelled_differently(&name),
+            let reading = match reading.get(&name) {
+                Some(job_environments) => job_environments.clone(),
+                None => ReadingEnvironments::new(),
+            };
+            let scope = stored.scope_of_reads(&name, repo, &reading);
+            let environment_scope = match (&scope, repo) {
+                (None, Some(repo)) => stored.environment_scope_of(&name, repo),
+                _ => None,
+            };
+            let stored_as = match (&scope, &environment_scope) {
+                (None, None) => stored.spelled_differently(&name),
+                _ => None,
             };
             SecretRow {
                 name,
                 reads: places.into_iter().collect(),
                 scope,
+                environment_scope,
                 stored_as,
             }
         })
@@ -879,18 +1153,26 @@ pub(super) fn verdict_message(verdict: Verdict, label: &str, pool: &Pool) -> Str
     }
 }
 
-/// GitHub names architectures `X64`/`ARM64`; the engine declares
-/// `x86_64`/`aarch64` and nothing else, so say which one this host is.
+/// The engine's name for the architecture a label names, when it names one:
+/// GitHub spells them `X64`/`ARM64`, the engine `x86_64`/`aarch64`.
+fn engine_arch(label: &str) -> Option<&'static str> {
+    let label = label.trim();
+    if label.eq_ignore_ascii_case("X64") || label.eq_ignore_ascii_case("x86_64") {
+        return Some("x86_64");
+    }
+    if label.eq_ignore_ascii_case("ARM64") || label.eq_ignore_ascii_case("aarch64") {
+        return Some("aarch64");
+    }
+    None
+}
+
+/// Why a label for another architecture can never be served here.
 fn arch_note(label: &str, host_arch: &str) -> Option<String> {
-    let engine_arch = match label.to_ascii_uppercase().as_str() {
-        "X64" => "x86_64",
-        "ARM64" => "aarch64",
-        _ => return None,
-    };
+    let engine_arch = engine_arch(label)?;
     Some(if engine_arch == host_arch {
-        format!("{label} is GitHub's name for this host's {host_arch}")
+        format!("{label} is this host's architecture ({host_arch})")
     } else {
-        format!("{label} is GitHub's name for {engine_arch}, not this host's {host_arch}")
+        format!("{label} names {engine_arch}, not this host's {host_arch}")
     })
 }
 
@@ -952,11 +1234,17 @@ pub(super) fn label_report(scans: &[Scan], pool: &Pool) -> LabelReport {
                 }
                 if let Some(group) = request.group.as_deref() {
                     let label = format!("group: {group}");
-                    let verdict = if group.eq_ignore_ascii_case("default") {
-                        Verdict::Default
-                    } else {
-                        Verdict::RunnerGroup
-                    };
+                    // The scheduler parses the group as an integer and treats
+                    // the Default group's id (1) as the name `Default`
+                    // (`job_matches_runner_group`), so `1`, `01`, and `+1` all
+                    // name it.
+                    let group = group.trim();
+                    let verdict =
+                        if group.eq_ignore_ascii_case("default") || group.parse::<i64>() == Ok(1) {
+                            Verdict::Default
+                        } else {
+                            Verdict::RunnerGroup
+                        };
                     add_use(&mut rows, &label, &place, verdict);
                 }
                 for expression in &request.dynamic {
@@ -1016,6 +1304,10 @@ fn request_of(job: &str, runs_on: &RunsOn) -> RunsOnRequest {
         }
         RunsOn::Dynamic(Value::String(text)) => sort_label(text, &mut request),
         RunsOn::Dynamic(Value::Object(map)) => {
+            // `group:` is read as a string only, exactly as the engine's own
+            // `RunsOn::group()` reads it: an unquoted numeric group is dropped
+            // there, so the engine schedules such a job with no group
+            // constraint and this scan must not invent one.
             if let Some(group) = map.get("group").and_then(Value::as_str) {
                 if group.contains("${{") {
                     request.dynamic.push(group.to_owned());
@@ -1061,6 +1353,11 @@ pub(super) fn declare_line(pool: &Pool, report: &LabelReport) -> Option<String> 
         .iter()
         .filter(|row| row.verdict == Verdict::Undeclared)
     {
+        // A label for another architecture can never be served on this host,
+        // so declaring it would only advertise a runner that does not exist.
+        if engine_arch(&row.label).is_some_and(|arch| arch != pool.host_arch.as_str()) {
+            continue;
+        }
         let plain = !row.label.contains([',', ' ', '\t']);
         let known = declared
             .iter()
@@ -1154,11 +1451,18 @@ pub(super) fn secret_rows_json(scan: &Scan, rows: &[SecretRow]) -> Vec<Value> {
             } else {
                 None
             };
+            // Once the row is configured the environment is no longer the
+            // reason it would be missing, so it is not reported.
+            let environment_scope = match row.scope {
+                Some(_) => None,
+                None => row.environment_scope.as_deref(),
+            };
             json!({
                 "name": row.name,
                 "repo": repo,
                 "reads": row.reads,
                 "configured": row.scope,
+                "environment_scope": environment_scope,
                 "stored_as": row.stored_as,
                 "command": command,
             })
@@ -1228,14 +1532,42 @@ mod tests {
     }
 
     #[test]
-    fn secret_reads_skip_engine_tokens_comments_and_lookalikes() {
+    fn secret_reads_skip_engine_tokens_and_lookalikes() {
         let text = "a: ${{ secrets.GITHUB_TOKEN }}\n\
                     b: ${{ secrets.ACTIONS_RUNTIME_TOKEN }}\n\
                     c: ${{ mysecrets.NOT_A_SECRET }}\n\
                     d: ${{ my-secrets.NOT_EITHER }}\n\
-                    # e: ${{ secrets.COMMENTED_OUT }}\n\
                     secrets:\n  inherit: true\n";
         assert!(names(text).is_empty(), "{:?}", names(text));
+    }
+
+    #[test]
+    fn secret_reads_count_expressions_only() {
+        let text = "# uses secrets.FROM_COMMENT\n\
+                    run: echo \"kept in secrets.FROM_PROSE\"\n\
+                    env:\n\
+                    \x20 A: ${{ secrets.FROM_EXPRESSION }}\n\
+                    \x20 B: ${{ secrets['BRACKETED'] }}\n\
+                    \x20 C: ${{ SECRETS.UPPER_CONTEXT }}\n\
+                    rule: ${{ env.X }} > secrets.AFTER_EXPRESSION\n\
+                    if: secrets.FROM_CONDITION != ''\n\
+                    \x20 step:\n\
+                    \x20   - if: ${{ secrets.FROM_STEP_CONDITION }}\n\
+                    \x20     run: echo ${{ secrets.IN_STEP }}\n\
+                    \x20 run: |\n\
+                    \x20   # echo ${{ secrets.IN_RUN_BLOCK }}\n";
+        assert_eq!(
+            names(text),
+            vec![
+                ("FROM_EXPRESSION".to_owned(), 4),
+                ("BRACKETED".to_owned(), 5),
+                ("UPPER_CONTEXT".to_owned(), 6),
+                ("FROM_CONDITION".to_owned(), 8),
+                ("FROM_STEP_CONDITION".to_owned(), 10),
+                ("IN_STEP".to_owned(), 11),
+                ("IN_RUN_BLOCK".to_owned(), 13),
+            ]
+        );
     }
 
     #[test]
@@ -1278,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_secrets_report_the_most_specific_scope_and_match_exactly() {
+    fn stored_secrets_report_the_most_specific_ready_scope_and_match_exactly() {
         let stored = Stored::from_listing(&[
             (
                 "OP_SERVICE_ACCOUNT_TOKEN".to_owned(),
@@ -1293,17 +1625,42 @@ mod tests {
             ("NPM_TOKEN".to_owned(), None, None),
             ("op_lower".to_owned(), None, None),
         ]);
+        let reading = |environment: Option<&str>| -> ReadingEnvironments {
+            BTreeSet::from([environment.map(str::to_owned)])
+        };
         assert_eq!(
             stored
                 .scope_of("OP_SERVICE_ACCOUNT_TOKEN", Some("o/r"))
                 .as_deref(),
-            Some("repository o/r")
+            Some("repository o/r"),
+            "the repository tier reaches every job"
         );
         assert_eq!(
-            stored.scope_of("DEPLOY_KEY", Some("o/r")).as_deref(),
-            Some("environment prod of o/r")
+            stored
+                .scope_of_reads("DEPLOY_KEY", Some("o/r"), &reading(Some("prod")))
+                .as_deref(),
+            Some("environment prod of o/r"),
+            "the reading job declares the environment the tier is stored for"
         );
-        assert_eq!(stored.scope_of("DEPLOY_KEY", Some("other/x")), None);
+        assert_eq!(
+            stored.scope_of_reads("DEPLOY_KEY", Some("o/r"), &reading(Some("staging"))),
+            None,
+            "another environment's jobs are not supplied"
+        );
+        assert_eq!(
+            stored.scope_of_reads("DEPLOY_KEY", Some("o/r"), &reading(None)),
+            None,
+            "a job with no environment is not supplied"
+        );
+        assert_eq!(
+            stored.environment_scope_of("DEPLOY_KEY", "o/r").as_deref(),
+            Some("environment prod of o/r"),
+            "the tier it is stored in is named instead"
+        );
+        assert_eq!(
+            stored.scope_of_reads("DEPLOY_KEY", Some("other/x"), &reading(Some("prod"))),
+            None
+        );
         assert_eq!(
             stored.scope_of("NPM_TOKEN", Some("other/x")).as_deref(),
             Some("global")
@@ -1312,6 +1669,77 @@ mod tests {
         assert_eq!(
             stored.spelled_differently("OP_LOWER").as_deref(),
             Some("op_lower")
+        );
+    }
+
+    #[test]
+    fn an_environment_only_secret_is_ready_only_for_a_job_that_declares_it() {
+        let stored = Stored::from_listing(&[(
+            "DEPLOY_KEY".to_owned(),
+            Some("o/r".to_owned()),
+            Some("prod".to_owned()),
+        )]);
+        let rows_for = |job: &str| {
+            let text = format!(
+                "on: push\njobs:\n  deploy:\n{job}    runs-on: ubuntu-latest\n    \
+                 steps:\n      - run: deploy --key ${{{{ secrets.DEPLOY_KEY }}}}\n"
+            );
+            let scan = scan_with(
+                Some("o/r"),
+                &[(".github/workflows/deploy.yml", text.as_str())],
+            );
+            secret_rows(&scan, &stored)
+        };
+        // The job declares the environment the tier is stored for: the engine
+        // supplies the value.
+        let rows = rows_for("    environment: prod\n");
+        assert_eq!(rows[0].scope.as_deref(), Some("environment prod of o/r"));
+        assert_eq!(secrets_decision(&rows), "ok");
+        // Any other job — none, another environment, one that only resolves at
+        // run time — gets no value, so the read is missing and the tier it is
+        // stored in is named.
+        for job in [
+            "",
+            "    environment: staging\n",
+            "    environment: ${{ inputs.stage }}\n",
+        ] {
+            let rows = rows_for(job);
+            assert_eq!(rows[0].scope, None, "{job:?}");
+            assert_eq!(
+                rows[0].environment_scope.as_deref(),
+                Some("environment prod of o/r"),
+                "{job:?}"
+            );
+            assert_eq!(
+                rows[0].status(),
+                "MISSING (stored only in environment prod of o/r)"
+            );
+            assert_eq!(secrets_decision(&rows), "missing");
+        }
+        // One reading job without the environment is enough to fail the whole
+        // read, wherever the other reads and the workflow's own fields sit.
+        let text = "on: push\nenv:\n  KEY: ${{ secrets.DEPLOY_KEY }}\njobs:\n  \
+                    deploy:\n    environment: prod\n    runs-on: ubuntu-latest\n    \
+                    steps:\n      - run: echo $KEY\n  \
+                    test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $KEY\n";
+        let scan = scan_with(Some("o/r"), &[(".github/workflows/deploy.yml", text)]);
+        let rows = secret_rows(&scan, &stored);
+        assert_eq!(rows[0].scope, None);
+        assert_eq!(secrets_decision(&rows), "missing");
+        // A read no job carries — a composite action, a workflow that does not
+        // parse — is credited to no environment either.
+        let action = scan_with(
+            Some("o/r"),
+            &[(
+                ".github/actions/deploy/action.yml",
+                "runs:\n  using: composite\n  steps:\n    - run: echo ${{ secrets.DEPLOY_KEY }}\n",
+            )],
+        );
+        let rows = secret_rows(&action, &stored);
+        assert_eq!(rows[0].scope, None);
+        assert_eq!(
+            rows[0].environment_scope.as_deref(),
+            Some("environment prod of o/r")
         );
     }
 
@@ -1389,6 +1817,40 @@ mod tests {
             vec![".github/actions/x/action.yml", ".github/workflows/ci.yml"]
         );
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn deep_composite_actions_are_read_by_both_paths() {
+        // The engine has no depth limit for composite actions, so a checkout
+        // scan and a GitHub tree listing must both read an action nested
+        // deeper than any walk limit used to stop at.
+        let deep = format!(
+            ".github/actions/{}/action.yml",
+            (1..=10)
+                .map(|depth| depth.to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        let tree = json!({"tree": [
+            {"path": ".github/workflows/ci.yml", "type": "blob"},
+            {"path": deep, "type": "blob"},
+        ]});
+        assert_eq!(
+            workflow_paths(&tree),
+            vec![deep.clone(), ".github/workflows/ci.yml".to_owned()]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nested = (1..=10).map(|depth| depth.to_string()).collect::<PathBuf>();
+        let action = root.join(".github/actions").join(nested).join("action.yml");
+        std::fs::create_dir_all(action.parent().unwrap()).unwrap();
+        std::fs::write(&action, "runs: {}\n").unwrap();
+        let mut notes = Vec::new();
+        let files = scan_checkout(root, &mut notes);
+        assert!(notes.is_empty());
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, vec![deep.as_str()]);
     }
 
     #[test]
@@ -1479,14 +1941,26 @@ mod tests {
     #[test]
     fn arch_labels_name_the_engine_architecture() {
         let pool = pool(OFFICIAL_GOLDEN);
-        let x64 = verdict_message(Verdict::Undeclared, "X64", &pool);
-        assert!(
-            x64.contains("GitHub's name for this host's x86_64"),
-            "{x64}"
+        assert_eq!(
+            arch_note("X64", &pool.host_arch).as_deref(),
+            Some("X64 is this host's architecture (x86_64)")
         );
+        assert_eq!(
+            arch_note("x86_64", &pool.host_arch).as_deref(),
+            Some("x86_64 is this host's architecture (x86_64)")
+        );
+        assert_eq!(
+            arch_note("ARM64", &pool.host_arch).as_deref(),
+            Some("ARM64 names aarch64, not this host's x86_64")
+        );
+        assert_eq!(
+            arch_note("aarch64", &pool.host_arch).as_deref(),
+            Some("aarch64 names aarch64, not this host's x86_64")
+        );
+        assert_eq!(arch_note("gpu-box", &pool.host_arch), None);
         let arm = verdict_message(Verdict::Undeclared, "ARM64", &pool);
         assert!(
-            arm.contains("GitHub's name for aarch64, not this host's x86_64"),
+            arm.contains("ARM64 names aarch64, not this host's x86_64"),
             "{arm}"
         );
     }
@@ -1547,23 +2021,49 @@ mod tests {
             Some("o/r"),
             &[(
                 ".github/workflows/groups.yml",
-                "on: push\njobs:\n  default:\n    runs-on:\n      group: Default\n      labels: [self-hosted]\n  external:\n    runs-on:\n      group: mac-pool\n      labels: [Linux]\n",
+                "on: push\njobs:\n  named:\n    runs-on:\n      group: Default\n      labels: [self-hosted]\n  by_id:\n    runs-on:\n      group: '1'\n      labels: [self-hosted]\n  padded_id:\n    runs-on:\n      group: \"01\"\n      labels: [self-hosted]\n  signed_id:\n    runs-on:\n      group: '+1'\n      labels: [self-hosted]\n  unquoted:\n    runs-on:\n      group: 1\n      labels: [self-hosted]\n  external:\n    runs-on:\n      group: mac-pool\n      labels: [Linux]\n",
             )],
         );
         let report = label_report(&[scan], &pool);
-        let default_group = report
-            .rows
-            .iter()
-            .find(|row| row.label == "group: Default")
-            .expect("default group row");
-        assert_eq!(default_group.verdict, Verdict::Default);
-        let external_group = report
-            .rows
-            .iter()
-            .find(|row| row.label == "group: mac-pool")
-            .expect("external group row");
-        assert_eq!(external_group.verdict, Verdict::RunnerGroup);
+        let row = |label: &str| {
+            report
+                .rows
+                .iter()
+                .find(|row| row.label == label)
+                .unwrap_or_else(|| panic!("{label} row"))
+        };
+        // The scheduler parses the group as an integer, so `1`, `01`, and `+1`
+        // all name the Default group, like the name `Default` itself.
+        for label in ["group: Default", "group: 1", "group: 01", "group: +1"] {
+            assert_eq!(row(label).verdict, Verdict::Default, "{label}");
+        }
+        // An unquoted numeric group is not a string and the engine's own
+        // `RunsOn::group()` drops it: such a job schedules with no group
+        // constraint, so only the quoted job carries the `group: 1` row.
+        assert_eq!(row("group: 1").uses.len(), 1, "{:?}", row("group: 1").uses);
+        assert!(row("group: 1").uses[0].contains("by_id"));
+        assert_eq!(row("group: mac-pool").verdict, Verdict::RunnerGroup);
         assert_eq!(report.decision(), "warning");
+    }
+
+    #[test]
+    fn the_declare_line_skips_labels_of_another_architecture() {
+        let pool = pool(OFFICIAL_GOLDEN);
+        let scan = scan_with(
+            Some("o/r"),
+            &[(
+                ".github/workflows/agents.yml",
+                "on: push\njobs:\n  arm:\n    runs-on: ARM64\n  engine_arm:\n    runs-on: aarch64\n  same_host:\n    runs-on: X64\n  gpu:\n    runs-on: gpu-box\n",
+            )],
+        );
+        let report = label_report(&[scan], &pool);
+        // `X64` names this host, so its jobs could be served by declaring it;
+        // `ARM64` and `aarch64` name the other architecture, so declaring them
+        // would advertise a runner that cannot serve those jobs.
+        assert_eq!(
+            declare_line(&pool, &report).as_deref(),
+            Some("PRELOOP_RUNNER_LABELS=custom-lab,gpu-box,X64")
+        );
     }
 
     #[test]
@@ -1583,6 +2083,18 @@ mod tests {
             encode_path(".github/workflows/a b.yml"),
             ".github/workflows/a%20b.yml"
         );
+    }
+
+    #[tokio::test]
+    async fn a_repo_that_is_not_a_slug_is_refused_before_any_request() {
+        let config = ConfigFile::default();
+        for bad in ["o/r/../../app/hook/deliveries", "o/r?x=1", "o/r#f", "a/b/c"] {
+            let error = fetch_repo(&config, bad).await.unwrap_err();
+            assert!(
+                error.contains("owner/repository"),
+                "{bad} was not refused before a request: {error}"
+            );
+        }
     }
 
     #[test]

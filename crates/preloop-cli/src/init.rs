@@ -341,7 +341,7 @@ struct Session {
     from_serve: bool,
 }
 
-/// The answers the four steps produce, before any of them is applied.
+/// The answers the five steps produce, before any of them is applied.
 #[derive(Debug)]
 struct Answers {
     auth: AuthChoice,
@@ -397,10 +397,80 @@ fn oversized_archive_warning(bytes: u64, what: &str) -> Option<String> {
     })
 }
 
+/// The base image the engine will actually fork jobs from, in the engine's own
+/// precedence (`preloop_runner_server::config::golden_base_image`): a non-blank
+/// `PRELOOP_RUNNER_BASE_IMAGE` override, else the `[golden]` section, else the
+/// packed official golden. The resolver itself cannot be called here — the
+/// config file still holds the pre-wizard golden until the run ends — so
+/// `chosen` stands in for the `[golden]` section.
+fn effective_base_image(chosen: Option<&str>) -> String {
+    if let Ok(value) = std::env::var(preloop_runner_server::config::BASE_IMAGE_ENV)
+        && !value.trim().is_empty()
+    {
+        return value;
+    }
+    chosen
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(OFFICIAL_GOLDEN)
+        .to_owned()
+}
+
+/// Escape control characters in human-report lines — `runs-on` labels, file
+/// paths, parser messages — as visible `\x1b`-style text: a crafted workflow
+/// must not be able to move the cursor, retitle the terminal, or inject an
+/// ANSI sequence into `init`'s output. Mirrors `sanitize_console_text` in
+/// `preloop-dap`, except the bytes are shown rather than dropped, so the
+/// reader still sees what the workflow said. C0 controls, DEL, and C1
+/// (ESC included) are all escaped.
+fn escape_control(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_owned();
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            let code = character as u32;
+            if code <= 0xff {
+                escaped.push_str(&format!("\\x{code:02x}"));
+            } else {
+                escaped.push_str(&format!("\\u{{{code:x}}}"));
+            }
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+/// The scope label a successful write leaves `name` at, named by the same
+/// [`workflows::Stored`] view the report looks names up in, so the two cannot
+/// drift.
+fn stored_scope(name: &str, repo: Option<&str>) -> Option<String> {
+    workflows::Stored::from_listing(&[(name.to_owned(), repo.map(str::to_owned), None)])
+        .scope_of(name, repo)
+}
+
+/// Apply one successful interactive `secret set` to the rows it satisfies: a
+/// row that read `name` for this target is now configured at the scope the
+/// write used. Returns whether any row changed.
+fn mark_stored(rows: &mut [workflows::SecretRow], name: &str, repo: Option<&str>) -> bool {
+    let scope = stored_scope(name, repo);
+    let mut changed = false;
+    for row in rows
+        .iter_mut()
+        .filter(|row| row.name == name && row.scope.is_none())
+    {
+        row.scope = scope.clone();
+        row.stored_as = None;
+        changed = true;
+    }
+    changed
+}
+
 impl Session {
     fn section(&self, title: &str) {
         if !self.json {
-            println!("\n{title}");
+            println!("\n{}", escape_control(title));
         }
     }
 
@@ -414,7 +484,7 @@ impl Session {
 
     fn note(&self, line: &str) {
         if !self.json {
-            println!("    {line}");
+            println!("    {}", escape_control(line));
         }
     }
 
@@ -435,11 +505,18 @@ impl Session {
         }
 
         self.section("Applying your answers:");
-        if answers.auth_unchanged {
+        // The URL the App flow resolved is also the engine's own public origin:
+        // Check Run detail links and the webhook drift check read
+        // `PRELOOP_PUBLIC_URL`, and the run mode that starts is the only thing
+        // that can carry the answer there (for the service, its environment
+        // file is written now — it does not inherit this shell).
+        let public_url = if answers.auth_unchanged {
             self.report_stored_credentials(&config, &args).await?;
+            engine_public_url(&args, None)
         } else {
-            self.configure_credentials(&args, answers.auth).await?;
-        }
+            let answer = self.configure_credentials(&args, answers.auth).await?;
+            engine_public_url(&args, answer.as_ref())
+        };
         let decision = if answers.golden_unchanged {
             let decision = decision_from_config(&config, &answers.golden).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -479,6 +556,11 @@ impl Session {
             "step": "done",
             "decision": answers.mode.as_str(),
             "config_path": written,
+            // What the run mode this run starts is handed. It is not written
+            // to the config file: `serve` reads PRELOOP_PUBLIC_URL (or
+            // --public-url), and the installer renders it into the service's
+            // own environment file.
+            "public_url": public_url.as_deref(),
             "golden": {
                 "kind": decision.kind.as_str(),
                 "base_image": decision.base_image,
@@ -486,7 +568,8 @@ impl Session {
             },
             "preflight": preflight,
         }));
-        self.start_mode(answers.mode, observability, &written).await
+        self.start_mode(answers.mode, observability, &written, public_url.as_deref())
+            .await
     }
 
     // -- step 0: answers -------------------------------------------------
@@ -503,7 +586,7 @@ impl Session {
         if !self.json {
             println!(
                 "preloop init — configuring {}\n\
-                 Four steps; press Enter to keep the current answer.",
+                 Five steps; press Enter to keep the current answer.",
                 preloop_runner_server::config::config_path().display()
             );
         }
@@ -807,8 +890,9 @@ impl Session {
         self.note(&format!("kept: {summary}"));
         if args.public_url.is_some() {
             self.note(
-                "--public-url applies when the credential is created or changed; to point \
-                 the kept App's webhook at it: preloop setup github --via app --public-url <URL>",
+                "the kept credential is not reconfigured, but the engine this run starts will \
+                 use --public-url; to point the kept App's webhook at it: \
+                 preloop setup github --via app --public-url <URL>",
             );
         }
         let verify = if args.repos.is_empty() {
@@ -824,11 +908,13 @@ impl Session {
         Ok(())
     }
 
+    /// The stable URL the App flow resolved, when it asked one: the run mode
+    /// this run starts needs it too (see [`engine_public_url`]).
     async fn configure_credentials(
         &mut self,
         args: &InitArgs,
         auth: AuthChoice,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<PublicUrlAnswer>> {
         self.section("1/5 Credentials:");
         match auth {
             AuthChoice::None => {
@@ -836,7 +922,7 @@ impl Session {
                     "local only — no GitHub credential written; existing ones are left alone",
                 );
                 self.emit(json!({"step": "credentials", "decision": "none", "result": {}}));
-                return Ok(());
+                return Ok(None);
             }
             AuthChoice::App => self.note("GitHub App"),
             AuthChoice::Pat => self.note("fine-grained PAT"),
@@ -925,7 +1011,7 @@ impl Session {
             "result": result,
             "log": log,
         }));
-        Ok(())
+        Ok(stable_url)
     }
 
     /// Verify the stored credential live, the way `preloop doctor` does.
@@ -999,8 +1085,9 @@ impl Session {
     }
 
     /// The stable-URL answer for an App flow: `--public-url`, else a usable
-    /// `PRELOOP_PUBLIC_URL`, else one prompt on a terminal. Blank skips, and the
-    /// App is then created without a webhook.
+    /// `PRELOOP_PUBLIC_URL`, else one prompt on a terminal. The prompt takes a
+    /// URL directly, a detected tailnet name on Enter, or `-` to skip — and an
+    /// App created without a webhook never triggers on pushes or pull requests.
     fn public_url_answer(
         &mut self,
         flag: Option<&str>,
@@ -1036,30 +1123,30 @@ impl Session {
                 source: "skipped",
             });
         }
-        for line in PUBLIC_URL_EXPLAINER {
-            self.note(line);
+        // A Tailscale host already has a stable HTTPS name (Funnel/Serve
+        // publish under it), so offer it instead of making the operator look
+        // one up. Detection is best effort: no tailscale, no suggestion.
+        let suggestion = detected_public_url();
+        for line in public_url_help(suggestion.as_deref()) {
+            self.note(&line);
         }
         loop {
-            let answer = self.read_line("    public URL (blank = skip, local only): ")?;
-            if answer.is_empty() {
-                self.note_no_public_url();
-                return Ok(PublicUrlAnswer {
-                    url: None,
-                    source: "skipped",
-                });
-            }
-            match validate_public_url(&answer) {
-                Ok(url) => {
+            let answer = self.read_line(&public_url_prompt(suggestion.as_deref()))?;
+            match read_public_url(&answer, suggestion.as_deref()) {
+                UrlInput::Use { url, source } => {
                     return Ok(PublicUrlAnswer {
                         url: Some(url),
-                        source: "prompt",
+                        source,
                     });
                 }
-                Err(reason) => {
-                    self.note(&format!(
-                        "{reason}; enter an https:// address, or leave it blank"
-                    ));
+                UrlInput::Skip => {
+                    self.note_no_public_url();
+                    return Ok(PublicUrlAnswer {
+                        url: None,
+                        source: "skipped",
+                    });
                 }
+                UrlInput::Retry(reason) => self.note(&reason),
             }
         }
     }
@@ -1321,10 +1408,11 @@ impl Session {
         self.section("3/5 Workflows: secrets and runner labels");
         let config = load_config().context("reading the engine config")?;
         let checkout = workflows::checkout_root();
-        let origin = checkout
-            .as_ref()
-            .map(|_| crate::detect_repository())
-            .filter(|repo| !repo.starts_with("local/"));
+        // A checkout with no `origin` keeps its `local/<dir>` identity: it is
+        // the scope local workflow submissions store and read secrets under,
+        // so dropping it would report those secrets missing and offer to
+        // store them globally instead.
+        let origin = checkout.as_ref().map(|_| crate::detect_repository());
         let targets = workflows::targets(&args.repos, checkout.as_deref(), origin.as_deref());
         if targets.is_empty() {
             self.note(
@@ -1353,10 +1441,15 @@ impl Session {
             }
         }
         self.workflow_secrets(args, &config, &scans).await?;
+        // The pool's golden is the image the engine will actually fork jobs
+        // from: `PRELOOP_RUNNER_BASE_IMAGE`, else this run's choice, else the
+        // official golden. Classifying the labels against the wizard's choice
+        // alone would claim `ubuntu-22.04` runs on the official golden while
+        // an override makes the engine run it on the override.
         let pool = workflows::Pool::new(
             crate::runner_pool_labels(),
             std::env::consts::ARCH,
-            golden.base_image.as_deref().unwrap_or(OFFICIAL_GOLDEN),
+            &effective_base_image(golden.base_image.as_deref()),
         );
         self.workflow_labels(&scans, &pool);
         Ok(())
@@ -1381,17 +1474,13 @@ impl Session {
             return Ok(());
         }
         let (stored, stored_in) = Self::stored_secret_names(config).await;
-        let per_target: Vec<_> = scans
+        let mut per_target: Vec<_> = scans
             .iter()
             .filter(|scan| scan.skipped.is_none())
             .map(|scan| (scan, workflows::secret_rows(scan, &stored)))
             .collect();
         self.note(&format!("secrets (checked against the {stored_in}):"));
-        let mut json_secrets = Vec::new();
-        let mut all_rows = Vec::new();
-        let mut missing: Vec<(String, Option<String>)> = Vec::new();
         for (scan, rows) in &per_target {
-            json_secrets.extend(workflows::secret_rows_json(scan, rows));
             if rows.is_empty() {
                 self.note(&format!("{}: none read", workflows::target_name(scan)));
                 continue;
@@ -1410,24 +1499,31 @@ impl Session {
             for line in workflows::table(&["SECRET", "READ IN", "CONFIGURED"], &cells) {
                 self.note(&format!("  {line}"));
             }
-            missing.extend(
-                rows.iter()
-                    .filter(|row| row.scope.is_none())
-                    .map(|row| (row.name.clone(), scan.target.repo.clone())),
-            );
-            all_rows.extend(rows.iter().cloned());
         }
-        if self.interactive && !missing.is_empty() {
-            let mut stored_now = Vec::new();
-            for pair in &missing {
-                let (name, repo) = pair;
-                if workflows::set_command(name, repo.as_deref()).is_none() {
+        // The rows the interactive pass can fix, by position in `per_target`.
+        let mut missing_at: Vec<(usize, usize)> = Vec::new();
+        for (target_index, (_, rows)) in per_target.iter().enumerate() {
+            for (row_index, row) in rows.iter().enumerate() {
+                if row.scope.is_none() {
+                    missing_at.push((target_index, row_index));
+                }
+            }
+        }
+        if self.interactive && !missing_at.is_empty() {
+            for &(target_index, row_index) in &missing_at {
+                let (name, repo) = {
+                    let (scan, rows) = &per_target[target_index];
+                    (rows[row_index].name.clone(), scan.target.repo.clone())
+                };
+                if workflows::set_command(&name, repo.as_deref()).is_none() {
                     continue;
                 }
-                let scope = repo
-                    .as_deref()
-                    .map_or_else(|| "globally".to_owned(), |repo| format!("for {repo}"));
-                if !self.ask_bool(&format!("    set {name} {scope} now? [y/N] "), false)? {
+                let scope = repo.as_deref().map_or_else(
+                    || "globally".to_owned(),
+                    |repo| format!("for {}", escape_control(repo)),
+                );
+                let prompt = format!("    set {} {scope} now? [y/N] ", escape_control(&name));
+                if !self.ask_bool(&prompt, false)? {
                     continue;
                 }
                 let command = github_setup::SecretCommand::Set {
@@ -1437,11 +1533,28 @@ impl Session {
                     env: None,
                 };
                 match github_setup::cmd_secret(github_setup::SecretArgs { command }).await {
-                    Ok(()) => stored_now.push(pair.clone()),
+                    Ok(()) => {
+                        // The write succeeded, so the row is configured at the
+                        // scope it was written to: the table, the JSON entries,
+                        // and the decision below all come from that state.
+                        let (_, rows) = &mut per_target[target_index];
+                        mark_stored(rows, &name, repo.as_deref());
+                    }
                     Err(error) => self.note(&format!("not set: {error:#}")),
                 }
             }
-            missing.retain(|pair| !stored_now.contains(pair));
+        }
+        let mut json_secrets = Vec::new();
+        let mut all_rows = Vec::new();
+        let mut missing: Vec<(String, Option<String>)> = Vec::new();
+        for (scan, rows) in &per_target {
+            json_secrets.extend(workflows::secret_rows_json(scan, rows));
+            missing.extend(
+                rows.iter()
+                    .filter(|row| row.scope.is_none())
+                    .map(|row| (row.name.clone(), scan.target.repo.clone())),
+            );
+            all_rows.extend(rows.iter().cloned());
         }
         let commands: Vec<String> = missing
             .iter()
@@ -1752,6 +1865,7 @@ impl Session {
         mode: RunMode,
         observability: Option<preloop_observability::Observability>,
         config_path: &Path,
+        public_url: Option<&str>,
     ) -> anyhow::Result<()> {
         match mode {
             RunMode::Configure => {
@@ -1763,6 +1877,15 @@ impl Session {
                         "configure only: `preloop serve` reads {} on its next start",
                         config_path.display()
                     );
+                    if let Some(url) = public_url {
+                        // Nothing here starts, and the config file does not
+                        // hold the URL: without this the answer is lost the
+                        // moment the wizard exits.
+                        println!(
+                            "public URL {url} — start `serve` with PRELOOP_PUBLIC_URL={url} \
+                             (or --public-url {url}) to keep using it"
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1789,7 +1912,7 @@ impl Session {
                         state_dir.join("preloop.db").display()
                     );
                 }
-                crate::cmd_engine(crate::ServeArgs::default(), observability).await
+                crate::cmd_engine(serve_args_for(public_url), observability).await
             }
             RunMode::Service => {
                 ensure_service_root()?;
@@ -1797,7 +1920,10 @@ impl Session {
                     println!("installing the control plane as a service…");
                 }
                 let home = std::env::var_os("PRELOOP_HOME").map(PathBuf::from);
-                crate::server_install::run(crate::server_install::install_args(home))
+                crate::server_install::run(crate::server_install::install_args(
+                    home,
+                    public_url.map(str::to_owned),
+                ))
             }
         }
     }
@@ -2052,17 +2178,157 @@ fn credential_summary(config: &ConfigFile) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublicUrlAnswer {
     url: Option<String>,
-    /// `flag`, `env`, `prompt`, or `skipped`.
+    /// `flag`, `env`, `prompt`, `suggested`, or `skipped`.
     source: &'static str,
 }
 
-/// Why the stable-URL question is asked, in the wizard's own words.
-const PUBLIC_URL_EXPLAINER: [&str; 4] = [
+/// The URL the run mode this run starts (or installs) is handed, so Check Run
+/// detail links and the webhook health check use the address GitHub was given
+/// instead of the loopback default.
+///
+/// The App flow's own answer wins — it may have come from the prompt — and
+/// without one (`--auth pat`, `--auth none`, or a kept credential)
+/// `--public-url` and then `PRELOOP_PUBLIC_URL` are read the same way
+/// `preloop serve` reads them. A value that does not validate is dropped:
+/// `serve` would fall back to loopback anyway, and only the App flow, which has
+/// to give GitHub a working URL, refuses the input outright.
+fn engine_public_url(args: &InitArgs, answer: Option<&PublicUrlAnswer>) -> Option<String> {
+    if let Some(answer) = answer {
+        return answer.url.clone();
+    }
+    args.public_url
+        .clone()
+        .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
+        .and_then(|raw| validate_public_url(&raw).ok())
+}
+
+/// `serve` args for the foreground mode: `serve`'s own defaults plus the URL
+/// resolved above. `None` keeps `serve`'s fallback (`PRELOOP_PUBLIC_URL`, then
+/// loopback) untouched.
+fn serve_args_for(public_url: Option<&str>) -> crate::ServeArgs {
+    crate::ServeArgs {
+        public_url: public_url.map(str::to_owned),
+        ..crate::ServeArgs::default()
+    }
+}
+
+/// Why the stable-URL question is asked, and how to get one, in the wizard's
+/// own words. Whatever fronts the engine must publish *only*
+/// `/api/v1/github/webhooks`: the port also serves runner registration, which
+/// no tunnel should expose (docs/self-hosting.md, "Exposure options").
+const PUBLIC_URL_HELP: [&str; 8] = [
     "PR status checks and push-triggered runs need GitHub to reach this engine at a stable",
-    "HTTPS URL. Use Tailscale Funnel, a Cloudflare *named* Tunnel (quick tunnels change on",
-    "restart and break the App's webhook), or your own domain behind a reverse proxy.",
-    "Expose only /api/v1/github/webhooks; everything else can stay private.",
+    "HTTPS URL — only /api/v1/github/webhooks may be public, never the whole port (it also",
+    "serves runner registration). Tailscale Funnel, mounted at just that path:",
+    "  tailscale funnel --set-path=/api/v1/github/webhooks --bg http://127.0.0.1:9090/api/v1/github/webhooks",
+    "(use your PRELOOP_LISTEN port in place of 9090)",
+    "Alternatives: a Cloudflare *named* Tunnel (quick tunnels change on restart and break the",
+    "App's webhook) behind a path-filtering proxy, or your own domain + reverse proxy — see",
+    "docs/self-hosting.md, \"Exposure options\".",
 ];
+
+/// What one line at the URL prompt means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UrlInput {
+    /// A usable URL, and whether the operator typed it or accepted the
+    /// suggestion.
+    Use { url: String, source: &'static str },
+    /// Webhooks stay off.
+    Skip,
+    /// Refused, with the reason to show before asking again.
+    Retry(String),
+}
+
+/// Read one answer to the URL question. Blank is the suggestion when there is
+/// one, and `-` skips in either case (webhooks off, said plainly).
+fn read_public_url(input: &str, suggestion: Option<&str>) -> UrlInput {
+    if input.is_empty() {
+        return match suggestion {
+            Some(url) => UrlInput::Use {
+                url: url.to_owned(),
+                source: "suggested",
+            },
+            None => UrlInput::Skip,
+        };
+    }
+    if input == "-" {
+        return UrlInput::Skip;
+    }
+    match validate_public_url(input) {
+        Ok(url) => UrlInput::Use {
+            url,
+            source: "prompt",
+        },
+        Err(reason) => {
+            let way_out = match suggestion {
+                Some(_) => "type \"-\" to leave webhooks off",
+                None => "leave it blank to skip",
+            };
+            UrlInput::Retry(format!("{reason}; enter an https:// address, or {way_out}"))
+        }
+    }
+}
+
+/// The prompt for the URL question. A detected URL is one keystroke away;
+/// without one the only safe default is to skip, so the wizard asks for a URL
+/// rather than suggesting an address GitHub could not reach.
+fn public_url_prompt(suggestion: Option<&str>) -> String {
+    match suggestion {
+        Some(url) => format!("    public URL [{url}] (\"-\" skips, webhooks off): "),
+        None => "    public URL (blank = skip, local only): ".to_owned(),
+    }
+}
+
+/// The explanation shown before the prompt, with the detected URL called out:
+/// an accepted suggestion must never look like something `init` invented.
+fn public_url_help(suggestion: Option<&str>) -> Vec<String> {
+    let mut lines: Vec<String> = PUBLIC_URL_HELP
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect();
+    lines.push(match suggestion {
+        Some(url) => format!("detected on this host with tailscale, Enter accepts it: {url}"),
+        None => {
+            "no stable URL detected here — type the one your tunnel or proxy publishes".to_owned()
+        }
+    });
+    lines
+}
+
+/// A stable HTTPS URL this host probably already has: the tailnet's own name
+/// for this machine, which Tailscale Funnel and Serve publish under. Best
+/// effort and never fatal — no tailscale, a stopped daemon, or an unreadable
+/// answer all mean "no suggestion" rather than a wizard failure.
+fn detected_public_url() -> Option<String> {
+    let tailscale = find_on_path("tailscale")?;
+    let output = std::process::Command::new(tailscale)
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    tailnet_public_url(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `tailscale status --json`'s name for this machine as a URL
+/// (`https://<machine>.<tailnet>.ts.net`). Tailscale writes it as an FQDN with
+/// a trailing dot, and a node that is not up has a name GitHub could not reach
+/// either, so anything that does not validate is not offered.
+fn tailnet_public_url(status_json: &str) -> Option<String> {
+    let status: Value = serde_json::from_str(status_json).ok()?;
+    // The daemon's own verdict on the tailnet link: "Stopped", "NeedsLogin",
+    // and friends still report a DNS name.
+    if status.get("BackendState")?.as_str()? != "Running" {
+        return None;
+    }
+    let dns_name = status
+        .get("Self")?
+        .get("DNSName")?
+        .as_str()?
+        .trim_end_matches('.');
+    validate_public_url(&format!("https://{dns_name}")).ok()
+}
 
 /// Check the URL GitHub will deliver webhooks to, and return it without a
 /// trailing slash. Refused: anything but https, a loopback or `localhost` host
@@ -3014,6 +3280,201 @@ mod tests {
         assert!(error.to_string().contains("https://"), "{error}");
     }
 
+    /// The chosen URL is not only what the App's webhook gets: the run mode
+    /// this run starts must carry it too, or Check Run detail links and the
+    /// webhook health check stay on the loopback default. The kept-credential
+    /// path never reaches `configure_credentials`, so it resolves the URL from
+    /// `--public-url`/`PRELOOP_PUBLIC_URL` there.
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_chosen_url_reaches_serve_and_the_service_install() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let mut args = InitArgs {
+            public_url: Some(" https://flag.example.com/ ".to_owned()),
+            ..InitArgs::default()
+        };
+        // No App answer (PAT, `--auth none`, or a kept credential): the flag.
+        assert_eq!(
+            engine_public_url(&args, None).as_deref(),
+            Some("https://flag.example.com")
+        );
+        assert_eq!(
+            serve_args_for(engine_public_url(&args, None).as_deref())
+                .public_url
+                .as_deref(),
+            Some("https://flag.example.com"),
+            "the foreground engine must start with the URL GitHub was given"
+        );
+        // Without one, `serve` keeps its own fallback (PRELOOP_PUBLIC_URL, then
+        // loopback): nothing here may invent an address for it.
+        assert_eq!(serve_args_for(None).public_url, None);
+
+        // The App flow's answer — possibly accepted from the prompt — wins.
+        let answer = PublicUrlAnswer {
+            url: Some("https://tail.example.ts.net".to_owned()),
+            source: "suggested",
+        };
+        assert_eq!(
+            engine_public_url(&args, Some(&answer)).as_deref(),
+            Some("https://tail.example.ts.net")
+        );
+        // A skipped answer is still an answer: webhooks stay off on purpose.
+        let skipped = PublicUrlAnswer {
+            url: None,
+            source: "skipped",
+        };
+        assert_eq!(engine_public_url(&args, Some(&skipped)), None);
+
+        // The kept-credential path has no App answer to hand over, so the
+        // environment stands in for the flag there.
+        args.public_url = None;
+        let previous = std::env::var_os("PRELOOP_PUBLIC_URL");
+        // SAFETY: TEST_ENV_LOCK serializes this process-global env access; the
+        // value read above is restored below.
+        unsafe { std::env::set_var("PRELOOP_PUBLIC_URL", "https://env.example.com/") };
+        assert_eq!(
+            engine_public_url(&args, None).as_deref(),
+            Some("https://env.example.com"),
+            "a kept credential still needs the engine's public origin"
+        );
+        // The local-dev loopback default is not an origin GitHub can use.
+        // SAFETY: as above.
+        unsafe { std::env::set_var("PRELOOP_PUBLIC_URL", "http://127.0.0.1:9090") };
+        assert_eq!(engine_public_url(&args, None), None);
+        // SAFETY: restores the value read above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PRELOOP_PUBLIC_URL", value),
+                None => std::env::remove_var("PRELOOP_PUBLIC_URL"),
+            }
+        }
+    }
+
+    /// A suggestion is offered from evidence, never guessed:
+    /// `tailscale status --json`'s own name for this machine while the tailnet
+    /// is up.
+    #[test]
+    fn a_running_tailnet_supplies_the_suggested_url() {
+        let status = json!({
+            "BackendState": "Running",
+            "MagicDNSSuffix": "tail1234.ts.net",
+            "Self": {
+                "ID": "n1234",
+                "HostName": "builder",
+                // Tailscale reports an FQDN, trailing dot included.
+                "DNSName": "builder.tail1234.ts.net.",
+                "OS": "linux",
+            },
+            "Peer": {},
+        })
+        .to_string();
+        assert_eq!(
+            tailnet_public_url(&status).as_deref(),
+            Some("https://builder.tail1234.ts.net")
+        );
+    }
+
+    #[test]
+    fn no_usable_tailscale_answer_means_no_suggestion() {
+        for (what, status) in [
+            (
+                "tailscale absent or failed, so not JSON at all",
+                "command not found",
+            ),
+            ("an empty answer", ""),
+            (
+                "a stopped daemon still names a node",
+                "{\"BackendState\":\"Stopped\",\"Self\":{\"DNSName\":\"builder.tail1234.ts.net.\"}}",
+            ),
+            (
+                "a logged-out node",
+                "{\"BackendState\":\"NeedsLogin\",\"Self\":{\"DNSName\":\"builder.tail1234.ts.net.\"}}",
+            ),
+            ("no Self block", "{\"BackendState\":\"Running\"}"),
+            (
+                "a Self without a DNS name",
+                "{\"BackendState\":\"Running\",\"Self\":{\"HostName\":\"builder\"}}",
+            ),
+            (
+                "a name GitHub cannot reach",
+                "{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"localhost.\"}}",
+            ),
+            (
+                "an empty name",
+                "{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\".\"}}",
+            ),
+        ] {
+            assert_eq!(tailnet_public_url(status), None, "{what}: {status}");
+        }
+    }
+
+    /// The question takes a typed URL, the suggestion through Enter, or `-` to
+    /// skip; with no suggestion the older contract (blank = skip) still holds.
+    #[test]
+    fn the_url_answer_takes_a_typed_url_the_suggestion_or_a_skip() {
+        let suggestion = Some("https://builder.tail1234.ts.net");
+        assert_eq!(
+            read_public_url("", suggestion),
+            UrlInput::Use {
+                url: "https://builder.tail1234.ts.net".to_owned(),
+                source: "suggested"
+            },
+            "Enter accepts the suggestion"
+        );
+        assert_eq!(
+            read_public_url("https://ci.example.com/", suggestion),
+            UrlInput::Use {
+                url: "https://ci.example.com".to_owned(),
+                source: "prompt"
+            }
+        );
+        assert_eq!(read_public_url("-", suggestion), UrlInput::Skip);
+        assert_eq!(read_public_url("", None), UrlInput::Skip);
+        assert_eq!(read_public_url("-", None), UrlInput::Skip);
+        // A refused answer is asked again, and the retry names the way out.
+        match read_public_url("http://ci.example.com", suggestion) {
+            UrlInput::Retry(reason) => {
+                assert!(reason.contains("https://"), "{reason}");
+                assert!(reason.contains("webhooks off"), "{reason}");
+            }
+            other => panic!("a non-https URL must be refused, got {other:?}"),
+        }
+        match read_public_url("nonsense", None) {
+            UrlInput::Retry(reason) => assert!(reason.contains("blank"), "{reason}"),
+            other => panic!("garbage must be refused, got {other:?}"),
+        }
+    }
+
+    /// The how-to shown at the prompt: the exact path-scoped Funnel command,
+    /// where the full guide is, and — when one was detected — the URL itself,
+    /// so an accepted suggestion is never mistaken for a guess.
+    #[test]
+    fn the_url_prompt_shows_the_funnel_command_and_the_suggestion() {
+        let text = public_url_help(Some("https://builder.tail1234.ts.net")).join("\n");
+        assert!(
+            text.contains(
+                "tailscale funnel --set-path=/api/v1/github/webhooks --bg http://127.0.0.1:9090/api/v1/github/webhooks"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("docs/self-hosting.md"), "{text}");
+        assert!(text.contains("builder.tail1234.ts.net"), "{text}");
+        assert!(text.to_lowercase().contains("cloudflare"), "{text}");
+        assert!(
+            public_url_prompt(Some("https://builder.tail1234.ts.net"))
+                .contains("https://builder.tail1234.ts.net"),
+            "the suggestion must be visible at the prompt"
+        );
+        assert!(
+            public_url_prompt(None).contains("blank"),
+            "without a suggestion the prompt must still say blank skips"
+        );
+        // Nothing detected: no address is offered or invented.
+        let plain = public_url_help(None).join("\n");
+        assert!(!plain.contains("Enter accepts"), "{plain}");
+        assert!(!plain.contains("https://builder"), "{plain}");
+    }
+
     #[test]
     fn the_new_flags_parse() {
         let args = InitArgs::try_parse_from([
@@ -3031,5 +3492,222 @@ mod tests {
             Some("https://engine.example.com")
         );
         assert_eq!(args.repos, vec!["owner/name".to_owned()]);
+    }
+
+    /// A successful interactive write must leave the report configured: the
+    /// row, its JSON entry, and the decision all come from the post-write
+    /// state, not the snapshot taken before the prompt.
+    #[test]
+    fn a_secret_stored_interactively_is_reported_configured() {
+        let scan = workflows::Scan {
+            target: workflows::Target {
+                repo: Some("local/app".to_owned()),
+                checkout: None,
+            },
+            source: "checkout",
+            files: vec![workflows::WorkflowFile {
+                path: ".github/workflows/ci.yml".to_owned(),
+                text:
+                    "jobs:\n  deploy:\n    steps:\n      - run: echo ${{ secrets.DEPLOY_TOKEN }}\n"
+                        .to_owned(),
+            }],
+            skipped: None,
+            notes: Vec::new(),
+        };
+        let mut rows = vec![workflows::SecretRow {
+            name: "DEPLOY_TOKEN".to_owned(),
+            reads: vec![".github/workflows/ci.yml:4".to_owned()],
+            scope: None,
+            environment_scope: None,
+            stored_as: None,
+        }];
+        assert_eq!(workflows::secrets_decision(&rows), "missing");
+        assert_eq!(
+            workflows::secret_rows_json(&scan, &rows)[0]["command"],
+            json!("preloop secret set DEPLOY_TOKEN --repo local/app")
+        );
+
+        assert!(mark_stored(
+            &mut rows,
+            "DEPLOY_TOKEN",
+            scan.target.repo.as_deref()
+        ));
+        assert_eq!(rows[0].status(), "repository local/app");
+        assert_eq!(workflows::secrets_decision(&rows), "ok");
+        let entries = workflows::secret_rows_json(&scan, &rows);
+        assert_eq!(entries[0]["configured"], json!("repository local/app"));
+        assert_eq!(entries[0]["command"], Value::Null);
+        // The scope a write lands at is named by the same lookup the report
+        // uses: a store that already held the secret says the same thing.
+        let stored = workflows::Stored::from_listing(&[(
+            "DEPLOY_TOKEN".to_owned(),
+            Some("local/app".to_owned()),
+            None,
+        )]);
+        assert_eq!(
+            workflows::secret_rows(&scan, &stored)[0].scope,
+            rows[0].scope
+        );
+        // An already-configured row, and another name, are left alone.
+        assert!(!mark_stored(&mut rows, "DEPLOY_TOKEN", None));
+        assert!(!mark_stored(&mut rows, "OTHER_TOKEN", Some("local/app")));
+    }
+
+    /// `PRELOOP_RUNNER_BASE_IMAGE` beats the wizard's choice at serve time, so
+    /// the label verdicts must be classified against the override: the engine
+    /// runs `ubuntu-22.04` on the override, not on the official golden.
+    #[test]
+    fn label_verdicts_follow_the_effective_base_image() {
+        let _guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let previous = std::env::var_os(preloop_runner_server::config::BASE_IMAGE_ENV);
+        let pool = |base: &str| {
+            workflows::Pool::new(
+                vec![
+                    "self-hosted".to_owned(),
+                    "Linux".to_owned(),
+                    "x86_64".to_owned(),
+                ],
+                "x86_64",
+                base,
+            )
+        };
+        unsafe { std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV) };
+        assert_eq!(
+            effective_base_image(Some("ghcr.io/acme/chosen:1")),
+            "ghcr.io/acme/chosen:1"
+        );
+        assert_eq!(effective_base_image(None), OFFICIAL_GOLDEN);
+        assert_eq!(
+            workflows::classify("ubuntu-22.04", &pool(&effective_base_image(None))),
+            workflows::Verdict::HostedLinux { official: true },
+            "nothing configured means the packed official golden"
+        );
+
+        unsafe {
+            std::env::set_var(
+                preloop_runner_server::config::BASE_IMAGE_ENV,
+                "ghcr.io/acme/base:1",
+            )
+        };
+        let base = effective_base_image(Some("ghcr.io/acme/chosen:1"));
+        assert_eq!(base, "ghcr.io/acme/base:1");
+        assert_eq!(
+            workflows::classify("ubuntu-22.04", &pool(&base)),
+            workflows::Verdict::HostedLinux { official: false },
+            "ubuntu-22.04 runs on the override the engine resolved"
+        );
+        let message = workflows::verdict_message(
+            workflows::Verdict::HostedLinux { official: false },
+            "ubuntu-22.04",
+            &pool(&base),
+        );
+        assert!(message.contains("your configured golden"), "{message}");
+
+        // An exported-but-blank override behaves like an unset one.
+        unsafe { std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, " ") };
+        assert_eq!(effective_base_image(None), OFFICIAL_GOLDEN);
+        assert_eq!(
+            effective_base_image(Some("ghcr.io/acme/chosen:1")),
+            "ghcr.io/acme/chosen:1"
+        );
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, value)
+            },
+            None => unsafe { std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV) },
+        }
+    }
+
+    /// A checkout without an `origin` remote keeps its `local/<dir>` identity:
+    /// secrets the local submission path stored under that scope are found,
+    /// and a missing one is offered at that scope, never globally.
+    #[test]
+    fn a_local_checkout_keeps_its_local_secret_scope() {
+        let root = Path::new("/work/app");
+        let targets = workflows::targets(&[], Some(root), Some("local/app"));
+        assert_eq!(targets[0].repo.as_deref(), Some("local/app"));
+        assert_eq!(targets[0].checkout.as_deref(), Some(root));
+
+        let stored = workflows::Stored::from_listing(&[(
+            "DEPLOY_TOKEN".to_owned(),
+            Some("local/app".to_owned()),
+            None,
+        )]);
+        let scan = workflows::Scan {
+            target: workflows::Target {
+                repo: Some("local/app".to_owned()),
+                checkout: Some(root.to_path_buf()),
+            },
+            source: "checkout",
+            files: vec![workflows::WorkflowFile {
+                path: ".github/workflows/ci.yml".to_owned(),
+                text:
+                    "jobs:\n  deploy:\n    steps:\n      - run: echo ${{ secrets.DEPLOY_TOKEN }} \
+                       ${{ secrets.MISSING_TOKEN }}\n"
+                        .to_owned(),
+            }],
+            skipped: None,
+            notes: Vec::new(),
+        };
+        let rows = workflows::secret_rows(&scan, &stored);
+        let token = rows
+            .iter()
+            .find(|row| row.name == "DEPLOY_TOKEN")
+            .expect("the stored secret is read");
+        assert_eq!(token.scope.as_deref(), Some("repository local/app"));
+        assert_eq!(token.status(), "repository local/app");
+        let missing = rows
+            .iter()
+            .find(|row| row.name == "MISSING_TOKEN")
+            .expect("the missing secret is read");
+        assert_eq!(missing.scope, None);
+        assert_eq!(
+            workflows::set_command(&missing.name, scan.target.repo.as_deref()).as_deref(),
+            Some("preloop secret set MISSING_TOKEN --repo local/app"),
+            "the remediation must keep the repository scope"
+        );
+    }
+
+    /// Repository text reaches the human report through `note`/`section`,
+    /// which must render control characters visibly: a `runs-on` label cannot
+    /// inject an ANSI sequence into the terminal.
+    #[test]
+    fn repository_text_prints_escaped_not_raw() {
+        let escaped = escape_control("\x1b]0;pwn\x07");
+        assert_eq!(escaped, "\\x1b]0;pwn\\x07");
+        assert!(!escaped.chars().any(char::is_control));
+
+        // A label carried through the scanner keeps its bytes until print time.
+        let scan = workflows::Scan {
+            target: workflows::Target {
+                repo: Some("o/r".to_owned()),
+                checkout: None,
+            },
+            source: "github",
+            files: vec![workflows::WorkflowFile {
+                path: ".github/workflows/ci.yml".to_owned(),
+                text: "on: push\njobs:\n  a:\n    runs-on: \"\\e]0;pwn\\a\"\n".to_owned(),
+            }],
+            skipped: None,
+            notes: Vec::new(),
+        };
+        let pool = workflows::Pool::new(vec!["self-hosted".to_owned()], "x86_64", OFFICIAL_GOLDEN);
+        let report = workflows::label_report(&[scan], &pool);
+        assert!(report.unparsed.is_empty(), "{:?}", report.unparsed);
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.label.contains("pwn"))
+            .expect("the crafted label was scanned");
+        let printed = escape_control(&row.label);
+        assert!(!printed.chars().any(char::is_control), "{printed}");
+        assert!(printed.contains("\\x1b"), "{printed}");
+
+        // Ordinary text, including non-ASCII, is untouched.
+        assert_eq!(escape_control("ubuntu-22.04"), "ubuntu-22.04");
+        assert_eq!(
+            escape_control(".github/workflows/café.yml"),
+            ".github/workflows/café.yml"
+        );
     }
 }

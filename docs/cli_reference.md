@@ -292,11 +292,26 @@ allows it. It never fails init because a repository cannot be read or a secret
 is missing.
 
 For `--auth app`, the stable URL must be an HTTPS, non-loopback URL that GitHub
-can reach. Tailscale Funnel, a Cloudflare **named** Tunnel (not a quick Tunnel,
-whose URL changes on restart), or a domain/reverse proxy are suitable; expose
-only `/api/v1/github/webhooks`. Blank means local-only App webhooks: pushes and
-pull requests will not start runs and PR checks will not report. An existing
-`--public-url` or `PRELOOP_PUBLIC_URL` is used without asking.
+can reach. Answer the prompt with the URL directly; when `tailscale` is on the
+host and reports a running tailnet, its own name for the machine
+(`https://<machine>.<tailnet>.ts.net`) is suggested and Enter accepts it; type
+`-` to skip. Without a suggestion, an empty answer still skips. The prompt also
+prints the way there — a path-scoped Tailscale Funnel
+(`tailscale funnel --set-path=/api/v1/github/webhooks --bg
+http://127.0.0.1:9090/api/v1/github/webhooks`, exposing only that path), a
+Cloudflare **named** Tunnel (not a quick Tunnel, whose URL changes on restart)
+behind a path-filtering proxy, or a domain/reverse proxy; the full guide is in
+`docs/self-hosting.md` ("Exposure options"). Skipping means the App is created
+with webhooks off: pushes and pull requests will not start runs and PR checks
+will not report. An existing `--public-url` or `PRELOOP_PUBLIC_URL` is used
+without asking.
+
+The URL resolved here is not written to the config file: it is handed to
+whatever run mode init starts — the foreground `serve` args, or a
+`PRELOOP_PUBLIC_URL` line in the installed service's environment file — so
+Check Run detail links and the webhook health check use the address GitHub was
+given. (A kept credential — the "kept" path — resolves it from `--public-url` or
+`PRELOOP_PUBLIC_URL`, since nothing is reconfigured there.)
 
 The workflow report lists every `secrets.NAME` / `secrets['NAME']` reference
 (excluding engine-minted `GITHUB_TOKEN`), its file locations, and whether the
@@ -315,10 +330,10 @@ value.
 |---|---|
 | `--probe` | Print a side-effect-free capability report as JSON and exit (`arch`, `os`, `disk_free_bytes`, `data_root`, `hypervisor`, `docker`, `dockerfile_detected`, `smolvm`, `existing_config`, `credentials_configured`, `ghcr_reachable`, plus the base image `serve` would use) |
 | `--auth <app\|pat\|none>` | Credential step. `none` writes no credential (local-only engine) and leaves existing ones alone |
-| `--app-id <ID>`, `--pem-file <PATH>` | Existing App credentials (with `--auth app`); without them the browser flow creates one |
+| `--app-id <ID>`, `--pem-file <PATH>` | Existing App credentials (with `--auth app`); without them the browser flow creates one. With `--public-url`, this path points the App's webhook at the engine (`PATCH /app/hook/config`) instead of silently saving credentials whose hook stays inactive |
 | `--token <TOKEN>` | PAT (with `--auth pat`); falls back to `PRELOOP_GITHUB_PAT` |
 | `--org <NAME>` | Create the App under this organization |
-| `--public-url <URL>` | Stable HTTPS URL GitHub can reach. Enables App webhooks and PR checks; loopback and non-HTTPS URLs are rejected, and trailing slashes are removed |
+| `--public-url <URL>` | Stable HTTPS URL GitHub can reach. Enables App webhooks and PR checks; loopback and non-HTTPS URLs are rejected, and trailing slashes are removed. Also handed to the mode this run starts (foreground `serve`, or the installed service's environment), so Check Run links and the webhook health check use it |
 | `--port <N>`, `--no-browser`, `--webhook-secret <SECRET>` | As in `preloop setup github` |
 | `--repo <OWNER/NAME>` | Repository to verify and scan (repeatable); without it, the current checkout's origin is used |
 | `--no-secrets-scan` | Skip the workflow secret scan; the `runs-on` label report still runs |

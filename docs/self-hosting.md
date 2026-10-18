@@ -431,12 +431,25 @@ ingress if GitHub must deliver webhooks.
 ### B. Tailscale Funnel
 
 Tailscale Funnel provides public HTTPS without opening a port or running a
-proxy. Do **not** point it directly at Preloop: Funnel would publish the
-unauthenticated runner-registration surface described in §6. Put a
-path-filtering proxy in front and publish only the webhook path.
+proxy. Do **not** publish the whole engine port: Funnel would then expose the
+unauthenticated runner-registration surface described in §6.
 
-Keep Preloop on loopback and place a path-filtering proxy on a separate local
-port. For example, Caddy can forward only the webhook path to Preloop:
+Funnel's own path mount is enough for a webhook-only setup — mount that one
+path and every other path on the Funnel hostname answers 404:
+
+```sh
+tailscale funnel --set-path=/api/v1/github/webhooks --bg \
+    http://127.0.0.1:9090/api/v1/github/webhooks
+PRELOOP_PUBLIC_URL=https://<host>.<tailnet>.ts.net
+```
+
+`preloop init` offers that URL (read from `tailscale status --json`) as the
+suggested answer when the host is on a running tailnet.
+
+If you also need other authenticated paths (run pages, for example), put a
+path-filtering proxy in front and publish only its port. Keep Preloop on
+loopback and place the proxy on a separate local port; Caddy can forward only
+the webhook path to Preloop:
 
 ```caddy
 # /etc/caddy/Caddyfile

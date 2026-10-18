@@ -87,8 +87,10 @@ pub(crate) struct InstallArgs {
 
     /// Externally reachable base URL (GitHub webhook + Checks links). GitHub
     /// must be able to reach it: a public domain with DNS + reverse proxy for
-    /// production, or a tunnel (cloudflared, ngrok, Tailscale Funnel) to try
-    /// it out. See docs/setup.md "Exposing the engine to GitHub".
+    /// production, or a tunnel that publishes *only*
+    /// `/api/v1/github/webhooks` to try it out — a path-scoped Tailscale
+    /// Funnel, or a *named* Cloudflare Tunnel behind a path-filtering proxy.
+    /// See docs/setup.md "Exposing the engine to GitHub".
     #[arg(long, value_name = "URL")]
     public_url: Option<String>,
 
@@ -166,11 +168,15 @@ pub(crate) fn run(args: ServerArgs) -> Result<()> {
 /// A `server install` invocation for callers that own the surrounding flow
 /// (`preloop init --mode service`): the CLI's own defaults, with an explicit
 /// state home only when the operator set one — so a system install keeps
-/// defaulting to [`DEFAULT_HOME`] instead of silently following `PRELOOP_HOME`.
-pub(crate) fn install_args(home: Option<PathBuf>) -> ServerArgs {
+/// defaulting to [`DEFAULT_HOME`] instead of silently following `PRELOOP_HOME`
+/// — and the engine's public URL when the caller resolved one (it becomes a
+/// `PRELOOP_PUBLIC_URL` line in the service's environment file: the service
+/// does not inherit the installing shell's environment).
+pub(crate) fn install_args(home: Option<PathBuf>, public_url: Option<String>) -> ServerArgs {
     ServerArgs {
         command: ServerCommand::Install(InstallArgs {
             home,
+            public_url,
             ..InstallArgs::default()
         }),
     }
@@ -1496,8 +1502,12 @@ fn webhook_hint(public_url: Option<&str>) -> String {
         Some(_) => String::new(),
         None => "\n\
              \x20 webhooks:  no --public-url set — GitHub can't reach the engine yet.\n\
-             \x20          Re-run with --public-url (tunnel: `cloudflared tunnel --url\n\
-             \x20          http://127.0.0.1:9090`; production: DNS + reverse proxy).\n\
+             \x20          Re-run with --public-url once the webhook path is published:\n\
+             \x20          `tailscale funnel --set-path=/api/v1/github/webhooks --bg\n\
+             \x20          http://127.0.0.1:9090/api/v1/github/webhooks` (only that path\n\
+             \x20          goes public), a *named* Cloudflare Tunnel (a quick tunnel's\n\
+             \x20          URL changes on restart and breaks the App's webhook), or your\n\
+             \x20          own domain + reverse proxy.\n\
              \x20          See docs/setup.md \"Exposing the engine to GitHub\"."
             .to_owned(),
     }
@@ -2534,6 +2544,40 @@ WantedBy=multi-user.target
         assert!(env_line("A", "x\ny").is_err());
         assert!(env_line("A", "x\0y").is_err());
         assert_eq!(env_line("A", "x=y=z").unwrap(), "A=x=y=z");
+    }
+
+    /// `preloop init --mode service` resolves the engine's public URL itself
+    /// (flag, prompt, or environment) and hands it to the installer here: it
+    /// has to become the service's own `PRELOOP_PUBLIC_URL`, because the
+    /// service does not inherit the installing shell's environment — dropping
+    /// it would leave Check Run links and the webhook health check on the
+    /// loopback default.
+    #[test]
+    fn init_install_args_carry_the_public_url_into_the_env_file() {
+        let ServerArgs {
+            command: ServerCommand::Install(args),
+        } = install_args(None, Some("https://ci.example.com".to_owned()))
+        else {
+            panic!("install_args must build an install command");
+        };
+        assert_eq!(args.public_url.as_deref(), Some("https://ci.example.com"));
+        assert!(
+            args.home.is_none(),
+            "no operator-set home means the default"
+        );
+        assert_eq!(
+            config_env_lines(&args, None).unwrap(),
+            vec!["PRELOOP_PUBLIC_URL=https://ci.example.com".to_owned()]
+        );
+
+        let ServerArgs {
+            command: ServerCommand::Install(args),
+        } = install_args(None, None)
+        else {
+            panic!("install_args must build an install command");
+        };
+        assert_eq!(args.public_url, None);
+        assert!(config_env_lines(&args, None).unwrap().is_empty());
     }
 
     #[test]

@@ -859,11 +859,11 @@ enum Command {
 
     /// Configure credentials, the golden image, and how to run — in one step.
     ///
-    /// In a terminal this is a four-step wizard (credentials, golden, run
-    /// mode, preflight); with stdin or stdout not a TTY it takes the same
-    /// answers as flags and never prompts, so scripts and agents get the same
-    /// config. `--probe --json` reports host capabilities without touching
-    /// anything. Re-running reconfigures in place.
+    /// In a terminal this is a five-step wizard (credentials, golden,
+    /// workflows, run mode, preflight); with stdin or stdout not a TTY it
+    /// takes the same answers as flags and never prompts, so scripts and
+    /// agents get the same config. `--probe --json` reports host capabilities
+    /// without touching anything. Re-running reconfigures in place.
     Init(init::InitArgs),
 
     /// Verify the GitHub credential configuration.
