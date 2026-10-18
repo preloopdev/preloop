@@ -1,6 +1,7 @@
 //! CLI argument definitions.
 
 use clap::{Parser, Subcommand, ValueEnum};
+use preloop_gha_protocol::SecretString;
 use std::path::PathBuf;
 
 /// Rust reimplementation of the GitHub Actions runner.
@@ -125,8 +126,29 @@ pub struct RunArgs {
     /// runner root and runs a single job — the runner is already registered
     /// server-side, so `configure` is not needed (and `--via` is meaningless:
     /// the payload carries its own endpoints).
-    #[arg(long)]
+    ///
+    /// The payload holds the runner's private RSA key, so the official
+    /// `ACTIONS_RUNNER_INPUT_JITCONFIG` environment variable is the safer
+    /// input: argv is world-readable in process listings. An explicit
+    /// `--jitconfig` wins over the environment, as in `Runner.Listener`.
+    #[arg(long, env = "ACTIONS_RUNNER_INPUT_JITCONFIG", hide_env_values = true)]
     pub jitconfig: Option<String>,
+}
+
+impl RunArgs {
+    /// Take the JIT payload, if one was supplied.
+    ///
+    /// Wrapped in a [`SecretString`] — it carries the runner's private RSA key
+    /// — and an empty value (a set-but-empty container environment variable) is
+    /// treated as absent, matching the official runner's `string.IsNullOrEmpty`
+    /// check.
+    pub fn take_jit_payload(&mut self) -> Option<SecretString> {
+        let payload = self.jitconfig.take()?;
+        if payload.trim().is_empty() {
+            return None;
+        }
+        Some(SecretString::new(payload.trim()))
+    }
 }
 
 /// Arguments for `lint`.
@@ -254,6 +276,65 @@ mod tests {
                 "{flag} must not be accepted with --jitconfig"
             );
         }
+    }
+
+    #[test]
+    fn jitconfig_reads_the_official_environment_input() {
+        // The payload carries the runner's private key, so the arg must also
+        // read `ACTIONS_RUNNER_INPUT_JITCONFIG` and never echo its value.
+        // Asserted through the command metadata: this crate cannot call
+        // `std::env::set_var` (unsafe under edition 2024, and denied).
+        let command = Cli::command();
+        let run = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "run")
+            .expect("run subcommand");
+        let jitconfig = run
+            .get_arguments()
+            .find(|arg| arg.get_id() == "jitconfig")
+            .expect("jitconfig argument");
+        assert_eq!(
+            jitconfig
+                .get_env()
+                .map(|name| name.to_string_lossy().into_owned()),
+            Some("ACTIONS_RUNNER_INPUT_JITCONFIG".to_string())
+        );
+        assert!(jitconfig.is_hide_env_values_set());
+    }
+
+    #[test]
+    fn take_jit_payload_redacts_and_ignores_blank() {
+        let mut args = RunArgs {
+            once: false,
+            via: ProtocolPath::Broker,
+            jitconfig: Some(" configured-payload ".to_string()),
+        };
+        let payload = args.take_jit_payload().expect("payload");
+        assert_eq!(payload.expose(), "configured-payload");
+        assert_eq!(format!("{payload:?}"), "SecretString(<redacted>)");
+        assert!(
+            args.jitconfig.is_none(),
+            "payload must not stay in argv state"
+        );
+
+        for blank in [String::new(), "   ".to_string()] {
+            let mut args = RunArgs {
+                once: false,
+                via: ProtocolPath::Broker,
+                jitconfig: Some(blank.clone()),
+            };
+            assert!(
+                args.take_jit_payload().is_none(),
+                "blank payload {blank:?} must read as absent"
+            );
+        }
+
+        let mut absent = RunArgs {
+            once: false,
+            via: ProtocolPath::Broker,
+            jitconfig: None,
+        };
+        assert!(absent.take_jit_payload().is_none());
     }
 
     #[test]

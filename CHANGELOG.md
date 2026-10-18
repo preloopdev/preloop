@@ -12,8 +12,13 @@ Releases before v0.27.0 predate the changelog.
 - **JIT runner startup** (#628): `preloop-runner run --jitconfig <encoded>` now
   decodes GitHub's single-use runner payload, hydrates the runner credentials
   without registration-token or configure requests, and exits after one job.
-  JIT runners may be reclaimed by GitHub while idle, so the payload is intended
-  for provision-then-run-once hosts rather than a warm pool.
+  The payload is also read from `ACTIONS_RUNNER_INPUT_JITCONFIG` — it carries
+  the runner's private key, so it is kept out of argv and held in a
+  `SecretString` — the Node externals `configure` normally downloads are
+  provisioned for the fresh root, and the JIT root is refused a second job even
+  when the payload omits `Ephemeral`. JIT runners may be reclaimed by GitHub
+  while idle, so the payload is intended for provision-then-run-once hosts
+  rather than a warm pool.
 
 
 ### Added

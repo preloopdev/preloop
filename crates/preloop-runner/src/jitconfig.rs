@@ -10,16 +10,19 @@
 //! server-side when the config was minted.
 //!
 //! In practice the payload materializes `.runner`, `.credentials`, and
-//! `.credentials_rsaparams`. Two quirks of the server-emitted `.runner` are
-//! handled here rather than in `settings.rs`: keys are PascalCase and values
-//! are string-typed (`"AgentId": "1425"`, `"Ephemeral": "True"`), so the
-//! document is normalized into our canonical `RunnerSettings` JSON before it
-//! is written. A JIT materialized root is therefore indistinguishable from
-//! `configure` output and `RunnerConfig::load` consumes it unchanged.
+//! `.credentials_rsaparams`, and the three files use two different casings:
+//! `.runner` and `.credentials` carry the service's PascalCase POCO keys with
+//! string-typed values (`"AgentId": "1425"`, `"Ephemeral": "True"`,
+//! `"Data": {"ClientId": …}`), while `.credentials_rsaparams` carries .NET's
+//! web-default camelCase RSA fields (`d`, `dp`, `exponent`, `inverseQ`, …).
+//! Both are normalized into our canonical JSON before anything is written, so
+//! a JIT materialized root is indistinguishable from `configure` output and
+//! `RunnerConfig::load` consumes it unchanged.
 //!
-//! JIT runners are ephemeral: GitHub mints them `Ephemeral: true`, so the
-//! broker loop exits after the first job. An idle JIT runner may also be
-//! reclaimed server-side — observed removals after a few idle minutes
+//! JIT runners are single-use: GitHub mints them `Ephemeral: true` and the
+//! broker loop exits after the first job, so `materialize` forces the flag
+//! rather than trusting a payload that omits it. An idle JIT runner may also
+//! be reclaimed server-side — observed removals after a few idle minutes
 //! (upstream actions/runner#4726 is still open on the exact limit) — so
 //! `--jitconfig` is meant for provision-then-run-once hosts, not warm pools.
 
@@ -27,12 +30,21 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::settings::{
     CREDENTIALS_FILE, CredentialData, RSA_PARAMS_FILE, RUNNER_FILE, RsaParameters, RunnerConfig,
-    RunnerSettings, restrict_permissions, save_json,
+    RunnerSettings, save_json, write_private,
 };
+
+/// Largest accepted `--jitconfig` argument. A real payload is a few KB (three
+/// small JSON documents); the cap only exists so a hostile or corrupt value
+/// cannot make the runner allocate unbounded memory before it starts.
+const MAX_ENCODED_LEN: usize = 1 << 20;
+/// Largest accepted decoded size for one file in the payload.
+const MAX_FILE_LEN: usize = 256 << 10;
+/// Largest accepted total decoded size across every file in the payload.
+const MAX_TOTAL_LEN: usize = 1 << 20;
 
 /// Decode an `encoded_jit_config` payload into its file map.
 ///
@@ -40,46 +52,82 @@ use crate::settings::{
 /// The official runner accepts any string-valued map and writes every entry
 /// under the runner root; we additionally validate file names (relative
 /// basenames only — the payload is trusted server material, but a basename
-/// check costs nothing against a compromised or confused producer).
+/// check costs nothing against a compromised or confused producer) and bound
+/// the decoded size.
 pub fn decode_file_map(encoded: &str) -> Result<BTreeMap<String, Vec<u8>>> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(encoded.trim())
-        .context("JIT config is not valid base64")?;
+    if encoded.len() > MAX_ENCODED_LEN {
+        bail!(
+            "JIT config is {} bytes; the limit is {MAX_ENCODED_LEN}",
+            encoded.len()
+        );
+    }
+    let decoded = decode_base64(encoded).context("JIT config is not valid base64")?;
     let text = String::from_utf8(decoded).context("JIT config payload is not UTF-8")?;
     let map: Map<String, Value> = serde_json::from_str(text.trim_start_matches('\u{FEFF}'))
         .context("JIT config payload is not a JSON object")?;
 
     let mut files = BTreeMap::new();
+    let mut total_len = 0usize;
     for (name, value) in map {
         validate_file_name(&name)?;
         let encoded_content = value
             .as_str()
             .with_context(|| format!("JIT config entry `{name}` is not a base64 string"))?;
-        let content = base64::engine::general_purpose::STANDARD
-            .decode(encoded_content)
+        let content = decode_base64(encoded_content)
             .with_context(|| format!("JIT config entry `{name}` is not valid base64"))?;
+        if content.len() > MAX_FILE_LEN {
+            bail!(
+                "JIT config entry `{name}` decodes to {} bytes; the limit is {MAX_FILE_LEN}",
+                content.len()
+            );
+        }
+        total_len += content.len();
+        if total_len > MAX_TOTAL_LEN {
+            bail!("JIT config decodes to more than {MAX_TOTAL_LEN} bytes in total");
+        }
         files.insert(name, content);
     }
     Ok(files)
+}
+
+/// Base64-decode as `Convert.FromBase64String` does: embedded whitespace —
+/// the newlines a line-wrapped environment variable carries — is ignored.
+fn decode_base64(encoded: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
+    let compact: String = encoded
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    base64::engine::general_purpose::STANDARD.decode(compact)
 }
 
 /// Materialize a JIT config into `root` and return the resulting [`RunnerConfig`].
 ///
 /// Writes `.runner`, `.credentials`, and `.credentials_rsaparams` (plus any
 /// extra files the server included, verbatim) with 0600 permissions, matching
-/// the official runner's write-the-files-then-run flow. Existing configuration
-/// in `root` is replaced — the official runner does not guard on
-/// `IsConfigured()` for JIT either.
+/// the official runner's write-the-files-then-run flow.
+///
+/// Existing configuration in `root` is replaced — the official runner does
+/// not guard on `IsConfigured()` for JIT either — but the replacement is
+/// loud, and a failure while writing removes the files this call committed
+/// rather than leaving a half-materialized root holding credentials.
 pub fn materialize(encoded: &str, root: &Path) -> Result<RunnerConfig> {
     let files = decode_file_map(encoded)?;
 
     // Parse all three before writing anything: a bad payload errors cleanly
     // instead of leaving a half-materialized root.
-    let settings = normalize_runner_settings(
+    let mut settings = normalize_runner_settings(
         files
             .get(RUNNER_FILE)
             .context("JIT config is missing required file `.runner`")?,
     )?;
+    // Single-use is the JIT contract, not a property of the payload: the
+    // listener already forces `--once`, and the broker's `job-not-found` exit
+    // keys on `ephemeral` alone (Runner.cs `when (settings.Ephemeral)`), so a
+    // payload that omits the flag — or an older server that sends `False` —
+    // must not leave this runner polling after its one job.
+    if !settings.ephemeral {
+        settings.ephemeral = true;
+    }
     let credentials = normalize_credentials(
         files
             .get(CREDENTIALS_FILE)
@@ -93,26 +141,107 @@ pub fn materialize(encoded: &str, root: &Path) -> Result<RunnerConfig> {
 
     std::fs::create_dir_all(root)
         .with_context(|| format!("creating runner root {}", root.display()))?;
-    for (name, content) in &files {
-        let path = root.join(name);
-        match name.as_str() {
-            RUNNER_FILE => save_json(&path, &settings)?,
-            CREDENTIALS_FILE => save_json(&path, &credentials)?,
-            RSA_PARAMS_FILE => save_json(&path, &rsa_params)?,
-            // Unknown extra files are written verbatim, like the official
-            // runner — forward-compatible with any additional artifacts a
-            // future server version starts shipping in the payload.
-            _ => std::fs::write(&path, content)
-                .with_context(|| format!("writing {}", path.display()))?,
-        }
-        restrict_permissions(&path)?;
+    if RunnerConfig::is_configured(root) {
+        tracing::warn!(
+            "JIT config replaces the runner configuration already present in {} \
+             (the official runner overwrites it too); the previous registration \
+             is gone when this JIT runner exits",
+            root.display()
+        );
     }
+
+    // Stage every file beside its destination, then rename the whole set into
+    // place. Renames are metadata-only, so the failure mode that matters —
+    // running out of space while writing — leaves the root untouched.
+    Stage::write(root, &files, &settings, &credentials, &rsa_params)?.commit()?;
 
     Ok(RunnerConfig {
         settings,
         credentials,
         rsa_params,
     })
+}
+
+/// Files written for one JIT materialization, removed again unless committed.
+///
+/// Every file is staged next to its destination so a failing write cannot
+/// leave a partial `.runner` behind, and a failure partway through the rename
+/// set removes what this call already replaced.
+struct Stage {
+    /// `(temp, destination)` pairs in payload order.
+    staged: Vec<(PathBuf, PathBuf)>,
+    /// How many leading entries of `staged` are renamed into place.
+    committed: usize,
+}
+
+impl Stage {
+    fn write(
+        root: &Path,
+        files: &BTreeMap<String, Vec<u8>>,
+        settings: &RunnerSettings,
+        credentials: &CredentialData,
+        rsa_params: &RsaParameters,
+    ) -> Result<Self> {
+        let mut stage = Self {
+            staged: Vec::new(),
+            committed: 0,
+        };
+        for (name, content) in files {
+            let destination = root.join(name);
+            let temp =
+                destination.with_file_name(format!(".{name}.jit-{}.tmp", std::process::id()));
+            let result = match name.as_str() {
+                RUNNER_FILE => save_json(&temp, settings),
+                CREDENTIALS_FILE => save_json(&temp, credentials),
+                RSA_PARAMS_FILE => save_json(&temp, rsa_params),
+                // Unknown extra files are written verbatim, like the official
+                // runner — forward-compatible with any additional artifacts a
+                // future server version starts shipping in the payload.
+                _ => write_private(&temp, content),
+            };
+            stage.staged.push((temp, destination));
+            if let Err(error) = result {
+                stage.rollback();
+                return Err(error);
+            }
+        }
+        Ok(stage)
+    }
+
+    /// Rename every staged file into place, or undo everything staged.
+    fn commit(mut self) -> Result<()> {
+        while self.committed < self.staged.len() {
+            let (temp, destination) = &self.staged[self.committed];
+            if let Err(error) = std::fs::rename(temp, destination)
+                .with_context(|| format!("replacing {}", destination.display()))
+            {
+                self.rollback();
+                return Err(error);
+            }
+            self.committed += 1;
+        }
+        Ok(())
+    }
+
+    /// Best-effort removal of every staged temp file plus the destinations
+    /// this call already replaced. A renamed temp no longer exists, so
+    /// removing it twice is harmless.
+    fn rollback(&self) {
+        for (temp, _) in &self.staged {
+            remove_quietly(temp);
+        }
+        for (_, destination) in self.staged.iter().take(self.committed) {
+            remove_quietly(destination);
+        }
+    }
+}
+
+fn remove_quietly(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to clean up {}: {error}", path.display());
+    }
 }
 
 /// Reject anything that is not a relative basename: no separators, no parent
@@ -251,12 +380,14 @@ fn normalize_runner_settings(content: &[u8]) -> Result<RunnerSettings> {
 
 /// Parse the server-emitted `.credentials` document into [`CredentialData`].
 ///
-/// `.credentials` is camelCase in the wild, but the payload may carry
-/// `Scheme`/`Data` casing from a server-side `CredentialData` POCO — accept
-/// either. `data` keys are carried through verbatim (`clientId`,
-/// `authorizationUrl`, `authorizationUrlV2`, `requireFipsCryptography`, …);
-/// non-string scalars are stringified to match the official `Data` map of
-/// `Dictionary<string,string>`.
+/// The JIT payload carries the service's `CredentialData` POCO spelling
+/// (`Scheme`, `Data`, and `Data` keys `ClientId`/`AuthorizationUrl`), while a
+/// configured runner reads the camelCase spelling the official runner writes.
+/// Both outer and nested keys are canonicalized to camelCase, which is what
+/// the OAuth path and `requireFipsCryptography` lookups expect — upstream gets
+/// the same tolerance from a `Dictionary<string,string>` built with
+/// `StringComparer.OrdinalIgnoreCase`. Non-string scalars are stringified to
+/// match the official `Data` map of `Dictionary<string,string>`.
 fn normalize_credentials(content: &[u8]) -> Result<CredentialData> {
     let text = std::str::from_utf8(content)
         .context("JIT `.credentials` content is not UTF-8")?
@@ -282,7 +413,7 @@ fn normalize_credentials(content: &[u8]) -> Result<CredentialData> {
                     .context("JIT `.credentials` data is not an object")?;
                 for (k, v) in entries {
                     data.insert(
-                        k.clone(),
+                        canonical_data_key(k),
                         match v {
                             Value::String(_) => v.clone(),
                             other => Value::String(other.to_string()),
@@ -298,6 +429,12 @@ fn normalize_credentials(content: &[u8]) -> Result<CredentialData> {
         scheme: scheme.context("JIT `.credentials` is missing `scheme`")?,
         data,
     })
+}
+
+/// `ClientId`/`clientId`/`client_id` → `clientId` (idempotent for keys the
+/// official runner already writes in camelCase).
+fn canonical_data_key(key: &str) -> String {
+    to_camel_case(&to_snake_case(key))
 }
 
 fn parse_rsa_params(content: &[u8]) -> Result<RsaParameters> {
@@ -335,20 +472,41 @@ mod tests {
         }"#
     }
 
+    /// The `.credentials` a minted JIT config carries: the service's POCO
+    /// spelling (`Scheme`/`Data`, `ClientId`/`AuthorizationUrl`).
     fn sample_credentials() -> &'static str {
         r#"{
-            "scheme": "OAuth",
-            "data": {
-                "clientId": "9f8e7d6c-5b4a-3928-8170-6f5e4d3c2b1a",
-                "authorizationUrl": "https://vssps.example.com/_apis/oauth2/token",
-                "requireFipsCryptography": "False"
+            "Scheme": "OAuth",
+            "Data": {
+                "ClientId": "9f8e7d6c-5b4a-3928-8170-6f5e4d3c2b1a",
+                "AuthorizationUrl": "https://vssps.example.com/_apis/oauth2/token",
+                "RequireFipsCryptography": "False"
             }
         }"#
     }
 
+    /// RSA parameters in the casing the service emits: .NET's web-default
+    /// camelCase (`d`, `dp`, `dq`, `exponent`, `inverseQ`, `modulus`, `p`, `q`).
     fn sample_rsa_params() -> String {
         let keypair = preloop_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
-        serde_json::to_string(&keypair.to_rsaparams()).unwrap()
+        let lowercase = serde_json::to_value(keypair.to_rsaparams()).unwrap();
+        let object = lowercase.as_object().unwrap();
+        let mut renamed = Map::new();
+        for (key, value) in object {
+            let camel = match key.as_str() {
+                "D" => "d",
+                "DP" => "dp",
+                "DQ" => "dq",
+                "Exponent" => "exponent",
+                "InverseQ" => "inverseQ",
+                "Modulus" => "modulus",
+                "P" => "p",
+                "Q" => "q",
+                other => panic!("unexpected RSA parameter {other}"),
+            };
+            renamed.insert(camel.to_string(), value.clone());
+        }
+        serde_json::to_string(&renamed).unwrap()
     }
 
     fn sample_jitconfig() -> String {
@@ -509,16 +667,141 @@ mod tests {
     }
 
     #[test]
-    fn normalize_credentials_accepts_pascal_case() {
+    fn normalize_credentials_canonicalizes_data_keys() {
+        // The payload's PascalCase `Data` keys must not survive into the
+        // credential map the OAuth path reads.
         let creds = normalize_credentials(
-            br#"{"Scheme": "OAuth", "Data": {"clientId": "abc", "requireFipsCryptography": true}}"#,
+            br#"{"Scheme": "OAuth", "Data": {"ClientId": "abc", "AuthorizationUrl": "https://a",
+                 "RequireFipsCryptography": true}}"#,
         )
         .unwrap();
         assert_eq!(creds.scheme, "OAuth");
         assert_eq!(creds.client_id(), Some("abc"));
+        assert_eq!(creds.authorization_url(), Some("https://a"));
         assert_eq!(
             creds.data.get("requireFipsCryptography").unwrap(),
             &Value::String("true".into())
+        );
+        assert!(
+            !creds.data.contains_key("ClientId") && !creds.data.contains_key("AuthorizationUrl"),
+            "data keys must be canonical camelCase: {:?}",
+            creds.data
+        );
+    }
+
+    #[test]
+    fn normalize_credentials_accepts_camel_case() {
+        // Defensive: the shape our own `configure` writes also parses.
+        let creds = normalize_credentials(
+            br#"{"scheme": "OAuth", "data": {"clientId": "abc", "authorizationUrlV2": "https://v2"}}"#,
+        )
+        .unwrap();
+        assert_eq!(creds.client_id(), Some("abc"));
+        assert_eq!(
+            creds.data.get("authorizationUrlV2"),
+            Some(&Value::String("https://v2".into()))
+        );
+    }
+
+    #[test]
+    fn parse_rsa_params_accepts_both_casings() {
+        let pascal = br#"{"D":"a","DP":"b","DQ":"c","Exponent":"d","InverseQ":"e",
+                          "Modulus":"f","P":"g","Q":"h"}"#;
+        let camel = br#"{"d":"a","dp":"b","dq":"c","exponent":"d","inverseQ":"e",
+                          "modulus":"f","p":"g","q":"h"}"#;
+        for content in [&pascal[..], &camel[..]] {
+            let params = parse_rsa_params(content).unwrap();
+            assert_eq!(params.d, "a");
+            assert_eq!(params.dp, "b");
+            assert_eq!(params.dq, "c");
+            assert_eq!(params.exponent, "d");
+            assert_eq!(params.inverse_q, "e");
+            assert_eq!(params.modulus, "f");
+            assert_eq!(params.p, "g");
+            assert_eq!(params.q, "h");
+        }
+    }
+
+    #[test]
+    fn decode_ignores_embedded_whitespace() {
+        // `Convert.FromBase64String` ignores whitespace, so a payload from a
+        // line-wrapped environment variable must decode too.
+        let payload = sample_jitconfig();
+        let wrapped = format!("{}\n{}\n", &payload[..16], &payload[16..]);
+        assert_eq!(decode_file_map(&wrapped).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_payload() {
+        let encoded = "A".repeat(MAX_ENCODED_LEN + 1);
+        let err = decode_file_map(&encoded).unwrap_err();
+        assert!(err.to_string().contains("limit"), "got: {err:#}");
+    }
+
+    #[test]
+    fn decode_rejects_oversized_entry() {
+        let map = serde_json::json!({".runner": encode(&vec![b'a'; MAX_FILE_LEN + 1])});
+        let encoded = STANDARD.encode(serde_json::to_vec(&map).unwrap());
+        let err = decode_file_map(&encoded).unwrap_err();
+        assert!(err.to_string().contains("`.runner`"), "got: {err:#}");
+        assert!(err.to_string().contains("limit"), "got: {err:#}");
+    }
+
+    #[test]
+    fn materialize_forces_ephemeral() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runner =
+            sample_runner_settings().replace("\"Ephemeral\": \"True\"", "\"Ephemeral\": \"False\"");
+        let map = serde_json::json!({
+            ".runner": encode(runner.as_bytes()),
+            ".credentials": encode(sample_credentials().as_bytes()),
+            ".credentials_rsaparams": encode(sample_rsa_params().as_bytes()),
+        });
+        let encoded = STANDARD.encode(serde_json::to_vec(&map).unwrap());
+        let config = materialize(&encoded, dir.path()).unwrap();
+        // A JIT registration is single-use whether or not the payload says so.
+        assert!(config.settings.ephemeral);
+        assert!(RunnerConfig::load(dir.path()).unwrap().settings.ephemeral);
+    }
+
+    #[test]
+    fn materialize_replaces_existing_configuration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".runner"), br#"{"agentName":"older"}"#).unwrap();
+        std::fs::write(dir.path().join(".credentials"), b"stale").unwrap();
+        let config = materialize(&sample_jitconfig(), dir.path()).unwrap();
+        assert_eq!(config.settings.agent_name, "jit-runner-1");
+        assert_eq!(
+            RunnerConfig::load(dir.path()).unwrap().settings.agent_name,
+            "jit-runner-1"
+        );
+    }
+
+    #[test]
+    fn materialize_rolls_back_on_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A directory at a destination path makes the final rename fail after
+        // the payload's earlier files were already renamed into place.
+        std::fs::create_dir(dir.path().join(".credentials_rsaparams")).unwrap();
+        let err = materialize(&sample_jitconfig(), dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(".credentials_rsaparams"),
+            "got: {err:#}"
+        );
+        for name in [".runner", ".credentials"] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "{name} survived a failed materialization"
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".jit-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staged temps left behind: {leftovers:?}"
         );
     }
 

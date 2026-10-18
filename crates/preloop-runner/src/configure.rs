@@ -186,7 +186,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
     // --replace, and the orchestrator would have to deregister the dead agent
     // before provisioning a replacement.
     if !args.no_externals {
-        download_externals(&http, &root)
+        ensure_node_externals(&http, &root)
             .await
             .context("downloading Node.js externals")?;
     }
@@ -581,7 +581,10 @@ fn export_keypair(
 /// with matching version and a `bin/node --version` that prints `v<version>`.
 /// Stale/missing/mismatched entries are re-materialized (download into temp dir,
 /// verify SHA256 via pinned table + SHASUMS256.txt, atomic rename).
-async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result<()> {
+///
+/// Idempotent — a root whose runtimes are valid is left alone — so the JIT
+/// launch path (`run --jitconfig`, which skips `configure`) can call it too.
+pub(crate) async fn ensure_node_externals(http: &HttpClient, root: &std::path::Path) -> Result<()> {
     download_externals_with_fetcher(
         |url| {
             let http = http.clone();

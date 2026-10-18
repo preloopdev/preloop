@@ -16,11 +16,12 @@ use crate::settings::RunnerConfig;
 /// Run the listener (main loop of `preloop-runner run`).
 pub async fn run_listener(mut args: RunArgs, global: &GlobalArgs) -> Result<()> {
     let root = global.runner_root();
-    let jit_mode = args.jitconfig.is_some();
-    let config = if let Some(encoded) = args.jitconfig.take() {
+    let jit_payload = args.take_jit_payload();
+    let jit_mode = jit_payload.is_some();
+    let config = if let Some(payload) = jit_payload {
         // GitHub has already created and registered this runner.  Materialize
         // only the three configuration files; do not call any configure API.
-        let config = crate::jitconfig::materialize(&encoded, &root)
+        let config = crate::jitconfig::materialize(payload.expose(), &root)
             .context("decoding and materializing JIT runner configuration")?;
         // JIT configs are single-use by contract.  The payload normally has
         // Ephemeral=true, but forcing --once also protects us from a malformed
@@ -51,6 +52,18 @@ pub async fn run_listener(mut args: RunArgs, global: &GlobalArgs) -> Result<()> 
             return Err(error);
         }
     };
+
+    // A JIT root has by definition never run `configure`, which is what
+    // downloads the Node runtimes JavaScript actions need — the official
+    // runner ships them inside its distribution instead. Fetch them before
+    // the session exists so no job can be claimed without a runtime; a host
+    // that already has them, or that cannot reach nodejs.org, keeps working.
+    if jit_mode && let Err(error) = crate::configure::ensure_node_externals(&http, &root).await {
+        tracing::warn!(
+            "provisioning Node externals for this JIT runner failed: {error:#}; \
+             JavaScript actions will need a matching system Node"
+        );
+    }
 
     // Get OAuth token and create the listener session. Keep this inside a
     // result so JIT materialization is cleaned up even when token exchange or
@@ -98,6 +111,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use std::path::Path;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -142,6 +156,47 @@ mod tests {
         socket.write_all(response.as_bytes()).await.unwrap();
     }
 
+    /// Give the root valid `externals/node20` and `externals/node24` entries.
+    ///
+    /// The JIT launch provisions Node for a fresh root; a test that seeded
+    /// none would try to download from nodejs.org.
+    fn seed_node_externals(root: &Path) {
+        for (runtime, version) in [
+            ("node20", crate::NODE20_EXTERNALS_VERSION),
+            ("node24", crate::NODE24_EXTERNALS_VERSION),
+        ] {
+            let version = version.trim().trim_start_matches('v');
+            let dir = root.join("externals").join(runtime);
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            let node = if cfg!(windows) {
+                dir.join("node.exe")
+            } else {
+                dir.join("bin").join("node")
+            };
+            std::fs::write(&node, format!("#!/bin/sh\necho v{version}\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            crate::node_externals::write_manifest(
+                &dir,
+                &crate::node_externals::NodeManifest::new(
+                    runtime,
+                    version,
+                    &crate::node_externals::current_platform(),
+                    "test",
+                    "test",
+                ),
+            )
+            .unwrap();
+            assert!(
+                crate::node_externals::is_valid_externals_dir(&dir, runtime, version),
+                "seeded externals for {runtime} must validate"
+            );
+        }
+    }
+
     fn encoded_jit_config(oauth_url: &str, broker_url: &str) -> String {
         let keypair = preloop_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
         let runner = serde_json::json!({
@@ -156,18 +211,33 @@ mod tests {
             "ServerUrlV2": broker_url,
         });
         let credentials = serde_json::json!({
-            "scheme": "OAuth",
-            "data": {
-                "clientId": "jit-client",
-                "authorizationUrl": oauth_url,
+            "Scheme": "OAuth",
+            "Data": {
+                "ClientId": "jit-client",
+                "AuthorizationUrl": oauth_url,
             }
         });
+        // The service serializes the RSA fields in .NET's web-default casing;
+        // `InverseQ` is the one field that is not a plain lowercasing.
+        let rsa_params: serde_json::Map<String, serde_json::Value> =
+            serde_json::to_value(keypair.to_rsaparams())
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| {
+                    let camel = if key == "InverseQ" {
+                        "inverseQ".to_string()
+                    } else {
+                        key.to_ascii_lowercase()
+                    };
+                    (camel, value.clone())
+                })
+                .collect();
         let files = serde_json::json!({
             ".runner": STANDARD.encode(serde_json::to_vec(&runner).unwrap()),
             ".credentials": STANDARD.encode(serde_json::to_vec(&credentials).unwrap()),
-            ".credentials_rsaparams": STANDARD.encode(
-                serde_json::to_vec(&keypair.to_rsaparams()).unwrap()
-            ),
+            ".credentials_rsaparams": STANDARD.encode(serde_json::to_vec(&rsa_params).unwrap()),
         });
         STANDARD.encode(serde_json::to_vec(&files).unwrap())
     }
@@ -228,6 +298,9 @@ mod tests {
         });
 
         let root = tempfile::TempDir::new().unwrap();
+        // JIT mode provisions Node externals for the fresh root; seed valid
+        // entries so the test does not depend on nodejs.org.
+        seed_node_externals(root.path());
         let args = RunArgs {
             once: false,
             via: ProtocolPath::Broker,
