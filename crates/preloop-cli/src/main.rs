@@ -2161,7 +2161,7 @@ async fn cmd_engine(
                 "no runner pool: jobs will fail after the queue grace window. \
                  Install the Linux guest runner with `preloop update`, or set \
                  PRELOOP_RUNNER_BUNDLE to a directory containing preloop-runner \
-                 (see docs/vm-images.md)"
+                 (see docs/control-plane/operate/vm-images.mdx)"
             );
             false
         }
@@ -2735,7 +2735,7 @@ fn local_runner_pool_config(
     std::fs::create_dir_all(&control_bridge)?;
     set_private_directory_permissions(&control_bridge)?;
     let runner_bundle = discovered_runner_bundle().context(
-        "Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/vm-images.md)",
+        "Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/control-plane/operate/vm-images.mdx)",
     )?;
     let backend = vm_backend()?;
     // AgentENV has no socket relay: the guest dials the runner URL over plain

@@ -223,3 +223,7 @@ dev-vm-publish +PORTS:
 # Re-sync the VM's OMP providers with the host gateway (after a new login/key).
 dev-vm-omp-sync:
     scripts/dev-vm/omp-sync.sh
+
+# Render all published documentation diagrams from their Graphviz sources.
+docs-diagrams:
+    for dotfile in docs/diagrams/*.dot; do dot -Tsvg "$dotfile" -o "${dotfile%.dot}.svg"; done

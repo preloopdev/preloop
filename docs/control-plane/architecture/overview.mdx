@@ -1,0 +1,60 @@
+---
+title: Control-plane architecture overview
+description: A tour of the self-hosted control plane, workflow engine, runner protocol, microVM pool, storage, and observability.
+---
+
+Preloop’s control plane turns a workflow submission or GitHub event into jobs, dispatches those jobs to registered runners, and records their results. Use this page to understand where each responsibility lives before configuring or operating a self-hosted deployment.
+
+![Preloop system overview](/diagrams/system-overview.svg)
+
+## The system in one screen
+
+| Subsystem | Responsibility |
+| --- | --- |
+| **Control plane** | Accepts submissions and webhooks, authenticates callers, stores run and job state, schedules ready jobs, and exposes runner-compatible and native HTTP APIs. |
+| **Workflow engine** | Parses workflow YAML, matches triggers, expands reusable workflows and matrices, evaluates server-owned expressions, and builds runner job messages. |
+| **Runner protocol** | Implements the wire contracts used by the official Actions runner: registration, sessions, message delivery, job acquisition, renewals, completion, timelines, logs, cache, and artifacts. |
+| **MicroVM pool** | Forks an isolated microVM per job through `preloop-vm`'s `VmProvider`: SmolVM by default, AgentENV opt-in on Linux/KVM. Goldens are packed once and forked copy-on-write. |
+| **Storage** | Keeps durable control state in SQLite by default or Postgres for shared control-plane nodes; file-backed stores hold caches, artifacts, logs, and snapshots. |
+| **Observability** | Emits structured logs, Prometheus metrics, OpenTelemetry traces and logs, and a cached operational snapshot for health and capacity diagnosis. |
+
+A run follows this path:
+
+1. A GitHub webhook, `preloop run`, or another native API caller submits a workflow.
+2. The workflow engine parses and expands the workflow, then the control backend records the run, jobs, dependency graph, and queue state.
+3. A matching runner session receives a job message and acquires the job through the broker.
+4. The runner executes steps inside its own microVM and sends logs, timeline updates, cache/artifact traffic, and completion data back through the protocol.
+5. The control plane settles the job, promotes dependent jobs, and projects the durable state to GitHub Checks.
+
+## Crate map
+
+The map below follows the workspace members.
+
+| Crate | Responsibility |
+| --- | --- |
+| `preloop-cli` | Ships the `preloop` command: run, serve, status, logs, push, debug, and administration. |
+| `preloop-runner-server` | Control-plane HTTP routes, durable state, scheduling, GitHub integration, runner sessions, broker, OIDC, and results services. |
+| `preloop-runner` | Rust implementation of the Actions Listener and Worker. |
+| `preloop-runner-client` | Lightweight run submission and inspection client. |
+| `preloop-gha-protocol` | Versioned runner wire types, session crypto, NDJSON events, IDs, and secret-safe values. |
+| `preloop-gha-parser` | Workflow YAML models, trigger matching, reusable-workflow expansion, matrix expansion, and job plans. |
+| `preloop-gha-expressions` | `${{ }}` lexer, parser, evaluator, contexts, and status functions. |
+| `preloop-orchestrator` | Runner-pool scheduling, golden images, and machine lifecycle orchestration. |
+| `preloop-vm` | `VmProvider` abstraction consumed by the orchestrator, plus the SmolVM provider (default), the AgentENV provider (opt-in), machine specs, exec/copy, and fork/teardown primitives. |
+| `preloop-cache` | File-backed Actions cache protocol storage. |
+| `preloop-artifacts` | File-backed Actions artifact protocol storage. |
+| `preloop-dap` | Debug Adapter Protocol bridge and paused-job debugging support. |
+| `preloop-observability` | Logs, metrics, traces, status snapshots, and VM telemetry. |
+| `preloop-socket-activation` | Systemd-style socket activation support. |
+| `preloop-conformance` | Comparisons with the pinned official runner/server reference. |
+| `runner-watch` | Tracks runner releases and replays protocol captures for conformance. |
+| `benchmarks/preloop-perf` | Performance benchmark harness. |
+| `benchmarks/control-load` | Open-loop load and chaos harness for the Postgres control backend. |
+
+## Choose the next page
+
+- [HTTP APIs and durable state](/control-plane/architecture/api-and-state) — routes, authentication, transactions, and events.
+- [Job lifecycle](/control-plane/architecture/job-lifecycle) — trigger-to-check flow and runner leases.
+- [Workflow engine](/control-plane/architecture/workflow-engine) — parsing, matrices, reusable workflows, and expressions.
+- [MicroVM pool](/control-plane/architecture/sandboxes) — VM providers, golden forks, the warm pool, and teardown.
+- [Observability](/control-plane/architecture/observability) — metrics, OTLP, status, and operational signals.

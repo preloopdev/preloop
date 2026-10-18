@@ -90,7 +90,7 @@ pub(crate) struct InstallArgs {
     /// production, or a tunnel that publishes *only*
     /// `/api/v1/github/webhooks` to try it out — a path-scoped Tailscale
     /// Funnel, or a *named* Cloudflare Tunnel behind a path-filtering proxy.
-    /// See docs/setup.md "Exposing the engine to GitHub".
+    /// See docs/control-plane/operate/deploy.mdx "Exposure options".
     #[arg(long, value_name = "URL")]
     public_url: Option<String>,
 
@@ -1522,7 +1522,7 @@ fn webhook_hint(public_url: Option<&str>) -> String {
              \x20          exposes — a *named* Cloudflare Tunnel (a quick tunnel's URL\n\
              \x20          changes on restart and breaks the App's webhook), or your own\n\
              \x20          domain + reverse proxy.\n\
-             \x20          See docs/setup.md \"Exposing the engine to GitHub\"."
+             \x20          See docs/control-plane/operate/deploy.mdx \"Exposure options\"."
             .to_owned(),
     }
 }

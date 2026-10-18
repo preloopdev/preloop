@@ -1,0 +1,93 @@
+---
+title: Job lifecycle
+description: How a webhook or CLI submission becomes a runner job, executes in an isolated machine, and reports checks and results.
+---
+
+A Preloop run is durable before a runner starts it. The control plane accepts a trigger, builds a queue of dependency-aware jobs, leases each job to a matching runner, and settles the result before promoting dependents.
+
+![Preloop job lifecycle](/diagrams/job-lifecycle.svg)
+
+## 1. Accept a trigger
+
+Preloop has three common intake paths:
+
+- **GitHub webhook:** `POST /api/v1/github/webhooks` verifies the HMAC signature, binds an App signature to its installation, and writes the delivery to the durable webhook queue. The handler returns `202 Accepted` after the commit. Duplicate delivery IDs are acknowledged as duplicates instead of creating another run.
+- **`preloop run`:** the CLI builds a workflow submission and posts it to `POST /api/v1/runs`. A local workspace can be identified with the native local-workspace header; a generated or unpublished commit is uploaded as a one-use bundle. The CLI can request one workflow file, a job closure, an event simulation, or detached execution.
+- **Push flow:** `preloop run --push` tests the selected tree first. After the run is terminal, the CLI owns the Git push and calls `POST /api/v1/runs/{run_id}/push` to verify the tested tree, create or reuse the pull request, and publish any missing checks. The server never receives repository write credentials for this operation.
+
+The webhook worker resolves the event's commit, fetches workflow files at that commit (and builds a pull-request merge when required), projects the event adapter, and submits each matching workflow. Trigger filters cover event types, branches or tags, paths, activity types, and dispatch inputs.
+
+## 2. Parse, expand, and admit
+
+The workflow engine parses YAML, validates expressions, expands reusable workflows and matrices, builds the `needs:` graph, and constructs runner job messages. The control backend then records the run, immutable job plans, dependencies, concurrency keys, secrets metadata, and queue state.
+
+A job can be classified as:
+
+- **`ready`** — claimable by a matching runner.
+- **`blocked`** — waiting on `needs:`, `max-parallel`, or a job-level concurrency holder.
+- **`held`** — the run is behind a workflow-level concurrency group or an operator gate.
+- **`pending_expansion` / `expanding`** — a reusable caller or dynamic matrix must be expanded after its inputs or `needs` outputs are available.
+- **`claimed`** — a runner has acquired an execution attempt.
+
+Fork pull-request policy and environment protection can hold a run or job before dispatch. Environment gates are announced as GitHub deployment/check-run review actions; a reviewer can approve or reject them, and fork approval is an operator decision exposed by the native API and CLI.
+
+<Note>
+The shipped `preloop serve` entry point does not start the optional cron scheduler. The parser accepts `on: schedule`, but schedule events are not emitted by that entry point; use a webhook-backed event, dispatch, or `preloop run` for an active run.
+</Note>
+
+## 3. Match and acquire a runner
+
+The ready queue is ordered by priority and stable run/job order. A runner listener registers an agent identity, opens a session, and long-polls for a message. The message identifies the job attempt and its run-service URL. The listener acknowledges the message, then the worker calls `acquirejob` with the runner's listen credential.
+
+The control backend checks labels, runner groups, concurrency, and the attempt's ownership before returning the encrypted job message. A normal job lease lasts 2,700 seconds (45 minutes) and the worker renews it about every 60 seconds. The server uses shorter reaper thresholds for a hung worker (180 seconds with a live session) or a dead session (600 seconds), so a lost runner does not hold a job indefinitely.
+
+### Match labels the GitHub way
+
+`runs-on` is an AND requirement, not a preference. If a job asks for
+`[self-hosted, Linux, ARM64, gpu]`, a runner must advertise every label; extra
+runner labels are fine. Matching is case-insensitive. This is the same
+set-inclusion rule GitHub uses.
+
+GitHub-hosted image labels such as `ubuntu-latest` are not automatically
+capabilities of an external runner. The built-in Preloop microVM pool maps the
+supported Ubuntu labels to its configured golden; a standalone or remote runner
+must advertise the labels its host actually supports. Set extra labels with
+`PRELOOP_RUNNER_LABELS` for managed local runners or
+`preloop-runner configure --labels` for the standalone runner. If an existing
+workflow uses a label that the runner does not advertise, change `runs-on` or
+add that label to the runner.
+
+
+If no matching runner appears, a ready job receives a 120-second grace window. A host pool that is preparing can use the one-hour backstop; a pool whose advertised labels can never satisfy the job fails it as unschedulable instead of leaving it queued forever.
+
+## 4. Execute and report
+
+The runner worker prepares its workspace, evaluates step conditions, resolves actions and scripts, and executes each step in the assigned runner. For pool-managed runs that runner is a microVM forked from the resident golden and deleted when the job ends, so every job gets a fresh machine. See [MicroVM pool](/control-plane/architecture/sandboxes). During execution it sends:
+
+- timeline records, annotations, and log chunks through the runner-compatible `/_apis/` routes;
+- step updates and signed log/artifact URLs through Results/Twirp services;
+- cache and artifact transfers through the Actions cache/artifact protocol; and
+- OIDC requests through the job's generated token when the workflow grants `id-token: write`.
+
+The worker renews the lease while running. On completion it posts the step results, outputs, conclusion, and diagnostics to `completejob`/`FinishJob`. The server stores outputs for dependent jobs and emits a versioned durable job event.
+
+## 5. Settle, promote, and report checks
+
+A completion transaction records the attempt and job result, releases the runner claim, updates the run summary, and evaluates dependents. A successful dependency can promote a waiting job; a failed or skipped dependency is reflected in the dependent job's `needs` context and condition. Matrix fail-fast can cancel sibling legs according to the strategy.
+
+The outbox projector turns run/job events into coalesced check-run updates. One leased sender creates or patches GitHub Checks entries for queued, in-progress, and completed states, including annotations and environment review actions. When every job is terminal, the run receives its final conclusion and the CLI's event stream closes.
+
+## 6. Terminal states and recovery
+
+| State | Meaning |
+| --- | --- |
+| `queued` | Accepted and waiting for a claimable runner or for a gate to release. |
+| `pending` | Waiting on a concurrency or approval decision. |
+| `in_progress` | A runner has acquired the current attempt. |
+| `success` | All required work completed successfully. |
+| `failure` | A step, runner, dependency, or infrastructure condition failed. |
+| `cancelled` | The run or job was cancelled before successful completion. |
+| `skipped` | A condition, dependency result, or trigger policy prevented execution. |
+| `timed_out` | The stored conclusion refines a failure caused by the job timeout. |
+
+The default job timeout is 360 minutes; declared job timeouts are capped at five days. The background reaper cancels attempts that exceed the effective timeout, expires stale leases, fails permanently unmatchable ready jobs, and reclaims orphaned runner claims after restart. A failed job can be retained for a debug session or a preserved microVM; see [Debugging](/control-plane/guides/debugging) for the interactive path.

@@ -1,0 +1,36 @@
+digraph vm_pool {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.3, ranksep=0.55, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.12,0.07"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  subgraph cluster_cp {
+    label="Control plane (preloop serve)"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    server [label="preloop-runner-server\nqueue, scheduler, broker\nmatches a job to a runner", fillcolor="#e0f2fe"];
+    pool [label="Runner pool (preloop-orchestrator)\non-demand forks, or warm slots\nhost memory cap, disk reserve\ngolden cache, teardown, orphan sweep", fillcolor="#bae6fd"];
+  }
+
+  subgraph cluster_provider {
+    label="VM providers (preloop-vm)"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    contract [label="VmProvider trait\ncreate, start_forkable, fork\nexec, copy, pack, delete\ncapabilities()", fillcolor="#bae6fd"];
+    smolvm [label="SmolVmProvider — default\nlibkrun: Hypervisor.framework / KVM\nforks the packed golden", fillcolor="#e0f2fe"];
+    agentenv [label="AgentENV — opt-in\nPRELOOP_VM_BACKEND=agentenv\naenv snapshots, KVM host", fillcolor="#e0f2fe"];
+    { rank=same; smolvm; agentenv; }
+  }
+
+  subgraph cluster_vm {
+    label="microVM lifecycle"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    golden [label="Golden (fork base)\npacked preloop-ubuntu-24.04-<arch>\nor a configured base image\nbooted forkable; stays resident", fillcolor="#fef3c7"];
+    jobvm [label="Job microVM (one per job)\ncopy-on-write fork of the golden\nguest preloop-runner; deleted after the job", fillcolor="#fef3c7"];
+    bridge [label="Guest control bridge\nbinds the advertised origin in the guest\nsplices it back to the control plane", fillcolor="#fef3c7"];
+  }
+
+  server -> pool [label="queued jobs drive the target"];
+  pool -> contract [label="resolves the backend\nat startup"];
+  contract -> smolvm;
+  contract -> agentenv [label="PRELOOP_VM_BACKEND"];
+  pool -> golden [label="download or bake, then\nstart_forkable"];
+  golden -> jobvm [label="fork, one clone per job"];
+  agentenv -> jobvm [label="start from snapshot", style=dashed];
+  jobvm -> bridge [label="job traffic"];
+  bridge -> server [label="registers, polls, sends\nlogs and results", style=dashed, constraint=false];
+}
