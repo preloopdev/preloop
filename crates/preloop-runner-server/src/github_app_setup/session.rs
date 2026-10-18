@@ -78,11 +78,25 @@ fn install_wait() -> Duration {
         .map_or(INSTALL_WAIT, Duration::from_secs)
 }
 
-/// Requests the browser-facing setup routes answer per [`RATE_WINDOW`],
-/// across every client. A single operator drives a setup, so one shared
-/// budget is enough to slow a guesser down.
+/// Refused requests one browser-facing setup route answers per
+/// [`RATE_WINDOW`], across every client. Only refusals are charged, so the
+/// window caps guessing without ever billing the operator's own request, and
+/// each route has its own window, so a flood against one cannot spend the
+/// other's.
 const RATE_LIMIT: u32 = 30;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// The two browser-facing setup routes. Each has its own refusal budget: the
+/// link is what a guesser can try to steal, and the callback is what GitHub
+/// answers with once the App exists, so neither may be able to starve the
+/// other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupRoute {
+    /// `GET /setup/github`: the App-creation form the setup link opens.
+    Form,
+    /// `GET /setup/github/callback`: GitHub's redirect after creation.
+    Callback,
+}
 
 /// Explains where GitHub's result goes, on the form the engine serves.
 const DELIVERY_NOTE: &str = "GitHub returns the credentials to this engine, which stores them \
@@ -97,8 +111,44 @@ pub struct SetupSessions {
 #[derive(Default)]
 struct Table {
     current: Option<Session>,
-    window_started: Option<Instant>,
-    window_requests: u32,
+    form_window: Window,
+    callback_window: Window,
+}
+
+impl Table {
+    fn window(&mut self, route: SetupRoute) -> &mut Window {
+        match route {
+            SetupRoute::Form => &mut self.form_window,
+            SetupRoute::Callback => &mut self.callback_window,
+        }
+    }
+}
+
+/// One route's refusal budget: how many refused requests it has answered in
+/// the window that started at `started`.
+#[derive(Default)]
+struct Window {
+    started: Option<Instant>,
+    requests: u32,
+}
+
+impl Window {
+    /// Charge one refused request. `false` means the window is full, so the
+    /// caller answers 429 and the refusal goes unbilled.
+    fn charge(&mut self, now: Instant) -> bool {
+        let window_open = self
+            .started
+            .is_some_and(|start| now.duration_since(start) < RATE_WINDOW);
+        if !window_open {
+            self.started = Some(now);
+            self.requests = 0;
+        }
+        if self.requests >= RATE_LIMIT {
+            return false;
+        }
+        self.requests += 1;
+        true
+    }
 }
 
 struct Session {
@@ -219,22 +269,16 @@ impl SetupSessions {
         Self::default()
     }
 
-    /// Admit one request against the route rate limit. `false` means the
+    /// Charge one refused request against `route`'s budget. `false` means the
     /// window is full and the caller should answer 429.
-    pub fn admit_request(&self, now: Instant) -> bool {
-        let mut table = self.inner.lock();
-        let window_open = table
-            .window_started
-            .is_some_and(|start| now.duration_since(start) < RATE_WINDOW);
-        if !window_open {
-            table.window_started = Some(now);
-            table.window_requests = 0;
-        }
-        if table.window_requests >= RATE_LIMIT {
-            return false;
-        }
-        table.window_requests += 1;
-        true
+    ///
+    /// Charged only for requests the route is refusing, and only after the
+    /// token or session check has already failed. The window is what slows
+    /// guessing down, and a guess is a refusal; billing the requests
+    /// themselves would let a stranger's guesses spend the operator's own
+    /// link or callback into a 429.
+    pub fn charge_refusal(&self, now: Instant, route: SetupRoute) -> bool {
+        self.inner.lock().window(route).charge(now)
     }
 
     /// Start a session, replacing any earlier one that has nothing pending.
@@ -283,8 +327,8 @@ impl SetupSessions {
     /// A wrong token does not touch the session. The route that reaches here is
     /// unauthenticated, so anything a guess could change is something an
     /// onlooker could use to end a setup that is in progress — with a 256-bit
-    /// token compared in constant time, a guess cannot succeed, and the shared
-    /// rate limit is what caps how fast anyone can try.
+    /// token compared in constant time, a guess cannot succeed, and the form's
+    /// refusal budget is what caps how fast anyone can try.
     pub fn redeem_link(&self, now: Instant, token: &str) -> Option<FormGrant> {
         let mut table = self.inner.lock();
         let session = table.current.as_mut()?;
@@ -636,21 +680,27 @@ pub async fn poll_session(
 /// The query is parsed by hand, so a malformed one gets the same 404 as any
 /// other refusal rather than an extractor rejection that would reveal the
 /// route is live.
+///
+/// The token is checked before any budget is spent: a valid link is the
+/// operator's own request and is never answered 429 because a stranger spent
+/// the form's refusal window guessing.
 pub async fn setup_form(
     State(shared): State<Arc<SharedState>>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let now = Instant::now();
     let sessions = &shared.state.github_setup;
-    if !sessions.admit_request(now) {
-        return refuse(StatusCode::TOO_MANY_REQUESTS);
-    }
     let query: LinkQuery = parse_query(raw.as_deref());
-    let Some(token) = query.t.filter(|token| !token.is_empty()) else {
-        return refuse(StatusCode::NOT_FOUND);
-    };
-    let Some(grant) = sessions.redeem_link(now, &token) else {
-        return refuse(StatusCode::NOT_FOUND);
+    let redeemed = query
+        .t
+        .filter(|token| !token.is_empty())
+        .and_then(|token| sessions.redeem_link(now, &token));
+    let Some(grant) = redeemed else {
+        return if sessions.charge_refusal(now, SetupRoute::Form) {
+            refuse(StatusCode::NOT_FOUND)
+        } else {
+            refuse(StatusCode::TOO_MANY_REQUESTS)
+        };
     };
     let redirect_url = format!("{}/setup/github/callback", grant.public_url);
     let manifest = manifest(
@@ -680,30 +730,38 @@ pub async fn setup_form(
 
 /// `GET /setup/github/callback?code=&state=`: GitHub's redirect. Converts the
 /// code, stores the credentials, and reports the outcome to the poller.
+///
+/// The state is checked before any budget is spent, so GitHub's redirect for
+/// the operator's own setup is never answered 429 because a stranger spent
+/// the callback's refusal window, and the form's window is a separate one
+/// again: guesses against the link cannot spend this route's either.
 pub async fn setup_callback(
     State(shared): State<Arc<SharedState>>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let now = Instant::now();
-    if !shared.state.github_setup.admit_request(now) {
-        return refuse(StatusCode::TOO_MANY_REQUESTS);
-    }
+    let sessions = &shared.state.github_setup;
     let query: CallbackQuery = parse_query(raw.as_deref());
-    let conversion = match shared.state.github_setup.begin_conversion(
+    let conversion = match sessions.begin_conversion(
         now,
         query.state.as_deref(),
         query.code.as_deref(),
     ) {
         Ok(conversion) => conversion,
-        Err(Refusal::Inactive) => return refuse(StatusCode::NOT_FOUND),
-        Err(Refusal::Rejected) => {
-            return browser_page(
-                StatusCode::BAD_REQUEST,
-                error_page(
-                    "Setup not accepted",
-                    "This address did not come from the App-creation form this engine served.",
+        Err(refusal) => {
+            if !sessions.charge_refusal(now, SetupRoute::Callback) {
+                return refuse(StatusCode::TOO_MANY_REQUESTS);
+            }
+            return match refusal {
+                Refusal::Inactive => refuse(StatusCode::NOT_FOUND),
+                Refusal::Rejected => browser_page(
+                    StatusCode::BAD_REQUEST,
+                    error_page(
+                        "Setup not accepted",
+                        "This address did not come from the App-creation form this engine served.",
+                    ),
                 ),
-            );
+            };
         }
     };
     // The conversion runs as its own task, so it settles the session even if
@@ -1584,16 +1642,27 @@ mod tests {
     }
 
     #[test]
-    fn requests_are_rate_limited_per_window() {
+    fn refusals_are_rate_limited_per_route_and_window() {
         let sessions = SetupSessions::new();
         let now = Instant::now();
         for _ in 0..RATE_LIMIT {
-            assert!(sessions.admit_request(now));
+            assert!(sessions.charge_refusal(now, SetupRoute::Form));
         }
-        assert!(!sessions.admit_request(now), "the window is full");
         assert!(
-            sessions.admit_request(now + RATE_WINDOW),
-            "a new window admits requests again"
+            !sessions.charge_refusal(now, SetupRoute::Form),
+            "the form's window is full"
+        );
+        assert!(
+            sessions.charge_refusal(now, SetupRoute::Callback),
+            "the callback's window is its own: form refusals do not spend it"
+        );
+        for _ in 1..RATE_LIMIT {
+            assert!(sessions.charge_refusal(now, SetupRoute::Callback));
+        }
+        assert!(!sessions.charge_refusal(now, SetupRoute::Callback));
+        assert!(
+            sessions.charge_refusal(now + RATE_WINDOW, SetupRoute::Form),
+            "a new window takes refusals again"
         );
     }
 
@@ -1879,6 +1948,118 @@ mod tests {
             let limited = send(&app, get("/setup/github?t=x")).await;
             assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
             assert_eq!(limited.headers()["cache-control"], "no-store");
+
+            // The callback bursts the same way on its own window, and an
+            // inactive session reads as 404 until that window fills.
+            for _ in 0..RATE_LIMIT {
+                assert_eq!(
+                    send(&app, get("/setup/github/callback?code=c&state=s"))
+                        .await
+                        .status(),
+                    StatusCode::NOT_FOUND,
+                    "no session awaits the callback"
+                );
+            }
+            let limited = send(&app, get("/setup/github/callback?code=c&state=s")).await;
+            assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(limited.headers()["cache-control"], "no-store");
+        }
+
+        /// The windows bill refusals, not requests: a stranger can spend the
+        /// form's whole window guessing and the operator's own link still
+        /// opens the form.
+        #[tokio::test]
+        async fn a_spent_refusal_window_never_gates_the_operators_link() {
+            let _env = pin_setup_env(None).await;
+            let api = stub_github().await;
+            let (app, state, _temp) = engine(&api).await;
+            let (_session, link) = open_link(&app, &state).await;
+
+            for _ in 0..RATE_LIMIT {
+                assert_eq!(
+                    send(&app, get("/setup/github?t=x")).await.status(),
+                    StatusCode::NOT_FOUND
+                );
+            }
+            assert_eq!(
+                send(&app, get("/setup/github?t=x")).await.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "the form's window is full of refusals"
+            );
+
+            let form = send(&app, get(&link)).await;
+            assert_eq!(
+                form.status(),
+                StatusCode::OK,
+                "the operator's own link is served, not gated by the refusals"
+            );
+            let form = text(form).await;
+            assert!(form.contains("apps/new?state="), "{form}");
+        }
+
+        /// Each route refuses on its own window: guesses against the link
+        /// cannot spend the callback's, and a spent callback window never
+        /// refuses GitHub's redirect for the live setup.
+        #[tokio::test]
+        async fn each_route_refuses_on_its_own_window() {
+            let _env = pin_setup_env(None).await;
+            let api = stub_github().await;
+            let (app, state, _temp) = engine(&api).await;
+            let (session, link) = open_link(&app, &state).await;
+            let form = text(send(&app, get(&link)).await).await;
+            let state_nonce = state_of(&form);
+
+            // Spend the form's window on guesses.
+            for _ in 0..RATE_LIMIT {
+                assert_eq!(
+                    send(&app, get("/setup/github?t=x")).await.status(),
+                    StatusCode::NOT_FOUND
+                );
+            }
+            assert_eq!(
+                send(&app, get("/setup/github?t=x")).await.status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
+
+            // The callback has a window of its own, full only once it has
+            // answered a burst itself.
+            let forged = "/setup/github/callback?code=good-code&state=forged";
+            for _ in 0..RATE_LIMIT {
+                assert_eq!(
+                    send(&app, get(forged)).await.status(),
+                    StatusCode::BAD_REQUEST,
+                    "a forged callback is refused on the callback's own window"
+                );
+            }
+            assert_eq!(
+                send(&app, get(forged)).await.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "the callback's window fills like the form's"
+            );
+            assert_eq!(
+                send(&app, get("/setup/github?t=x")).await.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "neither route resets the other's window"
+            );
+
+            let callback = send(
+                &app,
+                get(&format!(
+                    "/setup/github/callback?code=good-code&state={state_nonce}"
+                )),
+            )
+            .await;
+            assert_eq!(
+                callback.status(),
+                StatusCode::OK,
+                "a spent refusal window never refuses the real callback"
+            );
+            let done = text(callback).await;
+            assert!(done.contains("GitHub App created"), "{done}");
+            assert_eq!(
+                poll_status(&app, &state, &session).await["status"],
+                "completed"
+            );
         }
 
         /// The whole engine-hosted flow over HTTP: the link serves the form once,

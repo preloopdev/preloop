@@ -126,7 +126,18 @@ Releases before v0.27.0 predate the changelog.
   the session outright — which made an onlooker's guesses a way to cancel a
   setup that was in progress. A mismatch is now refused and logged without
   touching the session; the one-time token is still burned the moment it is
-  used, and the shared request budget still caps how fast anyone can guess.
+  used, and the request budget still caps how fast anyone can guess.
+
+- **A spent setup budget no longer gates the operator's own request.** The
+  browser-facing setup routes billed every request to one shared window before
+  the token or state was checked, so any unauthenticated caller could spend it
+  guessing and the operator's own setup link — or GitHub's redirect with the
+  App's code — was answered 429 while a setup was open. The token and state
+  checks now run first and only a refusal is charged, so the operator's request
+  is never gated; the form and the callback each have their own window, so
+  neither route's guessing can spend the other's. A burst of invalid requests
+  still reads 404 (or 400 for a forged callback) up to the window's limit and
+  429 after it, and an inactive session still reads 404.
 
 - **`PRELOOP_PUBLIC_URL` alone now updates an existing App's webhook.** The
   effective public URL is resolved before the already-configured-App branch, so

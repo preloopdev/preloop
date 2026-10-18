@@ -686,7 +686,9 @@ pub fn build_app(
         .route("/api/v1/github/callback", get(github::github_callback))
         // Engine-hosted GitHub App setup (`preloop setup github --via app`
         // with a public URL). The API pair is administrator-only; the two
-        // browser routes answer 404 unless a setup session awaits them.
+        // browser routes answer 404 unless a setup session awaits them, and
+        // each carries its own refusal budget, so a burst of guesses against
+        // one cannot gate the other.
         .route(
             "/api/v1/github/setup-sessions",
             post(crate::github_app_setup::session::open_session).route_layer(
