@@ -232,30 +232,32 @@ fn git_command() -> Command {
     command
 }
 
-/// Run `command` under `deadline`, killing the child when it expires, and
-/// return its output whatever the exit status was.
+/// Run `command` under `deadline` and return its output whatever the exit
+/// status was, through the engine-wide bounded runner
+/// ([`preloop_observability::deadline::run_command`]): the child is killed and
+/// reaped when the deadline expires, and it cannot look hung merely because it
+/// filled a pipe.
 async fn git_output_within(
-    command: &mut Command,
+    mut command: Command,
     operation: &str,
     deadline: std::time::Duration,
 ) -> Result<std::process::Output, MergeError> {
-    crate::snapshots::apply_git_child_policy(command);
-    match tokio::time::timeout(deadline, command.output()).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(MergeError::Git {
-            operation: operation.to_owned(),
-            message: error.to_string(),
-        }),
-        Err(_) => Err(MergeError::Git {
-            operation: operation.to_owned(),
-            message: format!("timed out after {deadline:?}: killed the hung git process"),
-        }),
-    }
+    crate::snapshots::apply_git_child_policy(&mut command);
+    // Boxed so the spawn/drain/timeout machinery is not inlined into every
+    // handler future that can reach a merge build.
+    Box::pin(preloop_observability::deadline::run_command(
+        command, deadline, operation,
+    ))
+    .await
+    .map_err(|error| MergeError::Git {
+        operation: operation.to_owned(),
+        message: error.to_string(),
+    })
 }
 
 /// [`git_output_within`] plus the usual "a non-zero exit is an error" check.
 async fn run_git_within(
-    command: &mut Command,
+    command: Command,
     operation: &str,
     deadline: std::time::Duration,
 ) -> Result<std::process::Output, MergeError> {
@@ -281,7 +283,7 @@ async fn commit_present(repository: &Path, sha: &str) -> bool {
         .args(["cat-file", "-e", &format!("{sha}^{{commit}}")]);
     // Any failure — a non-zero exit, a spawn error, or the deadline — means
     // "not present"; callers answer by fetching, which is the safe direction.
-    git_output_within(&mut command, "check commit presence", GIT_CONTROL_TIMEOUT)
+    git_output_within(command, "check commit presence", GIT_CONTROL_TIMEOUT)
         .await
         .is_ok_and(|output| output.status.success())
 }
@@ -293,8 +295,7 @@ async fn rev_parse(repository: &Path, rev: &str) -> Result<String, MergeError> {
         .arg("--git-dir")
         .arg(repository)
         .args(["rev-parse", rev]);
-    let output = run_git_within(&mut command, &format!("rev-parse {rev}"), GIT_CONTROL_TIMEOUT)
-        .await?;
+    let output = run_git_within(command, &format!("rev-parse {rev}"), GIT_CONTROL_TIMEOUT).await?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
@@ -377,7 +378,7 @@ async fn ensure_mirror(mirror: &Path) -> Result<(), MergeError> {
         let mut init = git_command();
         init.args(["init", "--bare", "--quiet", "--template="])
             .arg(mirror);
-        match git_output_within(&mut init, "initialize merge mirror", GIT_CONTROL_TIMEOUT).await {
+        match git_output_within(init, "initialize merge mirror", GIT_CONTROL_TIMEOUT).await {
             Ok(output) => output,
             Err(error) => {
                 return Err(MergeError::Io {
@@ -398,7 +399,7 @@ async fn ensure_mirror(mirror: &Path) -> Result<(), MergeError> {
         .arg("--git-dir")
         .arg(mirror)
         .args(["config", "gc.auto", "0"]);
-    run_git_within(&mut disable_gc, "config gc.auto", GIT_CONTROL_TIMEOUT).await?;
+    run_git_within(disable_gc, "config gc.auto", GIT_CONTROL_TIMEOUT).await?;
     Ok(())
 }
 
@@ -463,25 +464,20 @@ async fn fetch_into_mirror_within(
         .arg(url)
         .arg(refspec);
     crate::snapshots::apply_git_child_policy(&mut command);
-    let output = match tokio::time::timeout(deadline, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return Err(MergeError::Fetch {
-                refspec: refspec.to_owned(),
-                url: crate::snapshots::sanitize_remote_url(url),
-                message: error.to_string(),
-            });
-        }
-        Err(_) => {
-            return Err(MergeError::Fetch {
-                refspec: refspec.to_owned(),
-                url: crate::snapshots::sanitize_remote_url(url),
-                message: format!(
-                    "git fetch timed out after {deadline:?}: killed the hung git process"
-                ),
-            });
-        }
-    };
+    // `what` carries the program name here because the message is the one an
+    // operator sees for a stalled forge: "git fetch timed out after 30m:
+    // killed the hung git process".
+    let output = Box::pin(preloop_observability::deadline::run_command(
+        command,
+        deadline,
+        "git fetch",
+    ))
+    .await
+    .map_err(|error| MergeError::Fetch {
+        refspec: refspec.to_owned(),
+        url: crate::snapshots::sanitize_remote_url(url),
+        message: error.to_string(),
+    })?;
     if !output.status.success() {
         let message = sanitized_fetch_error(
             url,
@@ -669,7 +665,7 @@ pub async fn merge_in(served: &Path, parents: &MergeParents) -> Result<MergeOutc
         .arg(&parents.base_sha)
         .arg(&parents.head_sha);
     // Merging two large trees is real compute over local objects.
-    let output = git_output_within(&mut command, "merge-tree", GIT_WORK_TIMEOUT).await?;
+    let output = git_output_within(command, "merge-tree", GIT_WORK_TIMEOUT).await?;
     let parsed = parse_merge_tree_output(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     match (output.status.success(), output.status.code(), parsed) {
@@ -724,7 +720,7 @@ async fn finish_merge(
         .env("GIT_COMMITTER_NAME", MERGE_IDENTITY_NAME)
         .env("GIT_COMMITTER_EMAIL", MERGE_IDENTITY_EMAIL)
         .env("GIT_COMMITTER_DATE", MERGE_IDENTITY_DATE);
-    let output = run_git_within(&mut command, "commit-tree", GIT_WORK_TIMEOUT).await?;
+    let output = run_git_within(command, "commit-tree", GIT_WORK_TIMEOUT).await?;
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !is_object_id(&sha) {
         return Err(MergeError::Git {
@@ -825,7 +821,7 @@ pub async fn publish_merge(
             .arg("--git-dir")
             .arg(served)
             .args(["update-ref", &name, &target]);
-        run_git_within(&mut command, &format!("update-ref {name}"), GIT_CONTROL_TIMEOUT).await?;
+        run_git_within(command, &format!("update-ref {name}"), GIT_CONTROL_TIMEOUT).await?;
     }
     for (operation, args) in [
         (
@@ -847,7 +843,7 @@ pub async fn publish_merge(
     ] {
         let mut command = git_command();
         command.arg("--git-dir").arg(served).args(&args);
-        run_git_within(&mut command, operation, GIT_CONTROL_TIMEOUT).await?;
+        run_git_within(command, operation, GIT_CONTROL_TIMEOUT).await?;
     }
     Ok(())
 }
@@ -981,21 +977,16 @@ async fn create_served_repository(state_dir: &Path, run_id: RunId) -> Result<Pat
     let mut init = git_command();
     init.args(["init", "--bare", "--quiet", "--template="])
         .arg(&served);
-    let output = match git_output_within(
-        &mut init,
-        "initialize served repository",
-        GIT_CONTROL_TIMEOUT,
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(error) => {
-            return Err(MergeError::Io {
-                path: served.display().to_string(),
-                message: error.to_string(),
-            });
-        }
-    };
+    let output =
+        match git_output_within(init, "initialize served repository", GIT_CONTROL_TIMEOUT).await {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(MergeError::Io {
+                    path: served.display().to_string(),
+                    message: error.to_string(),
+                });
+            }
+        };
     if !output.status.success() {
         return Err(MergeError::Io {
             path: served.display().to_string(),
@@ -1029,20 +1020,13 @@ async fn protect_mirror_for_run(
         return None;
     }
     let mut command = git_command();
-    command
-        .arg("--git-dir")
-        .arg(&mirror)
-        .args([
-            "update-ref",
-            &format!("refs/preloop/runs/{run_id}"),
-            merge_sha,
-        ]);
-    let output = git_output_within(
-        &mut command,
-        "publish merge-mirror run ref",
-        GIT_CONTROL_TIMEOUT,
-    )
-    .await;
+    command.arg("--git-dir").arg(&mirror).args([
+        "update-ref",
+        &format!("refs/preloop/runs/{run_id}"),
+        merge_sha,
+    ]);
+    let output =
+        git_output_within(command, "publish merge-mirror run ref", GIT_CONTROL_TIMEOUT).await;
     match output {
         Ok(output) if output.status.success() => Some(relative.to_string_lossy().to_string()),
         Ok(output) => {
