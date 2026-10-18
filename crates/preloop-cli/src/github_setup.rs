@@ -1750,7 +1750,8 @@ mod tests {
         pin_setup_env(home.path());
         // The production order: credentials are saved first, which binds the
         // App id in the config, and the webhook secret is what follows.
-        save_app_credentials("4242", TEST_APP_PEM, None).expect("the credentials must save");
+        save_app_credentials("4242", &SecretString::new(TEST_APP_PEM), None)
+            .expect("the credentials must save");
         let update = WebhookUpdate {
             url: "https://ci.example.com/api/v1/github/webhooks".to_owned(),
             secret: "fresh-secret".to_owned(),
@@ -1786,7 +1787,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let previous = capture_setup_env();
         pin_setup_env(home.path());
-        save_app_credentials("4242", TEST_APP_PEM, None).expect("the credentials must save");
+        save_app_credentials("4242", &SecretString::new(TEST_APP_PEM), None)
+            .expect("the credentials must save");
         let update = WebhookUpdate {
             url: "https://ci.example.com/api/v1/github/webhooks".to_owned(),
             secret: "fresh-secret".to_owned(),
