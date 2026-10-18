@@ -5573,7 +5573,7 @@ pub async fn github_callback(
         ));
     };
 
-    let credentials = match exchange_manifest_code(code).await {
+    let credentials = match exchange_manifest_code(&shared.state, code).await {
         Ok(credentials) => credentials,
         Err(status) => {
             warn!("GitHub App manifest code exchange failed");
@@ -5606,8 +5606,15 @@ pub async fn github_callback(
 
 /// Exchange the one-time manifest `code` for the App's credentials. The code is
 /// caller-supplied, so it is encoded as a single path segment.
-async fn exchange_manifest_code(code: &str) -> Result<AppManifestConversion, StatusCode> {
-    let client = crate::shared_http::CLIENT.clone();
+///
+/// The call is anonymous — the code itself is the only credential — so it is
+/// observed against GitHub's anonymous budget, under the App-auth subsystem
+/// that owns App registration. Everything still maps to a 500 for the handoff
+/// page, including a refusal while the breaker is open.
+async fn exchange_manifest_code(
+    state: &crate::state::AppState,
+    code: &str,
+) -> Result<AppManifestConversion, StatusCode> {
     let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
         .unwrap_or_else(|_| "https://api.github.com".to_owned());
     let url = format!(
@@ -5615,20 +5622,17 @@ async fn exchange_manifest_code(code: &str) -> Result<AppManifestConversion, Sta
         api_base,
         crate::actions::percent_encode_path_segment(code)
     );
-    let res = client
-        .post(&url)
-        .header("User-Agent", "preloop")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if !res.status().is_success() {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    res.json::<AppManifestConversion>()
-        .await
+    let value = crate::github_breaker::send_github_json(
+        state,
+        &crate::github_breaker::GithubCredential::anonymous(),
+        crate::github_breaker::GithubSubsystem::AppAuth,
+        reqwest::Method::POST,
+        &url,
+        None,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    serde_json::from_value::<AppManifestConversion>(value)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 

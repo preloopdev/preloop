@@ -245,7 +245,7 @@ async fn resolve_github_repo_meta(
     // Prefer the App registry: a private repository configured App-only has
     // no PAT, and the installation token is the only credential that can
     // read its metadata.
-    let mut app_token: Option<String> = None;
+    let mut app_credential: Option<crate::github_breaker::GithubCredential> = None;
     let mut api_url = "https://api.github.com".to_owned();
     if let Some(shared) = shared {
         api_url = shared
@@ -256,22 +256,54 @@ async fn resolve_github_repo_meta(
             .to_owned();
         if let Some(app) = crate::github_app::select_app_for_repo(shared, slug).await {
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-            app_token = crate::github_app::get_or_mint_token(&app, slug, &permissions)
-                .await
-                .ok();
+            if let Ok(token) = crate::github_app::get_or_mint_token(&app, slug, &permissions).await
+            {
+                // The mint ledger names the installation locally, so the call
+                // is observed on the installation that minted it; an
+                // unnameable one never borrows the PAT's budget.
+                let bucket = match app.mint_ledger.lookup(&token) {
+                    Some(entry) => crate::github_breaker::GithubCredentialBucket::Installation(
+                        entry.installation_id,
+                    ),
+                    None => crate::github_breaker::GithubCredentialBucket::InstallationUnknown,
+                };
+                app_credential = Some(crate::github_breaker::GithubCredential::bearer(
+                    token, bucket,
+                ));
+            }
         }
     }
-    let mut request = crate::shared_http::CLIENT
+    let credential = app_credential.unwrap_or_else(|| match github_pat {
+        Some(pat) => crate::github_breaker::GithubCredential::bearer(
+            pat,
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        ),
+        None => crate::github_breaker::GithubCredential::anonymous(),
+    });
+    // The 10 s per-request bound stays on the request: this lookup is
+    // best-effort for a run that is being created, so it must give up long
+    // before the shared client's own timeout.
+    let request = crate::shared_http::CLIENT
         .get(format!("{api_url}/repos/{slug}"))
         .header("User-Agent", "preloop-runner-server")
         .header("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(10));
-    if let Some(token) = app_token.as_deref().or(github_pat) {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(_) => return (None, None),
+    let response = match shared {
+        Some(shared) => crate::github_breaker::send_github(
+            &shared.state,
+            &credential,
+            crate::github_breaker::GithubSubsystem::Snapshots,
+            request,
+        )
+        .await
+        .ok(),
+        // Callers with no engine state (snapshots taken for a bare local
+        // directory) have no breaker registry to consult; the request keeps
+        // its own bound.
+        None => request.send().await.ok(),
+    };
+    let Some(response) = response else {
+        return (None, None);
     };
     if !response.status().is_success() {
         return (None, None);
@@ -4799,8 +4831,13 @@ static FORGE_RELAY_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
 /// status and response with only [`FORGE_RELAY_RESPONSE_HEADERS`] carried
 /// over — `www-authenticate` deliberately stays behind so an upstream 401
 /// (private repo) surfaces to the job as a fetch failure, not a git
-/// credential prompt.
-async fn forge_relay_forward(request: Request, upstream: &str) -> Result<Response<Body>, ApiError> {
+/// credential prompt. Credential-free by construction, so it is observed
+/// against GitHub's anonymous bucket under the snapshot subsystem.
+async fn forge_relay_forward(
+    state: &AppState,
+    request: Request,
+    upstream: &str,
+) -> Result<Response<Body>, ApiError> {
     let permit = FORGE_RELAY_PERMITS
         .try_acquire()
         .map_err(|_| ApiError::service_unavailable("forge relay is at capacity; retry shortly"))?;
@@ -4815,10 +4852,14 @@ async fn forge_relay_forward(request: Request, upstream: &str) -> Result<Respons
         .await
         .map_err(|error| ApiError::bad_request(format!("invalid relay request body: {error}")))?;
     builder = builder.body(body);
-    let response = builder
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("forge relay request failed: {error}")))?;
+    let response = crate::github_breaker::send_github(
+        state,
+        &crate::github_breaker::GithubCredential::anonymous(),
+        crate::github_breaker::GithubSubsystem::Snapshots,
+        builder,
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("forge relay request failed: {error}")))?;
     let status = response.status();
     let mut out = Response::builder().status(status.as_u16());
     for name in FORGE_RELAY_RESPONSE_HEADERS {
@@ -4886,7 +4927,7 @@ pub async fn forge_git_http(
     } else {
         format!("{upstream}?{query}")
     };
-    forge_relay_forward(request, &upstream).await
+    forge_relay_forward(&shared.state, request, &upstream).await
 }
 
 /// REST archive endpoint for checkouts that cannot run Git.
@@ -4945,7 +4986,7 @@ pub async fn forge_api_repo_tarball(
         .trim_end_matches('/')
         .to_owned();
     let upstream = format!("{api_base}/repos/{owner}/{repo}/tarball/{git_ref}");
-    forge_relay_forward(request, &upstream).await
+    forge_relay_forward(&shared.state, request, &upstream).await
 }
 
 /// `git archive` of a run's local-workspace snapshot, shaped like the forge's
@@ -5145,7 +5186,7 @@ pub async fn forge_api_repo(
         .trim_end_matches('/')
         .to_owned();
     let upstream = format!("{api_base}/repos/{owner}/{repo}");
-    forge_relay_forward(request, &upstream).await
+    forge_relay_forward(&shared.state, request, &upstream).await
 }
 
 #[cfg(test)]
@@ -7824,7 +7865,11 @@ mod archive_tests {
             .body(Body::empty())
             .unwrap();
         let upstream = format!("{forge_base}/repos/owner/repo/tarball/main");
-        let response = forge_relay_forward(request, &upstream).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let response = forge_relay_forward(&state, request, &upstream)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();

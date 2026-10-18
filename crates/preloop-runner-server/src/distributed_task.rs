@@ -148,7 +148,7 @@ async fn render_session_message(
             // (fresh cache, or re-introspected here: the job may have queued
             // past the cache TTL); unverifiable authority stays withheld and
             // the job keeps an empty token surface.
-            match crate::runs::verified_pat_scopes(&pat).await {
+            match crate::runs::verified_pat_scopes(&shared.state, &pat).await {
                 Some(scopes) => {
                     msg.variables.insert(
                         "system.github.token.pat_scopes".to_owned(),

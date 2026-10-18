@@ -1002,6 +1002,55 @@ async fn unknown_token_fails_closed_when_github_is_unreachable() {
     assert!(recorded_runs(&state).await.is_empty());
 }
 
+/// An installed GitHub outage costs one probe, not one round trip per
+/// dispatch: with the unnamed-installation bucket open, a third-party token is
+/// refused before github.com is contacted at all, and the dispatch still fails
+/// closed (502), never anonymous.
+#[tokio::test]
+async fn open_breaker_refuses_a_third_party_dispatch_without_touching_github() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let calls = Arc::new(parking_lot::Mutex::new(0));
+    let mut permissions = serde_json::Map::new();
+    permissions.insert("actions".to_owned(), json!("write"));
+    let stub = installation_stub(
+        Arc::clone(&calls),
+        permissions,
+        "selected",
+        &["octocat/repo"],
+    );
+    let (base, handle) = spawn_github_stub(stub).await;
+    let _env = pin_api_base(&base).await;
+
+    // Three dependency failures on the bucket dispatch auth validates an
+    // unattributable installation token under.
+    let breaker = state
+        .github_breakers
+        .breaker_for(crate::github_breaker::GithubCredentialBucket::InstallationUnknown);
+    for _ in 0..3 {
+        breaker.record_failure(
+            &crate::github_breaker::GithubFailureKind::Unavailable,
+            "502",
+        );
+    }
+    assert!(breaker.is_open());
+
+    let (status, body) = post_json(
+        &app,
+        "/repos/octocat/repo/dispatches",
+        r#"{"event_type": "deploy"}"#,
+        Some("ghs_third_party_token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body={body}");
+    assert_eq!(
+        *calls.lock(),
+        0,
+        "an open breaker must fail the dispatch before github.com is contacted"
+    );
+    assert!(recorded_runs(&state).await.is_empty());
+    handle.abort();
+}
+
 // ─── multi-App registry ────────────────────────────────────────────────
 
 /// Build a two-App registry: the default App (secret `legacy-secret`) plus a

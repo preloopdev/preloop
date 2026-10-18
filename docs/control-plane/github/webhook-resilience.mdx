@@ -43,6 +43,8 @@ The normal open interval starts at 30 seconds and grows to a 300-second ceiling.
 
 The queue gate prevents claims for GitHub-wide unavailability. A rate-limited credential can still be claimed, then parked and refunded when its dependency call reports the limit. This prevents a temporary outage from dead-lettering good deliveries.
 
+Every GitHub call in the engine uses the same breaker, not just the webhook path: check runs, actions, ref resolution, environments, snapshots and their anonymous forge relay, workflows, webhooks, App auth, dispatch auth and target resolution, push-back and auto-PR, the PAT scope probe, and the App-manifest exchange. Presigned cross-host LFS downloads are the one deliberate exception—they are not GitHub traffic and spend no GitHub API budget. Breaker state is keyed per credential bucket (installation id, PAT, App id, unnamed installation token, anonymous), because GitHub's budgets are per credential.
+
 ### 3. App health monitor
 
 Every 15 minutes by default, the monitor reads `GET /app` and `GET /app/hook/config` with an App JWT. It reports missing event subscriptions, the permission that gates each event, delivery-URL drift against `PRELOOP_PUBLIC_URL`, and read errors. It only reports and logs drift; it does not modify GitHub App settings.

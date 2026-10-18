@@ -344,6 +344,17 @@ pub enum GithubCredentialBucket {
     /// health checks, installation lookup and token minting). Each App is its
     /// own rate-limit identity.
     App(u64),
+    /// An installation token whose installation id this call cannot name —
+    /// dispatch auth validating a third-party token, where the id only
+    /// arrives in the response being made.
+    ///
+    /// Sharing the PAT's bucket would park the operator's own credential on a
+    /// stranger's token, and inventing an id would charge another
+    /// installation's budget, so unattributable installation tokens get one
+    /// bucket of their own. It stays a single bucket on purpose: keying on the
+    /// token (hashed, since the registry never removes breakers) would let a
+    /// caller mint an unbounded number of them with arbitrary bearer values.
+    InstallationUnknown,
     /// No credential (anonymous API, 60 req/hour/IP).
     Anonymous,
 }
@@ -367,6 +378,7 @@ impl GithubCredentialBucket {
             GithubCredentialBucket::Installation(id) => format!("installation:{id}"),
             GithubCredentialBucket::Pat => "pat".to_owned(),
             GithubCredentialBucket::App(id) => format!("app:{id}"),
+            GithubCredentialBucket::InstallationUnknown => "installation:unknown".to_owned(),
             GithubCredentialBucket::Anonymous => "anonymous".to_owned(),
         }
     }
@@ -607,8 +619,18 @@ pub enum GithubSubsystem {
     Webhooks,
     /// App-JWT calls that authenticate the App itself: installation lookup and
     /// listing, installation reads, and installation-token minting
-    /// (`github_app.rs`).
+    /// (`github_app.rs`), plus the one-time manifest code exchange that
+    /// registers the App (`github.rs`).
     AppAuth,
+    /// GitHub-compatible dispatch: auth validation and dispatch-target
+    /// resolution (`dispatch_auth.rs`, `dispatch.rs`).
+    Dispatch,
+    /// Push-back sync and webhook-driven auto-PR (`github_push.rs`,
+    /// `github_pr.rs`).
+    PushBack,
+    /// Credential introspection that is not an App JWT: the static PAT's
+    /// classic OAuth scope probe (`runs.rs`).
+    Credentials,
 }
 
 impl GithubSubsystem {
@@ -622,10 +644,13 @@ impl GithubSubsystem {
             GithubSubsystem::Workflows => "workflows",
             GithubSubsystem::Webhooks => "webhooks",
             GithubSubsystem::AppAuth => "app-auth",
+            GithubSubsystem::Dispatch => "dispatch",
+            GithubSubsystem::PushBack => "push-back",
+            GithubSubsystem::Credentials => "credentials",
         }
     }
 
-    const ALL: [GithubSubsystem; 8] = [
+    const ALL: [GithubSubsystem; 11] = [
         GithubSubsystem::CheckRuns,
         GithubSubsystem::Actions,
         GithubSubsystem::RefResolve,
@@ -634,6 +659,9 @@ impl GithubSubsystem {
         GithubSubsystem::Workflows,
         GithubSubsystem::Webhooks,
         GithubSubsystem::AppAuth,
+        GithubSubsystem::Dispatch,
+        GithubSubsystem::PushBack,
+        GithubSubsystem::Credentials,
     ];
 }
 
@@ -845,6 +873,172 @@ pub async fn send_observed_labeled(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The engine's GitHub REST funnel: one credential type, one send, one decode.
+// ---------------------------------------------------------------------------
+
+/// A GitHub credential and the rate-limit bucket it spends.
+///
+/// The two travel together on purpose: a call that authenticates with a token
+/// must be admitted, refused, and accounted for under that credential's own
+/// budget, and passing them separately is how a call ends up observed against
+/// the wrong installation (or, worse, against the anonymous bucket while
+/// spending an installation's budget).
+#[derive(Debug, Clone)]
+pub struct GithubCredential {
+    token: Option<String>,
+    bucket: GithubCredentialBucket,
+}
+
+impl GithubCredential {
+    /// A bearer credential: the static PAT, an installation token, or an App
+    /// JWT.
+    pub fn bearer(token: impl Into<String>, bucket: GithubCredentialBucket) -> Self {
+        Self {
+            token: Some(token.into()),
+            bucket,
+        }
+    }
+
+    /// No credential at all: public-repository access, charged to GitHub's
+    /// 60-requests-per-hour-per-IP anonymous budget.
+    pub fn anonymous() -> Self {
+        Self {
+            token: None,
+            bucket: GithubCredentialBucket::Anonymous,
+        }
+    }
+
+    /// The breaker bucket this credential's calls are keyed on.
+    pub fn bucket(&self) -> GithubCredentialBucket {
+        self.bucket
+    }
+
+    /// Attach the `Authorization` header for this credential.
+    ///
+    /// An anonymous credential contributes no header, which is what the forge
+    /// relay and the App-manifest exchange need: both must reach GitHub with
+    /// no credential of the engine's attached.
+    pub fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.token.as_deref() {
+            Some(token) => request.header("Authorization", format!("Bearer {token}")),
+            None => request,
+        }
+    }
+}
+
+/// GitHub answered an engine API call with a non-success status.
+///
+/// Typed so a caller can branch on the status without parsing text (dispatch
+/// auth turns a 401/403 into a refused credential and everything else into a
+/// gateway failure), while [`std::fmt::Display`] keeps the `status {code}`
+/// wording the push-back classifier already reads.
+#[derive(Debug)]
+pub struct GithubApiError {
+    method: reqwest::Method,
+    url: String,
+    /// The status GitHub answered with.
+    pub status: reqwest::StatusCode,
+    /// The response body, truncated to [`GithubApiError::BODY_LIMIT`] chars:
+    /// enough to explain the refusal, bounded because it lands in logs and
+    /// error messages.
+    pub body: String,
+}
+
+impl GithubApiError {
+    const BODY_LIMIT: usize = 1024;
+
+    fn new(method: reqwest::Method, url: &str, status: reqwest::StatusCode, body: String) -> Self {
+        Self {
+            method,
+            url: url.to_owned(),
+            status,
+            body: body.chars().take(Self::BODY_LIMIT).collect(),
+        }
+    }
+}
+
+impl std::fmt::Display for GithubApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GitHub API {} {} failed with status {}: {}",
+            self.method,
+            self.url,
+            self.status.as_u16(),
+            self.body
+        )
+    }
+}
+
+impl std::error::Error for GithubApiError {}
+
+/// Send one outbound GitHub request through the calling credential's breaker
+/// with per-subsystem consumption accounting.
+///
+/// This is [`send_observed_labeled`] with the engine's credential in hand, so
+/// no call site has to resolve the bucket and the bearer separately. Use it
+/// for calls that need their own client, headers, or response handling — a
+/// streaming relay, a header-only read, a per-request timeout;
+/// [`send_github_json`] covers the engine's standard JSON call.
+///
+/// A refusal while the breaker is open is an error downcastable to
+/// [`BreakerOpen`], and no GitHub budget was spent: callers that decide their
+/// own retry (the queue parks work, best-effort lookups fall back) can tell
+/// that case apart from a real failure.
+pub async fn send_github(
+    state: &crate::state::AppState,
+    credential: &GithubCredential,
+    subsystem: GithubSubsystem,
+    request: reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    let response = send_observed_labeled(
+        &state.github_breakers,
+        credential.bucket(),
+        &state.github_consumption,
+        subsystem,
+        credential.authorize(request),
+    )
+    .await?;
+    state
+        .github_consumption
+        .record_advertised_bytes(subsystem, &response);
+    Ok(response)
+}
+
+/// Send one engine-standard GitHub REST JSON call through the breaker.
+///
+/// The shape every JSON call in the engine shares: the shared outbound client,
+/// the standard GitHub headers, the credential's bearer (none when anonymous),
+/// an optional JSON body, and a decoded body. A non-success status becomes a
+/// [`GithubApiError`] carrying the status and the response text, so callers
+/// keep their own mapping (fail closed, 404, 500) without re-parsing.
+pub async fn send_github_json(
+    state: &crate::state::AppState,
+    credential: &GithubCredential,
+    subsystem: GithubSubsystem,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut request = crate::shared_http::CLIENT
+        .request(method.clone(), url)
+        .header("User-Agent", "preloop")
+        .header("Accept", "application/vnd.github+json");
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = send_github(state, credential, subsystem, request).await?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(GithubApiError::new(method, url, status, text).into());
+    }
+    serde_json::from_str(&text).map_err(|error| {
+        anyhow::anyhow!("GitHub API {method} {url} returned a non-JSON body: {error}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,7 +1212,10 @@ mod tests {
                 "snapshots",
                 "workflows",
                 "webhooks",
-                "app-auth"
+                "app-auth",
+                "dispatch",
+                "push-back",
+                "credentials"
             ]
         );
     }
@@ -1083,11 +1280,22 @@ mod tests {
         );
     }
 
+    /// What one request to [`StubGitHub`] carried, so a test can assert what
+    /// the engine actually sent — in particular that a credential went to the
+    /// host it was minted for and nowhere else.
+    #[derive(Debug, Clone)]
+    struct StubRequest {
+        method: String,
+        uri: String,
+        authorization: Option<String>,
+    }
+
     /// A tiny stub GitHub: serves scripted responses and counts hits, so
     /// tests prove the breaker engages without touching the real github.com.
     struct StubGitHub {
         base: String,
         hits: Arc<std::sync::atomic::AtomicU64>,
+        requests: Arc<std::sync::Mutex<Vec<StubRequest>>>,
     }
 
     impl StubGitHub {
@@ -1099,12 +1307,24 @@ mod tests {
             use std::sync::atomic::Ordering;
             let hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let hits_route = hits.clone();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let requests_route = requests.clone();
             let app = axum::Router::new().route(
                 "/{*path}",
-                axum::routing::any(move || {
+                axum::routing::any(move |request: axum::extract::Request| {
                     let hits_route = hits_route.clone();
+                    let requests_route = requests_route.clone();
                     async move {
                         hits_route.fetch_add(1, Ordering::SeqCst);
+                        requests_route.lock().unwrap().push(StubRequest {
+                            method: request.method().to_string(),
+                            uri: request.uri().to_string(),
+                            authorization: request
+                                .headers()
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                        });
                         let mut builder = axum::http::Response::builder().status(status);
                         for (name, value) in &headers {
                             builder = builder.header(name, value);
@@ -1116,7 +1336,19 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            Self { base, hits }
+            Self {
+                base,
+                hits,
+                requests,
+            }
+        }
+
+        fn count(&self) -> u64 {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn requests(&self) -> Vec<StubRequest> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -1504,5 +1736,232 @@ mod tests {
             refusal.to_string(),
             "GitHub circuit breaker is open (retry after 30s)"
         );
+    }
+
+    // ─── the REST funnel (send_github / send_github_json) ──────────────────
+
+    /// An `AppState` as a running server builds it, so the funnel is driven
+    /// against the same breaker registry and consumption counters.
+    async fn funnel_state() -> crate::state::AppState {
+        let temp = tempfile::tempdir().unwrap();
+        crate::state::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap()
+    }
+
+    /// A failing stub opens the credential's breaker, and the next call is
+    /// refused without touching GitHub: the whole point of routing every
+    /// engine call through the funnel is that an outage costs one round trip
+    /// per credential, not one per caller.
+    #[tokio::test]
+    async fn an_open_breaker_refuses_a_json_call_without_touching_github() {
+        let stub = StubGitHub::serve(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Vec::new(),
+            "{\"message\":\"boom\"}",
+        )
+        .await;
+        let state = funnel_state().await;
+        let credential = GithubCredential::bearer("ghp_test", GithubCredentialBucket::Pat);
+        let url = format!("{}/repos/o/r/commits/main", stub.base);
+
+        for attempt in 0..3 {
+            send_github_json(
+                &state,
+                &credential,
+                GithubSubsystem::PushBack,
+                reqwest::Method::GET,
+                &url,
+                None,
+            )
+            .await
+            .map(|body| panic!("attempt {attempt} must fail, decoded {body}"))
+            .expect_err("a 500 must fail");
+        }
+        assert_eq!(stub.count(), 3, "every attempt reached the stub");
+        assert_eq!(
+            stub.requests()[0].authorization.as_deref(),
+            Some("Bearer ghp_test"),
+            "the credential must actually reach GitHub"
+        );
+        let breaker = state
+            .github_breakers
+            .breaker_for(GithubCredentialBucket::Pat);
+        assert!(
+            breaker.is_open(),
+            "three dependency failures must open the breaker"
+        );
+        let usage = |subsystem: &str| {
+            state
+                .github_consumption
+                .snapshot()
+                .into_iter()
+                .find(|usage| usage.subsystem == subsystem)
+                .expect("subsystem counters exist")
+        };
+        assert_eq!(usage("push-back").requests, 3);
+        assert_eq!(usage("push-back").breaker_blocked, 0);
+
+        let error = send_github_json(
+            &state,
+            &credential,
+            GithubSubsystem::PushBack,
+            reqwest::Method::GET,
+            &url,
+            None,
+        )
+        .await
+        .expect_err("an open breaker must refuse the call");
+        assert!(
+            error.downcast_ref::<BreakerOpen>().is_some(),
+            "a breaker refusal must stay downcastable: {error:#}"
+        );
+        assert_eq!(stub.count(), 3, "the refusal must not reach GitHub");
+        assert_eq!(usage("push-back").breaker_blocked, 1);
+    }
+
+    /// An answer resets the credential's failures, and a bucket parks only its
+    /// own credential: GitHub's budgets are per credential, so a throttled PAT
+    /// must not stop the anonymous relay — which must also reach the forge
+    /// with no credential at all.
+    #[tokio::test]
+    async fn a_reachable_answer_closes_the_breaker_and_buckets_stay_independent() {
+        let failing =
+            StubGitHub::serve(axum::http::StatusCode::BAD_GATEWAY, Vec::new(), "{}").await;
+        let healthy =
+            StubGitHub::serve(axum::http::StatusCode::OK, Vec::new(), "{\"ok\":true}").await;
+        let state = funnel_state().await;
+        let pat = GithubCredential::bearer("ghp_test", GithubCredentialBucket::Pat);
+
+        for _ in 0..2 {
+            let _ = send_github_json(
+                &state,
+                &pat,
+                GithubSubsystem::PushBack,
+                reqwest::Method::GET,
+                &format!("{}/repos/o/r", failing.base),
+                None,
+            )
+            .await
+            .expect_err("a 502 must fail");
+        }
+        assert_eq!(failing.count(), 2);
+        assert!(
+            !state
+                .github_breakers
+                .breaker_for(GithubCredentialBucket::Pat)
+                .is_open(),
+            "two failures are below the threshold"
+        );
+
+        let body = send_github_json(
+            &state,
+            &pat,
+            GithubSubsystem::PushBack,
+            reqwest::Method::GET,
+            &format!("{}/repos/o/r", healthy.base),
+            None,
+        )
+        .await
+        .expect("a 200 must decode");
+        assert_eq!(body["ok"], true);
+        let breaker = state
+            .github_breakers
+            .breaker_for(GithubCredentialBucket::Pat);
+        assert!(
+            !breaker.is_open() && breaker.snapshot().consecutive_failures == 0,
+            "an answer must reset the credential's failure count"
+        );
+
+        // Same stub, anonymous credential: the funnel authorizes nothing and
+        // consults the anonymous bucket, which the PAT's failures never touched.
+        let response = send_github(
+            &state,
+            &GithubCredential::anonymous(),
+            GithubSubsystem::Snapshots,
+            crate::shared_http::CLIENT
+                .get(format!("{}/repos/o/r/tarball/main", healthy.base))
+                .header("Accept", "application/vnd.github+json"),
+        )
+        .await
+        .expect("an anonymous relay call must succeed");
+        assert!(response.status().is_success());
+        assert_eq!(healthy.count(), 2);
+        assert!(
+            !state
+                .github_breakers
+                .breaker_for(GithubCredentialBucket::Anonymous)
+                .is_open()
+        );
+        let anonymous = healthy.requests();
+        assert_eq!(anonymous.len(), 2);
+        assert_eq!(
+            anonymous[1].authorization, None,
+            "an anonymous credential must not put an Authorization header on the wire"
+        );
+        assert_eq!(anonymous[1].uri, "/repos/o/r/tarball/main");
+    }
+
+    /// A transport failure is a dependency failure too: the engine learns
+    /// GitHub is unreachable from the callback, not only from a 5xx body.
+    #[tokio::test]
+    async fn transport_failures_open_the_credential_breaker() {
+        let state = funnel_state().await;
+        let credential =
+            GithubCredential::bearer("ghp_test", GithubCredentialBucket::InstallationUnknown);
+        // Port 1 on loopback is closed: connection refused, no HTTP exchange.
+        for _ in 0..3 {
+            let _ = send_github_json(
+                &state,
+                &credential,
+                GithubSubsystem::Dispatch,
+                reqwest::Method::GET,
+                "http://127.0.0.1:1/installation",
+                None,
+            )
+            .await
+            .expect_err("connection refused must fail");
+        }
+        assert!(
+            state
+                .github_breakers
+                .breaker_for(GithubCredentialBucket::InstallationUnknown)
+                .is_open(),
+            "an unreachable GitHub must open the unnamed-installation bucket"
+        );
+    }
+
+    /// The funnel keeps the failure text the push-back classifier reads: a
+    /// non-2xx must still read as `status {code}`, with the body for the
+    /// operator, and the status must be reachable without parsing that text.
+    #[tokio::test]
+    async fn api_errors_carry_status_and_body() {
+        let stub = StubGitHub::serve(
+            axum::http::StatusCode::NOT_FOUND,
+            Vec::new(),
+            "{\"message\":\"Not Found\"}",
+        )
+        .await;
+        let state = funnel_state().await;
+        let error = send_github_json(
+            &state,
+            &GithubCredential::anonymous(),
+            GithubSubsystem::Workflows,
+            reqwest::Method::GET,
+            &format!("{}/repos/o/r", stub.base),
+            None,
+        )
+        .await
+        .expect_err("a 404 must fail");
+        let api = error
+            .downcast_ref::<GithubApiError>()
+            .expect("a non-success status must be typed");
+        assert_eq!(api.status, reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(api.body, "{\"message\":\"Not Found\"}");
+        assert!(
+            error.to_string().contains("status 404"),
+            "the classifier reads the status off the text: {error}"
+        );
+        assert_eq!(stub.count(), 1);
     }
 }
