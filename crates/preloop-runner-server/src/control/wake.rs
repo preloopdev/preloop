@@ -69,8 +69,19 @@ pub(crate) struct Listener {
 /// Spawn the listener: a dedicated connection that `LISTEN`s on [`CHANNEL`],
 /// [`EVENTS_CHANNEL`] and [`WEBHOOK_CHANNEL`] and republishes every notification
 /// on the returned channels. Reconnects with backoff when the connection
-/// drops (failover, restart).
+/// drops (failover, restart), and when an attempt stalls: every attempt —
+/// resolution, TCP connect, TLS, authentication and the `LISTEN`s — runs
+/// under [`crate::store_pg::CONNECT_TIMEOUT`], so a database that accepts TCP and
+/// then never answers is logged and retried instead of leaving a listener
+/// that silently never subscribed.
 pub(crate) fn spawn_listener(url: String) -> Listener {
+    spawn_listener_within(url, crate::store_pg::CONNECT_TIMEOUT)
+}
+
+/// [`spawn_listener`] with the per-attempt deadline given, so a test can
+/// prove that a stalled attempt ends at the deadline and is retried without
+/// waiting the production one.
+fn spawn_listener_within(url: String, deadline: Duration) -> Listener {
     let (wakes, _) = broadcast::channel(1024);
     let (events, _) = broadcast::channel(1024);
     let (webhooks, _) = broadcast::channel(1024);
@@ -82,7 +93,7 @@ pub(crate) fn spawn_listener(url: String) -> Listener {
     tokio::spawn(async move {
         let mut backoff = Duration::from_millis(200);
         loop {
-            match listen_once(&url, &wakes, &events, &webhooks).await {
+            match listen_once(&url, &wakes, &events, &webhooks, deadline).await {
                 Ok(()) => backoff = Duration::from_millis(200),
                 Err(error) => {
                     tracing::warn!(%error, "wake listener disconnected; reconnecting");
@@ -100,29 +111,22 @@ async fn listen_once(
     wakes: &broadcast::Sender<Wake>,
     events: &broadcast::Sender<String>,
     webhooks: &broadcast::Sender<String>,
+    deadline: Duration,
 ) -> anyhow::Result<()> {
-    let connect_url = crate::store_pg::connect_url(url);
     // The connection must be polled for the client's LISTEN to complete, so
     // it runs on its own task; notifications come back over `notes`.
     let (notes_tx, mut notes) = tokio::sync::mpsc::unbounded_channel();
-    let client = match crate::store_pg::tls_connector(url)? {
-        Some(tls) => {
-            let (client, connection) = tokio_postgres::connect(&connect_url, tls).await?;
-            tokio::spawn(drive(connection, notes_tx));
-            client
-        }
-        None => {
-            let (client, connection) =
-                tokio_postgres::connect(&connect_url, tokio_postgres::NoTls).await?;
-            tokio::spawn(drive(connection, notes_tx));
-            client
-        }
-    };
-    client
-        .batch_execute(&format!(
-            "LISTEN {CHANNEL}; LISTEN {EVENTS_CHANNEL}; LISTEN {WEBHOOK_CHANNEL}"
-        ))
-        .await?;
+    let listen = format!(
+        "{}; LISTEN {CHANNEL}; LISTEN {EVENTS_CHANNEL}; LISTEN {WEBHOOK_CHANNEL}",
+        crate::store_pg::session_timeouts_sql()
+    );
+    // One deadline for the whole attempt. Without it a database that accepts
+    // TCP and then stalls left this task waiting on the startup handshake or
+    // on the LISTENs forever: no notification, no error, no retry — a
+    // listener that is silently dead until the process restarts.
+    let _client =
+        crate::store_pg::open_session(deadline, url, &listen, |driver| drive(driver, notes_tx))
+            .await?;
     // A reconnect may have missed events committed while disconnected: wake
     // the event consumers once so they re-read from their bookmark.
     let _ = events.send(String::new());
@@ -163,17 +167,14 @@ pub(crate) async fn forward_webhook_wakes(
     }
 }
 
-/// Poll a connection, forwarding `(channel, payload)` of each notification
-/// until it closes.
-async fn drive<S, T>(
-    mut connection: tokio_postgres::Connection<S, T>,
+/// Poll a session's driver connection, forwarding `(channel, payload)` of
+/// each notification until it closes.
+async fn drive(
+    mut driver: crate::store_pg::Driver,
     notes: tokio::sync::mpsc::UnboundedSender<(String, String)>,
-) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+) {
     use futures::StreamExt;
-    let mut messages = futures::stream::poll_fn(move |cx| connection.poll_message(cx));
+    let mut messages = futures::stream::poll_fn(|cx| driver.poll_message(cx));
     while let Some(Ok(message)) = messages.next().await {
         if let tokio_postgres::AsyncMessage::Notification(note) = message
             && notes
@@ -187,10 +188,85 @@ async fn drive<S, T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Wake, forward_webhook_wakes};
+    use super::{Wake, forward_webhook_wakes, listen_once, spawn_listener_within};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
     use tokio::sync::{Notify, broadcast};
+
+    /// A TCP listener that accepts every connection and never answers: the
+    /// shape of a database that is hung rather than down. Each accepted
+    /// socket is held open by a task that never returns, so the peer sees a
+    /// live connection that simply never speaks.
+    async fn silent_listener() -> (u16, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _peer)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let _held = socket;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        (port, accepts)
+    }
+
+    /// A stalled database ends the listen attempt at the deadline. Before the
+    /// connect deadline, `listen_once` waited on the startup handshake
+    /// forever: the listener never subscribed, never logged and never
+    /// retried, so every wake hint was lost until the process restarted.
+    #[tokio::test]
+    async fn a_stalled_database_ends_the_listen_attempt_at_the_deadline() {
+        let (port, accepts) = silent_listener().await;
+        let url = format!("postgres://preloop@127.0.0.1:{port}/control");
+        let (wakes, _) = broadcast::channel(8);
+        let (events, _) = broadcast::channel(8);
+        let (webhooks, _) = broadcast::channel(8);
+        let started = Instant::now();
+        let error = listen_once(&url, &wakes, &events, &webhooks, Duration::from_millis(250))
+            .await
+            .expect_err("a database that never answers must not complete the listen attempt");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the attempt ended after {elapsed:?}, not at its 250 ms deadline"
+        );
+        let message = error.to_string();
+        for needle in ["Postgres", "connect deadline"] {
+            assert!(message.contains(needle), "{message}");
+        }
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 1,
+            "the TCP connect must have been accepted, so the stall was after it"
+        );
+    }
+
+    /// The listener loop retries a stalled attempt instead of leaving a
+    /// listener that silently never subscribed: with a short attempt
+    /// deadline, a database that accepts and never answers is connected to
+    /// again on the backoff schedule (200 ms doubling).
+    #[tokio::test]
+    async fn a_stalled_database_is_retried_not_silently_dead() {
+        let (port, accepts) = silent_listener().await;
+        let url = format!("postgres://preloop@127.0.0.1:{port}/control");
+        let _listener = spawn_listener_within(url, Duration::from_millis(100));
+        // Attempt one ends at its deadline, then the loop backs off 200 ms and
+        // tries again: more than one accepted connection proves the retry.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let attempts = accepts.load(Ordering::SeqCst);
+        assert!(
+            attempts >= 2,
+            "the listener made {attempts} attempt(s) in 2 s: a stalled attempt must end at its \
+             deadline and be retried"
+        );
+    }
 
     #[test]
     fn wake_round_trips_and_rejects_garbage() {

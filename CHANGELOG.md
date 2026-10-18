@@ -225,6 +225,24 @@ Releases before v0.27.0 predate the changelog.
   effective public URL is resolved before the already-configured-App branch, so
   setting it in the environment (without `--public-url`) points the configured
   App's webhook at that address instead of printing only that it is configured.
+
+- **A hung Postgres no longer freezes the engine, and a stuck statement or
+  lock wait is cancelled instead of waiting forever.** Every engine Postgres
+  session now opens under a 10 s connect deadline covering resolution, TCP,
+  TLS, authentication and the session `SET`s — `tokio-postgres` bounds only
+  the TCP connect — so a database that accepts connections and then stops
+  answering fails engine startup, a pooled reconnect, and the wake listener
+  with an error that names the deadline, and the listener retries with
+  backoff instead of sitting silently dead. Sessions then carry
+  `statement_timeout` 30 s, `lock_timeout` 15 s and
+  `idle_in_transaction_session_timeout` 60 s, so a statement stuck behind a
+  lock held by another transaction (the shape of the engine freeze that
+  started with Postgres killing idle-in-transaction sessions) is cancelled
+  with an error naming the timeout, instead of holding a runtime worker, a
+  pooled connection and its row locks indefinitely. Migrations are not
+  affected: `preloop store migrate` opens its own connection without these
+  guards, and the one migration a serving process can run (test-support
+  schema creation) lifts them to migration-scoped values.
 - **A hung OS keychain or trust daemon no longer freezes the engine.** On
   macOS, outbound TLS verified every new connection through
   `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked
