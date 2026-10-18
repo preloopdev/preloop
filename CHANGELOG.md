@@ -31,6 +31,17 @@ Releases before v0.27.0 predate the changelog.
   and read by the updater. Raising the golden pin does not rebuild the
   published golden: it is a digest-pinned OCI artifact, so a 1.30.1-baked
   golden needs a bake, publish, and digest bump per `docs/build-goldens.md`.
+- **One dependency/policy PR, and nothing mixed into it.** A pull request may
+  ship `deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`,
+  `supply-chain/**`, and any `Cargo.toml` or `Cargo.lock` in the tree together —
+  one supply-chain CI run — but it fails if any of them is mixed with source,
+  docs, `CHANGELOG.md`, another workflow, the `justfile`, or any other file.
+  Code that needs a new dependency lands in a follow-up PR, rebased on `main`
+  after the dependency/policy PR merges. The rule now lives in
+  `supply-chain/guard-policy-files.sh` (same script CI runs), with the policy
+  and the reasoning in `supply-chain/README.md`; run it locally as
+  `just supply-chain-guard`, which compares the merge base of `origin/main` and
+  `HEAD`. There is no override: the verdict follows from the diff.
 
 - **The file credential store is the default.** The engine token, GitHub App
   private key, PAT, and webhook secrets are written to `0600` files under

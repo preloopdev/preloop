@@ -12,6 +12,8 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 preloop-observability = { path = "../preloop-observability" }
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }
+hex = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
