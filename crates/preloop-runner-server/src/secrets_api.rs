@@ -26,10 +26,34 @@ pub fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Repository scope must look like `owner/repo`.
+/// Repository scope must look like `owner/repo`. Secret scopes also cover
+/// `local/<dir>` workspace identities, so this stays a shape check; anything
+/// destined for a GitHub URL wants [`valid_repo_slug`].
 pub fn valid_repo(repo: &str) -> bool {
     repo.split_once('/')
         .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty())
+}
+
+/// A single `owner`/`repo` segment before it is interpolated into a request
+/// URL. Path extractors may percent-decode first (`%2e%2e%2f..%2fusers%2fx%3F`
+/// arrives with real separators), and the URL crate then normalizes `.`/`..`
+/// while parsing — together they escape whatever path prefix the caller
+/// built. Only the dot names that normalization acts on are refused, plus
+/// `.git`: a repository GitHub does not allow. Every other name is passed
+/// through, `.github` and `.dotfiles` included, since GitHub has them.
+pub fn valid_repo_segment(segment: &str) -> bool {
+    !matches!(segment, "" | "." | ".." | ".git")
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// A GitHub `owner/repo` slug: exactly two segments, each safe to
+/// interpolate into an API URL path.
+pub fn valid_repo_slug(repo: &str) -> bool {
+    let mut segments = repo.split('/');
+    let (owner, name, rest) = (segments.next(), segments.next(), segments.next());
+    rest.is_none() && owner.is_some_and(valid_repo_segment) && name.is_some_and(valid_repo_segment)
 }
 
 /// Environment scope mirrors GitHub: letters, digits, hyphens, and
@@ -453,6 +477,53 @@ fn not_found_error(name: &str, query: &SecretQuery) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decoded path parameters can carry separators or dot segments;
+    /// `url`/`reqwest` normalize `..` while parsing, so a segment that slips
+    /// through escapes the configured path prefix (SSRF). Only the exact dot
+    /// segments are dangerous, and `.git` names no repository.
+    #[test]
+    fn repo_segments_reject_traversal() {
+        for bad in ["", ".", "..", ".git", "a/b", "a?b", "a#b", "..%2fusers"] {
+            assert!(!valid_repo_segment(bad), "{bad:?} must be refused");
+        }
+        for good in [
+            "owner",
+            "repo.js",
+            "some-repo_name",
+            "node-24.x",
+            ".github",
+            ".dotfiles",
+            "..foo",
+        ] {
+            assert!(valid_repo_segment(good), "{good:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn repo_slugs_accept_exactly_two_plain_segments() {
+        assert!(valid_repo_slug("owner/name"));
+        assert!(valid_repo_slug("Preloop/preloop.js"));
+        // Dot-prefixed names are real repositories: `.github` is the org
+        // profile repository, `.dotfiles` a common personal one.
+        assert!(valid_repo_slug("owner/.github"));
+        assert!(valid_repo_slug("owner/.dotfiles"));
+        assert!(valid_repo_slug(".github/actions"));
+        for bad in [
+            "",
+            "owner",
+            "owner/",
+            "/name",
+            "a/b/c",
+            "o/r/../../app/hook/deliveries",
+            "o/r?x=1",
+            "o/r#f",
+            "o/..",
+            "o/.git",
+        ] {
+            assert!(!valid_repo_slug(bad), "{bad:?} must be refused");
+        }
+    }
 
     #[test]
     fn credential_scope_conflict_matches_all_three_tiers() {

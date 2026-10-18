@@ -15,6 +15,7 @@ use preloop_runner_server::credential_store::{
     CredentialRef, CredentialWriter, SecretString, Written, github_reference,
     github_reference_with_host,
 };
+use preloop_runner_server::secrets_api::valid_repo;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -365,6 +366,20 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
 
     let path = save_app_credentials(&app_id, &pem, webhook_secret)?;
     println!("Wrote {}", path.display());
+    // Credentials alone do not deliver anything: GitHub's manifest flow sets
+    // the hook up, this path cannot, so an App whose id and key were supplied
+    // by hand has webhooks off until `--public-url` points them here. The
+    // secret just stored (or one from an earlier run) is reused, so a working
+    // secret is never rotated. A refusal is fatal and named — the secret is
+    // kept locally, the hook still delivers nowhere, and `apply_app_webhook`
+    // says all of that plus how to recover — because claiming success would
+    // leave pushes and pull requests silently starting nothing.
+    if let Some(update) = app_webhook_update(
+        args.public_url.as_deref(),
+        stored_webhook_secret(&load_config()?, &app_id),
+    ) {
+        apply_app_webhook(&app_id, &pem, &update).await?;
+    }
     println!(
         "App {app_id} configured. If the App is not yet installed on your repositories:\n\
          \x20 https://github.com/apps/<slug>/installations/new\n\
@@ -548,17 +563,27 @@ async fn setup_app_via_browser(args: &GithubSetupArgs) -> anyhow::Result<()> {
     doctor_app(&app_id, &credentials.pem, &args.repos).await
 }
 
-/// Point an already-configured App's webhook at a reachable URL.
+/// The webhook an existing App must be pointed at: the delivery URL, and the
+/// secret it signs with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebhookUpdate {
+    /// The full hook URL, `/api/v1/github/webhooks` included.
+    url: String,
+    secret: String,
+}
+
+/// The webhook to enable for an App at `public_url`, decided without touching
+/// GitHub. `None` without a URL: there is nothing to point anywhere, and the
+/// App keeps whatever hook it has.
 ///
-/// Reuses the stored secret when there is one — rotating it would silently
-/// break any other consumer of the same App — and generates one otherwise,
-/// since GitHub only signs deliveries when a secret is set.
-async fn enable_webhooks(
-    app_id: &str,
-    pem: &str,
-    public_url: &str,
+/// The stored secret is reused when there is one — rotating it would silently
+/// break any other consumer of the same App — and a fresh one is generated
+/// otherwise, since GitHub only signs deliveries when a secret is set.
+fn app_webhook_update(
+    public_url: Option<&str>,
     stored_secret: Option<String>,
-) -> anyhow::Result<()> {
+) -> Option<WebhookUpdate> {
+    let public_url = public_url?;
     let secret = match stored_secret.filter(|secret| !secret.is_empty()) {
         Some(secret) => secret,
         None => {
@@ -566,18 +591,45 @@ async fn enable_webhooks(
             bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         }
     };
-    let hook_url = format!(
-        "{}/api/v1/github/webhooks",
-        public_url.trim_end_matches('/')
-    );
-    preloop_runner_server::github_app::set_app_webhook_config(app_id, pem, &hook_url, &secret)
-        .await?;
+    Some(WebhookUpdate {
+        url: format!(
+            "{}/api/v1/github/webhooks",
+            public_url.trim_end_matches('/')
+        ),
+        secret,
+    })
+}
+
+/// The webhook secret already stored for `app_id`, whether it is the primary
+/// App (`github.app_id`) or an entry in the `github.apps` registry. Reading it
+/// back is what keeps a re-run from rotating a secret GitHub is already
+/// signing with.
+fn stored_webhook_secret(config: &ConfigFile, app_id: &str) -> Option<String> {
+    if let Some(app) = config.github.apps.iter().find(|app| app.app_id == app_id) {
+        return app.webhook_secret().map(str::to_owned);
+    }
+    if config.github.app_id.as_deref() == Some(app_id) {
+        return config.github.webhook_secret().map(str::to_owned);
+    }
+    None
+}
+
+/// Store `secret` as the webhook secret for `app_id`, and return it as a
+/// fresh load reads it back — the value the engine will verify deliveries
+/// with.
+///
+/// This runs *before* GitHub is told which secret to sign with. The other
+/// order has a failure mode with no local trace: if the credential store or
+/// the config write fails (read-only or full filesystem, a refusing keychain)
+/// after GitHub accepted the secret, GitHub signs every delivery with a
+/// secret nobody holds, and every delivery fails verification.
+fn store_webhook_secret(app_id: &str, secret: &str) -> anyhow::Result<String> {
     let mut config = load_config()?;
     let mut writer =
         CredentialWriter::for_config(&config_path(), config.credential_store.as_deref())?;
     let webhook_ref =
         github_reference_with_host("webhook", config.github.server_url.as_deref(), Some(app_id))?;
-    persist_secret(&mut writer, &mut config, &webhook_ref, &secret)?;
+    persist_secret(&mut writer, &mut config, &webhook_ref, secret)?;
     if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
         existing.legacy_webhook_secret = None;
         existing.webhook_secret_ref = Some(webhook_ref.as_str().to_owned());
@@ -585,9 +637,59 @@ async fn enable_webhooks(
         config.github.legacy_webhook_secret = None;
         config.github.webhook_secret_ref = Some(webhook_ref.as_str().to_owned());
     }
-    println!("Secret stored in {}.", writer.destination());
     write_config(&config)?;
-    println!("App {app_id} webhook now delivers to {hook_url}");
+    println!("Secret stored in {}.", writer.destination());
+    stored_webhook_secret(&load_config()?, app_id)
+        .filter(|stored| !stored.is_empty())
+        .with_context(|| {
+            format!(
+                "the webhook secret for App {app_id} was written, but does not load back \
+                 from the credential store"
+            )
+        })
+}
+
+/// Persist the secret, then let `point_hook` — the GitHub call in production —
+/// aim the App's deliveries at `update.url` signing with it.
+///
+/// The split is the fix, not a style choice: `point_hook` runs second, and the
+/// secret it receives is the one read back from the local store, so GitHub is
+/// only ever told to sign with a value the engine holds. Whichever step fails,
+/// the outcome is coherent — the secret is kept when GitHub refused the
+/// update, and GitHub is untouched when the local writes failed — and a re-run
+/// reuses the stored secret rather than rotating it.
+async fn persist_secret_then_point_hook<F, Fut>(
+    app_id: &str,
+    update: &WebhookUpdate,
+    point_hook: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let stored = store_webhook_secret(app_id, &update.secret)?;
+    point_hook(stored).await.with_context(|| {
+        format!(
+            "App {app_id}'s webhook secret was stored locally, but GitHub refused the \
+             webhook update — its webhook still delivers nowhere. Fix the credentials (the \
+             App id and private key must match, and the App must be manageable with them) \
+             and re-run; the stored secret is reused, never rotated. Or point it at {} by \
+             hand under the App's Webhook settings.",
+            update.url
+        )
+    })
+}
+
+/// Point an App's webhook at `update`, storing the secret it will sign with
+/// first — see [`persist_secret_then_point_hook`] for why that order is the
+/// whole point.
+async fn apply_app_webhook(app_id: &str, pem: &str, update: &WebhookUpdate) -> anyhow::Result<()> {
+    persist_secret_then_point_hook(app_id, update, |secret| async move {
+        preloop_runner_server::github_app::set_app_webhook_config(app_id, pem, &update.url, &secret)
+            .await
+    })
+    .await?;
+    println!("App {app_id} webhook now delivers to {}", update.url);
     println!(
         "If deliveries do not arrive, tick **Active** under Webhook in the App's\n\
          settings — GitHub's API cannot set that flag, and an App created\n\
@@ -595,6 +697,20 @@ async fn enable_webhooks(
     );
     println!("Restart the engine (`preloop serve`) to pick up the secret.");
     Ok(())
+}
+
+/// Point an already-configured App's webhook at a reachable URL. For callers
+/// that always have a URL; see [`app_webhook_update`] for the decision and
+/// [`apply_app_webhook`] for the GitHub call.
+async fn enable_webhooks(
+    app_id: &str,
+    pem: &str,
+    public_url: &str,
+    stored_secret: Option<String>,
+) -> anyhow::Result<()> {
+    let update = app_webhook_update(Some(public_url), stored_secret)
+        .expect("a public URL always yields a webhook update");
+    apply_app_webhook(app_id, pem, &update).await
 }
 
 async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
@@ -943,11 +1059,6 @@ fn valid_secret_name(name: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-fn valid_repo_scope(repo: &str) -> bool {
-    repo.split_once('/')
-        .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty())
-}
-
 fn valid_env_scope(env: &str) -> bool {
     !env.is_empty()
         && env.len() <= 255
@@ -1090,7 +1201,7 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
                 anyhow::bail!("secret name must be UPPER_SNAKE (letters, digits, underscore)");
             }
             if let Some(repo) = &repo
-                && !valid_repo_scope(repo)
+                && !valid_repo(repo)
             {
                 anyhow::bail!("--repo must look like owner/repo");
             }
@@ -1168,7 +1279,7 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
         }
         SecretCommand::List { repo, env } => {
             if let Some(repo) = &repo
-                && !valid_repo_scope(repo)
+                && !valid_repo(repo)
             {
                 anyhow::bail!("--repo must look like owner/repo");
             }
@@ -1251,7 +1362,7 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
         }
         SecretCommand::Rm { name, repo, env } => {
             if let Some(repo) = &repo
-                && !valid_repo_scope(repo)
+                && !valid_repo(repo)
             {
                 anyhow::bail!("--repo must look like owner/repo");
             }
@@ -1439,6 +1550,369 @@ mod tests {
             "the mandatory baseline (contents: read, pull-requests: read) must survive \
              any explicit workflow permissions"
         );
+    }
+
+    /// A full `GithubSetupArgs` with everything but the fields under test at
+    /// the manual-App defaults, so those tests stay readable.
+    fn app_args(
+        app_id: Option<&str>,
+        pem_file: Option<&Path>,
+        public_url: Option<&str>,
+    ) -> GithubSetupArgs {
+        GithubSetupArgs {
+            via: Some(Via::App),
+            app_id: app_id.map(str::to_owned),
+            pem_file: pem_file.map(Path::to_path_buf),
+            add: false,
+            org: None,
+            port: 0,
+            public_url: public_url.map(str::to_owned),
+            app_name: "preloop-local".to_owned(),
+            no_browser: true,
+            webhook_secret: None,
+            token: None,
+            repos: Vec::new(),
+            workspace: None,
+        }
+    }
+
+    /// The manual App path (`--app-id` + `--pem-file`) saves credentials, which
+    /// on its own leaves the hook inactive: the manifest flow is what enables
+    /// webhooks for an App the browser created. So when a URL is given, that
+    /// path must end in a webhook update at exactly the URL checked here, or
+    /// pushes and pull requests never start a run.
+    #[test]
+    fn the_manual_app_path_enables_the_webhook_at_the_given_url() {
+        let args = app_args(
+            Some("4242"),
+            Some(Path::new("/tmp/app.pem")),
+            Some("https://ci.example.com/"),
+        );
+        let update =
+            app_webhook_update(args.public_url.as_deref(), Some("stored-secret".to_owned()))
+                .expect("--public-url must produce a webhook update for the manual App path");
+        assert_eq!(update.url, "https://ci.example.com/api/v1/github/webhooks");
+        assert_eq!(
+            update.secret, "stored-secret",
+            "the secret GitHub already signs with is reused, never rotated"
+        );
+
+        // A fresh secret is minted only when none is stored (GitHub signs
+        // deliveries only once a secret is set), and it is hex, like the
+        // engine's own secrets.
+        let fresh = app_webhook_update(args.public_url.as_deref(), Some(String::new())).unwrap();
+        assert_eq!(fresh.url, update.url);
+        assert_ne!(fresh.secret, update.secret);
+        assert_eq!(fresh.secret.len(), 64);
+        assert!(fresh.secret.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // No URL: nothing to point anywhere. The manual path then saves the
+        // credentials and touches no webhook, exactly as before.
+        let no_url = app_args(Some("4242"), Some(Path::new("/tmp/app.pem")), None);
+        assert_eq!(
+            app_webhook_update(no_url.public_url.as_deref(), Some("s".to_owned())),
+            None
+        );
+    }
+
+    /// Reading the stored secret back is per App: `--app-id` may name a
+    /// registry entry (`github.apps`) rather than the primary App, and picking
+    /// the wrong secret would break the App that is actually delivering.
+    #[test]
+    fn the_stored_webhook_secret_is_found_for_the_app_in_question() {
+        let mut config = ConfigFile::default();
+        assert_eq!(stored_webhook_secret(&config, "4242"), None);
+
+        config.github.app_id = Some("4242".to_owned());
+        config.github.legacy_webhook_secret = Some("primary-secret".to_owned());
+        assert_eq!(
+            stored_webhook_secret(&config, "4242").as_deref(),
+            Some("primary-secret")
+        );
+        assert_eq!(stored_webhook_secret(&config, "9999"), None);
+
+        config
+            .github
+            .apps
+            .push(preloop_runner_server::config::AppConfig {
+                app_id: "9999".to_owned(),
+                legacy_webhook_secret: Some("registry-secret".to_owned()),
+                ..Default::default()
+            });
+        assert_eq!(
+            stored_webhook_secret(&config, "9999").as_deref(),
+            Some("registry-secret")
+        );
+        assert_eq!(
+            stored_webhook_secret(&config, "4242").as_deref(),
+            Some("primary-secret"),
+            "a registry entry must not shadow the primary App's own secret"
+        );
+    }
+
+    /// A throwaway private key: the webhook tests only need *some* PEM saved
+    /// so the App id is bound in the config, and nothing parses it.
+    const TEST_APP_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nTEST-ONLY-NOT-A-REAL-KEY\n-----END RSA PRIVATE KEY-----\n";
+
+    /// The env keys the setup writers read, captured so a test can restore
+    /// them. Paired with [`pin_setup_env`] / [`restore_setup_env`], with
+    /// [`crate::TEST_ENV_LOCK`] held across the pair.
+    fn capture_setup_env() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        [
+            preloop_runner_server::config::CONFIG_PATH_ENV,
+            "PRELOOP_HOME",
+            CREDENTIAL_STORE_ENV,
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect()
+    }
+
+    /// Pin the config file and the credential store to `home`, so the setup
+    /// writers touch a temp dir instead of the developer's real config, home,
+    /// and keychain.
+    #[allow(unsafe_code)]
+    fn pin_setup_env(home: &Path) {
+        // SAFETY: TEST_ENV_LOCK serializes this process-global env access.
+        unsafe {
+            std::env::set_var(
+                preloop_runner_server::config::CONFIG_PATH_ENV,
+                home.join("config.toml"),
+            );
+            std::env::set_var("PRELOOP_HOME", home);
+            std::env::set_var(CREDENTIAL_STORE_ENV, "file");
+        }
+    }
+
+    /// Put back every value [`capture_setup_env`] read.
+    #[allow(unsafe_code)]
+    fn restore_setup_env(previous: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        // SAFETY: TEST_ENV_LOCK was held from the capture through the restore.
+        unsafe {
+            for (key, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// GitHub must only be told to sign with a secret the local store already
+    /// holds. The reversed order has a failure mode with no local trace: if
+    /// the credential-store or config write fails after GitHub accepted the
+    /// secret (read-only filesystem, refused keychain), GitHub signs every
+    /// delivery with a secret nobody has and each one fails verification.
+    /// `point_hook` stands in for the network call, so the order is observable
+    /// offline: the state it sees is the persisted one.
+    #[test]
+    fn the_webhook_secret_is_stored_before_github_is_pointed_at_the_hook() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        let previous = capture_setup_env();
+        pin_setup_env(home.path());
+        // The production order: credentials are saved first, which binds the
+        // App id in the config, and the webhook secret is what follows.
+        save_app_credentials("4242", TEST_APP_PEM, None).expect("the credentials must save");
+        let update = WebhookUpdate {
+            url: "https://ci.example.com/api/v1/github/webhooks".to_owned(),
+            secret: "fresh-secret".to_owned(),
+        };
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                persist_secret_then_point_hook("4242", &update, |secret| async move {
+                    assert_eq!(secret, "fresh-secret");
+                    assert_eq!(
+                        stored_webhook_secret(&load_config()?, "4242").as_deref(),
+                        Some("fresh-secret"),
+                        "GitHub must not be told to sign with a secret that is not stored yet"
+                    );
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+            });
+        restore_setup_env(previous);
+        result.expect("a stored secret must let the GitHub call run");
+    }
+
+    /// A GitHub call that fails after the secret was stored keeps the stored
+    /// secret — the hook is unchanged, so the retry must reuse that secret
+    /// instead of rotating a delivery the operator is about to fix — and the
+    /// error says where the secret is, because an operator who cannot tell
+    /// whether it survived has to guess before retrying.
+    #[test]
+    fn a_failed_github_call_keeps_the_stored_webhook_secret() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        let previous = capture_setup_env();
+        pin_setup_env(home.path());
+        save_app_credentials("4242", TEST_APP_PEM, None).expect("the credentials must save");
+        let update = WebhookUpdate {
+            url: "https://ci.example.com/api/v1/github/webhooks".to_owned(),
+            secret: "fresh-secret".to_owned(),
+        };
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let error = persist_secret_then_point_hook("4242", &update, |_secret| async move {
+                    Err::<(), anyhow::Error>(anyhow::anyhow!(
+                        "GitHub refused the webhook update (403): forbidden"
+                    ))
+                })
+                .await
+                .expect_err("a failed GitHub call must fail the command");
+                let config = load_config()?;
+                Ok::<_, anyhow::Error>((
+                    format!("{error:#}"),
+                    stored_webhook_secret(&config, "4242"),
+                ))
+            });
+        restore_setup_env(previous);
+        let (message, stored) = result.expect("the config must still load after the failure");
+        assert!(
+            message.contains("stored locally") && message.contains("still delivers nowhere"),
+            "the error must say the secret was kept and the hook is unchanged: {message}"
+        );
+        assert_eq!(
+            stored.as_deref(),
+            Some("fresh-secret"),
+            "the secret stored before the failed GitHub call must be kept"
+        );
+    }
+
+    /// The failure the order exists to prevent: a secret that cannot be
+    /// stored locally must never reach GitHub, or the hook would sign with a
+    /// secret that exists nowhere. A plain file where the credentials
+    /// directory belongs makes every store write fail, like a read-only or
+    /// full filesystem.
+    #[test]
+    fn a_failing_local_write_stops_the_github_call() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("credentials"), "not a directory").unwrap();
+        let previous = capture_setup_env();
+        pin_setup_env(home.path());
+        let update = WebhookUpdate {
+            url: "https://ci.example.com/api/v1/github/webhooks".to_owned(),
+            secret: "fresh-secret".to_owned(),
+        };
+        let github_called = std::cell::Cell::new(false);
+        let called = &github_called;
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                persist_secret_then_point_hook("4242", &update, |_secret| async move {
+                    called.set(true);
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+            });
+        restore_setup_env(previous);
+        result.expect_err("a secret that cannot be stored must fail the command");
+        assert!(
+            !github_called.get(),
+            "GitHub must not be told to sign with a secret that was never stored"
+        );
+    }
+
+    /// `--repo` on the secret commands is a *scope*, and a workspace identity
+    /// is `local/<dir>` — any directory basename, not a GitHub slug. The
+    /// stricter slug check, which is what a URL-interpolated request needs,
+    /// refuses every such scope, so all three subcommands are exercised here.
+    #[test]
+    #[allow(unsafe_code)]
+    fn secret_scopes_accept_a_local_workspace_repo() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("config.toml");
+        let previous: Vec<(&str, Option<std::ffi::OsString>)> = [
+            preloop_runner_server::config::CONFIG_PATH_ENV,
+            "PRELOOP_HOME",
+            CREDENTIAL_STORE_ENV,
+            "PRELOOP_URL",
+            "PRELOOP_SECRETS_STORE",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect();
+        // SAFETY: TEST_ENV_LOCK serializes this process-global env access, and
+        // every value read above is restored below. Port 1 refuses instantly,
+        // so each command takes its local-config path instead of talking to an
+        // engine that may be running on this host.
+        unsafe {
+            std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, &config_path);
+            std::env::set_var("PRELOOP_HOME", home.path());
+            std::env::set_var(CREDENTIAL_STORE_ENV, "file");
+            std::env::set_var("PRELOOP_URL", "http://127.0.0.1:1");
+            std::env::remove_var("PRELOOP_SECRETS_STORE");
+        }
+        let scope = "local/my-checkout".to_owned();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                cmd_secret(SecretArgs {
+                    command: SecretCommand::Set {
+                        name: "TOKEN".to_owned(),
+                        value: Some("v".to_owned()),
+                        repo: Some(scope.clone()),
+                        env: None,
+                    },
+                })
+                .await?;
+                let stored = preloop_runner_server::config::load_config_from(&config_path)?;
+                assert!(
+                    stored
+                        .repo_secrets
+                        .get(&scope)
+                        .is_some_and(|map| map.contains_key("TOKEN")),
+                    "the secret must be scoped to the local workspace identity"
+                );
+                cmd_secret(SecretArgs {
+                    command: SecretCommand::List {
+                        repo: Some(scope.clone()),
+                        env: None,
+                    },
+                })
+                .await?;
+                let refused = cmd_secret(SecretArgs {
+                    command: SecretCommand::Set {
+                        name: "TOKEN".to_owned(),
+                        value: Some("v".to_owned()),
+                        repo: Some("no-slash".to_owned()),
+                        env: None,
+                    },
+                })
+                .await;
+                let refused = refused.expect_err("a scope without owner/repo must be refused");
+                assert!(refused.to_string().contains("owner/repo"), "{refused}");
+                cmd_secret(SecretArgs {
+                    command: SecretCommand::Rm {
+                        name: "TOKEN".to_owned(),
+                        repo: Some(scope.clone()),
+                        env: None,
+                    },
+                })
+                .await
+            });
+        // SAFETY: restores every value read above.
+        unsafe {
+            for (key, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        result.expect("a local/<dir> scope must be accepted by set, list, and rm");
     }
 
     /// An OS store that refuses every write, like a locked keychain.
