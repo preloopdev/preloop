@@ -1981,6 +1981,19 @@ async fn workflows_at_git_ref(
     Ok(workflows)
 }
 
+/// The `actions.lock` of a self-built pull-request merge, read from the merge
+/// commit in the engine's mirror where it was built — the same revision
+/// [`fetch_merge_workflows`] reads the workflows from. GitHub has no copy of
+/// that commit, and its own `pull_request` runs read the merge's tree, so the
+/// pins the run resolves against are the merged ones.
+async fn fetch_merge_actions_lockfile(
+    shared: &Arc<SharedState>,
+    merge: &PrebuiltMerge,
+) -> anyhow::Result<Option<String>> {
+    let mirror = shared.state.state_dir.join(&merge.mirror_repository);
+    local_actions_lockfile(&mirror, &merge.sha).await
+}
+
 /// The workflows of a self-built pull-request merge, read from the merge commit
 /// in the engine's mirror where it was built. GitHub has no copy of that commit,
 /// and its own `pull_request` runs read their workflows from the merge, so this
@@ -2024,6 +2037,49 @@ async fn event_workflows(
             }
         },
         _ => fetch_workflows(shared, repo, resolved_sha).await,
+    }
+}
+
+/// The run's `actions.lock` and the revision it was read at, chosen the way
+/// [`event_workflows`] chooses the workflows.
+///
+/// A pull-request run on an engine-built merge reads the merge commit in the
+/// engine's mirror, which GitHub does not have; a mirror that cannot serve it
+/// falls back to the pull request head, with a warning, exactly as the
+/// workflows do. Every other event reads `resolved_sha`, the commit the run
+/// checks out. The lockfile and the workflow files therefore describe one
+/// revision, so the pins a run resolves against always belong to the workflows
+/// it executes.
+async fn event_actions_lockfile(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    effective: &EffectiveEvent,
+    engine_built_merge: Option<&PrebuiltMerge>,
+    resolved_sha: &str,
+) -> (String, anyhow::Result<Option<String>>) {
+    match (engine_built_merge, is_pull_request_run_event(effective)) {
+        (Some(merge), true) => match fetch_merge_actions_lockfile(shared, merge).await {
+            Ok(lockfile) => (merge.sha.clone(), Ok(lockfile)),
+            Err(error) => {
+                let head = effective
+                    .status_check_sha
+                    .clone()
+                    .unwrap_or_else(|| resolved_sha.to_owned());
+                warn!(
+                    repository = %repo,
+                    merge = %merge.sha,
+                    head = %head,
+                    ?error,
+                    "could not read actions.lock at the engine-built merge; using the pull request head's"
+                );
+                let read = fetch_actions_lockfile(shared, repo, &head).await;
+                (head, read)
+            }
+        },
+        _ => {
+            let read = fetch_actions_lockfile(shared, repo, resolved_sha).await;
+            (resolved_sha.to_owned(), read)
+        }
     }
 }
 
@@ -5096,37 +5152,33 @@ async fn process_delivery_payload_with_lease(
                 ));
             }
         };
-        // A self-built merge does not exist on GitHub, so its workflow
-        // inventory is read at the pull request's head commit — the tree
-        // whose workflows a run on the merge executes — and its `actions.lock`
-        // is read at that same commit, so the pins and the workflow files
-        // describe one revision.
-        let inventory_sha = match (&engine_built_merge, is_pull_request_run_event(effective)) {
-            (Some(_), true) => effective
-                .status_check_sha
-                .clone()
-                .unwrap_or_else(|| resolved_sha.clone()),
-            _ => resolved_sha.clone(),
+        // The run's `actions.lock`, read at the revision `event_workflows` read
+        // the workflows from, so the pins and the workflow files describe the
+        // one revision the run executes. A failed read fails the delivery,
+        // exactly as a failed workflow read does.
+        let (inventory_sha, lockfile) = event_actions_lockfile(
+            shared,
+            &repo_full_name,
+            effective,
+            engine_built_merge.as_ref(),
+            &resolved_sha,
+        )
+        .await;
+        let actions_lockfile = match lockfile {
+            Ok(lockfile) => lockfile,
+            Err(error) => {
+                error!(
+                    event = %effective.event,
+                    sha = %inventory_sha,
+                    source_ref = %workflow_ref,
+                    ?error,
+                    "Failed to fetch actions.lock at the event commit"
+                );
+                return WebhookOutcome::TransientError(format!(
+                    "Failed to fetch actions.lock at event commit: {error:?}"
+                ));
+            }
         };
-        // The run's `actions.lock`, read at the same commit as the workflows so
-        // the lockfile and the workflow files come from one revision. A failed
-        // read fails the delivery, exactly as a failed workflow read does.
-        let actions_lockfile =
-            match fetch_actions_lockfile(shared, &repo_full_name, &inventory_sha).await {
-                Ok(lockfile) => lockfile,
-                Err(error) => {
-                    error!(
-                        event = %effective.event,
-                        sha = %inventory_sha,
-                        source_ref = %workflow_ref,
-                        ?error,
-                        "Failed to fetch actions.lock at the event commit"
-                    );
-                    return WebhookOutcome::TransientError(format!(
-                        "Failed to fetch actions.lock at event commit: {error:?}"
-                    ));
-                }
-            };
 
         if effective.event == "push"
             && effective.git_ref == ref_default
@@ -8038,9 +8090,10 @@ mod tests {
 
     /// A pull-request graph in which the base changed `.github/workflows/ci.yml`
     /// after the pull request branched, and the head never touched that file.
-    /// Returns the head sha. Once the fixture commits the workspace, the base
-    /// tip is `main`.
-    fn build_base_advanced_workflow_graph(ws_dir: &std::path::Path) -> String {
+    /// `lockfile` is committed on the base alongside that change, so the merge
+    /// carries it and the head does not. Returns the head sha. Once the fixture
+    /// commits the workspace, the base tip is `main`.
+    fn build_base_advanced_graph(ws_dir: &std::path::Path, lockfile: Option<&str>) -> String {
         std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
         std::fs::write(
             ws_dir.join(".github/workflows/ci.yml"),
@@ -8067,12 +8120,27 @@ mod tests {
             marked_pull_request_workflow("merge-version"),
         )
         .unwrap();
+        if let Some(lockfile) = lockfile {
+            std::fs::write(ws_dir.join(".github/workflows/actions.lock"), lockfile).unwrap();
+        }
         git_output(ws_dir, &["add", "-A"]);
         git_output(ws_dir, &["commit", "-qm", "base advances the workflow"]);
         // `WebhookFixture` commits the workspace itself; leave it something to commit.
         std::fs::write(ws_dir.join(".fixture-marker"), "marker\n").unwrap();
         head
     }
+
+    /// A valid lockfile whose pins are visible in the submission, so a test can
+    /// tell which revision the run read it from.
+    const BASE_LOCKFILE: &str = concat!(
+        "version: 'v0.0.3'\n",
+        "dependencies:\n",
+        "  'example/action@v1':\n",
+        "    ref: 'v1'\n",
+        "    commit: 'sha1-1111111111111111111111111111111111111111'\n",
+        "    owner_id: 1\n",
+        "    repo_id: 2\n",
+    );
 
     /// A self-built merge runs the workflow revision at that merge. The base
     /// changed a workflow file the head never touched; GitHub's own
@@ -8085,7 +8153,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
-        let head = build_base_advanced_workflow_graph(&ws_dir);
+        let head = build_base_advanced_graph(&ws_dir, None);
 
         // GitHub never offers a merge for this head, so the engine builds its own.
         let api_head = head.clone();
@@ -8145,6 +8213,95 @@ mod tests {
         assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
     }
 
+    /// The run's `actions.lock` comes from the same revision as its workflows:
+    /// the merge. The base added the pin after the pull request branched and the
+    /// head never had one, so a lockfile read at the head would leave the
+    /// merge's workflow resolving against no pin at all.
+    #[tokio::test]
+    async fn self_built_merge_reads_the_lockfile_revision_at_the_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        let head = build_base_advanced_graph(&ws_dir, Some(BASE_LOCKFILE));
+
+        // GitHub never offers a merge for this head, so the engine builds its own.
+        let api_head = head.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": null },
+                    }),
+                );
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_millis(300),
+            poll_interval: Duration::from_millis(20),
+        };
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+        // The fixture commits the workspace, so the base tip is read after it.
+        let base_tip = git_output(&ws_dir, &["rev-parse", "main"]);
+
+        let payload = stale_pull_request_payload(&head, &"1".repeat(40), &base_tip);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-base-lockfile", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let record = fixture
+            .state
+            .backend
+            .get_webhook_delivery("delivery-pr-base-lockfile")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Done,
+            "the delivery must complete: {:?}",
+            record.last_error
+        );
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1, "exactly the pull_request run");
+        let run = inner.runs.values().next().unwrap();
+        assert!(
+            run.submission.workflow_yaml.contains("merge-version"),
+            "the run must execute the workflow revision at the merge, got:\n{}",
+            run.submission.workflow_yaml
+        );
+        assert_eq!(
+            run.submission.actions_lockfile.as_deref(),
+            Some(BASE_LOCKFILE),
+            "the lock must come from the merge, the revision the workflows came from"
+        );
+        let merge_sha = run.submission.sha.clone();
+        drop(inner);
+        assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
+    }
+
     /// When the engine's mirror cannot serve the merge's workflows, they come
     /// from the pull request head instead, so the delivery is not lost.
     #[tokio::test]
@@ -8152,7 +8309,7 @@ mod tests {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
-        let head = build_base_advanced_workflow_graph(&ws_dir);
+        let head = build_base_advanced_graph(&ws_dir, None);
         let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
         let shared = Arc::new(SharedState {
             state: fixture.state.clone(),
