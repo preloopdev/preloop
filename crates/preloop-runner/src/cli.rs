@@ -79,9 +79,13 @@ pub struct ConfigureArgs {
     #[arg(long, default_value = "_work")]
     pub work: String,
 
-    /// Runner group.
-    #[arg(long, default_value = "default")]
-    pub runner_group: String,
+    /// Runner group (defaults to the internal "Default" group).
+    ///
+    /// Omitted means the discovered internal pool, matching
+    /// `command.GetRunnerGroupName(defaultPool?.Name)` in the official
+    /// runner — a default group renamed on the server still resolves.
+    #[arg(long)]
+    pub runner_group: Option<String>,
 
     /// Run non-interactively.
     #[arg(long)]
@@ -353,7 +357,7 @@ mod tests {
         .unwrap();
         match &cli.command {
             Commands::Configure(args) => {
-                assert_eq!(args.runner_group, "gpu-runners");
+                assert_eq!(args.runner_group.as_deref(), Some("gpu-runners"));
             }
             _ => panic!("expected Configure"),
         }
@@ -373,7 +377,7 @@ mod tests {
         match &cli.command {
             Commands::Configure(args) => {
                 assert_eq!(args.work, "_work");
-                assert_eq!(args.runner_group, "default");
+                assert!(args.runner_group.is_none());
                 assert!(!args.replace);
                 assert!(!args.ephemeral);
                 assert!(!args.unattended);

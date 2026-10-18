@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use reqwest::header::ACCEPT;
 
 use crate::cli::{ConfigureArgs, GlobalArgs, RemoveArgs};
-use crate::client::http::HttpClient;
+use crate::client::http::{HttpClient, HttpError};
 use crate::node_externals;
 use crate::settings::{CredentialData, RsaParameters, RunnerConfig, RunnerSettings};
 
@@ -156,21 +156,25 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         &http,
         &registration.service_url,
         &registration.oauth_token,
-        &args.runner_group,
+        args.runner_group.as_deref(),
     )
     .await?;
     info!("Discovered pool '{pool_name}' (ID: {pool_id})");
 
-    // Step 5b: Check for existing agent
-    if let Some(existing_id) = check_existing_agent(
+    // Step 5b: Check for existing agent. The lookup happens before anything is
+    // destroyed, and the deletion it authorises is deferred until every
+    // fallible local step is done (step 6b): a failed download must not leave a
+    // previously working runner unregistered while `.runner` still points at
+    // the identity we just deleted.
+    let existing_agent = check_existing_agent(
         &http,
         &registration.service_url,
         &registration.oauth_token,
         ALL_POOLS,
         &runner_name,
     )
-    .await?
-    {
+    .await?;
+    if let Some(existing_id) = existing_agent {
         if !args.replace {
             anyhow::bail!(
                 "Runner '{}' already exists (agent ID: {}). Use --replace.",
@@ -178,17 +182,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
                 existing_id
             );
         }
-        info!("Replacing existing agent {existing_id}");
-        let delete_url = agent_delete_url(&registration.service_url, existing_id);
-        http.delete_with_token_header(
-            &delete_url,
-            &registration.oauth_token,
-            ACCEPT.as_str(),
-            DISTTASK_AGENT_ACCEPT,
-        )
-        .await
-        .with_context(|| format!("deleting existing agent {existing_id} during --replace"))?;
-        info!("Deleted existing agent {existing_id}");
+        info!("Replacing agent {existing_id}");
     }
 
     // Step 6: Download Node.js externals (unless --no-externals).
@@ -201,6 +195,20 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         download_externals(&http, &root)
             .await
             .context("downloading Node.js externals")?;
+    }
+
+    // Step 6b: Retire the agent being replaced, now that the local assets it
+    // needs are in place.
+    if let Some(existing_id) = existing_agent {
+        delete_agent(
+            &http,
+            &registration.service_url,
+            &registration.oauth_token,
+            existing_id,
+        )
+        .await
+        .with_context(|| format!("deleting existing agent {existing_id} during --replace"))?;
+        info!("Deleted existing agent {existing_id}");
     }
 
     // Step 7: Register agent with the server (correct endpoint)
@@ -330,10 +338,11 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
 /// Run the `remove` subcommand.
 ///
 /// Mirrors the official `UnconfigureAsync`: request a *remove-scoped*
-/// credential (`runner_event: "remove"`), then delete the agent through
-/// `/_apis/distributedtask/pools/{pool}/agents/{id}`. Local files are removed
-/// either way, but a server-side deregistration failure is reported as an
-/// error — a ghost registration left behind would keep minting tokens.
+/// credential (`runner_event: "remove"`), look the runner up by name, and skip
+/// the delete when it is already gone. Local files are removed only once the
+/// server no longer has the registration — they are the retry's credentials —
+/// and a delete failure is reported as an error so a ghost registration is
+/// never mistaken for a clean removal.
 pub async fn run_remove(args: RemoveArgs, global: &GlobalArgs) -> Result<()> {
     let root = global.runner_root();
 
@@ -351,36 +360,39 @@ pub async fn run_remove(args: RemoveArgs, global: &GlobalArgs) -> Result<()> {
         register_runner(&http, &config.settings.git_hub_url, &args.token, "remove").await?;
     let service_url = http.rewrite_url(&registration.service_url).into_owned();
 
-    let delete_url = agent_delete_url(&service_url, config.settings.agent_id);
+    // The official runner looks the agent up by name before deleting it and
+    // prints "Does not exist. Skipping Removing runner from the server." when
+    // it is gone, so a registration retired through the UI or by
+    // stale-runner cleanup still cleans up locally.
+    let existing_agent = check_existing_agent(
+        &http,
+        &service_url,
+        &registration.oauth_token,
+        ALL_POOLS,
+        &config.settings.agent_name,
+    )
+    .await?;
 
-    // Keep the local cleanup independent from the server response. A failed
-    // DELETE must not be downgraded to a warning: otherwise the local files
-    // disappear while a live registration remains on the server.
-    let server_result = http
-        .delete_with_token_header(
-            &delete_url,
-            &registration.oauth_token,
-            ACCEPT.as_str(),
-            DISTTASK_AGENT_ACCEPT,
-        )
-        .await;
-
-    let files_result = RunnerConfig::remove_files(&root);
-    match (server_result, files_result) {
-        (Err(error), Err(files_error)) => Err(error.context(format!(
-            "deregistering agent {} (also failed to remove local files: {files_error:#})",
-            config.settings.agent_id
-        ))),
-        (Err(error), Ok(())) => {
-            warn!("Local runner files removed, but the server still has the registration.");
-            Err(error.context(format!("deregistering agent {}", config.settings.agent_id)))
+    // A server-side failure returns before the local files are touched: the
+    // official runner throws ahead of `DeleteLocalRunnerConfig()`, so the
+    // agent id and repository URL stay behind for the retry instead of
+    // orphaning the registration with no local identity left to remove it.
+    match existing_agent {
+        Some(agent_id) => {
+            delete_agent(&http, &service_url, &registration.oauth_token, agent_id)
+                .await
+                .with_context(|| format!("deregistering agent {agent_id}"))?;
+            info!("Runner deregistered from server");
         }
-        (Ok(()), Err(files_error)) => Err(files_error),
-        (Ok(()), Ok(())) => {
-            info!("Runner removed");
-            Ok(())
-        }
+        None => info!(
+            "Runner '{}' does not exist on the server; removing local configuration",
+            config.settings.agent_name
+        ),
     }
+
+    RunnerConfig::remove_files(&root)?;
+    info!("Runner removed");
+    Ok(())
 }
 
 // ─── Registration helpers ────────────────────────────────────────────────
@@ -481,19 +493,54 @@ fn agent_delete_url(service_url: &str, agent_id: i64) -> String {
     format!("{service_url}/_apis/distributedtask/pools/{ALL_POOLS}/agents/{agent_id}")
 }
 
+/// Delete an agent through the distributed-task endpoint.
+///
+/// A `404` is the desired end state already holding — the registration is
+/// gone — so it is not an error, and a `remove` whose only remaining work is
+/// local cleanup still finishes.
+async fn delete_agent(
+    http: &HttpClient,
+    service_url: &str,
+    token: &str,
+    agent_id: i64,
+) -> Result<()> {
+    let url = agent_delete_url(service_url, agent_id);
+    match http
+        .delete_with_token_header(&url, token, ACCEPT.as_str(), DISTTASK_AGENT_ACCEPT)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) if is_not_found(&error) => {
+            info!("Agent {agent_id} is already gone from the server");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether an error carries an HTTP `404 Not Found`.
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<HttpError>())
+        .is_some_and(|error| {
+            matches!(error, HttpError::Status { status, .. } if *status == reqwest::StatusCode::NOT_FOUND)
+        })
+}
+
 /// Resolve the runner group (`--runner-group`) to `(pool_id, pool_name)` by
 /// querying the pools endpoint.
 ///
-/// Matches the official `ConfigureAsync` group resolution: pools are scoped
-/// to self-hosted (`!isHosted`), the requested group name is matched
-/// case-insensitively, and with no self-hosted pools at all the internal
-/// (`isInternal`) pool is the default. A name that hits no group, or more
-/// than one, is an error listing what the server reported.
+/// Matches the official `ConfigureAsync` group resolution: the first internal
+/// (`isInternal`) pool is the default, the requested group name is matched
+/// case-insensitively among the self-hosted (`!isHosted`) pools, and an
+/// omitted name falls back to the internal group's name. A name that hits no
+/// group, or more than one, is an error listing what the server reported.
 async fn discover_pool(
     http: &HttpClient,
     service_url: &str,
     token: &str,
-    runner_group: &str,
+    runner_group: Option<&str>,
 ) -> Result<(i64, String)> {
     let url = format!("{service_url}/_apis/distributedtask/pools?poolType=Automation");
     let resp: serde_json::Value = http
@@ -514,6 +561,12 @@ fn pool_is_hosted(pool: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+fn pool_is_internal(pool: &serde_json::Value) -> bool {
+    pool.get("isInternal")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn pool_name(pool: &serde_json::Value) -> Option<&str> {
     pool.get("name").and_then(serde_json::Value::as_str)
 }
@@ -522,31 +575,48 @@ fn pool_id(pool: &serde_json::Value) -> Option<i64> {
     pool.get("id").and_then(serde_json::Value::as_i64)
 }
 
+/// `(id, name)` of a pool, erroring when either field is absent.
+fn pool_identity(pool: &serde_json::Value) -> Result<(i64, String)> {
+    let id = pool_id(pool).context("pool missing 'id' field")?;
+    let name = pool_name(pool).context("pool missing 'name' field")?;
+    Ok((id, name.to_owned()))
+}
+
 /// Select a self-hosted pool by runner-group name.
-fn select_pool(pools: &[serde_json::Value], runner_group: &str) -> Result<(i64, String)> {
+///
+/// Mirrors `ConfigurationManager.ConfigureAsync`: the first internal
+/// (`isInternal`) pool is the default; a server that advertises no self-hosted
+/// group at all is used through it directly, and otherwise the requested name
+/// — defaulted to the internal group's name, as the official
+/// `command.GetRunnerGroupName(defaultPool?.Name)` does — is matched
+/// case-insensitively among the self-hosted (`!isHosted`) pools. Defaulting to
+/// the *discovered* name is what keeps an omitted `--runner-group` working
+/// when the default group has been renamed on the server.
+fn select_pool(pools: &[serde_json::Value], runner_group: Option<&str>) -> Result<(i64, String)> {
+    const NO_SELF_HOSTED_GROUPS: &str =
+        "Could not find any self-hosted runner groups. Contact support.";
+
     let self_hosted: Vec<&serde_json::Value> =
         pools.iter().filter(|pool| !pool_is_hosted(pool)).collect();
+    let internal = pools.iter().find(|pool| pool_is_internal(pool));
 
     if self_hosted.is_empty() {
-        // Official falls back to the internal ("Default") pool when no
-        // self-hosted groups exist.
-        let default = pools
-            .iter()
-            .find(|pool| {
-                pool.get("isInternal")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            })
-            .context("Could not find any self-hosted runner groups. Contact support.")?;
-        let id = pool_id(default).context("pool missing 'id' field")?;
-        let name = pool_name(default).context("pool missing 'name' field")?;
-        return Ok((id, name.to_owned()));
+        let default = internal.context(NO_SELF_HOSTED_GROUPS)?;
+        return pool_identity(default);
     }
+
+    let requested = match runner_group.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => name,
+        // `GetRunnerGroupName(defaultPool?.Name)`: the discovered internal
+        // group's name is the argument default, or the literal `"default"`
+        // when the server reports no internal pool.
+        None => internal.and_then(pool_name).unwrap_or("default"),
+    };
 
     let matches: Vec<&serde_json::Value> = self_hosted
         .iter()
         .copied()
-        .filter(|pool| pool_name(pool).is_some_and(|name| name.eq_ignore_ascii_case(runner_group)))
+        .filter(|pool| pool_name(pool).is_some_and(|name| name.eq_ignore_ascii_case(requested)))
         .collect();
 
     match matches.as_slice() {
@@ -557,15 +627,11 @@ fn select_pool(pools: &[serde_json::Value], runner_group: &str) -> Result<(i64, 
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "Could not find any self-hosted runner group named \"{runner_group}\". \
+                "Could not find any self-hosted runner group named \"{requested}\". \
                  Available self-hosted groups: {groups}"
             );
         }
-        [pool] => {
-            let id = pool_id(pool).context("pool missing 'id' field")?;
-            let name = pool_name(pool).context("pool missing 'name' field")?;
-            Ok((id, name.to_owned()))
-        }
+        [pool] => pool_identity(pool),
         _ => {
             let groups = matches
                 .iter()
@@ -573,7 +639,7 @@ fn select_pool(pools: &[serde_json::Value], runner_group: &str) -> Result<(i64, 
                 .map(|(name, id)| format!("{name} (id {id})"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!("More than one self-hosted runner group is named \"{runner_group}\": {groups}");
+            bail!("More than one self-hosted runner group is named \"{requested}\": {groups}");
         }
     }
 }
@@ -1233,8 +1299,37 @@ mod registration_parity_tests {
             {"id": 3, "name": "GPU", "isHosted": false, "isInternal": false},
         ]);
         assert_eq!(
-            select_pool(pools.as_array().unwrap(), "gpu").unwrap(),
+            select_pool(pools.as_array().unwrap(), Some("gpu")).unwrap(),
             (3, "GPU".to_owned()),
+        );
+    }
+
+    /// The pools response the official runner recorded against GitHub
+    /// (`.runner-watch/golden/v2.336.0/01-register-and-idle/flows.jsonl`):
+    /// `Default` (1, internal, self-hosted) and `GitHub Actions` (2, hosted).
+    #[test]
+    fn runner_group_defaults_to_the_discovered_internal_pool() {
+        let pools = serde_json::json!([
+            {"id": 1, "name": "Renamed Default", "isHosted": false, "isInternal": true},
+            {"id": 2, "name": "GitHub Actions", "isHosted": true, "isInternal": false},
+        ]);
+        // Omitted --runner-group: `command.GetRunnerGroupName(defaultPool?.Name)`
+        // supplies the name, so a renamed internal group still resolves instead
+        // of failing on the literal "default".
+        assert_eq!(
+            select_pool(pools.as_array().unwrap(), None).unwrap(),
+            (1, "Renamed Default".to_owned()),
+        );
+        // An explicit name is matched against the server's names only.
+        assert_eq!(
+            select_pool(pools.as_array().unwrap(), Some("renamed default")).unwrap(),
+            (1, "Renamed Default".to_owned()),
+        );
+        let error = select_pool(pools.as_array().unwrap(), Some("default")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Available self-hosted groups: Renamed Default")
         );
     }
 
@@ -1244,9 +1339,41 @@ mod registration_parity_tests {
             {"id": 1, "name": "GPU", "isHosted": false},
             {"id": 2, "name": "gpu", "isHosted": false},
         ]);
-        let error = select_pool(pools.as_array().unwrap(), "Gpu").unwrap_err();
+        let error = select_pool(pools.as_array().unwrap(), Some("Gpu")).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("GPU (id 1)"));
         assert!(message.contains("gpu (id 2)"));
+    }
+
+    #[test]
+    fn runner_group_absent_from_the_pool_list_lists_the_candidates() {
+        let pools = serde_json::json!([
+            {"id": 1, "name": "Default", "isHosted": false, "isInternal": true},
+            {"id": 2, "name": "GitHub Actions", "isHosted": true},
+        ]);
+        let error = select_pool(pools.as_array().unwrap(), Some("GPU")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Available self-hosted groups: Default")
+        );
+
+        // No self-hosted group at all: the internal pool decides, or the
+        // server is reported as unusable exactly like the official runner.
+        let only_hosted =
+            serde_json::json!([{"id": 2, "name": "GitHub Actions", "isHosted": true}]);
+        let error = select_pool(only_hosted.as_array().unwrap(), None).unwrap_err();
+        assert!(error.to_string().contains("Contact support."));
+
+        // No internal pool reported: the literal `"default"` is the argument
+        // default (`defaultPoolName ?? "default"`) and is still name-matched.
+        let unmarked = serde_json::json!([
+            {"id": 4, "name": "Default", "isHosted": false},
+            {"id": 2, "name": "GitHub Actions", "isHosted": true},
+        ]);
+        assert_eq!(
+            select_pool(unmarked.as_array().unwrap(), None).unwrap(),
+            (4, "Default".to_owned()),
+        );
     }
 }
