@@ -23,6 +23,12 @@
 //! - Nothing here configures environment variables. Callers apply their own
 //!   non-interactive policy (`GIT_TERMINAL_PROMPT`, `GIT_ASKPASS`, …) to the
 //!   [`Command`] they pass in.
+//! - These runners are ordinary futures, but they are not small ones. Awaiting
+//!   one several frames deep inside handler/future chains grows the enclosing
+//!   future by their state, which a debug build can push over a 2 MiB
+//!   test-thread stack. Where a call site is awaited through several nested
+//!   futures (proxy dispatch, snapshot handlers), box it:
+//!   `Box::pin(run_command(cmd, deadline, what)).await`.
 //!
 //! The async helpers use [`tokio::process`]; [`run_command_blocking`] and
 //! [`DeadlineGuard::run`] have no runtime dependency and are safe to use from
