@@ -854,9 +854,10 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     assert_eq!(spec.network, NetworkPolicy::PublicOnly);
     // A packed machine reaches node through the artifact's baked symlink
     // (`<root>/externals -> /opt/preloop/bin/externals`): the externals ride
-    // the bundle mount instead of a third virtiofs mount, which the packed
-    // launcher has no IRQ budget for. Only a machine booted from a raw image
-    // carries the separate externals mount.
+    // the bundle mount instead of a third virtiofs mount, which keeps the
+    // device-heaviest launcher config at two mounts (see `runner_volumes`).
+    // Only a machine booted from a raw image carries the separate externals
+    // mount.
     assert_eq!(
         &spec.volumes,
         &vec![
