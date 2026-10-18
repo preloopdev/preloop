@@ -3,7 +3,7 @@
 //!
 //! The control schema is created and upgraded by the migration runner
 //! (`preloop store migrate`, refinery over the embedded
-//! `migrations/{sqlite,postgres}` — see `docs/control-migrations.md`). A
+//! `migrations/{sqlite,postgres}` — see `docs/contributing/control-migrations.md`). A
 //! running server never creates, migrates or recreates the schema: it
 //! verifies, and refuses anything that is not exactly this build's migration
 //! set. Ledger rows are the sole version authority: `schema_meta` stays for
@@ -46,16 +46,16 @@ pub(crate) fn refusal(ledger: Ledger) -> String {
     match ledger {
         Ledger::Empty => "control database is not initialized (no migration ledger). Run \
              `preloop store migrate` before starting the server; the server never creates or \
-             upgrades the control schema itself (docs/control-migrations.md)."
+             upgrades the control schema itself (docs/control-plane/operate/storage.mdx)."
             .to_owned(),
         Ledger::Legacy => "control database is a legacy preloop store (store schema v11): a \
              different data model this build never adopts or rewrites. Migrate it once with \
              `preloop store import-legacy --source <old preloop.db> --target <new control.db>`, \
-             then point the server at the target (docs/control-migrations.md)."
+             then point the server at the target (docs/control-plane/operate/storage.mdx)."
             .to_owned(),
         Ledger::Foreign => "control database holds tables but no control schema; refusing to \
              initialize over existing state. Point the server at a dedicated control database, \
-             or import a legacy store (`preloop store import-legacy`, docs/control-migrations.md)."
+             or import a legacy store (`preloop store import-legacy`, docs/control-plane/operate/storage.mdx)."
             .to_owned(),
         Ledger::Unledgered => "control database has a control schema but no \
              `refinery_schema_history` ledger: it predates tracked migrations (an unreleased \
@@ -65,7 +65,7 @@ pub(crate) fn refusal(ledger: Ledger) -> String {
             .to_owned(),
         Ledger::MissingMeta => "control database has a migration ledger but no `schema_meta` \
              table: the schema is incomplete (a partial create or manual surgery). Restore the \
-             pre-migration backup or recreate the database (docs/control-migrations.md)."
+             pre-migration backup or recreate the database (docs/control-plane/operate/storage.mdx)."
             .to_owned(),
         Ledger::Applied(versions) => check_applied(&versions)
             .expect_err("an applied ledger in refusal() is divergent by definition"),
@@ -125,7 +125,7 @@ pub(crate) fn check_applied(applied: &[i32]) -> Result<(), String> {
         return Err(format!(
             "control database is older than this preloop build: migration(s) {} are not applied \
              (latest is {}). Run `preloop store migrate` before starting the server \
-             (docs/control-migrations.md).",
+             (docs/control-plane/operate/storage.mdx).",
             version_list(&missing),
             latest()
         ));
@@ -142,7 +142,7 @@ pub(crate) fn check_applied(applied: &[i32]) -> Result<(), String> {
     Err(format!(
         "control database migration ledger diverges from this build: missing {}, unknown {}. \
          Run `preloop store migrate` or restore the pre-migration backup \
-         (docs/control-migrations.md).",
+         (docs/control-plane/operate/storage.mdx).",
         version_list(&missing),
         version_list(&unknown)
     ))

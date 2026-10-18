@@ -39,35 +39,106 @@
     ]
   },
   "navigation": {
-    "groups": [
+    "tabs": [
       {
-        "group": "Getting started",
-        "pages": ["introduction", "quickstart", "setup", "cli_reference"]
+        "tab": "Overview",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": ["introduction"]
+          },
+          {
+            "group": "Project",
+            "pages": ["compatibility", "comparison", "roadmap"]
+          }
+        ]
       },
       {
-        "group": "Architecture",
-        "pages": ["system-architecture", "architecture", "control-migrations", "vm-substrates", "vm-images", "build-goldens"]
+        "tab": "Control plane",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": ["control-plane/quickstart", "control-plane/install", "control-plane/configuration"]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "control-plane/architecture/overview",
+              "control-plane/architecture/api-and-state",
+              "control-plane/architecture/job-lifecycle",
+              "control-plane/architecture/workflow-engine",
+              "control-plane/architecture/sandboxes",
+              "control-plane/architecture/observability"
+            ]
+          },
+          {
+            "group": "Connect GitHub",
+            "pages": [
+              "control-plane/github/app",
+              "control-plane/github/tokens",
+              "control-plane/github/webhook-resilience",
+              "control-plane/github/rest-api"
+            ]
+          },
+          {
+            "group": "Workflows",
+            "pages": [
+              "control-plane/guides/pull-requests-without-webhooks",
+              "control-plane/guides/debugging",
+              "control-plane/guides/agents"
+            ]
+          },
+          {
+            "group": "Operate",
+            "pages": [
+              "control-plane/operate/deploy",
+              "control-plane/operate/security",
+              "control-plane/operate/storage",
+              "control-plane/operate/vm-images",
+              "control-plane/operate/limits"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": ["control-plane/reference/cli", "control-plane/reference/environment"]
+          }
+        ]
       },
       {
-        "group": "Compatibility",
-        "pages": ["conformance", "fidelity-gap", "preloop_vs_others"]
-      },
-      {
-        "group": "Operations",
-        "pages": ["self-hosting", "push", "webhook-resilience", "github-app-webhook", "github-app-api-compat", "github-tokens", "retries-and-pool-memory"]
-      },
-      {
-        "group": "Debugging and automation",
-        "pages": ["debug-sessions", "agent-pre-push", "ci-gate-auto-pr"]
-      },
-      {
-        "group": "Project status",
-        "pages": ["roadmap"]
-      },
-      {
-        "group": "Demos",
-        "pages": ["demo/dap/omp-debugging-demo", "demo/dap/agent-prompt"]
+        "tab": "Runner",
+        "groups": [
+          {
+            "group": "Runner",
+            "pages": ["runner/overview", "runner/install", "runner/configuration", "runner/architecture"]
+          }
+        ]
       }
     ]
-  }
+  },
+  "redirects": [
+    { "source": "/quickstart", "destination": "/control-plane/quickstart" },
+    { "source": "/setup", "destination": "/control-plane/install" },
+    { "source": "/cli_reference", "destination": "/control-plane/reference/cli" },
+    { "source": "/system-architecture", "destination": "/control-plane/architecture/overview" },
+    { "source": "/architecture", "destination": "/control-plane/architecture/overview" },
+    { "source": "/vm-substrates", "destination": "/control-plane/architecture/sandboxes" },
+    { "source": "/vm-images", "destination": "/control-plane/operate/vm-images" },
+    { "source": "/build-goldens", "destination": "/control-plane/operate/vm-images" },
+    { "source": "/control-migrations", "destination": "/control-plane/operate/storage" },
+    { "source": "/conformance", "destination": "/compatibility" },
+    { "source": "/fidelity-gap", "destination": "/compatibility" },
+    { "source": "/preloop_vs_others", "destination": "/comparison" },
+    { "source": "/self-hosting", "destination": "/control-plane/operate/deploy" },
+    { "source": "/push", "destination": "/control-plane/guides/pull-requests-without-webhooks" },
+    { "source": "/webhook-resilience", "destination": "/control-plane/github/webhook-resilience" },
+    { "source": "/github-app-webhook", "destination": "/control-plane/github/app" },
+    { "source": "/github-app-api-compat", "destination": "/control-plane/github/rest-api" },
+    { "source": "/github-tokens", "destination": "/control-plane/github/tokens" },
+    { "source": "/retries-and-pool-memory", "destination": "/control-plane/operate/limits" },
+    { "source": "/debug-sessions", "destination": "/control-plane/guides/debugging" },
+    { "source": "/agent-pre-push", "destination": "/control-plane/guides/agents" },
+    { "source": "/ci-gate-auto-pr", "destination": "/control-plane/guides/agents" },
+    { "source": "/demo/dap/omp-debugging-demo", "destination": "/control-plane/guides/debugging" },
+    { "source": "/demo/dap/agent-prompt", "destination": "/control-plane/guides/agents" }
+  ]
 }

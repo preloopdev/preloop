@@ -1,0 +1,125 @@
+---
+title: "VM images and runner bundles"
+description: "Select, build, refresh, and troubleshoot the golden image and Linux runner bundle used by the microVM pool."
+---
+
+A golden is a packed, architecture-specific microVM artifact. With no custom base, the pool uses the pinned official runner source: file-backed pools download the packed artifact, while a backend that builds in the guest can bake the official runner base. A custom base is baked with the runner contract. Each job runs in a disposable VM or copy-on-write fork of that golden.
+
+## Select an image
+
+| Workflow or setting | Image selected |
+|---|---|
+| `runs-on: ubuntu-latest` or `ubuntu-24.04` with no custom base | Official Ubuntu 24.04 golden for the host architecture. |
+| `PRELOOP_RUNNER_BASE_IMAGE` | The configured OCI reference, archive, or local image is baked as supplied plus runner setup. |
+| `[golden].base_image` | Custom base when the environment variable is absent. |
+| `ubuntu-22.04`, `ubuntu-slim`, or `ubuntu-26.04` | No separate official image; the configured base remains in use. |
+
+`PRELOOP_RUNNER_BASE_IMAGE` wins over `[golden].base_image`. `[golden].kind` and `[golden].dockerfile` record how the setup wizard chose the image; the serving path reads `base_image`.
+
+The default packed OCI references are digest-pinned:
+
+```text
+arm64: ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:cf50db4cbbb38f47f0a533e1e35b523c6427df30261a3cd5bb49d9ef7e072414
+x86_64: ghcr.io/preloopdev/preloop-x86_64-smolvm-golden@sha256:5757a8319aba0604672e62425559f207cc9f21e9380be01e8e80227eaec21914
+```
+
+Override the OCI reference with `PRELOOP_GOLDEN_OCI_REF`. To use a release-asset mirror, set `PRELOOP_GOLDEN_URL`; it replaces the release-asset candidates and skips OCI. The mirror must provide `<url>.sha256` or an explicit `PRELOOP_GOLDEN_SHA256`. Transfers resume from `<payload>.partial` with HTTP Range requests and are installed only after digest verification. Release lookup is cached for five minutes and prefers stable releases.
+
+The pool stores payloads below `<PRELOOP_HOME>/vms/`, keyed by the sanitized base-image name and environment fingerprint. `preloop golden-path --home PATH --base-image REF` prints the exact path.
+
+## Build a custom golden
+
+Build the Linux guest runner and bake an immutable base image on a host matching the guest architecture:
+
+```sh
+just build-preloop
+preloop build-golden \
+  --runner-bundle target/aarch64-unknown-linux-gnu/debug \
+  --base-image ghcr.io/acme/preloop-base@sha256:... \
+  --output dist/acme-aarch64
+```
+
+`--runner-bundle` must name a directory containing a Linux `preloop-runner`. `--base-image` accepts an OCI reference, Docker-save archive, `.smolmachine` pack, or rootfs path. `--storage-gb` raises the guest disk ceiling for large snapshots. The published official golden is normally downloaded rather than rebuilt by this command; without a configured custom base, `build-golden` refuses to invent one.
+
+For a digest-pinned custom source, require and verify provenance:
+
+```sh
+PRELOOP_REQUIRE_BASE_DIGEST=1 \
+PRELOOP_VERIFY_BASE_IMAGE=1 \
+PRELOOP_VERIFY_BASE_IMAGE_REPO=acme/runner-image-blobs \
+preloop build-golden \
+  --runner-bundle target/aarch64-unknown-linux-gnu/release \
+  --base-image ghcr.io/acme/base@sha256:... \
+  --output dist/acme-aarch64
+```
+
+`PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` changes the keyless Sigstore identity match; `PRELOOP_BASE_IMAGE_PUBKEY` switches verification to a public key. The base-image verification checks a Cosign signature and SPDX attestation. A configured image is used as-is; add organization-wide packages to that image rather than expecting `build-golden` to install a package list.
+
+## What the bake and guest setup provide
+
+The served pool defaults to the `runner` account (UID 1001), writable `_work`, `/opt/hostedtoolcache`, and the `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` environment entries. A bake attempts to write `/etc/preloop-bake.json`, checks for a glibc loader, and refreshes apt indexes when apt exists. The contract does not choose language toolchains; use setup actions or a job container.
+
+At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stack limit with unlimited hard limit and 65536 soft/hard file descriptors. Per-machine initialization applies:
+
+| Guest setting | Value |
+|---|---:|
+| `vm.max_map_count` | `262144` |
+| `fs.inotify.max_user_watches` | `655360` |
+| `fs.inotify.max_user_instances` | `1280` |
+
+The engine also verifies that the guest hostname resolves to a local address and removes stale foreign mappings. The guest does not expose `/dev/kvm`: workloads that need nested virtualization must run on a runner outside the microVM pool.
+
+## Runner bundle discovery
+
+The engine searches in this order:
+
+1. `PRELOOP_RUNNER_BUNDLE`.
+2. The installed release path `<prefix>/lib/preloop/runner/<triple>/preloop-runner`.
+3. Development and executable-adjacent candidates under the selected Linux target.
+
+The bundle must be a Linux ELF binary even when the host is Linux. `install.sh` and `preloop update` install the guest bundle on both Linux and macOS. On a development host, set `PRELOOP_RUNNER_BUNDLE` explicitly when automatic target discovery cannot find the right architecture.
+
+If the bundle is absent, the engine logs that there is no runner pool and jobs fail after the queue grace window. Install the bundle with `preloop update` or set `PRELOOP_RUNNER_BUNDLE` to its directory.
+
+On the AgentENV backend the bundle is not copied into each golden: the host tree is archived into a content-addressed read-only volume named `preloop-runner-<digest>`, so a bundle update publishes a new volume instead of requiring a golden rebuild. `preloop volumes list` shows what is held and the versions each volume was populated from; `preloop volumes prune` and `preloop volumes gc` reclaim what nothing needs (the engine also collects superseded volumes on its own). See [AgentENV read-only volumes](/control-plane/architecture/sandboxes#agentenv-read-only-volumes) for the retention rules.
+
+## Version pins
+
+`versions.toml` controls the runner, SmolVM, and Node external pins:
+
+| Key | Current pin |
+|---|---:|
+| `runner_version` | `2.336.0` |
+| `smolvm_min_version` | `1.30.1` |
+| `smolvm_golden_version` | `1.30.1` |
+| `node20_externals_version` | `20.20.2` |
+| `node24_externals_version` | `24.19.0` |
+| `runner_image_docker_version` | `29.6.1` |
+| `runner_image_buildx_version` | `0.35.0` |
+
+`official-image.toml` pins the upstream runner-image sources:
+
+```text
+official_runner_image_base_amd64 = "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest@sha256:4f7e4be438e4eb9c0f23bebdec12cf1d25520876ad2052412ba18580919b7795"
+official_runner_image_base_arm64 = "ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest@sha256:3884ef2266edee7ae2da8f70f54faba5340238e68ede5274d0e90fdec80faf9e"
+```
+
+That file also records the hosted runtime limits and sysctl values shown above. Changing a compiled pin requires rebuilding and replacing the `preloop` executable; it does not change an already-installed binary.
+
+`smolvm_min_version` is a capability floor rather than a tracked release: it moves when a SmolVM release becomes the first to satisfy a runtime invariant Preloop depends on (fork freeze-source, packed ownership, the x86_64 virtio device budget). `preloop update --ensure-runtime` accepts and upgrades from that floor.
+
+## The virtio device budget (IRQ lines)
+
+A microVM's device count is capped by libkrun's MMIO IRQ allocation: one line per virtio device. Measured on x86_64 Linux at SmolVM 1.30.1, the allocation is 19 lines (IRQ 5-23) since SmolVM 1.23.0 and was 11 before that; an image machine created with `--storage`/`--overlay` starts with 9 devices, and each `--volume`, `--mount-socket` or extra `--disk` costs one. The 20th device fails the boot with `krun_start_enter returned: -22 (EINVAL)` and `no more IRQs are available` — the same `EINVAL` shape as a held or corrupt disk image, which is why the engine classifies it (`VmError::IrqExhausted`) and reports the machine's declared inventory and the ceilings. The arm64/macOS ceiling has not been measured.
+
+## Troubleshooting
+
+| Symptom | Action |
+|---|---|
+| Official golden download fails | Check egress to GHCR or the mirror, the architecture-specific digest, free disk, and the retained `.partial` file. |
+| A custom base is baked on every start | Check `PRELOOP_RUNNER_BASE_IMAGE`, the configured base, and the payload path from `preloop golden-path`. |
+| Jobs fail after the queue grace window | Install a Linux guest bundle or set `PRELOOP_RUNNER_BUNDLE`; a host binary does not qualify. |
+| `SIGKILL` during compilation | Raise `PRELOOP_RUNNER_MEMORY_MIB` or lower pool concurrency. |
+| Disk waits indefinitely | Check `PRELOOP_RUNNER_MIN_FREE_DISK_GB`, `PRELOOP_SKIP_DISK_PREFLIGHT`, and `PRELOOP_GOLDEN_UNPACK_FACTOR`. |
+| Every pool start fails with `krun_start_enter returned: -22 (EINVAL)` plus `no more IRQs are available` | The host ran out of MMIO IRQ lines for the machine's virtio devices (`VmError::IrqExhausted` — see [The virtio device budget](#the-virtio-device-budget-irq-lines)). Restarting the pool cannot help: upgrade the host runtime to the compiled floor (`preloop update --ensure-runtime`) or start the machine with fewer mounts. |
+| Wrong OS or labels | Check the custom base, `PRELOOP_RUNNER_LABELS`, and the workflow's `runs-on` labels. |

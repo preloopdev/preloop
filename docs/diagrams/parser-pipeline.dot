@@ -1,0 +1,48 @@
+digraph parser_pipeline {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.3, ranksep=0.48, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.13,0.08"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  subgraph cluster_input {
+    label="Workflow inputs"; fontsize=13; fontcolor="#7c3aed"; style="rounded,dashed"; color="#7c3aed"; margin=12;
+    yaml [label="workflow.yml\non:, jobs:, steps:", fillcolor="#ede9fe"];
+    action [label="action.yml\nuses: metadata", fillcolor="#ede9fe"];
+    event [label="Event payload\npush, pull_request, dispatch", fillcolor="#ede9fe"];
+    { rank=same; yaml; action; event; }
+  }
+
+  subgraph cluster_parse {
+    label="Parse and trigger matching"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    parse [label="yaml.rs\nparse_workflow(), parse_action_metadata()\nkey normalization", fillcolor="#bae6fd"];
+    model [label="models.rs\nWorkflow, Job, Step, Trigger\nMatrix, Strategy, Concurrency", fillcolor="#e0f2fe"];
+    match [label="trigger.rs\nWorkflow.on.match_event()\nglob_match branches, tags, paths, types", fillcolor="#e0f2fe"];
+  }
+
+  subgraph cluster_expand {
+    label="Normalize and expand"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    expr [label="eval.rs\nbuild_context(github, needs, matrix)\nresolve_string()", fillcolor="#e0f2fe"];
+    expand [label="expand.rs\nexpand_jobs_with_reusables_and_shas_\nand_inputs_and_event()\nworkflow_call, inputs, SHA refs", fillcolor="#bae6fd"];
+    matrix [label="matrix_expand.rs\nCartesian cells, IndexMap order\nfail-fast and max-parallel", fillcolor="#e0f2fe"];
+    dag [label="dag.rs\nvalidate_job_plans()\nneeds graph and cycle checks", fillcolor="#e0f2fe"];
+  }
+
+  subgraph cluster_output {
+    label="Job construction"; fontsize=13; fontcolor="#15803d"; style="rounded,dashed"; color="#22c55e"; margin=12;
+    cond [label="Expression conditions\npreloop_gha_expressions::effective_condition\nif: and status checks", fillcolor="#dcfce7"];
+    builder [label="job_builder.rs\nbuild_agent_job_message_with_\nnormalized_context()\nAgentJobRequestMessage", fillcolor="#dcfce7"];
+    output [label="Ready-to-queue plans\nJobPlan per matrix cell\nneeds-gated outputs", fillcolor="#bbf7d0"];
+  }
+
+  yaml -> parse [label="parse"];
+  action -> parse;
+  event -> match [label="payload"];
+  parse -> model [label="typed model"];
+  model -> match [label="workflow.on"];
+  match -> expr [label="matched event"];
+  expr -> expand [label="resolved fields"];
+  expand -> matrix [label="job strategies"];
+  matrix -> dag [label="expanded plans"];
+  dag -> cond [label="valid needs DAG"];
+  cond -> builder [label="effective conditions"];
+  builder -> output [label="DTOs"];
+}

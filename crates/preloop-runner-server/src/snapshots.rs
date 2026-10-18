@@ -6,6 +6,7 @@
 //! private writable checkout through the unmodified `actions/checkout`.
 
 use super::*;
+use crate::secrets_api::valid_repo_segment;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Request};
 use axum::http::{HeaderName, HeaderValue, Response, StatusCode, header};
@@ -4730,22 +4731,6 @@ fn snapshot_authorization_token(value: &str) -> Option<String> {
     Some(token.to_owned())
 }
 
-/// Validate an `owner`/`repo` segment before it is interpolated into a relay
-/// URL.
-///
-/// Axum percent-decodes path parameters, so a decoded value can carry `/`,
-/// `?`, `#`, or a whole dot segment (`%2e%2e%2f..%2fusers%2fx%3F`). The URL
-/// crate normalizes `.`/`..` while parsing, which would let such a segment
-/// escape the configured path prefix — `forge_api_repo` has no literal tail
-/// to anchor it. Anything but a plain name is refused.
-fn valid_repo_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && !segment.starts_with('.')
-        && segment
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-}
-
 /// Headers the forge relay copies inbound — everything else (notably
 /// `authorization`, `host`, `cookie`) is dropped so the upstream request is
 /// anonymous by construction.
@@ -5166,19 +5151,6 @@ pub async fn forge_api_repo(
 #[cfg(test)]
 mod auth_scoping_tests {
     use super::*;
-
-    /// Decoded path parameters can carry separators or dot segments;
-    /// `url`/`reqwest` normalize `..` while parsing, so a segment that slips
-    /// through escapes the configured path prefix (SSRF).
-    #[test]
-    fn relay_segments_reject_traversal() {
-        for bad in ["", ".", "..", ".git", "a/b", "a?b", "a#b", "..%2fusers"] {
-            assert!(!valid_repo_segment(bad), "{bad:?} must be refused");
-        }
-        for good in ["owner", "repo.js", "some-repo_name", "node-24.x"] {
-            assert!(valid_repo_segment(good), "{good:?} must be allowed");
-        }
-    }
 
     #[test]
     fn gzipped_git_body_decodes_and_plain_passes_through() {

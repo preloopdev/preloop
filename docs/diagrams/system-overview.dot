@@ -1,0 +1,49 @@
+digraph system_overview {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.3, ranksep=0.55, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.12,0.07"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  subgraph cluster_clients {
+    label="Clients and triggers"; fontsize=13; fontcolor="#7c3aed"; style="rounded,dashed"; color="#7c3aed"; margin=12;
+    github [label="GitHub / GHES\nwebhooks, dispatch, Checks API", fillcolor="#ede9fe"];
+    cli    [label="CLI and agent tools\npreloop run, /api/v1/runs", fillcolor="#ede9fe"];
+    runner [label="Actions runner\npreloop-runner or compatible\n/_apis and /broker", fillcolor="#ede9fe"];
+    { rank=same; github; cli; runner; }
+  }
+
+  subgraph cluster_cp {
+    label="Self-hosted control plane"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    server [label="preloop-runner-server\naxum: /api/v1, /_apis, /broker\nwebhooks, logs, results", fillcolor="#bae6fd"];
+    workflow [label="Workflow engine\npreloop-gha-parser + expressions\nYAML → DAG → matrix jobs", fillcolor="#e0f2fe"];
+    coord [label="Scheduler and coordination\nControlBackend, concurrency, OIDC\nSQLite default; Postgres option", fillcolor="#e0f2fe"];
+    { rank=same; workflow; coord; }
+  }
+
+  subgraph cluster_pool {
+    label="MicroVM pool"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    pool [label="Runner pool (preloop-orchestrator)\non-demand forks or warm slots\ngolden cache, host memory cap", fillcolor="#fef3c7"];
+    provider [label="VmProvider (preloop-vm)\nSmolVM default; AgentENV opt-in\nPRELOOP_VM_BACKEND", fillcolor="#fef3c7"];
+    vm [label="microVM per job\nCoW fork of the golden\nguest preloop-runner", fillcolor="#fef3c7"];
+    { rank=same; pool; provider; vm; }
+  }
+
+  subgraph cluster_storage {
+    label="Durable state and outputs"; fontsize=13; fontcolor="#15803d"; style="rounded,dashed"; color="#22c55e"; margin=12;
+    db [label="Control state\nruns, jobs, leases, outbox_events\nSQLite or Postgres", fillcolor="#dcfce7"];
+    blobs [label="File-backed protocol stores\npreloop-cache + preloop-artifacts\nlogs and artifacts", fillcolor="#dcfce7"];
+    checks [label="GitHub Checks\ncheck_run_updates projector\ncoalesced durable sender", fillcolor="#bbf7d0"];
+    { rank=same; db; blobs; checks; }
+  }
+
+  github -> server [label="webhook / REST"];
+  cli -> server [label="submit / inspect"];
+  runner -> server [label="register / poll"];
+  server -> workflow [label="parse and expand"];
+  server -> coord [label="submit, schedule"];
+  coord -> db [label="one command / txn"];
+  server -> pool [label="queued jobs"];
+  pool -> provider [label="fork per job"];
+  provider -> vm [label="libkrun / KVM"];
+  vm -> server [label="register, logs, results", constraint=false];
+  db -> checks [label="outbox projection"];
+}
