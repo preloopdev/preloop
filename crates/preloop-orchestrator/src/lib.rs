@@ -9820,7 +9820,7 @@ done
         );
         assert_eq!(
             std::fs::read_to_string(&resolv).unwrap(),
-            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n"
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\nnameserver 8.8.8.8\noptions edns0 trust-ad\n"
         );
         assert_eq!(
             std::fs::read_to_string(&managed).unwrap(),
