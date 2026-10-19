@@ -438,6 +438,13 @@ async fn fetch_into_mirror(
 /// stalled fetch delays exactly the task that issued it — the deadline, not a
 /// lock, is the guarantee. See [`GIT_TRANSFER_TIMEOUT`] for why thirty
 /// minutes cannot cut a legitimate fetch short.
+///
+/// Expiry kills the child, which cannot unlink a lock file it held at the
+/// time, so dead locks are swept before each fetch. Without an engine lock the
+/// age rule is the only safe one: concurrent deliveries legitimately hold
+/// per-ref locks here, and only a lock that has outlived the longest possible
+/// fetch ([`GIT_TRANSFER_TIMEOUT`], every engine fetch into a mirror) is
+/// provably not a live child's.
 async fn fetch_into_mirror_within(
     program: impl AsRef<std::ffi::OsStr>,
     deadline: std::time::Duration,
@@ -446,6 +453,10 @@ async fn fetch_into_mirror_within(
     refspec: &str,
     resolve_ref: &str,
 ) -> Result<String, MergeError> {
+    crate::snapshots::remove_stale_git_locks(
+        &source.mirror,
+        GIT_TRANSFER_TIMEOUT + std::time::Duration::from_secs(60),
+    );
     let mut command = crate::snapshots::git_command_for(program);
     if let Some((key, value)) = source
         .token
@@ -1280,6 +1291,61 @@ mod tests {
             )
             .await,
             "the fake git child {pid} outlived the deadline"
+        );
+    }
+
+    /// A `git` killed at its deadline leaves the lock file it held behind —
+    /// `SIGKILL` is uncatchable — and every later fetch into that mirror would
+    /// fail with "Unable to create '…lock': File exists". The mirror has no
+    /// engine lock, so only a lock older than any possible fetch is provably
+    /// dead; that sweep must run before the fetch, while a young lock (which a
+    /// concurrent delivery may still hold) must survive.
+    #[tokio::test]
+    async fn a_dead_lock_from_a_killed_mirror_fetch_is_swept_before_the_next_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, _pid_file) = crate::snapshots::bounded_git_tests::hanging_git(temp.path());
+        let mirror = temp.path().join("merge-mirror.git");
+        std::fs::create_dir_all(mirror.join("refs/preloop/merge/base")).unwrap();
+        let dead = mirror.join("refs/preloop/merge/base/main.lock");
+        let live = mirror.join("refs/preloop/merge/base/other.lock");
+        std::fs::write(&dead, "").unwrap();
+        std::fs::write(&live, "").unwrap();
+        let age = GIT_TRANSFER_TIMEOUT + std::time::Duration::from_secs(60);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        filetime::set_file_mtime(
+            &dead,
+            filetime::FileTime::from_unix_time(now - (age.as_secs() as i64) - 60, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(&live, filetime::FileTime::from_unix_time(now, 0)).unwrap();
+
+        let source = MergeSource {
+            mirror: mirror.clone(),
+            fetch_url: Some("https://github.com/owner/repo.git".to_owned()),
+            token: None,
+            forge_host: None,
+        };
+        let _ = fetch_into_mirror_within(
+            program,
+            std::time::Duration::from_millis(750),
+            &source,
+            "https://github.com/owner/repo.git",
+            "refs/heads/main",
+            "refs/preloop/merge/base/main",
+        )
+        .await
+        .expect_err("a git that never exits must hit the deadline");
+
+        assert!(
+            !dead.exists(),
+            "a lock older than any possible fetch must be swept before the fetch"
+        );
+        assert!(
+            live.exists(),
+            "a young lock may belong to a concurrent delivery and must survive"
         );
     }
 

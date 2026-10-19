@@ -979,10 +979,17 @@ async fn fetch_lfs_object_into_cache(
 /// cache after the lock is released.
 ///
 /// `auth_header` is an origin-scoped `http.<url>.extraheader` value from
-/// [`scoped_fetch_auth_header`]. It is passed as a command-line `-c` override
-/// rather than through `GIT_CONFIG_*`: [`apply_git_child_policy`] owns that
-/// environment to clear the credential helper list, and a second writer would
-/// clobber it. Nothing here needs a helper — the header is the credential.
+/// [`scoped_fetch_auth_header`]. It is staged in the child *environment*
+/// ([`stage_git_auth_header`]) — the value is a live bearer token and argv is
+/// world-readable — while the non-secret credential-helper reset rides on the
+/// command line ([`git_command_for`]). Nothing here needs a helper: the header
+/// is the credential.
+///
+/// Expiry is a `SIGKILL`, which Git cannot catch, so a fetch killed during a
+/// ref, `shallow`, or `packed-refs` update leaves its lock file behind. The
+/// caller holds this repository's cache lock, so every lock file found here is
+/// a corpse of a previous kill and is removed before the fetch; otherwise one
+/// timed-out submission would fail every later one with "File exists".
 async fn fetch_checkout_cache_commit(
     program: impl AsRef<std::ffi::OsStr>,
     deadline: std::time::Duration,
@@ -991,6 +998,10 @@ async fn fetch_checkout_cache_commit(
     commit_sha: &str,
     auth_header: Option<(&str, &str)>,
 ) -> Result<(), ApiError> {
+    // A previous fetch in this repository may have been killed at its
+    // deadline, and its lock files would fail this one. The cache lock is
+    // held, so nothing else is inside the repository.
+    remove_stale_git_locks(repository, std::time::Duration::ZERO);
     let mut fetch = git_command_for(program);
     if let Some((key, value)) = auth_header {
         stage_git_auth_header(&mut fetch, key, value);
@@ -2823,6 +2834,109 @@ pub(crate) fn stage_git_auth_header(command: &mut Command, key: &str, value: &st
         .env("GIT_CONFIG_VALUE_0", value);
 }
 
+/// A Git command for a fetch against the *workspace's own* remote.
+///
+/// Unlike [`git_command_for`] this does not reset Git's credential-helper
+/// list. The engine holds no credential for a GitLab, enterprise, or PAT-less
+/// GitHub origin — [`github_auth_header_for_remote`] covers GitHub and nothing
+/// else — so for a private workspace whose only credential is a configured
+/// helper, the helper *is* the credential. Resetting it fails the deepen,
+/// and the caller then rewrites history and submits SHAs the forge has never
+/// seen, which breaks every workflow that fetches those SHAs back.
+///
+/// The helper stays bounded, not unprompted-forever: the askpass programs are
+/// still pointed at `false` and `GIT_TERMINAL_PROMPT=0`/`GCM_INTERACTIVE=never`
+/// still apply ([`apply_git_child_policy`]), stdin is `/dev/null`, the wait is
+/// the caller's deadline, and expiry kills the child's whole process group —
+/// so a helper that blocks costs its fetch's deadline, never the engine.
+fn workspace_git_command() -> Command {
+    let mut command = Command::new(GIT_PROGRAM);
+    apply_git_child_policy(&mut command);
+    command
+}
+
+/// Remove the Git lock files a child killed at its deadline left behind.
+///
+/// The deadline is a `SIGKILL`, which Git cannot catch, so a fetch killed
+/// during a ref, config, `shallow`, or `packed-refs` update never unlinks the
+/// `*.lock` it held. Git then refuses every later operation in that repository
+/// with "Unable to create '…lock': File exists", so a single timed-out fetch
+/// would poison a persistent cache for every later submission.
+///
+/// `older_than` is the concurrency rule, and it is the whole safety argument:
+///
+/// * [`std::time::Duration::ZERO`] removes every lock file, which is correct
+///   only while the caller holds the repository's exclusive engine lock (the
+///   checkout cache, the snapshot object cache). No other engine child can be
+///   inside the repository then, so any lock file is a corpse.
+/// * A longer age is for a repository with no engine lock (the merge mirror):
+///   no engine fetch may hold a lock beyond its own deadline, so a lock older
+///   than that cannot belong to a live child. Anything younger is left alone
+///   rather than stolen from a fetch that is still running.
+///
+/// Best effort: a failed removal is logged and the caller proceeds, where Git
+/// reports the lock itself with a better message than this can.
+pub(crate) fn remove_stale_git_locks(repository: &FsPath, older_than: std::time::Duration) {
+    let now = std::time::SystemTime::now();
+    // Only the trees Git takes lock files in: walking the object fanout
+    // directories holds no locks and would cost more than the fetch's own
+    // control commands.
+    for (directory, recursive) in [
+        (repository.to_path_buf(), false),
+        (repository.join("refs"), true),
+        (repository.join("logs"), true),
+        (repository.join("objects").join("pack"), false),
+    ] {
+        remove_lock_files(&directory, recursive, older_than, now);
+    }
+}
+
+fn remove_lock_files(
+    directory: &FsPath,
+    recursive: bool,
+    older_than: std::time::Duration,
+    now: std::time::SystemTime,
+) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if recursive {
+                remove_lock_files(&path, true, older_than, now);
+            }
+            continue;
+        }
+        if path.extension().is_none_or(|extension| extension != "lock") {
+            continue;
+        }
+        if !older_than.is_zero() {
+            let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+                continue;
+            };
+            if now.duration_since(modified).unwrap_or_default() < older_than {
+                continue;
+            }
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => warn!(
+                path = %path.display(),
+                "removed a Git lock file left by a process killed at its deadline"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                path = %path.display(),
+                %error,
+                "could not remove a stale Git lock file"
+            ),
+        }
+    }
+}
+
 /// Run `command` under `deadline` and return its output whatever the exit
 /// status was, through the engine-wide bounded runner
 /// ([`preloop_observability::deadline::run_command`]): the child is killed and
@@ -2991,6 +3105,11 @@ async fn ensure_object_cache(
         ApiError::internal(format!("failed to create snapshot object cache: {error}"))
     })?;
     let _guard = acquire_cache_lock(&lock).await?;
+    // The lock covers the whole cache, so a lock file left by a `git` this
+    // engine killed at its deadline is a corpse, not a live writer. Removing it
+    // here is what keeps one timed-out deepen from failing every later
+    // snapshot of this workspace with "Unable to create '…lock': File exists".
+    remove_stale_git_locks(&repository, std::time::Duration::ZERO);
     let mut last_head = repository.as_os_str().to_os_string();
     last_head.push(".last-head");
     let last_head = PathBuf::from(last_head);
@@ -3215,10 +3334,17 @@ async fn deepen_object_cache_from_remote(
         return false;
     }
     let shallow_marker = repository.join("shallow");
-    let mut fetch = git_command();
+    let auth_header = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat));
+    // With the engine's own credential the helper list is reset as usual — the
+    // header is the credential and no helper is consulted. Without one, this
+    // fetch is the operator's own workspace remote, whose only credential may
+    // be a configured helper, so that list is left alone.
+    let mut fetch = match auth_header.is_some() {
+        true => git_command(),
+        false => workspace_git_command(),
+    };
     fetch.env("GIT_DIR", repository);
-    if let Some((key, value)) = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat))
-    {
+    if let Some((key, value)) = auth_header {
         // A private remote rejects the anonymous unshallow; the engine's own
         // GitHub credential (already used for action downloads) closes it.
         // Scoped by `github_auth_header_for_remote` so the PAT is never sent
@@ -8690,6 +8816,169 @@ pub(crate) mod bounded_git_tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "the fetch must fail fast, not sit on the deadline: {message}"
+        );
+    }
+
+    /// A `git` killed at its deadline cannot unlink the lock files it held, and
+    /// Git then refuses every later operation in that repository with
+    /// "Unable to create '…lock': File exists". Under the engine's exclusive
+    /// cache lock every lock file is that corpse, so every one of them goes —
+    /// and nothing that is not a lock file is touched.
+    #[test]
+    fn stale_git_locks_are_removed_under_the_repository_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("cache.git");
+        std::fs::create_dir_all(repository.join("refs/heads/feature")).unwrap();
+        std::fs::create_dir_all(repository.join("logs/refs/heads")).unwrap();
+        std::fs::create_dir_all(repository.join("objects/pack")).unwrap();
+        let locks = [
+            "HEAD.lock",
+            "config.lock",
+            "packed-refs.lock",
+            "shallow.lock",
+            "refs/heads/main.lock",
+            "refs/heads/feature/topic.lock",
+            "logs/refs/heads/main.lock",
+        ];
+        for lock in locks {
+            std::fs::write(repository.join(lock), "").unwrap();
+        }
+        // Not locks: the ref itself, an ordinary object file, an unrelated
+        // config. The sweep must leave all three alone.
+        std::fs::write(repository.join("refs/heads/main"), "sha\n").unwrap();
+        std::fs::write(repository.join("objects/pack/pack-abc.pack"), "").unwrap();
+        std::fs::write(repository.join("config"), "[core]\n").unwrap();
+
+        remove_stale_git_locks(&repository, std::time::Duration::ZERO);
+
+        for lock in locks {
+            assert!(!repository.join(lock).exists(), "{lock} survived the sweep");
+        }
+        assert!(repository.join("refs/heads/main").is_file());
+        assert!(repository.join("objects/pack/pack-abc.pack").is_file());
+        assert_eq!(
+            std::fs::read_to_string(repository.join("config")).unwrap(),
+            "[core]\n"
+        );
+    }
+
+    /// A mirror has no engine lock, so a lock file there may belong to a
+    /// concurrent delivery that is still fetching. Only a lock that has
+    /// outlived the longest fetch any engine child may hold is provably dead.
+    #[test]
+    fn without_a_repository_lock_only_a_lock_older_than_any_fetch_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mirror = temp.path().join("mirror.git");
+        std::fs::create_dir_all(mirror.join("refs/preloop/merge/base")).unwrap();
+        std::fs::create_dir_all(mirror.join("refs/preloop/merge/head")).unwrap();
+        let dead = mirror.join("refs/preloop/merge/base/main.lock");
+        let live = mirror.join("refs/preloop/merge/head/main.lock");
+        std::fs::write(&dead, "").unwrap();
+        std::fs::write(&live, "").unwrap();
+        let age = GIT_TRANSFER_TIMEOUT + std::time::Duration::from_secs(60);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        filetime::set_file_mtime(
+            &dead,
+            filetime::FileTime::from_unix_time(now - (age.as_secs() as i64) - 60, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(&live, filetime::FileTime::from_unix_time(now, 0)).unwrap();
+
+        remove_stale_git_locks(&mirror, age);
+
+        assert!(
+            !dead.exists(),
+            "a lock older than any possible fetch must be removed"
+        );
+        assert!(
+            live.exists(),
+            "a young lock may belong to a live concurrent fetch"
+        );
+    }
+
+    /// The workspace's own remote is the operator's credential domain. When the
+    /// engine has no credential for it, the deepen fetch must still be able to
+    /// use a configured credential helper — otherwise a private GitLab or
+    /// enterprise workspace that used to deepen falls back to a history rewrite
+    /// and submits SHAs the forge never had.
+    #[tokio::test]
+    async fn a_workspace_origin_deepen_keeps_the_configured_credential_helper() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new(GIT_PROGRAM)
+                .args(["-c", "commit.gpgsign=false"])
+                .args(["-c", "user.email=preloop@example.invalid"])
+                .args(["-c", "user.name=preloop"])
+                .args(args)
+                .status()
+                .expect("git runs in tests");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        // A real shallow bare clone, so the deepen takes the `--unshallow` path
+        // a shallow workspace's own origin takes.
+        let work = temp.path().join("work");
+        run_git(&["init", "-q", "-b", "main", work.to_str().unwrap()]);
+        std::fs::write(work.join("file.txt"), "one\n").unwrap();
+        run_git(&["-C", work.to_str().unwrap(), "add", "-A"]);
+        run_git(&["-C", work.to_str().unwrap(), "commit", "-qm", "one"]);
+        let cache = temp.path().join("cache.git");
+        run_git(&[
+            "clone",
+            "-q",
+            "--bare",
+            "--depth=1",
+            &format!("file://{}", work.display()),
+            cache.to_str().unwrap(),
+        ]);
+        assert!(
+            cache.join("shallow").is_file(),
+            "the fixture must produce a shallow cache"
+        );
+
+        let log = temp.path().join("helper-ran");
+        let helper = temp.path().join("credential-helper");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The deepen fetch runs with `GIT_DIR` on the cache, so that is where
+        // the helper has to be configured to be read.
+        run_git(&[
+            "-C",
+            cache.to_str().unwrap(),
+            "config",
+            "credential.helper",
+            helper.to_str().unwrap(),
+        ]);
+
+        // The workspace origin is a private remote the engine has no token for;
+        // `401` is what sends Git to the credential subsystem.
+        let workspace = temp.path().join("workspace");
+        run_git(&["init", "-q", "-b", "main", workspace.to_str().unwrap()]);
+        run_git(&[
+            "-C",
+            workspace.to_str().unwrap(),
+            "config",
+            "remote.origin.url",
+            &format!("http://{}/owner/repo.git", unauthorized_forge()),
+        ]);
+
+        let deepened = deepen_object_cache_from_remote(&cache, &workspace, None).await;
+        assert!(
+            !deepened,
+            "an origin that rejects the credential leaves the cache shallow"
+        );
+        assert!(
+            log.exists(),
+            "the deepen fetch must consult the configured credential helper"
         );
     }
 }
