@@ -26,6 +26,12 @@ pub async fn run_docker_action(
 
     info!("Running docker action: {image}");
 
+    // `docker run` below pulls the image when it is not cached, through the
+    // host's registry credential helpers; the run itself is filtered because
+    // the action is workflow-controlled. Pull it here, runner-owned, so a
+    // private action image still resolves on a cold host.
+    pre_pull_for_action(image, ctx).await;
+
     let inputs = evaluated_inputs(None, with, ctx)?;
     let env = container_action_env(ctx, &inputs, None, None)?;
     run_docker_image(image, workspace, ctx, env, None, Vec::new()).await
@@ -52,6 +58,11 @@ pub async fn run_docker_action_from_manifest(
         let tag = format!("action-{}", uuid::Uuid::new_v4());
 
         info!("Building docker action from {}", dockerfile.display());
+        // The build pulls each `FROM` image through the host's credential
+        // helpers, and the build itself must stay filtered (the Dockerfile is
+        // workflow-controlled): pre-pull the bases it names, best effort, so a
+        // private base image still builds on a cold host.
+        pre_pull_dockerfile_bases(&dockerfile, ctx).await;
         let ctx_ref = &mut *ctx;
         let on_chunk = Box::new(move |chunk: &[u8]| {
             ctx_ref.write_chunk(chunk);
@@ -83,6 +94,10 @@ pub async fn run_docker_action_from_manifest(
 
         tag
     } else {
+        // The same implicit pull as `docker://`: `docker run` below resolves
+        // a missing image through the host's credential helpers, while the run
+        // itself stays filtered.
+        pre_pull_for_action(image, ctx).await;
         image.to_string()
     };
 
@@ -132,6 +147,63 @@ async fn run_docker_image(
     }
 
     Ok(())
+}
+
+/// Best-effort trusted pull of an image an action is about to run, with the
+/// `docker pull` output written into the step's log.
+async fn pre_pull_for_action(image: &str, ctx: &mut StepContext<'_>) {
+    let mut log = Vec::new();
+    crate::worker::container_ops::pre_pull_action_image(image, &mut log).await;
+    for line in &log {
+        ctx.log(line);
+    }
+}
+
+/// Best-effort trusted pulls of the images a Dockerfile's `FROM`
+/// instructions name, written into the step's log.
+///
+/// A Dockerfile that cannot be read is left to `docker build`, which reports
+/// the real error.
+async fn pre_pull_dockerfile_bases(dockerfile: &Path, ctx: &mut StepContext<'_>) {
+    let Ok(contents) = std::fs::read_to_string(dockerfile) else {
+        return;
+    };
+    for image in dockerfile_base_images(&contents) {
+        pre_pull_for_action(&image, ctx).await;
+    }
+}
+
+/// Image references a Dockerfile builds on, in first-appearance order.
+///
+/// A best-effort scan, not a parser: `FROM` flags (`--platform=…`) are
+/// skipped, and the stage alias after the reference is ignored. A reference
+/// that needs build-arg substitution (`FROM $BASE`) or names `scratch` is left
+/// to `docker build` itself, and a reference named twice is pulled once.
+fn dockerfile_base_images(contents: &str) -> Vec<String> {
+    let mut images: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        if !tokens
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("FROM"))
+        {
+            continue;
+        }
+        let Some(image) = tokens.find(|token| !token.starts_with("--")) else {
+            continue;
+        };
+        if image.eq_ignore_ascii_case("scratch") || image.contains('$') {
+            continue;
+        }
+        if !images.iter().any(|existing| existing == image) {
+            images.push(image.to_string());
+        }
+    }
+    images
 }
 
 fn build_docker_run_args(
@@ -524,6 +596,39 @@ mod tests {
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"/tmp/work:/github/workspace".to_string()));
         assert!(args.contains(&"/github/workspace".to_string()));
+    }
+
+    #[test]
+    fn dockerfile_base_images_are_the_from_references() {
+        // `FROM` flags are skipped, the stage alias is ignored, case does not
+        // matter, and a reference reached only through build-arg substitution
+        // or naming `scratch` is left to `docker build`; a repeated reference
+        // is pulled once.
+        let contents = "\
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.22 AS build
+RUN go build ./...
+
+FROM alpine:3.20
+from debian:12
+FROM scratch
+FROM ${BASE_IMAGE}
+FROM golang:1.22
+";
+        assert_eq!(
+            dockerfile_base_images(contents),
+            vec![
+                "golang:1.22".to_string(),
+                "alpine:3.20".to_string(),
+                "debian:12".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dockerfile_without_a_resolvable_from_has_no_bases() {
+        assert!(dockerfile_base_images("RUN echo hi\n# FROM alpine:3.20\n").is_empty());
+        assert!(dockerfile_base_images("FROM scratch\n").is_empty());
     }
 
     #[test]

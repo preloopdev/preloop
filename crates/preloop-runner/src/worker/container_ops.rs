@@ -352,12 +352,18 @@ pub async fn create_network(network: &str, label: &str, log: &mut Vec<String>) -
 /// never touched), pulls with that config, then removes the credentials on
 /// drop. Matches official runner `ContainerOperationProvider.cs:193-221`.
 ///
-/// The pull goes through [`docker_cmd_trusted`], not [`docker_cmd`]: pulling
-/// without workflow-supplied credentials routes through the host's Docker
+/// The pull runs through [`docker_cmd_trusted`] only when no workflow
+/// credentials are supplied: authenticating then is left to the host's Docker
 /// credential helpers, which read their credentials from the environment
 /// (`docker-credential-ecr-login` wants `AWS_ACCESS_KEY_ID` /
 /// `AWS_SECRET_ACCESS_KEY`). This runs before any step exists and belongs to
 /// the runner, so it keeps them.
+///
+/// With workflow-supplied `credentials` the temporary config directory is the
+/// pull's only authentication source — `--config` replaces the host's Docker
+/// config, so no credential helper is consulted — and the pull runs filtered
+/// like any other command. A helper selected by the pulled registry must not
+/// get credentials that image authentication does not need.
 pub async fn pull_image(
     image: &str,
     credentials: Option<&RegistryCredentials>,
@@ -366,13 +372,40 @@ pub async fn pull_image(
     if let Some(creds) = credentials {
         let config_dir = docker_registry_login(image, creds, log).await?;
         let config_path = config_dir.path().to_string_lossy().to_string();
-        let result = docker_cmd_trusted(&["--config", &config_path, "pull", image], log).await;
+        let result = docker_cmd(&["--config", &config_path, "pull", image], log).await;
         drop(config_dir); // deletes temp credentials dir
         result?;
     } else {
         docker_cmd_trusted(&["pull", image], log).await?;
     }
     Ok(())
+}
+
+/// Pull an image an action container is about to use, before the action's own
+/// `docker` invocation starts.
+///
+/// `docker run` pulls a missing image (`--pull=missing` is Docker's default)
+/// and `docker build` pulls the images in its `FROM` instructions, both
+/// through the host's registry credential helpers, which read their
+/// credentials from the environment. The action's own invocation stays under
+/// [`HostEnvPolicy::Filtered`] — the image reference, the Dockerfile and the
+/// entrypoint are workflow-controlled — so the pull happens here first,
+/// runner-owned and with the host environment kept, exactly like
+/// [`pull_image`] does for job and service containers.
+///
+/// Best effort by design: the image may already be local, the host may be
+/// offline, and a `FROM` resolved through a build arg cannot be named here. A
+/// failure is logged and ignored because the action's own `docker run` /
+/// `docker build` reports the authoritative error.
+pub(crate) async fn pre_pull_action_image(image: &str, log: &mut Vec<String>) {
+    if image.is_empty() || image.eq_ignore_ascii_case("scratch") {
+        return;
+    }
+    if let Err(error) = docker_cmd_trusted(&["pull", image], log).await {
+        log.push(format!(
+            "##[warning]Pre-pulling {image} for a docker action failed: {error}"
+        ));
+    }
 }
 
 /// Start the job container (long-running with `tail -f /dev/null` entrypoint).

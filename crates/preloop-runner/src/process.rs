@@ -135,6 +135,9 @@ pub(crate) fn is_internal_step_env(key: &str) -> bool {
 /// are untouched) and is overridable with
 /// `PRELOOP_RUNNER_INHERIT_HOST_ENV=1` for workflows that genuinely rely on a
 /// host credential variable (which should instead be passed via `env:`).
+/// Two exact names are settled before the marker scan: the benign
+/// `TOKENIZERS_PARALLELISM` (kept) and the runner's own keypair
+/// (`PRELOOP_RUNNER_RSA_PARAMS`, dropped).
 pub(crate) fn is_sensitive_host_env(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     // Benign toolchain knobs whose name happens to trip a marker below.
@@ -144,6 +147,15 @@ pub(crate) fn is_sensitive_host_env(key: &str) -> bool {
     // `MY_TOKENIZERS_PARALLELISM_API_KEY` is still credential-shaped.
     if lower == "tokenizers_parallelism" {
         return false;
+    }
+    // The runner's own authentication key, whose name carries no marker.
+    // `PRELOOP_RUNNER_RSA_PARAMS` is an `RSAParameters` JSON keypair that a
+    // supervising orchestrator injects into the runner's environment
+    // (`configure.rs`'s `RSA_PARAMS_ENV`) so the runner need not generate one
+    // per job; a step that inherits it can print the complete registration key
+    // with a plain `env`.
+    if lower == "preloop_runner_rsa_params" {
+        return true;
     }
     const MARKERS: &[&str] = &[
         "token",
@@ -1440,6 +1452,9 @@ mod tests {
             "SERVICE_CREDENTIALS",
             "MY_SESSION_KEY",
             "GPG_KEY",
+            // The runner's own keypair: JSON `RSAParameters` with no
+            // credential marker in the name.
+            "PRELOOP_RUNNER_RSA_PARAMS",
         ] {
             assert!(is_sensitive_host_env(key), "{key} must be filtered");
         }
@@ -1513,6 +1528,13 @@ mod tests {
             HostEnvPolicy::Filtered,
             false
         ));
+        // The runner's own environment carries its pre-generated keypair as
+        // `PRELOOP_RUNNER_RSA_PARAMS`; a step must never read it.
+        assert!(!inherits_step_env(
+            "PRELOOP_RUNNER_RSA_PARAMS",
+            HostEnvPolicy::Filtered,
+            false
+        ));
         // Internal bookkeeping families are always dropped. `ACTIONS_*`
         // uppercase is deliberately kept: steps are entitled to see it, and
         // the per-job values are injected explicitly afterwards.
@@ -1574,6 +1596,7 @@ mod tests {
     async fn invoke_drops_credential_shaped_host_env_from_steps() {
         const CHILD_MARKER: &str = "PRELOOP_STEP_ENV_CREDENTIAL_CHILD";
         const SECRET: &str = "PRELOOP_TEST_CLIPROXY_API_KEY";
+        const RUNNER_KEY: &str = "PRELOOP_RUNNER_RSA_PARAMS";
         const PLAIN: &str = "PRELOOP_TEST_HOST_ENV_KEEP";
 
         if std::env::var_os(CHILD_MARKER).is_none() {
@@ -1584,8 +1607,14 @@ mod tests {
                     "process::tests::invoke_drops_credential_shaped_host_env_from_steps",
                     "--nocapture",
                 ])
+                // The escape hatch is documented, so a host configured with
+                // `PRELOOP_RUNNER_INHERIT_HOST_ENV=1` would otherwise leak it
+                // into the child, which would then correctly keep `SECRET` and
+                // fail this test's own assertions.
+                .env_remove("PRELOOP_RUNNER_INHERIT_HOST_ENV")
                 .env(CHILD_MARKER, "1")
                 .env(SECRET, "hunter2")
+                .env(RUNNER_KEY, r#"{"d":"private-exponent"}"#)
                 .env(PLAIN, "kept-value")
                 .status()
                 .expect("spawning the seeded test subprocess");
@@ -1602,6 +1631,7 @@ mod tests {
                 "-c",
                 &format!(
                     "printenv {SECRET} || echo SECRET-MISSING; \
+                     printenv {RUNNER_KEY} || echo RUNNER-KEY-MISSING; \
                      printenv {PLAIN} || echo PLAIN-MISSING"
                 ),
             ],
@@ -1621,8 +1651,16 @@ mod tests {
             "credential-shaped host env {SECRET} reached a step: {output}"
         );
         assert!(
+            output.contains("RUNNER-KEY-MISSING"),
+            "the runner's own keypair env {RUNNER_KEY} reached a step: {output}"
+        );
+        assert!(
             !output.contains("hunter2"),
             "the credential value itself reached a step: {output}"
+        );
+        assert!(
+            !output.contains("private-exponent"),
+            "the runner keypair value itself reached a step: {output}"
         );
         assert!(
             output.contains("kept-value"),
