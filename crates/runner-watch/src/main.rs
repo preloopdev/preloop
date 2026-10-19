@@ -4015,7 +4015,7 @@ fn update_readme_runner_version(version: &str) -> anyhow::Result<()> {
     }
     let text = fs::read_to_string(&path)?;
     let replacement = format!(
-        "## Current Status\n\n**As of 2026-06-29, preloop is tracked by runner-watch against the official `actions/runner` {version} protocol surface.**\n\npreloop currently supports the core runner lifecycle:\n\n1. Registers against preloop (GHES-style org URL)\n2. Creates encrypted sessions (AES key exchange)\n3. Receives and decrypts job messages\n4. Executes jobs and reports completion\n5. Supports `needs` DAG, matrix strategies, trigger matching, expression evaluation\n\nWorkspace tests pass via `cargo test --workspace`. runner-watch records protocol-sync artifacts under `.runner-watch/`; remaining fidelity work is tracked in [docs/fidelity-gap.md](docs/fidelity-gap.md).\n\n"
+        "## Current Status\n\n**As of 2026-06-29, preloop is tracked by runner-watch against the official `actions/runner` {version} protocol surface.**\n\npreloop currently supports the core runner lifecycle:\n\n1. Registers against preloop (GHES-style org URL)\n2. Creates encrypted sessions (AES key exchange)\n3. Receives and decrypts job messages\n4. Executes jobs and reports completion\n5. Supports `needs` DAG, matrix strategies, trigger matching, expression evaluation\n\nWorkspace tests pass via `cargo test --workspace`. runner-watch records protocol-sync artifacts under `.runner-watch/`; remaining fidelity work is tracked in [docs/contributing/fidelity-gap.md](docs/contributing/fidelity-gap.md).\n\n"
     );
     if let (Some(start), Some(end)) = (
         text.find("## Current Status\n"),
@@ -4039,7 +4039,7 @@ fn update_readme_runner_version(version: &str) -> anyhow::Result<()> {
 }
 
 fn update_fidelity_gap(version: &str, spec_dir: &Path) -> anyhow::Result<()> {
-    let path = PathBuf::from("docs/fidelity-gap.md");
+    let path = PathBuf::from("docs/contributing/fidelity-gap.md");
     if !path.exists() {
         return Ok(());
     }

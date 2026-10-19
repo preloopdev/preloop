@@ -1,0 +1,70 @@
+---
+title: Compatibility
+description: Understand Preloop's GitHub Actions compatibility target, verification evidence, and current limitations.
+---
+
+Preloop is compatible with GitHub Actions when an existing workflow can run without changing its YAML, the runner can complete its protocol exchange, and GitHub-integrated checks still report the result. Use this page to choose a deployment and to identify the few behaviors that need an external runner or a workflow adjustment.
+
+## Three compatibility boundaries
+
+| Boundary | What compatibility means in Preloop |
+|---|---|
+| Runner protocol | The official `actions/runner` can register, create a session, acquire and renew jobs, report completion, stream logs, and use cache, artifact, and OIDC service endpoints. Local URLs, IDs, and tokens are implementation equivalents rather than GitHub service values. |
+| Workflow semantics | Existing workflow YAML keeps its GitHub meaning for triggers, expressions, contexts, matrices, `needs`, outputs, secrets, permissions, cancellation, reusable workflows, cache, artifacts, and common action handlers. |
+| GitHub integration | The self-hosted control plane receives GitHub webhooks, fetches workflow content and refs, mints scoped job credentials, and publishes Check Runs. GitHub Apps can also use the Actions dispatch and polling subset of the REST API. |
+
+Compatibility does not mean reproducing GitHub's internal service topology. Preloop uses local control, results, cache, and artifact stores behind the same runner-facing contracts. Signed URLs, service hosts, token bytes, timestamps, and other volatile values are normalized or intentionally local.
+
+## Protocol target
+
+The current protocol target is **`actions/runner` v2.336.0**, pinned by `runner_version` in `versions.toml`. The bundled `preloop-runner` follows the official Listener/Worker split; the control plane can also accept an official runner in supported external-runner configurations.
+
+A GitHub App can trigger the compatible REST surface with:
+
+- `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches` for `workflow_dispatch`. Invalid inputs return `422`; a workflow without that trigger returns `409`.
+- `POST /repos/{owner}/{repo}/dispatches` for `repository_dispatch`. Matching workflows are broadcast the event and the endpoint returns `204`.
+- `GET /repos/{owner}/{repo}/actions/workflows` and `GET /repos/{owner}/{repo}/actions/runs` for polling.
+
+Workflow dispatch requires `actions: write`. Repository dispatch requires `contents: write`. The supported credential forms are system bearer credentials, PATs, App JWTs, and installation tokens. Workflow and run IDs are filename-based or deterministic local IDs, not GitHub's numeric database IDs.
+
+## How compatibility is verified
+
+The five conformance layers are summarized below. The maintainer runbook contains the capture formats, setup, and exact commands in [the conformance guide](https://github.com/preloopdev/preloop/blob/main/docs/contributing/conformance.md).
+
+- **Captured wire:** a MITM proxy records the exact HTTP exchange between the official runner and GitHub, then records the corresponding exchange with Preloop.
+- **Replayed wire:** 39 v2.336.0 capture definitions are retained; 36 are in the gated set and three are quarantined by corpus-integrity checks. Replay compares status codes, request/response schemas, job and step conclusions, timelines, annotations, and service exchanges.
+- **Invariant properties:** randomized server tests exercise queue modes, cancellation, lease expiry, stale-runner cleanup, assignment binding, and matrix/concurrency interactions.
+- **Formal model checking:** the scheduling and gate model is checked with the Specula/TLA+ artifacts retained in the repository. Findings are reconciled against the current implementation; one recorded model finding is withdrawn as a model artifact.
+- **Whole-repo behavior:** the same workflows are run through Preloop and comparison systems. The checked-in benchmark manifests contain 39 recorded entries, while the broader scenario corpus contains 66 directories; results compare job and step names, order, conclusions, and failure behavior.
+
+To replay the configured golden set locally, use `just conform`. A runner-watch replay can target the pinned version explicitly:
+
+```sh
+runner-watch conform \
+  --runner 2.336.0 \
+  --preloop-url http://127.0.0.1:9090
+```
+
+The gate treats volatile values such as timestamps, GUIDs, session IDs, tokens, and random URL segments as non-semantic. A passing replay therefore means the observable contract matches where the runner and workflows depend on it, not that Preloop has GitHub's private hostnames or token service.
+
+## Known limitations
+
+These are current behaviors users can encounter on public/main. They are separate from historical campaign findings in the contributor tracker.
+
+| Area | Current behavior and user impact |
+|---|---|
+| Runner binary updates | `preloop-runner` acknowledges refresh messages and can refresh settings, but it does not replace its own binary. Update the installed Preloop runner with the product release. |
+| Background-step controls | Background steps and result aggregation are supported; explicit background cancel-control steps are not complete. Workflows using those controls can diverge from the official runner. |
+| Remote actions inside local composites | The control plane admits a remote action only when the run's workflow or an admitted remote composite declares it. A remote `uses:` referenced solely from inside a local composite action is refused with `403`; declare it in the workflow as well. |
+| Action-download telemetry | Action downloads report basic information such as archive size; the structured upstream telemetry payload is not emitted. |
+| Hosted service topology | The control plane exposes 30 runner-facing service definitions, not the complete GitHub/Azure hosted location catalog. Actions that require an unimplemented hosted service can fail. |
+| macOS and Windows jobs | The built-in pool provides Linux guests. A job requiring a matching macOS or Windows runner needs an external runner registered with the corresponding labels. |
+| Nested virtualization | Workloads that require guest KVM or nested virtualization are not supported inside the microVM guest. |
+| Multi-architecture Docker builds | The guest does not provide a general binfmt emulation layer, so a cross-architecture Docker build may fall back to the host architecture or fail. |
+| SARIF upload | A scanner can produce SARIF locally, but uploading security results requires a GitHub security-events backend and token. |
+| Cached checkouts | A cached checkout can retain the engine as its Git origin. Explicitly check out the forge remote before pushing from that workspace. |
+| Large Git LFS objects | LFS objects larger than 1 GiB fall back to the forge instead of the local checkout cache. |
+| Container networking | A custom Docker network can bypass the control bridge. HTTPS container traffic also needs a certificate covering the container-facing gateway. |
+| CLI planning views | Preloop has workflow planning commands but no workflow graph visualization or dry-run/list command equivalent to every local-runner tool. |
+
+For alternatives and the measured local benchmark snapshot, see [Comparison](/comparison). For deployment-specific host and storage requirements, see [Control plane deployment](/control-plane/operate/deploy).

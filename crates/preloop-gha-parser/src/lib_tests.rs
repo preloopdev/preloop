@@ -30,7 +30,7 @@ fn glob_match_double_star_requires_a_real_separator_before_a_literal_slash() {
         "`**/*.md` must not match a root-level file"
     );
     assert!(
-        glob_match("**/*.md", "docs/cli_reference.md"),
+        glob_match("**/*.md", "docs/roadmap.md"),
         "`**/*.md` matches inside a directory"
     );
     assert!(
@@ -44,7 +44,7 @@ fn glob_match_double_star_requires_a_real_separator_before_a_literal_slash() {
         "`**.md` must match a root-level file"
     );
     assert!(
-        glob_match("**.md", "docs/cli_reference.md"),
+        glob_match("**.md", "docs/roadmap.md"),
         "`**.md` must match a nested file"
     );
 
@@ -57,8 +57,8 @@ fn glob_match_double_star_requires_a_real_separator_before_a_literal_slash() {
 #[test]
 fn glob_match_single_star_does_not_cross_separators() {
     assert!(glob_match("*.md", "README.md"));
-    assert!(!glob_match("*.md", "docs/cli_reference.md"));
-    assert!(glob_match("docs/*.md", "docs/cli_reference.md"));
+    assert!(!glob_match("*.md", "docs/roadmap.md"));
+    assert!(glob_match("docs/*.md", "docs/roadmap.md"));
     assert!(!glob_match("docs/*.md", "docs/adr/0001-title.md"));
     assert!(glob_match("docs/**", "docs/adr/0001-title.md"));
 }

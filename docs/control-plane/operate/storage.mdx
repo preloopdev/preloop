@@ -1,0 +1,94 @@
+---
+title: "Storage and retention"
+description: "Choose SQLite or Postgres, apply migrations safely, retain run data, and back up operator state."
+---
+
+The control plane persists runs, jobs, webhook deliveries, runners, sessions, logs, Check Run mappings, and outbox records. SQLite is the zero-configuration default for one engine; Postgres is the shared backend for multiple engine nodes.
+
+## Choose a backend
+
+| Backend | Configuration | Operating model |
+|---|---|---|
+| SQLite | Nothing, or `sqlite://PATH`, `sqlite:PATH`, or a bare path | `<PRELOOP_HOME>/state/preloop.db`; one engine process owns the file. WAL and four query-only readers are used. |
+| Postgres | `postgres://...` or `postgresql://...` | External database; several engine nodes may share it. Add `?sslmode=require`, `verify-ca`, or `verify-full` for TLS. |
+
+Precedence is `preloop serve --store URL`, then `PRELOOP_STORE_URL`, then the SQLite default. `PRELOOP_HOME` defaults to `$HOME/.preloop` (or `./.preloop` when no home is available); a system service normally uses `/var/lib/preloop`.
+
+Postgres uses 16 writer and 16 reader connections by default, plus one dedicated wake listener. Set `PRELOOP_PG_WRITERS` and `PRELOOP_PG_READERS` to size the pools; each value is clamped to at least one. Queue claims use row locks with `SKIP LOCKED`, and notifications are wake hints rather than the source of truth.
+
+## Apply schema migrations
+
+The control schema uses embedded, forward-only refinery migrations. A fresh local SQLite store is initialized by the supported setup paths (`preloop serve` on a fresh `$PRELOOP_HOME`, `preloop init`, `preloop server install`); existing stores are upgraded explicitly:
+
+```sh
+export PRELOOP_STORE_URL='postgres://preloop@db.example/preloop?sslmode=verify-full'
+preloop store migrate
+preloop store status
+preloop serve
+```
+
+For SQLite, an existing nonempty database with pending migrations receives a consistent backup named `<db>.pre-migrate-<unix>.bak` before migration. `--no-backup` disables that backup; use it only when an external backup already exists. `--dry-run` reports the migration plan but is not a strictly read-only filesystem probe. Migrations are forward-only; restore a backup or apply a corrective migration rather than expecting a down migration.
+
+Useful flags:
+
+```text
+preloop store migrate [--store URL] [--adopt-baseline] [--no-backup] [--dry-run]
+preloop store status [--store URL]
+```
+
+The migration ledger is `refinery_schema_history`; it, not `schema_meta`, is the version authority. `schema_meta` retains the key fingerprint used to reject an incompatible state key. `preloop serve` initializes a brand-new local store (absent or empty) and otherwise refuses an uninitialized, legacy, older, newer, incomplete, or divergent schema rather than migrating it, and points to `preloop store migrate`. A Postgres store is the operator's to provision.
+
+### Import a legacy database
+
+Legacy `preloop.db` files are not read automatically. Stop the old engine, then import into a new control database:
+
+```sh
+preloop store import-legacy \
+  --source /old/preloop.db \
+  --target /var/lib/preloop/state/preloop.db \
+  --state-dir /var/lib/preloop/state \
+  --active refuse \
+  --json
+```
+
+The source is opened read-only, hashed before and after, and accepts legacy schema versions 11 and 12. The target is staged and verified before publication. `--active refuse` is the default; use `--active requeue` or `--active cancel` when you have explicitly decided how unfinished work should be handled. `--key FILE` supplies the cluster key when it is not at `PRELOOP_HMAC_KEY` or `<state-dir>/hmac-key.bin`.
+
+## Retention and quotas
+
+| Setting | Default | Effect |
+|---|---:|---|
+| `PRELOOP_RETENTION_DAYS` / `retention_days` | `90` | Deletes terminal runs and their checks, statuses, artifacts, and logs. `0` disables cleanup. |
+| `PRELOOP_RERUN_WINDOW_DAYS` | `30` | Keeps failed, cancelled, or timed-out runs live for in-place reruns. `0` uses the 60-second archival grace. |
+| `PRELOOP_OUTBOX_RETENTION_SECONDS` | `3600` | Removes outbox rows older than the window once all durable consumers have read them. |
+| `PRELOOP_SNAPSHOT_RETENTION_SECONDS` | `1800` | Retains completed workspace snapshots for late retries and reuse. |
+| `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` | `24` | Removes aged diagnostic staging directories. `0` disables the age sweep, but expired reservations are still reaped. |
+| `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` / `[cache].total_quota_bytes` | `10 GiB` | LRU quota for finalized Actions cache entries. |
+| `PRELOOP_CHECKOUT_CACHE_MODE` | `off` | `off`, `run-scoped`, or `repository`. |
+| `PRELOOP_CHECKOUT_CACHE_RUN_RETENTION_SECONDS` | `3600` | Run-scoped object retention. |
+| `PRELOOP_CHECKOUT_CACHE_REPOSITORY_RETENTION_SECONDS` | `604800` | Idle repository-cache retention. |
+| `PRELOOP_CHECKOUT_CACHE_MAX_BYTES` | `100 GiB` | Combined checkout-object ceiling. |
+
+Retention sweeps run once at startup and hourly. Only terminal runs are candidates; queued, pending, and in-progress runs are retained regardless of age. Diagnostic reservations expire after one hour, with a per-job cap of 32 pending upload tokens.
+
+## State layout and backups
+
+The default state home contains:
+
+| Path | Contents |
+|---|---|
+| `state/preloop.db`, `-wal`, `-shm` | SQLite control data and live WAL sidecars. |
+| `credentials/` | File-backed App keys, PATs, webhook secrets, and system token; directory `0700`, files `0600`. |
+| `config.toml` | Nonsecret references and, when configured, sealed secret data; mode `0600`. |
+| `secrets.key` | Legacy config-secrets key, written only while the credential store cannot be reached and migrated into it once it can. A file that disagrees with the store is renamed `secrets.key.orphan-<unix-ts>`, never deleted. |
+| `state/hmac-key.bin` | Cluster/runtime JWT and run-secret sealing key; `PRELOOP_HMAC_KEY` can supply it externally. |
+| `state/blobs/`, `state/cache/`, `state/artifacts/` | Artifacts, caches, diagnostics, and blob data. |
+| `state/run-secrets/`, `state/live-logs/` | Sealed per-run secrets and log segments. |
+| `state/snapshots/`, `state/checkout-cache/` | Immutable workspaces and checkout object caches. |
+| `vms/`, `smolvm/` | Packed goldens and mutable SmolVM machine data. |
+| `externals/` | Host-side Node/action externals; override with `PRELOOP_RUNNER_EXTERNALS`. |
+
+For SQLite, stop the engine or use a consistent database backup; retain the database together with its `-wal` and `-shm` files when making a live file copy. Back up the credential store, config, HMAC key, and any blobs, logs, artifacts, or snapshots whose retention matters. `preloop.sock`, `serve.lock`, and PID files are runtime artifacts, not backup data.
+
+Keep the state directory on one filesystem. Snapshot, blob, and cache publication uses atomic renames; splitting the directory across devices causes `EXDEV` failures. The HMAC key must remain stable across restarts and nodes or stored secrets and state fingerprints cannot be read.
+
+On Postgres, a dedicated wake listener receives `preloop_webhooks` notifications, so every node's webhook worker wakes when another node makes a delivery claimable. Notifications are only a latency gain: workers re-read the queue at least every five seconds, and durable queue state and migrations remain shared through Postgres. SQLite is single-node and wakes only its own worker. Live logs, debug sessions, and file-backed cache and artifact reservations remain node-local, so a shared store alone is not a complete active-active deployment.

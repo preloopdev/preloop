@@ -1,0 +1,64 @@
+digraph expression_engine {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.3, ranksep=0.48, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.13,0.08"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  subgraph cluster_src {
+    label="Expression sources"; fontsize=13; fontcolor="#7c3aed"; style="rounded,dashed"; color="#7c3aed"; margin=12;
+    template [label="Step fields\nrun, name, with, env\n${{ }} templates (runner-time)", fillcolor="#ede9fe"];
+    condition [label="if: conditions\njob gate in server; step gate in runner", fillcolor="#ede9fe"];
+    matrix [label="Matrix and contexts\nfromJSON() during expansion\nenv, inputs, needs, outputs", fillcolor="#ede9fe"];
+    { rank=same; template; condition; matrix; }
+  }
+
+  subgraph cluster_parse {
+    label="Parse to AST"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    lexer [label="lexer.rs\nToken: Ident, String, Number, Bool\na['key'], a[0], a[b.c], * projections", fillcolor="#bae6fd"];
+    parser [label="expr_parser.rs\nrecursive descent\nparse_expr() → Expr", fillcolor="#e0f2fe"];
+    ast [label="ast.rs\nLiteral, Path, Binary, Call\nMemberAccess, Index", fillcolor="#e0f2fe"];
+  }
+
+  subgraph cluster_eval {
+    label="Context and evaluation"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    ctx [label="context.rs\nflat roots + dotted/index paths\nmerge_root(), resolve_value()", fillcolor="#e0f2fe"];
+    cond [label="conditions.rs\neffective_condition()\nis_truthy, status checks", fillcolor="#e0f2fe"];
+    eval [label="evaluator.rs\neval(&Expr, &Context, budget) → Value\ncase-insensitive comparisons", fillcolor="#bae6fd"];
+  }
+
+  subgraph cluster_fns {
+    label="Built-in function dispatch"; fontsize=13; fontcolor="#15803d"; style="rounded,dashed"; color="#22c55e"; margin=12;
+    strings [label="String helpers\nformat, join, contains\nstartsWith, endsWith", fillcolor="#dcfce7"];
+    json [label="JSON helpers\ntoJSON, fromJSON\nobject and array values", fillcolor="#dcfce7"];
+    hash [label="hashFiles\nSHA-256 matching workspace files\nbounded enumeration and bytes", fillcolor="#bbf7d0"];
+    status [label="Control helpers\nalways, success, failure, cancelled\ncase (lazy predicate)", fillcolor="#dcfce7"];
+    { rank=same; strings; json; hash; status; }
+  }
+
+  subgraph cluster_out {
+    label="Resolved values"; fontsize=13; fontcolor="#15803d"; style="rounded,dashed"; color="#22c55e"; margin=12;
+    out_str [label="String\ninterpolated command or field", fillcolor="#dcfce7"];
+    out_bool [label="Boolean\neffective if: result", fillcolor="#dcfce7"];
+    out_json [label="JSON / number\nmatrix, env, inputs, outputs", fillcolor="#bbf7d0"];
+    { rank=same; out_str; out_bool; out_json; }
+  }
+
+  template -> lexer [label="raw ${{ }}"];
+  condition -> lexer;
+  matrix -> lexer;
+  lexer -> parser [label="tokens"];
+  parser -> ast [label="AST"];
+  ast -> ctx [label="paths"];
+  ast -> eval [label="operators / calls"];
+  ctx -> eval [label="scope values"];
+  condition -> cond [label="effective default", constraint=false];
+  cond -> eval [label="status context"];
+  eval -> strings;
+  eval -> json;
+  eval -> hash;
+  eval -> status;
+  strings -> out_str;
+  strings -> out_bool;
+  json -> out_json;
+  hash -> out_str;
+  status -> out_bool;
+}

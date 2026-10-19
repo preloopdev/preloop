@@ -49,10 +49,10 @@ wire captures before merging.
 
 ## Conformance documentation
 
-- [`docs/conformance.md`](docs/conformance.md) — conformance harness, fixture expansion, command comparison, and the provider integration gate.
+- [`docs/contributing/conformance.md`](docs/contributing/conformance.md) — conformance harness, fixture expansion, command comparison, and the provider integration gate.
 - `benchmarks/compatibility/` — the evidence index: server fidelity (official runner against GitHub vs. preloop), runner fidelity, live behavior, MITM captures, and replay gates.
 - `.runner-watch/golden/` — golden wire captures by runner version. New protocol behaviors should ship with a golden.
-- `docs/fidelity-gap.md` — known protocol gaps and roadmap. If you're fixing a gap, link it.
+- `docs/contributing/fidelity-gap.md` — known protocol gaps and roadmap. If you're fixing a gap, link it.
 
 
 
@@ -81,17 +81,20 @@ workflow warning when the tap token is missing.
 `dist-workspace.toml` is the source of truth for what gets built and
 `cargo-dist-version` pins the dist that runs in CI, but `release.yml` is
 hand-maintained (`allow-dirty = ["ci"]`) and carries the publish jobs — change
-both together. The `preloop` name on crates.io is reserved by a documentation-only
-crate under `packaging/crates-io/preloop/`; no workflow publishes it, so it is
-released by hand (`cargo publish` from that directory, which needs a crates.io
-token with `publish-new` and a verified account email).
+both together. The `preloop` name on crates.io is held by a documentation-only
+crate under `packaging/crates-io/preloop/`. Its first version is released by hand
+(a crates.io token scoped to that crate name, with a verified account email);
+after that `publish-crates-io` publishes it on every stable tag through a trusted
+publisher, so no crates.io token is stored here. The job skips with a workflow
+warning until that first publish has happened — `packaging/crates-io/README.md`
+has the steps.
 
 ## Project structure
 
-- `docs/architecture.md` — crate map + module map.
-- `docs/setup.md` — setup, credentials, secrets, config.
-- `docs/debug-sessions.md` — the step debugger (pause, inspect, retry).
-- `docs/github-app-webhook.md` / `docs/github-tokens.md` — GitHub integration surface.
+- `docs/control-plane/architecture/overview.mdx` — crate map + module map.
+- `docs/control-plane/install.mdx` — setup, credentials, secrets, config.
+- `docs/control-plane/guides/debugging.mdx` — the step debugger (pause, inspect, retry).
+- `docs/control-plane/github/app.mdx` / `docs/control-plane/github/tokens.mdx` — GitHub integration surface.
 - `AGENTS.md` — agent/LLM-specific conventions.
 
 ## Quick start

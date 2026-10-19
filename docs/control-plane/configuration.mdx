@@ -1,0 +1,152 @@
+---
+title: Configuration
+description: Where Preloop keeps its configuration, how GitHub credentials and secrets are stored, and what state the engine keeps.
+---
+
+`preloop init`, `preloop setup github`, and `preloop secret` write one configuration file, `~/.preloop/config.toml`. The engine reads the same file when it starts. The commands are the supported way to change credentials and secrets. You can also edit the file, and the reference below lists its keys.
+
+## Where files live
+
+| Path | Contents |
+|---|---|
+| `$PRELOOP_HOME/config.toml` | Settings, references to GitHub credentials, and stored secrets. Mode `0600`. |
+| `$PRELOOP_HOME/credentials/` | GitHub App private key, personal access token, webhook secret, engine token, and the key that protects stored secrets. Each entry is a private `0600` file. |
+| `$PRELOOP_HOME/state/` | The control database by default. See [Durable state](#durable-state). |
+
+`PRELOOP_HOME` defaults to `~/.preloop`. Set it to move the whole state directory.
+
+Set `credential_store = "os"` to use the macOS Keychain, Windows Credential Manager, or Linux Secret Service for engine and GitHub credentials. The file store remains the fallback when the OS store is unavailable.
+
+Every call into the OS credential store is bounded. A keychain or Secret Service that does not answer within 10 seconds (it is waiting on an unlock prompt nobody will see, or its daemon is hung) fails that call with an error saying so, and preloop treats the OS store as unavailable for the rest of the process instead of waiting again. Outbound TLS never asks the OS at handshake time: preloop trusts the bundled Mozilla roots, the certificates in the OS store (read once at startup, for at most 5 seconds), and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`. A CA added to the OS store while the engine runs is picked up on the next restart.
+
+On a headless macOS host, keep the login keychain from re-locking itself, or the next program that reads it raises an unlock dialog on the unattended console and `securityd` blocks every other keychain client behind it:
+
+```sh
+security set-keychain-settings ~/Library/Keychains/login.keychain-db
+```
+
+With no flags this removes the idle timeout and the lock-on-sleep setting.
+
+`PRELOOP_CONFIG` moves only the configuration file. The credential directory then sits next to that file.
+
+## Configuration file
+
+The file is plain TOML. Keys that the CLI writes are marked in the comments:
+
+```toml
+secrets_store = "file"          # "file" (default) or "memory"
+credential_store = "file"       # "file" (default) or "os" for the system keychain
+retention_days = 90             # keep finished runs this many days; 0 keeps them forever
+max_jobs_per_run = 500          # cap on jobs after matrix expansion; 0 disables the cap
+
+[github]                        # written by `preloop setup github`
+app_id = "123456"
+mint_failure = "local"          # "local" (default), "error", or "pat"
+server_url = "https://github.com"
+api_url = "https://api.github.com"
+graphql_url = "https://api.github.com/graphql"
+
+[github.pr]                     # opening pull requests after webhook-driven pushes
+auto = "feature"                # "feature" (default) or "never"
+draft = true                    # new pull requests start as drafts
+exclude = ["release/*"]         # branch patterns that never get a pull request
+
+[golden]                        # written by `preloop init`
+kind = "official"               # "official", "oci", "dockerfile", or "file"
+# base_image = "ghcr.io/acme/base@sha256:…"   # set for a custom image
+
+[secrets]                       # written by `preloop secret set`
+DOCKERHUB_TOKEN = "sealed:v1:…"
+
+[repo_secrets."owner/repo"]
+AWS_CREDS = "sealed:v1:…"
+
+[env_secrets."owner/repo".prod]
+DB_PASSWORD = "sealed:v1:…"
+```
+
+Keys under `[github]` that hold credentials, such as `app_pem_ref` and `webhook_secret_ref`, point at entries in the credential directory. Leave them to `preloop setup github`.
+
+### Other tables
+
+| Table | Controls | Read |
+|---|---|---|
+| `[fork_policy]` | Whether workflows from fork pull requests wait for approval. | [Security](/control-plane/operate/security) |
+| `[execution_protection]` | Event and actor rules that gate workflow runs. | [Security](/control-plane/operate/security) |
+| `[token_permissions_ceiling]` | A cap on the `permissions:` a job token may request. | [Security](/control-plane/operate/security) |
+| `[environment_rules."owner/repo".<env>]` | Protection rules for a deployment environment. | [Security](/control-plane/operate/security) |
+| `[cache]`, `[checkout_cache]` | Actions cache quota and checkout reuse. | [Environment variables](/control-plane/reference/environment) |
+
+## GitHub credentials
+
+Use a GitHub App, which mints a short-lived token for each job. A fine-grained personal access token is the fallback for organizations that block App installs.
+
+```sh
+preloop setup github --via app          # creates the App in your browser
+preloop setup github --via pat --repo owner/repo
+```
+
+The App flow stores the private key and webhook secret in the credential directory, and the file keeps only references. [GitHub App](/control-plane/github/app) covers the setup and webhook options. [GitHub tokens](/control-plane/github/tokens) explains what each job's token can do.
+
+`mint_failure` decides what a job gets when the App cannot mint a token. `local` (the default) leaves the job without an App installation token. `error` rejects the run. `pat` falls back to the stored personal access token, which is broader, so choose it deliberately.
+
+## Secrets
+
+Secrets work like GitHub's three tiers of Actions secrets. Each name is resolved for a job from the most specific tier first:
+
+| Tier | Set with | Used by |
+|---|---|---|
+| Run | `preloop run --secret NAME=VALUE` | That run only. Overrides the stored tiers. |
+| Environment | `preloop secret set NAME --repo owner/repo --env prod` | Jobs that declare that `environment:` in that repository. |
+| Repository | `preloop secret set NAME --repo owner/repo` | That repository's jobs. |
+| Global | `preloop secret set NAME` | Every trusted job. |
+
+Manage them with:
+
+```sh
+preloop secret set DOCKERHUB_TOKEN          # prompts without echoing the value
+preloop secret set DB_PASSWORD --repo owner/repo --env prod --value "$DB_PASSWORD"
+preloop secret list --repo owner/repo       # names only, never values
+preloop secret rm DOCKERHUB_TOKEN
+```
+
+- Names are uppercase letters, digits, and underscores.
+- Environment names use letters, digits, hyphens, and underscores, up to 255 characters, and cannot start with `-` or `_`.
+- If the engine is running, `set` and `rm` apply to the next run immediately. If it is not, the CLI writes the config file, and the engine reads it on its next start.
+- With `secrets_store = "memory"` or `PRELOOP_SECRETS_STORE=memory`, values live only in the running engine, and `set` needs a running engine.
+
+Workflows read secrets the usual way:
+
+```yaml
+steps:
+  - run: echo "$DOCKERHUB_TOKEN" | docker login -u user --password-stdin
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+```
+
+`preloop run` checks the workflow for `secrets.*` names the engine has no value for, and prints the `preloop secret set` commands to fix them. Add `--strict-secrets` to make a missing secret fail the run. A secret with no value reaches the step as an empty string.
+
+Runs from untrusted sources get no stored secrets. This includes pull requests from forks that arrive through the GitHub webhook. Runs you submit with `preloop run` are trusted.
+
+### How stored values are protected
+
+Values in the file are encrypted. The file holds `sealed:v1:` ciphertext, and the data key lives in the credential store. A `0600` `secrets.key` file next to the config is written only while that store cannot hold the key, and it is migrated into the store once it can. `preloop secret list` and `preloop doctor` never print values, and job logs mask them.
+
+If the key cannot be read, for example while the macOS login keychain is locked, startup fails and names what to unlock. Preloop never generates a replacement key over sealed secrets, because a new key cannot open them. A `secrets.key` file that disagrees with the store is renamed `secrets.key.orphan-<unix-ts>`, never deleted.
+
+To keep secrets out of the configuration file entirely, use `secrets_store = "memory"` with a systemd encrypted credential. [Deploy](/control-plane/operate/deploy) describes the credential setup.
+
+## Durable state
+
+The engine keeps run history, queued jobs, runners, sessions, and logs. They survive restarts.
+
+- **SQLite** is the default. The database is `$PRELOOP_HOME/state/preloop.db`, and the engine needs no setup.
+- **Postgres** is optional. Set `PRELOOP_STORE_URL` or pass `--store postgres://…` to `preloop serve`, after running `preloop store migrate`.
+
+A fresh local SQLite store is prepared by the supported first-run paths (`preloop serve`, `preloop init`, `preloop server install`). A serving process never initializes or upgrades a store that already exists; use `preloop store migrate` for existing or mismatched schemas, and provision a Postgres store yourself. [Storage](/control-plane/operate/storage) covers backups, retention, and moving from an older database.
+
+## Limitations
+
+- The native API uses one shared system credential, `PRELOOP_SYSTEM_TOKEN`. The engine has no per-user identities, so anyone holding that token has full access to the native API. Give each operator their own engine.
+- `preloop push` without a run ID publishes the most recent run on the engine, which may belong to someone else.
+- Per-user identities and roles are on the [roadmap](/roadmap).
