@@ -20,6 +20,7 @@ pub mod execution_protection;
 pub mod fork_policy;
 pub mod github;
 pub mod github_app;
+pub mod github_app_setup;
 pub mod github_breaker;
 pub mod github_pr;
 pub mod github_push;

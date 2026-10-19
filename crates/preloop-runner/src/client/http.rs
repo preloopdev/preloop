@@ -48,6 +48,19 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+/// Redact the credential segment of a `/twirp-blob/…` upload URL for logs.
+///
+/// Blob upload URLs carry their capability JWT in the path, so tracing must
+/// never render the token: keep everything through the `/twirp-blob/` marker
+/// and drop the rest. Non-blob URLs are returned byte-identical so general
+/// debuggability is unchanged.
+fn redact_blob_url(url: &str) -> std::borrow::Cow<'_, str> {
+    match url.split_once("/twirp-blob/") {
+        Some((prefix, _)) => std::borrow::Cow::Owned(format!("{prefix}/twirp-blob/<redacted>")),
+        None => std::borrow::Cow::Borrowed(url),
+    }
+}
+
 /// Shared HTTP client wrapping reqwest with CA bundle, proxy, and auth.
 #[derive(Clone)]
 pub struct HttpClient {
@@ -314,7 +327,8 @@ impl HttpClient {
             if attempt > 0 {
                 let delay = Duration::from_secs(1 << attempt); // 2s, 4s
                 tracing::warn!(
-                    "Retrying POST {url} (attempt {}, backoff {delay:?})",
+                    "Retrying POST {} (attempt {}, backoff {delay:?})",
+                    redact_blob_url(url),
                     attempt + 1
                 );
                 tokio::time::sleep(delay).await;
@@ -509,7 +523,8 @@ impl HttpClient {
             if attempt > 0 {
                 let delay = Duration::from_secs(1 << attempt);
                 tracing::warn!(
-                    "Retrying PUT {url} (attempt {}, backoff {delay:?})",
+                    "Retrying PUT {} (attempt {}, backoff {delay:?})",
+                    redact_blob_url(url),
                     attempt + 1
                 );
                 tokio::time::sleep(delay).await;
@@ -557,7 +572,8 @@ impl HttpClient {
             if attempt > 0 {
                 let delay = Duration::from_secs(1 << attempt);
                 tracing::warn!(
-                    "Retrying PUT {url} (attempt {}, backoff {delay:?})",
+                    "Retrying PUT {} (attempt {}, backoff {delay:?})",
+                    redact_blob_url(url),
                     attempt + 1
                 );
                 tokio::time::sleep(delay).await;
@@ -819,6 +835,38 @@ mod tests {
                 assert_eq!(body, "signed url expired");
             }
         }
+    }
+
+    #[test]
+    fn blob_urls_are_redacted_in_log_lines() {
+        // The token is the credential: only the marker survives.
+        assert_eq!(
+            redact_blob_url(
+                "https://runner:8443/twirp-blob/artifact/eyJhbGciOiJIUzI1NiJ9.payload.sig"
+            ),
+            "https://runner:8443/twirp-blob/<redacted>"
+        );
+        // Query parameters ride along with the credential and are dropped too.
+        assert_eq!(
+            redact_blob_url(
+                "https://runner:8443/twirp-blob/diag/abc.def.ghi?sv=2021-08-06&sig=dummy"
+            ),
+            "https://runner:8443/twirp-blob/<redacted>"
+        );
+        // Non-blob URLs stay byte-identical for debuggability.
+        assert_eq!(
+            redact_blob_url(
+                "https://results.example.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL"
+            ),
+            "https://results.example.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL"
+        );
+        assert_eq!(
+            redact_blob_url(
+                "http://127.0.0.1:9090/twirp/github.actions.results.api.v1.BlobService/RefreshUploadURL"
+            ),
+            "http://127.0.0.1:9090/twirp/github.actions.results.api.v1.BlobService/RefreshUploadURL"
+        );
+        assert_eq!(redact_blob_url("not-a-url"), "not-a-url");
     }
 
     #[cfg(unix)]

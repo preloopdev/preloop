@@ -364,7 +364,7 @@ if [ "$RUNNER_ONLY" = 1 ]; then
     preloop-runner configure --url https://github.com/OWNER/REPO --token <TOKEN>
     preloop-runner run
 
-[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/setup.md#just-the-runner
+[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/runner/install.mdx
 EOF
         exit 0
     fi
@@ -380,7 +380,7 @@ elif install_from_release; then
     cd your-repo && preloop run -f .github/workflows/ci.yml
     preloop run --push --create-pr     # CI first, then a draft PR
 
-[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/setup.md
+[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/control-plane/install.mdx
 EOF
     exit 0
 fi
@@ -424,7 +424,7 @@ if [ "$RUNNER_ONLY" = 1 ]; then
     preloop-runner configure --url https://github.com/OWNER/REPO --token <TOKEN>
     preloop-runner run
 
-[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/setup.md#just-the-runner
+[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/runner/install.mdx
 EOF
     exit 0
 fi
@@ -456,7 +456,7 @@ if [ "$ZIGBUILD" = 1 ] && command -v cargo-zigbuild >/dev/null 2>&1; then
     say "cross-compiling the Linux microVM runner (aarch64)..."
     cargo zigbuild --release -p preloop-runner --target aarch64-unknown-linux-gnu 2>/dev/null || \
         cargo zigbuild --release -p aksh-runner --target aarch64-unknown-linux-gnu 2>/dev/null || \
-        say "runner build failed — host CLI works, but microVM jobs need it (see docs/setup.md)"
+        say "runner build failed — host CLI works, but microVM jobs need it (see docs/control-plane/install.mdx)"
 else
     say "skipping microVM runner cross-build (no zig/cargo-zigbuild)"
 fi
@@ -475,5 +475,5 @@ cat <<EOF
     preloop init                       # step by step: credentials, VM image, run mode
     cd your-repo && preloop run -f .github/workflows/ci.yml
 
-[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/setup.md
+[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/control-plane/install.mdx
 EOF
