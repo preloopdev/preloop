@@ -462,8 +462,7 @@ mod tests {
         );
         write_manifest(&runtime_dir, &manifest).unwrap();
         let fake_node = runtime_dir.join("bin/node");
-        std::fs::write(&fake_node, "#!/bin/sh\necho v24.3.0\n").unwrap();
-        std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_node_stand_in(&fake_node, "echo v24.3.0\n");
         assert!(is_valid_externals_dir(&runtime_dir, "node24", "24.3.0"));
     }
 
