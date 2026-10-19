@@ -264,11 +264,15 @@ Changes from today:
 - **Retain the GUID-presence contract, per delivery.** Every verified delivery
   gets a `delivery_guid`-keyed **receipt** row (`event_deliveries`, §4.4) even
   when it is filtered (e.g. a `check_run` created echo) *and* even when it
-  collapses into an event that another source already queued. The event then
-  carries the terminal `ignored`/`done`/`failed` state with a reason. The
-  watchdog's "no local row ⇒ missing" join (`webhook_watchdog.rs:453-476`)
-  depends on this; a filtered-but-absent delivery would otherwise be
-  redelivered forever.
+  collapses into an event that another source already queued. A delivery that
+  collapses onto an existing fact attaches its receipt to that event; a
+  delivery that adds no queue row at all creates its own event in the terminal
+  `ignored` state, keyed by its delivery GUID, with the filter named in
+  `reason` — that is what keeps `event_deliveries.event_id` a real row. The
+  event therefore always carries the terminal `ignored`/`done`/`failed` state
+  with a reason. The watchdog's "no local row ⇒ missing" join
+  (`webhook_watchdog.rs:453-476`) reads the receipt; a filtered-but-absent
+  delivery would otherwise be redelivered forever.
 
 ### 4.4 The `events` table
 
@@ -375,7 +379,9 @@ event_deliveries (
 ```
 
 Every verified delivery inserts its own receipt — including the ones that add
-no queue row. Two deliveries for the same fact have two distinct GUIDs and
+no queue row, which get an `ignored` event keyed by their delivery GUID so
+`event_id` always names a real row (§4.3). Two deliveries for the same fact
+have two distinct GUIDs and
 both receipts exist, so the watchdog never sees a "missing" GUID it would
 redeliver until the attempt cap turns into a permanent false finding. Presence
 means "a receipt exists"; the **event's** state decides what happens next
@@ -478,12 +484,14 @@ GUID-scoped where it does not. Consequences worth stating:
   with the first `A` event, so the third push runs nothing; the transition key
   makes it a new fact while the reconciler's twin of the *same* transition
   still collapses by the unique index. A repeated *identical* transition is the
-  one case git cannot distinguish from a redelivery: the webhook occurrence
-  does run (its `push_id` differs from the one recorded on the existing event,
-  so ingest writes it as its own occurrence with `dedupe_key + "\0" +
-  push_id`), and a reconciler twin for that transition collapses. If that
-  webhook was lost, only the watchdog's exact replay repairs it — the
-  reconciler's transition comparison cannot see it.
+  one case git cannot distinguish from a redelivery; matching at ingest is
+  three-way on `(app_id, kind, transition)` — an existing event with
+  `push_id IS NULL` (synthesized, so any webhook for that transition belongs to
+  it) or with the same `push_id` (a redelivery) absorbs the delivery as a
+  receipt and nothing else, while a different non-null `push_id` is a new
+  occurrence written as `dedupe_key + "\0" + push_id`. If that webhook was
+  lost, only the watchdog's exact replay repairs it — the reconciler's
+  transition comparison cannot see it.
 - **A `failed` event is revived only by a genuine re-delivery** (same GUID), by
   a reconciler synthesis after the grace period, or by the local repair of
   §4.9 item 2 when the event is not a dead letter — a plain duplicate is a
@@ -493,6 +501,7 @@ GUID-scoped where it does not. Consequences worth stating:
 
 ```sql
 processed_heads (
+  app_id      text not null,       -- the App whose run processed the fact (§4.3)
   repository  text not null,
   git_ref     text not null,
   sha         text not null,
@@ -502,10 +511,13 @@ processed_heads (
   merge_sha   text,                -- locally computed merge commit that was tested (§4.7)
   run_ids     uuid[] not null default '{}',
   processed_at timestamptz not null default now(),
-  primary key (repository, git_ref, sha, kind, base_sha)
+  primary key (app_id, repository, git_ref, sha, kind, base_sha)
 )
 ```
 
+Ledger identity is app-scoped like the event keys, for the same reason: a head
+that one App's run already covered must not read as processed for another App,
+so both the write and every reconciler lookup carry the App being scanned.
 Ledger rows are written in the same transaction as the run(s) they caused.
 Retention is independent of run archival (a run may be archived at 90 days;
 the ledger keeps 180) so a post-archival reconcile does not re-fire old heads.
@@ -568,6 +580,14 @@ holds them (`events.mirror_owner`, set from the fetched-ref index
 fetches). Object availability is in the control store for exactly that reason:
 any replica can answer "can I serve this?" without touching the network, and
 the leader's fetch is usable by every event it repairs.
+
+`mirror_owner` is advisory and never outlives the fact that justifies it: it is
+cleared when the event is reclaimed after lease expiry, `mirror_refs` rows
+carry `updated_at` and count only while their holder is live (the same replica
+liveness the `source_leases` lease tracks), and a claim that finds no *live*
+holder takes the event in normal order and refetches when the remote is up. A
+dead owner therefore costs at most one deferral — never an event pinned to a
+replica that is gone, and never a stale `mirror_refs` row routing work to it.
 
 **PR merge (fixes F2).** The engine already implements the mechanism:
 
