@@ -4067,9 +4067,18 @@ async fn plan_goldens<P: VmProvider>(
             // No record: not adoptable, and the stale-machine sweep owns it.
             continue;
         };
+        // A golden that has served a fork is left as SmolVM's frozen branch
+        // base, and `machine status` reports that state as unknown. It is
+        // still a working fork source — the record proves the bake finished,
+        // and a fork that finds the base spent re-arms it — so a restart must
+        // not mistake it for garbage. Live (s2, 78dcb693d): an engine stopped
+        // while staging was aborted mid-teardown, leaving the serving v1
+        // frozen; the restart's plan accepted only running/stopped machines,
+        // ignored the recorded v1 (record and marker intact), cold-started the
+        // configured v2 instead, and no stand-in ever served.
         if !matches!(
             provider.status(&name).await,
-            Ok(MachineState::Running) | Ok(MachineState::Stopped)
+            Ok(MachineState::Running) | Ok(MachineState::Stopped) | Ok(MachineState::Unknown)
         ) {
             continue;
         }
@@ -9164,6 +9173,7 @@ mod lifecycle_tests {
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
+    use tokio::io::AsyncReadExt as _;
     use tokio::sync::Mutex;
 
     /// The production scenario that OOMed: 22 GiB host, 8 GiB runners.
@@ -9318,6 +9328,18 @@ mod lifecycle_tests {
         fn failing_create(mut self) -> Self {
             self.fail_create = true;
             self
+        }
+
+        /// Put a registered machine into an arbitrary state.
+        ///
+        /// Models a state the provider's status read cannot classify, such as
+        /// the frozen branch base an aborted engine shutdown leaves behind
+        /// ("machine status" then names neither running nor stopped).
+        pub(super) async fn set_state(&self, name: &MachineName, state: MachineState) {
+            self.machines
+                .lock()
+                .await
+                .insert(name.as_str().to_owned(), state);
         }
 
         /// `create` waits on `barrier` with the test, then draws `bytes` from
@@ -14730,15 +14752,25 @@ fi"#,
         let superseded = CancellationToken::new();
         superseded.cancel();
         let idle = Arc::new(std::sync::Mutex::new(0));
-        let task = tokio::spawn(run_one_runner(
-            provider.clone(),
-            &config,
-            runner,
-            CancellationToken::new(),
-            idle,
-            superseded,
-            None,
-        ));
+        // The runner task outlives this scope: carry the config by value so
+        // the spawn can own it.
+        let config = Arc::new(config);
+        let task = tokio::spawn({
+            let config = config.clone();
+            let provider = provider.clone();
+            async move {
+                run_one_runner(
+                    provider,
+                    &config,
+                    runner,
+                    CancellationToken::new(),
+                    idle,
+                    superseded,
+                    None,
+                )
+                .await
+            }
+        });
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
             .await
             .expect("a superseded claim is stopped without waiting for its job")
@@ -16304,6 +16336,67 @@ mod golden_cache_tests {
             plan.spared(),
             vec![previous_name],
             "the serving golden is exempt from the stale-machine sweep"
+        );
+    }
+
+    /// A restart after a shutdown that aborted mid-teardown must keep serving
+    /// the generation that was already prepared.
+    ///
+    /// Live (s2, 78dcb693d): the engine stopped while v2 staged; the CLI's
+    /// 30 s shutdown grace aborted the pool before its teardown ran, leaving
+    /// the serving v1 in SmolVM's frozen branch-base state — `machine status`
+    /// names neither running nor stopped. The restart saw v1's record and
+    /// marker but skipped it as if it were garbage, cold-started the
+    /// configured v2, and no stand-in served through the staging window, so
+    /// the rotation never happened.
+    #[tokio::test]
+    async fn a_restart_after_a_staging_shutdown_serves_the_frozen_previous_golden() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.base_image = "ghcr.io/acme/runner:ubuntu24".to_owned();
+        config.artifact_stem = scratch.path().join("artifact");
+        std::fs::create_dir_all(scratch.path().join("goldens")).unwrap();
+
+        let previous_spec = EnvironmentSpec::for_base(config.base_image.clone());
+        let desired = EnvironmentSpec::for_base_with_source(
+            config.base_image.clone(),
+            format!(
+                "oci:ghcr.io/acme/runner:ubuntu24@sha256:{}",
+                "ab".repeat(32)
+            ),
+        );
+        let previous = MachineName::new(fingerprint_golden_name(
+            &config.name_prefix,
+            &previous_spec.fingerprint,
+        ))
+        .unwrap();
+        provider
+            .create(&test_machine_spec(&config, &previous))
+            .await
+            .unwrap();
+        write_golden_record(&config, &previous, &previous_spec.fingerprint);
+        write_configured_golden_marker(&config, &previous_spec.fingerprint);
+        // The aborted shutdown left the fork base frozen: the provider's
+        // status read has neither "running" nor "stopped" to match.
+        provider.set_state(&previous, MachineState::Unknown).await;
+
+        let plan = plan_goldens(&provider, &config, &desired).await;
+
+        assert_eq!(
+            plan.serving,
+            Some((previous.clone(), previous_spec.fingerprint.clone())),
+            "the frozen generation still serves while the configured one stages"
+        );
+        assert!(!plan.up_to_date, "the configured golden is still owed");
+        assert!(
+            plan.surplus.is_empty(),
+            "no generation is reclaimed on this restart"
+        );
+        assert_eq!(
+            plan.spared(),
+            vec![previous],
+            "the frozen serving golden is exempt from the stale-machine sweep"
         );
     }
 
