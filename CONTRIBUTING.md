@@ -81,10 +81,13 @@ workflow warning when the tap token is missing.
 `dist-workspace.toml` is the source of truth for what gets built and
 `cargo-dist-version` pins the dist that runs in CI, but `release.yml` is
 hand-maintained (`allow-dirty = ["ci"]`) and carries the publish jobs — change
-both together. The `preloop` name on crates.io is reserved by a documentation-only
-crate under `packaging/crates-io/preloop/`; no workflow publishes it, so it is
-released by hand (`cargo publish` from that directory, which needs a crates.io
-token with `publish-new` and a verified account email).
+both together. The `preloop` name on crates.io is held by a documentation-only
+crate under `packaging/crates-io/preloop/`. Its first version is released by hand
+(a crates.io token scoped to that crate name, with a verified account email);
+after that `publish-crates-io` publishes it on every stable tag through a trusted
+publisher, so no crates.io token is stored here. The job skips with a workflow
+warning until that first publish has happened — `packaging/crates-io/README.md`
+has the steps.
 
 ## Project structure
 

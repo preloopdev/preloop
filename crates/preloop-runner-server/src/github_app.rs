@@ -55,6 +55,20 @@ const MAX_INSTALLATION_PAGES: u32 = 10;
 /// Page size for installation discovery; 100 is GitHub's maximum.
 const INSTALLATIONS_PER_PAGE: usize = 100;
 
+/// How long a confirmed "no installation on this owner" answer is reused
+/// before discovery runs again.
+///
+/// Discovery is one paginated `GET /app/installations` sweep per App and a job
+/// token can ask for it on every request, so a miss is remembered for a short
+/// window instead of being recomputed each time. Short on purpose: an
+/// installation added later must be noticed, which is why the miss is never
+/// permanent and the traversal that hit it is not memoised.
+const INSTALLATION_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bound on remembered installation misses, so requests naming many owners
+/// cannot grow the map without limit. Clearing it only costs a fresh lookup.
+const MAX_CACHED_INSTALLATION_MISSES: usize = 1024;
+
 /// Workflow permission scopes with no GitHub App counterpart. `id-token`
 /// controls Actions OIDC issuance and `models` controls GitHub Models access;
 /// both are runtime-only, and forwarding either makes the installation-token
@@ -243,6 +257,15 @@ pub struct GitHubAppCredentials {
     /// mid-job or outlive a revoked installation. Discovery is the expensive
     /// call, so caching it leaves one API request per job in steady state.
     installation_cache: Arc<RwLock<HashMap<String, u64>>>,
+    /// Owners this App was found not to be installed on, with when the lookup
+    /// ran.
+    ///
+    /// Discovery costs one paginated `GET /app/installations` sweep per App, and
+    /// a job token can ask for it on every request, so a confirmed miss is
+    /// reused for [`INSTALLATION_MISS_TTL`]. That is short on purpose: an
+    /// installation added later must still be noticed, which is why a miss is
+    /// never treated as permanent.
+    installation_misses: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     /// Every installation token this App has minted, keyed by token hash.
     /// The GitHub-compatible dispatch API consults it to validate a token
     /// offline — without a github.com round-trip — when github.com is
@@ -438,6 +461,7 @@ impl GitHubAppCredentials {
             mint_failure,
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
+            installation_misses: Arc::new(RwLock::new(HashMap::new())),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
@@ -545,6 +569,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
                 mint_failure,
                 pat_fallback: pat_fallback.clone(),
                 installation_cache: Arc::new(RwLock::new(HashMap::new())),
+                installation_misses: Arc::new(RwLock::new(HashMap::new())),
                 mint_ledger: Arc::new(MintLedger::default()),
                 // The primary slot's webhook secret belongs to this App — it
                 // is the default App's secret — so a payload it signs is bound
@@ -633,6 +658,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
             mint_failure,
             pat_fallback: pat_fallback.clone(),
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
+            installation_misses: Arc::new(RwLock::new(HashMap::new())),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret,
             installation_id: app.installation_id,
@@ -1305,7 +1331,38 @@ async fn installation_id_for(
             return Ok(*installation_id);
         }
     }
-    let installation_id = find_installation(api_base, creds, app_jwt, owner).await?;
+    {
+        // A confirmed miss is reused for a short window: discovery is a
+        // paginated sweep, and an authenticated job can ask again on every
+        // request. Past the window the lookup runs again, so an installation
+        // added later is still picked up.
+        let misses = creds.installation_misses.read().await;
+        if let Some(seen) = misses.get(&key)
+            && seen.elapsed() < INSTALLATION_MISS_TTL
+        {
+            anyhow::bail!(
+                "this GitHub App has no installation on {owner}; install it on that account (checked {}s ago)",
+                seen.elapsed().as_secs()
+            );
+        }
+    }
+    let installation_id = match find_installation(api_base, creds, app_jwt, owner).await {
+        Ok(installation_id) => installation_id,
+        Err(error) => {
+            if error.to_string().contains(NO_INSTALLATION_MARKER) {
+                let mut misses = creds.installation_misses.write().await;
+                if misses.len() >= MAX_CACHED_INSTALLATION_MISSES {
+                    misses.clear();
+                }
+                misses.insert(key, std::time::Instant::now());
+            }
+            return Err(error);
+        }
+    };
+    {
+        let mut misses = creds.installation_misses.write().await;
+        misses.remove(&key);
+    }
     creds
         .installation_cache
         .write()
@@ -2057,6 +2114,7 @@ fn credentials_for(app_id: &str, pem: &str) -> anyhow::Result<GitHubAppCredentia
         mint_failure: MintFailurePolicy::LocalJwt,
         pat_fallback: None,
         installation_cache: Arc::new(RwLock::new(HashMap::new())),
+        installation_misses: Arc::new(RwLock::new(HashMap::new())),
         mint_ledger: Arc::new(MintLedger::default()),
         webhook_secret: None,
         installation_id: None,
@@ -2497,6 +2555,7 @@ mod tests {
             mint_failure: MintFailurePolicy::LocalJwt,
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
+            installation_misses: Arc::new(RwLock::new(HashMap::new())),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
@@ -2583,6 +2642,104 @@ mod tests {
             .expect("JSON claims");
             assert_eq!(claims["iss"], "424", "must authenticate as the App itself");
         }
+    }
+
+    /// A confirmed "no installation on this owner" answer is reused for a
+    /// short window, because a job token can ask for discovery on every
+    /// request and discovery is a paginated `GET /app/installations` sweep.
+    /// Past the window the lookup runs again, so an installation added later
+    /// is still noticed, and the remembered answer keeps classifying as a
+    /// definitive miss rather than a transient failure.
+    #[tokio::test]
+    async fn a_confirmed_installation_miss_is_cached_for_a_short_window() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let discoveries = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&discoveries);
+        let stub = Router::new().route(
+            "/app/installations",
+            get(move || {
+                let counted = Arc::clone(&counted);
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Json(Vec::<serde_json::Value>::new())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+
+        let creds = GitHubAppCredentials {
+            app_id: "424".to_owned(),
+            private_key: test_key(),
+            mint_failure: MintFailurePolicy::LocalJwt,
+            pat_fallback: None,
+            installation_cache: Arc::new(RwLock::new(HashMap::new())),
+            installation_misses: Arc::new(RwLock::new(HashMap::new())),
+            mint_ledger: Arc::new(MintLedger::default()),
+            webhook_secret: None,
+            installation_id: None,
+            verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            github_breakers: None,
+            github_consumption: None,
+        };
+
+        let first = installation_id_for(&api_base, &creds, "app-jwt", "ForkOwner")
+            .await
+            .expect_err("the stub has no installation");
+        assert_eq!(
+            discoveries.load(Ordering::SeqCst),
+            1,
+            "the first lookup discovers"
+        );
+
+        let second = installation_id_for(&api_base, &creds, "app-jwt", "ForkOwner")
+            .await
+            .expect_err("the cached miss is still a miss");
+        assert_eq!(
+            discoveries.load(Ordering::SeqCst),
+            1,
+            "a confirmed miss must not repeat discovery inside the window"
+        );
+        assert!(
+            matches!(
+                classify_installation_error(second),
+                AppLookupError::NotInstalled
+            ),
+            "a remembered miss still classifies as a definitive answer"
+        );
+        assert!(
+            first.to_string().contains(NO_INSTALLATION_MARKER),
+            "the miss keeps the marker callers classify on: {first}"
+        );
+
+        // Another owner is not answered by this owner's miss.
+        let _ = installation_id_for(&api_base, &creds, "app-jwt", "OtherOwner").await;
+        assert_eq!(
+            discoveries.load(Ordering::SeqCst),
+            2,
+            "the miss is keyed by owner"
+        );
+
+        // Once the window has passed, discovery runs again.
+        {
+            let mut misses = creds.installation_misses.write().await;
+            let stale = std::time::Instant::now()
+                .checked_sub(INSTALLATION_MISS_TTL)
+                .expect("the platform clock is older than the miss window");
+            misses.insert("forkowner".to_owned(), stale);
+        }
+        let _ = installation_id_for(&api_base, &creds, "app-jwt", "ForkOwner").await;
+        assert_eq!(
+            discoveries.load(Ordering::SeqCst),
+            3,
+            "an expired miss must be rediscovered, so a later installation is noticed"
+        );
     }
 
     fn granted() -> BTreeMap<String, String> {
