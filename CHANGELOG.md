@@ -168,6 +168,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A `tailscale` query that does not answer is abandoned, not waited out.**
+  The wizard's 5 s bound covered only the wait for the `tailscale` child to
+  exit; the answer was then read to the end of its stdout, so a child that had
+  forked — a shim or wrapper script on `PATH`, or a shell — left that pipe open
+  in a grandchild that outlived the kill, and the query ran for as long as
+  whatever the child left behind. The read now shares the deadline, and is
+  capped and abandoned with it, so a descendant that keeps writing can neither
+  hold the wizard nor grow the answer without bound.
+
 - **Local runs resolve a local composite's nested remote action again** (#649
   regression from #620): the runner resolves such an action with its job's
   runtime token and names the job by `system.orchestrationId`
