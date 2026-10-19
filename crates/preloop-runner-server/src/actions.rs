@@ -15,9 +15,12 @@ fn require_action_plan(
     match identity {
         crate::auth::ResultsIdentity::System => Ok(()),
         crate::auth::ResultsIdentity::Job(job) if job.plan_id == plan_id => Ok(()),
-        crate::auth::ResultsIdentity::Job(_) => Err(ApiError::forbidden(
-            "results-service token is not bound to that plan",
-        )),
+        crate::auth::ResultsIdentity::Job(_) => {
+            warn!(%plan_id, "action download refused: the job token is not bound to this plan");
+            Err(ApiError::forbidden(
+                "results-service token is not bound to that plan",
+            ))
+        }
     }
 }
 
@@ -57,8 +60,24 @@ pub async fn runnerresolve_actions(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    crate::auth::require_results_job(&identity, &orchestration_id, &job_id)?;
-    crate::auth::require_live_results_job(&shared.state, &identity).await?;
+    if let Err(error) = crate::auth::require_results_job(&identity, &orchestration_id, &job_id) {
+        warn!(
+            %orchestration_id,
+            %job_id,
+            reason = error.message(),
+            "runnerresolve/actions refused: the job token does not name this plan and job"
+        );
+        return Err(error);
+    }
+    if let Err(error) = crate::auth::require_live_results_job(&shared.state, &identity).await {
+        warn!(
+            %orchestration_id,
+            %job_id,
+            reason = error.message(),
+            "runnerresolve/actions refused: the job is no longer live"
+        );
+        return Err(error);
+    }
     let mut actions = serde_json::Map::new();
     collect_runnerresolve_refs(
         &shared,
@@ -698,7 +717,16 @@ pub async fn collect_runnerresolve_refs(
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
     let resolved: Vec<Option<ResolvedActionParts>> = stream.collect().await;
-    crate::auth::require_live_results_job(state, identity).await?;
+    if let Err(error) = crate::auth::require_live_results_job(state, identity).await {
+        warn!(
+            run_id = %run_id.0,
+            %orchestration_id,
+            %job_id,
+            reason = error.message(),
+            "runnerresolve/actions refused after resolution: the job settled"
+        );
+        return Err(error);
+    }
     for parts in resolved.into_iter().flatten() {
         if let Some((key, value)) = runnerresolve_action_from_parts(state, parts) {
             actions.entry(key).or_insert(value);
@@ -749,7 +777,15 @@ pub async fn collect_action_download_infos(
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
     let resolved: Vec<Option<ResolvedActionParts>> = stream.collect().await;
-    crate::auth::require_live_results_job(state, identity).await?;
+    if let Err(error) = crate::auth::require_live_results_job(state, identity).await {
+        warn!(
+            run_id = %run_id.0,
+            %plan_id,
+            reason = error.message(),
+            "action download refused after resolution: the job settled"
+        );
+        return Err(error);
+    }
     let mut actions = BTreeMap::new();
     for parts in resolved.into_iter().flatten() {
         if let Some((key, value)) = action_download_info_from_parts(state, parts) {
@@ -946,6 +982,7 @@ async fn declared_actions_for_plan(
     {
         Ok(request) => request.run_id,
         Err(crate::control::ControlError::NotFound(_)) => {
+            warn!(%plan_id, "action download refused: no run has this plan");
             return Err(ApiError::forbidden(format!(
                 "action downloads are not permitted for unknown plan `{plan_id}`"
             )));
@@ -984,6 +1021,11 @@ async fn declared_actions_for_runnerresolve(
         {
             Ok(request) => request.run_id,
             Err(crate::control::ControlError::NotFound(_)) => {
+                warn!(
+                    %orchestration_id,
+                    %job_id,
+                    "runnerresolve/actions refused: no request or plan matches this job"
+                );
                 return Err(ApiError::forbidden(format!(
                     "action downloads are not permitted for unknown job `{job_id}`"
                 )));
@@ -1053,7 +1095,8 @@ async fn local_composite_declared_for_run(
         .await
         .map_err(ApiError::from)?;
     // A GitHub-sourced run reads its manifests from its own repository at its
-    // head commit. A local submission without a snapshot has no such commit.
+    // head commit. A local submission without a snapshot has no such commit, so
+    // nothing can be read: that answer is incomplete and is never remembered.
     let source = match run.workspace_snapshot.as_ref() {
         Some(snapshot) => Some(LocalManifests::Snapshot(snapshot)),
         None if run.submission.local_workspace.is_none() => Some(LocalManifests::Forge {
@@ -1072,10 +1115,16 @@ async fn local_composite_declared_for_run(
             )
             .await
         }
-        None => LocalDeclared {
-            actions: BTreeSet::new(),
-            complete: true,
-        },
+        None => {
+            warn!(
+                %run_id,
+                "run has a local workspace but no snapshot on its record; its local composite manifests cannot be read, so their nested actions stay denied"
+            );
+            LocalDeclared {
+                actions: BTreeSet::new(),
+                complete: false,
+            }
+        }
     };
     let actions = Arc::new(found.actions);
     if found.complete
@@ -1428,20 +1477,36 @@ impl<'a> LocalTree<'a> {
     }
 }
 
-/// What `path` names in a snapshot's commit, read with git. A snapshot is local
-/// and immutable, so a failed read is simply absent.
+/// What `path` names in a snapshot's commit, read with git. A missing entry is
+/// absent. A git failure is not: the entry may well exist, so the traversal is
+/// left incomplete (and is not remembered) rather than reading "nothing".
 async fn snapshot_probe(repository: &std::path::Path, commit: &str, path: &str) -> Probe {
-    let Some(kind) = snapshot_entry_kind(repository, commit, path).await else {
-        return Probe::Missing;
+    let kind = match snapshot_entry_kind(repository, commit, path).await {
+        Ok(Some(kind)) => kind,
+        Ok(None) => return Probe::Missing,
+        Err(error) => {
+            warn!(path, %error, "could not read the run's snapshot tree; its local composite manifests stay denied for this request");
+            return Probe::Transient;
+        }
     };
     let file = std::path::Path::new(path);
     let node = match kind {
         SnapshotKind::Directory => TreeNode::Directory,
         SnapshotKind::Symlink => match read_snapshot_file(repository, commit, file).await {
-            Some(target) => TreeNode::Symlink(target),
-            None => return Probe::Missing,
+            Ok(Some(target)) => TreeNode::Symlink(target),
+            Ok(None) => return Probe::Missing,
+            Err(error) => {
+                warn!(path, %error, "could not read a symlink in the run's snapshot; its local composite manifests stay denied for this request");
+                return Probe::Transient;
+            }
         },
-        SnapshotKind::File => TreeNode::File(read_snapshot_file(repository, commit, file).await),
+        SnapshotKind::File => match read_snapshot_file(repository, commit, file).await {
+            Ok(bytes) => TreeNode::File(bytes),
+            Err(error) => {
+                warn!(path, %error, "could not read a file in the run's snapshot; its local composite manifests stay denied for this request");
+                return Probe::Transient;
+            }
+        },
         SnapshotKind::Other => TreeNode::Other,
     };
     Probe::Node(node)
@@ -1456,12 +1521,12 @@ enum SnapshotKind {
 }
 
 /// The kind of the entry `path` names in `commit`'s tree, read without following
-/// links. `None` when there is no such entry.
+/// links. `Ok(None)` when there is no such entry; `Err` when git could not answer.
 async fn snapshot_entry_kind(
     repository: &std::path::Path,
     commit: &str,
     path: &str,
-) -> Option<SnapshotKind> {
+) -> anyhow::Result<Option<SnapshotKind>> {
     // Literal pathspecs: the path names one entry, so a glob or magic prefix in
     // it must not match other entries.
     let output = tokio::process::Command::new("git")
@@ -1469,15 +1534,20 @@ async fn snapshot_entry_kind(
         .arg("--git-dir")
         .arg(repository)
         .args(["ls-tree", "-z", "--full-tree", commit, "--", path])
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .await
-        .ok()?;
+        .map_err(|error| {
+            anyhow::anyhow!("starting git ls-tree in {}: {error}", repository.display())
+        })?;
     if !output.status.success() {
-        return None;
+        anyhow::bail!(
+            "git ls-tree {path} at {commit} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     // Records are `<mode> SP <type> SP <object> TAB <path> NUL`.
-    output.stdout.split(|byte| *byte == 0).find_map(|record| {
+    Ok(output.stdout.split(|byte| *byte == 0).find_map(|record| {
         let tab = record.iter().position(|byte| *byte == b'\t')?;
         if &record[tab + 1..] != path.as_bytes() {
             return None;
@@ -1492,7 +1562,7 @@ async fn snapshot_entry_kind(
             mode if mode.starts_with("100") => SnapshotKind::File,
             _ => SnapshotKind::Other,
         })
-    })
+    }))
 }
 
 /// Add remote actions nested in the local composite manifests that a run's
@@ -1507,15 +1577,21 @@ async fn local_composite_declared_actions(
     reusable_workflows: &BTreeMap<String, String>,
 ) -> LocalDeclared {
     let Some(mut tree) = LocalTree::open(shared, source) else {
+        warn!(
+            "the run's source is not a readable snapshot or repository; its local composite manifests cannot be read, so their nested actions stay denied"
+        );
         return LocalDeclared {
             actions: BTreeSet::new(),
-            complete: true,
+            complete: false,
         };
     };
     let Ok(workflow) = preloop_gha_parser::parse_workflow(workflow_yaml) else {
+        warn!(
+            "the run's stored workflow does not parse; its local composite manifests cannot be followed, so their nested actions stay denied"
+        );
         return LocalDeclared {
             actions: BTreeSet::new(),
-            complete: true,
+            complete: false,
         };
     };
 
@@ -1532,18 +1608,25 @@ async fn local_composite_declared_actions(
     let mut declared = BTreeSet::new();
     let mut visited_actions = BTreeSet::new();
     let mut references_left = MAX_LOCAL_TRAVERSAL_REFERENCES;
+    // A traversal that stopped on a limit has not read every manifest the
+    // workflow could reach, so what it found is not the run's whole answer.
+    let mut truncated = false;
     while let Some((action_path, depth)) = pending.pop_front() {
-        if depth > MAX_LOCAL_ACTION_DEPTH
-            || visited_actions.len() >= MAX_LOCAL_ACTION_MANIFESTS
-            || !visited_actions.insert(action_path.clone())
-        {
+        if depth > MAX_LOCAL_ACTION_DEPTH || visited_actions.len() >= MAX_LOCAL_ACTION_MANIFESTS {
+            truncated = true;
+            continue;
+        }
+        if !visited_actions.insert(action_path.clone()) {
             continue;
         }
         let (remote, nested_local) = match tree.manifest(&action_path).await {
             ManifestRead::Found(nested) => nested,
             ManifestRead::Absent | ManifestRead::Transient => continue,
             // Out of lookups: nothing further is read, so the rest stays denied.
-            ManifestRead::Exhausted => break,
+            ManifestRead::Exhausted => {
+                truncated = true;
+                break;
+            }
         };
         let cost = remote.len() + nested_local.len();
         if cost > references_left {
@@ -1551,6 +1634,7 @@ async fn local_composite_declared_actions(
                 run_references = cost,
                 "local composite traversal reached its reference budget; the rest of the tree stays denied"
             );
+            truncated = true;
             break;
         }
         references_left -= cost;
@@ -1569,7 +1653,7 @@ async fn local_composite_declared_actions(
     }
     LocalDeclared {
         actions: declared,
-        complete: tree.complete,
+        complete: tree.complete && !truncated,
     }
 }
 
@@ -1581,8 +1665,9 @@ struct ForgeManifests<'a> {
     repo: String,
     commit: String,
     /// The `contents: read` credential, looked up on first use and kept for the
-    /// rest of the traversal.
-    credential: Option<ContentsCredential>,
+    /// rest of the traversal. `None` records a failed lookup, so it is not retried
+    /// within the traversal.
+    credential: Option<Option<(String, crate::github_breaker::GithubCredentialBucket)>>,
 }
 
 impl ForgeManifests<'_> {
@@ -1590,12 +1675,11 @@ impl ForgeManifests<'_> {
     /// the file it names, and reports a link to a directory as a `symlink`
     /// object carrying its target.
     async fn probe(&mut self, path: &str) -> Probe {
-        let (token, bucket) = match self.credential().await {
-            ContentsCredential::Token(token, bucket) => (token, bucket),
-            // No App covers the repository, so nothing in it can be read. That
-            // is a definitive answer: the path is absent.
-            ContentsCredential::NotInstalled => return Probe::Missing,
-            ContentsCredential::Transient => return Probe::Transient,
+        let Some((token, bucket)) = self.credential().await else {
+            // No App covers the repository, or the lookup failed: the path cannot
+            // be read. That is not a definitive absence, so the traversal stays
+            // incomplete and is not remembered.
+            return Probe::Transient;
         };
         let api_base = self.shared.state.github_urls.api_url.trim_end_matches('/');
         let segments: Vec<String> = path.split('/').map(percent_encode_path_segment).collect();
@@ -1645,14 +1729,14 @@ impl ForgeManifests<'_> {
 
     /// The run repository's contents-read credential, looked up on first use and
     /// kept for the rest of the traversal.
-    async fn credential(&mut self) -> ContentsCredential {
+    async fn credential(
+        &mut self,
+    ) -> Option<(String, crate::github_breaker::GithubCredentialBucket)> {
         if self.credential.is_none() {
             let repository = format!("{}/{}", self.owner, self.repo);
             self.credential = Some(contents_read_credential(self.shared, &repository).await);
         }
-        self.credential
-            .clone()
-            .unwrap_or(ContentsCredential::Transient)
+        self.credential.clone().flatten()
     }
 }
 
@@ -1677,23 +1761,16 @@ fn forge_node(body: &serde_json::Value) -> TreeNode {
     }
 }
 
-/// What a `contents: read` credential lookup found for a repository.
-#[derive(Clone)]
-enum ContentsCredential {
-    /// An installation token scoped to the repository, and its rate-limit bucket.
-    Token(String, crate::github_breaker::GithubCredentialBucket),
-    /// No registered App is installed on the repository. That is a definitive
-    /// answer, so the empty traversal it leads to may be remembered for the run.
-    NotInstalled,
-    /// The lookup or the mint failed, so coverage is unknown. Not remembered.
-    Transient,
-}
-
 /// The credential that reads `repository`'s contents: a `contents: read`
 /// installation token scoped to that repository, minted from the GitHub App
 /// installed on its owner, with the installation as its rate-limit bucket.
-/// Unlike action downloads there is no static-PAT fallback.
-async fn contents_read_credential(shared: &SharedState, repository: &str) -> ContentsCredential {
+/// `None` when no App covers the repository or the lookup or mint fails; the
+/// caller then reads nothing and the traversal stays incomplete. Unlike action
+/// downloads there is no static-PAT fallback.
+async fn contents_read_credential(
+    shared: &SharedState,
+    repository: &str,
+) -> Option<(String, crate::github_breaker::GithubCredentialBucket)> {
     let app = match crate::github_app::candidate_apps_for_repo_inner(shared, repository).await {
         Ok(mut candidates) if !candidates.is_empty() => candidates.swap_remove(0),
         Ok(_) | Err(crate::github_app::AppLookupError::NotInstalled) => {
@@ -1701,7 +1778,7 @@ async fn contents_read_credential(shared: &SharedState, repository: &str) -> Con
                 repository,
                 "no GitHub App installation covers this repository; its local composite manifests cannot be read, so their nested actions stay denied"
             );
-            return ContentsCredential::NotInstalled;
+            return None;
         }
         Err(crate::github_app::AppLookupError::Transient(error)) => {
             warn!(
@@ -1709,7 +1786,7 @@ async fn contents_read_credential(shared: &SharedState, repository: &str) -> Con
                 %error,
                 "could not tell whether a GitHub App covers this repository; its local composite manifests cannot be read, so their nested actions stay denied"
             );
-            return ContentsCredential::Transient;
+            return None;
         }
     };
     let api_base = shared.state.github_urls.api_url.trim_end_matches('/');
@@ -1729,21 +1806,21 @@ async fn contents_read_credential(shared: &SharedState, repository: &str) -> Con
                 %error,
                 "could not mint a contents-read installation token; its local composite manifests cannot be read, so their nested actions stay denied"
             );
-            return ContentsCredential::Transient;
+            return None;
         }
     };
     // The installation is the rate-limit identity, so never invent one.
     match crate::github_app::installation_for_repo(&app, repository).await {
-        Ok(installation) if installation != 0 => ContentsCredential::Token(
+        Ok(installation) if installation != 0 => Some((
             token,
             crate::github_breaker::GithubCredentialBucket::Installation(installation),
-        ),
+        )),
         _ => {
             warn!(
                 repository,
                 "could not resolve the installation for this repository; its local composite manifests cannot be read, so their nested actions stay denied"
             );
-            ContentsCredential::Transient
+            None
         }
     }
 }
@@ -1870,11 +1947,14 @@ fn valid_snapshot_commit(commit: &str) -> bool {
     (40..=64).contains(&commit.len()) && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// The bytes of `path` in `commit`, read with git. `Ok(None)` when the blob is
+/// over the manifest size cap, which the traversal does not load. `Err` when git
+/// could not produce it.
 async fn read_snapshot_file(
     repository: &std::path::Path,
     commit: &str,
     path: &std::path::Path,
-) -> Option<Vec<u8>> {
+) -> anyhow::Result<Option<Vec<u8>>> {
     let object = format!("{}:{}", commit, path.to_string_lossy());
     let mut child = tokio::process::Command::new("git")
         .arg("--git-dir")
@@ -1886,23 +1966,34 @@ async fn read_snapshot_file(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
+        .map_err(|error| anyhow::anyhow!("starting git show {object}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git show {object}: no stdout pipe"))?;
     let mut bytes = Vec::with_capacity(ACTION_MANIFEST_MAX_BYTES + 1);
     let read_result = stdout
         .take((ACTION_MANIFEST_MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .await;
-    if read_result.is_err() || bytes.len() > ACTION_MANIFEST_MAX_BYTES {
+    if let Err(error) = read_result {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        return None;
+        anyhow::bail!("reading git show {object}: {error}");
     }
-    let status = child.wait().await.ok()?;
+    if bytes.len() > ACTION_MANIFEST_MAX_BYTES {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Ok(None);
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| anyhow::anyhow!("waiting for git show {object}: {error}"))?;
     if !status.success() {
-        return None;
+        anyhow::bail!("git show {object} exited with {status}");
     }
-    Some(bytes)
+    Ok(Some(bytes))
 }
 
 /// Nested `uses:` scopes from a composite action's manifest, memoized per
@@ -3431,6 +3522,187 @@ jobs:
         let (top, reusable) = reusable_chain("      - uses: ./.github/actions/deep\n");
         let declared = snapshot_declared(&state, &snapshot, &top, &reusable).await;
         assert!(declared.contains("deep/action"), "{declared:?}");
+    }
+
+    /// A snapshot made by the production `create_workspace_snapshot` (the one a
+    /// `preloop run` submission stores on its run record) must admit the remote
+    /// actions its local composites call. The fixtures above use a plain bare
+    /// clone; this runs the real layout (alternates, synthetic commit, staged
+    /// then published) with the template's shape: two jobs that call one local
+    /// composite naming four remote actions, one of them undeclared.
+    #[tokio::test]
+    async fn real_workspace_snapshot_admits_nested_remote_actions() {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|error| panic!("git {args:?}: {error}"));
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let workflow = r#"
+name: Build & Publish
+on: push
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/common-setup
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/common-setup
+"#;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let composite = workspace.join(".github/actions/common-setup/action.yml");
+        std::fs::create_dir_all(composite.parent().unwrap()).unwrap();
+        std::fs::write(
+            &composite,
+            composite_manifest(&[
+                "jdx/mise-action@v4",
+                "1password/load-secrets-action@v4",
+                "iloveitaly/github-action-direnv-load-and-mask@master",
+                "actions/cache@v6",
+            ]),
+        )
+        .unwrap();
+        let workflow_file = workspace.join(".github/workflows/build_and_publish.yml");
+        std::fs::create_dir_all(workflow_file.parent().unwrap()).unwrap();
+        std::fs::write(&workflow_file, workflow).unwrap();
+        git(&workspace, &["init", "-q"]);
+        git(&workspace, &["config", "user.name", "test"]);
+        git(
+            &workspace,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(&workspace, &["add", "."]);
+        git(&workspace, &["commit", "-qm", "workspace"]);
+
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let snapshot = crate::snapshots::create_workspace_snapshot(
+            &state.state_dir,
+            &workspace,
+            RunId(uuid::Uuid::new_v4()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("workspace snapshot: {}", error.message()));
+        let declared = local_composite_declared_actions(
+            &state.shared(),
+            LocalManifests::Snapshot(&snapshot),
+            workflow,
+            &BTreeMap::new(),
+        )
+        .await;
+        for expected in [
+            "jdx/mise-action",
+            "1password/load-secrets-action",
+            "iloveitaly/github-action-direnv-load-and-mask",
+            "actions/cache",
+        ] {
+            assert!(
+                declared.actions.contains(expected),
+                "real snapshot {} must admit {expected}: {:?} complete={}",
+                snapshot.repository,
+                declared.actions,
+                declared.complete,
+            );
+        }
+        assert!(
+            declared.complete,
+            "a readable snapshot is a definitive answer"
+        );
+    }
+
+    /// A traversal that could not read its source is incomplete, so its empty
+    /// answer is never remembered for the run: a snapshot whose commit is not a
+    /// commit id, a snapshot repository that is not on disk, and a workflow that
+    /// does not parse. Each used to come back as a definitive, memoised "nothing".
+    #[tokio::test]
+    async fn local_composite_missing_source_is_incomplete() {
+        let setup = composite_manifest(&["dtolnay/rust-toolchain@stable"]);
+        let (_temp, state, snapshot) =
+            local_snapshot_fixture(&[(".github/actions/setup/action.yml", setup.as_str())]).await;
+        let shared = state.shared();
+        let invalid_commit = crate::snapshots::WorkspaceSnapshot {
+            commit_sha: "not-a-commit".to_owned(),
+            ..snapshot.clone()
+        };
+        let missing_repository = crate::snapshots::WorkspaceSnapshot {
+            repository: "snapshots/no-such-run".to_owned(),
+            ..snapshot.clone()
+        };
+        for (label, source, workflow) in [
+            (
+                "invalid commit",
+                LocalManifests::Snapshot(&invalid_commit),
+                SETUP_WORKFLOW,
+            ),
+            (
+                "missing repository",
+                LocalManifests::Snapshot(&missing_repository),
+                SETUP_WORKFLOW,
+            ),
+            (
+                "unparseable workflow",
+                LocalManifests::Snapshot(&snapshot),
+                "jobs: [}",
+            ),
+        ] {
+            let declared =
+                local_composite_declared_actions(&shared, source, workflow, &BTreeMap::new()).await;
+            assert!(
+                declared.actions.is_empty(),
+                "{label}: {:?}",
+                declared.actions
+            );
+            assert!(
+                !declared.complete,
+                "{label}: an unreadable source must not be remembered as a definitive answer"
+            );
+        }
+    }
+
+    /// A traversal that stops on one of its budgets has not read every
+    /// manifest the workflow reaches, so what it found is a partial answer and
+    /// is never remembered for the run.
+    #[tokio::test]
+    async fn local_composite_limit_hit_is_incomplete() {
+        // One composite names more distinct remote actions than the whole
+        // traversal may spend references on, so the traversal stops at it.
+        let actions: Vec<String> = (0..=MAX_LOCAL_TRAVERSAL_REFERENCES)
+            .map(|index| format!("owner{index}/repo@v1"))
+            .collect();
+        let uses: Vec<&str> = actions.iter().map(String::as_str).collect();
+        let setup = composite_manifest(&uses);
+        let (_temp, state, snapshot) =
+            local_snapshot_fixture(&[(".github/actions/setup/action.yml", setup.as_str())]).await;
+        let declared = local_composite_declared_actions(
+            &state.shared(),
+            LocalManifests::Snapshot(&snapshot),
+            SETUP_WORKFLOW,
+            &BTreeMap::new(),
+        )
+        .await;
+        assert!(
+            !declared.complete,
+            "a traversal that stopped on its reference budget is not a definitive answer"
+        );
+        assert!(
+            declared.actions.is_empty(),
+            "the manifest past the budget is not read: {} actions",
+            declared.actions.len()
+        );
     }
 
     /// Ticket TTL is ~20 minutes, not 6 hours: a leaked bearerless ticket URL
