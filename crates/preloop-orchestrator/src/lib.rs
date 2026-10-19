@@ -3543,22 +3543,23 @@ impl GoldenCache {
         &self,
         fingerprint: String,
         name: MachineName,
-        previous: Option<&str>,
+        _previous: Option<&str>,
     ) -> Vec<(String, MachineName)> {
         let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
         let mut replaced = Vec::new();
+        // Every other golden this pool holds is a predecessor of the one now
+        // serving: the stand-in that answered for the staged fingerprint (live:
+        // it can be registered under an identity the restart resolved a moment
+        // earlier, so matching fingerprints is not enough), the generation
+        // served before the switch, or a golden for an environment this pool
+        // used to fork. The switch's contract is that a superseded golden takes
+        // no new work — its forks are released and its machine, record and
+        // payload are deleted once the last clone exits. A job that needs
+        // another environment stages that golden again.
         for (other_fingerprint, entry) in entries.iter_mut() {
             if entry.name == name {
                 entry.retiring = false;
                 entry.substitutes = None;
-                continue;
-            }
-            // Replaced: the entry that stood in for `fingerprint` while it was
-            // staged, and the generation this pool served before the switch.
-            let stood_in = entry.substitutes.as_deref() == Some(fingerprint.as_str());
-            let served_before = previous == Some(other_fingerprint.as_str())
-                && other_fingerprint.as_str() != fingerprint.as_str();
-            if !stood_in && !served_before {
                 continue;
             }
             entry.retiring = true;
@@ -7782,12 +7783,20 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // runner is busy, not idle; a runner that exits without taking one leaves
     // the guard to this function's teardown.
     let claim_claimed = claimed.clone();
+    // A claim that observes its golden already superseded is not preserved:
+    // the job goes back to the queue instead of running on the old golden.
+    let late_claim = Arc::new(tokio::sync::Notify::new());
+    let claim_superseded = superseded.clone();
+    let claim_late = late_claim.clone();
     let claim = async {
         if busy_rx.await.is_err() {
             return;
         }
         claim_claimed.store(true, Ordering::Release);
         idle.release();
+        if claim_superseded.is_cancelled() {
+            claim_late.notify_one();
+        }
     };
 
     let result = tokio::select! {
@@ -7842,6 +7851,26 @@ async fn run_one_runner<P: VmProvider + 'static>(
             run_task.abort();
             let _ = run_task.await;
             info!(machine = name.as_str(), "retiring an idle runner forked from a superseded golden");
+            // Release the server-side identity, and with it any job the
+            // control plane had already bound to this runner, before the VM
+            // stops: the binding must re-enter the pool at the switch, not
+            // after the claim-binding TTL, so a replacement forked from the
+            // new golden can take the job immediately.
+            notify_runner_gone(config, name).await;
+            provider.stop(name).await.map_err(OrchestratorError::from)
+        },
+        _ = late_claim.notified() => {
+            run_task.abort();
+            let _ = run_task.await;
+            info!(
+                machine = name.as_str(),
+                "stopping a runner that claimed a job after its golden was superseded; the purge returns the job to the queue"
+            );
+            // A job accepted by a runner of the retired generation must not
+            // run there: the purge requeues the claimed-but-unfinished job,
+            // and the pool forks a replacement from the new golden. A runner
+            // that claimed before the switch is left to finish its job.
+            notify_runner_gone(config, name).await;
             provider.stop(name).await.map_err(OrchestratorError::from)
         },
         _ = wait_for_environment_change(config, &environment.base, claimed.clone()) => {
@@ -14631,6 +14660,108 @@ fi"#,
             vec!["create:lifecycle-test-0-1"],
             "one slot serves one job from exactly one VM"
         );
+    }
+
+    /// A job claimed by a runner of a superseded golden must not run there.
+    ///
+    /// The switch retires the old generation, and a claim that lands in the
+    /// same instant (or just after) is returned to the queue: the runner is
+    /// stopped and its server identity purged — the purge requeues the
+    /// claimed-but-unfinished job — so the pool forks its replacement from the
+    /// new golden instead of finishing the job on the old one.
+    #[tokio::test]
+    async fn a_claim_after_the_switch_returns_the_job_to_the_queue() {
+        // Stand in for the server: record the purge request, answer 200.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let purges = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = purges.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if let Some(line) = request.lines().next() {
+                        sink.lock().unwrap().push(line.to_owned());
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                              content-length: 2\r\n\r\n{}",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let run_gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .announcing_busy()
+                .with_run_gate(run_gate.clone()),
+        );
+        let mut config = test_config(false);
+        config.server_url = format!("http://{addr}");
+        // SAFETY: test-only env for the purge bearer; the fake server ignores it.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let runner = provision_slot(
+            &provider,
+            &config,
+            0,
+            1,
+            None,
+            &Arc::new(KeyPool::new()),
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                boot_from_pack: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("provisioning succeeds")
+        .expect("a runner is provisioned");
+
+        // Supersede the golden before the runner starts: the job it claims
+        // arrives after the switch, the window the retirement alone does not
+        // cover (the claim is announced by the guest, not by the engine).
+        let superseded = CancellationToken::new();
+        superseded.cancel();
+        let idle = Arc::new(std::sync::Mutex::new(0));
+        let task = tokio::spawn(run_one_runner(
+            provider.clone(),
+            &config,
+            runner,
+            CancellationToken::new(),
+            idle,
+            superseded,
+            None,
+        ));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("a superseded claim is stopped without waiting for its job")
+            .expect("the runner task joins");
+
+        assert!(
+            result.is_ok(),
+            "a superseded claim is requeued, not reported as a guest failure: {result:?}"
+        );
+        let purged = purges.lock().unwrap().clone();
+        assert!(
+            purged
+                .iter()
+                .any(|line| line.contains("/api/v1/runners/purge")),
+            "the retiring runner's purge requeues the claimed job: {purged:?}"
+        );
+        let events = provider.events().await;
+        assert!(
+            events.iter().any(|event| event.starts_with("stop:")),
+            "the superseded runner is stopped: {events:?}"
+        );
+        run_gate.notify_waiters();
+        server.abort();
     }
 
     /// Wait until `predicate` holds for the pool status snapshot.
