@@ -16,10 +16,14 @@
 //!   unpadded, percent-encoding, hex), matching is ASCII case-insensitive,
 //!   and every base64 segment is decoded at all four group alignments, so a
 //!   shifted encoding (`printf 'x%s' "$SECRET" | base64`) is redacted too —
-//!   including one wrapped across a 76-column line break. Percent- and
-//!   hex-encodings of a *shifted* payload stay outside that decode pass. All
-//!   runner log paths and the server-side log persistence pass must use
-//!   these.
+//!   including one wrapped across a 76-column line break, one whose run mixes
+//!   the two alphabet families, and one preceded by a label (`token=…`).
+//!   Segments are decoded on the original input, so a variant match inside a
+//!   token cannot split it into undecodable fragments, and trailing `=`
+//!   padding is masked with the token so the encoded length is not left on
+//!   display. Percent- and hex-encodings of a *shifted* payload stay outside
+//!   that decode pass. All runner log paths and the server-side log
+//!   persistence pass must use these.
 //!
 //! [`StreamingMasker`] provides the same transform-aware strength for
 //! chunked writers: secrets split across write-chunk boundaries are matched
@@ -160,12 +164,36 @@ where
     }
     sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
 
+    // A shifted base64 encoding of a secret is decided on the original input,
+    // before any variant replacement: masking a variant that sits inside the
+    // token would insert a non-base64 [`MASK_MARKER`] into it, the fragments
+    // would no longer decode, and the rest of the encoded secret would stay in
+    // the output. The whole span is replaced instead, one marker per physical
+    // line so line checkpoints stay valid.
+    let alignment_spans = if transform_aware {
+        base64_alignment_spans(input, &raw_secrets)
+    } else {
+        Vec::new()
+    };
+
     // Scan the original input once. A marker run that overlaps a short
     // marker-valued secret is canonicalized to one replacement marker, rather
     // than being mistaken for unmasked input or expanded on every pass.
     let mut result = String::with_capacity(input.len());
     let mut offset = 0;
+    let mut span_index = 0;
     while offset < input.len() {
+        while span_index < alignment_spans.len() && alignment_spans[span_index].1 <= offset {
+            span_index += 1;
+        }
+        if span_index < alignment_spans.len() && alignment_spans[span_index].0 <= offset {
+            // One marker per physical line, like the variant pass, so line
+            // checkpoints stay valid.
+            let end = alignment_spans[span_index].1;
+            push_line_preserving_marker(&mut result, &input[offset..end]);
+            offset = end;
+            continue;
+        }
         let remaining = &input[offset..];
         let case_insensitive = transform_aware;
         let matching_secret = match_secret_at(remaining, &sorted, case_insensitive);
@@ -206,30 +234,34 @@ where
             offset += character.len_utf8();
         }
     }
-    if transform_aware {
-        mask_base64_alignment_runs(&mut result, &raw_secrets);
-    }
     result
 }
 
-/// Mask base64 runs that decode to a registered secret at *any* alignment.
+/// Byte ranges of `input` that decode to a registered secret at *any*
+/// alignment — the base64 pass of [`mask_secrets_inner`].
 ///
 /// [`secret_variants`] precomputes encodings that start at byte 0 of the
 /// secret, so a one- or two-byte prefix shifts the base64 group alignment and
 /// slips past them: `printf 'x%s' "$SECRET" | base64` leaks the value. This
 /// pass decodes every base64-looking segment at the four possible group
-/// alignments and masks the whole segment when the decoded bytes contain a
+/// alignments and reports the whole segment when the decoded bytes contain a
 /// secret, which covers every prefix length (`len % 4` is all that changes the
 /// byte grouping) and, because the whole segment is replaced, also hides the
 /// prefix-dependent leading characters.
 ///
 /// A label immediately before the token (`b64-shift1=eHBl…`) merges into the
 /// same run, because `=` is a base64 byte itself; segments are split on `=`
-/// so the token decodes on its own and only the token is replaced. Base64
-/// wrapped at a fixed column is reassembled across the line break before
-/// decoding, so a secret whose encoding straddles the wrap is still found;
-/// the replacement keeps one marker per physical line so line checkpoints
-/// stay valid.
+/// so the token decodes on its own and only the token is replaced. A run that
+/// mixes the two alphabet families is split at the characters the family it
+/// is decoded under cannot contain, so `+eH5-fn4=` is still decoded as the
+/// URL-safe token `eH5-fn4` instead of being rejected wholesale. `=` padding
+/// that only trails a segment is masked with it, so a partial mask does not
+/// leave the encoded length on display.
+///
+/// Base64 wrapped at a fixed column is reassembled across the line break
+/// before decoding, so a secret whose encoding straddles the wrap is still
+/// found; the replacement keeps one marker per physical line so line
+/// checkpoints stay valid.
 ///
 /// Secrets shorter than [`MIN_ELIGIBLE_SECRET_LEN`] are skipped here: they
 /// already match most text by design, and scanning decodes makes false
@@ -237,31 +269,21 @@ where
 ///
 /// Work is linear in the length of the input: every segment is decoded at
 /// most four times (once per group alignment) with a single alphabet family
-/// chosen from the segment's own bytes. No prefix cap is applied on purpose —
-/// truncating the decode would let a shifted encoding hide behind megabytes
-/// of base64 filler, which is exactly the leak this pass exists to close.
+/// chosen from the segment's own bytes, and each segment is tested as it is
+/// produced, so only tainted spans are retained. No prefix cap is applied on
+/// purpose — truncating the decode would let a shifted encoding hide behind
+/// megabytes of base64 filler, which is exactly the leak this pass exists to
+/// close.
 ///
 /// Only base64 is covered here. Percent-encoded (`%78%70…`) and hex (`7870…`)
 /// forms of a *shifted* payload are not, because the raw secret bytes do not
 /// appear when those encodings are base64-decoded; the precomputed variants
 /// cover percent/hex of the unshifted value.
-fn mask_base64_alignment_runs(output: &mut String, raw_secrets: &[String]) {
+fn base64_alignment_spans(input: &str, raw_secrets: &[String]) -> Vec<(usize, usize)> {
     let Some(scanner) = AlignmentScanner::new(raw_secrets) else {
-        return;
+        return Vec::new();
     };
-    let ranges = tainted_segment_ranges(output, &scanner, true);
-    if ranges.is_empty() {
-        return;
-    }
-    let mut masked = String::with_capacity(output.len());
-    let mut consumed = 0;
-    for (start, end) in ranges {
-        masked.push_str(&output[consumed..start]);
-        push_line_preserving_marker(&mut masked, &output[start..end]);
-        consumed = end;
-    }
-    masked.push_str(&output[consumed..]);
-    *output = masked;
+    tainted_segment_ranges(input, &scanner, true)
 }
 
 /// Append one [`MASK_MARKER`] per physical line of `span`, keeping the
@@ -348,6 +370,10 @@ fn is_base64_byte(byte: u8) -> bool {
 /// [`AlignmentScanner::segment_tainted`], so they cannot drift apart.
 struct AlignmentScanner {
     /// Eligible raw secret bytes, longest first.
+    ///
+    /// ASCII-lowercased: matching inside a decode is case-insensitive like
+    /// the rest of the transform-aware API, so registering `AbCd` also covers
+    /// a shifted encoding of `xabcd`.
     needles: Vec<Vec<u8>>,
     /// Shortest segment that can carry an eligible secret.
     min_len: usize,
@@ -361,7 +387,7 @@ impl AlignmentScanner {
         let mut needles: Vec<Vec<u8>> = raw_secrets
             .iter()
             .filter(|secret| secret.len() >= MIN_ELIGIBLE_SECRET_LEN)
-            .map(|secret| secret.as_bytes().to_vec())
+            .map(|secret| secret.as_bytes().to_ascii_lowercase())
             .collect();
         needles.sort_by_key(|needle| std::cmp::Reverse(needle.len()));
         needles.dedup();
@@ -425,18 +451,25 @@ impl AlignmentScanner {
     }
 }
 
-/// Whether `haystack` contains `needle`. Decoded payloads can be large, so
-/// positions whose first byte cannot start a match are skipped instead of
-/// comparing the full needle at every offset.
+/// Whether `haystack` contains `needle`, ignoring ASCII case.
+///
+/// Decoded payloads can be large, so positions whose first byte cannot start a
+/// match are skipped instead of comparing the full needle at every offset.
+/// `needle` is ASCII-lowercased by [`AlignmentScanner::new`].
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return false;
     }
     let first = needle[0];
     let mut start = 0;
-    while let Some(offset) = haystack[start..].iter().position(|byte| *byte == first) {
+    while let Some(offset) = haystack[start..]
+        .iter()
+        .position(|byte| byte.eq_ignore_ascii_case(&first))
+    {
         let index = start + offset;
-        if haystack[index..].starts_with(needle) {
+        if haystack[index..].len() >= needle.len()
+            && haystack[index..index + needle.len()].eq_ignore_ascii_case(needle)
+        {
             return true;
         }
         start = index + 1;
@@ -444,16 +477,23 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-/// A base64 segment that can carry an alignment-shifted secret.
-struct CandidateSegment<'a> {
-    /// Byte range in the scanned text to replace when the segment is tainted
-    /// (`=` padding excluded).
-    start: usize,
-    /// Exclusive end of the range.
-    end: usize,
-    /// Decode input: the text range itself, or the same bytes with the line
-    /// breaks removed when a wrapped token was reassembled.
-    decode: std::borrow::Cow<'a, str>,
+/// Which base64 alphabet family a segment is decoded under. The two families
+/// share the alphanumeric characters and differ only in their last two.
+#[derive(Clone, Copy)]
+enum AlphabetFamily {
+    Standard,
+    UrlSafe,
+}
+
+impl AlphabetFamily {
+    /// Whether `byte` can carry payload in this family. `=` padding is a
+    /// boundary for both families and is handled by the caller.
+    fn contains(self, byte: u8) -> bool {
+        match self {
+            Self::Standard => byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'),
+            Self::UrlSafe => byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'),
+        }
+    }
 }
 
 /// Length of the newline sequence at `position`: 0, 1 (`\n`) or 2 (`\r\n`).
@@ -496,12 +536,28 @@ fn wrapped_line_continues(bytes: &[u8], start: usize, end: usize) -> Option<usiz
     Some(newline)
 }
 
-/// Collect the base64 segments of `text` that can carry an alignment-shifted
-/// secret. `=` padding splits segments so an embedded separator
-/// (`label=token`) does not fail the decode. With `join_wraps`, a segment
-/// continuing on the next line as a wrapped base64 line is reassembled
-/// first, so the decode sees the token's bytes in order.
-fn collect_candidates(text: &str, join_wraps: bool) -> Vec<CandidateSegment<'_>> {
+/// Visit every base64 segment of `text` that can carry an alignment-shifted
+/// secret, as `(start, end, decode)`.
+///
+/// `start..end` is the byte range to replace when the segment is tainted
+/// (including `=` padding that only trails it) and `decode` is the bytes to
+/// decode: the segment without padding, or the segment with the line breaks of
+/// a reassembled wrap removed.
+///
+/// `=` splits segments, so an embedded separator (`label=token`) does not fail
+/// the decode. A run that mixes the two alphabet families is scanned once per
+/// family, split at the characters that family cannot carry, so `+eH5-fn4=`
+/// is decoded as the URL-safe token `eH5-fn4` instead of being rejected
+/// wholesale. With `join_wraps`, a segment continuing on the next line as a
+/// wrapped base64 line is reassembled first, so the decode sees the token's
+/// bytes in order; a wrap continues the run's payload segment — after the last
+/// `=` separator, without trailing padding — so a label is not mistaken for
+/// part of the wrapped line.
+///
+/// Segments are offered as they are produced and the caller decides on each
+/// one immediately: a body of millions of short segments never accumulates
+/// candidates, only the spans the caller keeps.
+fn for_each_candidate(text: &str, join_wraps: bool, visit: &mut impl FnMut(usize, usize, &str)) {
     let bytes = text.as_bytes();
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut index = 0;
@@ -517,85 +573,144 @@ fn collect_candidates(text: &str, join_wraps: bool) -> Vec<CandidateSegment<'_>>
         runs.push((run_start, index));
     }
 
-    let mut candidates = Vec::new();
     for &(run_start, run_end) in &runs {
-        let mut segment_start = run_start;
-        for (offset, &byte) in bytes[run_start..run_end].iter().enumerate() {
-            if byte == b'=' {
-                let position = run_start + offset;
-                push_candidate(&mut candidates, text, segment_start, position);
-                segment_start = position + 1;
+        let run = &bytes[run_start..run_end];
+        let mixed = run.iter().any(|byte| matches!(byte, b'+' | b'/'))
+            && run.iter().any(|byte| matches!(byte, b'-' | b'_'));
+        if mixed {
+            for family in [AlphabetFamily::Standard, AlphabetFamily::UrlSafe] {
+                visit_run_segments(text, bytes, run_start, run_end, Some(family), visit);
             }
+        } else {
+            visit_run_segments(text, bytes, run_start, run_end, None, visit);
         }
-        push_candidate(&mut candidates, text, segment_start, run_end);
     }
 
     if join_wraps {
-        for (position, &(run_start, run_end)) in runs.iter().enumerate() {
-            if wrapped_line_continues(bytes, run_start, run_end).is_none() {
+        // The segment a wrap continues: the run's last `=`-separated segment
+        // with trailing padding removed. A label before the token (`token=…`)
+        // is not part of the wrapped line, and padding ends it.
+        let wrap_segments: Vec<(usize, usize)> = runs
+            .iter()
+            .map(|&(run_start, run_end)| {
+                let end = bytes[run_start..run_end]
+                    .iter()
+                    .rposition(|byte| *byte != b'=')
+                    .map(|offset| run_start + offset + 1)
+                    .unwrap_or(run_start);
+                let start = bytes[run_start..end]
+                    .iter()
+                    .rposition(|byte| *byte == b'=')
+                    .map(|offset| run_start + offset + 1)
+                    .unwrap_or(run_start);
+                (start, end)
+            })
+            .collect();
+        for (position, &(segment_start, segment_end)) in wrap_segments.iter().enumerate() {
+            if segment_start == segment_end
+                || wrapped_line_continues(bytes, segment_start, segment_end).is_none()
+            {
                 continue;
             }
             // Only start at the head of a wrap chain, so a continuation line
             // does not produce a second, nested candidate for the same wrap.
-            let head = position == 0
-                || wrapped_line_continues(bytes, runs[position - 1].0, runs[position - 1].1)
-                    .is_none();
+            let head = position == 0 || {
+                let (previous_start, previous_end) = wrap_segments[position - 1];
+                previous_start == previous_end
+                    || wrapped_line_continues(bytes, previous_start, previous_end).is_none()
+            };
             if !head {
                 continue;
             }
-            let mut decode = String::from(&text[run_start..run_end]);
-            let mut chain_end = run_end;
+            let mut decode = String::from(&text[segment_start..segment_end]);
+            let mut chain_end = segment_end;
+            let mut chain_run = position;
             let mut cursor = position + 1;
-            while let Some(&(next_start, next_end)) = runs.get(cursor) {
+            while let Some(&(next_start, next_end)) = wrap_segments.get(cursor) {
                 // The continuation must begin on the line right after the wrap.
                 let newline = newline_len_at(bytes, chain_end);
-                if newline == 0 || next_start != chain_end + newline {
+                if newline == 0 || next_start != chain_end + newline || next_start == next_end {
                     break;
                 }
-                // Only the leading segment (before any `=`) continues the token.
-                let leading_end = (next_start..next_end)
-                    .find(|position| bytes[*position] == b'=')
-                    .unwrap_or(next_end);
-                if leading_end == next_start {
-                    break;
-                }
-                decode.push_str(&text[next_start..leading_end]);
-                chain_end = leading_end;
+                decode.push_str(&text[next_start..next_end]);
+                chain_end = next_end;
+                chain_run = cursor;
                 if wrapped_line_continues(bytes, next_start, next_end).is_none() {
                     break;
                 }
                 cursor += 1;
             }
-            if chain_end != run_end {
-                candidates.push(CandidateSegment {
-                    start: run_start,
-                    end: chain_end,
-                    decode: std::borrow::Cow::Owned(decode),
-                });
+            if chain_end != segment_end {
+                visit(
+                    segment_start,
+                    trailing_padding_end(bytes, chain_end, runs[chain_run].1),
+                    &decode,
+                );
             }
         }
     }
-    candidates
 }
 
-fn push_candidate<'a>(
-    candidates: &mut Vec<CandidateSegment<'a>>,
-    text: &'a str,
+/// Visit the `=`-separated segments of one run, additionally splitting at the
+/// bytes `family` (when given) cannot carry.
+fn visit_run_segments(
+    text: &str,
+    bytes: &[u8],
+    run_start: usize,
+    run_end: usize,
+    family: Option<AlphabetFamily>,
+    visit: &mut impl FnMut(usize, usize, &str),
+) {
+    let mut segment_start = run_start;
+    for position in run_start..run_end {
+        let byte = bytes[position];
+        let boundary = byte == b'=' || family.is_some_and(|family| !family.contains(byte));
+        if boundary {
+            visit_segment(text, bytes, run_end, segment_start, position, visit);
+            segment_start = position + 1;
+        }
+    }
+    visit_segment(text, bytes, run_end, segment_start, run_end, visit);
+}
+
+/// Visit one non-empty segment `start..end`.
+///
+/// The masked range is extended over `=` padding that only trails the segment,
+/// matching the unshifted variants (a padded base64 variant is replaced whole):
+/// the padding is part of the token's length, not payload, so a partial mask
+/// must not leave it behind to advertise how many bytes the token encodes.
+fn visit_segment(
+    text: &str,
+    bytes: &[u8],
+    run_end: usize,
     start: usize,
     end: usize,
+    visit: &mut impl FnMut(usize, usize, &str),
 ) {
-    if end > start {
-        candidates.push(CandidateSegment {
-            start,
-            end,
-            decode: std::borrow::Cow::Borrowed(&text[start..end]),
-        });
+    if end <= start {
+        return;
+    }
+    visit(
+        start,
+        trailing_padding_end(bytes, end, run_end),
+        &text[start..end],
+    );
+}
+
+/// End of the `=` padding that immediately follows `end` inside a run: `end`
+/// when payload follows (`a=b`, `label=token`), the run's end when only padding
+/// is left (`token==`).
+fn trailing_padding_end(bytes: &[u8], end: usize, run_end: usize) -> usize {
+    if end < run_end && bytes[end..run_end].iter().all(|byte| *byte == b'=') {
+        run_end
+    } else {
+        end
     }
 }
 
 /// Byte ranges of `text` that must be masked because their decoded base64
-/// bytes contain a secret, sorted and merged so nested candidates (a wrapped
-/// token contains its own continuation line) collapse into one span.
+/// bytes contain a secret, sorted and merged so nested spans (a wrapped token
+/// contains its own continuation line) collapse into one span.
 ///
 /// A segment that still runs to the end of `text` is decided on the bytes
 /// available: a secret found in its decoded prefix is a stable match, so the
@@ -605,11 +720,14 @@ fn tainted_segment_ranges(
     scanner: &AlignmentScanner,
     join_wraps: bool,
 ) -> Vec<(usize, usize)> {
-    let mut ranges: Vec<(usize, usize)> = collect_candidates(text, join_wraps)
-        .into_iter()
-        .filter(|candidate| scanner.segment_tainted(&candidate.decode))
-        .map(|candidate| (candidate.start, candidate.end))
-        .collect();
+    // Each segment is decoded and dropped as it is produced, so only the
+    // tainted spans are retained.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for_each_candidate(text, join_wraps, &mut |start, end, decode| {
+        if scanner.segment_tainted(decode) {
+            ranges.push((start, end));
+        }
+    });
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for (start, end) in ranges {
@@ -730,11 +848,12 @@ pub fn strip_url_userinfo(url: &str) -> String {
 /// [`AlignmentScanner::hold_bound`] bytes, then flushed, so non-secret text
 /// is never held indefinitely).
 ///
-/// Unlike the batch pass, a window that starts mid-token is not reassembled
-/// across a line break whose earlier lines were already emitted: the
-/// withheld tail is bounded, so base64 wrapped above that bound is decided by
-/// the caller's batch masking (the runner masks each write before sending) —
-/// this streaming strength is the defense-in-depth layer.
+/// Line breaks inside one window are reassembled like the batch pass, so a
+/// wrapped token delivered in a single push — the whole body of one
+/// `append_log` request, say — is redacted. A wrap split across two pushes is
+/// only covered up to the withheld tail's bound; longer wraps are decided by
+/// the caller's batch masking (the runner masks each write before sending),
+/// which is the defense-in-depth layer this streaming strength backs up.
 ///
 /// Byte streams that are not valid UTF-8 are masked lossily, like the rest
 /// of this module: the carry always holds valid UTF-8.
@@ -797,8 +916,11 @@ impl StreamingMasker {
     /// base64 bytes can still complete an alignment-shifted encoding of a
     /// secret; a run longer than that bound is flushed from its head, after
     /// the withheld window (which contains the flushed bytes) has been
-    /// decoded and found clean. The withheld tail is returned by a later
-    /// [`push`](Self::push) or by [`finish`](Self::finish).
+    /// decoded and found clean. A decided span is emitted even inside that
+    /// region: a complete match or a tainted token does not depend on later
+    /// bytes, so holding it back would only delay masking. The withheld tail
+    /// is returned by a later [`push`](Self::push) or by
+    /// [`finish`](Self::finish).
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         let mut window = std::mem::take(&mut self.carry);
         window.extend_from_slice(chunk);
@@ -832,9 +954,16 @@ impl StreamingMasker {
     /// runs to the end of the window) is decided on the bytes available: a
     /// match found in the decoded prefix is stable, so more bytes only ever
     /// extend the masked span.
+    ///
+    /// Wrapped base64 is reassembled here like the batch pass: the server
+    /// persists `append_log` bodies straight from this masker, and a
+    /// compatible client may send a whole wrapped token in one body, so the
+    /// lines of a wrap must be joined before decoding. A wrap split across
+    /// two pushes is only bounded by [`AlignmentScanner::hold_bound`], so it
+    /// stays the caller's batch masking that decides it.
     fn alignment_ranges(&self, text: &str) -> Vec<(usize, usize)> {
         match &self.scanner {
-            Some(scanner) => tainted_segment_ranges(text, scanner, false),
+            Some(scanner) => tainted_segment_ranges(text, scanner, true),
             None => Vec::new(),
         }
     }
@@ -857,12 +986,16 @@ impl StreamingMasker {
 
 /// Emit `text` with secret matches and pre-computed alignment ranges redacted.
 ///
-/// A byte at or after `hold_from` is never emitted raw: it may still become
-/// part of a base64 token decided by a later chunk. A byte at or after
-/// `soft_hold_from` is withheld only when it is the head of a possible
-/// secret; `usize::MAX` disables either bound. A complete match or a tainted
-/// segment is always redacted, even inside the withheld region, because the
-/// decision is stable once made.
+/// A byte at or after `hold_from` belongs to the unresolved trailing base64 run
+/// and may still become part of a token decided by a later chunk, so it is
+/// written speculatively: if no decided span follows it in this window the
+/// speculative tail is cut off and withheld. A decided span — a complete
+/// match or a tainted base64 range — does not depend on later bytes, so
+/// everything before it is emitted (a token must never be left half-masked
+/// just because it sits in the hold region), and multi-line spans keep one
+/// marker per physical line. A byte at or after `soft_hold_from` that is the
+/// head of a possible secret is withheld whatever follows it; `usize::MAX`
+/// disables either bound.
 ///
 /// Returns the masked output and the index where the withheld tail starts.
 fn mask_window(
@@ -875,28 +1008,31 @@ fn mask_window(
     let mut out = String::with_capacity(text.len());
     let mut pos = 0;
     let mut range = 0;
+    // (text offset, output length) where the speculative tail starts.
+    let mut speculative: Option<(usize, usize)> = None;
     while pos < text.len() {
         while range < ranges.len() && ranges[range].1 <= pos {
             range += 1;
         }
-        if range < ranges.len() && ranges[range].0 <= pos {
+        let range_end = (range < ranges.len() && ranges[range].0 <= pos).then(|| ranges[range].1);
+        let matched = match range_end {
+            Some(_) => None,
+            None => match_secret_at(&text[pos..], secrets, true),
+        };
+        if let Some(end) = range_end.or_else(|| matched.map(|secret| pos + secret.len())) {
             // A tainted base64 segment is opaque as a whole, whether or not
             // an earlier match redacted its head.
-            out.push_str(MASK_MARKER);
-            pos = ranges[range].1;
+            speculative = None;
+            push_line_preserving_marker(&mut out, &text[pos..end]);
+            pos = end;
             continue;
         }
         let remaining = &text[pos..];
-        if let Some(secret) = match_secret_at(remaining, secrets, true) {
-            out.push_str(MASK_MARKER);
-            pos += secret.len();
-            continue;
-        }
-        if pos >= hold_from {
-            break;
-        }
         if pos >= soft_hold_from && is_secret_prefix(remaining, secrets) {
             break;
+        }
+        if speculative.is_none() && pos >= hold_from {
+            speculative = Some((pos, out.len()));
         }
         let ch = remaining
             .chars()
@@ -905,7 +1041,13 @@ fn mask_window(
         out.push(ch);
         pos += ch.len_utf8();
     }
-    (out, pos)
+    match speculative {
+        Some((text_offset, out_len)) => {
+            out.truncate(out_len);
+            (out, text_offset)
+        }
+        None => (out, pos),
+    }
 }
 
 /// Whether `remaining` is a proper prefix of any secret (some secret is
@@ -1376,14 +1518,14 @@ mod tests {
             "bnRlc3QtbWFzay05ZjNrMg=="
         );
         let masked = mask_secrets_transform_aware(&input, [secret], &[]);
-        assert_eq!(masked, "***\n***==", "leaked wrapped token: {masked}");
+        assert_eq!(masked, "***\n***", "leaked wrapped token: {masked}");
         assert_eq!(
             masked.bytes().filter(|byte| *byte == b'\n').count(),
             input.bytes().filter(|byte| *byte == b'\n').count()
         );
         // Preserve-lines mode must emit the same one-marker-per-line shape.
         let preserved = mask_secrets_preserving_lines_transform_aware(&input, [secret], &[]);
-        assert_eq!(preserved, "***\n***==");
+        assert_eq!(preserved, "***\n***");
     }
 
     /// CR LF pairs inside a wrapped token stay adjacent, with one marker per
@@ -1398,7 +1540,7 @@ mod tests {
             "bnRlc3QtbWFzay05ZjNrMg=="
         );
         let masked = mask_secrets_preserving_lines_transform_aware(&input, [secret], &[]);
-        assert_eq!(masked, "***\r\n***==");
+        assert_eq!(masked, "***\r\n***");
     }
 
     /// The server live-feed path masks one line at a time and cannot see a
@@ -1418,7 +1560,7 @@ mod tests {
     #[test]
     fn short_secret_shifted_base64_is_masked() {
         let masked = mask_secrets_transform_aware("eGFiY2Q=", ["abcd"], &[]);
-        assert_eq!(masked, "***=");
+        assert_eq!(masked, "***");
     }
 
     /// Adjacent base64-alphabet text after a valid unpadded token used to make
@@ -1471,7 +1613,7 @@ mod tests {
         let token = "eHBlbnRlc3QtbWFzay05ZjNrMg==";
         let mut masker = StreamingMasker::new([secret].iter().copied());
         let out = stream_chunks(&mut masker, &[format!("step output: {token}\n").as_bytes()]);
-        assert_eq!(String::from_utf8(out).unwrap(), "step output: ***==\n");
+        assert_eq!(String::from_utf8(out).unwrap(), "step output: ***\n");
     }
 
     /// Every split position of a shifted token across two chunks must be
@@ -1485,7 +1627,15 @@ mod tests {
             let (head, tail) = token.split_at(split);
             let mut masker = StreamingMasker::new([secret].iter().copied());
             let out = stream_chunks(&mut masker, &[head.as_bytes(), tail.as_bytes()]);
-            assert_eq!(String::from_utf8(out).unwrap(), "***==", "split at {split}");
+            let text = String::from_utf8(out).unwrap();
+            // The padding is masked with the token body; when the split falls
+            // inside the padding itself the later chunk carries it, and a
+            // chunk of nothing but padding is not a secret.
+            assert_eq!(
+                text.trim_end_matches('='),
+                "***",
+                "split at {split}: {text}"
+            );
         }
     }
 
@@ -1504,5 +1654,93 @@ mod tests {
         );
         let rest = masker.finish();
         assert_eq!(String::from_utf8([first, rest].concat()).unwrap(), chunk);
+    }
+
+    /// A run can hold a character of the other alphabet family from adjacent
+    /// log text (`+` here, in front of a URL-safe token). Rejecting the run
+    /// because it mixes families leaves the shifted token decodable, so the
+    /// run is scanned once per family instead.
+    #[test]
+    fn mixed_alphabet_run_is_decoded_per_family() {
+        // base64url("x~~~~") — the secret is `~~~~`. The `+` in front is a
+        // standard-alphabet character that cannot appear in that token.
+        let masked = mask_secrets_transform_aware("+eH5-fn4=", ["~~~~"], &[]);
+        assert_eq!(masked, "+***");
+    }
+
+    /// The transform-aware API matches ASCII case-insensitively, so a shifted
+    /// encoding of the case-folded secret must be masked like the raw value.
+    #[test]
+    fn shifted_encoding_of_a_case_folded_secret_is_masked() {
+        use base64::engine::Engine as _;
+        // Registering `AbCd` masks raw `abcd`; base64("xabcd") decodes to the
+        // same case-folded bytes.
+        let token = base64::engine::general_purpose::STANDARD.encode("xabcd");
+        assert_eq!(token, "eGFiY2Q=");
+        assert_eq!(mask_secrets_transform_aware(&token, ["AbCd"], &[]), "***");
+    }
+
+    /// A variant match inside a shifted token must not split it: the marker is
+    /// not a base64 byte, so the fragments would stop decoding and the rest of
+    /// the encoded secret would stay in the log. The token spans are decided
+    /// on the original input, before any replacement.
+    #[test]
+    fn variant_match_inside_a_shifted_token_does_not_split_it() {
+        let token = "eHBlbnRlc3QtbWFzay05ZjNrMg==";
+        // The second secret is a literal substring of the token.
+        let masked =
+            mask_secrets_transform_aware(token, ["pentest-mask-9f3k2", "bnRlc3QtbWFz"], &[]);
+        assert_eq!(masked, "***", "fragment survived: {masked}");
+    }
+
+    /// A label before a wrapped token must not stop the reassembly: the first
+    /// line is `token=` plus the wrapped bytes, so the `=` is a segment
+    /// boundary inside the run rather than part of the wrapped line.
+    #[test]
+    fn labeled_wrapped_base64_token_is_masked() {
+        let secret = "pentest-mask-9f3k2";
+        let input = format!(
+            "token={}\n{}",
+            "eHh4".repeat(18) + "eHBl",
+            "bnRlc3QtbWFzay05ZjNrMg=="
+        );
+        let masked = mask_secrets_transform_aware(&input, [secret], &[]);
+        assert!(
+            !masked.contains("bnRlc3QtbWFzay05ZjNrMg"),
+            "leaked wrapped token: {masked}"
+        );
+        assert!(masked.starts_with("token="), "label must survive: {masked}");
+    }
+
+    /// `append_log` persists `push` output straight away, so a body that ends
+    /// in a complete secret must be redacted on that push rather than held for
+    /// `finish` (the whole body is one base64 run: `=` and `-` are base64
+    /// bytes, so the trailing-run hold covers it).
+    #[test]
+    fn streaming_masker_masks_a_secret_that_ends_the_chunk() {
+        let mut masker = StreamingMasker::new(["super-secret"].iter().copied());
+        let out = masker.push(b"token=super-secret");
+        assert_eq!(String::from_utf8(out).unwrap(), "token=***");
+    }
+
+    /// A compatible client can send a whole wrapped token in one body, so the
+    /// streaming masker must reassemble the wrap like the batch pass; the
+    /// replacement keeps one marker per physical line.
+    #[test]
+    fn streaming_masker_masks_a_wrapped_token_in_one_push() {
+        let secret = "pentest-mask-9f3k2";
+        let input = format!(
+            "{}\n{}",
+            "eHh4".repeat(18) + "eHBl",
+            "bnRlc3QtbWFzay05ZjNrMg=="
+        );
+        let mut masker = StreamingMasker::new([secret].iter().copied());
+        let out = stream_chunks(&mut masker, &[input.as_bytes()]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("bnRlc3QtbWFzay05ZjNrMg"),
+            "leaked wrapped token: {text}"
+        );
+        assert_eq!(text, "***\n***");
     }
 }
