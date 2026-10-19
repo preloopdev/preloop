@@ -1,10 +1,15 @@
 # GitHub resiliency
 
 Status: **design — PR 0, no code yet.** Written against `public/main` @
-`4831f828`, then re-verified against `public/main` @ `85e1fa168` (2026-10-18).
-Merged work that narrowed a failure shape or fixed a root cause is called out
-inline, and the remaining roadmap is stated against that revision. Line anchors
-are approximate once the code moves; file anchors are relative to
+`4831f828`, then re-verified against `public/main` @ `85e1fa168` (2026-10-18),
+then merged onto `public/main` @ `cd90fa39c` for the docs restructure
+(`docs/control-plane/**`, `docs/contributing/**` — where the related documents
+below now live). The nineteen commits in between also move
+`crates/preloop-runner-server/src/` (12 files, +827/−151), so code *line*
+anchors are approximate against the merged tree; file anchors and the findings
+they support are unchanged. Merged work that narrowed a failure shape or fixed a
+root cause is called out inline, and the remaining roadmap is stated against
+that revision. File anchors are relative to
 `crates/preloop-runner-server/src/` (so `control/lite/schema.sql` means
 `src/control/lite/schema.sql`) unless they name another path. Load-bearing
 anchors were re-checked against `85e1fa168`.
