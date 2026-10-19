@@ -14086,8 +14086,16 @@ mod golden_download_tests {
     /// reaches the network — no connection to `api_base`, and none of the 30 s
     /// metadata deadline spent — and the same lookup, once the open window
     /// lapses, must go out again, take the answer, and close the breaker.
-    /// (The breaker's window is a `std::time::Instant`, so this test runs on
-    /// the real clock rather than a paused one.)
+    ///
+    /// The client is built *before* the breaker is tripped: the first client in
+    /// a process waits up to five seconds for the OS certificate store
+    /// (`shared_http::tls_roots`), and a wait like that between the trip and
+    /// the lookup would let the window lapse and admit the very request this
+    /// test needs refused. Between the trip and the call there is only
+    /// in-memory work, and the window is a second wide, so a scheduling stall
+    /// cannot blur the premise either. (The breaker's window is a
+    /// `std::time::Instant`, so this test runs on the real clock rather than a
+    /// paused one.)
     #[tokio::test]
     async fn open_breaker_refuses_the_golden_release_lookup_before_it_spends_the_deadline() {
         let body = serde_json::json!([
@@ -14114,6 +14122,10 @@ mod golden_download_tests {
             }
         });
 
+        // See the doc comment: the TLS roots (and therefore this client) are
+        // resolved before the breaker is tripped.
+        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
+
         let funnel = GithubFunnel {
             breakers: Arc::new(GithubBreakerRegistry::new(BreakerConfig {
                 enabled: true,
@@ -14121,8 +14133,8 @@ mod golden_download_tests {
                 // wait out and long enough that the refusal below cannot race
                 // its expiry.
                 failure_threshold: 1,
-                base_open: Duration::from_millis(250),
-                max_open: Duration::from_millis(250),
+                base_open: Duration::from_secs(1),
+                max_open: Duration::from_secs(1),
                 probe_timeout: Duration::from_secs(5),
             })),
             consumption: Arc::new(GithubConsumption::default()),
@@ -14133,7 +14145,6 @@ mod golden_download_tests {
         breaker.record_failure(&GithubFailureKind::Unavailable, "503 from api.github.com");
         assert!(breaker.is_open(), "the anonymous bucket starts open");
 
-        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
         let started = std::time::Instant::now();
         let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
         let waited = started.elapsed();
@@ -14165,7 +14176,7 @@ mod golden_download_tests {
         // The refusal must not have been cached as a negative answer: once the
         // window lapses the lookup is admitted, the stub answers, and the
         // breaker closes on the reachability proof.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
         let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
         assert_eq!(tag.as_deref(), Some("v9.9.9"), "the lookup must answer");
         assert!(
