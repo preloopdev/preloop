@@ -35,7 +35,10 @@ pub async fn twirp_workflow_steps_update(
         .unwrap_or("");
     crate::auth::require_results_job(&identity, plan_id, agent_job_id_str)?;
     let steps_payload = payload["steps"].as_array().cloned();
-    let plan_uuid = uuid::Uuid::parse_str(plan_id).ok();
+    // Step records are keyed by the run's plan: key them by the token's own
+    // plan, never by the orchestration spelling of the path segment.
+    let plan_uuid =
+        uuid::Uuid::parse_str(&crate::auth::results_storage_plan_id(&identity, plan_id)).ok();
     let job_uuid = uuid::Uuid::parse_str(agent_job_id_str).ok();
     let (Some(plan_uuid), Some(job_uuid)) = (plan_uuid, job_uuid) else {
         return Ok(Json(json!({"ok": true})));
@@ -72,10 +75,9 @@ pub async fn twirp_get_job_logs_signed_blob_url(
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
     )?;
-    let path = format!(
-        "/replay/results/{}/{}/job-logs.txt",
-        request.workflow_run_backend_id, job_id
-    );
+    let storage_plan =
+        crate::auth::results_storage_plan_id(&identity, &request.workflow_run_backend_id);
+    let path = format!("/replay/results/{}/{}/job-logs.txt", storage_plan, job_id);
     let expires_at = crate::auth::replay_ticket_expiry();
     let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
     Ok(Json(json!({
@@ -301,7 +303,9 @@ pub async fn twirp_get_step_logs_signed_blob_url(
     )?;
     let path = format!(
         "/replay/results/{}/{}/step-{}.txt",
-        request.workflow_run_backend_id, job_id, request.step_backend_id
+        crate::auth::results_storage_plan_id(&identity, &request.workflow_run_backend_id),
+        job_id,
+        request.step_backend_id
     );
     let expires_at = crate::auth::replay_ticket_expiry();
     let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
@@ -336,7 +340,9 @@ pub async fn twirp_get_step_summary_signed_blob_url(
     )?;
     let path = format!(
         "/replay/results/{}/{}/step-{}-summary.md",
-        request.workflow_run_backend_id, job_id, request.step_backend_id
+        crate::auth::results_storage_plan_id(&identity, &request.workflow_run_backend_id),
+        job_id,
+        request.step_backend_id
     );
     let expires_at = crate::auth::replay_ticket_expiry();
     let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
@@ -398,11 +404,13 @@ pub async fn twirp_create_step_summary_metadata(
         &request.workflow_job_run_backend_id,
     )?;
     let byte_count = request.size.unwrap_or_default().min(usize::MAX as u64) as usize;
+    let storage_plan =
+        crate::auth::results_storage_plan_id(&identity, &request.workflow_run_backend_id);
     let mut inner = shared.state.inner.lock().await;
     inner.log_metadata.insert(
         results_metadata_key(
             "summary",
-            Some(&request.workflow_run_backend_id),
+            Some(&storage_plan),
             Some(job_id.as_str()),
             Some(&request.step_backend_id),
         ),
@@ -447,11 +455,12 @@ pub async fn twirp_create_step_logs_metadata(
     let line_count = request.line_count.unwrap_or_default();
     let line_count_usize = line_count.min(usize::MAX as u64) as usize;
     let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
+    let storage_plan = crate::auth::results_storage_plan_id(&identity, plan_id);
     let mut inner = shared.state.inner.lock().await;
     inner.log_metadata.insert(
         results_metadata_key(
             "step",
-            Some(plan_id),
+            Some(&storage_plan),
             Some(job_id.as_str()),
             Some(&request.step_backend_id),
         ),
@@ -494,11 +503,12 @@ pub async fn twirp_create_job_logs_metadata(
     let line_count = request.line_count.unwrap_or_default();
     let line_count_usize = line_count.min(usize::MAX as u64) as usize;
     let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
+    let storage_plan = crate::auth::results_storage_plan_id(&identity, plan_id);
     let mut inner = shared.state.inner.lock().await;
     inner.log_metadata.insert(
         results_metadata_key(
             "job",
-            Some(plan_id),
+            Some(&storage_plan),
             Some(job_id.as_str()),
             Some(job_id.as_str()),
         ),

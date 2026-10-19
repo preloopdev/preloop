@@ -49,10 +49,10 @@ wire captures before merging.
 
 ## Conformance documentation
 
-- [`docs/conformance.md`](docs/conformance.md) — conformance harness, fixture expansion, command comparison, and the provider integration gate.
+- [`docs/contributing/conformance.md`](docs/contributing/conformance.md) — conformance harness, fixture expansion, command comparison, and the provider integration gate.
 - `benchmarks/compatibility/` — the evidence index: server fidelity (official runner against GitHub vs. preloop), runner fidelity, live behavior, MITM captures, and replay gates.
 - `.runner-watch/golden/` — golden wire captures by runner version. New protocol behaviors should ship with a golden.
-- `docs/fidelity-gap.md` — known protocol gaps and roadmap. If you're fixing a gap, link it.
+- `docs/contributing/fidelity-gap.md` — known protocol gaps and roadmap. If you're fixing a gap, link it.
 
 
 
@@ -88,10 +88,10 @@ token with `publish-new` and a verified account email).
 
 ## Project structure
 
-- `docs/architecture.md` — crate map + module map.
-- `docs/setup.md` — setup, credentials, secrets, config.
-- `docs/debug-sessions.md` — the step debugger (pause, inspect, retry).
-- `docs/github-app-webhook.md` / `docs/github-tokens.md` — GitHub integration surface.
+- `docs/control-plane/architecture/overview.mdx` — crate map + module map.
+- `docs/control-plane/install.mdx` — setup, credentials, secrets, config.
+- `docs/control-plane/guides/debugging.mdx` — the step debugger (pause, inspect, retry).
+- `docs/control-plane/github/app.mdx` / `docs/control-plane/github/tokens.mdx` — GitHub integration surface.
 - `AGENTS.md` — agent/LLM-specific conventions.
 
 ## Quick start

@@ -684,6 +684,31 @@ pub fn build_app(
         )
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
+        // Engine-hosted GitHub App setup (`preloop setup github --via app`
+        // with a public URL). The API pair is administrator-only; the two
+        // browser routes answer 404 unless a setup session awaits them, and
+        // each carries its own refusal budget, so a burst of guesses against
+        // one cannot gate the other.
+        .route(
+            "/api/v1/github/setup-sessions",
+            post(crate::github_app_setup::session::open_session).route_layer(
+                middleware::from_fn_with_state(shared.clone(), require_system_bearer),
+            ),
+        )
+        .route(
+            "/api/v1/github/setup-sessions/{session_id}",
+            get(crate::github_app_setup::session::poll_session).route_layer(
+                middleware::from_fn_with_state(shared.clone(), require_system_bearer),
+            ),
+        )
+        .route(
+            "/setup/github",
+            get(crate::github_app_setup::session::setup_form),
+        )
+        .route(
+            "/setup/github/callback",
+            get(crate::github_app_setup::session::setup_callback),
+        )
         // Operator surface over the durable queue: inspect it, replay from
         // the retained local payload (which outlives GitHub's three-day
         // redelivery window), and read one repair-health document.

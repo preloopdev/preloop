@@ -328,7 +328,7 @@ async fn create_control_schema(client: &mut Client) -> Result<(), ControlError> 
 /// sole version authority, and a missing ledger (uninitialized database,
 /// legacy `public` store, pre-ledger `control` schema) or an
 /// older/newer/divergent applied set refuses with the recovery command
-/// (`preloop store migrate`, see `docs/control-migrations.md`).
+/// (`preloop store migrate`, see `docs/contributing/control-migrations.md`).
 async fn ensure_schema(client: &mut Client) -> Result<(), ControlError> {
     let ledger = super::migrations::postgres_ledger(client)
         .await
