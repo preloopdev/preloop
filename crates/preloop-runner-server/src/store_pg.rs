@@ -5,7 +5,7 @@
 //! backend is gone — `control/pg` owns all scheduling state now.
 use postgres_rustls::MakeTlsConnector;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Deadline for a Postgres session to become usable: resolution, the TCP
 /// connect, the TLS handshake, authentication, and the session-setup
@@ -193,7 +193,10 @@ impl Driver {
 /// Every engine Postgres session opens through here, so a database that
 /// accepts TCP and then stops answering fails the caller at the deadline
 /// (naming Postgres and the deadline) instead of parking it forever — engine
-/// startup, a pooled reconnect and the wake listener included.
+/// startup, a pooled reconnect and the wake listener included. The deadline
+/// is absolute, not per phase: setup runs on what the connect left, so a
+/// database that is slow to authenticate *and* then stalls cannot hold the
+/// caller for twice the advertised deadline.
 pub(crate) async fn open_session<Fut>(
     deadline: Duration,
     url: &str,
@@ -203,13 +206,29 @@ pub(crate) async fn open_session<Fut>(
 where
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let started = Instant::now();
     let (client, driver) = connect_bounded(deadline, url).await?;
-    tokio::spawn(drive(driver));
-    tokio::time::timeout(deadline, client.batch_execute(setup))
-        .await
-        .map_err(|_| connect_deadline_error(deadline))?
-        .map_err(anyhow::Error::from)?;
-    Ok(client)
+    let driver_task = tokio::spawn(drive(driver));
+    // The budget the connect left, not a fresh copy of it: authentication
+    // that succeeds just under the deadline must not grant the setup batch
+    // another full one.
+    let remaining = deadline.saturating_sub(started.elapsed());
+    match tokio::time::timeout(remaining, client.batch_execute(setup)).await {
+        Ok(Ok(())) => Ok(client),
+        Ok(Err(error)) => {
+            driver_task.abort();
+            Err(error.into())
+        }
+        Err(_elapsed) => {
+            // Both failure paths abandon the session, and the client alone
+            // cannot end the driver: tokio-postgres keeps a connection with
+            // an in-flight request alive until its response arrives, so a
+            // server that never answers the batch would leave the spawned
+            // task and its socket behind on every retry. Abort it.
+            driver_task.abort();
+            Err(connect_deadline_error(deadline))
+        }
+    }
 }
 
 /// Connect under `deadline` and return the client with its driver.
@@ -325,6 +344,94 @@ pub fn connect_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Postgres stand-in that accepts the connection, spends
+    /// `handshake_after` before completing the startup handshake, and then
+    /// never answers a statement.
+    ///
+    /// The delay is what makes a per-phase deadline observable: the connect
+    /// phase spends most of the budget and still succeeds, so a setup batch
+    /// on a deadline of its own would push the caller past the advertised
+    /// one. The returned receiver resolves when the client end of the socket
+    /// is dropped, which is how a test sees the driver task die.
+    async fn stalling_after_the_startup_handshake(
+        handshake_after: Duration,
+    ) -> (u16, tokio::sync::oneshot::Receiver<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(handshake_after).await;
+            // AuthenticationOk, then ReadyForQuery (idle): the client's
+            // connect resolves on the second and sends the setup batch next.
+            const HANDSHAKE: &[u8] = b"R\x00\x00\x00\x08\x00\x00\x00\x00Z\x00\x00\x00\x05I";
+            if socket.write_all(HANDSHAKE).await.is_err() {
+                return;
+            }
+            // Hold the socket open, so the caller fails at its deadline
+            // rather than on a closed connection.
+            let mut scratch = [0u8; 4096];
+            while matches!(socket.read(&mut scratch).await, Ok(read) if read > 0) {}
+            let _ = closed_tx.send(());
+        });
+        (port, closed_rx)
+    }
+
+    /// One deadline covers the connect *and* the setup batch: a database
+    /// slow to authenticate and then silent must fail the caller at the
+    /// deadline, not at twice it.
+    #[tokio::test]
+    async fn the_setup_batch_shares_the_connect_deadline() {
+        let deadline = Duration::from_millis(600);
+        let (port, _closed) =
+            stalling_after_the_startup_handshake(Duration::from_millis(400)).await;
+        let url = format!("postgres://preloop@127.0.0.1:{port}/control");
+        let started = Instant::now();
+        let error = open_session(deadline, &url, "SET search_path TO control", |driver| {
+            driver.run()
+        })
+        .await
+        .expect_err("a database that never answers the setup batch must not open a session");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "the attempt failed in {elapsed:?}, before its {deadline:?} deadline: {error}"
+        );
+        assert!(
+            elapsed < deadline + deadline / 2,
+            "the attempt took {elapsed:?}: the setup batch must spend what the connect left \
+             of one {deadline:?} deadline, not a fresh one"
+        );
+        assert!(error.to_string().contains("connect deadline"), "{error}");
+    }
+
+    /// An abandoned session takes its driver down with it. `tokio-postgres`
+    /// keeps a connection with an in-flight request alive until the response
+    /// arrives, so dropping the client is not enough: the task and its
+    /// socket would survive every retry of the wake listener. The stand-in
+    /// sees the client end of the socket close, which only an aborted driver
+    /// produces.
+    #[tokio::test]
+    async fn an_abandoned_session_aborts_its_driver() {
+        let (port, closed) = stalling_after_the_startup_handshake(Duration::from_millis(50)).await;
+        let url = format!("postgres://preloop@127.0.0.1:{port}/control");
+        open_session(
+            Duration::from_millis(300),
+            &url,
+            "SET search_path TO control",
+            |driver| driver.run(),
+        )
+        .await
+        .expect_err("the setup batch is never answered, so the session must not open");
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("the driver task must be aborted with the abandoned session")
+            .expect("the stand-in reports the closed socket");
+    }
 
     /// The driver config carries the connect deadline, and a connection
     /// string cannot raise it back: `connect_timeout` in the URL is
