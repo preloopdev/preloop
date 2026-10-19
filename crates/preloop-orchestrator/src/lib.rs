@@ -6045,6 +6045,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         info!(max_concurrent, "on-demand runner pool (size=0)");
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let accounting = Arc::new(QueueAccounting::default());
         let provisioning = Arc::new(std::sync::Mutex::new(0));
         // Every concurrent runner above is one resident VM ceiling; only what
         // the host has left may hold a non-default environment golden.
@@ -6061,12 +6062,13 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 if shutdown.is_cancelled() {
                     break;
                 }
-                let queued = pending.map_or(0, |p| p.load(Ordering::Acquire));
+                let queued = pending.map_or(0, |p| accounting.observe(p.load(Ordering::Acquire)));
                 // Runners already registered or booting cover queued jobs;
                 // forking past that only leaves idle runners that never get
                 // work. `building` includes the reservations this loop takes
                 // below, so a queued job counts the fork it is already paying
-                // for.
+                // for. A just-claimed job receives a local credit until the
+                // sampled queue depth drops and accounts for it.
                 let committed = idle.lock().map_or(0, |n| *n) + building.lock().map_or(0, |n| *n);
                 if queued > committed {
                     break;
@@ -6096,6 +6098,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
             let slot_registry = golden_cache.clone();
+            let slot_accounting = accounting.clone();
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
@@ -6126,6 +6129,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_registry,
                     slot_budget,
                     slot_handles,
+                    slot_accounting,
                     reservation,
                     slot_semaphore,
                     permit_slot,
@@ -6633,6 +6637,39 @@ struct RunnerEnvironment {
     /// because the host cannot retain another environment golden must boot the
     /// job's own base image and take the contract on the guest.
     boot_from_pack: bool,
+}
+
+/// The server publishes a sampled ready-queue depth. A runner claim can land
+/// after the sample and before the next one, so the old depth still includes
+/// that job while the runner has already left `idle`. Keep one local claim
+/// credit until a later sample drops the depth by the same amount.
+#[derive(Default)]
+struct QueueAccounting {
+    state: std::sync::Mutex<QueueAccountingState>,
+}
+
+#[derive(Default)]
+struct QueueAccountingState {
+    observed_depth: Option<usize>,
+    claimed_since_sample: usize,
+}
+
+impl QueueAccounting {
+    fn observe(&self, depth: usize) -> usize {
+        let mut state = self.state.lock().unwrap();
+        if let Some(previous) = state.observed_depth
+            && depth < previous
+        {
+            state.claimed_since_sample =
+                state.claimed_since_sample.saturating_sub(previous - depth);
+        }
+        state.observed_depth = Some(depth);
+        depth.saturating_sub(state.claimed_since_sample)
+    }
+
+    fn record_claim(&self) {
+        self.state.lock().unwrap().claimed_since_sample += 1;
+    }
 }
 
 /// Handles every slot in the pool shares.
@@ -7221,6 +7258,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     golden_cache: Arc<GoldenCache>,
     golden_budget: GoldenBudget,
     handles: PoolHandles,
+    accounting: Arc<QueueAccounting>,
     reservation: BuildReservation,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
@@ -7323,6 +7361,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         idle.clone(),
         fork.as_ref()
             .map_or_else(CancellationToken::new, GoldenFork::superseded),
+        Some(accounting),
         Some(reservation),
     )
     .await;
@@ -7488,6 +7527,7 @@ async fn run_slot<P: VmProvider + 'static>(
             idle.clone(),
             fork.as_ref()
                 .map_or_else(CancellationToken::new, GoldenFork::superseded),
+            None,
             None,
         )
         .await;
@@ -7758,6 +7798,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     idle: Arc<std::sync::Mutex<usize>>,
     superseded: CancellationToken,
+    accounting: Option<Arc<QueueAccounting>>,
     reservation: Option<BuildReservation>,
 ) -> Result<(), OrchestratorError> {
     let ReadyRunner {
@@ -7802,6 +7843,9 @@ async fn run_one_runner<P: VmProvider + 'static>(
             return;
         }
         claim_claimed.store(true, Ordering::Release);
+        if let Some(accounting) = &accounting {
+            accounting.record_claim();
+        }
         idle.release();
         if claim_superseded.is_cancelled() {
             claim_late.notify_one();
@@ -14629,6 +14673,7 @@ fi"#,
             idle,
             CancellationToken::new(),
             None,
+            None,
         )
         .await
         .expect_err("runner failure must propagate");
@@ -14661,6 +14706,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             handles,
+            Arc::new(QueueAccounting::default()),
             BuildReservation::reserve(
                 Arc::new(std::sync::Mutex::new(0)),
                 config.pool_status.clone(),
@@ -14766,6 +14812,7 @@ fi"#,
                     CancellationToken::new(),
                     idle,
                     superseded,
+                    None,
                     None,
                 )
                 .await
@@ -15183,6 +15230,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             handles,
+            Arc::new(QueueAccounting::default()),
             reservation,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -15210,6 +15258,19 @@ fi"#,
             (0, 0, 0),
             "every counter must return to zero after the slot stops"
         );
+    }
+
+    /// A sampled queue can still contain the job a runner just claimed. The
+    /// claim credit remains until the next queue snapshot excludes it, so a
+    /// new sample cannot make the same job look queued twice.
+    #[test]
+    fn a_delayed_queue_snapshot_does_not_fork_after_a_claim() {
+        let accounting = QueueAccounting::default();
+        assert_eq!(accounting.observe(1), 1);
+        accounting.record_claim();
+        assert_eq!(accounting.observe(1), 0);
+        assert_eq!(accounting.observe(0), 0);
+        assert_eq!(accounting.observe(1), 1, "a later job is forkable");
     }
 
     /// One queued job forks one runner, even with the whole concurrency budget
