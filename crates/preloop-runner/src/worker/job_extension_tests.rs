@@ -1562,12 +1562,52 @@ fn golden_runner_version() -> String {
     panic!("runner_version not found in ../../versions.toml");
 }
 
+/// Golden corpus version a scenario is read from: the shipped
+/// `runner_version` when its flat capture exists, otherwise the newest corpus
+/// that has it.
+///
+/// `versions.toml`'s `runner_version` is the *shipped* runner pin, and it can
+/// move ahead of the flat capture corpus — the compatibility pin is bumped
+/// before the flows are recorded (see #710, whose `v2.337.0` directory holds
+/// only nested `gh-official/*` captures). Reading the pin blindly turns every
+/// parser test into "failed to load golden acquirejob"; falling back to the
+/// newest corpus keeps the tests running until that capture lands.
+fn golden_runner_version_for(scenario: &str) -> Option<String> {
+    let root = std::path::Path::new("../../.runner-watch/golden");
+    let has = |version: &str| {
+        root.join(format!("v{version}/{scenario}/flows.jsonl"))
+            .is_file()
+    };
+    let pinned = golden_runner_version();
+    if has(&pinned) {
+        return Some(pinned);
+    }
+    let mut versions: Vec<String> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.strip_prefix('v').map(str::to_owned))
+        .filter(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+        .filter(|version| has(version))
+        .collect();
+    versions.sort_by(|a, b| version_key(a).cmp(&version_key(b)));
+    versions.pop()
+}
+
+/// Numeric components of a `vN.N.N` corpus directory, for a version sort.
+fn version_key(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
+}
+
 fn load_golden_acquirejob(scenario: &str) -> Option<serde_json::Value> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     let path = format!(
         "../../.runner-watch/golden/v{}/{scenario}/flows.jsonl",
-        golden_runner_version()
+        golden_runner_version_for(scenario)?
     );
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
