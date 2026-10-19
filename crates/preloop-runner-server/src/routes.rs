@@ -1,4 +1,6 @@
 use super::*;
+use std::pin::Pin;
+use std::task::Poll;
 use utoipa::OpenApi;
 
 // The worker-facing debug surface is fail-closed in two places: the route
@@ -19,31 +21,43 @@ pub const DEBUG_SESSION_CLOSE_SUFFIX: &str = "/close";
 /// bound the transient cost at ~256 MiB; requests over the cap are shed with
 /// 503 instead of being queued, which would only move the same pressure
 /// behind an unbounded wait list. Shedding is the last-resort bound: GitHub
-/// does not retry a non-2xx on its own, so a shed delivery is recorded as
-/// failed and must be redelivered (GitHub's redelivery UI, or
-/// `preloop webhooks replay`).
+/// does not retry a non-2xx on its own, and a shed request never reaches the
+/// store, so there is no local payload copy to replay — the delivery exists
+/// only at GitHub and is recovered from GitHub's redelivery log.
 const MAX_CONCURRENT_WEBHOOK_UPLOADS: usize = 8;
 
-/// How long an admitted webhook request may hold its upload slot.
+/// How long an admitted webhook request may spend uploading its body.
 ///
 /// The slot cap alone would let eight stalled uploads — headers received, body
 /// never finished — pin every permit and answer legitimate deliveries 503, a
-/// self-DoS behind the gate. This budget releases the slot instead: a request
-/// still running after it is cut off with 408. It sits just above the
-/// handler's own 8 s ack budget (`WEBHOOK_ACK_BUDGET` in `github.rs`), so a
-/// legitimate slow store still completes, while a stalled peer cannot pin a
-/// slot. The timeout also cancels the handler's enqueue wait, so a delivery
-/// cut off mid-enqueue may not be persisted; GitHub records that delivery as
-/// failed and it can be redelivered.
-const WEBHOOK_REQUEST_BUDGET: Duration = Duration::from_secs(10);
+/// self-DoS behind the gate. This budget releases the slot instead: a body
+/// still arriving when it fires is cut off with 408. It covers the upload
+/// only. The handler's acknowledgement budget (`WEBHOOK_ACK_BUDGET` in
+/// `github.rs`) starts once the body is in, so a slow but valid upload cannot
+/// spend the budget the durable write needs: a delivery that takes 4 s to
+/// arrive still gets the store its full 8 s, where a deadline over the whole
+/// request would have cancelled it mid-write and lost it. A 408 therefore
+/// means the body never arrived and nothing was recorded — like a shed
+/// request, that delivery must be redelivered from GitHub.
+const WEBHOOK_INGEST_BUDGET: Duration = Duration::from_secs(10);
+
+/// Admission cap and ingest budget for the webhook route.
+///
+/// One value because `limit_webhook_uploads` enforces both: `slots` bounds how
+/// many bodies are buffered at once, `ingest_budget` how long any one of them
+/// may spend arriving. Tests build a gate with their own budget rather than
+/// waiting out the production one.
+struct WebhookUploadGate {
+    slots: Arc<tokio::sync::Semaphore>,
+    ingest_budget: Duration,
+}
 
 /// Try to take a webhook upload slot, or shed the request.
 ///
 /// Load-shedding is deliberate: a bounded queue only moves the memory
 /// pressure to a slower moment. A shed delivery is recoverable rather than
-/// lost — it is recorded as failed and redelivered by hand (GitHub's UI or
-/// `preloop webhooks replay`), because GitHub does not retry an arbitrary
-/// non-2xx itself.
+/// lost — it never reached the store, so it is redelivered from GitHub's
+/// delivery log, because GitHub does not retry an arbitrary non-2xx itself.
 fn reserve_webhook_upload_slot(
     slots: &Arc<tokio::sync::Semaphore>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, StatusCode> {
@@ -53,18 +67,70 @@ fn reserve_webhook_upload_slot(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
-/// Gate webhook body extraction; the permit is held until the response is
-/// produced, i.e. for as long as the buffered body (and the queued delivery
-/// record) is alive, and never longer than `WEBHOOK_REQUEST_BUDGET`.
+/// Wrap `body` so `complete` fires once the body has been read to its end, or
+/// has failed, or has been dropped.
+///
+/// The middleware has to know when an upload has finished, but the handler's
+/// extractor is what reads the body, so the signal has to travel with it. A
+/// body dropped before it is read — a payload rejected as oversized — signals
+/// too: that request already has its answer and must not be timed out on the
+/// way out. Only data frames pass through; a webhook delivery carries no
+/// trailers, and the `Bytes` extractor ignores them in any case.
+fn signal_body_complete(body: Body, complete: tokio::sync::oneshot::Sender<()>) -> Body {
+    use futures::Stream as _;
+
+    let mut body = body.into_data_stream();
+    let mut complete = Some(complete);
+    Body::from_stream(stream::poll_fn(move |cx| {
+        let next = Pin::new(&mut body).poll_next(cx);
+        if matches!(next, Poll::Ready(None) | Poll::Ready(Some(Err(_))))
+            && let Some(complete) = complete.take()
+        {
+            let _ = complete.send(());
+        }
+        next
+    }))
+}
+
+/// Resolve when an admitted request is still uploading after its ingest
+/// budget, and never once the body is in.
+///
+/// `body_complete` resolves when the body is exhausted, fails, or is dropped,
+/// so an Ok result means the upload is over — whatever it cost — and the
+/// deadline must stop counting; waiting on a future that never resolves keeps
+/// the middleware off the handler's clock.
+async fn upload_deadline(budget: Duration, body_complete: tokio::sync::oneshot::Receiver<()>) {
+    if tokio::time::timeout(budget, body_complete).await.is_ok() {
+        std::future::pending::<()>().await
+    }
+}
+
+/// Gate webhook uploads.
+///
+/// The permit is held until the response is produced — as long as the buffered
+/// body, and the record built from it, are alive — while the ingest budget
+/// covers only the upload. Once the body is in, the handler runs to its own
+/// budgets: the deadline is disarmed rather than left ticking, because a
+/// delivery that has finished arriving must not be cancelled while it is still
+/// inside the acknowledgement budget it is allowed (`WEBHOOK_ACK_BUDGET`).
 async fn limit_webhook_uploads(
-    State(slots): State<Arc<tokio::sync::Semaphore>>,
+    State(gate): State<Arc<WebhookUploadGate>>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let _permit = reserve_webhook_upload_slot(&slots)?;
-    match tokio::time::timeout(WEBHOOK_REQUEST_BUDGET, next.run(request)).await {
-        Ok(response) => Ok(response),
-        Err(_) => Err(StatusCode::REQUEST_TIMEOUT),
+    let _permit = reserve_webhook_upload_slot(&gate.slots)?;
+    let (parts, body) = request.into_parts();
+    let (body_complete_tx, body_complete_rx) = tokio::sync::oneshot::channel();
+    let handler = next.run(Request::from_parts(
+        parts,
+        signal_body_complete(body, body_complete_tx),
+    ));
+    tokio::pin!(handler);
+    let deadline = upload_deadline(gate.ingest_budget, body_complete_rx);
+    tokio::pin!(deadline);
+    tokio::select! {
+        response = &mut handler => Ok(response),
+        () = &mut deadline => Err(StatusCode::REQUEST_TIMEOUT),
     }
 }
 
@@ -429,8 +495,10 @@ pub fn build_app(
         ));
 
     // Shared by the webhook route's gate: see `limit_webhook_uploads`.
-    let webhook_upload_slots =
-        Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WEBHOOK_UPLOADS));
+    let webhook_upload_gate = Arc::new(WebhookUploadGate {
+        slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WEBHOOK_UPLOADS)),
+        ingest_budget: WEBHOOK_INGEST_BUDGET,
+    });
 
     let router = Router::new()
         .route("/healthz", get(healthz))
@@ -746,12 +814,14 @@ pub fn build_app(
                 // …and bound how many of those bodies are buffered at once
                 // before the HMAC check, so the unauthenticated ingress
                 // cannot be used as a memory amplifier. Over-cap requests are
-                // shed with 503 — recoverable by redelivery, not retried on
-                // their own — and an admitted request is cut off after
-                // `WEBHOOK_REQUEST_BUDGET` so a stalled peer cannot pin a
-                // slot while legitimate deliveries queue up behind it.
+                // shed with 503 — redelivered from GitHub, not retried on
+                // their own — and an upload still arriving after
+                // `WEBHOOK_INGEST_BUDGET` is cut off with 408, so a stalled
+                // peer cannot pin a slot while legitimate deliveries queue up
+                // behind it. The budget covers the upload alone: the handler
+                // keeps its own acknowledgement budget once the body is in.
                 .layer(middleware::from_fn_with_state(
-                    webhook_upload_slots.clone(),
+                    webhook_upload_gate.clone(),
                     limit_webhook_uploads,
                 )),
         )
@@ -1319,85 +1389,126 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// The webhook body is buffered before the HMAC is checked, so uploads
-    /// past the slot cap must be shed (503) instead of queued. Without the
-    /// gate the ninth request reaches the handler and answers 401, which this
-    /// test treats as a regression. Each staged body signals on its first
-    /// poll, so the test waits until the extractors actually hold the slots
-    /// rather than sleeping and hoping.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn webhook_route_sheds_when_upload_slots_are_full() {
-        use futures::stream;
-        use std::task::Poll;
+    /// The production admission cap over a budget the test picks, so no test
+    /// here waits out (or races) the real ten seconds.
+    fn webhook_gate(ingest_budget: Duration) -> Arc<WebhookUploadGate> {
+        Arc::new(WebhookUploadGate {
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WEBHOOK_UPLOADS)),
+            ingest_budget,
+        })
+    }
 
+    /// The upload gate over a stub handler that reads its body, so admission
+    /// and the ingest deadline are driven without the webhook handler's
+    /// signature check or store.
+    fn gate_router(gate: Arc<WebhookUploadGate>) -> Router {
+        Router::new()
+            .route("/webhooks", post(|_body: Bytes| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(gate, limit_webhook_uploads))
+    }
+
+    /// Uploads past the slot cap are shed (503) rather than queued: the body
+    /// is buffered before the HMAC is checked, so an unbounded admission is
+    /// the memory amplifier this gate exists to prevent. The test holds the
+    /// permits itself, so passing does not depend on how long a staged upload
+    /// takes to be cut off — the timing the earlier version of this test
+    /// shared with the ingest deadline.
+    #[tokio::test]
+    async fn webhook_uploads_are_shed_past_the_slot_cap() {
+        let gate = webhook_gate(Duration::from_secs(60));
+        let held: Vec<_> = (0..MAX_CONCURRENT_WEBHOOK_UPLOADS)
+            .map(|_| reserve_webhook_upload_slot(&gate.slots).expect("slot"))
+            .collect();
+        let router = gate_router(gate.clone());
+
+        let shed = router
+            .clone()
+            .oneshot(Request::post("/webhooks").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(held);
+        let admitted = router
+            .oneshot(Request::post("/webhooks").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+    }
+
+    /// A body still arriving when the ingest budget is spent is cut off with
+    /// 408 and gives its slot back, so a stalled peer cannot pin the ingress.
+    #[tokio::test]
+    async fn stalled_upload_is_cut_off_at_the_ingest_budget() {
+        let gate = webhook_gate(Duration::from_millis(50));
+        let router = gate_router(gate.clone());
+
+        let stalled = Body::from_stream(stream::pending::<Result<Bytes, std::io::Error>>());
+        let response = router
+            .oneshot(Request::post("/webhooks").body(stalled).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(
+            reserve_webhook_upload_slot(&gate.slots).is_ok(),
+            "the cut-off upload must release its slot"
+        );
+    }
+
+    /// The ingest budget covers the upload, not the handler: a body that
+    /// arrives inside the budget leaves the handler to finish its own work,
+    /// even when that work outlasts the budget. The deadline this replaced
+    /// wrapped the whole request, so it cancelled stores that were still
+    /// inside `WEBHOOK_ACK_BUDGET` — and a delivery cancelled mid-write is
+    /// unrecorded and has to be redelivered from GitHub.
+    #[tokio::test]
+    async fn handler_work_outliving_the_ingest_budget_completes() {
+        let gate = webhook_gate(Duration::from_millis(50));
+        let router = Router::new()
+            .route(
+                "/webhooks",
+                post(|_body: Bytes| async {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn_with_state(gate, limit_webhook_uploads));
+
+        // The body is itself slow — arriving just inside the budget — so the
+        // slow upload the budget exists for is covered alongside the handler's
+        // longer-running work.
+        let body = Body::from_stream(stream::once(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(b"payload"))
+        }));
+        let response = router
+            .oneshot(Request::post("/webhooks").body(body).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The gate is wired onto the real webhook route: with a free slot the
+    /// request reaches the handler instead of being shed, and the unsigned
+    /// body is rejected there with 401.
+    #[tokio::test]
+    async fn webhook_route_reaches_the_handler_through_the_upload_gate() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let router = app(state, CancellationToken::new());
 
-        let mut stalled = Vec::new();
-        let mut buffering = Vec::new();
-        for _ in 0..MAX_CONCURRENT_WEBHOOK_UPLOADS {
-            let router = router.clone();
-            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
-            buffering.push(started_rx);
-            stalled.push(tokio::spawn(async move {
-                // A body that never yields a chunk keeps the extractor (and
-                // the permit) parked exactly like a slow upload; its first
-                // poll is the moment the extractor starts buffering.
-                let mut started_tx = Some(started_tx);
-                let body = Body::from_stream(stream::poll_fn(
-                    move |_cx| -> Poll<Option<Result<bytes::Bytes, std::io::Error>>> {
-                        if let Some(started_tx) = started_tx.take() {
-                            let _ = started_tx.send(());
-                        }
-                        Poll::Pending
-                    },
-                ));
-                let request = Request::post("/api/v1/github/webhooks")
-                    .header("x-github-event", "push")
-                    .body(body)
-                    .unwrap();
-                router
-                    .oneshot(request)
-                    .await
-                    .map(|response| response.status())
-            }));
-        }
-
-        // Wait until every staged upload holds a slot and its extractor is
-        // parked mid-body, so the probe below cannot race them.
-        let admitted = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            futures::future::join_all(buffering),
-        )
-        .await;
-
-        let probe = if admitted.is_ok() {
-            Some(
-                router
-                    .oneshot(
-                        Request::post("/api/v1/github/webhooks")
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap()
-                    .status(),
+        let response = router
+            .oneshot(
+                Request::post("/api/v1/github/webhooks")
+                    .body(Body::empty())
+                    .unwrap(),
             )
-        } else {
-            None
-        };
+            .await
+            .unwrap();
 
-        for task in stalled {
-            task.abort();
-            let _ = task.await;
-        }
-
-        assert!(
-            admitted.is_ok(),
-            "every staged upload must take a slot and start its body"
-        );
-        assert_eq!(probe, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
