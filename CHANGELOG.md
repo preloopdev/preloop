@@ -12,17 +12,18 @@ Releases before v0.27.0 predate the changelog.
 
 - **Webhook ingress bounds and times out body uploads.** The GitHub webhook
   route buffers at most eight request bodies (each up to the 32 MiB route
-  limit) at once, and sheds further requests with 503, so an unauthenticated
-  caller can no longer use the ingress as a memory amplifier before the HMAC
-  check. An upload still arriving after 10 s is cut off with 408, so a stalled
-  peer cannot pin every slot and starve legitimate deliveries. That budget
-  covers the upload alone: once the body is in, the handler keeps its own
-  acknowledgement budget, so a slow but valid delivery is still recorded. A
-  shed or timed-out request never reached the store and has no local payload
-  to replay, so recovering one means redelivering it from GitHub's delivery
-  log; `preloop webhooks replay` cannot help. With `--record-flows`, the
-  webhook body is no longer buffered by the flow recorder ahead of the route's
-  own admission.
+  limit) at once, so an unauthenticated caller can no longer use the ingress
+  as a memory amplifier before the HMAC check. An upload is cut off with 408
+  if it is still arriving after 10 s, or if it stops sending for 3 s — holding
+  a slot now costs an actual transfer instead of just a connection — and a
+  delivery that arrives while every slot is taken waits up to 1 s for one
+  rather than being shed outright. Those budgets cover the upload alone: once
+  the body is in, the handler keeps its own acknowledgement budget, so a slow
+  but valid delivery is still recorded. A shed or timed-out request never
+  reached the store and has no local payload to replay, so recovering one
+  means redelivering it from GitHub's delivery log; `preloop webhooks replay`
+  cannot help. With `--record-flows`, the webhook body is no longer buffered
+  by the flow recorder ahead of the route's own admission.
 
 ### Added
 
