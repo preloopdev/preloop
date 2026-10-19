@@ -60,6 +60,9 @@ fn write_executable(path: &Path, contents: &str) {
 ///   missing `--from-volume`. `volume delete` refuses a mounted volume.
 /// * `<exe>.volume-status` overrides the status `volume inspect` reports.
 /// * `<exe>.fail-volume-create` makes every `volume create` fail.
+/// * `<exe>.overlap-probe` makes every `volume create` publish an arrival
+///   marker and wait (bounded, ~20 s) for a second create, recording
+///   `<exe>.overlap` only when two creates were in flight together.
 /// * `<exe>.fail-sudo` and `<exe>.fail-payload` behave as before.
 fn fake_aenv() -> (TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
@@ -175,7 +178,14 @@ case "${1-}" in
     ;;
   delete)
     id=${2-}
+    # The sandbox and mount tables are shared by every invocation, and this
+    # rewrite uses one fixed temp name: take the same lock a concurrent start
+    # takes, or two deletes collide on the temp file (`mv: ... No such file
+    # or directory`) and a rewrite can write back a table read before the
+    # other's append.
+    while ! mkdir "$0.lock" 2>/dev/null; do sleep 0.01; done
     if ! grep -qx "$id" "$sandboxes"; then
+      rmdir "$0.lock"
       printf 'sandbox %s not found\n' "$id" >&2
       exit 1
     fi
@@ -183,6 +193,7 @@ case "${1-}" in
     mv "$sandboxes.tmp" "$sandboxes"
     grep -v "^$id|" "$mounts" > "$mounts.tmp" || true
     mv "$mounts.tmp" "$mounts"
+    rmdir "$0.lock"
     printf 'ok\n'
     ;;
   volume)
@@ -204,27 +215,50 @@ case "${1-}" in
           printf 'backend refused volume %s\n' "$name" >&2
           exit 1
         fi
-        # Overlap probe: with `<exe>.overlap-probe`, a create holds a marker
-        # directory for a moment and records it when a second create is inside
-        # it at the same time. One global populate lock can never overlap; a
-        # per-tree lock does, which is how a test tells them apart without
-        # measuring wall time or waiting for the other side.
-        if [ -f "$0.overlap-probe" ]; then
-          if ! mkdir "$0.in-create" 2>/dev/null; then
+        # Overlap probe: with `<exe>.overlap-probe`, every create publishes an
+        # arrival marker and waits (bounded) for a second create, so
+        # `<exe>.overlap` records that two creates were in flight together — a
+        # fact, not a window a slow machine can miss. A per-tree populate lock
+        # lets different trees meet here; one global lock never can, and the
+        # test's assertion is what tells them apart.
+        if [ -f "$0.overlap-probe" ] && [ ! -f "$0.overlap" ]; then
+          arrivals="$0.in-create"
+          mkdir -p "$arrivals"
+          marker="$arrivals/$$"
+          : > "$marker"
+          # Every exit path drops this create's marker, so a stale one can
+          # never be counted later as a partner that is in flight.
+          trap "rm -f '$marker'" EXIT INT TERM
+          waited=0
+          while [ ! -f "$0.overlap" ] && \
+            [ "$(ls "$arrivals" | wc -l | tr -d ' ')" -lt 2 ] && \
+            [ "$waited" -lt 400 ]; do
+            waited=$((waited + 1))
+            sleep 0.05
+          done
+          if [ "$(ls "$arrivals" | wc -l | tr -d ' ')" -ge 2 ]; then
             : > "$0.overlap"
           fi
-          sleep 1
-          rmdir "$0.in-create" 2>/dev/null || true
+          rm -f "$marker"
         fi
+        # The volume table is shared by every invocation of this fake, and these
+        # tests start machines in parallel: serialize the check and the append
+        # against the read-modify-write a concurrent delete does, or that
+        # rewrite writes back a table read before this append — the volume
+        # vanishes and the flow's next inspect reports it not found.
+        while ! mkdir "$0.volume-lock" 2>/dev/null; do sleep 0.01; done
         if grep -q "^$name|" "$volumes"; then
+          rmdir "$0.volume-lock"
           printf 'volume %s already exists\n' "$name" >&2
           exit 1
         fi
         if [ -n "$from" ] && ! grep -q "^$from|" "$volumes"; then
+          rmdir "$0.volume-lock"
           printf 'volume %s not found\n' "$from" >&2
           exit 1
         fi
         printf '%s|%s|%s\n' "$name" "$mode" "$from" >> "$volumes"
+        rmdir "$0.volume-lock"
         printf 'Created volume %s\n' "$name"
         ;;
       inspect)
@@ -240,16 +274,30 @@ case "${1-}" in
         ;;
       delete)
         name=${3-}
+        # Serialize the whole rewrite against a concurrent create's append, and
+        # against `start`, which validates this name under `$0.lock` before it
+        # records the mount: holding `$0.volume-lock` alone lets a delete land
+        # between that check and that append, leaving a mount that names a
+        # volume no longer in the table. Both locks, in that order, and always
+        # released before an exit.
+        while ! mkdir "$0.lock" 2>/dev/null; do sleep 0.01; done
+        while ! mkdir "$0.volume-lock" 2>/dev/null; do sleep 0.01; done
         if ! grep -q "^$name|" "$volumes"; then
+          rmdir "$0.volume-lock"
+          rmdir "$0.lock"
           printf 'volume %s not found\n' "$name" >&2
           exit 1
         fi
         if grep -q "|$name\$" "$mounts"; then
+          rmdir "$0.volume-lock"
+          rmdir "$0.lock"
           printf 'volume %s is mounted by a sandbox and cannot be deleted\n' "$name" >&2
           exit 1
         fi
         grep -v "^$name|" "$volumes" > "$volumes.tmp" || true
         mv "$volumes.tmp" "$volumes"
+        rmdir "$0.volume-lock"
+        rmdir "$0.lock"
         printf 'Deleted volume %s\n' "$name"
         ;;
       list)
