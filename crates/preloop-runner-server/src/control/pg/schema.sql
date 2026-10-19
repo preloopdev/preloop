@@ -406,6 +406,38 @@ CREATE TABLE github_token_requests (
     untrusted               boolean NOT NULL
 );
 
+-- Job-owned installation tokens owing a remote revocation. Deliberately has
+-- no foreign key to `job_requests`: an archived or purged attempt must not
+-- erase the obligation to revoke its token. `sealed_token` is Envelope
+-- ciphertext, never the raw credential. After a successful revoke (or a
+-- 401) the row becomes a tombstone with no sealed token, kept until the
+-- token's own `expires_at` so a stale online-validation cache cannot
+-- re-accept it; cleanup deletes rows once that expiry has passed.
+CREATE TABLE github_token_revocations (
+    token_hash              text PRIMARY KEY,
+    request_id              bigint,
+    run_id                  uuid NOT NULL,
+    job_id                  text NOT NULL,
+    agent_job_id            uuid NOT NULL,
+    app_id                  text NOT NULL,
+    installation_id         bigint NOT NULL,
+    repository              text NOT NULL,
+    sealed_token            bytea,
+    expires_at              timestamptz NOT NULL,
+    state                   text NOT NULL DEFAULT 'pending'
+                              CHECK (state IN ('pending','revoked','spent')),
+    attempts                integer NOT NULL DEFAULT 0,
+    next_attempt_at         timestamptz NOT NULL,
+    last_error              text,
+    created_at              timestamptz NOT NULL
+);
+CREATE INDEX github_token_revocations_due
+    ON github_token_revocations(next_attempt_at);
+CREATE INDEX github_token_revocations_request
+    ON github_token_revocations(request_id);
+CREATE INDEX github_token_revocations_expiry
+    ON github_token_revocations(expires_at);
+
 -- Step manifest + progress per attempt. Written in per-node batches.
 CREATE TABLE job_steps (
     agent_job_id            uuid NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,

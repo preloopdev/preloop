@@ -502,6 +502,91 @@ pub(crate) struct ClaimedJob {
 pub(crate) fn plan_fields(agent_job_id: uuid::Uuid) -> (String, String) {
     (agent_job_id.to_string(), "actions".to_owned())
 }
+/// A job-owned GitHub App installation token whose remote revocation is owed.
+///
+/// Persisted by `record_github_token_revocation` before the token is put in a
+/// job message. `sealed_token` is `store::Envelope` ciphertext bound to
+/// `token_hash`; the plaintext credential never reaches the database.
+#[derive(Clone)]
+pub(crate) struct NewGitHubTokenRevocation {
+    /// SHA-256 hex of the raw token. Primary key and ledger correlation.
+    pub(crate) token_hash: String,
+    /// Execution attempt that owns the token. `None` only for defensive
+    /// callers; job dispatch always supplies one.
+    pub(crate) request_id: Option<i64>,
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) agent_job_id: uuid::Uuid,
+    pub(crate) app_id: String,
+    pub(crate) installation_id: u64,
+    pub(crate) repository: String,
+    pub(crate) sealed_token: Vec<u8>,
+    pub(crate) expires_at_us: i64,
+    /// When the reconciler may first act on this row.
+    pub(crate) next_attempt_at_us: i64,
+    pub(crate) created_at_us: i64,
+}
+
+/// Outcome of one remote revocation attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TokenRevocationResolution {
+    /// GitHub accepted `DELETE /installation/token`.
+    Revoked,
+    /// GitHub answered `401`: the token is already invalid (expired or
+    /// revoked elsewhere). It cannot authorize anything, but the tombstone is
+    /// kept until the token's own expiry so a stale dispatch-validation cache
+    /// cannot accept it either.
+    Spent,
+}
+
+/// One pending revocation claimed by a lifecycle reconciler.
+#[derive(Clone)]
+pub(crate) struct GitHubTokenRevocation {
+    pub(crate) token_hash: String,
+    pub(crate) request_id: Option<i64>,
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) agent_job_id: uuid::Uuid,
+    pub(crate) app_id: String,
+    pub(crate) installation_id: u64,
+    pub(crate) repository: String,
+    /// Envelope ciphertext; redacted `Debug`, only unsealed by the lifecycle
+    /// worker. `pub(crate)` so the backend row decoders can populate it.
+    pub(crate) sealed_token: Vec<u8>,
+    pub(crate) expires_at_us: i64,
+    /// Failed network attempts so far; the reconciler backs off on it.
+    pub(crate) attempts: u32,
+    pub(crate) last_error: Option<String>,
+}
+
+impl GitHubTokenRevocation {
+    /// The sealed envelope, for decryption at the revocation boundary only.
+    pub(crate) fn sealed_token(&self) -> &[u8] {
+        &self.sealed_token
+    }
+}
+
+/// Redact by construction: the ciphertext is not a credential, but it exists
+/// only to be unsealed at one call site and must never be dumped into logs.
+impl std::fmt::Debug for GitHubTokenRevocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubTokenRevocation")
+            .field("token_hash", &self.token_hash)
+            .field("request_id", &self.request_id)
+            .field("run_id", &self.run_id)
+            .field("job_id", &self.job_id)
+            .field("agent_job_id", &self.agent_job_id)
+            .field("app_id", &self.app_id)
+            .field("installation_id", &self.installation_id)
+            .field("repository", &self.repository)
+            .field("sealed_token", &"<sealed>")
+            .field("expires_at_us", &self.expires_at_us)
+            .field("attempts", &self.attempts)
+            .field("last_error", &self.last_error)
+            .finish()
+    }
+}
+
 /// Everything `acquirejob` needs in one read: the request record, its stored
 /// job-message TEMPLATE (secrets/tokens stripped; `preloop_secret_spec`
 /// carries what to resolve through the SecretProvider), the id-token grant

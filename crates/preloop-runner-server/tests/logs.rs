@@ -3917,18 +3917,26 @@ async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
             .expect("trusted job defers a token request");
         assert!(fork_request.untrusted);
         assert!(!trusted_request.untrusted);
-        let fork_mint = crate::broker::mint_dispatch_github_token(&shared, &fork_request).await;
+        let provenance = crate::github_token_revocation::JobTokenProvenance {
+            request_id: 1,
+            run_id: preloop_gha_protocol::RunId::new(),
+            job_id: preloop_gha_protocol::JobId("build".to_owned()),
+            agent_job_id: uuid::Uuid::new_v4(),
+        };
+        let fork_mint =
+            crate::broker::mint_dispatch_github_token(&shared, &fork_request, &provenance).await;
         assert!(
             matches!(fork_mint, Ok(None)),
             "fork job must not receive the PAT fallback under the `pat` policy"
         );
         let trusted_mint =
-            crate::broker::mint_dispatch_github_token(&shared, &trusted_request).await;
+            crate::broker::mint_dispatch_github_token(&shared, &trusted_request, &provenance).await;
         assert_eq!(
             trusted_mint
                 .expect("trusted job's mint failure is not a dispatch error")
                 .expect("pat policy hands the PAT to a trusted job")
-                .token,
+                .token
+                .expose(),
             "github_pat_broad",
             "the PAT fallback still applies to trusted jobs"
         );

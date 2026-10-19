@@ -245,6 +245,74 @@ pub(crate) trait ControlBackend: Send + Sync {
         token_request: &crate::models::GitHubTokenRequest,
     ) -> Result<(), ControlError>;
 
+    /// Persist a job-owned installation token's pending revocation.
+    ///
+    /// Must commit before the token is placed in a job message. The row keeps
+    /// only Envelope ciphertext plus the token hash and is deliberately not
+    /// tied to `job_requests` by a foreign key: the attempt may be archived or
+    /// purged while GitHub is unreachable, and the obligation must survive.
+    async fn record_github_token_revocation(
+        &self,
+        revocation: NewGitHubTokenRevocation,
+    ) -> Result<(), ControlError>;
+
+    /// Claim due pending revocations for one reconciler pass.
+    ///
+    /// A row is due when its attempt is terminal (or no longer exists), or
+    /// its token has already expired, and `next_attempt_at` has passed.
+    /// Claiming pushes `next_attempt_at` out by `claim_lease`, so another node
+    /// or a later pass does not race this one; a crash mid-call retries after
+    /// the lease. Failed attempts are counted by
+    /// [`Self::retry_github_token_revocation`].
+    async fn due_github_token_revocations(
+        &self,
+        now_us: i64,
+        limit: usize,
+        claim_lease_us: i64,
+    ) -> Result<Vec<GitHubTokenRevocation>, ControlError>;
+
+    /// Mark a revocation resolved: clear the sealed credential and turn the
+    /// row into a tombstone (`revoked` or `spent`) that survives until the
+    /// token's own expiry. Dispatch authentication consults tombstones before
+    /// the online/cache fallback, so a terminal job token cannot regain
+    /// authority through a stale validation cache. Idempotent.
+    async fn settle_github_token_revocation(
+        &self,
+        token_hash: &str,
+        resolution: TokenRevocationResolution,
+    ) -> Result<(), ControlError>;
+
+    /// Record a failed revocation attempt and schedule the next retry.
+    /// `error` is an HTTP status or transport description, never a token.
+    async fn retry_github_token_revocation(
+        &self,
+        token_hash: &str,
+        error: &str,
+        next_attempt_at_us: i64,
+    ) -> Result<(), ControlError>;
+
+    /// Delete tombstones and dead pending rows whose token expiry is older
+    /// than `cleanup_before_us`. Returns the number of rows removed.
+    async fn expire_github_token_revocations(
+        &self,
+        cleanup_before_us: i64,
+    ) -> Result<usize, ControlError>;
+
+    /// Whether a job-owned token may authenticate a dispatch right now.
+    ///
+    /// `None`: not a tracked job token (engine side-channel mint or a
+    /// third-party installation token) — the caller may use the ledger and
+    /// online paths. `Some(true)`: tracked, unexpired, still pending
+    /// revocation, and its attempt is live under the same rule as
+    /// `auth::job_is_live`. `Some(false)`: tracked and expired, settled,
+    /// revoked, or its attempt is terminal/timeout/lease-expired/missing.
+    /// Checked before any online validation, including the short-TTL cache.
+    async fn job_token_dispatchable(
+        &self,
+        token_hash: &str,
+        now_us: i64,
+    ) -> Result<Option<bool>, ControlError>;
+
     /// Record a runner's job completion: flip the job (and run) status,
     /// settle the request, release concurrency, promote newly-unblocked
     /// dependents, and return the post-transition run plus the effects the
@@ -1995,6 +2063,84 @@ impl ControlBackend for Backend {
             }
             Self::Postgres(b) => {
                 b.record_token_request(run_id, request_id, token_request)
+                    .await
+            }
+        }
+    }
+    async fn record_github_token_revocation(
+        &self,
+        revocation: NewGitHubTokenRevocation,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.record_github_token_revocation(revocation).await,
+            Self::Postgres(b) => b.record_github_token_revocation(revocation).await,
+        }
+    }
+    async fn due_github_token_revocations(
+        &self,
+        now_us: i64,
+        limit: usize,
+        claim_lease_us: i64,
+    ) -> Result<Vec<GitHubTokenRevocation>, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.due_github_token_revocations(now_us, limit, claim_lease_us)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.due_github_token_revocations(now_us, limit, claim_lease_us)
+                    .await
+            }
+        }
+    }
+    async fn settle_github_token_revocation(
+        &self,
+        token_hash: &str,
+        resolution: TokenRevocationResolution,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.settle_github_token_revocation(token_hash, resolution)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.settle_github_token_revocation(token_hash, resolution)
+                    .await
+            }
+        }
+    }
+    async fn expire_github_token_revocations(
+        &self,
+        cleanup_before_us: i64,
+    ) -> Result<usize, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.expire_github_token_revocations(cleanup_before_us).await,
+            Self::Postgres(b) => b.expire_github_token_revocations(cleanup_before_us).await,
+        }
+    }
+    async fn job_token_dispatchable(
+        &self,
+        token_hash: &str,
+        now_us: i64,
+    ) -> Result<Option<bool>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.job_token_dispatchable(token_hash, now_us).await,
+            Self::Postgres(b) => b.job_token_dispatchable(token_hash, now_us).await,
+        }
+    }
+    async fn retry_github_token_revocation(
+        &self,
+        token_hash: &str,
+        error: &str,
+        next_attempt_at_us: i64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.retry_github_token_revocation(token_hash, error, next_attempt_at_us)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.retry_github_token_revocation(token_hash, error, next_attempt_at_us)
                     .await
             }
         }

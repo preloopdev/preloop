@@ -326,6 +326,38 @@ CREATE TABLE github_token_requests (
     untrusted               INTEGER NOT NULL
 );
 
+-- Job-owned installation tokens owing a remote revocation. Deliberately has
+-- no foreign key to `job_requests`: an archived or purged attempt must not
+-- erase the obligation to revoke its token. `sealed_token` is Envelope
+-- ciphertext, never the raw credential. After a successful revoke (or a
+-- 401) the row becomes a tombstone with no sealed token, kept until the
+-- token's own `expires_at` so a stale online-validation cache cannot
+-- re-accept it; cleanup deletes rows once that expiry has passed.
+CREATE TABLE github_token_revocations (
+    token_hash              TEXT PRIMARY KEY,
+    request_id              INTEGER,
+    run_id                  TEXT NOT NULL,
+    job_id                  TEXT NOT NULL,
+    agent_job_id            TEXT NOT NULL,
+    app_id                  TEXT NOT NULL,
+    installation_id         INTEGER NOT NULL,
+    repository              TEXT NOT NULL,
+    sealed_token            BLOB,
+    expires_at              INTEGER NOT NULL,
+    state                   TEXT NOT NULL DEFAULT 'pending'
+                              CHECK (state IN ('pending','revoked','spent')),
+    attempts                INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at         INTEGER NOT NULL,
+    last_error              TEXT,
+    created_at              INTEGER NOT NULL
+);
+CREATE INDEX github_token_revocations_due
+    ON github_token_revocations(next_attempt_at);
+CREATE INDEX github_token_revocations_request
+    ON github_token_revocations(request_id);
+CREATE INDEX github_token_revocations_expiry
+    ON github_token_revocations(expires_at);
+
 CREATE TABLE job_steps (
     agent_job_id            TEXT NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,
     step_id                 TEXT NOT NULL,

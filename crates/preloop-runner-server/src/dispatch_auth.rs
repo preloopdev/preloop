@@ -226,7 +226,31 @@ async fn authenticate(
 
     // Installation tokens.
     //
-    // Fast path first: a token preloop itself minted is proven by the mint
+    // Durable job-token gate FIRST: a token minted for a dispatched job is
+    // rejected the moment its attempt is terminal (or the attempt row is
+    // gone), even if revocation is still pending, even after a restart has
+    // emptied the in-memory mint ledger, and before the short-TTL online
+    // validation cache. Otherwise a ledger miss would fall through to
+    // `validate_installation_online`, which accepts any still-valid token.
+    let bearer_hash = sha256_hex(bearer);
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    match crate::github_token_revocation::dispatchable_token(shared.as_ref(), &bearer_hash, now_us)
+        .await
+        .map_err(ApiError::from)?
+    {
+        Some(true) => {}
+        Some(false) => {
+            return Err(ApiError::unauthorized(
+                "this job's GitHub App installation token has ended and is no longer accepted",
+            ));
+        }
+        None => {}
+    }
+
+    // Fast path next: a token preloop itself minted is proven by the mint
     // ledger with no network traffic, which keeps dispatch working offline.
     // The token may have been minted by any registered App — not just the
     // legacy default — so the legacy ledger and every registry App's ledger

@@ -1032,6 +1032,11 @@ pub struct AppState {
     /// The full registered GitHub App registry. The legacy env-var App
     /// is always the first entry and mirrors `github_app`.
     pub github_apps: Option<crate::github_app::GitHubApps>,
+    /// Operator policy for a job whose App installation token cannot be
+    /// minted. Resolved and validated at startup even when no App is
+    /// configured, so `error` refuses the dispatch rather than letting the
+    /// common static-PAT fallback run.
+    pub github_mint_failure: crate::github_app::MintFailurePolicy,
     /// Short-TTL cache of installation tokens validated against github.com
     /// for the GitHub-compatible dispatch API.
     pub dispatch_token_cache: Arc<crate::dispatch_auth::InstallationTokenCache>,
@@ -1512,6 +1517,10 @@ impl AppState {
         // legacy field reports through the same breaker and accounting.
         let github_apps = crate::github_app::load_from(&config)?
             .map(|apps| apps.with_github_accounting(&github_breakers, &github_consumption));
+        // Validate the policy even when no App is configured: a typo must be
+        // a startup error in every mode, and `error` must remain enforceable
+        // on an App-less deployment (see `broker::mint_dispatch_github_token`).
+        let github_mint_failure = crate::github_app::MintFailurePolicy::load(&config)?;
         let github_app = github_apps
             .as_ref()
             .map(|registry| registry.default_app().clone());
@@ -1761,6 +1770,7 @@ impl AppState {
             store_mutation: Arc::new(Mutex::new(())),
             github_app,
             github_apps,
+            github_mint_failure,
             dispatch_token_cache: Arc::new(crate::dispatch_auth::InstallationTokenCache::default()),
             dispatch_actor_cache: Arc::new(crate::dispatch_auth::DispatchActorCache::default()),
             github_pat,

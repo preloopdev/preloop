@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **Job-owned GitHub App tokens are revoked at attempt terminal, and
+  `mint_failure=error` no longer falls through to the static PAT.** Every
+  installation token minted for a dispatched job is sealed in a durable
+  revocation ledger tied to its attempt and expiry before it enters the job
+  message. Completion, cancellation, timeout, dead-runner reaping and attempt
+  retries revoke it with `DELETE /installation/token` authenticated by the
+  token itself; transient GitHub failures are retained and retried with capped
+  backoff until the token expires. The dispatch-auth path rejects a tracked
+  token as soon as its attempt is terminal, before the online-validation cache
+  and across restarts, so a revoked or terminal job token cannot regain
+  authority by falling through to third-party validation. With a configured
+  App, no App at all, no coverage for the repository, or a lost deferred mint
+  request, an explicit `PRELOOP_GITHUB_APP_MINT_FAILURE=error` now refuses the
+  claim instead of embedding the repository-unscoped static PAT. PAT support on
+  its own is unchanged, and static PATs, OIDC JWTs and downstream STS
+  credentials remain unrevokable by the engine — see
+  `docs/control-plane/github/tokens.mdx` for the outage/crash window.
+
 ### Fixed
 
 - **Retries preserve nested-action authorization.** Retrying a claimed job now

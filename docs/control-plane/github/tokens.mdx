@@ -87,10 +87,24 @@ The ceiling is inactive until the table exists. When active, levels are `none < 
 | `PRELOOP_GITHUB_APP_MINT_FAILURE` | Job behavior |
 |---|---|
 | `local` | Do not use an App token. A later common broker fallback may still provide a verified static PAT. Remove the PAT or use `error` when fail-closed behavior is required. |
-| `error` | Fail the claimed job instead of running after an App mint failure. |
+| `error` | Fail the claimed job instead of running after an App mint failure. This includes a deployment with **no App at all** and an App that does not cover the repository: the common broker PAT fallback is refused, and the claim fails with an actionable error. A static PAT stored for server-side calls is never silently injected into a job under this policy. |
 | `pat` | Use the configured PAT without per-job or repository narrowing. |
 
-Fork pull-request jobs never receive the PAT fallback. They keep the local runtime credential even when App minting fails.
+Fork pull-request jobs never receive the PAT fallback. They keep the local runtime credential even when App minting fails. The legacy AzDO poll delivery path does not mint App tokens, so under `error` it also refuses the claim rather than embedding a PAT; use the broker delivery path for App-backed jobs.
+
+`error` is the existing App-only enforcement switch for *dispatched job tokens*.
+There is no separate `require_app` configuration. `preloop setup github --via app`
+and `--via pat` merely choose how the credential is stored; they do not enforce a
+mode at runtime. A fail-closed production deployment therefore combines:
+
+1. a GitHub App installed on the repository owner (or `installation_id` pinned),
+2. `PRELOOP_GITHUB_APP_MINT_FAILURE=error` (or `[github] mint_failure = "error"`), and
+3. no static PAT needed for job delivery — keeping `PRELOOP_GITHUB_TOKEN` is
+   still valid for server-side features (remote workflows, check runs, action
+   archives), because `error` never lets it reach a job.
+
+An invalid mint-failure value is a startup error even when no App is configured;
+it cannot disappear into a later fallback.
 
 ## PAT fallback
 
@@ -107,3 +121,55 @@ For an ordinary trusted job, the effective order is:
 3. An empty `GITHUB_TOKEN`; anonymous public API reads may still work.
 
 The runtime JWT remains separate at every step. It continues to authenticate cache, artifacts, logs, OIDC, and local checkout.
+
+## Revoking job App tokens
+
+Every installation token minted for a dispatched job is recorded before it
+enters the job message, bound to the execution attempt and the token's GitHub
+`expires_at`. The record holds the token sealed with the control-plane cluster
+key (the same envelope used for sealed configuration secrets) because GitHub's
+`DELETE /installation/token` must be authenticated **by the token being
+revoked**; the App private key cannot stand in for it.
+
+When the attempt reaches a terminal state — success, failure, cancellation,
+timeout, dead-runner reaping, or an attempt retry that retires the old
+execution — the lifecycle worker revokes that attempt's tokens. Engine
+side-channel mints (check-run updates, snapshots, remote action downloads) are
+not job-owned: they are neither tracked nor revoked. A reclaim of the same job
+mints a fresh token; the retired attempt's token is revoked separately, and
+sibling jobs' tokens are untouched.
+
+The GitHub-compatible dispatch API checks the durable record before its
+in-memory mint ledger and before online validation, including after an engine
+restart and ahead of the 60-second online-validation cache. A token whose
+attempt is terminal is therefore rejected for dispatch immediately, even while
+remote revocation is still pending.
+
+Honest limits:
+
+- **Outage window.** If GitHub is unreachable when the attempt ends, the token
+  remains valid at github.com until GitHub accepts the revoke or the token's
+  own `expires_at` (installation tokens are typically valid about an hour).
+  The engine retains the obligation and retries with capped exponential
+  backoff (up to 30 minutes between attempts) until expiry; it never reports a
+  revoke it did not observe.
+- **Crash window.** The revocation record commits before delivery, so a crash
+  after delivery cannot strand an untracked job token. Rows survive restart
+  and are retried. A crash between a successful mint and that commit results
+  in a token that never reached a guest; the engine attempts an inline revoke
+  and otherwise the credential expires untracked.
+- **Storage.** The sealed raw token lives in the control database until the
+  revoke succeeds or the token expires. Reading it requires both the database
+  and the cluster key; it is never written to event logs, job messages, or the
+  ordinary scheduling tables.
+- **PATs are not revocable.** A deployment that keeps `PRELOOP_GITHUB_TOKEN`
+  (the operator explicitly chose to keep PAT support) cannot job-revoke it:
+  copies already embedded in a job remain usable until the operator rotates
+  the PAT. The engine does not claim otherwise.
+- **OIDC and external sessions.** Preloop-signed OIDC JWTs and any downstream
+  STS credentials exchanged for them cannot be revoked by the engine after
+  issuance. Cloud providers must enforce short lifetimes, audience and subject
+  conditions.
+- **Official runners against github.com.** When the engine does not mint the
+  job's credential (an official runner talking directly to github.com), the
+  engine has no revocation authority over it.

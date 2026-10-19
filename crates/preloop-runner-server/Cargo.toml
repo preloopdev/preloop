@@ -121,6 +121,11 @@ path = "tests/registration.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "token_revocation"
+path = "tests/token_revocation.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "broker"
 path = "tests/broker.rs"
 required-features = ["test-support"]

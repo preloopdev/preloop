@@ -430,7 +430,13 @@ async fn persisted_token_request_without_trust_metadata_fails_closed() {
         declared: true,
         untrusted: old.untrusted,
     };
-    let mint = crate::broker::mint_dispatch_github_token(&shared, &old_request).await;
+    let provenance = crate::github_token_revocation::JobTokenProvenance {
+        request_id: 1,
+        run_id: preloop_gha_protocol::RunId::new(),
+        job_id: preloop_gha_protocol::JobId("build".to_owned()),
+        agent_job_id: uuid::Uuid::new_v4(),
+    };
+    let mint = crate::broker::mint_dispatch_github_token(&shared, &old_request, &provenance).await;
     assert!(
         matches!(mint, Ok(None)),
         "a request whose trust metadata was never recorded must not receive the PAT fallback"
@@ -1336,7 +1342,13 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
             state: state.clone(),
             shutdown,
         });
-        let mint = crate::broker::mint_dispatch_github_token(&shared, &request).await;
+        let provenance = crate::github_token_revocation::JobTokenProvenance {
+            request_id: 1,
+            run_id: preloop_gha_protocol::RunId::new(),
+            job_id: preloop_gha_protocol::JobId("build".to_owned()),
+            agent_job_id: uuid::Uuid::new_v4(),
+        };
+        let mint = crate::broker::mint_dispatch_github_token(&shared, &request, &provenance).await;
         match policy {
             // The job still runs; it just has no GitHub credential.
             MintFailurePolicy::LocalJwt => assert!(matches!(mint, Ok(None))),

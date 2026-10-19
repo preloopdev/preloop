@@ -143,6 +143,18 @@ async fn render_session_message(
         // a real GitHub credential. Without one the job's token surface stays
         // empty — never the job-scoped runtime token, which is an engine
         // credential (`broker_acquire_job` documents the full reasoning).
+        if !fork_restricted
+            && shared.state.github_mint_failure == crate::github_app::MintFailurePolicy::Error
+        {
+            // This legacy poll path never mints an App token. Under `error`
+            // that is a configuration/route mismatch, not a licence to embed
+            // the repository-unscoped static PAT: fail the attempt loudly.
+            crate::broker::fail_unclaimable_request(shared, ctx.request.request_id).await;
+            return Err(ApiError::bad_gateway(
+                "PRELOOP_GITHUB_APP_MINT_FAILURE=error: this job was delivered on the legacy \
+                 poll path, which has no GitHub App mint; refusing the static PAT fallback",
+            ));
+        }
         if !fork_restricted && let Some(pat) = shared.state.static_github_pat() {
             // The PAT is embedded only when its OAuth scopes are verified
             // (fresh cache, or re-introspected here: the job may have queued
@@ -159,7 +171,7 @@ async fn render_session_message(
                     crate::broker::apply_minted_token_to_message(
                         &mut msg,
                         &crate::broker::MintedGitHubToken {
-                            token: pat,
+                            token: preloop_gha_protocol::SecretString::new(pat),
                             effective_permissions: None,
                         },
                         false,

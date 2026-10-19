@@ -1862,6 +1862,12 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         run_background_reaper(checker_shared).await;
     });
+    // Job-token revocation has its own shutdown-aware worker: a hung GitHub
+    // socket must delay token cleanup, never the critical job-death reaper.
+    let revocation_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::github_token_revocation::run(revocation_shared).await;
+    });
     let cache_pruner_shared = shared.clone();
     tokio::spawn(async move {
         run_checkout_cache_pruner(cache_pruner_shared).await;
