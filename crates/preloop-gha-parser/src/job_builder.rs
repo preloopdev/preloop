@@ -395,6 +395,7 @@ pub fn build_agent_job_message_with_normalized_context(
         &strategy_value,
         secrets,
         &plan.inputs,
+        plan.shard_index.zip(plan.shard_total),
     );
 
     let mut resolved_secrets = BTreeMap::new();
@@ -415,6 +416,7 @@ pub fn build_agent_job_message_with_normalized_context(
         &strategy_value,
         &resolved_secrets,
         &plan.inputs,
+        plan.shard_index.zip(plan.shard_total),
     );
 
     // Resolve expressions in step env and with.
@@ -619,6 +621,25 @@ pub fn build_agent_job_message_with_normalized_context(
             .collect(),
     );
     context_data.insert("matrix".to_owned(), matrix_ctx);
+    // Preloop extension (`parallelism: N`): the shard's 1-based index and
+    // count, exposed to runner-side expressions as `shard.index` /
+    // `shard.count`. Only present for sharded jobs (mirrors how matrix keys
+    // are only meaningful when expanded).
+    if let (Some(index), Some(total)) = (plan.shard_index, plan.shard_total) {
+        context_data.insert(
+            "shard".to_owned(),
+            PipelineContextData::Dict(BTreeMap::from([
+                (
+                    "index".to_owned(),
+                    PipelineContextData::Number(index as f64),
+                ),
+                (
+                    "count".to_owned(),
+                    PipelineContextData::Number(total as f64),
+                ),
+            ])),
+        );
+    }
     context_data.insert(
         "needs".to_owned(),
         PipelineContextData::Dict(BTreeMap::new()),

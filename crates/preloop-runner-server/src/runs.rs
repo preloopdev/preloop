@@ -126,16 +126,28 @@ pub async fn metrics(State(shared): State<Arc<SharedState>>) -> impl IntoRespons
 /// token, so it must not contain spaces or other invalid token characters —
 /// the job display name ("Run tests with system wide configuration") would
 /// crash the worker with `FormatException`.
-fn orchestration_id(plan_id: &str, job_id: &str, matrix_index: Option<usize>) -> String {
+///
+/// Preloop extension: a `parallelism:` shard appends its 1-based shard index
+/// to the suffix (`build._1_2` for matrix cell 1, shard 2; `build.__shard_2`
+/// for a sharded non-matrix job), so two shards never share one
+/// orchestration ID.
+fn orchestration_id(
+    plan_id: &str,
+    job_id: &str,
+    matrix_index: Option<usize>,
+    shard_index: Option<usize>,
+) -> String {
     // The official runner emits this value as a User-Agent product token
     // (`ProductInfoHeaderValue("OrchestrationId", ...)`), so the whole string
     // must be token-safe. Reusable-call job ids contain '/' ("ci/build"),
     // which .NET rejects with FormatException. GitHub's own ids never carry
     // those characters; map everything outside the token alphabet to '-'.
     let job_id = sanitize_job_id_token(job_id);
-    match matrix_index {
-        Some(index) => format!("{plan_id}.{job_id}._{index}"),
-        None => format!("{plan_id}.{job_id}.__default"),
+    match (matrix_index, shard_index) {
+        (Some(matrix), Some(shard)) => format!("{plan_id}.{job_id}._{matrix}_{shard}"),
+        (Some(matrix), None) => format!("{plan_id}.{job_id}._{matrix}"),
+        (None, Some(shard)) => format!("{plan_id}.{job_id}.__shard_{shard}"),
+        (None, None) => format!("{plan_id}.{job_id}.__default"),
     }
 }
 
@@ -1748,6 +1760,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             &serde_json::json!({}),
             &BTreeMap::new(),
             &job.inputs,
+            job.shard_index.zip(job.shard_total),
         );
 
         // Evaluate condition for root jobs (no needs) outside the lock.
@@ -2863,6 +2876,7 @@ pub(crate) fn build_job_artifacts(
             &agent_msg.plan.plan_id,
             &job.base_id,
             job.matrix_index,
+            job.shard_index,
         )),
     );
     // GitHub's dispatcher sets `github.job` from the `system.github.job`
@@ -4059,6 +4073,7 @@ pub(crate) async fn rerun_run_with_mode(
                     &serde_json::json!({}),
                     &BTreeMap::new(),
                     &job.inputs,
+                    job.shard_index.zip(job.shard_total),
                 );
                 templates.push(crate::control::types::RerunJobTemplate {
                     job_id: job_id.clone(),
@@ -4632,20 +4647,45 @@ mod tests {
         // Plain job: `{planId}.{jobId}.__default` (golden:
         // 49f720db-...hello.__default)
         assert_eq!(
-            orchestration_id("49f720db-d368-4a3a-8b97-adbc8733aa79", "hello", None),
+            orchestration_id("49f720db-d368-4a3a-8b97-adbc8733aa79", "hello", None, None),
             "49f720db-d368-4a3a-8b97-adbc8733aa79.hello.__default"
         );
         // Matrix cells: 1-based index suffix (golden: build._1/_2/_3)
         assert_eq!(
-            orchestration_id("37e6d806-40ab-4d76-92bd-7f6b0c91c002", "build", Some(2)),
+            orchestration_id(
+                "37e6d806-40ab-4d76-92bd-7f6b0c91c002",
+                "build",
+                Some(2),
+                None
+            ),
             "37e6d806-40ab-4d76-92bd-7f6b0c91c002.build._2"
+        );
+        // Preloop `parallelism:` shards: the shard index joins the suffix so
+        // no two shards of one job share an orchestration ID.
+        assert_eq!(
+            orchestration_id(
+                "37e6d806-40ab-4d76-92bd-7f6b0c91c002",
+                "build",
+                Some(2),
+                Some(3)
+            ),
+            "37e6d806-40ab-4d76-92bd-7f6b0c91c002.build._2_3"
+        );
+        assert_eq!(
+            orchestration_id(
+                "37e6d806-40ab-4d76-92bd-7f6b0c91c002",
+                "build",
+                None,
+                Some(1)
+            ),
+            "37e6d806-40ab-4d76-92bd-7f6b0c91c002.build.__shard_1"
         );
         // The value must be a valid User-Agent product token: the official
         // runner inserts it into `ProductInfoHeaderValue`, which throws
         // FormatException on spaces (e.g. a display name like
         // "Run tests with system wide configuration").
-        assert!(!orchestration_id("p", "j", None).contains(' '));
-        assert!(!orchestration_id("p", "j", Some(1)).contains(' '));
+        assert!(!orchestration_id("p", "j", None, None).contains(' '));
+        assert!(!orchestration_id("p", "j", Some(1), Some(2)).contains(' '));
     }
 
     #[test]
@@ -4714,6 +4754,8 @@ mod tests {
             matrix: Default::default(),
             matrix_index: None,
             matrix_total: None,
+            shard_index: None,
+            shard_total: None,
             deferred_matrix: None,
             env: BTreeMap::new(),
             steps: Vec::new(),
@@ -4797,6 +4839,8 @@ mod tests {
             matrix: Default::default(),
             matrix_index: None,
             matrix_total: None,
+            shard_index: None,
+            shard_total: None,
             deferred_matrix: None,
             env: BTreeMap::new(),
             steps: Vec::new(),

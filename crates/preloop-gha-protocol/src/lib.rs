@@ -505,6 +505,23 @@ pub struct JobPlan {
     /// `strategy.job-total` context (1-based total, like GitHub).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix_total: Option<usize>,
+    /// 1-based index of this shard within its base job, when the job was
+    /// fanned out by the preloop `parallelism:` extension. Always paired with
+    /// `shard_total`; `None` when the job was not sharded.
+    ///
+    /// Preloop extension (GitHub has no `parallelism:` key): feeds the
+    /// `shard.index` expression context and the `PRELOOP_SHARD_INDEX` env var.
+    /// Wire-compatible: omitted from the serialized plan when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_index: Option<usize>,
+    /// Total number of shards for the base job, when the job was fanned out
+    /// by the preloop `parallelism:` extension. Always paired with
+    /// `shard_index`; `None` when the job was not sharded.
+    ///
+    /// Preloop extension: feeds the `shard.count` expression context and the
+    /// `PRELOOP_SHARD_COUNT` env var. Wire-compatible: omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_total: Option<usize>,
     /// Deferred expression for runtime dynamic matrix expansion, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_matrix: Option<String>,

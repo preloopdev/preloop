@@ -389,6 +389,8 @@ mod tests {
             matrix: Default::default(),
             matrix_index: None,
             matrix_total: None,
+            shard_index: None,
+            shard_total: None,
             deferred_matrix: None,
             env: Default::default(),
             steps: vec![],

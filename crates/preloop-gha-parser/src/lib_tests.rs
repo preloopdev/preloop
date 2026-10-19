@@ -1161,6 +1161,7 @@ jobs:
         &json!({}),
         &BTreeMap::new(),
         &cell.inputs,
+        cell.shard_index.zip(cell.shard_total),
     );
     assert_eq!(
         preloop_gha_expressions::eval_expression("inputs.dry_run", &ctx).unwrap(),
@@ -4504,5 +4505,303 @@ fn same_repository_refs_must_name_a_workflow_file_under_github_workflows() {
         "$/src/x.yml",
     ] {
         assert_eq!(same_repository_path(uses), None, "`{uses}` must be refused");
+    }
+}
+
+/// `parallelism: N` (a preloop extension — GitHub has no such key) fans one
+/// job out into N shard plans at expansion time, Buildkite-style. The shard
+/// ids are stable across re-runs, `base_id` stays the workflow job id so
+/// `needs:` fan-in works, and each shard sees `shard.index` / `shard.count`
+/// plus `PRELOOP_SHARD_INDEX` / `PRELOOP_SHARD_COUNT` in its environment.
+#[test]
+fn parallelism_fans_job_into_shard_plans() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: 4
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 4);
+    let ids: Vec<&str> = jobs.iter().map(|job| job.id.0.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "test (shard 1/4)",
+            "test (shard 2/4)",
+            "test (shard 3/4)",
+            "test (shard 4/4)",
+        ]
+    );
+    // Display names carry the same suffix.
+    let names: Vec<&str> = jobs.iter().map(|job| job.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "test (shard 1/4)",
+            "test (shard 2/4)",
+            "test (shard 3/4)",
+            "test (shard 4/4)",
+        ]
+    );
+    for (position, job) in jobs.iter().enumerate() {
+        let index = position + 1;
+        // `base_id` stays the workflow job id: this is what makes `needs:`
+        // fan-in and fail-fast sibling cancellation cover every shard.
+        assert_eq!(job.base_id, "test");
+        assert_eq!(job.shard_index, Some(index));
+        assert_eq!(job.shard_total, Some(4));
+        assert_eq!(job.env.get("PRELOOP_SHARD_INDEX"), Some(&index.to_string()));
+        assert_eq!(job.env.get("PRELOOP_SHARD_COUNT"), Some(&"4".to_owned()));
+    }
+}
+
+/// Steps address their shard through the `shard` expression context, so a
+/// test runner can partition work: `--partition ${{ shard.index }}/${{
+/// shard.count }}`. The context is only present when the job is sharded.
+#[test]
+fn parallelism_exposes_shard_index_and_count_to_expressions() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: 4
+    name: "shard ${{ shard.index }} of ${{ shard.count }}"
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 4);
+    let names: Vec<&str> = jobs.iter().map(|job| job.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "shard 1 of 4 (shard 1/4)",
+            "shard 2 of 4 (shard 2/4)",
+            "shard 3 of 4 (shard 3/4)",
+            "shard 4 of 4 (shard 4/4)",
+        ]
+    );
+}
+
+/// `parallelism: 1` is a no-op: one plan, no suffix, shard fields unset.
+#[test]
+fn parallelism_one_is_a_noop() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: 1
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id.0, "test");
+    assert_eq!(jobs[0].name, "test");
+    assert_eq!(jobs[0].shard_index, None);
+    assert_eq!(jobs[0].shard_total, None);
+    assert!(!jobs[0].env.contains_key("PRELOOP_SHARD_INDEX"));
+    assert!(!jobs[0].env.contains_key("PRELOOP_SHARD_COUNT"));
+}
+
+/// Invalid `parallelism:` values are parse errors, not silent misbehavior:
+/// zero shards, more than GitHub's 256-combination matrix cap, an expression
+/// (v1 has no runtime fan-out to evaluate it against), and a non-integral
+/// float.
+#[test]
+fn parallelism_rejects_invalid_values() {
+    for (label, value) in [
+        ("zero", "0"),
+        ("over the 256-shard cap", "257"),
+        ("expression", "${{ github.event.inputs.shards }}"),
+        ("non-integral float", "4.5"),
+    ] {
+        let workflow = parse_workflow(&format!(
+            r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: {value}
+    steps:
+      - run: echo hi
+"#
+        ))
+        .unwrap();
+        let error = expand_jobs(&workflow).expect_err(&format!("{label} must be rejected"));
+        let message = error.to_string();
+        assert!(
+            message.contains("parallelism"),
+            "{label}: error should name the key, got `{message}`"
+        );
+    }
+    // An integral float is accepted: YAML `4.0` parses as a float.
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: 4.0
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    assert_eq!(expand_jobs(&workflow).unwrap().len(), 4);
+}
+
+/// `parallelism:` composes with `matrix:` as one synthetic axis: the shard
+/// index restarts per matrix combination and every plan carries both.
+#[test]
+fn parallelism_multiplies_with_matrix() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: 2
+    strategy:
+      matrix:
+        os: [a, b]
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 4);
+    let ids: Vec<&str> = jobs.iter().map(|job| job.id.0.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "test (a) (shard 1/2)",
+            "test (a) (shard 2/2)",
+            "test (b) (shard 1/2)",
+            "test (b) (shard 2/2)",
+        ]
+    );
+    for job in &jobs {
+        assert_eq!(job.base_id, "test");
+        assert_eq!(job.shard_total, Some(2));
+        assert!(job.shard_index == Some(1) || job.shard_index == Some(2));
+        // The matrix combination still rides along.
+        let os = job.matrix.get("os").and_then(|value| value.as_str());
+        assert!(os == Some("a") || os == Some("b"));
+        assert_eq!(job.env.get("PRELOOP_SHARD_COUNT"), Some(&"2".to_owned()));
+    }
+}
+
+/// A downstream `needs: [sharded]` waits for every shard: needs matching
+/// keys on `base_id`, which shards keep, so fan-in is free.
+#[test]
+fn parallelism_needs_fans_in_over_all_shards() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  sharded:
+    runs-on: ubuntu-latest
+    parallelism: 4
+    steps:
+      - run: echo hi
+  downstream:
+    runs-on: ubuntu-latest
+    needs: [sharded]
+    steps:
+      - run: echo done
+"#,
+    )
+    .unwrap();
+
+    // Validation passes with the unexpanded need: no UnknownNeed error.
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 5);
+    let downstream = jobs
+        .iter()
+        .find(|job| job.id.0 == "downstream")
+        .expect("downstream plan");
+    assert_eq!(
+        downstream
+            .needs
+            .iter()
+            .map(|need| need.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sharded"]
+    );
+    // And the need resolves to all four shard plans via base_id matching,
+    // the same way validate_job_plans expands it.
+    let mut matched: Vec<&str> = jobs
+        .iter()
+        .filter(|candidate| candidate.base_id == "sharded")
+        .map(|candidate| candidate.id.0.as_str())
+        .collect();
+    matched.sort();
+    assert_eq!(
+        matched,
+        vec![
+            "sharded (shard 1/4)",
+            "sharded (shard 2/4)",
+            "sharded (shard 3/4)",
+            "sharded (shard 4/4)",
+        ]
+    );
+}
+
+/// A job without `parallelism:` behaves exactly as before: no suffix, no
+/// shard fields, no shard env vars.
+#[test]
+fn parallelism_absent_changes_nothing() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [a, b]
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].id.0, "test (a)");
+    for job in &jobs {
+        assert_eq!(job.shard_index, None);
+        assert_eq!(job.shard_total, None);
+        assert!(!job.env.contains_key("PRELOOP_SHARD_INDEX"));
+        assert!(!job.env.contains_key("PRELOOP_SHARD_COUNT"));
     }
 }

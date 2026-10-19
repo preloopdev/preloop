@@ -251,6 +251,9 @@ fn build_eval_context(ctx: &ConcurrencyContext<'_>) -> Context {
                 strategy,
                 &BTreeMap::new(),
                 ctx.inputs,
+                // Concurrency groups are evaluated without shard identity in
+                // v1; a sharded job's group is shared across its shards.
+                None,
             );
             if let Some(needs) = ctx.needs {
                 c.insert("needs", needs.clone());

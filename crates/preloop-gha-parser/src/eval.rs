@@ -307,26 +307,31 @@ const CTX_JOB_IF: &[&str] = &[
     "inputs",
     "vars",
     "needs",
+    "shard",
     "always(0,0)",
     "failure(0,MAX)",
     "cancelled(0,0)",
     "success(0,MAX)",
 ];
-const CTX_JOB_RUNS_ON: &[&str] = &["github", "inputs", "vars", "needs", "matrix", "strategy"];
+const CTX_JOB_RUNS_ON: &[&str] = &[
+    "github", "inputs", "vars", "needs", "matrix", "strategy", "shard",
+];
 const CTX_STRATEGY: &[&str] = &["github", "inputs", "vars", "needs"];
 const CTX_JOB_ENV: &[&str] = &[
-    "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets",
+    "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "shard",
 ];
 const CTX_JOB_CONCURRENCY: &[&str] = &["github", "inputs", "vars", "needs", "strategy", "matrix"];
 const CTX_JOB_DEFAULTS_RUN: &[&str] = &[
-    "github", "inputs", "vars", "strategy", "matrix", "needs", "env",
+    "github", "inputs", "vars", "strategy", "matrix", "needs", "env", "shard",
 ];
 const CTX_NO_EXPRESSIONS: &[&str] = &[];
-const CTX_JOB_CONTAINER: &[&str] = &["github", "inputs", "needs", "strategy", "matrix", "vars"];
+const CTX_JOB_CONTAINER: &[&str] = &[
+    "github", "inputs", "needs", "strategy", "matrix", "vars", "shard",
+];
 const CTX_CONTAINER_CREDENTIALS: &[&str] = &["github", "inputs", "vars", "secrets", "env"];
 const CTX_RUNNER: &[&str] = &[
     "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "steps", "job", "runner",
-    "env",
+    "env", "shard",
 ];
 const CTX_STEP_IF: &[&str] = &[
     "github",
@@ -335,6 +340,7 @@ const CTX_STEP_IF: &[&str] = &[
     "needs",
     "strategy",
     "matrix",
+    "shard",
     "steps",
     "job",
     "runner",
@@ -355,6 +361,7 @@ const CTX_STEP_TIMEOUT: &[&str] = &[
     "needs",
     "strategy",
     "matrix",
+    "shard",
     "secrets",
     "job",
     "runner",
@@ -368,6 +375,7 @@ const CTX_STEP_ENV: &[&str] = &[
     "needs",
     "strategy",
     "matrix",
+    "shard",
     "secrets",
     "steps",
     "job",
@@ -624,6 +632,7 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
 }
 
 /// Build an expression evaluation context from workflow data.
+#[allow(clippy::too_many_arguments)]
 pub fn build_context(
     github: &Value,
     env: &BTreeMap<String, String>,
@@ -632,6 +641,7 @@ pub fn build_context(
     strategy: &Value,
     secrets: &BTreeMap<String, String>,
     inputs: &BTreeMap<String, Value>,
+    shard: Option<(usize, usize)>,
 ) -> Context {
     let mut ctx = Context::default();
 
@@ -678,6 +688,17 @@ pub fn build_context(
     let inputs_value: Map<String, Value> =
         inputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     ctx.insert("inputs", Value::Object(inputs_value));
+    // Preloop extension (`parallelism: N`): the shard's 1-based index and the
+    // shard count, mirroring the `shard.index` / `shard.count` parse-time
+    // context. Only present for sharded jobs; evaluations that are not
+    // per-shard (concurrency groups, rerun condition templates) leave it
+    // absent.
+    if let Some((index, total)) = shard {
+        let mut shard_map = Map::new();
+        shard_map.insert("index".to_owned(), Value::from(index as u64));
+        shard_map.insert("count".to_owned(), Value::from(total as u64));
+        ctx.insert("shard", Value::Object(shard_map));
+    }
     ctx
 }
 
@@ -861,6 +882,7 @@ mod tests {
             &json!({}),
             &secrets,
             &BTreeMap::new(),
+            None,
         );
         assert_eq!(
             resolve_string("${{ secrets.PROBE_SECRET }}", &ctx).unwrap(),

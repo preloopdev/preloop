@@ -697,6 +697,16 @@ pub struct Job {
     /// runner as `jobTimeout` (seconds) on the job request message.
     #[serde(default, rename = "timeout-minutes")]
     pub timeout_minutes: Option<DeferredNumber>,
+    /// Shard fan-out for this job (preloop extension — GitHub has no such
+    /// key, so it deliberately lives at the top level of the job rather than
+    /// under `strategy`, which is GitHub's namespace).
+    ///
+    /// `parallelism: N` expands one job into N shard plans at expansion time
+    /// (like one synthetic matrix axis), each carrying `shard.index` /
+    /// `shard.count` and `PRELOOP_SHARD_INDEX` / `PRELOOP_SHARD_COUNT`.
+    /// Workflows using it are not portable to GitHub Actions.
+    #[serde(default)]
+    pub parallelism: Option<DeferredNumber>,
 }
 
 /// `defaults:` block in a job definition.

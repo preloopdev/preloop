@@ -2349,6 +2349,7 @@ fn build_reusable_expansion(
             &serde_json::json!({}),
             &BTreeMap::new(),
             &plan.inputs,
+            plan.shard_index.zip(plan.shard_total),
         )
     })?;
     Ok(BuiltExpansion::Reusable {
@@ -2417,6 +2418,7 @@ fn build_matrix_expansion(
             // The fan-out plans carry the node's scoped inputs on the plan
             // itself, so the cell `if:` sees the same `inputs` the steps will.
             &plan.inputs,
+            plan.shard_index.zip(plan.shard_total),
         )
     })?;
     Ok(BuiltExpansion::Matrix { jobs })

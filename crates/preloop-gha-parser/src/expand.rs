@@ -117,10 +117,15 @@ fn resolved_job_name(
     base_id: &str,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> String {
     match name {
-        Some(raw) => crate::eval::resolve_string(raw, &expression_context(matrix, inputs, None))
-            .unwrap_or_else(|_| raw.to_owned()),
+        Some(raw) => crate::eval::resolve_string(
+            raw,
+            &expression_context(matrix, inputs, None, shard_index, shard_total),
+        )
+        .unwrap_or_else(|_| raw.to_owned()),
         None => matrix_expand::display_job_name(base_id, matrix),
     }
 }
@@ -149,8 +154,10 @@ fn resolved_runs_on(
     labels: Vec<String>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> Vec<String> {
-    let context = expression_context(matrix, inputs, None);
+    let context = expression_context(matrix, inputs, None, shard_index, shard_total);
     let resolved: Vec<String> = labels
         .iter()
         .flat_map(|label| {
@@ -177,6 +184,8 @@ fn resolved_continue_on_error(
     job_id: &str,
     value: Option<&JobContinueOnError>,
     matrix: &IndexMap<String, Value>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> Result<bool, ParserError> {
     let Some(value) = value else {
         return Ok(false);
@@ -209,6 +218,7 @@ fn resolved_continue_on_error(
                         .collect(),
                 ),
             );
+            insert_shard_context(&mut context, shard_index, shard_total);
             let result = eval_expression(expression, &context).map_err(|error| {
                 ParserError::InvalidContinueOnError {
                     job_id: job_id.to_owned(),
@@ -225,10 +235,28 @@ fn resolved_continue_on_error(
     }
 }
 
+/// Insert the preloop `shard` expression context (`shard.index`, 1-based, and
+/// `shard.count`) when a job was fanned out by `parallelism:`. Shared by
+/// [`expression_context`] and the one place that builds its context by hand.
+fn insert_shard_context(
+    context: &mut Context,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
+) {
+    if let (Some(index), Some(total)) = (shard_index, shard_total) {
+        let mut shard_map = serde_json::Map::new();
+        shard_map.insert("index".to_owned(), Value::from(index as u64));
+        shard_map.insert("count".to_owned(), Value::from(total as u64));
+        context.insert("shard", Value::Object(shard_map));
+    }
+}
+
 fn expression_context(
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
     event_name: Option<&str>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> Context {
     let mut context = Context::default();
     context.insert(
@@ -240,6 +268,12 @@ fn expression_context(
                 .collect(),
         ),
     );
+    // Preloop extension: `parallelism: N` fans one job into N shards, and
+    // each shard sees its 1-based index and the total as `shard.index` /
+    // `shard.count` — mirroring how `matrix.*` is exposed. Only present when
+    // the job was actually sharded (N > 1), like `matrix_index` is only `Some`
+    // when a matrix expanded.
+    insert_shard_context(&mut context, shard_index, shard_total);
     let actual_event = event_name.unwrap_or(if inputs.is_some() && !inputs.unwrap().is_empty() {
         "workflow_dispatch"
     } else {
@@ -286,6 +320,8 @@ fn resolve_deferred_bool(
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
     default: bool,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> Result<bool, ParserError> {
     let Some(value) = value else {
         return Ok(default);
@@ -293,8 +329,11 @@ fn resolve_deferred_bool(
     match value {
         DeferredBool::Literal(value) => Ok(*value),
         DeferredBool::Expression(expression) => {
-            let result = eval_expression(expression, &expression_context(matrix, inputs, None))
-                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+            let result = eval_expression(
+                expression,
+                &expression_context(matrix, inputs, None, shard_index, shard_total),
+            )
+            .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             result.as_bool().ok_or_else(|| {
                 ParserError::InvalidExpression(format!(
                     "expression returned {result}, expected a boolean"
@@ -308,6 +347,8 @@ fn resolve_deferred_number(
     value: Option<&DeferredNumber>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> Result<Option<u64>, ParserError> {
     let Some(value) = value else { return Ok(None) };
     match value {
@@ -323,8 +364,11 @@ fn resolve_deferred_number(
             })
         }
         DeferredNumber::Expression(expression) => {
-            let result = eval_expression(expression, &expression_context(matrix, inputs, None))
-                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+            let result = eval_expression(
+                expression,
+                &expression_context(matrix, inputs, None, shard_index, shard_total),
+            )
+            .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             result.as_u64().map(Some).ok_or_else(|| {
                 ParserError::InvalidExpression(format!(
                     "expression returned {result}, expected a number"
@@ -333,6 +377,7 @@ fn resolve_deferred_number(
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn resolve_step_timeout(
     job_id: &str,
     step_label: &str,
@@ -340,6 +385,8 @@ fn resolve_step_timeout(
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
     matrix_deferred: bool,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> Result<Option<u32>, ParserError> {
     let resolved = if matrix_deferred {
         match value {
@@ -349,7 +396,7 @@ fn resolve_step_timeout(
             Some(DeferredNumber::Expression(_)) | None => None,
         }
     } else {
-        resolve_deferred_number(value, matrix, inputs)?
+        resolve_deferred_number(value, matrix, inputs, shard_index, shard_total)?
     };
     let Some(value) = resolved else {
         return Ok(None);
@@ -547,36 +594,106 @@ fn oidc_environment(
     }
 }
 
+/// Maximum `parallelism:` shards for one job.
+///
+/// Mirrors GitHub's 256-combination matrix cap: a shard fan-out is one
+/// synthetic matrix axis, so one job cannot declare more shards than a matrix
+/// could declare cells. (The matrix product itself is capped separately by
+/// the existing matrix expansion; the run-level jobs cap is the backstop for
+/// their product.)
+const MAX_PARALLELISM_SHARDS: u64 = 256;
+
+/// Resolve a job's `parallelism:` key to a shard count: 1 when unset.
+///
+/// Preloop extension (GitHub has no `parallelism:` key). Validation is strict
+/// so a typo cannot silently fan a run out into thousands of jobs. Only
+/// static values are accepted in v1 — an expression would need the runtime
+/// fan-out path, which does not exist yet, so it is a parse error rather than
+/// a silent no-op.
+fn resolve_parallelism(job_id: &str, job: &Job) -> Result<usize, ParserError> {
+    let Some(value) = job.parallelism.as_ref() else {
+        return Ok(1);
+    };
+    match value {
+        DeferredNumber::Expression(expression) => Err(ParserError::InvalidExpression(format!(
+            "job `{job_id}`: `parallelism:` does not accept expressions in v1 \
+             (got `{expression}`); use a whole number"
+        ))),
+        DeferredNumber::Literal(_) | DeferredNumber::Float(_) => {
+            let shards = value.literal().ok_or_else(|| {
+                ParserError::InvalidExpression(format!(
+                    "job `{job_id}`: `parallelism:` must be a whole number of shards"
+                ))
+            })?;
+            if shards == 0 {
+                return Err(ParserError::InvalidExpression(format!(
+                    "job `{job_id}`: `parallelism:` must be at least 1"
+                )));
+            }
+            if shards > MAX_PARALLELISM_SHARDS {
+                return Err(ParserError::InvalidExpression(format!(
+                    "job `{job_id}`: `parallelism:` {shards} exceeds the \
+                     {MAX_PARALLELISM_SHARDS}-shard limit"
+                )));
+            }
+            Ok(shards as usize)
+        }
+    }
+}
+
+/// Display name for one shard: the resolved job name plus a stable
+/// ` (shard i/N)` suffix, kept under GitHub's 100-character display cap the
+/// same way matrix names are truncated.
+fn shard_display_name(name: String, index: usize, total: usize) -> String {
+    let suffix = format!(" (shard {index}/{total})");
+    let max_base =
+        matrix_expand::MAX_DISPLAY_NAME_LEN.saturating_sub(suffix.encode_utf16().count());
+    format!(
+        "{}{suffix}",
+        matrix_expand::truncate_display_name_to(name, max_base)
+    )
+}
+
 /// Expand all jobs for a workflow.
 pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
+        let shards = resolve_parallelism(job_id, job)?;
         let (matrixes, deferred_matrix) =
             expand_matrix(job_id, job.strategy.matrix.as_ref(), None, None)?.into_cells();
         let matrix_deferred = deferred_matrix.is_some();
         let matrix_count = matrixes.len();
+        // A needs-deferred matrix keeps one un-suffixed placeholder node; the
+        // runtime fan-out (`expand_deferred_matrix_job`) replaces it with
+        // cells × shards. Fanning shards here too would double-count.
+        let shard_total = if matrix_deferred { 1 } else { shards };
         for (matrix_index, matrix) in matrixes.into_iter().enumerate() {
-            let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
-            let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
-            let mut env = global_env.clone();
-            env.extend(job.env.clone().into_strings());
-            let mut plan = job_plan_from_job(
-                job_id,
-                job,
-                expanded_id,
-                matrix,
-                (matrix_count > 1).then_some(matrix_index + 1),
-                (matrix_count > 1).then_some(matrix_count),
-                env,
-                oidc_environment,
-                workflow.permissions.as_ref(),
-                workflow.defaults.as_ref(),
-                None,
-                matrix_deferred,
-            )?;
-            plan.deferred_matrix = deferred_matrix.clone();
-            plans.push(plan);
+            for shard in 1..=shard_total {
+                let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
+                let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
+                let mut env = global_env.clone();
+                env.extend(job.env.clone().into_strings());
+                let sharded = shards > 1;
+                let mut plan = job_plan_from_job(
+                    job_id,
+                    job,
+                    expanded_id,
+                    matrix.clone(),
+                    (matrix_count > 1).then_some(matrix_index + 1),
+                    (matrix_count > 1).then_some(matrix_count),
+                    sharded.then_some(shard),
+                    sharded.then_some(shards),
+                    env,
+                    oidc_environment,
+                    workflow.permissions.as_ref(),
+                    workflow.defaults.as_ref(),
+                    None,
+                    matrix_deferred,
+                )?;
+                plan.deferred_matrix = deferred_matrix.clone();
+                plans.push(plan);
+            }
         }
     }
     dag::validate_job_plans(&plans)?;
@@ -591,6 +708,8 @@ fn job_plan_from_job(
     matrix: IndexMap<String, Value>,
     matrix_index: Option<usize>,
     matrix_total: Option<usize>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
     env: BTreeMap<String, String>,
     oidc_environment: Option<String>,
     workflow_permissions: Option<&Value>,
@@ -612,7 +731,13 @@ fn job_plan_from_job(
             _ => false,
         }
     } else {
-        resolved_continue_on_error(job_id, job.continue_on_error.as_ref(), &matrix)?
+        resolved_continue_on_error(
+            job_id,
+            job.continue_on_error.as_ref(),
+            &matrix,
+            shard_index,
+            shard_total,
+        )?
     };
     let fail_fast = if matrix_deferred {
         match job.strategy.fail_fast {
@@ -620,7 +745,14 @@ fn job_plan_from_job(
             _ => true,
         }
     } else {
-        resolve_deferred_bool(job.strategy.fail_fast.as_ref(), &matrix, inputs, true)?
+        resolve_deferred_bool(
+            job.strategy.fail_fast.as_ref(),
+            &matrix,
+            inputs,
+            true,
+            shard_index,
+            shard_total,
+        )?
     };
     let max_parallel = if matrix_deferred {
         job.strategy
@@ -628,7 +760,13 @@ fn job_plan_from_job(
             .as_ref()
             .and_then(DeferredNumber::literal)
     } else {
-        resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?
+        resolve_deferred_number(
+            job.strategy.max_parallel.as_ref(),
+            &matrix,
+            inputs,
+            shard_index,
+            shard_total,
+        )?
     };
     // Job `timeout-minutes` resolves like `max-parallel`: literals apply even
     // under a needs-deferred matrix, expressions wait for the runtime fan-out.
@@ -637,7 +775,13 @@ fn job_plan_from_job(
             .as_ref()
             .and_then(DeferredNumber::literal)
     } else {
-        resolve_deferred_number(job.timeout_minutes.as_ref(), &matrix, inputs)?
+        resolve_deferred_number(
+            job.timeout_minutes.as_ref(),
+            &matrix,
+            inputs,
+            shard_index,
+            shard_total,
+        )?
     };
     let steps = job
         .steps
@@ -656,6 +800,8 @@ fn job_plan_from_job(
                 &matrix,
                 inputs,
                 matrix_deferred,
+                shard_index,
+                shard_total,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -670,17 +816,55 @@ fn job_plan_from_job(
     {
         defaults.push(defaults_run_token(run));
     }
-    let name = resolved_job_name(job.name.as_deref(), job_id, &matrix, inputs);
+    let name = resolved_job_name(
+        job.name.as_deref(),
+        job_id,
+        &matrix,
+        inputs,
+        shard_index,
+        shard_total,
+    );
+    // Preloop `parallelism:` extension: one job fans out into N shard plans.
+    // The shard suffix keeps ids and display names distinct and stable across
+    // re-runs; `base_id` stays the workflow job id so `needs:` fan-in matches
+    // every shard (see `dag::validate_job_plans`) and fail-fast sibling
+    // cancellation (keyed by `base_id`) covers shards for free.
+    //
+    // Shard outputs are deliberately not individually addressable downstream:
+    // like matrix outputs, fan-out outputs have no clean addressing scheme,
+    // so v1 leaves them unaddressable rather than inventing one.
+    let (expanded_id, name) = match (shard_index, shard_total) {
+        (Some(index), Some(total)) => (
+            format!("{expanded_id} (shard {index}/{total})"),
+            shard_display_name(name, index, total),
+        ),
+        _ => (expanded_id, name),
+    };
+    let mut env = env;
+    if let (Some(index), Some(total)) = (shard_index, shard_total) {
+        // Preloop's own names, deliberately not Buildkite's: this is a
+        // preloop extension and the contract is preloop's to version.
+        env.insert("PRELOOP_SHARD_INDEX".to_owned(), index.to_string());
+        env.insert("PRELOOP_SHARD_COUNT".to_owned(), total.to_string());
+    }
     Ok(JobPlan {
         id: JobId(expanded_id),
         base_id: job_id.to_owned(),
         name,
         runner_group: job.runs_on.group(),
-        runs_on: resolved_runs_on(job.runs_on.labels(), &matrix, inputs),
+        runs_on: resolved_runs_on(
+            job.runs_on.labels(),
+            &matrix,
+            inputs,
+            shard_index,
+            shard_total,
+        ),
         needs: job.needs.ids(),
         matrix,
         matrix_index,
         matrix_total,
+        shard_index,
+        shard_total,
         // Set by the caller, which is what knows whether the matrix was
         // deferred; a concrete combination never carries an expression.
         deferred_matrix: None,
@@ -848,6 +1032,17 @@ fn expand_jobs_with_reusables_internal(
             if frame.depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
                 return Err(ParserError::MaxNestingDepthExceeded);
             }
+            // Preloop `parallelism:` v1 does not fan out reusable-workflow
+            // caller placeholders: the runtime materialization
+            // (`expand_reusable_call` / `expand_deferred_reusable_call`) would
+            // need a per-shard callee subtree. Reject loudly instead of
+            // silently running the caller unsharded.
+            if resolve_parallelism(job_id, job)? > 1 {
+                return Err(ParserError::InvalidExpression(format!(
+                    "job `{job_id}`: `parallelism:` is not supported on \
+                     reusable-workflow caller jobs in v1"
+                )));
+            }
             let uses = &callee_reference(declared, frame.origin, reusable_workflow_shas)?;
             let path = normalize_reusable_path(uses);
             let yaml = reusable_workflows
@@ -982,7 +1177,7 @@ fn expand_jobs_with_reusables_internal(
                 // every value raw: the runtime fan-out evaluates them per
                 // cell once the matrix exists.
                 let resolved_inputs: BTreeMap<String, Value> = if deferred_matrix.is_none() {
-                    let cell_context = expression_context(&matrix, inputs, event_name);
+                    let cell_context = expression_context(&matrix, inputs, event_name, None, None);
                     let mut evaluated = BTreeMap::new();
                     for (name, (input_type, coerced)) in &coerced_inputs {
                         let value = match coerced {
@@ -1051,6 +1246,8 @@ fn expand_jobs_with_reusables_internal(
                         job_id,
                         &matrix,
                         Some(&resolved_inputs),
+                        None,
+                        None,
                     ),
                     runner_group: None,
                     runs_on: Vec::new(),
@@ -1058,6 +1255,8 @@ fn expand_jobs_with_reusables_internal(
                     matrix,
                     matrix_index: (matrix_count > 1).then_some(matrix_index + 1),
                     matrix_total: (matrix_count > 1).then_some(matrix_count),
+                    shard_index: None,
+                    shard_total: None,
                     deferred_matrix: deferred_matrix.clone(),
                     env,
                     steps: Vec::new(),
@@ -1109,31 +1308,40 @@ fn expand_jobs_with_reusables_internal(
         // its upstream jobs finish, so `expand_matrix` reports it as deferred
         // rather than as zero cells. The job keeps one un-suffixed DAG node
         // (and its `if:` gating) until the runtime fan-out replaces it.
+        let shards = resolve_parallelism(job_id, job)?;
         let (matrix_cells, deferred_matrix) =
             expand_matrix(job_id, job.strategy.matrix.as_ref(), inputs, event_name)?.into_cells();
         let matrix_deferred = deferred_matrix.is_some();
         let matrix_count = matrix_cells.len();
+        // Like `expand_jobs`: a needs-deferred matrix keeps one placeholder;
+        // the runtime fan-out replaces it with cells × shards.
+        let shard_total = if matrix_deferred { 1 } else { shards };
         for (matrix_index, matrix) in matrix_cells.into_iter().enumerate() {
-            let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
-            let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
-            let mut env = global_env.clone();
-            env.extend(job.env.clone().into_strings());
-            let mut plan = job_plan_from_job(
-                job_id,
-                job,
-                expanded_id,
-                matrix,
-                (matrix_count > 1).then_some(matrix_index + 1),
-                (matrix_count > 1).then_some(matrix_count),
-                env,
-                oidc_environment,
-                workflow.permissions.as_ref(),
-                workflow.defaults.as_ref(),
-                inputs,
-                matrix_deferred,
-            )?;
-            plan.deferred_matrix = deferred_matrix.clone();
-            plans.push(plan);
+            for shard in 1..=shard_total {
+                let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
+                let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
+                let mut env = global_env.clone();
+                env.extend(job.env.clone().into_strings());
+                let sharded = shards > 1;
+                let mut plan = job_plan_from_job(
+                    job_id,
+                    job,
+                    expanded_id,
+                    matrix.clone(),
+                    (matrix_count > 1).then_some(matrix_index + 1),
+                    (matrix_count > 1).then_some(matrix_count),
+                    sharded.then_some(shard),
+                    sharded.then_some(shards),
+                    env,
+                    oidc_environment,
+                    workflow.permissions.as_ref(),
+                    workflow.defaults.as_ref(),
+                    inputs,
+                    matrix_deferred,
+                )?;
+                plan.deferred_matrix = deferred_matrix.clone();
+                plans.push(plan);
+            }
         }
     }
     Ok(plans)
@@ -1531,6 +1739,7 @@ impl InheritedDefaults<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn step_plan(
     job_id: &str,
     step_index: usize,
@@ -1539,6 +1748,8 @@ fn step_plan(
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
     matrix_deferred: bool,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> Result<StepPlan, ParserError> {
     let step_label = step
         .name
@@ -1551,6 +1762,8 @@ fn step_plan(
         matrix,
         inputs,
         matrix_deferred,
+        shard_index,
+        shard_total,
     )?;
     let working_directory = step
         .working_directory
@@ -1577,7 +1790,8 @@ fn step_plan(
                     DeferredBool::Expression(_) => None,
                 })
             } else {
-                resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
+                resolve_deferred_bool(Some(value), matrix, inputs, false, shard_index, shard_total)
+                    .map(Some)
             }
         })?,
         timeout_in_minutes,
@@ -1633,7 +1847,7 @@ fn expand_matrix(
             }
             let value = eval_expression(
                 expression,
-                &expression_context(&IndexMap::new(), inputs, event_name),
+                &expression_context(&IndexMap::new(), inputs, event_name, None, None),
             )
             .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             if value.is_null() {
@@ -1672,7 +1886,7 @@ fn expand_matrix(
         {
             let resolved = eval_expression(
                 expression,
-                &expression_context(&IndexMap::new(), inputs, event_name),
+                &expression_context(&IndexMap::new(), inputs, event_name, None, None),
             )
             .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             if resolved.is_null() {
@@ -1742,6 +1956,10 @@ pub fn expand_deferred_matrix_job(
 
     let combinations = resolve_deferred_matrix_cells(job_id, expression, needs_outputs, inputs)?;
     let matrix_count = combinations.len();
+    // The preloop `parallelism:` extension fans out here too: the parse-time
+    // placeholder carried no shards (fanning there would double-count), so the
+    // runtime fan-out produces cells × shards.
+    let shards = resolve_parallelism(job_id, job)?;
 
     let global_env = workflow.env.clone().into_strings();
     let mut plans = Vec::new();
@@ -1753,32 +1971,37 @@ pub fn expand_deferred_matrix_job(
         .map(|(prefix, _)| format!("{prefix}/"));
 
     for (matrix_index, matrix) in combinations.into_iter().enumerate() {
-        let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
-        let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
-        let mut env = global_env.clone();
-        env.extend(job.env.clone().into_strings());
-        let mut plan = job_plan_from_job(
-            job_id,
-            job,
-            expanded_id,
-            matrix,
-            (matrix_count > 1).then_some(matrix_index + 1),
-            (matrix_count > 1).then_some(matrix_count),
-            env,
-            oidc_environment,
-            workflow.permissions.as_ref(),
-            workflow.defaults.as_ref(),
-            inputs,
-            false,
-        )?;
-        if let Some(prefix) = &needs_prefix {
-            plan.needs = plan
-                .needs
-                .iter()
-                .map(|need| JobId(format!("{prefix}{}", need.0)))
-                .collect();
+        for shard in 1..=shards {
+            let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
+            let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
+            let mut env = global_env.clone();
+            env.extend(job.env.clone().into_strings());
+            let sharded = shards > 1;
+            let mut plan = job_plan_from_job(
+                job_id,
+                job,
+                expanded_id,
+                matrix.clone(),
+                (matrix_count > 1).then_some(matrix_index + 1),
+                (matrix_count > 1).then_some(matrix_count),
+                sharded.then_some(shard),
+                sharded.then_some(shards),
+                env,
+                oidc_environment,
+                workflow.permissions.as_ref(),
+                workflow.defaults.as_ref(),
+                inputs,
+                false,
+            )?;
+            if let Some(prefix) = &needs_prefix {
+                plan.needs = plan
+                    .needs
+                    .iter()
+                    .map(|need| JobId(format!("{prefix}{}", need.0)))
+                    .collect();
+            }
+            plans.push(plan);
         }
-        plans.push(plan);
     }
 
     Ok(plans)
@@ -1936,6 +2159,15 @@ pub fn expand_deferred_reusable_call(
     let matrix_count = cells.len();
     let mut jobs = Vec::new();
     let mut reusable_calls = BTreeMap::new();
+    // Preloop `parallelism:` v1 rejects sharded reusable-caller placeholders at
+    // parse time, so a sharded caller plan can never arrive here. Guard anyway:
+    // cloning it per cell without fanning shards would silently run unsharded.
+    if caller_plan.shard_total.is_some() {
+        return Err(ParserError::InvalidExpression(format!(
+            "job `{}`: `parallelism:` is not supported on reusable-workflow caller jobs in v1",
+            caller_plan.id.0
+        )));
+    }
     for (matrix_index, cell) in cells.into_iter().enumerate() {
         let mut cell_plan = caller_plan.clone();
         cell_plan.id = JobId(matrix_expand::expanded_job_id(&caller_plan.id.0, &cell));
@@ -1944,6 +2176,8 @@ pub fn expand_deferred_reusable_call(
             &caller_plan.id.0,
             &cell,
             Some(&caller_plan.inputs),
+            None,
+            None,
         );
         cell_plan.matrix = cell;
         cell_plan.matrix_index = (matrix_count > 1).then_some(matrix_index + 1);
@@ -1964,7 +2198,13 @@ pub fn expand_deferred_reusable_call(
                 {
                     let resolved = crate::eval::resolve_string(
                         raw,
-                        &expression_context(&cell_plan.matrix, Some(&caller_plan.inputs), None),
+                        &expression_context(
+                            &cell_plan.matrix,
+                            Some(&caller_plan.inputs),
+                            None,
+                            None,
+                            None,
+                        ),
                     )
                     .map_err(ParserError::InvalidExpression)?;
                     cell_plan

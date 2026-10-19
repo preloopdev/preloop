@@ -284,7 +284,7 @@ fn value_key(value: &Value) -> String {
 }
 
 /// GitHub's display-name length cap (`JobNameBuilder.Build`).
-const MAX_DISPLAY_NAME_LEN: usize = 100;
+pub(crate) const MAX_DISPLAY_NAME_LEN: usize = 100;
 
 /// Collect the scalar leaves of one matrix value in declaration order.
 ///
@@ -343,17 +343,24 @@ pub fn display_job_name(base: &str, matrix: &IndexMap<String, Value>) -> String 
 ///
 /// .NET counts UTF-16 code units; cut on a `char` boundary so a multi-byte
 /// character is never split.
-fn truncate_display_name(name: String) -> String {
+pub(crate) fn truncate_display_name(name: String) -> String {
+    truncate_display_name_to(name, MAX_DISPLAY_NAME_LEN)
+}
+
+/// Truncate a display name to an arbitrary UTF-16 cap, same convention as
+/// [`truncate_display_name`]. Used for shard-suffixed names, which reserve
+/// room for the ` (shard i/N)` suffix under the 100-character cap.
+pub(crate) fn truncate_display_name_to(name: String, max_len: usize) -> String {
     let mut units = 0;
     let mut keep = 0;
     for (index, character) in name.char_indices() {
-        if units + character.len_utf16() > MAX_DISPLAY_NAME_LEN - 3 {
+        if units + character.len_utf16() > max_len.saturating_sub(3) {
             break;
         }
         units += character.len_utf16();
         keep = index + character.len_utf8();
     }
-    if name.encode_utf16().count() <= MAX_DISPLAY_NAME_LEN {
+    if name.encode_utf16().count() <= max_len {
         return name;
     }
     format!("{}...", &name[..keep])

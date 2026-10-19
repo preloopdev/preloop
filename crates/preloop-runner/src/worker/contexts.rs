@@ -579,10 +579,10 @@ impl JobContext {
             ctx.insert("secrets", serde_json::Value::Object(secrets_map));
         }
 
-        // matrix/needs/strategy/vars/inputs from contextData
+        // matrix/needs/strategy/vars/inputs/shard from contextData
         // GitHub sends these in Azure DevOps typed-dictionary format;
         // decode before inserting so expression evaluation sees flat objects.
-        for key in ["matrix", "needs", "strategy", "vars", "inputs"] {
+        for key in ["matrix", "needs", "strategy", "vars", "inputs", "shard"] {
             if let Some(val) = self.context_data.get(key) {
                 ctx.insert(key, super::job_extension::decode_typed_value(val));
             }
