@@ -16,9 +16,9 @@ limitations are tracked in [the roadmap](../roadmap.md).
 The Rust runner protocol client (`preloop-runner`) lives in this workspace
 alongside the control plane.
 
-Upstream reference: `actions/runner` v2.336.0 (commit `98aabcd429c4e8402406c56ce2d26387fed3b9ce`)
+Upstream reference: `actions/runner` v2.337.0 (commit `397b032cbf865e9c3ddfab89d533ec19325e1273`)
 
-Previous baseline: `actions/runner` v2.335.1 (commit `7d737449ef346f6524f75688d0c9c95fa10ba10a`)
+Previous baseline: `actions/runner` v2.336.0 (commit `98aabcd429c4e8402406c56ce2d26387fed3b9ce`)
 
 
 ## GitHub App dispatch API compatibility (REST surface)
