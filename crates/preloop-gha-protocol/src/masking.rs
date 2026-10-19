@@ -557,23 +557,15 @@ fn wrapped_line_continues(bytes: &[u8], start: usize, end: usize) -> Option<usiz
 /// Segments are offered as they are produced and the caller decides on each
 /// one immediately: a body of millions of short segments never accumulates
 /// candidates, only the spans the caller keeps.
+///
+/// Runs are discovered as they are walked, never collected: the input is a
+/// log body an attacker controls, and a body of alternating one-byte runs and
+/// delimiters would otherwise cost a tuple per run for the run list and again
+/// for the wrap list — a multiple of the body size, held while the caller's
+/// masker lock is taken.
 fn for_each_candidate(text: &str, join_wraps: bool, visit: &mut impl FnMut(usize, usize, &str)) {
     let bytes = text.as_bytes();
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if !is_base64_byte(bytes[index]) {
-            index += 1;
-            continue;
-        }
-        let run_start = index;
-        while index < bytes.len() && is_base64_byte(bytes[index]) {
-            index += 1;
-        }
-        runs.push((run_start, index));
-    }
-
-    for &(run_start, run_end) in &runs {
+    for (run_start, run_end) in Base64Runs::new(bytes) {
         let run = &bytes[run_start..run_end];
         let mixed = run.iter().any(|byte| matches!(byte, b'+' | b'/'))
             && run.iter().any(|byte| matches!(byte, b'-' | b'_'));
@@ -587,67 +579,122 @@ fn for_each_candidate(text: &str, join_wraps: bool, visit: &mut impl FnMut(usize
     }
 
     if join_wraps {
-        // The segment a wrap continues: the run's last `=`-separated segment
-        // with trailing padding removed. A label before the token (`token=…`)
-        // is not part of the wrapped line, and padding ends it.
-        let wrap_segments: Vec<(usize, usize)> = runs
-            .iter()
-            .map(|&(run_start, run_end)| {
-                let end = bytes[run_start..run_end]
-                    .iter()
-                    .rposition(|byte| *byte != b'=')
-                    .map(|offset| run_start + offset + 1)
-                    .unwrap_or(run_start);
-                let start = bytes[run_start..end]
-                    .iter()
-                    .rposition(|byte| *byte == b'=')
-                    .map(|offset| run_start + offset + 1)
-                    .unwrap_or(run_start);
-                (start, end)
-            })
-            .collect();
-        for (position, &(segment_start, segment_end)) in wrap_segments.iter().enumerate() {
-            if segment_start == segment_end
-                || wrapped_line_continues(bytes, segment_start, segment_end).is_none()
-            {
-                continue;
-            }
-            // Only start at the head of a wrap chain, so a continuation line
-            // does not produce a second, nested candidate for the same wrap.
-            let head = position == 0 || {
-                let (previous_start, previous_end) = wrap_segments[position - 1];
-                previous_start == previous_end
-                    || wrapped_line_continues(bytes, previous_start, previous_end).is_none()
-            };
-            if !head {
-                continue;
-            }
-            let mut decode = String::from(&text[segment_start..segment_end]);
-            let mut chain_end = segment_end;
-            let mut chain_run = position;
-            let mut cursor = position + 1;
-            while let Some(&(next_start, next_end)) = wrap_segments.get(cursor) {
+        visit_wrap_chains(text, bytes, visit);
+    }
+}
+
+/// The maximal base64 runs of a byte slice, in order, without collecting them.
+struct Base64Runs<'a> {
+    bytes: &'a [u8],
+    index: usize,
+}
+
+impl<'a> Base64Runs<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, index: 0 }
+    }
+}
+
+impl Iterator for Base64Runs<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        let bytes = self.bytes;
+        while self.index < bytes.len() && !is_base64_byte(bytes[self.index]) {
+            self.index += 1;
+        }
+        if self.index >= bytes.len() {
+            return None;
+        }
+        let start = self.index;
+        while self.index < bytes.len() && is_base64_byte(bytes[self.index]) {
+            self.index += 1;
+        }
+        Some((start, self.index))
+    }
+}
+
+/// The segment of a run that a wrap continues: after the last `=` separator,
+/// with trailing `=` padding removed. A label before the token (`token=…`) is
+/// not part of the wrapped line, and padding ends it. Empty for an all-padding
+/// run.
+fn payload_segment(bytes: &[u8], run_start: usize, run_end: usize) -> (usize, usize) {
+    let end = bytes[run_start..run_end]
+        .iter()
+        .rposition(|byte| *byte != b'=')
+        .map(|offset| run_start + offset + 1)
+        .unwrap_or(run_start);
+    let start = bytes[run_start..end]
+        .iter()
+        .rposition(|byte| *byte == b'=')
+        .map(|offset| run_start + offset + 1)
+        .unwrap_or(run_start);
+    (start, end)
+}
+
+/// Visit reassembled wrap chains: a wrapped token continues on the line right
+/// after the line that ends it, so each run only needs to be compared with the
+/// one chain still open and the previous run's payload. Nothing per run is
+/// retained, so run density cannot amplify memory use.
+fn visit_wrap_chains(text: &str, bytes: &[u8], visit: &mut impl FnMut(usize, usize, &str)) {
+    // (candidate start, decode buffer, chain end, end of the run it ends in).
+    let mut chain: Option<(usize, String, usize, usize)> = None;
+    let mut previous: Option<(usize, usize)> = None;
+    for (run_start, run_end) in Base64Runs::new(bytes) {
+        let (segment_start, segment_end) = payload_segment(bytes, run_start, run_end);
+        let wrap_line = segment_start != segment_end
+            && wrapped_line_continues(bytes, segment_start, segment_end).is_some();
+        let mut close = false;
+        match chain.as_mut() {
+            Some((_, decode, chain_end, chain_run_end)) => {
                 // The continuation must begin on the line right after the wrap.
-                let newline = newline_len_at(bytes, chain_end);
-                if newline == 0 || next_start != chain_end + newline || next_start == next_end {
-                    break;
+                let newline = newline_len_at(bytes, *chain_end);
+                if newline != 0
+                    && segment_end > segment_start
+                    && segment_start == *chain_end + newline
+                {
+                    decode.push_str(&text[segment_start..segment_end]);
+                    *chain_end = segment_end;
+                    *chain_run_end = run_end;
+                    close = !wrap_line;
+                } else {
+                    close = true;
                 }
-                decode.push_str(&text[next_start..next_end]);
-                chain_end = next_end;
-                chain_run = cursor;
-                if wrapped_line_continues(bytes, next_start, next_end).is_none() {
-                    break;
-                }
-                cursor += 1;
             }
-            if chain_end != segment_end {
-                visit(
-                    segment_start,
-                    trailing_padding_end(bytes, chain_end, runs[chain_run].1),
-                    &decode,
-                );
+            None => {
+                // Only start at the head of a wrap chain, so a continuation
+                // line does not produce a second, nested candidate for the
+                // same wrap.
+                let previous_is_wrap = previous.is_some_and(|(start, end)| {
+                    start != end && wrapped_line_continues(bytes, start, end).is_some()
+                });
+                if wrap_line && !previous_is_wrap {
+                    chain = Some((
+                        segment_start,
+                        String::from(&text[segment_start..segment_end]),
+                        segment_end,
+                        run_end,
+                    ));
+                }
             }
         }
+        if close {
+            let (chain_start, decode, chain_end, chain_run_end) =
+                chain.take().expect("closed chain is open");
+            visit(
+                chain_start,
+                trailing_padding_end(bytes, chain_end, chain_run_end),
+                &decode,
+            );
+        }
+        previous = Some((segment_start, segment_end));
+    }
+    if let Some((chain_start, decode, chain_end, chain_run_end)) = chain {
+        visit(
+            chain_start,
+            trailing_padding_end(bytes, chain_end, chain_run_end),
+            &decode,
+        );
     }
 }
 
@@ -1591,6 +1638,23 @@ mod tests {
                 "over-masked {input}"
             );
         }
+    }
+
+    /// A log body an attacker controls can be dense in tiny base64 runs
+    /// (alternating runs, both alphabet families, padding, delimiters). The
+    /// scanner discovers runs as it walks them and keeps nothing per run, so
+    /// run density cannot amplify its memory beyond the tainted spans; the
+    /// body comes back byte-for-byte because no run is long enough to decode
+    /// to the secret.
+    #[test]
+    fn adversarial_run_density_is_returned_unchanged() {
+        let secret = "pentest-mask-9f3k2";
+        // Roughly 300k one- and two-byte runs in a 4 MiB body.
+        let mut input = String::with_capacity(4 * 1024 * 1024 + 16);
+        while input.len() < 4 * 1024 * 1024 {
+            input.push_str("A+b B_c A d=!aAdD=");
+        }
+        assert_eq!(mask_secrets_transform_aware(&input, [secret], &[]), input);
     }
 
     /// A multi-megabyte base64-alphabet run must complete and come back
