@@ -8,8 +8,8 @@
     "dark": "#0485F7"
   },
   "logo": {
-    "light": "/images/preloop-logo-wide.jpg",
-    "dark": "/images/preloop-logo-wide.jpg",
+    "light": "/images/preloop-logo-wide.png",
+    "dark": "/images/preloop-logo-wide.png",
     "href": "https://preloop.dev"
   },
   "favicon": "/images/preloop-logo.png",
