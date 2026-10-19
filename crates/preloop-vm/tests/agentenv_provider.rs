@@ -274,21 +274,30 @@ case "${1-}" in
         ;;
       delete)
         name=${3-}
-        # Serialize the whole rewrite against a concurrent create's append.
+        # Serialize the whole rewrite against a concurrent create's append, and
+        # against `start`, which validates this name under `$0.lock` before it
+        # records the mount: holding `$0.volume-lock` alone lets a delete land
+        # between that check and that append, leaving a mount that names a
+        # volume no longer in the table. Both locks, in that order, and always
+        # released before an exit.
+        while ! mkdir "$0.lock" 2>/dev/null; do sleep 0.01; done
         while ! mkdir "$0.volume-lock" 2>/dev/null; do sleep 0.01; done
         if ! grep -q "^$name|" "$volumes"; then
           rmdir "$0.volume-lock"
+          rmdir "$0.lock"
           printf 'volume %s not found\n' "$name" >&2
           exit 1
         fi
         if grep -q "|$name\$" "$mounts"; then
           rmdir "$0.volume-lock"
+          rmdir "$0.lock"
           printf 'volume %s is mounted by a sandbox and cannot be deleted\n' "$name" >&2
           exit 1
         fi
         grep -v "^$name|" "$volumes" > "$volumes.tmp" || true
         mv "$volumes.tmp" "$volumes"
         rmdir "$0.volume-lock"
+        rmdir "$0.lock"
         printf 'Deleted volume %s\n' "$name"
         ;;
       list)
