@@ -1277,7 +1277,13 @@ fn report_golden_download_progress(source: &str, downloaded_bytes: u64, total_by
 /// Free space on the filesystem holding `path`, in bytes.
 #[cfg(unix)]
 fn filesystem_available_space(path: &Path) -> std::io::Result<u64> {
-    let stat = nix::sys::statvfs::statvfs(path).map_err(std::io::Error::from)?;
+    // A directory the pool has not created yet lives on the volume of its nearest
+    // existing ancestor; statting the missing path refused every rotation.
+    let existing = path
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .unwrap_or(path);
+    let stat = nix::sys::statvfs::statvfs(existing).map_err(std::io::Error::from)?;
     Ok(stat.blocks_available() as u64 * stat.fragment_size() as u64)
 }
 
@@ -3395,6 +3401,20 @@ impl GoldenCache {
         *self.desired.write().await = Some(spec);
     }
 
+    /// Whether a switch to `fingerprint` is still owed: the desired identity is
+    /// not published yet, or no golden answers for it. A restart publishes the
+    /// configured identity while the previous generation still serves it as a
+    /// stand-in, and that is a rotation not yet done.
+    pub async fn staging_owed(&self, fingerprint: &str) -> bool {
+        let published = self
+            .desired
+            .read()
+            .await
+            .as_ref()
+            .map(|spec| spec.fingerprint.clone());
+        published.as_deref() != Some(fingerprint) || self.get(fingerprint).await.is_none()
+    }
+
     pub async fn desired(&self) -> Option<EnvironmentSpec> {
         self.desired.read().await.clone()
     }
@@ -3506,6 +3526,7 @@ impl GoldenCache {
         &self,
         fingerprint: String,
         name: MachineName,
+        previous: Option<&str>,
     ) -> Vec<(String, MachineName)> {
         let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
         let mut replaced = Vec::new();
@@ -3515,7 +3536,12 @@ impl GoldenCache {
                 entry.substitutes = None;
                 continue;
             }
-            if entry.substitutes.as_deref() != Some(fingerprint.as_str()) {
+            // Replaced: the entry that stood in for `fingerprint` while it was
+            // staged, and the generation this pool served before the switch.
+            let stood_in = entry.substitutes.as_deref() == Some(fingerprint.as_str());
+            let served_before = previous == Some(other_fingerprint.as_str())
+                && other_fingerprint.as_str() != fingerprint.as_str();
+            if !stood_in && !served_before {
                 continue;
             }
             entry.retiring = true;
@@ -4216,7 +4242,7 @@ async fn stage_and_switch_golden<P: VmProvider + 'static>(
         ));
     };
     for (fingerprint, retired) in cache
-        .switch_to(spec.fingerprint.clone(), name.clone())
+        .switch_to(spec.fingerprint.clone(), name.clone(), previous_fingerprint)
         .await
     {
         retire_golden(provider, config, cache, &fingerprint, &retired).await;
@@ -4340,7 +4366,9 @@ async fn golden_rotation_task<P: VmProvider + 'static>(
                 continue;
             }
         };
-        if current.fingerprint == desired.fingerprint {
+        // Owed until a golden answers for the desired identity: a restart publishes
+        // it while the previous generation still stands in for it.
+        if !cache.staging_owed(&desired.fingerprint).await {
             continue;
         }
         info!(
@@ -4986,7 +5014,13 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
     env_spec: &EnvironmentSpec,
     shutdown: &CancellationToken,
 ) -> Result<(), OrchestratorError> {
-    let payload = artifact_payload(&config.artifact_stem, &env_spec.base);
+    // Keyed by the *resolved* identity, not the raw base: a rotation's new
+    // generation is the same base string with a new source revision, and the
+    // unresolved payload path still holds the serving generation's pack. Using
+    // it here unpacked the old bytes under the new fingerprint — the golden
+    // "rotated" without changing, and the old payload was then deleted while
+    // the new golden still booted it.
+    let payload = payload_for_fingerprint(config, &env_spec.fingerprint);
     ensure_golden_payload(provider, config, env_spec, &payload, shutdown).await?;
     // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
     // launcher stub written at the payload stem. A downloaded release asset
@@ -15639,7 +15673,7 @@ mod golden_cache_tests {
         let fork = cache.fork_started(&previous).expect("the stand-in serves");
         assert!(
             cache
-                .switch_to("fp-new".to_owned(), next.clone())
+                .switch_to("fp-new".to_owned(), next.clone(), None)
                 .await
                 .is_empty(),
             "a live fork keeps the old golden until it exits"
@@ -15656,6 +15690,75 @@ mod golden_cache_tests {
             cache.releasable().await,
             vec![("fp-old".to_owned(), previous)]
         );
+    }
+
+    /// The generation served before a normal switch is retired by it, though
+    /// nothing registered it as a stand-in: it stops being a fork source and is
+    /// deleted once its last fork exits.
+    #[tokio::test]
+    async fn rotation_switch_retires_the_generation_served_before_it() {
+        let cache = Arc::new(GoldenCache::new("pool".to_owned()));
+        let previous = MachineName::new(fingerprint_golden_name("pool", &"aa".repeat(32))).unwrap();
+        let next = MachineName::new(fingerprint_golden_name("pool", &"bb".repeat(32))).unwrap();
+        cache.insert("fp-old".to_owned(), previous.clone()).await;
+        let fork = cache
+            .fork_started(&previous)
+            .expect("the served golden is tracked");
+        assert!(
+            cache
+                .switch_to("fp-new".to_owned(), next.clone(), Some("fp-old"))
+                .await
+                .is_empty(),
+            "a live fork keeps the previous golden until it exits"
+        );
+        assert_eq!(cache.get("fp-new").await, Some(next));
+        assert_eq!(
+            cache.retiring().await,
+            vec![("fp-old".to_owned(), previous.clone())]
+        );
+        drop(fork);
+        assert_eq!(
+            cache.releasable().await,
+            vec![("fp-old".to_owned(), previous)]
+        );
+    }
+
+    /// A restart publishes the configured identity before a golden for it
+    /// exists. The previous generation stands in, the switch is still owed, and
+    /// the switch retires the stand-in.
+    #[tokio::test]
+    async fn rotation_restart_during_staging_still_owes_the_switch() {
+        let cache = Arc::new(GoldenCache::new("pool".to_owned()));
+        let desired = EnvironmentSpec::for_base("preloop-official-golden".to_owned());
+        let fp = desired.fingerprint.clone();
+        let previous = MachineName::new(fingerprint_golden_name("pool", &"aa".repeat(32))).unwrap();
+        let next = MachineName::new(fingerprint_golden_name("pool", &"bb".repeat(32))).unwrap();
+        cache
+            .register_substitute(previous.clone(), "fp-old".to_owned(), fp.clone())
+            .await;
+        cache.set_desired(desired).await;
+        assert!(
+            cache.staging_owed(&fp).await,
+            "a stand-in is not the switched golden"
+        );
+        assert_eq!(
+            cache.switch_to(fp.clone(), next, Some(fp.as_str())).await,
+            vec![("fp-old".to_owned(), previous)],
+            "the switch retires the stand-in"
+        );
+        assert!(
+            !cache.staging_owed(&fp).await,
+            "the switched golden answers for the desired identity"
+        );
+    }
+
+    /// The staging preflight measures a directory the pool has not created yet on
+    /// the volume it will live on, instead of refusing to stage.
+    #[test]
+    fn a_path_not_yet_created_is_measured_on_its_volume() {
+        let scratch = tempfile::tempdir().unwrap();
+        let missing = scratch.path().join("vms").join("goldens");
+        assert!(filesystem_available_space(&missing).unwrap() > 0);
     }
 
     /// Staging a second golden needs room for *both*: the one serving keeps
