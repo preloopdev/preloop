@@ -430,6 +430,8 @@ fn spec(name: &str, bundle: &Path) -> MachineSpec {
         sockets: Vec::new(),
         dns: None,
         rosetta: false,
+        guest_volumes: Vec::new(),
+        workload_init: None,
     }
 }
 
