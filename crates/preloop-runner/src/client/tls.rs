@@ -203,10 +203,7 @@ mod tests {
     fn env_ca_bundle_is_loaded_and_missing_files_are_ignored() {
         let dir = std::env::temp_dir().join(format!("runner-tls-roots-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let Some(fixture) = TestCert::generate(&dir) else {
-            eprintln!("skipping: no usable openssl CLI to generate a test certificate");
-            return;
-        };
+        let fixture = TestCert::fixture(&dir);
         let bundle_path = fixture.cert_path.to_string_lossy().into_owned();
         let lookup =
             move |name: &str| (name == "PRELOOP_GITHUB_CA_FILE").then(|| bundle_path.clone());
@@ -251,10 +248,7 @@ mod tests {
     fn client_config_trusts_the_ca_bundle_over_tls() {
         let dir = std::env::temp_dir().join(format!("runner-tls-handshake-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let Some(fixture) = TestCert::generate(&dir) else {
-            eprintln!("skipping: no usable openssl CLI to generate a test certificate");
-            return;
-        };
+        let fixture = TestCert::fixture(&dir);
         let port = fixture.spawn_server();
         let pem = std::fs::read(&fixture.cert_path).unwrap();
 
@@ -283,9 +277,35 @@ mod tests {
         Ok(response)
     }
 
-    /// A throwaway self-signed `localhost` certificate, generated with the
-    /// `openssl` CLI so the runner crate needs no certificate-generation
-    /// dependency.
+    /// The throwaway self-signed `localhost` pair the loopback tests serve and
+    /// trust, committed as a fixture instead of generated with the `openssl`
+    /// CLI.
+    ///
+    /// The suite cannot rely on that CLI: the CI golden image is `ubuntu:24.04`
+    /// plus `git`/`curl`/`ca-certificates` and carries no `openssl` binary, so
+    /// both tests below returned early there and the CA-bundle path was never
+    /// exercised on CI. The key is a test-only throwaway that protects nothing
+    /// and is used nowhere else, and the certificate is valid for a century so
+    /// the fixture does not expire under the suite. It is explicitly `CA:FALSE`
+    /// because rustls rejects a CA certificate used as an end entity.
+    const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBmTCCAT6gAwIBAgIUMF5KHa1b0/eRFBuWbeSCZ5haBFYwCgYIKoZIzj0EAwIw\n\
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTAxOTA2MjE0OVoYDzIxMjYwOTI1\n\
+MDYyMTQ5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\n\
+PQMBBwNCAARy3OQjPn6fWKJ/4Vv1woHBGUNIHNM0BProY7H8phtNcodAbEWT5NuM\n\
++tA2jboLMYKeqZLsXH6kYOIgglmAQEE5o2wwajAdBgNVHQ4EFgQUn4mANVB9c/KN\n\
+LQTHjsQUWhCe0OowHwYDVR0jBBgwFoAUn4mANVB9c/KNLQTHjsQUWhCe0OowGgYD\n\
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwCgYIKoZIzj0E\n\
+AwIDSQAwRgIhANqJX/3MrRQTCDa/ZcFCd0Fd5dS1CblTq5TanNF6oQdcAiEA4uvu\n\
+Yw1lxkY2YPSI1eHI3rQ4U4WRmu3gFXOYjGb6/m8=\n\
+-----END CERTIFICATE-----\n";
+
+    const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgbprkw/QMtgoVDWgk\n\
+Eyl+sOWRirOb5m+Qhr28E6xdbU6hRANCAARy3OQjPn6fWKJ/4Vv1woHBGUNIHNM0\n\
+BProY7H8phtNcodAbEWT5NuM+tA2jboLMYKeqZLsXH6kYOIgglmAQEE5\n\
+-----END PRIVATE KEY-----\n";
+
     struct TestCert {
         cert_path: std::path::PathBuf,
         certs: Vec<CertificateDer<'static>>,
@@ -293,42 +313,21 @@ mod tests {
     }
 
     impl TestCert {
-        fn generate(dir: &std::path::Path) -> Option<Self> {
+        /// Materialize the committed fixture and load it. No external tool is
+        /// involved, so the loopback handshake runs wherever the suite does.
+        fn fixture(dir: &std::path::Path) -> Self {
             let cert_path = dir.join("cert.pem");
-            let key_path = dir.join("key.pem");
-            let config_path = dir.join("cert.cnf");
-            std::fs::write(
-                &config_path,
-                "[req]\ndistinguished_name = dn\nx509_extensions = v3_req\nprompt = no\n\
-                 [dn]\nCN = localhost\n\
-                 [v3_req]\nsubjectAltName = DNS:localhost,IP:127.0.0.1\n",
-            )
-            .ok()?;
-            let generated = std::process::Command::new("openssl")
-                .args([
-                    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                ])
-                .arg("-keyout")
-                .arg(&key_path)
-                .arg("-out")
-                .arg(&cert_path)
-                .arg("-config")
-                .arg(&config_path)
-                .output()
-                .ok()?;
-            if !generated.status.success() {
-                return None;
-            }
-            let certs = CertificateDer::pem_file_iter(&cert_path)
-                .ok()?
+            std::fs::write(&cert_path, CERT_PEM).expect("write the fixture certificate");
+            let certs = CertificateDer::pem_slice_iter(CERT_PEM.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
-                .ok()?;
-            let key = rustls::pki_types::PrivateKeyDer::from_pem_file(&key_path).ok()?;
-            Some(Self {
+                .expect("the fixture certificate parses");
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(KEY_PEM.as_bytes())
+                .expect("the fixture key parses");
+            Self {
                 cert_path,
                 certs,
                 key,
-            })
+            }
         }
 
         /// Serve one HTTPS response on a loopback port, then exit.
