@@ -175,7 +175,14 @@ case "${1-}" in
     ;;
   delete)
     id=${2-}
+    # The sandbox and mount tables are shared by every invocation, and this
+    # rewrite uses one fixed temp name: take the same lock a concurrent start
+    # takes, or two deletes collide on the temp file (`mv: ... No such file
+    # or directory`) and a rewrite can write back a table read before the
+    # other's append.
+    while ! mkdir "$0.lock" 2>/dev/null; do sleep 0.01; done
     if ! grep -qx "$id" "$sandboxes"; then
+      rmdir "$0.lock"
       printf 'sandbox %s not found\n' "$id" >&2
       exit 1
     fi
@@ -183,6 +190,7 @@ case "${1-}" in
     mv "$sandboxes.tmp" "$sandboxes"
     grep -v "^$id|" "$mounts" > "$mounts.tmp" || true
     mv "$mounts.tmp" "$mounts"
+    rmdir "$0.lock"
     printf 'ok\n'
     ;;
   volume)
