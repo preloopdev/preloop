@@ -3917,3 +3917,231 @@ async fn runner_lease_expiration_disconnect_reaper() {
         assert_eq!(run.status, ExecutionStatus::Failure);
     }
 }
+
+/// Provisioned registration never receives the system credential, and the
+/// exchanged RunnerManage grant is bound to the same one-time provision token:
+/// consuming it at agent creation makes every copy of the grant unusable.
+#[tokio::test]
+async fn provision_registration_grant_is_one_shot_and_never_system() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let provision = format!("provision-{}", uuid::Uuid::new_v4());
+    stage_provision_token(&state, &provision);
+
+    let exchange_uri = "/api/v3/actions/runner-registration";
+    let exchanged = request_json_with_bearer(
+        &app,
+        Method::POST,
+        exchange_uri,
+        json!({"url": "http://127.0.0.1:9090", "runner_event": "register"}),
+        &provision,
+    )
+    .await;
+    let grant = exchanged["token"].as_str().unwrap().to_owned();
+    assert_ne!(
+        grant, state.system_token,
+        "the guest must not receive the system token"
+    );
+    let claims = state
+        .verify_local_jwt_claims(&grant)
+        .expect("bound registration grant verifies while the provision token is pending");
+    assert!(
+        claims
+            .get("pvt_hash")
+            .and_then(|value| value.as_str())
+            .is_some(),
+        "the grant must carry the provision binding"
+    );
+    assert!(
+        claims.get("pvt_hash").and_then(|value| value.as_str())
+            != Some(crate::auth::provision_token_hash(&state.system_token).as_str()),
+        "the binding is to the provision token, not the system token"
+    );
+
+    let register = |bearer: String| {
+        let app = app.clone();
+        async move {
+            request_status_with_bearer(
+                &app,
+                Method::POST,
+                "/runner/server/_apis/v1/Agent/1/0",
+                json!({
+                    "name": format!("vm-{}", uuid::Uuid::new_v4()),
+                    "version": "2.335.1",
+                    "ephemeral": true,
+                    "labels": [{"name": "self-hosted", "type": "system"}]
+                }),
+                &bearer,
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        register(grant.clone()).await,
+        StatusCode::OK,
+        "a pending provision-bound grant registers the VM"
+    );
+    assert!(
+        state
+            .pending_registrations
+            .read()
+            .unwrap()
+            .get(&provision)
+            .is_none(),
+        "agent creation consumes the provision token the grant was bound to"
+    );
+    assert_eq!(
+        register(grant.clone()).await,
+        StatusCode::UNAUTHORIZED,
+        "a copied exchanged grant cannot register again after consumption"
+    );
+
+    // The raw provision token is spent too.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            exchange_uri,
+            json!({"url": "http://127.0.0.1:9090"}),
+            &provision,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // An operator system token still exchanges and registers normally.
+    let operator = request_json_with_bearer(
+        &app,
+        Method::POST,
+        exchange_uri,
+        json!({"url": "http://127.0.0.1:9090"}),
+        &state.system_token,
+    )
+    .await;
+    let operator_grant = operator["token"].as_str().unwrap();
+    assert!(
+        state
+            .verify_local_jwt_claims(operator_grant)
+            .unwrap()
+            .get("pvt_hash")
+            .is_none(),
+        "operator grants are not provision-bound"
+    );
+    assert_eq!(register(operator_grant.to_owned()).await, StatusCode::OK);
+
+    // A provision-bound grant is registration-only: it cannot delete agents.
+    let second = format!("provision-{}", uuid::Uuid::new_v4());
+    stage_provision_token(&state, &second);
+    let admin_bound = request_json_with_bearer(
+        &app,
+        Method::POST,
+        exchange_uri,
+        json!({"url": "http://127.0.0.1:9090"}),
+        &second,
+    )
+    .await;
+    let admin_bound = admin_bound["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::DELETE,
+            "/runner/server/_apis/distributedtask/pools/1/agents/999",
+            Value::Null,
+            &admin_bound,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "provision-bound grants must not reach runner administration"
+    );
+}
+
+/// A single-use runner's borrowed listen credential stops authenticating as
+/// soon as its attempt settles, even before/without the registration row
+/// being purged. A fresh idle ephemeral runner is still usable.
+#[tokio::test]
+async fn spent_ephemeral_runner_credentials_are_denied_before_purge() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let shared = state.shared();
+    let agent_job = uuid::Uuid::new_v4();
+    let run_key = register_live_job_in(&state, agent_job, "plan-ephemeral", "owner/repo").await;
+
+    let register_ephemeral = |name: String| {
+        let app = app.clone();
+        let bearer = state.system_token.clone();
+        async move {
+            let exchanged = request_json_with_bearer(
+                &app,
+                Method::POST,
+                "/api/v3/actions/runner-registration",
+                json!({"url": "http://127.0.0.1:9090"}),
+                &bearer,
+            )
+            .await;
+            let grant = exchanged["token"].as_str().unwrap().to_owned();
+            let registered = request_json_with_bearer(
+                &app,
+                Method::POST,
+                "/runner/server/_apis/v1/Agent/1/0",
+                json!({
+                    "name": name,
+                    "version": "2.335.1",
+                    "ephemeral": true,
+                    "labels": [{"name": "self-hosted", "type": "system"}]
+                }),
+                &grant,
+            )
+            .await;
+            registered["id"].as_i64().expect("registered runner id")
+        }
+    };
+    let spent = register_ephemeral("spent-vm".to_owned()).await;
+    let fresh = register_ephemeral("fresh-vm".to_owned()).await;
+
+    let listen = |id: i64| {
+        state
+            .local_jwt(json!({
+                "sub": format!("preloop-runner-listen-{id}"),
+                "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
+                "jti": uuid::Uuid::new_v4().to_string()
+            }))
+            .unwrap()
+    };
+    // Fresh idle single-use runner: no attempt yet, so its credentials work.
+    assert_eq!(
+        crate::auth::registered_runner_id(&shared, &listen(fresh)).await,
+        Some(fresh)
+    );
+
+    // Give the spent runner a terminal attempt.
+    let updated = state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE job_requests SET runner_id = ?2, result = 'success', finished_at = ?3 \
+                 WHERE agent_job_id = ?1",
+                (agent_job.to_string(), spent, crate::store::now_us()),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    assert_eq!(
+        crate::auth::registered_runner_id(&shared, &listen(spent)).await,
+        None,
+        "a spent ephemeral runner's listen token must not authenticate"
+    );
+    assert!(
+        !crate::auth::runner_registration_bearer_authorized(&state, &listen(spent)),
+        "a listen token is not a registration credential anyway"
+    );
+    // Other runners are unaffected.
+    assert_eq!(
+        crate::auth::registered_runner_id(&shared, &listen(fresh)).await,
+        Some(fresh)
+    );
+    let _ = run_key;
+    let _ = app;
+}

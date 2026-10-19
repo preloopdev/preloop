@@ -688,6 +688,21 @@ impl PgBackend {
             }
             PurgeGuard::RegistrationToken => exists && !owns_session().await?,
             PurgeGuard::IfPhantom => exists && !owns_session().await?,
+            PurgeGuard::SpentEphemeral => {
+                exists
+                    && tx
+                        .query_opt(
+                            "SELECT 1 FROM runners r WHERE r.runner_id = $1 AND r.ephemeral \
+                         AND EXISTS (SELECT 1 FROM job_requests q \
+                                     WHERE q.runner_id = r.runner_id AND q.result IS NOT NULL) \
+                         AND NOT EXISTS (SELECT 1 FROM job_requests q \
+                                         WHERE q.runner_id = r.runner_id AND q.result IS NULL)",
+                            &[&runner_id],
+                        )
+                        .await
+                        .map_err(db)?
+                        .is_some()
+            }
         };
         if !allowed {
             tx.commit().await.map_err(db)?;

@@ -7050,10 +7050,13 @@ async fn provision_runner<P: VmProvider + 'static>(
         "--ephemeral".into(),
         "--no-externals".into(),
     ]);
-    let mut secrets = vec![(
-        "PRELOOP_RUNNER_TOKEN".to_owned(),
-        SecretSource::HostEnv(config.registration_token_env.clone()),
-    )];
+    // Pool-provisioned guests must never receive the host's system token:
+    // bootstrap runs as guest root, so anything in its environment is
+    // attacker-controlled. They receive only the one-time provision
+    // credential, which the server accepts for the registration exchange and
+    // consumes at agent creation. A manual (non-pool) configure keeps the
+    // operator's usual token source.
+    let mut secrets = Vec::new();
     // One-time provision token: the control plane pairs this machine's
     // registration with the queued job the machine was provisioned for. The
     // guest cannot fabricate a pairing because only this exact configure
@@ -7097,10 +7100,27 @@ async fn provision_runner<P: VmProvider + 'static>(
                     "PRELOOP_PROVISION_TOKEN".to_owned(),
                     SecretSource::HostFile(path.clone()),
                 ));
+                // `configure --token` reads PRELOOP_RUNNER_TOKEN. Point it at
+                // the same one-time file; the server exchanges it for a
+                // provision-bound RunnerManage grant.
+                secrets.push((
+                    "PRELOOP_RUNNER_TOKEN".to_owned(),
+                    SecretSource::HostFile(path.clone()),
+                ));
                 provision_token_file = Some(path);
             }
             Err(error) => warn!(%error, "could not stage provision token"),
         }
+    }
+    if config.pending_registrations.is_none() {
+        // Manual/legacy configure outside the pool still uses the operator's
+        // token source. Pool provisioning with a failed token stage stays
+        // credential-less (and fails closed) rather than leaking the system
+        // token into the guest.
+        secrets.push((
+            "PRELOOP_RUNNER_TOKEN".to_owned(),
+            SecretSource::HostEnv(config.registration_token_env.clone()),
+        ));
     }
     // Held until `configure` returns; dropping it wipes the key from disk.
     let staged = stage_runner_key(config, name, keys).await;

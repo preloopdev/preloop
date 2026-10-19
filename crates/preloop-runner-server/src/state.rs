@@ -168,6 +168,7 @@ impl AppState {
     /// granted. Signing binds each URL to the one action it was minted for.
     pub fn sign_action_ticket(
         &self,
+        job: &str,
         owner: &str,
         repo: &str,
         git_ref: &str,
@@ -175,13 +176,17 @@ impl AppState {
     ) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key)
             .expect("HMAC accepts keys of any length");
-        mac.update(action_ticket_payload(owner, repo, git_ref, expires_at).as_bytes());
+        mac.update(action_ticket_payload(job, owner, repo, git_ref, expires_at).as_bytes());
         URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 
-    /// Whether `signature` authorises this exact action at this expiry.
+    /// Whether `signature` authorises this exact action at this expiry for
+    /// this job. The job is part of the signed payload so a URL minted for one
+    /// attempt cannot be replayed by another and can be liveness-checked at
+    /// serve time.
     pub fn verify_action_ticket(
         &self,
+        job: &str,
         owner: &str,
         repo: &str,
         git_ref: &str,
@@ -201,7 +206,7 @@ impl AppState {
         let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key) else {
             return false;
         };
-        mac.update(action_ticket_payload(owner, repo, git_ref, expires_at).as_bytes());
+        mac.update(action_ticket_payload(job, owner, repo, git_ref, expires_at).as_bytes());
         // Constant-time comparison: `verify_slice` rejects length mismatches
         // and never short-circuits on the first differing byte.
         mac.verify_slice(&provided).is_ok()
@@ -1979,8 +1984,14 @@ impl AppState {
 /// splice the `\n`-joined format into a different action's payload. Two
 /// distinct actions always sign distinct bytes, so a ticket minted for one
 /// action can never validate for another.
-fn action_ticket_payload(owner: &str, repo: &str, git_ref: &str, expires_at: u64) -> String {
-    serde_json::to_string(&("action-archive", owner, repo, git_ref, expires_at))
+fn action_ticket_payload(
+    job: &str,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+    expires_at: u64,
+) -> String {
+    serde_json::to_string(&("action-archive", job, owner, repo, git_ref, expires_at))
         .expect("a tuple of strings and an integer always serializes")
 }
 
@@ -2308,19 +2319,31 @@ mod tests {
     #[test]
     fn action_ticket_payload_is_injective_across_newline_splits() {
         let expires_at = 1_800_000_000u64;
-        let first = action_ticket_payload("acme", "repo", "v1\nx", expires_at);
-        let second = action_ticket_payload("acme", "repo\nv1", "x", expires_at);
+        let job = "11111111-1111-1111-1111-111111111111";
+        let first = action_ticket_payload(job, "acme", "repo", "v1\nx", expires_at);
+        let second = action_ticket_payload(job, "acme", "repo\nv1", "x", expires_at);
         assert_ne!(
             first, second,
             "two actions must never produce the same ticket payload"
         );
         // Sanity: the encoding still covers every component.
-        let baseline = action_ticket_payload("acme", "repo", "v1", expires_at);
+        let baseline = action_ticket_payload(job, "acme", "repo", "v1", expires_at);
         assert_ne!(baseline, first);
         assert_ne!(baseline, second);
         assert_ne!(
             baseline,
-            action_ticket_payload("acme", "repo", "v1", expires_at + 1)
+            action_ticket_payload(job, "acme", "repo", "v1", expires_at + 1)
+        );
+        assert_ne!(
+            baseline,
+            action_ticket_payload(
+                "22222222-2222-2222-2222-222222222222",
+                "acme",
+                "repo",
+                "v1",
+                expires_at
+            ),
+            "the owner job is part of the signed payload"
         );
     }
 
@@ -2336,14 +2359,26 @@ mod tests {
             .as_secs()
             + 3600;
 
-        let signature = state.sign_action_ticket("acme", "repo", "v1\nx", expires_at);
+        let job = "11111111-1111-1111-1111-111111111111";
+        let signature = state.sign_action_ticket(job, "acme", "repo", "v1\nx", expires_at);
         assert!(
-            state.verify_action_ticket("acme", "repo", "v1\nx", expires_at, &signature),
+            state.verify_action_ticket(job, "acme", "repo", "v1\nx", expires_at, &signature),
             "the minted action must verify"
         );
         assert!(
-            !state.verify_action_ticket("acme", "repo\nv1", "x", expires_at, &signature),
+            !state.verify_action_ticket(job, "acme", "repo\nv1", "x", expires_at, &signature),
             "a ticket for one action must not validate for a newline-split twin"
+        );
+        assert!(
+            !state.verify_action_ticket(
+                "22222222-2222-2222-2222-222222222222",
+                "acme",
+                "repo",
+                "v1\nx",
+                expires_at,
+                &signature
+            ),
+            "a ticket for one job must not validate for another"
         );
     }
     /// The fork-tier resolver used to take the scope's last `:` component,

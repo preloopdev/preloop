@@ -1124,6 +1124,58 @@ impl PgBackend {
             .is_some())
     }
 
+    /// Whether this runner may still use (or mint) runner credentials.
+    /// See [`runner_credentials_usable_tx`] for the rule shared with the
+    /// claim fence.
+    pub(super) async fn runner_credentials_usable(
+        &self,
+        runner_id: i64,
+    ) -> Result<bool, ControlError> {
+        let client = self.reader().await?;
+        Self::runner_credentials_usable_tx(&*client, runner_id).await
+    }
+
+    /// [`PgBackend::runner_credentials_usable`] over an existing client or
+    /// transaction. Shared with the claim fence so eligibility and the claim
+    /// read the same rule atomically.
+    pub(super) async fn runner_credentials_usable_tx(
+        client: &impl tokio_postgres::GenericClient,
+        runner_id: i64,
+    ) -> Result<bool, ControlError> {
+        Ok(client
+            .query_opt(
+                "SELECT 1 FROM runners r WHERE r.runner_id = $1 AND (\
+                    NOT r.ephemeral OR NOT EXISTS (\
+                        SELECT 1 FROM job_requests q \
+                        WHERE q.runner_id = r.runner_id AND q.result IS NOT NULL))",
+                &[&runner_id],
+            )
+            .await
+            .map_err(db)?
+            .is_some())
+    }
+
+    /// Whether a runner may take a new job, serialized on its registration
+    /// row. A single-use runner may own at most one attempt ever; the
+    /// `FOR UPDATE` makes a concurrent first claim wait, so two sessions
+    /// cannot both observe "no attempts" and claim.
+    pub(super) async fn runner_can_claim_tx(
+        client: &impl tokio_postgres::GenericClient,
+        runner_id: i64,
+    ) -> Result<bool, ControlError> {
+        Ok(client
+            .query_opt(
+                "SELECT 1 FROM runners r WHERE r.runner_id = $1 AND (\
+                    NOT r.ephemeral OR NOT EXISTS (\
+                        SELECT 1 FROM job_requests q \
+                        WHERE q.runner_id = r.runner_id)) FOR UPDATE",
+                &[&runner_id],
+            )
+            .await
+            .map_err(db)?
+            .is_some())
+    }
+
     /// The runner registered under an OAuth client id.
     ///
     /// Statement: `SELECT runner_id FROM runners WHERE client_id = $1`.

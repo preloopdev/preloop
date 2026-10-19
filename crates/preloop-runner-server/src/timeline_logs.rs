@@ -1020,10 +1020,17 @@ pub async fn authorize_reporting_callback(
     Ok(request)
 }
 
-/// [`authorize_reporting_callback`] for routes that *mutate* the run's
-/// records: ownership plus the liveness rule
-/// ([`crate::auth::authorize_live_reporting_request`]). A settled attempt's
-/// credential may still read its records, but it must not rewrite them.
+/// [`authorize_reporting_callback`] for routes that touch the run's records:
+/// ownership plus the liveness rule
+/// ([`crate::auth::authorize_live_reporting_request`]).
+///
+/// A job runtime token is handed to workflow code and outlives its attempt,
+/// so it must neither read nor rewrite the run's records after the attempt is
+/// settled, cancelled, timed out, or lease-expired. Reads that must survive
+/// the job use the native (system) API. Final-reporting routes
+/// (`FinishJob`, completion) deliberately keep
+/// [`authorize_reporting_callback`] so a late or duplicate report still
+/// settles the attempt.
 pub async fn authorize_live_reporting_callback(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
@@ -1070,7 +1077,7 @@ pub async fn get_timeline_records_authenticated(
     Query(query): Query<TimelineQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_id = path.3.parse().ok();
-    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    authorize_live_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
     get_timeline_records(State(shared), Path(path), Query(query)).await
 }
 
@@ -1149,7 +1156,7 @@ pub async fn get_timeline_records_plan_authenticated(
     Query(query): Query<TimelineQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
-    authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
+    authorize_live_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
     get_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Query(query)).await
 }
 

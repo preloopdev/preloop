@@ -594,6 +594,9 @@ impl ControlBackend for PgBackend {
     async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError> {
         self.runner_exists(runner_id).await
     }
+    async fn runner_credentials_usable(&self, runner_id: i64) -> Result<bool, ControlError> {
+        self.runner_credentials_usable(runner_id).await
+    }
     async fn runner_for_client(&self, client_id: &str) -> Result<Option<i64>, ControlError> {
         self.runner_for_client(client_id).await
     }

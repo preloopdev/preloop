@@ -5500,6 +5500,15 @@ impl PgBackend {
         caps: &RunnerCapabilities,
         require_assignments: bool,
     ) -> Result<Option<(RunId, JobId)>, ControlError> {
+        // A single-use runner may own at most one attempt ever. The runner
+        // row is locked for the duration of the claim transaction, so a
+        // concurrent completion/claim cannot observe "no attempts" and slip a
+        // second claim in.
+        if let Some(proven) = verified_runner_id
+            && !PgBackend::runner_can_claim_tx(tx, proven).await?
+        {
+            return Ok(None);
+        }
         let verified = verified_runner_id.is_some();
         let runner_match = logic::RunnerMatchRow {
             labels: caps.labels.clone(),

@@ -8,6 +8,7 @@
 use super::codec::{self, now_us};
 use super::jobs;
 use super::requests;
+use super::runners::runner_can_claim_tx;
 use super::{LiteBackend, db};
 use crate::control::backend::PollRequest;
 use crate::control::logic;
@@ -194,6 +195,15 @@ fn claim_one(
         Option<(Option<i64>, bool, bool, bool)>,
         Option<i64>,
     );
+    // A single-use runner may own at most one attempt ever. Eligibility and
+    // the claim share this writer transaction (SQLite has one writer), so a
+    // concurrent completion cannot slip a second claim in between the read
+    // and the UPDATE.
+    if let Some(proven) = verified_runner_id
+        && !runner_can_claim_tx(tx, proven)?
+    {
+        return Ok(None);
+    }
     let now = now_us();
     let fresh_after = now - crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
     let verified = verified_runner_id.is_some();

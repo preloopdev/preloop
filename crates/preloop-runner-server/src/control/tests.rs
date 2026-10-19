@@ -8406,6 +8406,92 @@ mod pg {
         suite::submit_poll_complete_lifecycle(&backend).await;
     }
 
+    /// A single-use runner may own one attempt: its credentials stay valid
+    /// through that attempt and stop when it settles; the claim fence denies
+    /// a second job; the spent-ephemeral purge guard deletes the row only
+    /// after no attempt is in flight. Exercises the PG SQL, not only SQLite.
+    #[tokio::test]
+    async fn ephemeral_runner_credentials_and_claim_fence() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let runner = backend
+            .register_runner(super::RegisterRunner {
+                ephemeral: true,
+                ..super::register_runner("ephemeral")
+            })
+            .await
+            .unwrap();
+        let runner_id = runner.runner.id;
+        assert!(backend.runner_credentials_usable(runner_id).await.unwrap());
+
+        let first_run = RunId::new();
+        backend
+            .submit_run(super::submit_run(
+                first_run,
+                vec![super::submit_job(first_run, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(super::create_session(runner_id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = backend
+            .poll_session(super::poll(&session.session_id, runner_id))
+            .await
+            .unwrap()
+        else {
+            panic!("ephemeral runner must claim its first job");
+        };
+        assert!(
+            backend.runner_credentials_usable(runner_id).await.unwrap(),
+            "credentials stay usable while the one attempt is in flight"
+        );
+
+        backend
+            .settle_agent_request(
+                claimed.request.request_id,
+                preloop_gha_protocol::ExecutionStatus::Success,
+                &crate::distributed_task::agent_request_locked_until(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !backend.runner_credentials_usable(runner_id).await.unwrap(),
+            "a settled single-use runner is spent"
+        );
+
+        let second_run = RunId::new();
+        backend
+            .submit_run(super::submit_run(
+                second_run,
+                vec![super::submit_job(second_run, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                backend
+                    .poll_session(super::poll(&session.session_id, runner_id))
+                    .await
+                    .unwrap(),
+                PollOutcome::Empty
+            ),
+            "a spent ephemeral runner must not claim a second job"
+        );
+
+        assert!(
+            backend
+                .purge_runner_guarded(runner_id, crate::control::PurgeGuard::SpentEphemeral)
+                .await
+                .unwrap()
+                .is_some(),
+            "atomic spent-ephemeral guard purges after the attempt settles"
+        );
+        assert!(!backend.runner_credentials_usable(runner_id).await.unwrap());
+    }
+
     #[tokio::test]
     async fn interactive_runs_are_claimed_ahead_of_older_pushes() {
         let Some((_pg, backend)) = backend().await else {

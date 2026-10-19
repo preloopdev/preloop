@@ -713,11 +713,21 @@ pub async fn register_runner_compat(
         runner_group_id,
         runner_group_name,
     };
-    let provision_token = headers
-        .get("x-preloop-provision-token")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let bearer_authorized = crate::auth::bearer_from_headers(&headers).is_some_and(|token| {
+    let bearer = crate::auth::bearer_from_headers(&headers);
+    // A pool-provisioned configure flow holds a one-time provision token (in
+    // its env/header) and exchanges it for a registration grant. Prefer the
+    // grant's own bound token so the grant and the header cannot authorize
+    // separate registrations; the bound value is looked up while the token is
+    // still pending, then consumed below.
+    let bound_provision =
+        bearer.and_then(|token| crate::auth::bound_provision_token(&shared.state, token));
+    let provision_token = bound_provision.or_else(|| {
+        headers
+            .get("x-preloop-provision-token")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    });
+    let bearer_authorized = bearer.is_some_and(|token| {
         crate::auth::runner_registration_bearer_authorized(&shared.state, token)
     });
     let provision_issued_at = provision_token

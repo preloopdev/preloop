@@ -205,7 +205,7 @@ pub async fn get_timeline_records_org(
     Query(query): Query<crate::timeline_logs::TimelineQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
-    crate::timeline_logs::authorize_reporting_callback(
+    crate::timeline_logs::authorize_live_reporting_callback(
         &shared,
         &headers,
         &plan_id,

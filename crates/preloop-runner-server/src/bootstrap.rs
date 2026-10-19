@@ -650,6 +650,42 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         }
     }
 
+    // Retry single-use runner cleanup every tick. Credentials are already
+    // denied by `runner_credentials_usable`, so this is hygiene, not the
+    // revocation itself: a failed/racy purge above, a lost orchestrator
+    // notification, or a restart cannot leave a spent registration able to
+    // authenticate.
+    for runner_id in shared
+        .state
+        .backend
+        .ephemeral_runner_ids()
+        .await
+        .unwrap_or_default()
+    {
+        if !shared
+            .state
+            .backend
+            .runner_credentials_usable(runner_id)
+            .await
+            .unwrap_or(true)
+        {
+            match shared
+                .state
+                .backend
+                .purge_runner_guarded(runner_id, crate::control::PurgeGuard::SpentEphemeral)
+                .await
+            {
+                Ok(Some(_)) => tracing::info!(runner_id, "retired spent ephemeral runner"),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    runner_id,
+                    ?error,
+                    "spent ephemeral runner cleanup failed; will retry next tick"
+                ),
+            }
+        }
+    }
+
     // Environment rules: refresh every key the resolver queued (first-seen
     // misses on GitHub-sourced repos, TTL-expired entries) ahead of the gate
     // sweep, so a `Pending` hold never outlives the fetch that unblocks it.

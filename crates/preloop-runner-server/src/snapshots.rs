@@ -4760,22 +4760,45 @@ const FORGE_RELAY_RESPONSE_HEADERS: &[&str] = &[
     "etag",
 ];
 
+/// The bearer token a forge-relay request presents, if any.
+///
+/// Extracted before awaiting: `hyper::Request<Body>` is not `Sync`, so holding
+/// a `&Request` across the liveness lookup makes the handler future non-`Send`.
+fn forge_relay_token(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(snapshot_authorization_token)
+}
+
 /// Authorize a forge-relay request with a live job runtime token.
 ///
 /// Same credential posture as [`snapshot_git_http`]: a Basic `x-access-token`
 /// (what `actions/checkout` sends) or a Bearer value must verify as a job
 /// runtime JWT. Anonymous callers get the Bearer challenge so git reports
 /// the rejection instead of prompting.
-fn authorize_forge_relay(state: &AppState, request: &Request) -> Result<(), Box<Response<Body>>> {
-    let token = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(snapshot_authorization_token);
-    match token.and_then(|token| state.job_uuid_from_token(&token)) {
-        Some(_) => Ok(()),
-        None => Err(Box::new(snapshot_unauthorized_response(
+async fn authorize_forge_relay(
+    state: &AppState,
+    token: Option<String>,
+) -> Result<(), Box<Response<Body>>> {
+    let Some(job) = token
+        .as_deref()
+        .and_then(|token| state.job_uuid_from_token(token))
+    else {
+        return Err(Box::new(snapshot_unauthorized_response(
             "forge relay requires a job runtime token",
+        )));
+    };
+    // The relay is reachable from inside the job VM and the runtime token is
+    // exported to workflow steps, so a settled, cancelled, timed-out, or
+    // lease-expired attempt must not keep using the engine as an anonymous
+    // Git/API proxy. The reload endpoint below deliberately re-checks the
+    // token before serving a snapshot tarball.
+    match crate::auth::job_is_live(state, job).await {
+        Ok(true) => Ok(()),
+        _ => Err(Box::new(snapshot_unauthorized_response(
+            "forge relay requires a live job runtime token",
         ))),
     }
 }
@@ -4854,7 +4877,8 @@ pub async fn forge_git_http(
     Path((org, repo)): Path<(String, String)>,
     request: Request,
 ) -> Result<Response<Body>, ApiError> {
-    if let Err(response) = authorize_forge_relay(&shared.state, &request) {
+    let token = forge_relay_token(&request);
+    if let Err(response) = authorize_forge_relay(&shared.state, token).await {
         return Ok(*response);
     }
     let method = request.method().clone();
@@ -4921,18 +4945,14 @@ pub async fn forge_api_repo_tarball(
     if !valid_repo_segment(&owner) || !valid_repo_segment(&repo) || !valid_archive_ref(&git_ref) {
         return Err(ApiError::bad_request("invalid archive path"));
     }
+    // The request body is not `Sync`: keep only the credential, and let the
+    // request go before awaiting, or the handler future is not `Send`.
+    let token = forge_relay_token(&request);
     if owner == "snapshots" {
-        // The request body is not `Sync`: keep only the credential, and let the
-        // request go before awaiting, or the handler future is not `Send`.
-        let token = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(snapshot_authorization_token);
         drop(request);
         return snapshot_repo_tarball(&shared, &repo, &git_ref, token).await;
     }
-    if let Err(response) = authorize_forge_relay(&shared.state, &request) {
+    if let Err(response) = authorize_forge_relay(&shared.state, token).await {
         return Ok(*response);
     }
     // The API base is the forge's own api host (`api.github.com` for the
@@ -5127,7 +5147,8 @@ pub async fn forge_api_repo(
     Path((owner, repo)): Path<(String, String)>,
     request: Request,
 ) -> Result<Response<Body>, ApiError> {
-    if let Err(response) = authorize_forge_relay(&shared.state, &request) {
+    let token = forge_relay_token(&request);
+    if let Err(response) = authorize_forge_relay(&shared.state, token).await {
         return Ok(*response);
     }
     // Same segment rules as `forge_git_http`: without them a decoded

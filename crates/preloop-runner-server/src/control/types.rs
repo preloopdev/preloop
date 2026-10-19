@@ -1087,6 +1087,11 @@ pub(crate) enum PurgeGuard {
     /// Liveness phantom sweep: purge only when the runner still exists and
     /// owns no session; otherwise purge nothing and report `false`.
     IfPhantom,
+    /// Single-use cleanup: purge only when the runner exists, is ephemeral,
+    /// has at least one settled attempt, and owns no unsettled attempt. The
+    /// eligibility checks and the delete share one transaction, so a claim
+    /// cannot slip in between them.
+    SpentEphemeral,
 }
 
 /// One reaper sweep over the runs with something due (`reap_sweep`). Built by

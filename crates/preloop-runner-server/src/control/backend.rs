@@ -941,6 +941,14 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Whether `runner_id` is registered (indexed point read).
     async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError>;
+    /// Whether this runner may still use (or mint) runner credentials.
+    ///
+    /// Every registered runner is usable; a single-use (`--ephemeral`) runner
+    /// stops being usable once any attempt it owned has settled. This is the
+    /// authoritative revocation rule — it does not depend on the registration
+    /// row being deleted, so a failed/racy purge or a restart cannot leave a
+    /// stolen listen token or RSA key able to mint/authenticate.
+    async fn runner_credentials_usable(&self, runner_id: i64) -> Result<bool, ControlError>;
 
     /// The runner registered under OAuth `client_id`, if any.
     async fn runner_for_client(&self, client_id: &str) -> Result<Option<i64>, ControlError>;
@@ -2533,6 +2541,13 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.runner_exists(runner_id).await,
             Self::Postgres(b) => b.runner_exists(runner_id).await,
+        }
+    }
+
+    async fn runner_credentials_usable(&self, runner_id: i64) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.runner_credentials_usable(runner_id).await,
+            Self::Postgres(b) => b.runner_credentials_usable(runner_id).await,
         }
     }
 
