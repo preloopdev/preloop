@@ -164,6 +164,12 @@ fn runner_volumes(
 /// so a stalled install reports curl's own error first, and only a hang the
 /// per-transfer limits cannot see reaches this deadline. A healthy install
 /// takes well under a minute.
+///
+/// The install runs in its own process group
+/// ([`deadline::run_command_status_in_group`]): the routine's real work is in
+/// grandchildren (`curl`, `shasum`, `tar`, the cached `node --version`), so
+/// killing the shell alone would leave the one hanging step running behind a
+/// failure the pool already reported.
 const HOST_EXTERNALS_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Deadline for one `cp -a` of the externals tree, into the runner bundle or
@@ -236,8 +242,11 @@ fn prune_stale_externals(externals_root: &Path) {
 ///
 /// Every subprocess it runs goes through `preloop_observability::deadline`, so
 /// the install and the bundle copies are bounded and their children are killed
-/// at the deadline. This is called from `RunnerPool::run`, and an unbounded wait
-/// here would stop every machine the pool would create.
+/// at the deadline — the install's whole process group, so the `curl` or `tar`
+/// it is waiting on dies with it. This is called from `RunnerPool::run`, and an
+/// unbounded wait here would stop every machine the pool would create; a
+/// shutdown there cancels this future outright, which kills the group for the
+/// same reason.
 async fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
     let externals = config.externals_dir.join("externals");
     let needs_host = crate::node_externals::expected_runtimes()
@@ -256,7 +265,12 @@ async fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), Orchestr
         for command in node_externals_at(config.externals_dir.to_string_lossy().as_ref()) {
             let mut install = tokio::process::Command::new(&command[0]);
             install.args(&command[1..]);
-            let status = deadline::run_command_status(
+            // The install is a shell routine whose real work (curl, tar, shasum)
+            // runs in grandchildren, so it starts its own process group: the
+            // runner kills that whole group at the deadline, and dropping the
+            // future kills it too — which is what `RunnerPool::run` does when a
+            // shutdown wins the race.
+            let status = deadline::run_command_status_in_group(
                 install,
                 HOST_EXTERNALS_INSTALL_TIMEOUT,
                 "host node externals install (nodejs.org)",
@@ -1164,11 +1178,19 @@ async fn reconcile_orphans<P: VmProvider + 'static>(
         }
         // Sweep first, so a data dir removed on this tick has the hypervisor
         // still holding its blocks released by the purge below, in the same
-        // tick, instead of an interval later.
-        match provider.sweep_orphaned_data_dirs().await {
-            Ok(swept) if swept > 0 => info!(swept, "removed orphaned machine data directories"),
-            Ok(_) => {}
-            Err(error) => warn!(%error, "periodic orphaned data-dir sweep failed"),
+        // tick, instead of an interval later. Bounded like the purge: the
+        // provider walks the registry and the data roots and can shell out for
+        // each machine, so a stalled sweep would stop this reconciler from ever
+        // reaching its deadline-protected work.
+        match tokio::time::timeout(HOST_CLEANUP_TIMEOUT, provider.sweep_orphaned_data_dirs()).await
+        {
+            Ok(Ok(swept)) if swept > 0 => info!(swept, "removed orphaned machine data directories"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "periodic orphaned data-dir sweep failed"),
+            Err(_) => warn!(
+                deadline = ?HOST_CLEANUP_TIMEOUT,
+                "periodic orphaned data-dir sweep abandoned at its deadline"
+            ),
         }
         match deadline::run_blocking(
             HOST_CLEANUP_TIMEOUT,
@@ -1845,10 +1867,29 @@ async fn download_oci_golden(
     // under an OCI index, so the digest/tags resolve to one indirection. The
     // shared client follows that one level, taking the first listed manifest
     // (our packs publish exactly one platform entry).
-    let resolved = match get_manifest(&metadata, &oci, MANIFEST_ACCEPT, None).await {
-        Ok(resolved) => resolved,
-        Err(error) => {
+    //
+    // One budget for the whole resolution, not the client's per-request one:
+    // an index costs two manifest fetches and possibly a bearer-token
+    // exchange, and each request would otherwise get its own
+    // [`GOLDEN_METADATA_TIMEOUT`], so a registry that dribbles `HEAD`-like
+    // answers could hold startup for a multiple of the advertised budget.
+    let resolved = match tokio::time::timeout(
+        GOLDEN_METADATA_TIMEOUT,
+        get_manifest(&metadata, &oci, MANIFEST_ACCEPT, None),
+    )
+    .await
+    {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => {
             warn!(reference, %error, "OCI golden manifest unavailable");
+            return Ok(false);
+        }
+        Err(_) => {
+            warn!(
+                reference,
+                deadline = ?GOLDEN_METADATA_TIMEOUT,
+                "OCI golden metadata lookup abandoned at its deadline"
+            );
             return Ok(false);
         }
     };
@@ -1889,15 +1930,21 @@ async fn download_oci_golden(
     let partial = golden_partial_path(payload);
     let downloaded = {
         let client = client.clone();
+        // The blob's 401 handshake goes to the metadata client: the token
+        // lookup is a small request, and answering it on the transfer client
+        // would give it the download's hour.
+        let token_client = metadata.clone();
         let blob_url = blob_url.clone();
         let repository = oci.repository.clone();
         download_golden_with_resume(&partial, "OCI", layer_size, None, move |offset| {
             let client = client.clone();
+            let token_client = token_client.clone();
             let url = blob_url.clone();
             let repository = repository.clone();
             Box::pin(async move {
                 crate::oci::registry_get(
                     &client,
+                    &token_client,
                     &url,
                     &repository,
                     "*/*",
@@ -4399,6 +4446,26 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
     Ok(())
 }
 
+/// What an `OrphanPurge::All` sweep that outlived its deadline means to its
+/// caller.
+///
+/// `All` is the only scope that may kill a *live* hypervisor, so it is only
+/// ever used where nothing of ours can be running: pool startup and pool
+/// teardown ([`preloop_vm::purge_orphaned_vms`]). Those two moments differ in
+/// what an abandoned sweep costs, which is all this decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanPurgeDuty {
+    /// The pool is about to boot machines. The sweep is bounded per child now,
+    /// but a caller that stopped waiting cannot know it finished, and it kills
+    /// from a process table it read after that: a runner booted in the
+    /// meantime is in it. Do not serve on that.
+    BeforeServing,
+    /// The pool is stopping, and this process is going away with the sweep
+    /// thread. An unfinished sweep is worth a warning, not an error that turns
+    /// an intentional stop into a reported failure.
+    WhileStopping,
+}
+
 impl<P: VmProvider + 'static> RunnerPool<P> {
     /// Construct a runner pool.
     pub fn new(provider: Arc<P>, config: RunnerPoolConfig) -> Result<Self, OrchestratorError> {
@@ -4426,10 +4493,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             pool_status: self.config.pool_status.clone(),
             armed: true,
         };
-        ensure_host_externals(&self.config).await?;
         // Every machine the phases below create before a shutdown is torn
         // down by `teardown`, so the cache exists from the first one on.
         let golden_cache = Arc::new(GoldenCache::new(self.config.name_prefix.clone()));
+        // A stop that arrives during the install must not wait out its
+        // 30-minute deadline: the install runs in its own process group, so
+        // dropping it here takes the shell, its `curl`, and its `tar` with it,
+        // and the next start redoes only what is still missing.
+        let Some(installed) = unless_shutdown(&shutdown, ensure_host_externals(&self.config)).await
+        else {
+            info!("shutdown during host externals install; stopping the pool");
+            return self.teardown(&golden_cache).await;
+        };
+        installed?;
         // A backend whose packs are not host files (AgentENV keeps them as
         // server-side snapshots) has no artifact to build, download, or
         // relocate: its golden is prepared directly from the base image by
@@ -4461,7 +4537,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             return Err(error);
         }
         self.sweep_stale_artifacts().await;
-        if let Err(error) = self.remove_stale_machines().await {
+        if let Err(error) = self
+            .remove_stale_machines(OrphanPurgeDuty::BeforeServing)
+            .await
+        {
             // A sweep that failed halfway may have left machines behind; give
             // the teardown a chance to finish the cleanup before reporting
             // the failure.
@@ -4693,7 +4772,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 );
             }
         }
-        self.remove_stale_machines().await
+        self.remove_stale_machines(OrphanPurgeDuty::WhileStopping)
+            .await
     }
 
     /// Golden slots the host can still afford alongside `runners` live VMs.
@@ -4956,7 +5036,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         Ok(())
     }
 
-    async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
+    /// Sweep the machines a previous engine left behind, then the hypervisors
+    /// and layer mounts they orphaned.
+    ///
+    /// `purge_duty` decides what an unfinished `All` orphan purge means to the
+    /// caller; see [`OrphanPurgeDuty`].
+    async fn remove_stale_machines(
+        &self,
+        purge_duty: OrphanPurgeDuty,
+    ) -> Result<(), OrchestratorError> {
         self.remove_stale_runner_machines().await?;
         // A crashed server orphans its detached `_boot-vm` hypervisor
         // processes; when the data dir was cleaned out from under them the
@@ -4975,8 +5063,25 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             Ok(Ok(killed)) if killed > 0 => {
                 info!(killed, "purged orphaned SmolVM hypervisor processes")
             }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "orphaned hypervisor purge abandoned"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "orphaned hypervisor purge failed"),
+            // `All` kills every hypervisor under this home, so a sweep this
+            // caller stopped waiting for is still a sweep that will kill: it
+            // reads the process table *after* the wait gave up, and a machine
+            // booted in the meantime is in that table. Continuing into machine
+            // creation would hand it exactly that.
+            Err(error) => match purge_duty {
+                OrphanPurgeDuty::BeforeServing => {
+                    return Err(OrchestratorError::Pool(format!(
+                        "orphaned hypervisor purge did not finish, so the host's hypervisor \
+                         state is unknown and an `All` sweep still running would kill the \
+                         runners booted next: {error}"
+                    )));
+                }
+                OrphanPurgeDuty::WhileStopping => {
+                    warn!(%error, "orphaned hypervisor purge abandoned")
+                }
+            },
         }
         // Killing a hypervisor releases its storage but not its layer mount:
         // the `pack/layers-cs` sparseimage stays attached to the host, and
@@ -5002,13 +5107,24 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // The registry sweep above cannot see a machine whose registry row is
         // gone but whose data dir survived (smolvm's delete drops the row
         // first; a failed remove_dir_all or a crashed engine strands the
-        // files). Reconcile the filesystem against the registry.
-        match self.provider.sweep_orphaned_data_dirs().await {
-            Ok(swept) if swept > 0 => {
+        // files). Reconcile the filesystem against the registry, bounded like
+        // every other step here: the sweep walks the data roots and can shell
+        // out per machine.
+        match tokio::time::timeout(
+            HOST_CLEANUP_TIMEOUT,
+            self.provider.sweep_orphaned_data_dirs(),
+        )
+        .await
+        {
+            Ok(Ok(swept)) if swept > 0 => {
                 info!(swept, "removed orphaned machine data directories")
             }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "orphaned data-dir sweep failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "orphaned data-dir sweep failed"),
+            Err(_) => warn!(
+                deadline = ?HOST_CLEANUP_TIMEOUT,
+                "orphaned data-dir sweep abandoned at its deadline"
+            ),
         }
         self.sweep_pack_intermediates().await;
         Ok(())

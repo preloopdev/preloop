@@ -293,8 +293,16 @@ fn push_challenge_param(params: &mut Vec<(String, String)>, raw: &mut String) {
 /// A `token` already in hand short-circuits the challenge; `resume_from` adds a
 /// byte range on both the first and the retried request, which is what makes a
 /// resumed blob transfer authenticate the same way as a fresh one.
+///
+/// `token_client` serves the token exchange only. A blob needs the caller's
+/// long-lived transfer client for its body, but the 401 that triggers the
+/// handshake comes back immediately: exchanging it on the transfer client would
+/// let a stalled token service hold a 9.6 GB pull — and therefore pool start —
+/// for the transfer's whole budget. Callers whose `client` already carries the
+/// metadata deadline pass it for both.
 pub async fn registry_get(
     client: &reqwest::Client,
+    token_client: &reqwest::Client,
     url: &str,
     repository: &str,
     accept: &str,
@@ -327,7 +335,7 @@ pub async fn registry_get(
         let Some(challenge) = challenge else {
             return Err(OciError::Unauthorized);
         };
-        let Some(token) = request_bearer_token(client, &challenge, repository).await? else {
+        let Some(token) = request_bearer_token(token_client, &challenge, repository).await? else {
             return Err(OciError::Unauthorized);
         };
         let response = send(Some(&token))
@@ -444,7 +452,16 @@ async fn fetch_json(
     reference: &OciReference,
     accept: &str,
 ) -> Result<Value, OciError> {
-    let response = registry_get(client, url, &reference.repository, accept, None, None).await?;
+    let response = registry_get(
+        client,
+        client,
+        url,
+        &reference.repository,
+        accept,
+        None,
+        None,
+    )
+    .await?;
     let body = response.bytes().await.map_err(|error| {
         OciError::Message(format!("cannot read the response from {url}: {error}"))
     })?;
