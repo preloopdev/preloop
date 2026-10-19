@@ -216,15 +216,24 @@ case "${1-}" in
           sleep 1
           rmdir "$0.in-create" 2>/dev/null || true
         fi
+        # The volume table is shared by every invocation of this fake, and these
+        # tests start machines in parallel: serialize the check and the append
+        # against the read-modify-write a concurrent delete does, or that
+        # rewrite writes back a table read before this append — the volume
+        # vanishes and the flow's next inspect reports it not found.
+        while ! mkdir "$0.volume-lock" 2>/dev/null; do sleep 0.01; done
         if grep -q "^$name|" "$volumes"; then
+          rmdir "$0.volume-lock"
           printf 'volume %s already exists\n' "$name" >&2
           exit 1
         fi
         if [ -n "$from" ] && ! grep -q "^$from|" "$volumes"; then
+          rmdir "$0.volume-lock"
           printf 'volume %s not found\n' "$from" >&2
           exit 1
         fi
         printf '%s|%s|%s\n' "$name" "$mode" "$from" >> "$volumes"
+        rmdir "$0.volume-lock"
         printf 'Created volume %s\n' "$name"
         ;;
       inspect)
@@ -240,16 +249,21 @@ case "${1-}" in
         ;;
       delete)
         name=${3-}
+        # Serialize the whole rewrite against a concurrent create's append.
+        while ! mkdir "$0.volume-lock" 2>/dev/null; do sleep 0.01; done
         if ! grep -q "^$name|" "$volumes"; then
+          rmdir "$0.volume-lock"
           printf 'volume %s not found\n' "$name" >&2
           exit 1
         fi
         if grep -q "|$name\$" "$mounts"; then
+          rmdir "$0.volume-lock"
           printf 'volume %s is mounted by a sandbox and cannot be deleted\n' "$name" >&2
           exit 1
         fi
         grep -v "^$name|" "$volumes" > "$volumes.tmp" || true
         mv "$volumes.tmp" "$volumes"
+        rmdir "$0.volume-lock"
         printf 'Deleted volume %s\n' "$name"
         ;;
       list)
