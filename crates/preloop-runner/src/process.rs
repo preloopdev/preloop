@@ -135,9 +135,10 @@ pub(crate) fn is_internal_step_env(key: &str) -> bool {
 /// are untouched) and is overridable with
 /// `PRELOOP_RUNNER_INHERIT_HOST_ENV=1` for workflows that genuinely rely on a
 /// host credential variable (which should instead be passed via `env:`).
-/// Two exact names are settled before the marker scan: the benign
-/// `TOKENIZERS_PARALLELISM` (kept) and the runner's own keypair
-/// (`PRELOOP_RUNNER_RSA_PARAMS`, dropped).
+/// Three exact names are settled before the marker scan: the benign
+/// `TOKENIZERS_PARALLELISM` (kept), the runner's own keypair
+/// (`PRELOOP_RUNNER_RSA_PARAMS`, dropped), and Docker's
+/// `DOCKER_AUTH_CONFIG` credential configuration (dropped).
 pub(crate) fn is_sensitive_host_env(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     // Benign toolchain knobs whose name happens to trip a marker below.
@@ -155,6 +156,10 @@ pub(crate) fn is_sensitive_host_env(key: &str) -> bool {
     // per job; a step that inherits it can print the complete registration key
     // with a plain `env`.
     if lower == "preloop_runner_rsa_params" {
+        return true;
+    }
+    // Docker registry credentials can use this name without a generic marker.
+    if lower == "docker_auth_config" {
         return true;
     }
     const MARKERS: &[&str] = &[
@@ -1455,6 +1460,9 @@ mod tests {
             // The runner's own keypair: JSON `RSAParameters` with no
             // credential marker in the name.
             "PRELOOP_RUNNER_RSA_PARAMS",
+            // Docker's JSON registry credential configuration has no generic
+            // marker either.
+            "DOCKER_AUTH_CONFIG",
         ] {
             assert!(is_sensitive_host_env(key), "{key} must be filtered");
         }
