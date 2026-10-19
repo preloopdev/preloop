@@ -114,22 +114,40 @@ fn load_native_root_certs(
             return Vec::new();
         }
     };
-    let mut usable = rustls::RootCertStore::empty();
-    let mut roots = Vec::new();
-    for cert in loaded.certs {
-        // Skip whatever the WebPKI anchor parser rejects: one unusable
-        // keychain item must not fail every client built from this list.
-        if let Err(error) = usable.add(cert.clone()) {
-            tracing::warn!(%error, "ignoring unusable certificate from the OS store");
-            continue;
-        }
-        roots.push(cert);
-    }
+    let roots = usable_anchors(loaded.certs, "the OS certificate store");
     for error in &loaded.errors {
         tracing::warn!(%error, "reading the OS certificate store");
     }
     tracing::info!(count = roots.len(), "loaded OS root certificates");
     roots
+}
+
+/// Keep only the certificates the WebPKI anchor parser accepts, warning about
+/// each one dropped.
+///
+/// Every list this module hands out must be usable as-is. The bundled anchors
+/// and the OS store already answer to this parser, but the bundle files under
+/// `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE` are operator-supplied, and a
+/// consumer that adds the list strictly — `preloop-runner-server`'s Postgres
+/// connector aborts the whole connector on the first anchor it cannot parse —
+/// would turn one malformed bundle certificate into a lasting TLS outage.
+/// Dropping the certificate costs nothing: rustls could never have used it as
+/// a trust anchor anyway.
+fn usable_anchors(
+    certs: Vec<CertificateDer<'static>>,
+    source: &str,
+) -> Vec<CertificateDer<'static>> {
+    let mut probe = rustls::RootCertStore::empty();
+    let mut usable = Vec::with_capacity(certs.len());
+    for cert in certs {
+        match probe.add(cert.clone()) {
+            Ok(()) => usable.push(cert),
+            Err(error) => {
+                tracing::warn!(%error, source, "ignoring unusable TLS root certificate");
+            }
+        }
+    }
+    usable
 }
 
 /// Extra PEM bundles from `PRELOOP_GITHUB_CA_FILE` — a CA that should
@@ -159,11 +177,15 @@ fn ca_certificates(env: impl Fn(&str) -> Option<String>) -> Vec<CertificateDer<'
 
 /// Read one PEM bundle from `path` and parse its certificates. Missing or
 /// invalid files log and return empty — verification stays on, we just add no
-/// roots. Split out so tests exercise it without mutating process env.
+/// roots — and an individual certificate the anchor parser rejects is dropped
+/// rather than allowed to break the clients built from the whole set (see
+/// [`usable_anchors`]). Split out so tests exercise it without mutating
+/// process env.
 fn load_ca_bundle(path: &std::path::Path, env: &str) -> Vec<CertificateDer<'static>> {
     match std::fs::read(path) {
         Ok(pem) => match CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>() {
             Ok(certs) => {
+                let certs = usable_anchors(certs, env);
                 tracing::info!(path = %path.display(), env, count = certs.len(),
                     "loaded additional TLS root certificates");
                 certs
@@ -184,7 +206,12 @@ fn load_ca_bundle(path: &std::path::Path, env: &str) -> Vec<CertificateDer<'stat
 
 /// The root set as a rustls store, for clients that install a whole
 /// [`rustls::ClientConfig`] instead of reqwest's own rustls config.
-fn store() -> rustls::RootCertStore {
+///
+/// Parsed once per process and cloned per config: the runner builds a client
+/// per job (plus one per control transport) and the engine one per server
+/// start, and parsing the whole anchor set on every build is pure overhead
+/// now that the set itself is process-wide.
+static ROOTS: LazyLock<rustls::RootCertStore> = LazyLock::new(|| {
     let mut store = rustls::RootCertStore::empty();
     let (added, ignored) = store.add_parsable_certificates(root_certs().iter().cloned());
     if ignored > 0 {
@@ -192,6 +219,11 @@ fn store() -> rustls::RootCertStore {
     }
     tracing::debug!(added, "parsed the shared TLS root set");
     store
+});
+
+/// The parsed shared root set, alive for the process.
+fn store() -> &'static rustls::RootCertStore {
+    &ROOTS
 }
 
 /// The root set as reqwest `Certificate`s, skipping anything reqwest rejects
@@ -258,14 +290,16 @@ fn install_roots_blocking(
 ///
 /// `extra_ca_pem` is an already-read CA bundle (the runner's `--ca-bundle`
 /// path or its `SSL_CERT_FILE` fallback), which has to stay honored now that
-/// the platform verifier is out of the picture.
+/// the platform verifier is out of the picture. Certificates the anchor
+/// parser rejects are dropped with a warning, like every other source, rather
+/// than failing the client build (see [`usable_anchors`]).
 pub fn client_config(extra_ca_pem: Option<&[u8]>) -> anyhow::Result<rustls::ClientConfig> {
-    let mut roots = store();
+    let mut roots = store().clone();
     if let Some(pem) = extra_ca_pem {
         let certs = CertificateDer::pem_slice_iter(pem)
             .collect::<Result<Vec<_>, _>>()
             .context("parsing the CA bundle")?;
-        for cert in certs {
+        for cert in usable_anchors(certs, "the CA bundle") {
             roots
                 .add(cert)
                 .context("adding a certificate from the CA bundle")?;
@@ -333,6 +367,33 @@ mod tests {
     fn missing_ca_file_returns_empty_not_panic() {
         let certs = load_ca_bundle(std::path::Path::new("/nonexistent/ca.pem"), "TEST");
         assert!(certs.is_empty());
+    }
+
+    /// One malformed certificate in an operator's bundle must not take the
+    /// whole root set down with it: the Postgres connector in
+    /// `preloop-runner-server` adds this list strictly and aborts the
+    /// connector on the first anchor it cannot parse.
+    #[test]
+    fn unusable_bundle_certificate_is_dropped_not_fatal() {
+        let dir = std::env::temp_dir().join(format!("preloop-tls-mixed-{}", std::process::id()));
+        let path = write_test_cert_pem(&dir, "mixed_ca_bundle.pem");
+        let mut bundle = std::fs::read(&path).expect("read the test certificate");
+        bundle.extend_from_slice(b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n");
+        std::fs::write(&path, &bundle).expect("write the mixed bundle");
+
+        let certs = load_ca_bundle(&path, "TEST");
+        assert_eq!(
+            certs.len(),
+            1,
+            "the valid certificate must survive its neighbour"
+        );
+        let mut probe = rustls::RootCertStore::empty();
+        for cert in certs {
+            probe
+                .add(cert)
+                .expect("every certificate the loader hands out must be a trust anchor");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
