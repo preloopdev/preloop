@@ -2,9 +2,9 @@
 
 Status: **design — PR 0, no code yet.** Written against `public/main` @
 `4831f828`, then re-verified against `public/main` @ `85e1fa168` (2026-10-18),
-then merged onto `public/main` @ `cd90fa39c` for the docs restructure
+then merged onto `public/main` @ `0cf5d78e4` for the docs restructure
 (`docs/control-plane/**`, `docs/contributing/**` — where the related documents
-below now live). The nineteen commits in between also move
+below now live). The twenty commits in between also move
 `crates/preloop-runner-server/src/` (12 files, +827/−151), so code *line*
 anchors are approximate against the merged tree; file anchors and the findings
 they support are unchanged. Merged work that narrowed a failure shape or fixed a
@@ -21,7 +21,7 @@ App setup),
 [agents.mdx](./control-plane/guides/agents.mdx) (CI gate and auto-PR),
 [api-and-state.mdx](./control-plane/architecture/api-and-state.mdx) §State
 Model,
-[debug-sessions-design.md](./contributing/debug-sessions-design.md).
+[debug-sessions-design.md](https://github.com/preloopdev/preloop/blob/main/docs/contributing/debug-sessions-design.md).
 
 ## 1. Goal
 
@@ -297,10 +297,11 @@ events (
   priority        smallint not null default 100,
   lease_until     timestamptz,
   lease_token     uuid,
+  mirror_owner    text,                 -- replica that can serve this event's mirror objects (§4.7)
   last_error      text,
   received_at     timestamptz not null default now(),
   processed_at    timestamptz,
-  unique (kind, dedupe_key)
+  unique (app_id, kind, dedupe_key)
 )
 ```
 
@@ -450,7 +451,7 @@ Three layers, each with a different job:
 | Layer | Key | Purpose |
 |---|---|---|
 | Delivery | `delivery_guid` (PK) | one receipt row per delivery (§4.4); absorbs GitHub redeliveries of the same payload |
-| Event | `(kind, dedupe_key)` unique | collapse webhook / pushed / synthesized events for the same GitHub fact |
+| Event | `(app_id, kind, dedupe_key)` unique | collapse webhook / pushed / synthesized events for the same GitHub fact |
 | Run | `(event_id, workflow_path)` unique | a replayed event never creates a second run for the same workflow |
 
 Canonical keys. Every key is prefixed with `app_id` (the App whose secret
@@ -674,7 +675,9 @@ Algorithm, per repo, in one pass:
      default-branch tip is an **internal** comparison base only:
      `commits[]` is rebuilt over that base..`after` from `git log` (the
      adapter's `[skip ci]` test reads every commit in the batch), and changed
-     files come from the mirror diff against it (for `paths:` filters).
+     files come from the mirror diff — `before..after` when `before` is a real
+     SHA, comparison-base..`after` for a created ref, and the PR merge base for
+     a `pull_request` (`base...head`, §4.7).
      `head_commit` comes from `git cat-file`, and
      `repository.default_branch` from the `app_repositories` registry — the
      adapter falls back to `main`, which would silently change trust tier and
