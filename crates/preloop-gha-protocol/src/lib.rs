@@ -71,6 +71,18 @@ pub fn workspace_dir_for_repository(repository: Option<&str>) -> Option<std::pat
 /// our runner and our orchestrator; it never crosses the GitHub wire protocol.
 pub const RUNNER_BUSY_SENTINEL: &str = "::preloop-runner::job-acquired";
 
+/// Line a runner prints on stdout immediately before it exits.
+///
+/// The exit code follows the sentinel, separated by one space. A runner's
+/// descendants can inherit the exec channel's stdout and outlive the runner
+/// (a container shim, a daemonizing helper), and a channel that only reports
+/// end-of-stream on every writer closing never reports this runner's exit.
+/// This line is what the orchestrator watches so a completed job releases its
+/// pool slot without waiting for those descendants.
+///
+/// Like [`RUNNER_BUSY_SENTINEL`], this never crosses the GitHub wire protocol.
+pub const RUNNER_EXIT_SENTINEL: &str = "::preloop-runner::exit";
+
 /// Stable identifier for a workflow run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

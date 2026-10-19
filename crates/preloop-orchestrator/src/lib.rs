@@ -10,7 +10,7 @@ pub mod oci;
 use crate::environment::{EnvironmentSpec, is_official_golden};
 use crate::keys::{KeyPool, StagedKey};
 use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
-use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
+use preloop_gha_protocol::{RUNNER_BUSY_SENTINEL, RUNNER_EXIT_SENTINEL};
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
 /// `VmProvider` implementation can model the handshake this pool relies on.
@@ -6389,6 +6389,15 @@ async fn guest_unresponsive<P: VmProvider + 'static>(
     }
 }
 
+/// Parse a runner's exit announcement: `<RUNNER_EXIT_SENTINEL> <code>`.
+fn runner_exit_code(line: &str) -> Option<i32> {
+    line.trim()
+        .strip_prefix(RUNNER_EXIT_SENTINEL)?
+        .trim_start()
+        .parse()
+        .ok()
+}
+
 /// Run the guest runner to completion, signalling the first job it accepts.
 ///
 /// Streaming rather than buffering the guest's output is what makes the busy
@@ -6396,6 +6405,14 @@ async fn guest_unresponsive<P: VmProvider + 'static>(
 /// 30-second buffered-exec read timeout. A guest that wedges never closes the
 /// stream, so the stream races a liveness probe: without it one wedged VM
 /// pinned its pool slot for good.
+///
+/// A healthy guest can still leave the stream open: the runner exits after its
+/// single job, but a descendant it spawned holds the exec channel's write end,
+/// and providers that report end-of-stream only when every writer closes (the
+/// AgentENV `envd` exec channel is one) never deliver it. The runner therefore
+/// announces its exit on stdout ([`RUNNER_EXIT_SENTINEL`]); that line ends the
+/// wait even while the stream stays open, and dropping the provider future
+/// kills the host-side exec client before the caller deletes the VM.
 async fn run_until_exit<P: VmProvider + 'static>(
     provider: &Arc<P>,
     name: &MachineName,
@@ -6404,9 +6421,11 @@ async fn run_until_exit<P: VmProvider + 'static>(
     liveness: GuestLiveness,
 ) -> Result<(), VmError> {
     let (chunks, mut receiver) = mpsc::channel(64);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     let machine = name.as_str().to_owned();
     let watcher = tokio::spawn(async move {
         let mut busy = Some(busy);
+        let mut exit = Some(exit_tx);
         let mut pending = String::new();
         // Guest output is the only window into the worker. Forwarding it to
         // tracing is what makes an in-VM failure diagnosable from the host;
@@ -6418,6 +6437,22 @@ async fn run_until_exit<P: VmProvider + 'static>(
                 OutputChunk::Stdout(bytes) => (bytes, true),
                 OutputChunk::Stderr(bytes) => (bytes, false),
             };
+            // The busy announcement is read before the line scan: a runner
+            // that accepts and finishes a job in one read still tells the
+            // pool it was busy before it reports the exit.
+            if is_stdout && busy.is_some() {
+                pending.push_str(&String::from_utf8_lossy(&bytes));
+                if pending.contains(RUNNER_BUSY_SENTINEL) {
+                    if let Some(busy) = busy.take() {
+                        let _ = busy.send(());
+                    }
+                    pending.clear();
+                } else if pending.len() > 2 * RUNNER_BUSY_SENTINEL.len() {
+                    // Keep only enough tail to rejoin a sentinel split across reads.
+                    let keep = pending.len() - RUNNER_BUSY_SENTINEL.len();
+                    pending.drain(..keep);
+                }
+            }
             line_buffer.push_str(&String::from_utf8_lossy(&bytes));
             // Cap retained tail to prevent unbounded growth from a guest
             // that never emits newlines (e.g. progress bar, binary output).
@@ -6437,29 +6472,42 @@ async fn run_until_exit<P: VmProvider + 'static>(
                 if !line.is_empty() {
                     debug!(machine = machine.as_str(), stdout = is_stdout, "{line}");
                 }
-            }
-            if !is_stdout {
-                continue;
-            }
-            if busy.is_none() {
-                continue;
-            }
-            pending.push_str(&String::from_utf8_lossy(&bytes));
-            if pending.contains(RUNNER_BUSY_SENTINEL) {
-                if let Some(busy) = busy.take() {
-                    let _ = busy.send(());
+                // The runner announces its own exit because the exec channel
+                // may stay open for as long as a descendant holds stdout.
+                if is_stdout
+                    && let Some(code) = runner_exit_code(line)
+                    && let Some(exit) = exit.take()
+                {
+                    let _ = exit.send(code);
                 }
-                pending.clear();
-            } else if pending.len() > 2 * RUNNER_BUSY_SENTINEL.len() {
-                // Keep only enough tail to rejoin a sentinel split across reads.
-                let keep = pending.len() - RUNNER_BUSY_SENTINEL.len();
-                pending.drain(..keep);
             }
         }
     });
 
     let code = tokio::select! {
         code = provider.exec_stream(name, run, chunks) => code,
+        // A runner that announced its exit has finished its single job even
+        // when a process it spawned (a container shim, a daemonizing helper)
+        // still holds the exec channel's write end. Dropping the provider
+        // future kills the host-side `aenv exec` client; the caller then
+        // deletes the VM, which also kills the descendant. Without this the
+        // slot stayed pinned for as long as that descendant lived.
+        exit = async {
+            match exit_rx.await {
+                Ok(code) => code,
+                // The watcher only ends without announcing when the stream
+                // itself ended; the provider branch is then ready as well.
+                Err(_) => std::future::pending::<i32>().await,
+            }
+        } => {
+            debug!(
+                machine = name.as_str(),
+                exit_code = exit,
+                "guest runner announced its exit; closing the exec stream"
+            );
+            watcher.abort();
+            Ok::<i32, VmError>(exit)
+        },
         error = guest_unresponsive(provider, name, liveness) => {
             warn!(machine = name.as_str(), %error, "runner guest is wedged; abandoning its stream");
             watcher.abort();
@@ -7543,6 +7591,10 @@ mod lifecycle_tests {
         /// resident.
         fail_deletes_remaining: Mutex<u32>,
         announce_busy: bool,
+        /// When set, the guest runner announces this exit code and then the
+        /// exec channel stays open forever: a descendant inherited stdout and
+        /// outlived the runner, which is what envd's end-of-stream waits on.
+        exit_without_end: Option<i32>,
         /// When set, `exec_with_secret_env` (the configure step) blocks until
         /// notified, so a test can observe the pool mid-provision.
         configure_gate: Option<Arc<tokio::sync::Notify>>,
@@ -7607,6 +7659,7 @@ mod lifecycle_tests {
                 fail_delete,
                 fail_deletes_remaining: Mutex::new(0),
                 announce_busy: false,
+                exit_without_end: None,
                 configure_gate: None,
                 run_gate: None,
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
@@ -7666,6 +7719,13 @@ mod lifecycle_tests {
 
         fn announcing_busy(mut self) -> Self {
             self.announce_busy = true;
+            self
+        }
+
+        /// Announce this runner exit, then keep the exec channel open forever
+        /// — a descendant inherited stdout and outlived the runner.
+        fn exiting_without_closing_stream(mut self, code: i32) -> Self {
+            self.exit_without_end = Some(code);
             self
         }
 
@@ -11270,6 +11330,19 @@ fi"#,
                 // failures are represented by `Err(VmError)` instead.
                 return Ok(1);
             }
+            if let Some(code) = self.exit_without_end {
+                output
+                    .send(OutputChunk::Stdout(
+                        format!("{RUNNER_EXIT_SENTINEL} {code}\n").into_bytes(),
+                    ))
+                    .await
+                    .unwrap();
+                // The runner is gone but a descendant still holds stdout, so
+                // the channel never reports end-of-stream. A provider that
+                // honours `kill_on_drop` stops waiting when its future drops;
+                // the test asserts the caller does drop it on the exit line.
+                std::future::pending::<()>().await;
+            }
             Ok(0)
         }
 
@@ -11843,6 +11916,173 @@ fi"#,
             matches!(result, Err(VmError::GuestUnresponsive { probes: 3, .. })),
             "{result:?}"
         );
+    }
+
+    /// The runner exits and announces it, but a descendant it spawned still
+    /// holds the exec channel's write end, so the provider never reports
+    /// end-of-stream. The slot must be released on the runner's own line
+    /// rather than on the channel closing.
+    #[tokio::test]
+    async fn a_runner_exit_line_releases_a_stream_held_open_by_a_descendant() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .announcing_busy()
+                .exiting_without_closing_stream(0),
+        );
+        let name = MachineName::new("lifecycle-test-0-7").unwrap();
+        let (busy, busy_rx) = tokio::sync::oneshot::channel();
+        // Long enough that only the exit line can end the wait.
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(30),
+            failures: 3,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_until_exit(&provider, &name, &["run".to_owned()], busy, liveness),
+        )
+        .await
+        .expect("a runner exit line must not wait for its descendants to close stdout");
+
+        assert!(result.is_ok(), "{result:?}");
+        busy_rx
+            .await
+            .expect("the busy sentinel still reaches the pool before the exit");
+    }
+
+    /// The announced exit code keeps the same non-zero contract as a stream
+    /// that closed normally: the pool records a guest exit, not success.
+    #[tokio::test]
+    async fn a_runner_exit_line_propagates_a_nonzero_code() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).exiting_without_closing_stream(7),
+        );
+        let name = MachineName::new("lifecycle-test-0-8").unwrap();
+        let (busy, _busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(30),
+            failures: 3,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_until_exit(&provider, &name, &["run".to_owned()], busy, liveness),
+        )
+        .await
+        .expect("a runner exit line must not wait for its descendants to close stdout");
+
+        assert!(
+            matches!(
+                result,
+                Err(VmError::Command {
+                    operation: "run",
+                    exit_code: 7,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// Only the exact exit line is an announcement; runner output that
+    /// merely mentions it (or a truncated line) must not release the slot.
+    #[test]
+    fn runner_exit_line_parsing_is_strict() {
+        assert_eq!(runner_exit_code("::preloop-runner::exit 0"), Some(0));
+        assert_eq!(runner_exit_code("::preloop-runner::exit 17\r"), Some(17));
+        assert_eq!(runner_exit_code("::preloop-runner::exiting 0"), None);
+        assert_eq!(runner_exit_code("echo ::preloop-runner::exit 0"), None);
+        assert_eq!(runner_exit_code("::preloop-runner::exit"), None);
+        assert_eq!(runner_exit_code("::preloop-runner::exit nope"), None);
+    }
+
+    /// The AgentENV shape end to end: a fake `aenv` announces the runner's
+    /// exit, then leaves a background child holding the exec channel's stdout
+    /// — exactly what `envd` waits for before it sends `End`, so the CLI never
+    /// exits. The stream wait must end on the announcement and drop the exec
+    /// client; otherwise the slot stays pinned on a healthy guest.
+    #[tokio::test]
+    async fn agentenv_stream_held_open_by_a_descendant_releases_the_slot() {
+        use preloop_vm::agentenv::AgentEnvProvider;
+
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let binary = dir.path().join("aenv");
+        let holder = dir.path().join("holder.pid");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 start) echo s1 ;;\n\
+                 exec)\n\
+                   if [ \"$4\" = \"run\" ]; then\n\
+                     printf '%s\\n%s 0\\n' \
+                       '::preloop-runner::job-acquired' '::preloop-runner::exit'\n\
+                     sleep 30 &\n\
+                     echo $! > '{holder}';\n\
+                   fi\n\
+                   ;;\n\
+                 delete) ;;\n\
+                 ls) echo '[]' ;;\n\
+                 esac\n\
+                 exit 0\n",
+                holder = holder.display()
+            ),
+        )
+        .expect("write fake aenv");
+        std::fs::set_permissions(
+            &binary,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod fake aenv");
+
+        let provider = Arc::new(AgentEnvProvider::new(&binary));
+        let name = MachineName::new("lifecycle-test-aenv-stream").unwrap();
+        provider
+            .create(&MachineSpec {
+                name: name.clone(),
+                image: "ubuntu:24.04".to_owned(),
+                cpus: 2,
+                memory_mib: 2048,
+                storage_gib: 8,
+                overlay_gib: None,
+                network: NetworkPolicy::PublicOnly,
+                volumes: Vec::new(),
+                sockets: Vec::new(),
+                dns: None,
+                rosetta: false,
+                guest_volumes: Vec::new(),
+                workload_init: None,
+            })
+            .await
+            .expect("create test machine");
+        provider.start(&name).await.expect("fake aenv start");
+
+        let (busy, busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(30),
+            failures: 3,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_until_exit(&provider, &name, &["run".to_owned()], busy, liveness),
+        )
+        .await;
+        // The fake's descendant outlives the wait by design; never leave it
+        // behind, especially when the fix regressed and the timeout fired.
+        if let Ok(pid) = std::fs::read_to_string(&holder) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid.trim()])
+                .status();
+        }
+        let result = outcome.expect("the runner exit line must release the stream");
+        assert!(result.is_ok(), "{result:?}");
+        busy_rx
+            .await
+            .expect("the busy sentinel reaches the pool first");
     }
 
     /// Issue #295: once the packed golden is forkable, the pool must ask the
@@ -12874,6 +13114,55 @@ fi"#,
         );
         assert!(!crashed_lock.exists(), "stale companion lock is swept");
         assert!(!stale_tmp.exists(), "lockless staging file is swept");
+    }
+
+    /// A runner that announced its exit while a descendant kept the exec
+    /// channel open must still take the whole slot down: `run_one_runner`
+    /// returns after the announcement, then deletes the machine (which kills
+    /// the holder in the guest) instead of pinning the permit.
+    #[tokio::test]
+    async fn held_stream_after_runner_exit_tears_down_the_machine() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .announcing_busy()
+                .exiting_without_closing_stream(0),
+        );
+        let config = test_config(false);
+        let runner = provision_slot(
+            &provider,
+            &config,
+            0,
+            1,
+            None,
+            &Arc::new(KeyPool::new()),
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                boot_from_pack: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("provisioning succeeds")
+        .expect("a runner is provisioned");
+        let name = runner.name.clone();
+        let idle = Arc::new(std::sync::Mutex::new(0));
+        run_one_runner(
+            provider.clone(),
+            &config,
+            runner,
+            CancellationToken::new(),
+            idle,
+        )
+        .await
+        .expect("the announced exit releases the slot");
+        let events = provider.events().await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event == &format!("delete:{}", name.as_str())),
+            "the slot must delete the machine and its descendant: {events:?}"
+        );
     }
 
     #[tokio::test]

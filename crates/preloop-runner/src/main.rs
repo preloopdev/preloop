@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();
 
+    let announces_exit = matches!(&cli.command, Commands::Run(_));
     let result = match cli.command {
         Commands::Configure(args) => {
             preloop_runner::configure::run_configure(args, &cli.global).await
@@ -58,6 +59,22 @@ async fn main() -> Result<()> {
             Ok(())
         }
     };
+    // The exec channel's end-of-stream can be delayed indefinitely by a
+    // descendant that inherited stdout and outlived this process, so a
+    // single-use runner announces its own exit. The orchestrator stops
+    // waiting for the channel as soon as it sees this line and tears the VM
+    // down, which is what releases the pool slot.
+    if announces_exit {
+        use std::io::Write as _;
+        let exit_code = i32::from(result.is_err());
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(
+            stdout,
+            "{} {exit_code}",
+            preloop_gha_protocol::RUNNER_EXIT_SENTINEL
+        );
+        let _ = stdout.flush();
+    }
     // Bounded 2s flush of buffered telemetry before exit; a clean shutdown
     // must not drop the last flush window's records.
     observability_runtime.shutdown().await;
