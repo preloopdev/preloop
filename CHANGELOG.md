@@ -299,13 +299,14 @@ Releases before v0.27.0 predate the changelog.
 
 - **Every remaining outbound client uses the in-process TLS roots, and the
   macOS keychain probe is killed at its deadline.** The OTLP exporter's
-  blocking client, the runner's engine/GitHub clients, and `preloop-runner
-  lint`'s remote-workflow fetch now verify against the same process-wide roots
-  as the engine (bundled Mozilla, the OS store read with a 5 s deadline, and
-  `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`) instead of reqwest's platform
-  verifier, so a hung `trustd`/`securityd` can no longer stall them. `preloop
-  runner lint` also gains a 30 s request / 10 s connect deadline. The
-  login-keychain writability probe's cleanup delete (`security
+  blocking client (including the engine hosted by `preloop serve`, whose CLI
+  installs the same builder), the runner's engine/GitHub clients, and
+  `preloop-runner lint`'s remote-workflow fetch now verify against the same
+  process-wide roots as the engine (bundled Mozilla, the OS store read with a
+  5 s deadline, and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`) instead of
+  reqwest's platform verifier, so a hung `trustd`/`securityd` can no longer
+  stall them. `preloop runner lint` also gains a 30 s request / 10 s connect
+  deadline. The login-keychain writability probe's cleanup delete (`security
   delete-generic-password`) is now killed after 2 s instead of leaking its
   child and guard thread forever, and the secrets/policy API config
   load-and-write (which can reach the keychain for the sealing key) runs on
