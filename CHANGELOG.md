@@ -35,6 +35,15 @@ Releases before v0.27.0 predate the changelog.
   ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
   cargo-zigbuild match `release-runner.yml`.
 
+- **The `preloop` crate on crates.io tracks releases.** `publish-crates-io` in
+  the release workflow publishes `packaging/crates-io/preloop` — the crate that
+  holds the name on crates.io and points readers at the channels that do install
+  the CLI — at each release version, authenticating with a crates.io trusted
+  publisher instead of a stored token. The job skips with a workflow warning
+  while the name is unclaimed and no-ops when that version is already published,
+  so re-running a tag stays safe. The first version is still claimed by hand:
+  see `packaging/crates-io/README.md`.
+
 - **Superseded AgentENV volumes are collected automatically.** A runner bundle
   change publishes a new content-addressed volume and leaves the old one behind;
   the engine now reclaims the ones nothing needs — unmounted by any sandbox, past
