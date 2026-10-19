@@ -425,7 +425,7 @@ async fn debug_credentials_die_with_their_job() {
             Some(&runtime),
         )
         .await,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "a settled job's runtime token must not mint a debug credential"
     );
     assert_eq!(
@@ -445,7 +445,7 @@ async fn debug_credentials_die_with_their_job() {
             Some(&worker),
         )
         .await,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "a settled job's debug-worker token must not open a session"
     );
 }

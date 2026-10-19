@@ -3083,7 +3083,9 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
         }
     });
 
-    // Opening a session for a job you are not is refused outright.
+    // Opening a session for a job you are not is refused outright. The
+    // attacker token names no live attempt, so the liveness gate answers with
+    // the same 404 as a missing session (ids stay unprobeable).
     assert_eq!(
         request_status_with_bearer(
             &app,
@@ -3093,7 +3095,7 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
             &attacker_token,
         )
         .await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
 
     let opened = request_json_with_bearer(
@@ -3354,7 +3356,8 @@ async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
             asking_for_itself.clone()
         )
         .await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND,
+        "a token naming no live attempt is answered like a missing request"
     );
     assert_eq!(
         refused(runtime_token.clone(), json!({ "agent_job_id": stranger })).await,

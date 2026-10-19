@@ -41,11 +41,15 @@ pub async fn require_protocol_bearer(
 ///
 /// These routes are authenticated by the attempt's own token but must keep
 /// working after the attempt is settled or timed out: the runner may report
-/// completion late, and a duplicate report must be idempotent. Every other
-/// job-token route is denied once the attempt is no longer live.
+/// completion late, and a duplicate report must be idempotent. `renewjob` is
+/// included because it is a heartbeat with no read/write authority — its
+/// handler already answers `409` for a settled attempt, which the runner
+/// classifies correctly; middleware `403` would look like an auth failure.
+/// Every other job-token route is denied once the attempt is no longer live.
 fn is_final_reporting_route(method: &axum::http::Method, path: &str) -> bool {
     if *method == axum::http::Method::POST {
-        return (path.starts_with("/broker/") && path.ends_with("/completejob"))
+        return (path.starts_with("/broker/")
+            && (path.ends_with("/completejob") || path.ends_with("/renewjob")))
             || path.contains("/_apis/v1/FinishJob/")
             || ((path.starts_with("/_apis/v1/plans/")
                 || path.starts_with("/runner/server/_apis/v1/plans/"))
@@ -430,15 +434,15 @@ pub async fn job_is_live(state: &AppState, job_uuid: uuid::Uuid) -> Result<bool,
         {
             return Ok(false);
         }
-    } else if !record.locked_until.is_empty() {
-        if let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(&record.locked_until) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            if deadline.timestamp() <= now {
-                return Ok(false);
-            }
+    } else if !record.locked_until.is_empty()
+        && let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(&record.locked_until)
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if deadline.timestamp() <= now {
+            return Ok(false);
         }
     }
     // Cancellation settles the logical job immediately, before the runner has
@@ -1271,7 +1275,13 @@ pub async fn require_worker_bearer(
         bearer_token(&request).and_then(|token| shared.state.job_uuid_from_debug_token(token));
     match job {
         Some(job) => {
-            require_live_job(&shared.state, job).await?;
+            // A settled/unknown job is reported exactly like a missing
+            // session: the debug surface deliberately does not let a caller
+            // probe which attempt ids exist.
+            match job_is_live(&shared.state, job).await? {
+                true => {}
+                false => return Err(ApiError::not_found("no such debug session")),
+            }
             request.extensions_mut().insert(WorkerJob(job));
             Ok(next.run(request).await)
         }
@@ -1306,7 +1316,13 @@ pub async fn require_job_runtime_bearer(
     let job = bearer_token(&request).and_then(|token| shared.state.job_uuid_from_token(token));
     match job {
         Some(job) => {
-            require_live_job(&shared.state, job).await?;
+            // Same shape as the backend's "no active job request" answer for
+            // a settled attempt: the exchange must not distinguish missing
+            // from spent ids.
+            match job_is_live(&shared.state, job).await? {
+                true => {}
+                false => return Err(ApiError::not_found("no active job request")),
+            }
             request.extensions_mut().insert(JobRuntimeIdentity(job));
             Ok(next.run(request).await)
         }

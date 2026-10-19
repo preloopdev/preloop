@@ -485,7 +485,7 @@ pub async fn blob_put(
             match stream_body_to_file(body, &tmp_path, MAX_ASSEMBLED_BYTES).await {
                 Ok(size) => match tokio::fs::rename(&tmp_path, &data_path).await {
                     Ok(()) => {
-                        info!(kind, token, size, "blob single-shot upload");
+                        info!(kind, jti = %stage_name, size, "blob single-shot upload");
                         StatusCode::CREATED
                     }
                     Err(e) => {

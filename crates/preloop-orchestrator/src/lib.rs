@@ -6027,6 +6027,42 @@ async fn await_machine_gone<P: VmProvider + 'static>(
     }
 }
 
+/// Guest environment secrets for a `configure` run.
+///
+/// A pool-managed guest receives only its one-time provision credential (as
+/// both the explicit provision header value and `PRELOOP_RUNNER_TOKEN`, which
+/// `configure --token` reads). It never receives the host's system token: the
+/// bootstrap process runs as guest root, so its environment is
+/// attacker-controlled. A manual/legacy configure keeps the operator's
+/// token source. A pool-managed run whose token staging failed gets no
+/// credential at all and fails closed.
+fn configure_credential_secrets(
+    pool_managed: bool,
+    provision_token: Option<&std::path::Path>,
+    registration_token_env: &str,
+) -> Vec<(String, SecretSource)> {
+    if pool_managed {
+        return provision_token
+            .map(|path| {
+                vec![
+                    (
+                        "PRELOOP_PROVISION_TOKEN".to_owned(),
+                        SecretSource::HostFile(path.to_path_buf()),
+                    ),
+                    (
+                        "PRELOOP_RUNNER_TOKEN".to_owned(),
+                        SecretSource::HostFile(path.to_path_buf()),
+                    ),
+                ]
+            })
+            .unwrap_or_default();
+    }
+    vec![(
+        "PRELOOP_RUNNER_TOKEN".to_owned(),
+        SecretSource::HostEnv(registration_token_env.to_owned()),
+    )]
+}
+
 /// Provision one ephemeral runner for a slot under a fresh machine name.
 ///
 /// Names carry a generation so consecutive runners get distinct names across
@@ -7056,7 +7092,6 @@ async fn provision_runner<P: VmProvider + 'static>(
     // credential, which the server accepts for the registration exchange and
     // consumes at agent creation. A manual (non-pool) configure keeps the
     // operator's usual token source.
-    let mut secrets = Vec::new();
     // One-time provision token: the control plane pairs this machine's
     // registration with the queued job the machine was provisioned for. The
     // guest cannot fabricate a pairing because only this exact configure
@@ -7096,32 +7131,16 @@ async fn provision_runner<P: VmProvider + 'static>(
                     });
                 }
                 provision_token_value = Some(token);
-                secrets.push((
-                    "PRELOOP_PROVISION_TOKEN".to_owned(),
-                    SecretSource::HostFile(path.clone()),
-                ));
-                // `configure --token` reads PRELOOP_RUNNER_TOKEN. Point it at
-                // the same one-time file; the server exchanges it for a
-                // provision-bound RunnerManage grant.
-                secrets.push((
-                    "PRELOOP_RUNNER_TOKEN".to_owned(),
-                    SecretSource::HostFile(path.clone()),
-                ));
                 provision_token_file = Some(path);
             }
             Err(error) => warn!(%error, "could not stage provision token"),
         }
     }
-    if config.pending_registrations.is_none() {
-        // Manual/legacy configure outside the pool still uses the operator's
-        // token source. Pool provisioning with a failed token stage stays
-        // credential-less (and fails closed) rather than leaking the system
-        // token into the guest.
-        secrets.push((
-            "PRELOOP_RUNNER_TOKEN".to_owned(),
-            SecretSource::HostEnv(config.registration_token_env.clone()),
-        ));
-    }
+    let mut secrets = configure_credential_secrets(
+        config.pending_registrations.is_some(),
+        provision_token_file.as_deref(),
+        &config.registration_token_env,
+    );
     // Held until `configure` returns; dropping it wipes the key from disk.
     let staged = stage_runner_key(config, name, keys).await;
     if let Some(staged) = &staged {
@@ -7527,6 +7546,47 @@ mod lifecycle_tests {
         assert_eq!(
             on_demand_memory_cap(32 * 1024, 0),
             (32 * 1024 - 2048 - 1) as usize
+        );
+    }
+
+    /// A pool-managed guest receives only the one-time provision credential;
+    /// the host system token never enters its environment. Manual configure
+    /// still uses the operator's token source.
+    #[test]
+    fn configure_guest_secrets_never_carry_the_system_token() {
+        let provision = std::path::Path::new("/tmp/.provision-token-test");
+        let pool = configure_credential_secrets(true, Some(provision), "PRELOOP_SYSTEM_TOKEN");
+        assert_eq!(
+            pool,
+            vec![
+                (
+                    "PRELOOP_PROVISION_TOKEN".to_owned(),
+                    SecretSource::HostFile(provision.to_path_buf())
+                ),
+                (
+                    "PRELOOP_RUNNER_TOKEN".to_owned(),
+                    SecretSource::HostFile(provision.to_path_buf())
+                ),
+            ]
+        );
+        assert!(
+            !pool
+                .iter()
+                .any(|(_, source)| matches!(source, SecretSource::HostEnv(_))),
+            "pool guests must not read a host credential env var"
+        );
+
+        // Token staging failure stays credential-less rather than falling
+        // back to the system token.
+        assert!(configure_credential_secrets(true, None, "PRELOOP_SYSTEM_TOKEN").is_empty());
+
+        assert_eq!(
+            configure_credential_secrets(false, None, "PRELOOP_SYSTEM_TOKEN"),
+            vec![(
+                "PRELOOP_RUNNER_TOKEN".to_owned(),
+                SecretSource::HostEnv("PRELOOP_SYSTEM_TOKEN".to_owned())
+            )],
+            "manual configure keeps the operator's source"
         );
     }
 

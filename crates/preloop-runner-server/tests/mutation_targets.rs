@@ -595,13 +595,13 @@ fn test_excerpts(files: &[String], mutant: &str) -> String {
     if let Some((_, enclosing)) = mutant.rsplit_once(" in ") {
         keywords.push(enclosing.trim());
     }
-    if let Some(rest) = mutant.split("delete field ").nth(1) {
-        if let Some((field, tail)) = rest.split_once(" from struct ") {
-            keywords.push(field.trim());
-            if let Some(ty) = tail.split_whitespace().next() {
-                let ty = ty.trim_end_matches(',');
-                keywords.push(ty.rsplit("::").next().unwrap_or(ty));
-            }
+    if let Some(rest) = mutant.split("delete field ").nth(1)
+        && let Some((field, tail)) = rest.split_once(" from struct ")
+    {
+        keywords.push(field.trim());
+        if let Some(ty) = tail.split_whitespace().next() {
+            let ty = ty.trim_end_matches(',');
+            keywords.push(ty.rsplit("::").next().unwrap_or(ty));
         }
     }
     keywords.retain(|keyword| !keyword.is_empty());
