@@ -606,6 +606,7 @@ pub(crate) fn make_hook_step(
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     }
 }
 
@@ -670,6 +671,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             raw: serde_json::json!({}),
             is_background: false,
+            post_of: Vec::new(),
         };
         let mut job = super::super::contexts::JobContext::new(
             "job".into(),
