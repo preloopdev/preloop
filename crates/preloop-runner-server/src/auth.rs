@@ -834,11 +834,26 @@ pub fn results_identity(
     Ok(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
 }
 
+/// Whether a Results path's plan segment names the token's plan. The bare plan
+/// id does, and so does the runner's `system.orchestrationId`
+/// (`{planId}.{jobId}.{suffix}`): the runner sends that value as the plan
+/// segment when it addresses its own job, with the plan id as its prefix.
+fn path_names_token_plan(path_plan: &str, token_plan: &str) -> bool {
+    !token_plan.is_empty()
+        && (path_plan == token_plan
+            || path_plan
+                .strip_prefix(token_plan)
+                .is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// Whether a job token addresses the Results target `plan_id` / `job_id`. The
+/// job UUID must match exactly, so a token never reaches another job, and the
+/// plan segment must name the token's own plan (see [`path_names_token_plan`]).
 pub fn results_identity_binds_job(identity: &ResultsIdentity, plan_id: &str, job_id: &str) -> bool {
     match identity {
         ResultsIdentity::System => true,
         ResultsIdentity::Job(identity) => {
-            identity.plan_id == plan_id
+            path_names_token_plan(plan_id, &identity.plan_id)
                 && job_id
                     .parse::<uuid::Uuid>()
                     .is_ok_and(|job| job == identity.job_id)
@@ -877,6 +892,22 @@ pub fn require_canonical_results_job_id(
         .parse::<uuid::Uuid>()
         .map(|job| job.to_string())
         .unwrap_or_else(|_| job_id.to_owned()))
+}
+
+/// The plan a Results handler must key storage by: a job token's own plan.
+///
+/// A runner may address its own job with the plan segment spelled as its
+/// `system.orchestrationId` (`{planId}.{jobId}.__default`), which
+/// `path_names_token_plan` accepts for authorization. A replay path or
+/// metadata key built from that spelling names a namespace no reader resolves
+/// (logs are read back under the plan id, `runs.rs`), so handlers that write
+/// storage use the token's own plan instead. The system identity keeps the
+/// requested segment: engine callers address opaque backend ids.
+pub fn results_storage_plan_id(identity: &ResultsIdentity, requested_plan_id: &str) -> String {
+    match identity {
+        ResultsIdentity::System => requested_plan_id.to_owned(),
+        ResultsIdentity::Job(job) => job.plan_id.clone(),
+    }
 }
 
 /// Runner identity proven by a listen token on this request.
