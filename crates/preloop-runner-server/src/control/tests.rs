@@ -3624,14 +3624,16 @@ pub(crate) mod suite {
             .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
             .await
             .unwrap();
-        match backend
+        let initial_enqueue = match backend
             .poll_session(poll(&session.session_id, runner.runner.id))
             .await
             .unwrap()
         {
-            PollOutcome::Claimed(_) => {}
+            PollOutcome::Claimed(claimed) => claimed.queued.enqueued_at_unix_nanos,
             other => panic!("expected claim, got {other:?}"),
-        }
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
 
         // The runner dies: purge requeues its claimed job.
         backend.purge_runner(runner.runner.id).await.unwrap();
@@ -3667,6 +3669,10 @@ pub(crate) mod suite {
         {
             PollOutcome::Claimed(claimed) => {
                 assert_eq!(claimed.queued.job_id, JobId("build".to_owned()));
+                assert!(
+                    claimed.queued.enqueued_at_unix_nanos > initial_enqueue,
+                    "requeue must restart the ready-queue clock"
+                );
             }
             other => panic!("expected re-claim of purged job, got {other:?}"),
         }

@@ -188,11 +188,30 @@ impl Default for PoolSnapshot {
 ///
 /// Consolidates the four ad-hoc `Option<Arc<…>>` handles. Single writer (pool)
 /// + multiple readers (sampler, status) — cheap `RwLock`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PoolStatus {
     inner: Arc<RwLock<PoolSnapshot>>,
     /// One-time provision tokens (separate from snapshot to avoid cloning large map on every snapshot).
     pending_tokens: Arc<RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>>,
+    /// Live completion notifications from the runner server to the co-hosted pool.
+    completion_events: tokio::sync::broadcast::Sender<RunnerJobCompleted>,
+}
+
+/// Completion of a job reported by a specific registered runner.
+///
+/// The runner pool uses this advisory event to release a single-use VM even
+/// when the guest's exec stream remains open after the broker completed the
+/// job. The persisted control-plane completion remains authoritative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobCompleted {
+    pub runner_id: i64,
+    pub runner_name: String,
+}
+
+impl Default for PoolStatus {
+    fn default() -> Self {
+        Self::new(PoolSnapshot::default())
+    }
 }
 
 impl std::fmt::Debug for PoolStatus {
@@ -211,10 +230,27 @@ impl std::fmt::Debug for PoolStatus {
 
 impl PoolStatus {
     pub fn new(snapshot: PoolSnapshot) -> Self {
+        let (completion_events, _) = tokio::sync::broadcast::channel(64);
         Self {
             inner: Arc::new(RwLock::new(snapshot)),
             pending_tokens: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            completion_events,
         }
+    }
+
+    /// Subscribe to terminal job reports from the co-hosted runner server.
+    pub fn subscribe_runner_completion(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<RunnerJobCompleted> {
+        self.completion_events.subscribe()
+    }
+
+    /// Publish a terminal job report for the runner that owned it.
+    pub fn notify_runner_completion(&self, runner_id: i64, runner_name: String) {
+        let _ = self.completion_events.send(RunnerJobCompleted {
+            runner_id,
+            runner_name,
+        });
     }
 
     pub fn snapshot(&self) -> PoolSnapshot {
@@ -584,5 +620,24 @@ impl Default for OperationalSnapshot {
             telemetry: TelemetrySnapshot::default(),
             conditions: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runner_completion_notifies_subscribers() {
+        let status = PoolStatus::default();
+        let mut events = status.subscribe_runner_completion();
+        status.notify_runner_completion(17, "runner-17".to_owned());
+        assert_eq!(
+            events.recv().await.expect("completion event"),
+            RunnerJobCompleted {
+                runner_id: 17,
+                runner_name: "runner-17".to_owned(),
+            }
+        );
     }
 }

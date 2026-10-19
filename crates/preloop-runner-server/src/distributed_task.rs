@@ -435,6 +435,40 @@ pub async fn agent_request_ack(
     Ok(StatusCode::OK)
 }
 
+/// Notify the co-hosted runner pool after a terminal completion is committed.
+///
+/// The broker endpoint identifies the reporting runner by numeric id while
+/// the VM pool identifies it by the configured runner name (the machine name).
+/// Resolve the name while the registration is still present, then publish the
+/// advisory event. The persisted completion remains authoritative if the
+/// registration disappeared during teardown.
+pub(crate) async fn notify_runner_completion(shared: &Arc<SharedState>, runner_id: i64) {
+    let runner_name = shared
+        .state
+        .backend
+        .list_runners(None)
+        .await
+        .ok()
+        .and_then(|listing| {
+            listing
+                .runners
+                .into_iter()
+                .find(|runner| runner.id == runner_id)
+        })
+        .map(|runner| runner.name);
+    if let Some(runner_name) = runner_name {
+        shared
+            .state
+            .pool_status
+            .notify_runner_completion(runner_id, runner_name);
+    } else {
+        tracing::debug!(
+            runner_id,
+            "runner completion committed after its registration disappeared"
+        );
+    }
+}
+
 /// PATCH /_apis/v1/AgentRequest/:pool_id/:request_id — renew or complete job request.
 /// The runner sends this to renew the job lock or report completion.
 pub async fn agent_request_patch(
@@ -529,7 +563,11 @@ pub async fn agent_request_patch(
             }
         });
         if let Some(c) = completion {
-            let _ = complete_job_inner(shared.clone(), c).await;
+            if complete_job_inner(shared.clone(), c).await.is_ok() {
+                if let Some(runner_id) = verified_runner_id {
+                    notify_runner_completion(&shared, runner_id).await;
+                }
+            }
         }
         return Ok(Json(
             agent_request_response(&shared, pool_id, request_id).await,
@@ -783,6 +821,7 @@ pub(crate) async fn complete_job_settling(
         ));
     }
     mask_completion_payload(&shared, &mut completion)?;
+    let reporting_runner_id = settle.map(|attempt| attempt.runner_id);
     let outcome = shared
         .state
         .backend
@@ -1003,6 +1042,9 @@ pub(crate) async fn complete_job_settling(
                 tracing::warn!(%error, "failed to prune live-log segments");
             }
         });
+    }
+    if let Some(runner_id) = reporting_runner_id {
+        notify_runner_completion(&shared, runner_id).await;
     }
     Ok(Json(record))
 }

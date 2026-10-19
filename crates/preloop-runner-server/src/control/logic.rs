@@ -1288,6 +1288,16 @@ mod decision_tests {
                 first_seen: now - Duration::from_secs(30)
             }
         );
+        // A requeued job receives a fresh ready-enqueue timestamp, so the
+        // first sweep starts a new short grace window instead of measuring
+        // time spent on its abandoned runner.
+        let fresh = starvation_candidate(&linux, Duration::from_secs(1), None, now);
+        assert_eq!(
+            starvation_verdict(&fresh, now, false, LONG_UP, &[]),
+            StarvationVerdict::Mark {
+                first_seen: now - Duration::from_secs(1)
+            }
+        );
         let job = starvation_candidate(&linux, Duration::from_secs(121), None, now);
         let StarvationVerdict::Starve { reason, grace } =
             starvation_verdict(&job, now, false, LONG_UP, &[])

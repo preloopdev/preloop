@@ -72,6 +72,15 @@ const GOLDEN_RETRY_MAX: Duration = Duration::from_secs(60);
 const TEARDOWN_RETRY_MIN: Duration = Duration::from_secs(1);
 const TEARDOWN_RETRY_MAX: Duration = Duration::from_secs(30);
 const TEARDOWN_RETRY_ATTEMPTS: u32 = 3;
+/// How long a registered single-use runner may wait without accepting a job.
+///
+/// On-demand provisioning can race a queue-depth sample and create a spare.
+/// The spare must not pin a VM and semaphore permit forever while its
+/// `run --once` broker poll waits for work that has already been claimed.
+const UNCLAIMED_RUNNER_IDLE_GRACE: Duration = Duration::from_secs(30);
+/// Give the control plane a short window to finish log/result fan-out after
+/// recording the runner's terminal completion before closing its exec stream.
+const RUNNER_COMPLETION_GRACE: Duration = Duration::from_secs(2);
 
 /// Debug marker contents written by the orchestrator when it parks a failed VM.
 pub const DEBUG_MARKER_IDLE: &str = "preserved";
@@ -4692,17 +4701,24 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // the host has left may hold a non-default environment golden.
         let golden_budget = self.golden_budget(max_concurrent, &golden_cache).await;
         let mut slots = JoinSet::new();
+        // Reserve a slot before provisioning starts. `queue_depth` is sampled
+        // asynchronously; without this local reservation the same queued job
+        // can be observed repeatedly while the first VM is still booting.
+        let in_flight = Arc::new(AtomicUsize::new(0));
         let mut next_slot: usize = 0;
 
         loop {
-            // Wait until the server has queued at least one job.
+            // Wait until queued work exceeds locally reserved slots. The
+            // server's queue sample may remain stale while a claim is being
+            // provisioned, so checking only `queued > 0` over-provisions.
             let pending = self.config.pending_jobs.as_deref();
             loop {
                 if shutdown.is_cancelled() {
                     break;
                 }
                 let queued = pending.map_or(0, |p| p.load(Ordering::Acquire));
-                if queued > 0 {
+                let reserved = in_flight.load(Ordering::Acquire);
+                if queued > reserved {
                     break;
                 }
                 tokio::select! {
@@ -4723,6 +4739,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     permit.expect("semaphore is never closed")
                 }
             };
+            in_flight.fetch_add(1, Ordering::AcqRel);
+            let in_flight_slot = in_flight.clone();
 
             let slot = next_slot;
             next_slot = next_slot.wrapping_add(1);
@@ -4758,6 +4776,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     permit_slot,
                 )
                 .await;
+                in_flight_slot.fetch_sub(1, Ordering::AcqRel);
                 if let Err(error) = &result {
                     warn!(slot, %error, "on-demand runner failed");
                 }
@@ -6201,6 +6220,10 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // re-polling the JoinHandle: a completed `&mut JoinHandle` cannot be
     // polled again, and `select!` re-polls its branches.
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let completion = config
+        .pool_status
+        .as_ref()
+        .map(|status| status.subscribe_runner_completion());
     let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_provider = provider.clone();
     let run_name = name.clone();
@@ -6209,7 +6232,15 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // claims it or it is torn down.
     let mut idle = IdleGuard::register(idle, config.pool_status.clone());
     let run_task = tokio::spawn(async move {
-        let result = run_until_exit(&run_provider, &run_name, &run, busy_tx, GUEST_LIVENESS).await;
+        let result = run_until_exit(
+            &run_provider,
+            &run_name,
+            &run,
+            busy_tx,
+            completion,
+            GUEST_LIVENESS,
+        )
+        .await;
         let _ = done_tx.send(result);
     });
 
@@ -6225,6 +6256,9 @@ async fn run_one_runner<P: VmProvider + 'static>(
         idle.release();
     };
 
+    let idle_deadline = tokio::time::sleep(UNCLAIMED_RUNNER_IDLE_GRACE);
+    tokio::pin!(idle_deadline);
+
     let result = tokio::select! {
         _ = shutdown.cancelled() => {
             // Killing the host-side `smolvm machine exec` process does not
@@ -6238,6 +6272,16 @@ async fn run_one_runner<P: VmProvider + 'static>(
             run_task.abort();
             let _ = run_task.await;
             info!(machine = name.as_str(), environment = %environment.base, "replacing idle runner for queued environment");
+            provider.stop(name).await.map_err(OrchestratorError::from)
+        },
+        _ = &mut idle_deadline, if !claimed.load(Ordering::Acquire) => {
+            info!(
+                machine = name.as_str(),
+                idle_secs = UNCLAIMED_RUNNER_IDLE_GRACE.as_secs(),
+                "single-use runner accepted no job; releasing idle VM"
+            );
+            run_task.abort();
+            let _ = run_task.await;
             provider.stop(name).await.map_err(OrchestratorError::from)
         },
         done = async {
@@ -6418,6 +6462,9 @@ async fn run_until_exit<P: VmProvider + 'static>(
     name: &MachineName,
     run: &[String],
     busy: tokio::sync::oneshot::Sender<()>,
+    completion: Option<
+        tokio::sync::broadcast::Receiver<preloop_observability::status::RunnerJobCompleted>,
+    >,
     liveness: GuestLiveness,
 ) -> Result<(), VmError> {
     let (chunks, mut receiver) = mpsc::channel(64);
@@ -6425,6 +6472,7 @@ async fn run_until_exit<P: VmProvider + 'static>(
     let machine = name.as_str().to_owned();
     let watcher = tokio::spawn(async move {
         let mut busy = Some(busy);
+        let mut completion = completion;
         let mut exit = Some(exit_tx);
         let mut pending = String::new();
         // Guest output is the only window into the worker. Forwarding it to
@@ -6432,7 +6480,44 @@ async fn run_until_exit<P: VmProvider + 'static>(
         // consuming it purely to sniff for the busy sentinel meant every
         // worker-side decision was invisible.
         let mut line_buffer = String::new();
-        while let Some(chunk) = receiver.recv().await {
+        loop {
+            let chunk = tokio::select! {
+                chunk = receiver.recv() => chunk,
+                event = async {
+                    completion
+                        .as_mut()
+                        .expect("completion branch is enabled only when subscribed")
+                        .recv()
+                        .await
+                }, if completion.is_some() => {
+                    match event {
+                        Ok(event) if event.runner_name == machine => {
+                            if let Some(busy) = busy.take() {
+                                let _ = busy.send(());
+                            }
+                            // The server has recorded the terminal result. Keep
+                            // the provider stream alive briefly for final log
+                            // fan-out, then the outer select drops the stream
+                            // future and the caller tears down the VM.
+                            tokio::time::sleep(RUNNER_COMPLETION_GRACE).await;
+                            if let Some(exit) = exit.take() {
+                                let _ = exit.send(0);
+                            }
+                            return;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            completion = None;
+                            continue;
+                        }
+                    }
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             let (bytes, is_stdout) = match chunk {
                 OutputChunk::Stdout(bytes) => (bytes, true),
                 OutputChunk::Stderr(bytes) => (bytes, false),
@@ -11907,7 +11992,7 @@ fi"#,
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, liveness),
+            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
         )
         .await
         .expect("a wedged guest must not pin the runner stream");
@@ -11940,7 +12025,7 @@ fi"#,
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, liveness),
+            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
         )
         .await
         .expect("a runner exit line must not wait for its descendants to close stdout");
@@ -11968,7 +12053,7 @@ fi"#,
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, liveness),
+            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
         )
         .await
         .expect("a runner exit line must not wait for its descendants to close stdout");
@@ -11984,6 +12069,54 @@ fi"#,
             ),
             "{result:?}"
         );
+    }
+
+    /// A broker completion releases a healthy runner even if its `run --once`
+    /// process and the exec stream never emit the runner-exit sentinel.
+    #[tokio::test]
+    async fn broker_completion_releases_a_stream_without_runner_exit() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .announcing_busy()
+                .with_run_gate(gate),
+        );
+        let name = MachineName::new("lifecycle-test-completion").unwrap();
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        let completion = Some(pool_status.subscribe_runner_completion());
+        let (busy, busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(30),
+            failures: 3,
+        };
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            let name = name.clone();
+            async move {
+                run_until_exit(
+                    &provider,
+                    &name,
+                    &["run".to_owned()],
+                    busy,
+                    completion,
+                    liveness,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        pool_status.notify_runner_completion(7, name.as_str().to_owned());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("completion event must release the stream")
+            .expect("runner task must not panic");
+        assert!(result.is_ok(), "{result:?}");
+        busy_rx
+            .await
+            .expect("completion release still marks the runner busy");
     }
 
     /// Only the exact exit line is an announcement; runner output that
@@ -12068,7 +12201,7 @@ fi"#,
         };
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, liveness),
+            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
         )
         .await;
         // The fake's descendant outlives the wait by design; never leave it
