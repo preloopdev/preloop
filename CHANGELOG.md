@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **Log masking covers base64 alignment shifts.** A secret piped through
+  `base64` with a short prefix in front of it (`printf 'x%s' "$SECRET" |
+  base64`) no longer reaches a masked log. Masked log paths now redact
+  base64 encodings of a registered secret at any byte alignment, including
+  tokens that straddle 76-column wrapped lines and tokens split across write
+  chunks in server-side log persistence. Percent- and hex-encodings of such
+  a shifted payload are still not covered by this pass; register the exact
+  value when a workflow prints it that way.
+
 ### Added
 
 - **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or
@@ -34,6 +45,15 @@ Releases before v0.27.0 predate the changelog.
 - **Dev tools pinned in `mise.toml`.** `mise install` provides zig, cargo-zigbuild,
   ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
   cargo-zigbuild match `release-runner.yml`.
+
+- **The `preloop` crate on crates.io tracks releases.** `publish-crates-io` in
+  the release workflow publishes `packaging/crates-io/preloop` — the crate that
+  holds the name on crates.io and points readers at the channels that do install
+  the CLI — at each release version, authenticating with a crates.io trusted
+  publisher instead of a stored token. The job skips with a workflow warning
+  while the name is unclaimed and no-ops when that version is already published,
+  so re-running a tag stays safe. The first version is still claimed by hand:
+  see `packaging/crates-io/README.md`.
 
 - **Superseded AgentENV volumes are collected automatically.** A runner bundle
   change publishes a new content-addressed volume and leaves the old one behind;
@@ -392,6 +412,16 @@ Releases before v0.27.0 predate the changelog.
   merged upload, and the logs endpoint falls back to the larger per-step
   representation when one exists. This preserves mutation and other
   heavy-step output after guest temporary-storage pressure.
+
+- **Post hooks of skipped actions no longer run**: a workflow step that did
+  not run, because its `if:` was false or an earlier step failed, no longer
+  runs its action's `post` hook. The official runner registers a post hook
+  while the action's handler runs — for the action's `Pre` step as well as its
+  main step — but the engine ran every post hook under its `always()` default,
+  so cleanup hooks of skipped steps ran for minutes and their failures were
+  recorded beside the real first failure. A post hook whose action never
+  reached its handler is now recorded as `skipped`; hooks of actions that ran,
+  and hooks whose action's `pre:` step ran, are unchanged.
 
 ## [0.34.4] - 2026-10-13
 
