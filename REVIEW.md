@@ -8,8 +8,7 @@ everything else, so a change that reads elegantly but diverges subtly from the
 official protocol is worse than one that is boring and identical.
 
 Before you review anything non-trivial, read `AGENTS.md`, `CONTRIBUTING.md`, and
-`docs/architecture.md` so you understand the crate boundaries and the
-compatibility constraints.
+`docs/control-plane/architecture/overview.mdx` so you understand the crate boundaries and the compatibility constraints.
 
 ---
 
@@ -161,7 +160,7 @@ Confirm that lock scope stays minimal and that a lock is never held across an
 a new subscriber cannot miss an event. Verify that cancellation is honored
 promptly and leaves behind no zombie leases or sessions. Any change to durable
 state should go behind the `Store` trait rather than reaching for `sqlx`
-directly, as described in the State Model section of `docs/architecture.md`.
+directly, as described in the durable state section of `docs/control-plane/architecture/api-and-state.mdx`.
 
 ---
 
@@ -195,10 +194,11 @@ of the correctness priorities in section 1.
 Push for the smallest change that accomplishes the goal, and reject scope creep
 such as retries, validation, telemetry, or abstraction added "while we're here"
 unless the task actually asked for it. Resist speculative abstraction, since one
-concrete caller does not justify a trait, and lean on the existing `Store` and
-`VmProvider` seams (and the planned `RunStore`/`AuthProvider`/`RunnerProvider`
-seams in `docs/fidelity-gap.md` §4) when a real seam exists rather than
-inventing new ones.
+concrete caller does not justify a trait, and lean on the current `ControlBackend`
+and `VmProvider` boundaries in
+`docs/control-plane/architecture/api-and-state.mdx` and
+`docs/control-plane/architecture/sandboxes.mdx` when a real seam exists rather
+than inventing new ones.
 
 Keep one way to do each thing, because a second convention living beside an
 existing one is a defect, so a new masking helper sitting next to `mask_secrets`
@@ -226,11 +226,12 @@ comment, especially quirks that exist to match the official runner, because a
 note like `// matches Runner.Worker v2.336.0 casing` keeps a future cleanup from
 reintroducing a bug, and it helps to link the upstream source or golden capture.
 
-Make sure the docs move with the behavior, including the `docs/architecture.md`
-module map, `docs/fidelity-gap.md` for protocol status, and any relevant files
-under `docs/roadmap.md`. Finally, expect tests to defend observable contracts, since a
-good test fails on a plausible bug while asserting struct field defaults or
-source text is just noise. Tests should follow the existing conventions and stay
+Make sure the docs move with the behavior, including the
+`docs/control-plane/architecture/overview.mdx` module map,
+`docs/contributing/fidelity-gap.md` for protocol status, and any relevant files
+under `docs/roadmap.md`. Finally, expect tests to defend observable contracts,
+since a good test fails on a plausible bug while asserting struct field defaults
+or source text is just noise. Tests should follow the existing conventions and
 deterministic and safe to run in the full suite, which includes respecting
 `PROPTEST_CASES`.
 

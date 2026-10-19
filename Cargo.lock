@@ -2535,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "preloop-cli"
-version = "0.34.4"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2715,6 +2715,7 @@ dependencies = [
 name = "preloop-observability"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -2724,7 +2725,10 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "rand 0.10.2",
+ "rcgen",
  "reqwest",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "tokio",
@@ -2732,6 +2736,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "webpki-root-certs",
 ]
 
 [[package]]
@@ -2830,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "preloop-runner-server"
-version = "0.34.4"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2895,6 +2900,7 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "uuid",
+ "webpki-root-certs",
  "x509-parser",
 ]
 

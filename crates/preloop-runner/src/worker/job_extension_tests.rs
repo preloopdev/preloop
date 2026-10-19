@@ -29,7 +29,7 @@ fn snapshot_rewrite_appends_to_workflow_supplied_git_config() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     // Workflow entry survives, snapshot entries land after it.
     assert_eq!(
@@ -71,7 +71,7 @@ fn snapshot_origin_rewrite_routes_hardcoded_forge_urls_to_the_snapshot() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
@@ -127,7 +127,7 @@ fn snapshot_rewrite_installs_its_own_extraheader_only() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     // The rewrite installs only its own snapshot header. github.com auth is
     // the checkout's own job (the broker patches the minted token into the
@@ -161,7 +161,7 @@ fn snapshot_auth_header_is_registered_as_a_mask() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("GIT_CONFIG_VALUE_2").map(String::as_str),
@@ -197,7 +197,7 @@ fn snapshot_origin_rewrite_routes_git_scheme_repository_url_to_the_snapshot() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
@@ -402,7 +402,7 @@ fn inject_github_env_sets_core_vars() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(job.env.get("CI").unwrap(), "true");
     assert_eq!(job.env.get("GITHUB_ACTIONS").unwrap(), "true");
@@ -430,7 +430,7 @@ fn inject_github_env_stringifies_boolean_ref_protected() {
             "github": { "ref": "refs/heads/main", "ref_protected": true }
         }
     });
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
     assert_eq!(job.env.get("GITHUB_REF_PROTECTED").unwrap(), "true");
 
     let mut job = JobContext::new(
@@ -444,7 +444,7 @@ fn inject_github_env_stringifies_boolean_ref_protected() {
             "github": { "ref": "refs/heads/main", "ref_protected": false }
         }
     });
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
     assert_eq!(job.env.get("GITHUB_REF_PROTECTED").unwrap(), "false");
 }
 
@@ -637,7 +637,7 @@ fn inject_actions_env_from_system_vss_endpoint_data() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("ACTIONS_RUNTIME_URL").map(String::as_str),
@@ -703,7 +703,7 @@ fn injects_job_environment_variables_from_acquire_payload() {
         }]
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("MEGA_GLOBAL_ENV").map(String::as_str),
@@ -740,7 +740,7 @@ fn job_message_variables_do_not_leak_into_step_env() {
         },
         "environmentVariables": []
     });
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     for leaked in [
         "system.orchestrationId",
@@ -773,6 +773,7 @@ fn github_job_falls_back_to_context_when_variable_absent() {
             "contextData": {"github": {"job": "legacy-build"}},
             "environmentVariables": []
         }),
+        crate::settings::ControlPlane::Engine,
     );
     assert_eq!(
         job.env.get("GITHUB_JOB").map(String::as_str),
@@ -814,6 +815,7 @@ runs:
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     }];
     let mut action_paths = std::collections::HashMap::new();
     action_paths.insert(
@@ -839,6 +841,12 @@ runs:
             if with.get("__preloop_entry").and_then(|v| v.as_str()) == Some("cleanup.js")
     ));
     assert_eq!(ordered[2].condition.as_deref(), Some("always()"));
+    assert_eq!(
+        ordered[2].post_of,
+        ["main-action", "__pre_main-action"],
+        "both the pre step and the main step register the post hook"
+    );
+    assert!(ordered[1].post_of.is_empty());
 }
 
 #[test]
@@ -866,6 +874,7 @@ fn lifecycle_registers_post_for_each_repeated_action_invocation() {
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     };
     let mut action_paths = std::collections::HashMap::new();
     action_paths.insert(
@@ -916,6 +925,7 @@ fn lifecycle_local_actions_skip_pre_but_retain_main_and_post() {
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     };
     let main_steps = vec![
         action_step("local", "./.github/actions/local"),
@@ -991,6 +1001,7 @@ runs:
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     }];
     let mut action_paths = std::collections::HashMap::new();
     action_paths.insert(
@@ -1207,6 +1218,7 @@ fn lifecycle_fixture(
             env,
             raw: serde_json::json!({"generated": index, "metadata": spec.metadata}),
             is_background: index % 2 == 0,
+            post_of: Vec::new(),
         });
     }
 
@@ -1486,7 +1498,7 @@ fn test_golden_acquirejob_payloads_parsing() {
             msg.get("contextData").cloned().unwrap_or_default(),
         );
         job.workspace = Some("_work/repo/repo".into());
-        inject_github_env(&mut job, &msg);
+        inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
         // GITHUB_REPOSITORY must be set and not empty (from contextData.github.repository)
         let repo = job.env.get("GITHUB_REPOSITORY").map(|s| s.as_str());
@@ -1538,7 +1550,7 @@ fn test_golden_acquirejob_payloads_parsing() {
             msg.get("contextData").cloned().unwrap_or_default(),
         );
         github_job.workspace = job.workspace.clone();
-        inject_github_env_with_plane(&mut github_job, &msg, crate::settings::ControlPlane::GitHub);
+        inject_github_env(&mut github_job, &msg, crate::settings::ControlPlane::GitHub);
         assert_eq!(
             github_job.env.get("GITHUB_TOKEN").map(String::as_str),
             Some(wire_token.as_str()),
@@ -1928,7 +1940,7 @@ fn unresolved_job_env_token_evaluates_to_the_minted_token_at_step_time() {
     }]);
     let mut job = claimed_job(&message);
     job.workspace = Some("_work/repo/repo".into());
-    inject_github_env(&mut job, &message);
+    inject_github_env(&mut job, &message, crate::settings::ControlPlane::Engine);
     assert_eq!(
         job.env.get("GITHUB_TOKEN").map(String::as_str),
         Some(CLAIM_MINTED_TOKEN),
@@ -1966,7 +1978,7 @@ fn job_env_github_token_override_does_not_replace_the_github_token_context() {
     }]);
     let mut job = claimed_job(&message);
     job.workspace = Some("_work/repo/repo".into());
-    inject_github_env_with_plane(&mut job, &message, crate::settings::ControlPlane::GitHub);
+    inject_github_env(&mut job, &message, crate::settings::ControlPlane::GitHub);
 
     assert_eq!(
         job.env.get("GITHUB_TOKEN").map(String::as_str),
@@ -2004,7 +2016,7 @@ fn empty_system_token_slot_falls_back_to_the_github_token_alias() {
 
         let mut job = claimed_job(&message);
         job.workspace = Some("_work/repo/repo".into());
-        inject_github_env_with_plane(&mut job, &message, crate::settings::ControlPlane::GitHub);
+        inject_github_env(&mut job, &message, crate::settings::ControlPlane::GitHub);
         assert_eq!(
             job.env.get("GITHUB_TOKEN").map(String::as_str),
             Some(CLAIM_MINTED_TOKEN),
@@ -2024,7 +2036,11 @@ fn empty_system_token_slot_falls_back_to_the_github_token_alias() {
         // Engine registration: the same variables stay off the step surface.
         let mut engine_job = claimed_job(&message);
         engine_job.workspace = Some("_work/repo/repo".into());
-        inject_github_env(&mut engine_job, &message);
+        inject_github_env(
+            &mut engine_job,
+            &message,
+            crate::settings::ControlPlane::Engine,
+        );
         assert_eq!(
             engine_job.env.get("GITHUB_TOKEN").map(String::as_str),
             None,

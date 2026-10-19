@@ -113,6 +113,39 @@ fn written_log_line_count(line: &str) -> u64 {
     line.bytes().filter(|byte| *byte == b'\n').count() as u64 + 1
 }
 
+/// Context names of action steps whose handler actually started, shared between
+/// `run_steps` and the action handler that registers them.
+///
+/// The official runner registers a post job step from `ActionRunner.RunAsync`,
+/// for the Pre and the Main stage, once the action's definition has loaded
+/// (`ActionRunner.cs`, `RunAsync`: the `HasPost` block runs after
+/// `taskManager.LoadAction`). A generated post hook therefore runs only when the
+/// action it cleans up after entered its handler — a step whose condition passed
+/// but whose environment, file-command setup or action resolution failed never
+/// registers it.
+#[derive(Debug, Clone, Default)]
+pub struct HookRegistrations {
+    started: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl HookRegistrations {
+    /// Record that `context_name`'s action handler started, registering its post
+    /// hook. Idempotent: composite nesting re-enters the same step.
+    pub fn register(&self, context_name: &str) {
+        self.started.lock().insert(context_name.to_owned());
+    }
+
+    /// Drop a registration, used when a replayed range re-runs its steps: a step
+    /// registers its hook again only if it runs again.
+    pub fn unregister(&self, context_name: &str) {
+        self.started.lock().remove(context_name);
+    }
+
+    pub fn is_registered(&self, context_name: &str) -> bool {
+        self.started.lock().contains(context_name)
+    }
+}
+
 pub struct StepContext<'a> {
     pub job: &'a mut JobContext,
     pub step_id: String,
@@ -159,6 +192,8 @@ pub struct StepContext<'a> {
     pub live_logs: Option<Arc<LiveLogQueue>>,
     /// Monotonic line counter for live log feed (per step).
     live_line_counter: std::sync::atomic::AtomicU64,
+    /// Post-hook registrations this step's action makes when it starts.
+    pub hooks: HookRegistrations,
 }
 
 impl<'a> StepContext<'a> {
@@ -231,6 +266,7 @@ impl<'a> StepContext<'a> {
             stdout_partial_is_continuation: std::sync::atomic::AtomicBool::new(false),
             live_logs,
             live_line_counter: std::sync::atomic::AtomicU64::new(1),
+            hooks: HookRegistrations::default(),
         }
     }
 

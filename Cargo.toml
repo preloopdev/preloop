@@ -28,7 +28,7 @@ edition = "2024"
 # deployed binary's provenance unreadable (a host reporting CLI 0.32.7 was
 # running post-0.32.7 code, while `service.version` showed the server's
 # unrelated 0.2.0). Both now inherit this single number.
-version = "0.34.4"
+version = "0.35.0"
 license = "MIT"
 repository = "https://github.com/preloopdev/preloop"
 homepage = "https://github.com/preloopdev/preloop"
@@ -71,6 +71,7 @@ refinery = { version = "0.10.0", default-features = false, features = ["rusqlite
 postgres_rustls = "0.1"
 tokio-rustls = "0.26"
 rustls-native-certs = "0.8"
+webpki-root-certs = "1"
 serde_yaml = "0.9"
 rpassword = "7"
 sha2 = { version = "0.10", features = ["oid"] }

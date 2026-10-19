@@ -14,19 +14,21 @@ use std::path::Path;
 /// A GitHub-operated endpoint hands the runner a real GitHub credential in the
 /// job's `system.github.token` variable, so the worker may project it onto
 /// `github.token`/`GITHUB_TOKEN` exactly like the official runner
-/// (`ExecutionContext.InitializeJob`). On a preloop engine that variable is the
-/// control plane's own slot: the claim writes the GitHub credential it minted
-/// there and leaves it empty when it has none, and the job-scoped runtime
-/// credential is a control-plane credential workflow code must not see. So
-/// engine registrations keep `system.github.token` off the step surface and
-/// read the `github.token` context the claim patches instead.
+/// (`ExecutionContext.InitializeJob`). On a preloop engine that variable is
+/// the control plane's GitHub credential slot: the claim writes the GitHub
+/// credential it minted there and leaves it empty when it has none. The
+/// job-scoped runtime JWT is a separate control-plane credential delivered
+/// through the job's `SystemVssConnection` endpoint; it is never written to
+/// this variable. Engine registrations therefore keep `system.github.token`
+/// off the step surface and read the `github.token` context the claim patches
+/// instead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ControlPlane {
     /// Registered against a preloop engine (or anything that is not a URL
     /// `register_runner` registers against GitHub). Fails closed:
-    /// `system.github.token` is treated as a control-plane credential and
-    /// never exported.
+    /// `system.github.token` is treated as the claim's GitHub credential
+    /// slot and is never exported.
     #[default]
     Engine,
     /// Registered against github.com: `system.github.token` is a real GitHub
@@ -40,13 +42,22 @@ impl<'de> Deserialize<'de> for ControlPlane {
         D: serde::Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Ok(if value.eq_ignore_ascii_case("github") {
-            Self::GitHub
+        if value.eq_ignore_ascii_case("github") {
+            Ok(Self::GitHub)
+        } else if value.eq_ignore_ascii_case("engine") {
+            Ok(Self::Engine)
         } else {
-            // Unknown values fail closed; old files omit the field and use
-            // `Default` through `#[serde(default)]` on RunnerSettings.
-            Self::Engine
-        })
+            // A value this build does not recognise is corrupt registration
+            // metadata, not an implicit engine registration: silently
+            // selecting Engine would hide a typo or a field written by a
+            // newer build. Old files omit the field entirely, which
+            // `Option<ControlPlane>` plus `#[serde(default)]` still accepts.
+            // Name the field and the accepted values; do not echo the raw
+            // value, which may have come from corrupt or hostile metadata.
+            Err(serde::de::Error::custom(
+                "invalid `.runner` controlPlane value; expected \"engine\" or \"github\"",
+            ))
+        }
     }
 }
 
@@ -61,27 +72,30 @@ impl<'de> Deserialize<'de> for ControlPlane {
 /// `register_runner` actually registers against GitHub, map to `GitHub`; every
 /// other host, including self-hosted GHES and `*.ghe.com` (whose enterprise
 /// API host preloop does not route to), maps to `Engine` and keeps the
-/// control-plane fence. Unparseable URLs are `Engine` for the same reason.
+/// control-plane fence.
 ///
 /// `register_runner` matches hosts with a `contains("github.com")` substring
 /// test, so a host like `github.com.example.invalid` is registered against
 /// GitHub's API while this classification stays `Engine`; the disagreement is
 /// deliberately resolved in the closed direction, never by exporting a
 /// variable a control plane owns.
-pub fn control_plane_for_url(url: &str) -> ControlPlane {
-    let host = reqwest::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned));
-    let host = match host {
-        Some(host) => host.trim_end_matches('.').to_ascii_lowercase(),
-        // Bare hosts without a scheme ("example.com:8080") are engines:
-        // they can never be github.com.
-        None => return ControlPlane::Engine,
-    };
+///
+/// Unparseable URLs and URLs without a host are errors. Treating them as
+/// `Engine` would silently accept corrupt registration metadata and hide the
+/// misconfiguration until a workflow ran; callers must surface the error
+/// instead of choosing a plane.
+pub fn control_plane_for_url(url: &str) -> Result<ControlPlane> {
+    let parsed =
+        reqwest::Url::parse(url).context("registration URL is not a valid absolute URL")?;
+    let host = parsed
+        .host_str()
+        .context("registration URL has no host")?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if host == "github.com" || host.ends_with(".github.com") {
-        ControlPlane::GitHub
+        Ok(ControlPlane::GitHub)
     } else {
-        ControlPlane::Engine
+        Ok(ControlPlane::Engine)
     }
 }
 
@@ -131,12 +145,45 @@ pub struct RunnerSettings {
     /// preloop extension (not an official `.runner` field): which control
     /// plane this runner registered against, recorded at configure from the
     /// `--url` host. `None` in `.runner` files written before the field
-    /// existed, and for a value this build does not recognise.
+    /// existed; an unrecognised value is rejected when the file is parsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane: Option<ControlPlane>,
 }
 
+/// Registration state resolved from `.runner` for job execution.
+///
+/// Carrying the resolved plane next to the runner identity means a job never
+/// re-reads `.runner` (or re-derives the plane from whatever directory it
+/// happens to run in) after startup validated the registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerRegistration {
+    pub control_plane: ControlPlane,
+    pub runner_name: String,
+}
+
 impl RunnerSettings {
+    /// Load `.runner` only.
+    ///
+    /// Credential files are deliberately not read here. Callers that execute
+    /// jobs project the validated runtime state with [`Self::registration`];
+    /// callers that only need the settings validate with
+    /// [`Self::control_plane`] before using them.
+    pub fn load(root: &Path) -> Result<Self> {
+        load_json(&root.join(RUNNER_FILE))
+    }
+
+    /// Project the registration state a job needs.
+    ///
+    /// Resolves and validates the control plane and copies the registered
+    /// runner name. The only clone is the one this projection owns; reading
+    /// `.runner` for non-job purposes does not pay for it.
+    pub fn registration(&self) -> Result<RunnerRegistration> {
+        Ok(RunnerRegistration {
+            control_plane: self.control_plane()?,
+            runner_name: self.agent_name.clone(),
+        })
+    }
+
     /// The plane this runner registered against: the recorded value, or — for
     /// a `.runner` file that predates the field — the class of the
     /// registration URL the file already carries.
@@ -144,11 +191,14 @@ impl RunnerSettings {
     /// The inference is the classification `configure` would have recorded for
     /// that same URL, so an upgraded github.com runner keeps its GitHub token
     /// surface without re-registering, while an engine (or a host preloop does
-    /// not register against GitHub) stays fenced. A recorded but unrecognised
-    /// value deserialised to `Engine` and is never widened here.
-    pub fn control_plane(&self) -> ControlPlane {
-        self.control_plane
-            .unwrap_or_else(|| control_plane_for_url(&self.git_hub_url))
+    /// not register against GitHub) stays fenced. A recorded value wins over
+    /// the inferred one; an unrecognised recorded value is rejected at
+    /// deserialization. The registration URL is validated even when the field
+    /// is present, so corrupt metadata cannot hide behind an explicit plane.
+    pub fn control_plane(&self) -> Result<ControlPlane> {
+        let inferred =
+            control_plane_for_url(&self.git_hub_url).context("invalid `.runner` gitHubUrl")?;
+        Ok(self.control_plane.unwrap_or(inferred))
     }
 }
 
@@ -321,9 +371,15 @@ pub struct RunnerConfig {
 
 impl RunnerConfig {
     /// Load runner configuration from the given root directory.
+    ///
+    /// `.runner` is validated (including its recorded control plane) before
+    /// the credential files are read, so a malformed registration cannot be
+    /// mistaken for an engine registration by a running listener.
     pub fn load(root: &Path) -> Result<Self> {
+        let settings = RunnerSettings::load(root)?;
+        settings.control_plane()?;
         Ok(Self {
-            settings: load_json(&root.join(RUNNER_FILE))?,
+            settings,
             credentials: load_json(&root.join(CREDENTIALS_FILE))?,
             rsa_params: load_json(&root.join(RSA_PARAMS_FILE))?,
         })
@@ -680,16 +736,16 @@ mod tests {
         // Only hosts under github.com are GitHub's, because that is the one
         // URL shape `register_runner` registers against GitHub.
         assert_eq!(
-            control_plane_for_url("https://github.com/owner/repo"),
+            control_plane_for_url("https://github.com/owner/repo").unwrap(),
             ControlPlane::GitHub
         );
         assert_eq!(
-            control_plane_for_url("https://api.github.com"),
+            control_plane_for_url("https://api.github.com").unwrap(),
             ControlPlane::GitHub
         );
         // Host matching is case-insensitive and tolerates a trailing dot.
         assert_eq!(
-            control_plane_for_url("https://GitHub.COM/owner/repo"),
+            control_plane_for_url("https://GitHub.COM/owner/repo").unwrap(),
             ControlPlane::GitHub
         );
 
@@ -698,30 +754,37 @@ mod tests {
         // registration route preloop implements), and hosts that merely
         // contain "github.com" as a substring.
         assert_eq!(
-            control_plane_for_url("https://ci.internal.example"),
+            control_plane_for_url("https://ci.internal.example").unwrap(),
             ControlPlane::Engine
         );
         assert_eq!(
-            control_plane_for_url("http://127.0.0.1:9191"),
+            control_plane_for_url("http://127.0.0.1:9191").unwrap(),
             ControlPlane::Engine
         );
         assert_eq!(
-            control_plane_for_url("https://acme.ghe.com/org/repo"),
+            control_plane_for_url("https://acme.ghe.com/org/repo").unwrap(),
             ControlPlane::Engine
         );
         assert_eq!(
-            control_plane_for_url("https://ghe.corp.example/owner/repo"),
+            control_plane_for_url("https://ghe.corp.example/owner/repo").unwrap(),
             ControlPlane::Engine
         );
         assert_eq!(
-            control_plane_for_url("https://github.com.evil.example/o/r"),
+            control_plane_for_url("https://github.com.evil.example/o/r").unwrap(),
             ControlPlane::Engine
         );
         assert_eq!(
-            control_plane_for_url("https://notgithub.com/o/r"),
+            control_plane_for_url("https://notgithub.com/o/r").unwrap(),
             ControlPlane::Engine
         );
-        assert_eq!(control_plane_for_url("not a url"), ControlPlane::Engine);
+
+        // Malformed registration metadata must not silently become Engine.
+        for malformed in ["", "not a url", "example.com:8080"] {
+            assert!(
+                control_plane_for_url(malformed).is_err(),
+                "{malformed:?} must be rejected, not classified as Engine"
+            );
+        }
     }
 
     #[test]
@@ -743,37 +806,85 @@ mod tests {
             serde_json::from_str::<RunnerSettings>(&json).unwrap()
         };
         assert_eq!(
-            legacy("https://github.com/t/r").control_plane(),
+            legacy("https://github.com/t/r").control_plane().unwrap(),
             ControlPlane::GitHub
         );
         assert_eq!(
-            legacy("https://ci.internal.example").control_plane(),
+            legacy("https://ci.internal.example")
+                .control_plane()
+                .unwrap(),
             ControlPlane::Engine
         );
         assert_eq!(
-            legacy("https://ghe.corp.example/owner/repo").control_plane(),
+            legacy("https://ghe.corp.example/owner/repo")
+                .control_plane()
+                .unwrap(),
             ControlPlane::Engine
         );
+        assert!(
+            legacy("not a url").control_plane().is_err(),
+            "a legacy file with a malformed gitHubUrl must not classify as Engine"
+        );
 
-        // A recorded value wins over the URL, and an unrecognised one fails
-        // closed rather than being re-derived from the URL.
-        let recorded = |control_plane: &str| {
+        // A recorded value wins over the URL. An unrecognised value is
+        // rejected while parsing the file, not widened or fenced silently.
+        let recorded = |control_plane: &str, git_hub_url: &str| {
             let json = format!(
                 r#"{{
                     "agentId": 1,
                     "agentName": "test",
                     "poolId": 1,
                     "serverUrl": "https://example.com",
-                    "gitHubUrl": "https://github.com/t/r",
+                    "gitHubUrl": "{git_hub_url}",
                     "workFolder": "_work",
                     "controlPlane": "{control_plane}"
                 }}"#
             );
-            serde_json::from_str::<RunnerSettings>(&json).unwrap()
+            serde_json::from_str::<RunnerSettings>(&json)
         };
-        assert_eq!(recorded("github").control_plane(), ControlPlane::GitHub);
-        assert_eq!(recorded("engine").control_plane(), ControlPlane::Engine);
-        assert_eq!(recorded("surprise").control_plane(), ControlPlane::Engine);
+        // The explicit value is authoritative in both directions; it is a
+        // recorded decision, not a hint derived from the URL.
+        assert_eq!(
+            recorded("github", "https://ci.internal.example")
+                .unwrap()
+                .control_plane()
+                .unwrap(),
+            ControlPlane::GitHub
+        );
+        assert_eq!(
+            recorded("engine", "https://github.com/t/r")
+                .unwrap()
+                .control_plane()
+                .unwrap(),
+            ControlPlane::Engine
+        );
+        // Case-insensitive spellings configure accepts still work.
+        assert_eq!(
+            recorded("GitHub", "https://ci.internal.example")
+                .unwrap()
+                .control_plane()
+                .unwrap(),
+            ControlPlane::GitHub
+        );
+        // An explicit plane does not excuse a malformed registration URL.
+        assert!(
+            recorded("engine", "not a url")
+                .unwrap()
+                .control_plane()
+                .is_err(),
+            "a malformed gitHubUrl must fail even when controlPlane is present"
+        );
+        let error = recorded("surprise", "https://github.com/t/r")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("controlPlane") && error.contains("engine"),
+            "unknown controlPlane must be rejected with an actionable error, got: {error}"
+        );
+        assert!(
+            !error.contains("surprise"),
+            "the error must not echo the raw metadata value, got: {error}"
+        );
 
         // Configure always records the plane explicitly.
         let settings = RunnerSettings {
@@ -799,6 +910,83 @@ mod tests {
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"controlPlane\":\"engine\""));
+    }
+
+    #[test]
+    fn settings_load_requires_only_runner_file_and_rejects_bad_metadata() {
+        let dir = TempDir::new().unwrap();
+        let write = |json: &str| {
+            std::fs::write(dir.path().join(".runner"), json).unwrap();
+        };
+
+        // Missing `.runner` is an error, not an implicit Engine.
+        let error = format!("{:#}", RunnerSettings::load(dir.path()).unwrap_err());
+        assert!(
+            error.contains(".runner"),
+            "missing metadata error must name the file, got: {error}"
+        );
+
+        // Only `.runner` is needed: credentials and RSA params are not read
+        // on the job-execution path.
+        write(
+            r#"{
+                "agentId": 1,
+                "agentName": "test",
+                "poolId": 1,
+                "serverUrl": "https://example.com",
+                "gitHubUrl": "https://github.com/t/r",
+                "workFolder": "_work"
+            }"#,
+        );
+        let settings = RunnerSettings::load(dir.path()).unwrap();
+        let registration = settings.registration().unwrap();
+        assert_eq!(registration.control_plane, ControlPlane::GitHub);
+        assert_eq!(registration.runner_name, "test");
+
+        // Malformed JSON and unknown explicit planes fail loudly.
+        write("{ not json");
+        assert!(RunnerSettings::load(dir.path()).is_err());
+
+        write(
+            r#"{
+                "agentId": 1,
+                "agentName": "test",
+                "poolId": 1,
+                "serverUrl": "https://example.com",
+                "gitHubUrl": "https://github.com/t/r",
+                "workFolder": "_work",
+                "controlPlane": "enterprise"
+            }"#,
+        );
+        let error = format!("{:#}", RunnerSettings::load(dir.path()).unwrap_err());
+        assert!(
+            error.contains("controlPlane"),
+            "unknown plane error must name the field, got: {error}"
+        );
+
+        // A legacy file whose registration URL cannot be parsed is an error
+        // rather than an Engine registration.
+        write(
+            r#"{
+                "agentId": 1,
+                "agentName": "test",
+                "poolId": 1,
+                "serverUrl": "https://example.com",
+                "gitHubUrl": "not a url",
+                "workFolder": "_work"
+            }"#,
+        );
+        let error = format!(
+            "{:#}",
+            RunnerSettings::load(dir.path())
+                .unwrap()
+                .registration()
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("registration URL"),
+            "malformed URL error must name the registration URL, got: {error}"
+        );
     }
 
     #[test]

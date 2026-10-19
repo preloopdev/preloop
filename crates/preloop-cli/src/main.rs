@@ -21,6 +21,7 @@ mod aenv_egress;
 mod app_manifest;
 mod dap_client;
 mod debug_session;
+mod engine_app_setup;
 mod github_auth;
 mod github_setup;
 mod init;
@@ -29,6 +30,7 @@ mod push;
 mod server_install;
 mod store;
 mod update;
+mod volumes;
 mod webhooks;
 
 pub(crate) fn server_url() -> String {
@@ -36,22 +38,9 @@ pub(crate) fn server_url() -> String {
 }
 
 fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
-    if uses_default_transport {
-        return true;
-    }
-
     // An explicit loopback URL is still a local engine invocation. Do not
     // trust a host path for an arbitrary remote server.
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+    uses_default_transport || url_is_loopback(url)
 }
 
 fn mounted_control_origin(public_url: &str) -> Option<String> {
@@ -520,7 +509,11 @@ pub(crate) fn build_client() -> reqwest::Client {
     // is the runner/guest surface: it deliberately refuses native APIs
     // (`/api/v1/runs` and friends 404 there), so it must never be the
     // default transport for CLI commands.
-    reqwest::Client::builder()
+    //
+    // `with_tls_roots` pins verification to the shared in-process root set:
+    // the platform verifier would consult the OS trust daemon on every
+    // handshake, and that daemon can prompt or hang.
+    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
         .build()
         .expect("valid HTTP client configuration")
 }
@@ -589,7 +582,10 @@ fn default_vm_backend() -> VmBackend {
 pub(crate) fn vm_provider(backend: VmBackend) -> Box<dyn preloop_vm::VmProvider> {
     match backend {
         VmBackend::Smolvm => Box::new(preloop_vm::SmolVmProvider::default()),
-        VmBackend::Agentenv => Box::new(preloop_vm::agentenv::AgentEnvProvider::default()),
+        VmBackend::Agentenv => Box::new(
+            preloop_vm::agentenv::AgentEnvProvider::default()
+                .with_bundle_manifest(preloop_orchestrator::runner_bundle_manifest()),
+        ),
     }
 }
 
@@ -859,11 +855,11 @@ enum Command {
 
     /// Configure credentials, the golden image, and how to run — in one step.
     ///
-    /// In a terminal this is a four-step wizard (credentials, golden, run
-    /// mode, preflight); with stdin or stdout not a TTY it takes the same
-    /// answers as flags and never prompts, so scripts and agents get the same
-    /// config. `--probe --json` reports host capabilities without touching
-    /// anything. Re-running reconfigures in place.
+    /// In a terminal this is a five-step wizard (credentials, golden,
+    /// workflows, run mode, preflight); with stdin or stdout not a TTY it
+    /// takes the same answers as flags and never prompts, so scripts and
+    /// agents get the same config. `--probe --json` reports host capabilities
+    /// without touching anything. Re-running reconfigures in place.
     Init(init::InitArgs),
 
     /// Verify the GitHub credential configuration.
@@ -882,11 +878,17 @@ enum Command {
     /// pending migrations, report migration state — and the one-time import
     /// of a legacy v11 `preloop.db`.
     ///
-    /// `preloop serve` never migrates: a missing, older or newer control
-    /// schema refuses at boot and names `preloop store migrate` as the fix.
+    /// `preloop serve` initializes only a brand-new local store and otherwise
+    /// never migrates: an older, newer or divergent control schema refuses at
+    /// boot and names `preloop store migrate` as the fix.
     /// SQLite migrations take a consistent backup before changing anything
     /// (refinery has no down; restore the backup to roll back).
     Store(store::StoreArgs),
+
+    /// List and reclaim the read-only volumes the engine mounts. Each holds one
+    /// tree (today: the runner bundle); `prune` deletes the ones no sandbox
+    /// mounts, keeping the tree the engine would mount.
+    Volumes(volumes::VolumesArgs),
 
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
@@ -921,8 +923,8 @@ enum Command {
     /// tunnel or reverse proxy at `--listen` to receive events from GitHub.
     Serve(ServeArgs),
 
-    /// Former name for `serve`. Retained because `ensure_engine_running`
-    /// spawns it by name, and to keep existing supervisor units working.
+    /// Former name for `serve`. Retained so existing supervisor units and
+    /// scripts that still invoke it keep working.
     #[command(hide = true)]
     Engine,
 
@@ -1258,14 +1260,18 @@ async fn main() -> anyhow::Result<()> {
         // Schema administration and the legacy import are explicit and
         // offline; never bootstrap (or migrate) the engine for them.
         Command::Store(args) => store::run(args).await,
+        Command::Volumes(args) => volumes::run(args).await,
         // Planning parses local workflow files only; do not bootstrap the
         // control-plane engine for a command that never contacts it.
         Command::Plan(args) => cmd_plan(args).await,
         _ => {
-            // Bootstrap the engine for client commands, but bind the outcome
-            // instead of `?` so the telemetry flush below still runs when
-            // engine startup fails.
-            match ensure_engine_running().await {
+            // Client commands require an engine that is already running
+            // (#658): none of them starts one. The probe targets the endpoint
+            // the command will use — `dap --url` overrides `PRELOOP_URL`, and
+            // probing the default there would refuse a live engine. Bind the
+            // outcome instead of `?` so the telemetry flush below still runs
+            // when it is missing.
+            match require_running_engine(command_engine_url(&cli.command)).await {
                 Ok(()) => match cli.command {
                     Command::Run(args) => cmd_run(args).await,
                     Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
@@ -1291,7 +1297,8 @@ async fn main() -> anyhow::Result<()> {
                     | Command::Doctor(_)
                     | Command::Secret(_)
                     | Command::Server(_)
-                    | Command::Store(_) => {
+                    | Command::Store(_)
+                    | Command::Volumes(_) => {
                         unreachable!("daemon commands handled before client startup")
                     }
                 },
@@ -1599,135 +1606,131 @@ fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
 /// a misconfigured auth layer by succeeding where an anonymous probe would
 /// not. Authenticated readiness is checked against `/readyz` separately.
 async fn probe_engine_health(client: &reqwest::Client, url: &str) -> bool {
+    probe_engine_health_within(client, url, probe_timeout(url)).await
+}
+
+/// [`probe_engine_health`] against an explicit budget, so both endpoint
+/// classes can be covered without a network that is actually slow.
+async fn probe_engine_health_within(client: &reqwest::Client, url: &str, budget: Duration) -> bool {
     client
         .get(format!("{url}/healthz"))
-        .timeout(Duration::from_millis(500))
+        .timeout(budget)
         .send()
         .await
         .is_ok()
 }
 
-/// The last lines the engine wrote to `engine.log` at or after `offset`, which
-/// hold its own exit error. Empty when the log cannot be read.
-fn engine_log_tail(path: &std::path::Path, offset: u64) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL_LINES: usize = 20;
-    let mut bytes = Vec::new();
-    let read = std::fs::File::open(path).and_then(|mut file| {
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_to_end(&mut bytes)
-    });
-    if read.is_err() {
-        return String::new();
+/// How long the liveness probe waits for `/healthz` before it calls the
+/// endpoint dead.
+///
+/// The two budgets exist because the endpoints are not alike. A loopback
+/// engine answers in microseconds when it is listening and refuses the
+/// connection instantly when it is not, so a client command probes it
+/// tightly: the pre-push hook runs `preloop run`, and time spent waiting on a
+/// silent local endpoint is time it spends on every push. An explicit
+/// `PRELOOP_URL` may cross a network — a tunnel, a reverse proxy, a VPN —
+/// where a healthy `/healthz` can legitimately take longer than that, so the
+/// remote budget waits out one slow round trip instead of reporting a live
+/// engine as absent. Neither budget is negotiable at runtime: the probe has
+/// to refuse a genuinely dead endpoint in bounded time, and a stalled
+/// endpoint must not hang the command.
+const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The liveness-probe budget for `url` — see [`LOOPBACK_PROBE_TIMEOUT`].
+fn probe_timeout(url: &str) -> Duration {
+    if url_is_loopback(url) {
+        LOOPBACK_PROBE_TIMEOUT
+    } else {
+        REMOTE_PROBE_TIMEOUT
     }
-    let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let tail = &lines[lines.len().saturating_sub(TAIL_LINES)..];
-    if tail.is_empty() {
-        return String::new();
-    }
-    format!("\n{}\n(full log: {})", tail.join("\n"), path.display())
 }
 
-async fn ensure_engine_running() -> anyhow::Result<()> {
-    if std::env::var("PRELOOP_URL").is_ok() {
+/// The whole client-side engine-access policy, and it has exactly two
+/// outcomes: an engine that answers lets the command proceed, anything else
+/// refuses. No client command may start an engine (#658 — a `preloop run`
+/// from the pre-push hook used to boot a control plane and a smolVM on the
+/// developer's machine); `preloop serve` is the only entry point that starts
+/// one.
+///
+/// Pure on purpose: the start path is gone, so this is the policy's entire
+/// surface and tests cover it without touching the process table.
+fn engine_access(reachable: bool, url: &str) -> anyhow::Result<()> {
+    if reachable {
         return Ok(());
     }
+    Err(no_engine_error(url))
+}
 
+/// What a client command says, and exits non-zero with, when nothing answers
+/// the liveness probe: what was probed, and both ways to start an engine.
+///
+/// The message carries [`ENGINE_UNREACHABLE_MARKER`] through
+/// [`engine_unreachable_context`]. That is a compatibility contract, not
+/// decoration: the pre-push hook fails open only on that marker, so dropping
+/// it would turn a missing engine into "CI failed" and block pushes with a
+/// verdict about a run that never happened.
+fn no_engine_error(url: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no engine is running at {url} — start one with `preloop serve` (foreground) \
+         or `preloop server install` (supervised service)"
+    )
+    .context(engine_unreachable_context())
+}
+
+/// Probe the endpoint this CLI would use — `PRELOOP_URL` when set, else the
+/// local default — and refuse when nothing answers.
+///
+/// `PRELOOP_URL` still means "talk to that engine": it is probed like any
+/// other endpoint, never assumed live, and never replaced by a locally
+/// started one.
+///
+/// `url_override` is the endpoint a command carries itself (`dap --url`). It
+/// is probed instead of the default: the command will talk to that engine, so
+/// probing anywhere else would refuse a live one.
+async fn require_running_engine(url_override: Option<&str>) -> anyhow::Result<()> {
     let client = build_client();
-    let url = server_url();
+    let url = url_override.map(str::to_owned).unwrap_or_else(server_url);
+    // Anonymous liveness probe — see `probe_engine_health`.
+    let reachable = probe_engine_health(&client, &url).await;
+    engine_access(reachable, &url)
+}
 
-    // The liveness probe is anonymous — see `probe_engine_health`.
-    if probe_engine_health(&client, &url).await {
-        return Ok(());
+/// The endpoint a client command selects for itself, when it has one. `None`
+/// means the command talks to whatever `PRELOOP_URL` (else the local default)
+/// names, which [`server_url`] resolves.
+fn command_engine_url(command: &Command) -> Option<&str> {
+    match command {
+        Command::Dap(args) => args.url.as_deref(),
+        _ => None,
     }
+}
 
-    eprintln!("[preloop] Starting local background engine...");
-
-    let preloop_dir = preloop_home();
-    let state_dir = preloop_dir.join("state");
-    let pid_path = preloop_dir.join("preloop.pid");
-
+/// First-run preparation for the one command that starts an engine: create
+/// the home and, when the control database is brand-new (absent or empty),
+/// initialize it through the embedded migrations, so a fresh `PRELOOP_HOME`
+/// serves with no extra step.
+///
+/// The database prepared is the one the boot will open: `store_url` is
+/// `preloop serve --store`, and `None` falls back to `PRELOOP_STORE_URL` and
+/// then to the state-dir default — the same precedence the server resolves
+/// (`StoreTarget::resolve`).
+///
+/// An existing database is never touched: `preloop serve` does not migrate,
+/// and an older, newer or divergent schema still fails the boot with
+/// `preloop store migrate` in the message. `PRELOOP_STORE_URL` redirects the
+/// store — a Postgres URL is the operator's to provision.
+fn prepare_local_engine_home(
+    home: &std::path::Path,
+    store_url: Option<&str>,
+) -> anyhow::Result<()> {
+    let state_dir = home.join("state");
     std::fs::create_dir_all(&state_dir)?;
-    set_private_directory_permissions(&preloop_dir)?;
-
-    // Brand-new local installs: initialize the control database here so
-    // first use stays zero-config. Anything that already exists is left
-    // untouched — the engine refuses a missing/older/newer schema and
-    // `preloop store migrate` is the explicit upgrade path (never implicit).
-    if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)? {
-        eprintln!(
-            "[preloop] initialized the local control database ({}), migrations applied",
-            state_dir.join("preloop.db").display()
-        );
+    set_private_directory_permissions(home)?;
+    if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir, store_url)? {
+        eprintln!("[preloop] initialized the brand-new control database");
     }
-
-    let store = preloop_runner_server::credential_store::engine_store(&preloop_dir)?;
-    let token = prepare_engine_token(
-        &preloop_dir,
-        std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
-        store.as_ref(),
-    )?;
-
-    let engine_bin = std::env::current_exe().context("resolve preloop executable")?;
-
-    let mut cmd = std::process::Command::new(&engine_bin);
-    cmd.arg("engine");
-    cmd.env("PRELOOP_SYSTEM_TOKEN", token);
-    cmd.env("PRELOOP_HOME", &preloop_dir);
-    // Lets the engine record in serve.lock that a preloop command started it,
-    // so a second `preloop serve` names the right way to stop it.
-    cmd.env(
-        preloop_runner_server::bootstrap::ENGINE_ORIGIN_ENV,
-        preloop_runner_server::bootstrap::EngineOrigin::Background.as_str(),
-    );
-    if std::env::var_os("RUST_LOG").is_none() {
-        cmd.env("RUST_LOG", "info,preloop=debug");
-    }
-
-    let engine_log = preloop_dir.join("engine.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&engine_log)?;
-    // Where this start's output begins, so a failed start quotes only its own error.
-    let log_offset = log_file.metadata()?.len();
-
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(log_file.try_clone()?);
-    cmd.stderr(log_file);
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn engine at {}", engine_bin.display()))?;
-
-    let _ = std::fs::write(&pid_path, child.id().to_string());
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(30) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!(
-                "engine exited before becoming ready: {status}{}",
-                engine_log_tail(&engine_log, log_offset)
-            );
-        }
-        if client
-            .get(format!("{url}/healthz"))
-            .timeout(Duration::from_millis(300))
-            .send()
-            .await
-            .is_ok()
-        {
-            eprintln!("[preloop] Engine ready.");
-            return Ok(());
-        }
-    }
-
-    anyhow::bail!("engine auto-boot timed out after 30 seconds");
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2075,14 +2078,23 @@ async fn cmd_engine(
     let runner_url = std::env::var("PRELOOP_RUNNER_URL").unwrap();
     let control_origin = mounted_control_origin(&runner_url);
 
+    // `preloop serve` is the only command that starts an engine (#658), so
+    // it owns the zero-config first run: create the home and initialize a
+    // brand-new control database. The removed client-command auto-start used
+    // to perform this step. `--store` selects the database, exactly as it
+    // selects the one the server below opens.
+    prepare_local_engine_home(&home, args.store.as_deref())?;
+
     // Resolve GitHub credentials before `AppState::new` reads the environment.
     // Both `github_app::load_from_env` and the webhook-secret lookup happen
     // inside `serve`, so anything published after that call is ignored.
     //
     // The offer comes first: `preloop init` writes credentials too, and a
     // credential configured by the wizard must be the one this process picks
-    // up, not the one it read a moment earlier.
-    offer_init_when_unconfigured().await?;
+    // up, not the one it read a moment earlier. The wizard may also resolve a
+    // public URL of its own (the App flow's question), which has to reach the
+    // engine *this* process is about to start.
+    offer_init_when_unconfigured(&public_url).await?;
     resolve_github_auth(&args, &state_dir)?;
 
     // Shared with the runner pool so it can size provisioning to the work
@@ -2149,7 +2161,7 @@ async fn cmd_engine(
                 "no runner pool: jobs will fail after the queue grace window. \
                  Install the Linux guest runner with `preloop update`, or set \
                  PRELOOP_RUNNER_BUNDLE to a directory containing preloop-runner \
-                 (see docs/vm-images.md)"
+                 (see docs/control-plane/operate/vm-images.mdx)"
             );
             false
         }
@@ -2475,9 +2487,12 @@ async fn wait_for_engine_socket(
     // and port); the Unix client rides the control socket instead. 500ms
     // timeout, 30s window.
     #[cfg(unix)]
-    let client = reqwest::Client::builder().unix_socket(socket).build()?;
+    let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+        .unix_socket(socket)
+        .build()?;
     #[cfg(not(unix))]
-    let client = reqwest::Client::new();
+    let client =
+        preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder()).build()?;
     let readyz_url = format!("http://{listen}/readyz");
     let start = std::time::Instant::now();
     let mut last_reason: Option<String> = None;
@@ -2584,7 +2599,12 @@ fn configured_base_image() -> anyhow::Result<String> {
 /// `serve` with no golden configured: offer the wizard when a human is
 /// watching, otherwise say the one line an operator needs. A non-interactive
 /// `serve` (systemd, CI, a pipe) must never block on a prompt.
-async fn offer_init_when_unconfigured() -> anyhow::Result<()> {
+///
+/// `engine_public_url` is the origin this engine resolved for itself before the
+/// wizard ran. The wizard can resolve a different one — the App flow asks for
+/// the address GitHub is given — and the handoff installs that answer into the
+/// running engine (or reports which origin won when the two disagree).
+async fn offer_init_when_unconfigured(engine_public_url: &str) -> anyhow::Result<()> {
     let config = preloop_runner_server::config::load_config()?;
     if preloop_runner_server::config::golden_base_image(&config).is_some() {
         return Ok(());
@@ -2612,33 +2632,26 @@ async fn offer_init_when_unconfigured() -> anyhow::Result<()> {
     // graph is genuinely cyclic (`serve` offers `init`, which can start
     // `serve`); the mode this entry point forces is what keeps it from
     // recursing at runtime.
-    Box::pin(init::run_from_serve()).await?;
+    let resolved = Box::pin(init::run_from_serve()).await?;
+    // The engine has not started serving yet, and its Check Run links and
+    // webhook health check read the origin off this environment: the answer
+    // has to land here, in-process, or the App would point at the new URL
+    // while every link and health check stayed on the old one.
+    if let Some(note) = init::apply_engine_public_url(engine_public_url, resolved.as_deref()) {
+        eprintln!("[preloop] {note}");
+    }
     eprintln!("[preloop] configuration written; continuing to serve");
     Ok(())
 }
 
-// Configuration assembly, not a public API: the parameter list mirrors the
-// inputs the pool genuinely needs.
-#[allow(clippy::too_many_arguments)]
-fn local_runner_pool_config(
-    home: &std::path::Path,
-    server_url: String,
-    control_origin: Option<String>,
-    control_upstream: Option<String>,
-    queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
-    pool_enabled: bool,
-    preparing_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pending_registrations: std::sync::Arc<
-        std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
-    >,
-    pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
-    observability: preloop_observability::Observability,
-) -> anyhow::Result<RunnerPoolConfig> {
-    let control_bridge = home.join("control-bridge");
-    std::fs::create_dir_all(&control_bridge)?;
-    set_private_directory_permissions(&control_bridge)?;
-    let runner_bundle = std::env::var_os("PRELOOP_RUNNER_BUNDLE")
+/// The Linux runner bundle the engine mounts: `PRELOOP_RUNNER_BUNDLE` when it
+/// names a usable tree, otherwise the installed or development bundle beside
+/// this executable.
+///
+/// Shared with `preloop volumes prune`, which must keep the volume of the
+/// bundle the engine would actually mount.
+pub(crate) fn discovered_runner_bundle() -> Option<PathBuf> {
+    std::env::var_os("PRELOOP_RUNNER_BUNDLE")
         .map(PathBuf::from)
         .filter(|path| linux_runner_bundle(path))
         .or_else(|| {
@@ -2676,7 +2689,54 @@ fn local_runner_pool_config(
                 .find(|directory| directory.join("preloop-runner").is_file())
         })
         .filter(|path| linux_runner_bundle(path))
-        .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/vm-images.md)")?;
+}
+
+/// The Node externals directory the engine mounts from: `PRELOOP_RUNNER_EXTERNALS`
+/// when set, otherwise `<preloop home>/externals`.
+///
+/// Mirrors the pool config's choice so `preloop volumes prune` reasons
+/// about the same tree the engine does.
+pub(crate) fn local_externals_dir() -> Option<PathBuf> {
+    std::env::var_os("PRELOOP_RUNNER_EXTERNALS")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("PRELOOP_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop"))
+                })
+                .map(|home| home.join("externals"))
+        })
+}
+
+/// The runner binary the pool expects inside a bundle, as
+/// [`RunnerPoolConfig::runner_binary_name`] sets it.
+pub(crate) const RUNNER_BINARY_NAME: &str = "preloop-runner";
+
+// Configuration assembly, not a public API: the parameter list mirrors the
+// inputs the pool genuinely needs.
+#[allow(clippy::too_many_arguments)]
+fn local_runner_pool_config(
+    home: &std::path::Path,
+    server_url: String,
+    control_origin: Option<String>,
+    control_upstream: Option<String>,
+    queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
+    pool_enabled: bool,
+    preparing_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pending_registrations: std::sync::Arc<
+        std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
+    >,
+    pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<RunnerPoolConfig> {
+    let control_bridge = home.join("control-bridge");
+    std::fs::create_dir_all(&control_bridge)?;
+    set_private_directory_permissions(&control_bridge)?;
+    let runner_bundle = discovered_runner_bundle().context(
+        "Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/control-plane/operate/vm-images.mdx)",
+    )?;
     let backend = vm_backend()?;
     // AgentENV has no socket relay: the guest dials the runner URL over plain
     // TCP, so a loopback URL points at the guest itself and no job can ever
@@ -8018,23 +8078,187 @@ mod tests {
         );
     }
 
+    /// The policy is probe-only (#658): an engine that answers is used, and a
+    /// silent endpoint refuses. There is no third outcome — no client command
+    /// starts an engine.
     #[test]
-    fn engine_log_tail_quotes_only_this_starts_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("engine.log");
-        let previous = "previous run\nold error\n";
-        std::fs::write(&log, previous).unwrap();
-        let offset = u64::try_from(previous.len()).unwrap();
-        std::fs::write(
-            &log,
-            format!("{previous}starting engine\nError: unlock the login keychain\n"),
-        )
-        .unwrap();
+    fn a_reachable_engine_lets_the_command_proceed() {
+        assert!(engine_access(true, "http://127.0.0.1:9090").is_ok());
+    }
 
-        let tail = engine_log_tail(&log, offset);
-        assert!(tail.contains("Error: unlock the login keychain"), "{tail}");
-        assert!(!tail.contains("old error"), "{tail}");
-        assert!(tail.contains(&log.display().to_string()), "{tail}");
-        assert_eq!(engine_log_tail(&dir.path().join("missing.log"), 0), "");
+    /// A command that names its own engine (`dap --url`) is probed there, not
+    /// at the default: the gate must not refuse the engine the command would
+    /// have talked to.
+    #[test]
+    fn a_command_endpoint_override_is_the_probed_endpoint() {
+        let dap = dap_client::DapArgs {
+            run_id: "run-42".to_owned(),
+            url: Some("http://127.0.0.1:19099".to_owned()),
+            token: None,
+        };
+        assert_eq!(
+            command_engine_url(&Command::Dap(dap)),
+            Some("http://127.0.0.1:19099")
+        );
+
+        let no_override = dap_client::DapArgs {
+            run_id: "run-42".to_owned(),
+            url: None,
+            token: None,
+        };
+        assert_eq!(command_engine_url(&Command::Dap(no_override)), None);
+        assert_eq!(command_engine_url(&Command::Version), None);
+    }
+
+    /// The refusal names the probed endpoint and both ways to start an engine,
+    /// and it carries the pre-push hook's fail-open marker. That marker is a
+    /// compatibility contract: without it the hook reads the non-zero exit as
+    /// "CI failed" and blocks the push over a run that never happened.
+    #[test]
+    fn an_unreachable_engine_refuses_with_the_marker_and_the_fix() {
+        let url = "http://127.0.0.1:19099";
+        let error = engine_access(false, url).unwrap_err();
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains(url), "{rendered}");
+        assert!(rendered.contains("no engine is running"), "{rendered}");
+        assert!(rendered.contains("preloop serve"), "{rendered}");
+        assert!(rendered.contains("preloop server install"), "{rendered}");
+        assert!(rendered.contains(ENGINE_UNREACHABLE_MARKER), "{rendered}");
+    }
+
+    /// `preloop serve` is the only command that starts an engine, so the
+    /// zero-config first run — the brand-new control database — must be part
+    /// of its path (`cmd_engine` calls this). A second preparation is a no-op:
+    /// an existing store is never rebuilt, and upgrading is `preloop store
+    /// migrate`.
+    #[test]
+    fn serve_prepares_a_fresh_home_and_leaves_an_existing_store_alone() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let previous_store = std::env::var_os(preloop_runner_server::store::STORE_URL_ENV);
+        unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) };
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("fresh-home");
+        std::fs::create_dir_all(&home).unwrap();
+        prepare_local_engine_home(&home, None).unwrap();
+        let db = home.join("state").join("preloop.db");
+        assert!(db.is_file(), "a fresh home must get a control database");
+        let created = std::fs::metadata(&db).unwrap();
+
+        prepare_local_engine_home(&home, None).unwrap();
+        let untouched = std::fs::metadata(&db).unwrap();
+        assert_eq!(
+            (created.len(), created.modified().unwrap()),
+            (untouched.len(), untouched.modified().unwrap()),
+            "an existing store must not be rewritten"
+        );
+
+        match previous_store {
+            Some(previous) => unsafe {
+                std::env::set_var(preloop_runner_server::store::STORE_URL_ENV, previous)
+            },
+            None => unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) },
+        }
+    }
+
+    /// `preloop serve --store` selects the store, and the first-run
+    /// preparation has to follow it: prepared against the state-dir default
+    /// instead, a fresh home would initialize a database the boot never opens
+    /// and then refuse the empty one it was pointed at.
+    #[test]
+    fn serve_prepares_the_store_it_was_pointed_at() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let previous_store = std::env::var_os(preloop_runner_server::store::STORE_URL_ENV);
+        // The explicit selection must win over the environment, exactly as it
+        // does for the boot.
+        unsafe {
+            std::env::set_var(
+                preloop_runner_server::store::STORE_URL_ENV,
+                "postgres://ignored",
+            )
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("fresh-home");
+        let custom = dir.path().join("custom.db");
+        std::fs::create_dir_all(&home).unwrap();
+        prepare_local_engine_home(&home, Some(&format!("sqlite://{}", custom.display()))).unwrap();
+
+        assert!(
+            custom.is_file(),
+            "the selected store must be the one initialized"
+        );
+        assert!(
+            !home.join("state").join("preloop.db").exists(),
+            "the state-dir default must stay untouched"
+        );
+
+        match previous_store {
+            Some(previous) => unsafe {
+                std::env::set_var(preloop_runner_server::store::STORE_URL_ENV, previous)
+            },
+            None => unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) },
+        }
+    }
+
+    /// The probe's budget follows the endpoint class: loopback is probed
+    /// tightly, anything that crosses a network gets room for a slow round
+    /// trip. One constant for both would either hang the pre-push hook or
+    /// report a healthy remote engine as absent.
+    #[test]
+    fn probe_budget_matches_the_endpoint_class() {
+        for loopback in [
+            "http://127.0.0.1:9090",
+            "http://127.0.0.2:9090",
+            "http://localhost:9090",
+            "http://[::1]:9090",
+        ] {
+            assert_eq!(
+                probe_timeout(loopback),
+                LOOPBACK_PROBE_TIMEOUT,
+                "{loopback}"
+            );
+        }
+        for remote in [
+            "https://ci.example.test",
+            "http://10.0.0.5:9090",
+            "http://preloop.internal:9090",
+            // Not a URL at all: an unrecognizable endpoint is never the local
+            // engine, so it gets the forgiving budget rather than a fast
+            // refusal.
+            "not a url",
+        ] {
+            assert_eq!(probe_timeout(remote), REMOTE_PROBE_TIMEOUT, "{remote}");
+        }
+    }
+
+    /// A remote engine that answers `/healthz` slowly is reachable, not
+    /// absent: the same delayed answer fails the loopback budget and passes
+    /// the remote one. Failing before the fix, when every endpoint was probed
+    /// with the loopback budget.
+    #[tokio::test]
+    async fn a_slow_probe_answer_is_not_read_as_an_absent_engine() {
+        let app = axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                "ok"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = build_client();
+        assert!(
+            probe_engine_health_within(&client, &base, REMOTE_PROBE_TIMEOUT).await,
+            "a delayed answer within the remote budget is reachable"
+        );
+        assert!(
+            !probe_engine_health_within(&client, &base, LOOPBACK_PROBE_TIMEOUT).await,
+            "the loopback budget still refuses a stalled endpoint"
+        );
     }
 }

@@ -5208,13 +5208,16 @@ async fn process_delivery_payload_with_lease(
 
 /// Webhook events the App-manifest flow asks GitHub to subscribe a new App to.
 ///
-/// Defaults to the minimal CI event set (`push`, `pull_request`, `check_run`
-/// — the environment review buttons arrive as `check_run.requested_action`,
-/// and GitHub only delivers it to Apps subscribed to `check_run`). GitHub
-/// cannot change an App's event subscriptions through its API after creation,
-/// so operators who need additional triggers must add them manually in the
-/// App settings UI. Operators who want a different creation-time set can
-/// override it with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated).
+/// Defaults to the minimal CI event set (`push`, `pull_request`, `check_run`,
+/// `workflow_job` — the environment review buttons arrive as
+/// `check_run.requested_action`, and GitHub only delivers it to Apps
+/// subscribed to `check_run`; `workflow_job` is the per-job
+/// queued/in_progress/completed signal and requires the `actions: read`
+/// permission before its checkbox even renders). GitHub cannot change an
+/// App's event subscriptions through its API after creation, so operators
+/// who need additional triggers must add them manually in the App settings
+/// UI. Operators who want a different creation-time set can override it with
+/// `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated).
 pub fn manifest_default_events() -> Vec<String> {
     if let Some(raw) = std::env::var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS")
         .ok()
@@ -5235,6 +5238,7 @@ pub fn manifest_default_events() -> Vec<String> {
         "push".to_owned(),
         "pull_request".to_owned(),
         "check_run".to_owned(),
+        "workflow_job".to_owned(),
     ]
 }
 
@@ -5818,7 +5822,10 @@ mod tests {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
         let defaults = manifest_default_events();
-        assert_eq!(defaults, vec!["push", "pull_request", "check_run"]);
+        assert_eq!(
+            defaults,
+            vec!["push", "pull_request", "check_run", "workflow_job"]
+        );
     }
 
     #[tokio::test]
@@ -5835,7 +5842,7 @@ mod tests {
         unsafe { std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "  ") };
         assert_eq!(
             manifest_default_events(),
-            vec!["push", "pull_request", "check_run"]
+            vec!["push", "pull_request", "check_run", "workflow_job"]
         );
         unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
     }
@@ -6306,7 +6313,13 @@ mod tests {
             Self::with_workspace(temp, ws_dir).await
         }
 
+        /// Build the fixture's engine.
+        ///
+        /// Completes the process-wide outbound client first, so its one-time
+        /// TLS root build cannot land inside a poll budget one of these tests
+        /// asserts on (same reasoning as [`poll_only_shared`]).
         async fn with_workspace(temp: &tempfile::TempDir, ws_dir: std::path::PathBuf) -> Self {
+            std::sync::LazyLock::force(&crate::shared_http::CLIENT);
             let event_sha = if ws_dir.join(".github/workflows").is_dir() {
                 commit_workspace(&ws_dir)
             } else {
@@ -7867,7 +7880,20 @@ mod tests {
 
     /// Engine state for driving [`poll_fresh_merge`] directly: a poll schedule
     /// and the environment's stubbed API, with no repository or merge needed.
+    ///
+    /// Also builds the process-wide outbound client before any caller starts a
+    /// poll budget. [`crate::shared_http::CLIENT`] is a `LazyLock` whose first
+    /// use pays for the TLS root set — the bundled Mozilla anchors, the OS
+    /// certificate store ([`crate::shared_http::tls_roots`] reads it through a
+    /// daemon with a deadline of its own), and any `PRELOOP_GITHUB_CA_FILE` /
+    /// `SSL_CERT_FILE` bundle. On a host with a slow trust store the *first*
+    /// probe spends the budget inside that build, no second poll happens, and
+    /// "the probe is retried within the budget" fails on the certificate store
+    /// instead of on the poll schedule. Warming here is test-only and keeps
+    /// every assertion in this family measuring the schedule the poll code is
+    /// written to honour; the engine's own client build is untouched.
     async fn poll_only_shared(temp: &tempfile::TempDir, budget: Duration) -> Arc<SharedState> {
+        std::sync::LazyLock::force(&crate::shared_http::CLIENT);
         let mut state = AppState::new(temp.path().join("state")).await.unwrap();
         state.fresh_merge_poll = FreshMergePoll {
             budget,

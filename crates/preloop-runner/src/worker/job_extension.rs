@@ -212,19 +212,12 @@ fn tool_cache_dir_for(workspace: &str, hosted: &Path) -> String {
 }
 
 /// Inject GITHUB_* and RUNNER_* environment variables into the job context.
-pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
-    // Which control plane this runner registered against decides whether the
-    // job's `system.github.token` variable is a usable GitHub credential —
-    // CWD is the runner root, where `.runner` lives (see `RUNNER_NAME`).
-    let control_plane = crate::settings::RunnerConfig::load(Path::new("."))
-        .map(|config| config.settings.control_plane())
-        .unwrap_or_default();
-    inject_github_env_with_plane(job, msg, control_plane);
-}
-
-/// `inject_github_env` with the control plane supplied by the caller —
-/// tests use this instead of materializing a `.runner` file.
-fn inject_github_env_with_plane(
+///
+/// `control_plane` is the registration state the worker validated from
+/// `.runner` at startup. Which plane this runner registered against decides
+/// whether the job's `system.github.token` variable is a usable GitHub
+/// credential; passing it in avoids re-reading runner metadata per job.
+pub fn inject_github_env(
     job: &mut JobContext,
     msg: &serde_json::Value,
     control_plane: crate::settings::ControlPlane,
@@ -298,12 +291,12 @@ fn inject_github_env_with_plane(
             // `githubContext["token"] = Variables.Get("system.github.token")`,
             // with `contextData` overlaid on top). The variable is only a
             // usable GitHub credential when the control plane is GitHub: on a
-            // preloop engine the control plane owns that slot — the claim
-            // fills it with the credential it minted (and patches the same
-            // value into the `github.token` context read here) and leaves it
-            // empty when it has none, so a step must never be handed a
-            // control-plane credential in its place. Engine registrations
-            // therefore export the context token alone.
+            // preloop engine the claim owns that slot — it writes the GitHub
+            // credential it minted (and patches the same value into the
+            // `github.token` context read here) and leaves it empty when it
+            // has none. The runtime JWT never enters this variable or the
+            // step environment. Engine registrations therefore export the
+            // context token alone.
             let context_token = str_from_json(&github, "token");
             if context_token.is_empty() && control_plane == crate::settings::ControlPlane::GitHub {
                 // `github_token` is the same credential under the canonical
@@ -316,14 +309,15 @@ fn inject_github_env_with_plane(
                 context_token
             }
         }),
-        // Runner variables — runner name from.runner settings, not job name
-        ("RUNNER_NAME", {
-            // Read from.runner settings file (CWD = runner root from spawn_job)
-            crate::settings::RunnerConfig::load(std::path::Path::new("."))
-                .ok()
-                .map(|c| c.settings.agent_name)
-                .unwrap_or_else(|| job.job_name.clone())
-        }),
+        // Runner variables — the registration name `run_job` copied from the
+        // validated `.runner`, never a per-job re-read of the file.
+        (
+            "RUNNER_NAME",
+            job.env
+                .get("RUNNER_NAME")
+                .cloned()
+                .unwrap_or_else(|| job.job_name.clone()),
+        ),
         ("RUNNER_OS", runner_os().to_string()),
         ("RUNNER_ARCH", runner_arch().to_string()),
         (
@@ -896,6 +890,7 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
             env,
             raw: step.clone(),
             is_background,
+            post_of: Vec::new(),
         });
     }
 
@@ -907,7 +902,9 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 /// Official runner builds three lists:
 /// - pre steps: declared order, `pre-if` defaults to `always()`
 /// - main steps: the workflow steps
-/// - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`
+/// - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`;
+///   each names its action step in `post_of`, and `run_steps` runs it only once that
+///   step has started (the official runner registers post hooks at run time)
 ///
 /// State context (`GITHUB_STATE` file) is wired so pre can communicate to post
 /// via `save-state`; `StepContext::build_env()` exposes those values as
@@ -951,12 +948,19 @@ pub fn build_step_list_with_lifecycle(
         // post cleanup is still registered. Keep this aligned with the pinned source
         // (ActionRunner.cs, `RunAsync`, lines 105-110).
         // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L105-L110
+        // Steps whose action handler registers the post hook: the main step, and
+        // the pre step when the action declares `pre:`. `ActionRunner.RunAsync`
+        // registers the post job step for the Pre stage as well as the Main one,
+        // so a pre step that ran must remain able to clean up after itself even
+        // when the main step is skipped.
+        let mut post_registrations = vec![step.context_name.clone()];
         if !is_local_action {
             // Pre step
             if let Some(pre_main) = &manifest.runs_pre {
                 let pre_if = manifest.runs_pre_if.as_deref().unwrap_or("always()");
                 let pre_context = format!("__pre_{}", step.context_name);
                 let pre_id = format!("__pre_{}", step.id);
+                post_registrations.push(pre_context.clone());
                 pre_steps.push(Step {
                     id: pre_id,
                     context_name: pre_context,
@@ -975,6 +979,7 @@ pub fn build_step_list_with_lifecycle(
                         "uses": uses,
                     }),
                     is_background: false,
+                    post_of: Vec::new(),
                 });
             }
         }
@@ -1005,6 +1010,7 @@ pub fn build_step_list_with_lifecycle(
                     "uses": uses,
                 }),
                 is_background: false,
+                post_of: post_registrations,
             });
         }
     }

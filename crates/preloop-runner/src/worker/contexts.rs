@@ -79,9 +79,11 @@ pub struct JobContext {
     /// Keyed by canonical subject name; value is (digest, kind).
     pub artifact_subjects: IndexMap<String, ArtifactSubject>,
     /// Control plane this runner registered against (`.runner` `controlPlane`),
-    /// set by `inject_github_env`. Decides whether the `system.github.token`
-    /// variable is a usable GitHub credential (github.com) or a control-plane
-    /// secret that must stay off the step surface (engine, the default).
+    /// set by `run_job` from the registration the worker validated and
+    /// reasserted by `inject_github_env`. Decides whether the
+    /// `system.github.token` variable is a usable GitHub credential
+    /// (github.com) or the claim's GitHub credential slot, which must stay
+    /// off the step surface (engine, the default).
     pub control_plane: crate::settings::ControlPlane,
 }
 
@@ -496,12 +498,11 @@ impl JobContext {
                 .unwrap_or_default()
         });
         let runner_workspace = self.workspace.clone().unwrap_or_default();
-        let runner_name = self.env.get("RUNNER_NAME").cloned().unwrap_or_else(|| {
-            crate::settings::RunnerConfig::load(std::path::Path::new("."))
-                .ok()
-                .map(|c| c.settings.agent_name)
-                .unwrap_or_else(|| self.job_name.clone())
-        });
+        let runner_name = self
+            .env
+            .get("RUNNER_NAME")
+            .cloned()
+            .unwrap_or_else(|| self.job_name.clone());
         let runner_ctx = serde_json::json!({
             "name": runner_name,
             "os": current_os(),
