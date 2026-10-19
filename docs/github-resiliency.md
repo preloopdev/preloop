@@ -2,9 +2,9 @@
 
 Status: **design — PR 0, no code yet.** Written against `public/main` @
 `4831f828`, then re-verified against `public/main` @ `85e1fa168` (2026-10-18),
-then merged onto `public/main` @ `0cf5d78e4` for the docs restructure
+then merged onto `public/main` @ `d7c5860d8` for the docs restructure
 (`docs/control-plane/**`, `docs/contributing/**` — where the related documents
-below now live). The twenty commits in between also move
+below now live). The twenty-one commits in between also move
 `crates/preloop-runner-server/src/` (12 files, +827/−151), so code *line*
 anchors are approximate against the merged tree; file anchors and the findings
 they support are unchanged. Merged work that narrowed a failure shape or fixed a
