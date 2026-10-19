@@ -135,7 +135,6 @@ impl CommandError {
             program: program.to_owned(),
         }
     }
-
     fn spawn(what: &str, program: String, source: io::Error) -> Self {
         Self::Spawn {
             what: what.to_owned(),
@@ -182,6 +181,25 @@ impl CommandError {
             Self::Spawn { .. } | Self::Io { .. } => None,
         }
     }
+}
+
+/// The timeout error plus the journal line an operator sees when a hung
+/// dependency is killed.
+///
+/// The message is the same text as the returned error — `what`, the deadline,
+/// and the program — so a caller that wraps or discards the error still leaves
+/// the reason in the engine's log. `process_group` records whether the kill
+/// reached the child's own workers.
+fn timeout_error(what: &str, program: &str, deadline: Duration) -> CommandError {
+    let error = CommandError::timeout_error(what, program, deadline);
+    tracing::warn!(
+        what = %what,
+        program = %program,
+        deadline_ms = deadline.as_millis() as u64,
+        process_group = cfg!(unix),
+        "{error}",
+    );
+    error
 }
 
 impl fmt::Display for CommandError {
@@ -382,7 +400,7 @@ async fn wait_with_capture(
         Ok(result) => result,
         Err(_) => {
             kill_and_reap(&mut child).await;
-            Err(CommandError::timeout_error(what, program, deadline))
+            Err(timeout_error(what, program, deadline))
         }
     }
 }
@@ -526,7 +544,7 @@ pub async fn run_command_with_stdin(
         Ok(result) => result,
         Err(_) => {
             kill_and_reap(&mut child).await;
-            Err(CommandError::timeout_error(what, &program, deadline))
+            Err(timeout_error(what, &program, deadline))
         }
     }
 }
@@ -557,7 +575,7 @@ pub async fn run_command_status(
         Ok(Err(source)) => Err(CommandError::io(what, &program, source)),
         Err(_) => {
             kill_and_reap(&mut child).await;
-            Err(CommandError::timeout_error(what, &program, deadline))
+            Err(timeout_error(what, &program, deadline))
         }
     }
 }
@@ -712,7 +730,7 @@ pub fn run_command_blocking_capped(
         let elapsed = started.elapsed();
         if elapsed >= deadline {
             kill_and_reap_blocking(&mut child);
-            return Err(CommandError::timeout_error(what, &program, deadline));
+            return Err(timeout_error(what, &program, deadline));
         }
         std::thread::sleep(POLL_INTERVAL.min(deadline - elapsed));
     };
@@ -737,13 +755,13 @@ pub fn run_command_blocking_capped(
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 let remaining = deadline.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
-                    return Err(CommandError::timeout_error(what, &program, deadline));
+                    return Err(timeout_error(what, &program, deadline));
                 }
                 match receiver.recv_timeout(remaining) {
                     Ok((PipeKind::Stdout, result)) => stdout = Some(result),
                     Ok((PipeKind::Stderr, result)) => stderr = Some(result),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        return Err(CommandError::timeout_error(what, &program, deadline));
+                        return Err(timeout_error(what, &program, deadline));
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         return Err(CommandError::io(
