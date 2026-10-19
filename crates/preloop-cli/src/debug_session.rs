@@ -567,10 +567,21 @@ async fn finish_with_verdict(
 }
 
 impl Api {
+    /// A request against the engine's debug-session API.
+    ///
+    /// Every method below is one-shot: a listing, a lookup, a lease or an
+    /// operation, all answered in milliseconds in memory by the engine. The
+    /// total deadline is therefore [`crate::ENGINE_CONTROL_TIMEOUT`], not the
+    /// client's 600-second idle read — a wedged engine must fail the command,
+    /// and a paused-session lookup inside a stalled `preloop run` must not sit
+    /// there for ten minutes.
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let builder = self
-            .client
-            .request(method, format!("{}{path}", self.base_url));
+        let builder = crate::engine_request(
+            &self.client,
+            method,
+            format!("{}{path}", self.base_url),
+            crate::ENGINE_CONTROL_TIMEOUT,
+        );
         match &self.token {
             Some(token) => builder.bearer_auth(token),
             None => builder,

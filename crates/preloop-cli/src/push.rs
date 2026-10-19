@@ -255,9 +255,22 @@ async fn git_output<'a>(
     git_output_with(cwd, args, GIT_CONTROL_TIMEOUT).await
 }
 
-/// Whether a sync failure is likely transient (GitHub unreachable, 5xx)
-/// rather than a permanent configuration or state problem.
+/// Whether a sync failure is likely transient (GitHub unreachable, 5xx, or a
+/// dependency that stalled past its deadline) rather than a permanent
+/// configuration or state problem.
 fn is_transient(error: &anyhow::Error) -> bool {
+    // A deadline expiry is typed, so it is recognized as one instead of by its
+    // text: `preloop_observability::deadline` reports its own errors as
+    // `CommandError::TimedOut` ("… timed out after 1800s"), which none of the
+    // phrases below match. A forge or transport that stalls is exactly what the
+    // retry schedule is for, and every retry is idempotent.
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<preloop_observability::deadline::CommandError>()
+            .is_some_and(preloop_observability::deadline::CommandError::timed_out)
+    }) {
+        return true;
+    }
     let text = format!("{error:#}").to_lowercase();
     [
         "could not resolve host",
@@ -276,6 +289,28 @@ fn is_transient(error: &anyhow::Error) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+/// One control request against the engine's native API, with the native
+/// bearer when there is one.
+///
+/// Every engine call in the push path is one-shot, so every one of them carries
+/// [`crate::ENGINE_CONTROL_TIMEOUT`]: the client's 600-second idle read only
+/// ends a connection that goes *completely* silent, so an engine that trickles
+/// response bytes — or stops answering without closing — would otherwise hold
+/// the sync, and the developer's terminal, open past every deadline the command
+/// documents.
+fn control_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = crate::engine_request(client, method, url, crate::ENGINE_CONTROL_TIMEOUT);
+    match token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
 }
 
 /// Run the full push-back for a run: fetch it, pin the push, and ask the
@@ -323,10 +358,12 @@ async fn prepare_push_sha(
     token: Option<&str>,
     run_id: &str,
 ) -> anyhow::Result<String> {
-    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
+    let request = control_request(
+        client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs/{run_id}"),
+        token,
+    );
     let response = request
         .send()
         .await
@@ -385,10 +422,12 @@ async fn push_run_once(
     push_sha: &str,
     opts: Option<PushOpts>,
 ) -> anyhow::Result<()> {
-    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
+    let request = control_request(
+        client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs/{run_id}"),
+        token,
+    );
     let response = request
         .send()
         .await
@@ -432,10 +471,12 @@ async fn push_run_once(
 
     // 2. The server verifies the pushed tree, reuses or creates the PR, and
     //    reports check runs — all idempotently.
-    let mut request = client.post(format!("{url}/api/v1/runs/{run_id}/push"));
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
+    let mut request = control_request(
+        client,
+        reqwest::Method::POST,
+        format!("{url}/api/v1/runs/{run_id}/push"),
+        token,
+    );
     if let Some(opts) = opts {
         request = request.json(&serde_json::json!({
             "create_pr": opts.create_pr,
@@ -861,8 +902,13 @@ mod tests {
         assert!(format!("{error:#}").contains("not present in this checkout"));
     }
 
-    #[test]
-    fn transient_classification() {
+    /// A deadline expiry is transient, not a permanent failure: the push path's
+    /// own `run_command` deadline reports a typed `CommandError::TimedOut`
+    /// ("git push origin … timed out after 1800s"), which the phrase list below
+    /// does not match. Classifying it as permanent made a stalled forge end
+    /// `preloop push` on the first attempt instead of using its retry schedule.
+    #[tokio::test]
+    async fn transient_classification() {
         let transient = [
             "git push failed: fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com",
             "git push failed: fatal: The remote end hung up unexpectedly",
@@ -871,6 +917,23 @@ mod tests {
         for message in transient {
             assert!(is_transient(&anyhow::anyhow!("{message}")), "{message}");
         }
+        // The real error, not a paraphrase of its text: `git_output` and the
+        // push itself wrap `run_command`'s typed expiry in `anyhow` context.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        let expired = preloop_observability::deadline::run_command(
+            command,
+            Duration::from_millis(100),
+            "git push origin abc:refs/heads/feat/x",
+        )
+        .await
+        .expect_err("a stalled git child must expire its deadline");
+        assert!(expired.timed_out(), "the runner must report a typed expiry");
+        let wrapped = anyhow::Error::new(expired).context("git push");
+        assert!(
+            is_transient(&wrapped),
+            "a deadline expiry must reach the retry schedule: {wrapped:#}"
+        );
         let permanent = [
             "branch feat/x on GitHub has commits that are not ancestors",
             "git push failed: fatal: Authentication failed for 'https://github.com/x/y.git/'",
@@ -892,6 +955,48 @@ mod tests {
             format!("{error:#}").contains("default branch"),
             "default-branch push refused: {error:#}"
         );
+    }
+
+    /// Every engine call in the push path carries the control total, so a
+    /// wedged engine fails the sync instead of holding it until the client's
+    /// 600-second idle read (or forever, if it trickles bytes).
+    #[test]
+    fn engine_calls_carry_the_control_deadline() {
+        let client = crate::build_client();
+        for (method, path) in [
+            (reqwest::Method::GET, "/api/v1/runs/x"),
+            (reqwest::Method::POST, "/api/v1/runs/x/push"),
+        ] {
+            let request = control_request(
+                &client,
+                method,
+                format!("http://127.0.0.1:1{path}"),
+                Some("token"),
+            )
+            .build()
+            .expect("the request builds");
+            assert_eq!(
+                request.timeout(),
+                Some(&crate::ENGINE_CONTROL_TIMEOUT),
+                "{path} must carry the control total"
+            );
+            assert!(
+                request
+                    .headers()
+                    .contains_key(reqwest::header::AUTHORIZATION),
+                "{path} must keep the native bearer"
+            );
+        }
+        // Without a token the request still builds and still has the total.
+        let anonymous = control_request(
+            &client,
+            reqwest::Method::GET,
+            "http://127.0.0.1:1/api/v1/runs/x".to_owned(),
+            None,
+        )
+        .build()
+        .expect("the request builds");
+        assert_eq!(anonymous.timeout(), Some(&crate::ENGINE_CONTROL_TIMEOUT));
     }
 
     /// The deadline, not the child, must end the call: the old synchronous

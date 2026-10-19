@@ -246,9 +246,14 @@ Releases before v0.27.0 predate the changelog.
   now run with every interactive credential path disabled
   (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS`/`SSH_ASKPASS` neutralised,
   `GCM_INTERACTIVE=never`) while the developer's own keychain/ssh-agent
-  credentials keep working. `preloop store migrate` bounds its Postgres connect
-  (10 s) and replaces the indefinite `pg_advisory_lock` wait with a 10-minute
-  `pg_try_advisory_lock` retry that names the other holder instead of hanging.
+  credentials keep working. A push that expires its own deadline is retried on
+  the existing transient schedule instead of failing the run.
+  `preloop store migrate` bounds its Postgres connect
+  (10 s, covering the handshake *and* session setup, not the handshake alone)
+  and replaces the indefinite `pg_advisory_lock` wait with a 10-minute
+  `pg_try_advisory_lock` retry — each probe itself bounded by what is left of
+  that wait, so a connection that stops answering mid-query cannot outlive it —
+  that names the other holder instead of hanging.
   Every deadline is a named constant, and every timeout error names the
   dependency and the deadline, so a hang is distinguishable from a failure.
 
