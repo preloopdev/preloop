@@ -149,13 +149,14 @@ async fn run_docker_image(
     Ok(())
 }
 
-/// Best-effort trusted pull of an image an action is about to run, with the
-/// `docker pull` output written into the step's log.
+/// Best-effort trusted pull of an image an action is about to run. The
+/// `docker pull` output goes to the step's log as docker's own text, so it is
+/// written raw rather than parsed for workflow commands.
 async fn pre_pull_for_action(image: &str, ctx: &mut StepContext<'_>) {
     let mut log = Vec::new();
     crate::worker::container_ops::pre_pull_action_image(image, &mut log).await;
     for line in &log {
-        ctx.log(line);
+        ctx.log_raw(line);
     }
 }
 
@@ -176,11 +177,14 @@ async fn pre_pull_dockerfile_bases(dockerfile: &Path, ctx: &mut StepContext<'_>)
 /// Image references a Dockerfile builds on, in first-appearance order.
 ///
 /// A best-effort scan, not a parser: `FROM` flags (`--platform=…`) are
-/// skipped, and the stage alias after the reference is ignored. A reference
-/// that needs build-arg substitution (`FROM $BASE`) or names `scratch` is left
-/// to `docker build` itself, and a reference named twice is pulled once.
+/// skipped. A reference that names an earlier stage (`FROM build` after
+/// `FROM golang AS build`) is a stage, not an image, and is skipped, as are
+/// `scratch` and references that need build-arg substitution (`FROM $BASE`);
+/// those are left to `docker build` itself. A reference named twice is pulled
+/// once.
 fn dockerfile_base_images(contents: &str) -> Vec<String> {
     let mut images: Vec<String> = Vec::new();
+    let mut stages: Vec<String> = Vec::new();
     for line in contents.lines() {
         let line = line.trim();
         if line.starts_with('#') {
@@ -196,11 +200,19 @@ fn dockerfile_base_images(contents: &str) -> Vec<String> {
         let Some(image) = tokens.find(|token| !token.starts_with("--")) else {
             continue;
         };
-        if image.eq_ignore_ascii_case("scratch") || image.contains('$') {
-            continue;
-        }
-        if !images.iter().any(|existing| existing == image) {
+        let is_stage = stages.iter().any(|stage| stage.eq_ignore_ascii_case(image));
+        if !is_stage
+            && !image.eq_ignore_ascii_case("scratch")
+            && !image.contains('$')
+            && !images.iter().any(|existing| existing == image)
+        {
             images.push(image.to_string());
+        }
+        // `FROM <image> AS <name>` declares a stage that later FROMs may name.
+        if let (Some(keyword), Some(name)) = (tokens.next(), tokens.next())
+            && keyword.eq_ignore_ascii_case("AS")
+        {
+            stages.push(name.to_string());
         }
     }
     images
@@ -600,10 +612,11 @@ mod tests {
 
     #[test]
     fn dockerfile_base_images_are_the_from_references() {
-        // `FROM` flags are skipped, the stage alias is ignored, case does not
-        // matter, and a reference reached only through build-arg substitution
-        // or naming `scratch` is left to `docker build`; a repeated reference
-        // is pulled once.
+        // `FROM` flags are skipped, case does not matter, and a reference that
+        // is a stage declared earlier (`AS build`, matched case-insensitively)
+        // is not an image. A reference reached only through build-arg
+        // substitution or naming `scratch` is left to `docker build`, and a
+        // repeated reference is pulled once.
         let contents = "\
 # syntax=docker/dockerfile:1
 FROM --platform=$BUILDPLATFORM golang:1.22 AS build
@@ -614,6 +627,8 @@ from debian:12
 FROM scratch
 FROM ${BASE_IMAGE}
 FROM golang:1.22
+FROM build AS packed
+FROM PACKED
 ";
         assert_eq!(
             dockerfile_base_images(contents),

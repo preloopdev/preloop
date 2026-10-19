@@ -393,19 +393,40 @@ pub async fn pull_image(
 /// runner-owned and with the host environment kept, exactly like
 /// [`pull_image`] does for job and service containers.
 ///
-/// Best effort by design: the image may already be local, the host may be
-/// offline, and a `FROM` resolved through a build arg cannot be named here. A
-/// failure is logged and ignored because the action's own `docker run` /
-/// `docker build` reports the authoritative error.
+/// An image the engine already holds is left alone, as `--pull=missing` leaves
+/// it: a `docker pull` of a tag contacts the registry even when the cached
+/// image is current, which would charge every cached action step a registry
+/// round trip (and a pull against Docker Hub's rate limit).
+///
+/// Best effort by design: the host may be offline, and a `FROM` resolved through
+/// a build arg cannot be named here. A failure is logged and ignored because the
+/// action's own `docker run` / `docker build` reports the authoritative error.
 pub(crate) async fn pre_pull_action_image(image: &str, log: &mut Vec<String>) {
-    if image.is_empty() || image.eq_ignore_ascii_case("scratch") {
+    if image.is_empty() || image.eq_ignore_ascii_case("scratch") || image_is_local(image).await {
         return;
     }
     if let Err(error) = docker_cmd_trusted(&["pull", image], log).await {
         log.push(format!(
-            "##[warning]Pre-pulling {image} for a docker action failed: {error}"
+            "##[warning]Pre-pulling {image} for a docker action failed: {error:#}"
         ));
     }
+}
+
+/// Whether the engine already holds `image`. The probe is silent: its output is
+/// dropped and any failure (no engine, unknown image) reads as "not local".
+async fn image_is_local(image: &str) -> bool {
+    process::invoke_with_host_env_policy(
+        "docker",
+        &["image", "inspect", image],
+        Path::new("."),
+        &HashMap::new(),
+        HostEnvPolicy::Filtered,
+        None,
+        None,
+        false,
+    )
+    .await
+    .is_ok_and(|result| result.exit_code == 0)
 }
 
 /// Start the job container (long-running with `tail -f /dev/null` entrypoint).
