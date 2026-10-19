@@ -583,6 +583,175 @@ pub(crate) mod suite {
         );
     }
 
+    /// Job-owned GitHub App token revocations: recorded before use, dispatch
+    /// gated while the attempt lives, due after settlement, retryable, settled
+    /// idempotently into a tombstone, and expired. Backend-neutral so SQLite
+    /// and PostgreSQL execute the same statements.
+    pub(crate) async fn github_token_revocation_lifecycle(backend: &dyn ControlBackend) {
+        let now = crate::store::now_us();
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("revocation"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        else {
+            panic!("the revocation fixture job must be claimed");
+        };
+        let hash = "a".repeat(64);
+        let expires_at_us = now + 3_600_000_000;
+        backend
+            .record_github_token_revocation(NewGitHubTokenRevocation {
+                token_hash: hash.clone(),
+                request_id: Some(claimed.request.request_id),
+                run_id,
+                job_id: claimed.queued.job_id.clone(),
+                agent_job_id: claimed.request.agent_job_id,
+                app_id: "123".to_owned(),
+                installation_id: 456,
+                repository: "owner/repo".to_owned(),
+                sealed_token: vec![1, 2, 3, 4],
+                expires_at_us,
+                next_attempt_at_us: now - 1,
+                created_at_us: now,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.job_token_dispatchable(&hash, now).await.unwrap(),
+            Some(true),
+            "a tracked unexpired token on a live attempt is dispatchable"
+        );
+        assert!(
+            backend
+                .due_github_token_revocations(now, 10, 1_000_000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a live attempt's token is not due yet"
+        );
+
+        backend
+            .settle_agent_request(
+                claimed.request.request_id,
+                ExecutionStatus::Success,
+                &crate::distributed_task::agent_request_locked_until(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.job_token_dispatchable(&hash, now).await.unwrap(),
+            Some(false),
+            "terminal attempt revokes dispatch authority before remote revocation"
+        );
+        let due = backend
+            .due_github_token_revocations(now, 10, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].token_hash, hash);
+        assert_eq!(due[0].sealed_token(), [1, 2, 3, 4]);
+
+        backend
+            .retry_github_token_revocation(&hash, "503", now + 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .due_github_token_revocations(now, 10, 1_000_000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed attempt is backed off"
+        );
+        assert_eq!(
+            backend
+                .due_github_token_revocations(now + 1_000_001, 10, 1_000_000)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the retry becomes due after the backoff"
+        );
+
+        backend
+            .settle_github_token_revocation(&hash, TokenRevocationResolution::Revoked)
+            .await
+            .unwrap();
+        backend
+            .settle_github_token_revocation(&hash, TokenRevocationResolution::Revoked)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.job_token_dispatchable(&hash, now).await.unwrap(),
+            Some(false),
+            "a tombstone stays non-dispatchable until expiry"
+        );
+
+        // Expired tracked token: due even before the attempt settles, and
+        // never dispatchable.
+        let expired_hash = "b".repeat(64);
+        backend
+            .record_github_token_revocation(NewGitHubTokenRevocation {
+                token_hash: expired_hash.clone(),
+                request_id: None,
+                run_id,
+                job_id: claimed.queued.job_id.clone(),
+                agent_job_id: uuid::Uuid::new_v4(),
+                app_id: "123".to_owned(),
+                installation_id: 456,
+                repository: "owner/repo".to_owned(),
+                sealed_token: vec![5, 6],
+                expires_at_us: now - 1,
+                next_attempt_at_us: now - 1,
+                created_at_us: now - 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .job_token_dispatchable(&expired_hash, now)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            backend
+                .due_github_token_revocations(now, 10, 1_000_000)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the expired token is due while the settled row is backing off"
+        );
+
+        assert_eq!(
+            backend
+                .expire_github_token_revocations(expires_at_us + 1)
+                .await
+                .unwrap(),
+            2,
+            "tombstone and expired pending row are cleaned up"
+        );
+        assert_eq!(
+            backend.job_token_dispatchable(&hash, now).await.unwrap(),
+            None,
+            "expired tombstones fall back to the untracked path"
+        );
+    }
+
     pub(crate) async fn submit_poll_complete_lifecycle(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
@@ -8406,6 +8575,14 @@ mod pg {
         suite::submit_poll_complete_lifecycle(&backend).await;
     }
 
+    #[tokio::test]
+    async fn github_token_revocation_lifecycle() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::github_token_revocation_lifecycle(&backend).await;
+    }
+
     /// A single-use runner may own one attempt: its credentials stay valid
     /// through that attempt and stop when it settles; the claim fence denies
     /// a second job; the spent-ephemeral purge guard deletes the row only
@@ -10182,6 +10359,11 @@ mod lite {
     #[tokio::test]
     async fn submit_poll_complete_lifecycle() {
         suite::submit_poll_complete_lifecycle(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn github_token_revocation_lifecycle() {
+        suite::github_token_revocation_lifecycle(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

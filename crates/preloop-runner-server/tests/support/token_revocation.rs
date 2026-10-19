@@ -7,9 +7,7 @@
 //! that same token. Sibling jobs, failed revocations, restart recovery and the
 //! operator's `error` policy are covered separately.
 
-mod common;
-
-use common::*;
+use super::common::*;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};

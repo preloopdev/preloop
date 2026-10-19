@@ -4403,3 +4403,6 @@ jobs:
 
 #[path = "support/credential_lifecycle.rs"]
 mod credential_lifecycle;
+
+#[path = "support/token_revocation.rs"]
+mod token_revocation;
