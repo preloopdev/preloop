@@ -2597,6 +2597,13 @@ fn parse_tailscale_json(stdout: &str) -> Option<Value> {
 /// status` talks to a daemon, and an unresponsive one must not hang the
 /// wizard. `None` when the program cannot be run, exits non-zero, or does not
 /// finish in time — all of which read as "no answer".
+///
+/// `timeout` bounds the whole call, not just the wait on the child. A kill
+/// reaches the direct child alone, so the write end of its stdout can outlive
+/// it in *its* children — some hosts' `/bin/sh` forks the command it was given
+/// rather than replacing itself with it — and a query that read until that
+/// pipe closed would then wait out whatever the child left behind. Past the
+/// deadline the answer is abandoned rather than awaited.
 fn bounded_stdout(command: &mut std::process::Command, timeout: Duration) -> Option<String> {
     use std::process::Stdio;
     command
@@ -2607,12 +2614,15 @@ fn bounded_stdout(command: &mut std::process::Command, timeout: Duration) -> Opt
     let mut stdout = child.stdout.take()?;
     // Drained on its own thread: a chatty answer fills the pipe buffer while
     // this thread watches the clock, and a full buffer would otherwise block
-    // the child until the deadline killed it.
-    let reader = std::thread::spawn(move || {
+    // the child until the deadline killed it. The answer comes back over a
+    // channel, never a join: the drain returns only once the pipe reaches EOF,
+    // which is exactly what the deadline is not allowed to wait for.
+    let (sender, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         use std::io::Read;
         let mut bytes = Vec::new();
         let _ = stdout.read_to_end(&mut bytes);
-        bytes
+        let _ = sender.send(bytes);
     });
     let deadline = std::time::Instant::now() + timeout;
     let mut succeeded = false;
@@ -2631,10 +2641,16 @@ fn bounded_stdout(command: &mut std::process::Command, timeout: Duration) -> Opt
     }
     if !succeeded {
         let _ = child.kill();
-        // Reaped either way, so the reader thread sees EOF.
+        // Reaped, so a killed child does not linger as a zombie. Children of
+        // its own are not ours to reap; the read below simply does not wait on
+        // them.
         let _ = child.wait();
     }
-    let bytes = reader.join().ok()?;
+    // Whatever the child left of the deadline, and no more: one that answered
+    // closed its own stdout and sends at once, and one that did not has
+    // nothing worth waiting for.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let bytes = answer.recv_timeout(remaining).ok()?;
     succeeded.then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 

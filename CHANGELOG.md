@@ -156,6 +156,13 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A `tailscale` query that does not answer is abandoned, not waited out.**
+  The wizard's 5 s bound covered only the wait for the `tailscale` child to
+  exit; the answer was then read to the end of its stdout, so a child that had
+  forked — a shim or wrapper script on `PATH`, or a shell — left that pipe open
+  in a grandchild that outlived the kill, and the query ran for as long as
+  whatever the child left behind. The read now shares the deadline.
+
 - **GitHub Apps created by the manifest flow now subscribe to
   `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
   signal joins the creation-time `default_events`, and `actions: read` joins
