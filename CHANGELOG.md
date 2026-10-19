@@ -40,6 +40,13 @@ Releases before v0.27.0 predate the changelog.
   bytes. The server drops any other name at the session door and the CLI
   refuses it before any path join or guest-tool invocation.
 
+### Fixed
+
+- **Retries preserve nested-action authorization.** Retrying a claimed job now
+  updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
+  Previously it still named the abandoned attempt, so nested action resolution
+  rejected the retried job's otherwise valid runtime token with HTTP 403.
+
 ## [0.35.0] - 2026-10-19
 
 ### Security
