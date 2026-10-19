@@ -227,6 +227,11 @@ pub async fn run_job(
         variables,
         context_data,
     );
+    // Official `HostContext` registers proxy passwords as secrets before any
+    // job output, so no job log line carries them.
+    for mask in super::steps_runner::proxy_password_masks(|name| std::env::var(name).ok()) {
+        job_ctx.add_mask(&mask);
+    }
     // v2.336.0 (#4546/#4550): Announce locked dependencies in Setup Job log
     if let Some(deps) = job_message
         .get("actionsDependencies")

@@ -602,6 +602,12 @@ pub async fn console_log(
 /// masked, and dropping live lines would break the feed for a backend
 /// hiccup. Durable persistence ([`replay_results_put`](crate::blob_store::replay_results_put),
 /// [`append_log`]) fails closed instead.
+///
+/// Each line is masked on its own, so a token split by a line break — base64
+/// wrapped at 76 columns, say — is not reassembled here: neither half decodes
+/// to the secret by itself. The reassembling batch pass and the streaming
+/// masker used by `append_log` cover that case, and both run on the durable
+/// paths; this per-line pass is the cheap transient-feed filter.
 async fn mask_live_wrapper(
     shared: &Arc<SharedState>,
     plan_id: &str,

@@ -1218,11 +1218,33 @@ pub(crate) async fn wait_for_daemon_ready(log: &mut Vec<String>) -> Result<()> {
     }
 }
 
+/// Render a docker command line for the runner's own diagnostic log with
+/// proxy passwords masked. `docker create` inlines `-e HTTPS_PROXY=<url>`,
+/// from the host (see [`inject_proxy_env`]) or from a container's own
+/// `env:`, which skips host injection, and tracing output does not pass
+/// through the job masks the step log gets.
+fn mask_proxy_passwords(args: &[&str]) -> String {
+    use super::steps_runner::{PROXY_ENV_NAMES, proxy_password_masks};
+    let mut masks = proxy_password_masks(|name| std::env::var(name).ok());
+    for pair in args.windows(2).filter(|pair| pair[0] == "-e") {
+        if let Some((name, value)) = pair[1].split_once('=')
+            && PROXY_ENV_NAMES.contains(&name)
+        {
+            masks.extend(preloop_gha_protocol::masking::url_password_masks(value));
+        }
+    }
+    preloop_gha_protocol::masking::mask_secrets_transform_aware(
+        &args.join(" "),
+        masks.iter().map(String::as_str),
+        &[],
+    )
+}
+
 /// Run a docker command, logging the command line, and return stdout lines.
 async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
     let cmd_line = format!("/usr/bin/docker {}", args.join(" "));
     log.push(format!("##[command]{cmd_line}"));
-    debug!("docker {}", args.join(" "));
+    debug!("docker {}", mask_proxy_passwords(args));
 
     let result = process::invoke(
         "docker",
@@ -1263,7 +1285,7 @@ async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>>
 async fn docker_cmd_stdout(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
     let cmd_line = format!("/usr/bin/docker {}", args.join(" "));
     log.push(format!("##[command]{cmd_line}"));
-    debug!("docker {}", args.join(" "));
+    debug!("docker {}", mask_proxy_passwords(args));
 
     let result = process::invoke(
         "docker",
@@ -2008,6 +2030,55 @@ mod tests {
         assert_eq!(
             env_arg_values(&args, "HTTP_PROXY"),
             ["http://proxy.example:3128"]
+        );
+    }
+
+    /// #395: the `docker create` command line echoed into the "Initialize
+    /// containers" log inlines the host proxy URL. With the password
+    /// registered as a job mask it reads `user:***@host`, the official
+    /// runner's masked shape.
+    #[test]
+    fn docker_create_command_line_masks_the_proxy_password() {
+        let proxy = "http://proxyuser:s3cr3t-pw@proxy.corp:8080";
+        let lookup = |name: &str| (name == "HTTPS_PROXY").then(|| proxy.to_string());
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        for mask in super::super::steps_runner::proxy_password_masks(lookup) {
+            job.add_mask(&mask);
+        }
+        let mut args = vec!["create".to_string(), "--name".into(), "job".into()];
+        inject_proxy_env_lookup(&mut args, &HashMap::new(), None, lookup);
+
+        let command = job.mask_secrets(&format!("##[command]/usr/bin/docker {}", args.join(" ")));
+        assert!(!command.contains("s3cr3t-pw"), "{command}");
+        assert!(
+            command.contains("-e HTTPS_PROXY=http://proxyuser:***@proxy.corp:8080"),
+            "{command}"
+        );
+        assert!(
+            command.contains("-e https_proxy=http://proxyuser:***@proxy.corp:8080"),
+            "{command}"
+        );
+    }
+
+    /// A container's own `env:` proxy is inlined as `-e NAME=VALUE` and skips
+    /// host injection, so the debug line masks that password too.
+    #[test]
+    fn docker_debug_line_masks_an_inlined_proxy_password() {
+        let line = mask_proxy_passwords(&[
+            "create",
+            "-e",
+            "HTTPS_PROXY=http://svc:wf-pw@proxy.corp:3128",
+            "alpine",
+        ]);
+        assert!(!line.contains("wf-pw"), "{line}");
+        assert!(
+            line.contains("-e HTTPS_PROXY=http://svc:***@proxy.corp:3128 alpine"),
+            "{line}"
         );
     }
 
