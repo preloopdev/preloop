@@ -27,7 +27,9 @@ use tracing::warn;
 /// the engine publish check runs. Anything beyond that is a decision the
 /// operator should make in the App's settings, not one this flow makes for
 /// them — an installation token is capped by the App's grant, so a narrow
-/// default cannot silently widen a job's authority.
+/// default cannot silently widen a job's authority. The one permission this
+/// flow adds on top is the Actions grant [`manifest_permissions`] decides
+/// from the event list.
 pub const DEFAULT_PERMISSIONS: &[(&str, &str)] = &[
     ("checks", "write"),
     ("contents", "read"),
@@ -97,6 +99,36 @@ pub fn creation_url(github: &str, org: Option<&str>, state: &str) -> String {
     }
 }
 
+/// The events the manifest subscribes, which decide the permissions below.
+///
+/// Empty without a public URL: the list only travels with a configured
+/// webhook, so an App GitHub cannot reach subscribes to nothing.
+fn manifest_events(public_url: Option<&str>) -> Vec<String> {
+    public_url
+        .map(|_| crate::github::manifest_default_events())
+        .unwrap_or_default()
+}
+
+/// Permissions the generated App requests for the events it subscribes.
+///
+/// [`DEFAULT_PERMISSIONS`] plus `actions: read` when the event list contains
+/// `workflow_job`: GitHub renders no checkbox for that event without the
+/// permission, and an App's event subscriptions cannot be changed through the
+/// API after creation, so the grant has to ride along with the subscription.
+/// Nothing else justifies it — a manifest with no `default_events` (no
+/// public URL) or one whose `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` omits
+/// `workflow_job` gets the narrow floor only.
+fn manifest_permissions(events: &[String]) -> serde_json::Map<String, serde_json::Value> {
+    let mut permissions: serde_json::Map<String, serde_json::Value> = DEFAULT_PERMISSIONS
+        .iter()
+        .map(|(scope, access)| ((*scope).to_owned(), serde_json::Value::from(*access)))
+        .collect();
+    if events.iter().any(|event| event == "workflow_job") {
+        permissions.insert("actions".to_owned(), serde_json::Value::from("read"));
+    }
+    permissions
+}
+
 /// The manifest GitHub renders as a pre-filled App-creation form.
 ///
 /// `hook_attributes` is only meaningful when GitHub can reach the engine, so
@@ -105,24 +137,26 @@ pub fn creation_url(github: &str, org: Option<&str>, state: &str) -> String {
 /// GitHub's side. GitHub rejects any `hook_attributes.url` it cannot reach
 /// over the public Internet — including an `active: false` one — so the field
 /// is omitted entirely. `setup_url` is where GitHub sends the browser after
-/// installation; callers that have no such page leave it out.
+/// installation; callers that have no such page leave it out. `default_events`
+/// and the permissions follow the same rule: no webhook, no subscriptions, and
+/// no wider permission than [`DEFAULT_PERMISSIONS`].
 pub fn manifest(
     name: &str,
     redirect_url: &str,
     public_url: Option<&str>,
     setup_url: Option<&str>,
 ) -> serde_json::Value {
-    let permissions: serde_json::Map<String, serde_json::Value> = DEFAULT_PERMISSIONS
-        .iter()
-        .map(|(scope, access)| ((*scope).to_owned(), serde_json::Value::from(*access)))
-        .collect();
+    // Decided once: `actions: read` and the event list cannot disagree, and
+    // an App whose operator dropped `workflow_job` from the list has no use
+    // for the grant that event alone needs.
+    let events = manifest_events(public_url);
     let mut manifest = serde_json::json!({
         "name": name,
         "url": public_url.unwrap_or("https://github.com/preloop-dev/preloop"),
         "redirect_url": redirect_url,
         "setup_on_update": false,
         "public": false,
-        "default_permissions": permissions,
+        "default_permissions": manifest_permissions(&events),
     });
     if let Some(setup_url) = setup_url {
         manifest["setup_url"] = serde_json::Value::from(setup_url);
@@ -132,7 +166,7 @@ pub fn manifest(
             "url": format!("{}/api/v1/github/webhooks", public.trim_end_matches('/')),
             "active": true,
         });
-        manifest["default_events"] = serde_json::json!(crate::github::manifest_default_events());
+        manifest["default_events"] = serde_json::json!(events);
     }
     manifest
 }
@@ -168,9 +202,11 @@ pub fn form_page(page: &FormPage<'_>) -> String {
         Some(public) => format!("Webhooks deliver to {}.", escape_html(public)),
         None => "Webhooks are off — this engine is not reachable from GitHub.".to_owned(),
     };
-    let permissions = DEFAULT_PERMISSIONS
+    // The same decision the manifest makes, so the page cannot promise fewer
+    // permissions than GitHub is about to request.
+    let permissions = manifest_permissions(&manifest_events(page.public_url))
         .iter()
-        .map(|(scope, access)| format!("{scope}: {access}"))
+        .map(|(scope, access)| format!("{scope}: {}", access.as_str().unwrap_or_default()))
         .collect::<Vec<_>>()
         .join(", ");
     let submit = if page.auto_submit {
@@ -476,6 +512,13 @@ mod tests {
         );
         assert_eq!(manifest["public"], false);
         assert_eq!(manifest["default_permissions"]["contents"], "read");
+        assert!(
+            manifest["default_permissions"].get("actions").is_none(),
+            "the Actions grant exists for the workflow_job subscription; an \
+             App created with no webhook subscribes to nothing and must not \
+             request the wider permission: {}",
+            manifest["default_permissions"]
+        );
     }
 
     #[test]
@@ -494,10 +537,87 @@ mod tests {
         let events = manifest["default_events"].as_array().unwrap();
         assert!(events.iter().any(|e| e == "push"));
         assert!(events.iter().any(|e| e == "pull_request"));
+        // The manifest's own JSON, so a failure names the exact creation-time
+        // list GitHub would receive.
+        let subscribed = manifest["default_events"].to_string();
+        assert!(
+            events.iter().any(|e| e == "workflow_job"),
+            "workflow_job can only be subscribed at App creation time: {subscribed}"
+        );
+        assert_eq!(
+            manifest["default_permissions"]["actions"], "read",
+            "workflow_job's checkbox does not render without actions: read"
+        );
+        assert_eq!(
+            manifest["default_events"],
+            serde_json::json!(manifest_events(Some("https://ci.example.com/"))),
+            "the subscriptions and the permission decision are the same list"
+        );
         assert!(
             manifest.get("setup_url").is_none(),
             "no setup page means no setup_url"
         );
+    }
+
+    #[test]
+    fn manifest_permissions_grant_actions_only_for_workflow_job() {
+        let with: Vec<String> = ["push", "workflow_job"]
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        let without: Vec<String> = ["push", "pull_request"]
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(
+            manifest_permissions(&with)["actions"],
+            "read",
+            "subscribing workflow_job needs Actions read or GitHub renders no \
+             checkbox for the event"
+        );
+        assert!(
+            manifest_permissions(&without).get("actions").is_none(),
+            "an event list without workflow_job must not widen the App with \
+             the permission that event alone needs"
+        );
+        for events in [&with, &without] {
+            assert_eq!(manifest_permissions(events)["contents"], "read");
+        }
+    }
+
+    #[test]
+    fn form_page_names_every_permission_the_manifest_requests() {
+        for public_url in [None, Some("https://ci.example.com")] {
+            let manifest = manifest(
+                "preloop",
+                "https://ci.example.com/setup/github/callback",
+                public_url,
+                None,
+            );
+            let html = form_page(&FormPage {
+                name: "preloop",
+                org: None,
+                action: "https://github.com/settings/apps/new?state=abc",
+                manifest: &manifest,
+                public_url,
+                delivery: "delivery",
+                auto_submit: false,
+            });
+            let requested = manifest["default_permissions"].as_object().unwrap();
+            for (scope, access) in requested {
+                let entry = format!("{scope}: {}", access.as_str().unwrap());
+                assert!(
+                    html.contains(&entry),
+                    "the page must name the permission the manifest asks for, \
+                     {entry}: {html}"
+                );
+            }
+            assert_eq!(
+                html.contains("actions: read"),
+                requested.contains_key("actions"),
+                "the page claims exactly the Actions grant the manifest does"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 
 use super::job_runner::ReportingContext;
 use super::server_queue::ServerQueue;
+use crate::client::results::UploadStage;
 use crate::worker::helpers::iso_now;
 
 /// Flush queued step-status updates to the server.
@@ -133,7 +134,8 @@ fn azdo_timeline_record_from_step_update(s: &super::server_queue::StepUpdate) ->
 
 /// Upload a single step's log content.
 ///
-/// Broker path: POST GetStepLogsSignedBlobURL → PUT blob.
+/// Broker path: `ResultsClient::upload_step_logs` (mint signed URL → PUT blob
+/// → refresh expired URL and retry; no URL escapes that call).
 /// AzDO path: POST create_log → PUT append_log → PATCH timeline log ref.
 pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &str) {
     if content.is_empty() {
@@ -203,37 +205,18 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
         return;
     }
 
-    // Broker path: signed-URL blob upload.
+    // Broker path: content-in/receipt-out blob upload. Mint, PUT, and the
+    // expired-URL refresh all stay inside the client — no signed URL is ever
+    // held or rendered here.
     let body = serde_json::json!({
         "workflow_job_run_backend_id": rpt.job_id,
         "workflow_run_backend_id": rpt.plan_id,
         "step_backend_id": step_id,
     });
 
-    let signed_url = match rpt
-        .results
-        .get_step_logs_signed_url(&rpt.token(), &body)
-        .await
-    {
-        Ok(resp) => resp
-            .get("logs_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        Err(e) => {
-            warn!("GetStepLogsSignedBlobURL failed for step {step_id}: {e:#}");
-            return;
-        }
-    };
-
-    if signed_url.is_empty() {
-        warn!("Empty signed URL for step {step_id}");
-        return;
-    }
-
     match rpt
         .results
-        .upload_log_blob(&signed_url, content.as_bytes().to_vec())
+        .upload_step_logs(&rpt.token(), &body, content.as_bytes().to_vec())
         .await
     {
         Ok(()) => {
@@ -255,14 +238,15 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
                 Err(e) => warn!("CreateStepLogsMetadata failed for step {step_id}: {e:#}"),
             }
         }
-        Err(e) => warn!("Log upload failed for step {step_id}: {e:#}"),
+        Err(e) => warn!("Log upload failed for step {step_id}: {e}"),
     }
 }
 
 /// Upload step summary content to the results service.
 ///
 /// AzDO path: no-op — the AzDO protocol has no step summary equivalent.
-/// Broker path: GetStepSummarySignedBlobURL → PUT blob → CreateStepSummaryMetadata.
+/// Broker path: `ResultsClient::upload_step_summary` (mint → PUT → refresh
+/// expired URL and retry) → CreateStepSummaryMetadata.
 pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content: &str) {
     if content.is_empty() {
         return;
@@ -284,36 +268,15 @@ pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content:
         "step_backend_id": step_id,
     });
 
-    let signed_url = match rpt
-        .results
-        .get_step_summary_signed_url(&rpt.token(), &body)
-        .await
-    {
-        Ok(resp) => resp
-            .get("summary_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        Err(e) => {
-            warn!("GetStepSummarySignedBlobURL failed for step {step_id}: {e:#}");
-            return;
-        }
-    };
-
-    if signed_url.is_empty() {
-        warn!("Empty signed URL for step summary {step_id}");
-        return;
-    }
-
     let byte_count = content.len();
     match rpt
         .results
-        .upload_log_blob(&signed_url, content.as_bytes().to_vec())
+        .upload_step_summary(&rpt.token(), &body, content.as_bytes().to_vec())
         .await
     {
         Ok(()) => info!("Uploaded summary for step {step_id} ({byte_count} bytes)"),
         Err(e) => {
-            warn!("Summary upload failed for step {step_id}: {e:#}");
+            warn!("Summary upload failed for step {step_id}: {e}");
             return;
         }
     }
@@ -339,7 +302,8 @@ pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content:
 ///
 /// AzDO path: no-op — individual step logs are already uploaded via
 /// `upload_step_log`; there is no separate job-log endpoint in the AzDO path.
-/// Broker path: POST GetJobLogsSignedBlobURL → PUT blob.
+/// Broker path: `ResultsClient::upload_job_logs` (mint → PUT → refresh
+/// expired URL and retry) → CreateJobLogsMetadata.
 pub(crate) async fn upload_job_log(rpt: &ReportingContext, content: &str) {
     if rpt.azdo.is_some() {
         debug!("AzDO path: skipping job log upload (step logs already uploaded individually)");
@@ -351,30 +315,9 @@ pub(crate) async fn upload_job_log(rpt: &ReportingContext, content: &str) {
         "workflow_run_backend_id": rpt.plan_id,
     });
 
-    let signed_url = match rpt
-        .results
-        .get_job_logs_signed_url(&rpt.token(), &body)
-        .await
-    {
-        Ok(resp) => resp
-            .get("logs_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        Err(e) => {
-            warn!("GetJobLogsSignedBlobURL failed: {e:#}");
-            return;
-        }
-    };
-
-    if signed_url.is_empty() {
-        warn!("Empty signed URL for job log");
-        return;
-    }
-
     match rpt
         .results
-        .upload_log_blob(&signed_url, content.as_bytes().to_vec())
+        .upload_job_logs(&rpt.token(), &body, content.as_bytes().to_vec())
         .await
     {
         Ok(()) => {
@@ -395,7 +338,7 @@ pub(crate) async fn upload_job_log(rpt: &ReportingContext, content: &str) {
                 Err(e) => warn!("CreateJobLogsMetadata failed: {e:#}"),
             }
         }
-        Err(e) => warn!("Job log upload failed: {e:#}"),
+        Err(e) => warn!("Job log upload failed: {e}"),
     }
 }
 
@@ -405,12 +348,6 @@ pub(crate) async fn upload_job_log(rpt: &ReportingContext, content: &str) {
 /// - Collects log files from the runner's _diag/ directory
 /// - Creates a zip archive with metadata
 /// - Uploads via the results service
-pub(crate) fn diagnostic_logs_url(response: &serde_json::Value) -> Option<&str> {
-    response
-        .get("diag_logs_url")
-        .and_then(|value| value.as_str())
-}
-
 pub(crate) async fn upload_diagnostic_logs(
     rpt: &ReportingContext,
     runner_root: &std::path::Path,
@@ -501,26 +438,9 @@ pub(crate) async fn upload_diagnostic_logs(
         "workflow_job_run_backend_id": job_id,
     });
 
-    let signed_url = match rpt
-        .results
-        .get_diagnostic_logs_signed_url(&rpt.token(), &body)
-        .await
-    {
-        Ok(response) => diagnostic_logs_url(&response).unwrap_or("").to_owned(),
-        Err(e) => {
-            debug!("Diagnostic log signed URL request failed (non-fatal): {e:#}");
-            return;
-        }
-    };
-
-    if signed_url.is_empty() {
-        debug!("Empty signed URL for diagnostic logs — server may not support this feature");
-        return;
-    }
-
     match rpt
         .results
-        .upload_blob_with_refresh(&rpt.token(), &signed_url, zip_content)
+        .upload_diag_logs(&rpt.token(), &body, zip_content)
         .await
     {
         Ok(()) => info!(
@@ -528,6 +448,10 @@ pub(crate) async fn upload_diagnostic_logs(
             log_files.len(),
             zip_path.display()
         ),
-        Err(e) => warn!("Diagnostic log upload failed: {e:#}"),
+        Err(e) if e.stage == UploadStage::Mint => {
+            // The server may simply not support diagnostic log uploads.
+            debug!("Diagnostic log signed URL request failed (non-fatal): {e}");
+        }
+        Err(e) => warn!("Diagnostic log upload failed: {e}"),
     }
 }

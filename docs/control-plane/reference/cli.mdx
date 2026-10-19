@@ -1,0 +1,472 @@
+---
+title: CLI reference
+description: Every preloop command, subcommand, and flag, with defaults and examples.
+---
+
+This reference lists every command and flag of the `preloop` binary. Run `preloop <command> --help` for the same text from the installed version. Environment variables that these commands read are listed in [Environment variables](/control-plane/reference/environment).
+
+`preloop --version` and `preloop version` print the build version. Commands that talk to the engine use `PRELOOP_URL` (default `http://127.0.0.1:9090`) and the native API token.
+
+**Only `preloop serve` and `preloop init --mode foreground` start an engine** (`preloop engine` is `serve`'s former name, kept for existing supervisor units). Every command that talks to an engine — `run`, `rerun`, `status`, `logs`, `cancel`, `shell`, `debug`, `dap`, `push`, `webhooks` — requires one that is already running: it probes `PRELOOP_URL` and, when nothing answers, exits non-zero naming the probed endpoint and how to start one — `preloop serve` for the foreground, `preloop server install` for a supervised service. `preloop run` is included: it submits work to an engine, it does not boot one (issue #658).
+
+Local and administrative commands (`plan`, `store`, `setup`, `doctor`, `secret`, `update`, `version`, `build-golden`, `golden-path`, and `init` outside `--mode foreground`) neither probe nor start an engine, so `preloop store migrate` still prepares a database with no engine running. A loopback endpoint is probed with a tight budget (500 ms) so a silent local engine refuses at once; an endpoint that crosses a network gets 5 s, so a healthy but slow remote engine is not reported absent.
+
+## Run and inspect workflows
+
+### preloop run
+
+Submit a workflow, stream its events, and wait for the run to finish. Requires a running engine (`preloop serve`); it does not start one.
+
+```sh
+preloop run -f .github/workflows/ci.yml --event pull_request
+preloop run -d -f ci.yml && preloop logs        # submit detached, then follow the latest run
+preloop run --job test --secret TOKEN=x
+```
+
+| Flag | Description |
+|---|---|
+| `-f, --file <FILE>` | Workflow file. A bare name resolves inside `.github/workflows/`. Omit it when the repository has exactly one workflow. |
+| `--event <EVENT>` | Simulated trigger, such as `push`, `pull_request`, or `merge_group`. Default `push`. |
+| `--job <JOB>` | Run one job by its key, with the jobs it `needs`. |
+| `--payload <PATH>` | JSON webhook body for the simulated event. Fields you supply win over derived ones. |
+| `--base <BASE>` | Base ref for `pull_request` and `merge_group` events. |
+| `--debug` | Pause a failed job in a debug session. |
+| `--no-debug` | Hidden compatibility flag: tear down on failure instead of keeping a failed VM for a debug session. Conflicts with `--debug`. |
+| `--preserve-on-failure` | Keep a failed job's VM for `preloop shell` without pausing the job. |
+| `--secret <NAME=VALUE>` | Run-scoped secret. Repeatable. |
+| `--strict-secrets` | Fail instead of warning when the workflow reads a secret the engine has not stored. |
+| `-d, --detach` | Submit and return without streaming events. |
+| `--push` | After a successful run, push the tested commit and publish the result. Requires a GitHub `origin`. |
+| `--create-pr` | Open a pull request for the branch when none is open. Implies `--push`. |
+| `--pr-draft[=BOOL]` | Open new pull requests as drafts. Default `true`. Use `--pr-draft=false` for ready-for-review pull requests. |
+| `--no-merge` | For `pull_request` events, test the branch alone instead of its merge with the base. |
+| `-m, --message <TEXT>` | Commit message for the commit `--push` creates from a dirty tree. Without it, `$EDITOR` opens in a terminal and a generated message is used otherwise. |
+
+**Local workspace.** A run snapshots your working tree, including uncommitted and untracked files that git does not ignore. The run never depends on what you pushed.
+
+**Interactive debugging.** In a terminal, a non-detached run on the default SmolVM backend pauses a failed job for `preloop debug`. Pass `--debug` to opt in for detached or non-interactive runs; the AgentENV backend (`PRELOOP_VM_BACKEND=agentenv`) never pauses implicitly, so it needs the flag as well.
+
+**`pull_request` runs.** Like GitHub, a local `pull_request` run tests the merge of the base branch's current tip into your head; the base is fetched from `origin`. A conflicted pull request fails the submission with the conflicted files listed, and an unfetchable base fails loudly. `--no-merge` tests the branch alone in either case. `push` events are unaffected: they test the commit itself.
+
+**Derived event data.** A local run fills in what git can answer: changed files (for `paths:` filters, from `git diff` against the base), the target branch for `branches:` filters, and the current branch or tag. It does not invent a pull request number, actor, or labels. Pass `--payload` when a workflow depends on those.
+
+**Secret preflight.** Before submitting, `preloop run` warns about the `secrets.*` names the workflow reads that the engine has not stored, and prints the `preloop secret set` commands to fix them. `--strict-secrets` turns that warning into a failure. The check reads the engine's own store — global, repository, and each `environment:` tier the workflow declares — never GitHub's, whose values are write-only. A job that passes `secrets: inherit` to a reusable workflow is called out, because its callee's names cannot be listed statically. `GITHUB_TOKEN` and the `ACTIONS_*` runtime tokens are ignored: the engine mints those per job.
+
+**`--push`.** A dirty tree is committed as a snapshot of exactly the files that were tested, and that commit is pushed only after the run succeeds. Publishing needs a GitHub App with `checks: write` to report check runs.
+
+### preloop plan
+
+Show the expanded job graph, including matrix fan-out and `needs:`, without running anything.
+
+| Flag | Description |
+|---|---|
+| `-f, --file <FILE>` | Workflow file. Same resolution as `run`. |
+| `--json` | Print machine-readable output. |
+
+### preloop status
+
+Show active and recent runs, or print one run's status word for scripts.
+
+```sh
+preloop status                  # table of recent runs
+preloop status <run-id>         # one status word, for scripts
+preloop status --json | jq .    # raw status JSON
+```
+
+| Argument or flag | Description |
+|---|---|
+| `[RUN_ID]` | Print only this run's machine-readable status word. |
+| `--json` | Print raw status JSON, with no prose. |
+| `--limit <N>` | Recent runs to show in the table. Default `20`. |
+
+### preloop logs
+
+Show run logs. Without flags, every job's log is merged in dispatch order.
+
+```sh
+preloop logs                          # the latest run
+preloop logs --job test               # one job
+preloop logs --job test --step 3      # one step of that job
+preloop logs -f --job test            # follow a job as it runs
+```
+
+| Argument or flag | Description |
+|---|---|
+| `[RUN_ID]` | Run to show. Defaults to the most recent run. |
+| `--job <JOB>` | A workflow job key (`build`) or the job's UUID. |
+| `--step <STEP>` | A 1-based step number in execution order. Needs `--job` when the run has more than one job. |
+| `-f, --follow` | Stream one job's console feed and exit when that job finishes. Needs `--job` unless the run has one job. Cannot be combined with `--step`. |
+
+Steps that the runner adds itself, such as `Set up job` and `Complete job`, appear in the whole-job log but do not take a `--step` number.
+
+### preloop cancel
+
+```sh
+preloop cancel [RUN_ID]
+```
+
+Cancels the run. `RUN_ID` defaults to the most recent active run.
+
+### preloop rerun
+
+```sh
+preloop rerun                       # the newest completed run, all jobs
+preloop rerun <run-id> --failed     # failed and cancelled jobs, plus their dependents
+preloop rerun <run-id> --job test   # one job and its dependents
+```
+
+| Argument or flag | Description |
+|---|---|
+| `[RUN_ID]` | Run to re-run. Defaults to the most recent completed run. |
+| `--failed` | Re-run only failed or cancelled jobs and the jobs that depend on them. Conflicts with `--job`. |
+| `--job <JOB_ID>` | Re-run one job, identified as `preloop status <run-id>` shows it, and its dependents. |
+
+With no flag, every job runs again as a new attempt on the same run. `github.run_attempt` increments, and the previous attempt stays in history. A run that the archiver has already moved to history can only be re-run in full, as a new run.
+
+### preloop push
+
+```sh
+preloop push [RUN_ID]
+```
+
+Publishes a completed run's result to GitHub: pushes the tested commit, creates or updates the pull request, and reports check runs. `RUN_ID` defaults to the most recent run. Re-running the command is safe.
+
+## Debug and inspect
+
+### preloop debug
+
+Attach to a job paused at a failed step, inspect it, and issue a verdict.
+
+```sh
+preloop debug                              # the only paused session
+preloop debug <run-id> --json              # show the paused session as JSON
+preloop debug <run-id> --verdict retry --from 3
+```
+
+| Argument or flag | Description |
+|---|---|
+| `[SESSION]` | Session ID, run ID, or job name. Optional when exactly one session is paused. |
+| `--json` | Print the paused session as JSON and exit. |
+| `--verdict <retry\|continue\|abort>` | Issue a verdict without attaching. |
+| `--sync` | With `retry`, copy host source changes into the VM first. |
+| `--export` | Copy source edits made inside the VM back to the host workspace. |
+| `--patch-only` | With `--export`, write the patch without applying it. |
+| `--force` | When syncing, overwrite VM-side edits. Without it, a file changed on both sides aborts the sync. |
+| `--revert <none\|untracked\|all>` | With `retry`, remove the failed attempt's workspace changes. Default `none`. |
+| `--from <STEP>` | With `retry`, re-run from a 1-based step number or step name. The step must be at or before the failed step. |
+| `--from-start` | With `retry`, re-run from the first user step of the job. |
+
+### preloop shell
+
+```sh
+preloop shell                 # the last failed run
+preloop shell last-failed
+```
+
+Opens a shell in a VM that was preserved after a failure. Use `--preserve-on-failure` on `run` to keep the VM.
+
+| Argument | Description |
+|---|---|
+| `[RUN_REF]` | Run reference, such as `last-failed`. Default `last-failed`. |
+
+### preloop dap
+
+Attach an interactive DAP client to a run that was started with debugging enabled.
+
+| Argument or flag | Description |
+|---|---|
+| `<RUN_ID>` | Run whose DAP endpoint to open. |
+| `--url <URL>` | Engine URL. Defaults to `PRELOOP_URL`. |
+| `--token <TOKEN>` | API token. Defaults to `PRELOOP_TOKEN`, then `PRELOOP_SYSTEM_TOKEN`, then the engine token in the credential store. |
+
+## Configure
+
+### preloop init
+
+Configure GitHub credentials, the golden image that every job forks from, workflow requirements, and how the engine runs. In a terminal, `init` asks each of its five steps. Any flag answers its step without a prompt, so a fully specified command runs without prompting.
+
+```sh
+preloop init --auth none --golden official --mode none
+preloop init --probe --json
+```
+
+The steps are credentials, golden, workflows, run mode, and preflight. The workflow step reads local `.github/workflows/*.yml|yaml` and `.github/actions/**/action.y*ml`; a `--repo` that is not the checkout is read through GitHub when its credential allows it. It never fails init because a repository cannot be read or a secret is missing.
+
+Its report lists every `secrets.NAME` / `secrets['NAME']` reference (excluding the engine-minted `GITHUB_TOKEN`), its file locations, and whether the name is configured globally, for the repository, or for an environment. In a terminal each missing UPPER_SNAKE name can be entered through a hidden prompt; otherwise the report prints the exact `preloop secret set NAME --repo OWNER/NAME` command. The `runs-on` table uses the engine's actual matching rules: base labels are `self-hosted`, `Linux`, and the host architecture; `ubuntu-latest`/`ubuntu-24.04` use the official golden, other `ubuntu-*` labels use the configured golden, and macOS/Windows labels require a matching external runner because the Linux pool cannot host them. Undeclared custom labels need a matching registered runner or an explicit `PRELOOP_RUNNER_LABELS` value.
+
+For `--auth app`, the stable URL must be an HTTPS, non-loopback URL that GitHub can reach. Answer the prompt with the URL directly; when `tailscale` is on the host and reports a running tailnet, its own name for the machine (`https://<machine>.<tailnet>.ts.net`) is offered: Enter accepts it when `tailscale funnel status --json` shows the webhook path as the only route this node publishes, and it is shown as a hint (blank still skips) when it is not Funnel-published or the Funnel also has other mounts. Type `-` to skip. The prompt also prints the way there — a Tailscale Funnel on a hostname nothing else serves (`tailscale funnel --set-path=/api/v1/github/webhooks --bg http://127.0.0.1:9090/api/v1/github/webhooks`; Funnel applies to the host and port, so a root mount beside it would publish the runner-registration surface too — check with `tailscale funnel status`), a Cloudflare **named** Tunnel (not a quick Tunnel, whose URL changes on restart) behind a path-filtering proxy, or a domain/reverse proxy; the full guide is in [Deploy](/control-plane/operate/deploy#exposure-options). Skipping means the App is created with webhooks off: pushes and pull requests will not start runs and PR checks will not report. An existing `--public-url` or `PRELOOP_PUBLIC_URL` is used without asking.
+
+The URL resolved here is not written to the config file: it is handed to whatever run mode init starts — the foreground `serve` args, or a `PRELOOP_PUBLIC_URL` line in the installed service's environment file — so Check Run detail links and the webhook health check use the address GitHub was given. (A kept credential — the "kept" path — resolves it from `--public-url` or `PRELOOP_PUBLIC_URL`, since nothing is reconfigured there.)
+
+| Flag | Description |
+|---|---|
+| `--probe` | Print a host capability report as JSON and exit. Changes nothing. |
+| `--auth <app\|pat\|none>` | Credential step. `none` writes no credential and leaves an existing one alone. |
+| `--app-id <ID>`, `--pem-file <PATH>` | Existing App credentials, with `--auth app`. Without them the browser flow creates one. With `--public-url`, this path points the App's webhook at the engine (`PATCH /app/hook/config`) instead of silently saving credentials whose hook stays inactive. |
+| `--token <TOKEN>` | Personal access token, with `--auth pat`. Falls back to `PRELOOP_GITHUB_PAT`. |
+| `--webhook-secret <SECRET>` | Webhook secret to store with the credential. |
+| `--org <NAME>` | Create the App under an organization, in the browser flow. |
+| `--public-url <URL>` | Stable HTTPS URL GitHub can reach. Enables App webhooks and PR checks; loopback and non-HTTPS URLs are rejected, and trailing slashes are removed. Also handed to the mode this run starts — the foreground `serve` args, or the installed service's environment file — so Check Run links and the webhook health check use it. |
+| `--port <N>` | Loopback port for GitHub's redirect. `0` picks a free port. |
+| `--no-browser` | Print the App-creation URL instead of opening a browser. |
+| `--repo <OWNER/NAME>` | Repository to verify and scan. Repeatable; without it, the current checkout's origin is used. |
+| `--no-secrets-scan` | Skip the workflow secret scan; the `runs-on` label report still runs. |
+| `--golden <official\|oci\|dockerfile\|file>` | Golden step. `official` is the packed official GitHub runner image. |
+| `--base-image <REF>` | OCI reference, with `--golden oci`. Pin it with `@sha256:…`. |
+| `--dockerfile <PATH>` | Dockerfile to build, with `--golden dockerfile`. Default `./Dockerfile`. |
+| `--docker-context <DIR>` | Build context, with `--golden dockerfile`. Default: the Dockerfile's directory. |
+| `--path <PATH>` | Local `.smolmachine` file or rootfs directory, with `--golden file`. |
+| `--mode <foreground\|service\|none>` | Run mode after setup: `serve` here, install a service, or write the configuration only. |
+| `--yes` | Accept the suggested answer to confirmation prompts. |
+| `--json` | Print one JSON object per step and implies non-interactive use. |
+
+Without a terminal on both stdin and stdout, or with `--json`, `init` never prompts. It then needs `--auth`, `--golden`, and `--mode`.
+
+Exit codes: `2` a required flag is missing or invalid. `3` preflight failed (disk, architecture, or hypervisor). `4` resolving, pulling, or building the base image failed. `1` any other failure.
+
+### preloop setup github
+
+Configure GitHub credentials directly, without the other `init` steps. With no App credentials and a public URL, the engine hosts the App-creation form; over SSH the command listens on `127.0.0.1:8765` on the server and you reach it with `ssh -L 8765:127.0.0.1:8765 <host>`; otherwise it is a single-use local listener. [GitHub App](/control-plane/github/app#register-the-app) walks through all three.
+
+```sh
+preloop setup github --via app
+preloop setup github --via pat --repo owner/repo
+```
+
+| Flag | Description |
+|---|---|
+| `--via <app\|pat>` | Credential type. `app` is recommended. |
+| *(no App flags)* | With `--via app` and no `--app-id`/`--pem-file`, creates the App through GitHub's manifest flow and stores everything. With a public URL the running engine hosts the form and stores the credentials; over SSH the listener is reached through a port forward; otherwise it is a local listener. See [GitHub App](/control-plane/github/app#register-the-app). |
+| `--app-id <ID>` | Existing App ID, with `--via app`. |
+| `--pem-file <PATH>` | Existing App private key, with `--via app`. |
+| `--add` | Create an additional App when one is already configured. Without it, an already-configured App is updated instead (webhook) or reported rather than duplicated. |
+| `--org <NAME>` | Create the App under an organization. |
+| `--port <N>` | Listener port for the local and SSH flows. Default: a free port locally, `8765` over SSH, so the `ssh -L` forward has a known port. |
+| `--public-url <URL>` | Selects engine-hosted App setup (the running engine serves the form and receives GitHub's redirect), and enables webhook delivery to this URL. Falls back to `PRELOOP_PUBLIC_URL`. Must be on the engine's own origin when the engine has `PRELOOP_PUBLIC_URL` set, and must be `https` unless it is loopback. On an already-configured App, updates its webhook instead of creating a second App. |
+| `--app-name <NAME>` | Name of the created App. Default `preloop-local`. GitHub requires it to be unique. |
+| `--no-browser` | Print the URL instead of opening a browser. |
+| `--webhook-secret <SECRET>` | Store a webhook secret you created yourself. |
+| `--token <TOKEN>` | Personal access token, with `--via pat`. Falls back to `PRELOOP_GITHUB_PAT`, then a hidden prompt. |
+| `--repo <OWNER/NAME>` | Repository to verify the credential against. Repeatable. On the engine-hosted flow the engine runs the checks with the key it just stored, after waiting up to five minutes for the App to be installed there; the CLI prints one `✓`/`✗` line per repository and exits non-zero if any failed (up to 16). |
+| `--workspace <PATH>` | Workspace whose workflows set the permission checklist. |
+
+### preloop doctor
+
+```sh
+preloop doctor --repo owner/repo
+```
+
+Reports which GitHub credentials are configured and how many global secrets are stored. With `--repo`, it also verifies the credential against GitHub, and it exits non-zero if a check fails. It needs a configuration file.
+
+| Flag | Description |
+|---|---|
+| `--repo <OWNER/NAME>` | Repository to verify against. Repeatable. |
+
+### preloop secret
+
+Manage stored secrets. Values are never printed.
+
+```sh
+preloop secret set DOCKERHUB_TOKEN                        # prompts, hidden
+preloop secret set DB_PASSWORD --repo owner/repo --env prod --value "$DB_PASSWORD"
+preloop secret list --repo owner/repo
+preloop secret rm DOCKERHUB_TOKEN
+```
+
+| Subcommand | Flags |
+|---|---|
+| `set <NAME>` | `--value <VALUE>`: value. Omitted, one line is read from stdin, hidden on a terminal. `--repo <OWNER/NAME>`: scope to one repository. `--env <ENV>`: scope to an environment of `--repo`. |
+| `list` | `--repo <OWNER/NAME>`: only that repository's names. `--env <ENV>`: only that environment's names (needs `--repo`). |
+| `rm <NAME>` | `--repo <OWNER/NAME>` and `--env <ENV>`: remove from that scope instead of the global one. |
+
+The [configuration guide](/control-plane/configuration#secrets) explains the scopes and when changes apply.
+
+## Serve and operate
+
+### preloop serve
+
+Run the control plane and the microVM pool in the foreground. This is the self-hosting entry point. It serves the GitHub webhook and Checks endpoints and starts microVMs for queued jobs.
+
+**The only foreground entry point that starts an engine** (`preloop init --mode foreground` runs this same mode): every command that talks to an engine requires one that is already running, while local and administrative commands never contact one. On a fresh `PRELOOP_HOME` it initializes the brand-new control database — the one `--store` / `PRELOOP_STORE_URL` selects, which is also the one the boot opens. An existing store is never migrated here; run `preloop store migrate` for that, and provision a Postgres store yourself.
+
+```sh
+preloop serve
+preloop serve --listen 0.0.0.0:9090 --public-url https://ci.example.com
+```
+
+| Flag | Description |
+|---|---|
+| `--listen <ADDR>` | Address to bind. Default `127.0.0.1:9090`. Overrides `PRELOOP_LISTEN`. |
+| `--public-url <URL>` | Address GitHub and remote runners reach. Default `http://127.0.0.1:<port>`. Overrides `PRELOOP_PUBLIC_URL`. |
+| `--github-app-id <ID>` | GitHub App ID. |
+| `--github-app-key <PATH>` | Path to the App's private key PEM. |
+| `--github-app-installation-id <ID>` | Installation ID. Skips installation discovery. |
+| `--webhook-secret <SECRET>` | Shared secret for verifying `X-Hub-Signature-256`. |
+| `--save` | Persist the supplied GitHub credentials for later runs. |
+| `--store <URL>` | Durable-state backend: `sqlite://<path>`, a bare path, or `postgres://…`. Default: `PRELOOP_STORE_URL`, then SQLite in the state directory. |
+
+`serve` initializes only a brand-new local store and never migrates an existing database. See [Configuration](/control-plane/configuration#durable-state) and [Storage](/control-plane/operate/storage#apply-schema-migrations).
+
+### preloop server
+
+Install or remove the engine as a supervised service. The [install guide](/control-plane/install#run-as-a-background-service) explains the scopes.
+
+```sh
+sudo preloop server install --public-url https://ci.example.com
+preloop server install --user
+preloop server uninstall --user --purge-data
+```
+
+`server install`:
+
+| Flag | Description |
+|---|---|
+| `--listen <ADDR>` | Bind address. Default `127.0.0.1:9090`. On Linux the port is opened through socket activation. |
+| `--public-url <URL>` | Externally reachable base URL for webhooks and Checks links. |
+| `--github-app-id <ID>` | GitHub App ID. |
+| `--github-app-key <PATH>` | App private key PEM. It is copied to a service-readable location. |
+| `--github-app-installation-id <ID>` | Installation ID. |
+| `--webhook-secret <SECRET>` | Shared secret for webhook signatures. |
+| `--home <PATH>` | State directory. Default `/var/lib/preloop`, or `~/.preloop` with `--user`. |
+| `--no-update-timer` | Skip the hourly self-update timer on Linux. |
+| `--systemd-credential <PATH>` | Mount an encrypted systemd credential with stored secrets. Linux only. |
+| `--user` | Install per-user units: systemd user units on Linux, a LaunchAgent on macOS. |
+| `--dry-run` | Print what would be written and run, without changing the system. |
+
+`server uninstall` removes the units and keeps the state directory unless you pass `--purge-data`. It accepts `--home`, `--user`, and `--dry-run`, with the same meanings.
+
+`server uninstall` flags:
+
+| Flag | Description |
+|---|---|
+| `--home <PATH>` | State directory to uninstall. Default `/var/lib/preloop`. |
+| `--purge-data` | Delete the state directory and its contents after removing the service. |
+| `--user` | Remove a per-user service. |
+| `--dry-run` | Print what would be removed without changing the system. |
+
+### preloop store
+
+Manage the control database. These commands are offline. They never start the engine.
+
+`migrate` initializes or upgrades the schema. `preloop serve` initializes only a brand-new local store and otherwise never applies migrations; run this command explicitly to upgrade an existing store. SQLite migrations take a pre-migration backup by default when the database exists and has pending migrations.
+
+```sh
+preloop store migrate --store postgres://…
+preloop store status
+preloop store import-legacy --source old/preloop.db --target state/control.db --state-dir state
+```
+
+| Subcommand | Flags |
+|---|---|
+| `migrate` | `--store <URL>`: store to initialize or upgrade. Defaults to `PRELOOP_STORE_URL`, then `$PRELOOP_HOME/state/preloop.db`. `--adopt-baseline`: accept a recognized pre-ledger schema and migrate it. `--no-backup`: skip the automatic SQLite backup before migrating. `--dry-run`: report migrations without applying them. |
+| `status` | `--store <URL>`: report applied, pending, and unknown migrations. |
+| `import-legacy` | `--source <LEGACY_DB>`: released `preloop.db` to read; it is never modified. `--target <CONTROL_DB>`: database to create; it must not exist. `--state-dir <DIR>`: state directory for the target. `--key <FILE>`: 32-byte cluster key. `--active <refuse\|requeue\|cancel>`: how to treat work still in flight. Default `refuse`. `--json`: print the full report. |
+
+### preloop webhooks
+
+Inspect, replay, and check the durable webhook queue. Preloop keeps each delivery's payload for 30 days, so a delivery can be replayed after GitHub stops offering it. See [Webhook resilience](/control-plane/github/webhook-resilience).
+
+```sh
+preloop webhooks list --state failed
+preloop webhooks replay <delivery-guid>
+preloop webhooks health --json
+```
+
+| Subcommand | Flags |
+|---|---|
+| `list` | `--state <received\|processing\|done\|failed>`: only deliveries in that state. `--limit <N>`: rows to print. Default `50`, maximum `500`. `--json`. |
+| `replay <DELIVERY_ID>` | The `X-GitHub-Delivery` GUID. Requeues the delivery from its stored payload. Processing is idempotent. |
+| `health` | `--json`. Shows queue depth, watchdog freshness, open repairs, the GitHub circuit-breaker state, and App webhook drift. |
+
+### preloop volumes
+
+Read-only volumes the engine mounts. Each holds one host tree — today the runner bundle, including the Node externals it carries — named `preloop-runner-<digest>` after the digest of the tree, so a new bundle is a new volume. The engine collects superseded volumes on its own (`gc`, and the [`PRELOOP_VOLUMES_*`](/control-plane/reference/environment#vm-backend) variables); these commands run that plan by hand, or reclaim volumes it deliberately leaves alone. They are offline: they talk to AgentENV (`PRELOOP_AENV_BINARY`, default `aenv`) and never bootstrap the engine.
+
+#### preloop volumes list
+
+Lists the volumes AgentENV holds, with kind, mode, size, status, and the runner/Node versions each one was populated from. AgentENV cannot be asked what is inside a volume, so the versions come from the index the engine writes when it populates one: a volume populated before that index existed, or by another host, reports `unknown (pre-manifest or created elsewhere)`.
+
+#### preloop volumes prune
+
+Deletes every volume that no sandbox mounts, except the tree the engine would mount. Without `--keep` that tree is the same selection the pool makes — `PRELOOP_RUNNER_BUNDLE` when it names a usable Linux runner bundle, otherwise the installed or development bundle beside the binary, including the engine's own mirror — plus the standalone Node externals (`PRELOOP_RUNNER_EXTERNALS`, else `$PRELOOP_HOME/externals`) when one is installed.
+
+AgentENV refuses to delete a mounted volume, and that is reported as `in use`, not as a failure. A dry run cannot tell which volumes a sandbox holds (the server only reveals a reservation when a delete is attempted), so it reports `candidate` instead of claiming a deletion.
+
+Pruning is safe while an engine is running: the provider re-checks that a remembered volume still exists before reusing it, and populates it again if it was deleted. It is not safe while a volume is being populated: one deleted between a populate's create and its first mount fails that populate.
+
+| Flag | Description |
+|---|---|
+| `--keep <DIR>` | Host tree whose volume is kept (repeatable). |
+| `--dry-run` | Report candidates without deleting anything. |
+
+#### preloop volumes gc
+
+Collects the volumes nothing needs any more. It keeps the trees named with `--keep` (without that flag, the same tree selection `prune` keeps), every volume a sandbox mounts, every volume this engine published and remembers, every volume younger than the grace period or with no recorded creation time, the newest superseded volume per kind for a rollback (`PRELOOP_VOLUMES_KEEP_PREVIOUS`, default 1), and any staging volume a populate is writing.
+
+Remembering a volume keeps it only while it can be mounted: a volume AgentENV reports as `failed` or `uploading` is kept until its grace period is over and then reclaimed as `unusable`, because this engine refuses to mount such a volume — keeping it would leave every start on that tree stuck.
+
+It deletes the rest and prints one row per volume — size, kind, age and the reason it is kept or deleted — so `--dry-run` shows exactly what a real run does. The reasons are `live`, `mounted`, `populating`, `young`, `unknown-age`, `previous` and `unmanaged` for kept volumes, and `superseded`, `abandoned` (a staging volume whose populate is gone) and `unusable` for deleted ones. A volume whose age nothing recorded — populated by an older build, or by another host — is kept, which is what `prune` is for.
+
+A planned deletion that something claimed between the plan and the deletion — a populate that started while the listing ran, or a volume this engine published for a start that is about to mount it — is printed as `left` and left for the next pass. A deletion the server refused for any reason other than a mounted volume exits nonzero, as `prune` does, so a caller can tell that the cleanup it asked for did not happen.
+
+The engine runs the same plan in the background after it populates a volume and every `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600 seconds), so a bundle change reclaims the bundle it replaced once the grace period is over. The timer starts with the engine, so an engine that only resumes sandboxes it already has still collects. `PRELOOP_VOLUMES_GC=off` stops those automatic passes and leaves this command.
+
+| Flag | Description |
+|---|---|
+| `--keep <DIR>` | Host tree whose volume is kept (repeatable). |
+| `--dry-run` | Print the plan without deleting anything. |
+
+### preloop update
+
+Check for a newer release, or install one. Installs are atomic.
+
+```sh
+preloop update --check
+```
+
+| Flag | Description |
+|---|---|
+| `--check` | Report whether a newer release exists. Install nothing. |
+| `--version <VERSION>` | Install this release tag or version instead of the latest stable one. |
+| `--repository <OWNER/NAME>` | Release source. Default `preloopdev/preloop`. Env: `PRELOOP_RELEASE_REPOSITORY`. |
+| `--api-url <URL>` | Hidden release API override. Must be HTTPS. Env: `PRELOOP_RELEASES_API`. |
+| `--ensure-runtime` | Hidden Unix-only operation: install the compatible SmolVM runtime without updating the Preloop binary. |
+
+On macOS, `update` also refreshes the Linux guest runner. On Unix it ensures the SmolVM runtime is present.
+
+## Companion client: preloop-runner-client
+
+`preloop-runner-client` is a separate binary that calls the native REST API directly. Release archives do not include it. Build it from a checkout with `cargo build --release -p preloop-runner-client`.
+
+```sh
+preloop-runner-client --server http://127.0.0.1:9090 events <run-id>
+preloop-runner-client --server http://127.0.0.1:9090 lint -W .github/workflows/ci.yml
+```
+
+| Global flag | Description |
+|---|---|
+| `--server <URL>` | Engine URL. Env `PRELOOP_SERVER`. Default `http://127.0.0.1:8080`, which is not the engine's default port, so pass `--server` when you run the engine on `9090`. |
+
+| Command | Description |
+|---|---|
+| `submit -W <FILE>` | Submit a workflow. Options: `--workspace-root`, `--event` (default `push`), `--payload`, `--repository` (default `local/preloop`), `--git-ref` (default `refs/heads/main`), `--var KEY=VALUE`, `--secret KEY=VALUE`, `--input KEY=VALUE`, `--debug`, `--debugger-welcome-message`. |
+| `run <RUN_ID>` | Fetch one run. |
+| `cancel <RUN_ID>` | Cancel a run. |
+| `rerun <RUN_ID>` | Re-run a run. |
+| `events <RUN_ID>` | Stream the run's events as NDJSON. |
+| `approve <RUN_ID> <JOB_ID> [--note]` | Approve a job waiting on its environment's required-reviewer gate. |
+| `approve-fork <RUN_ID> [--note]` | Release a run held by the fork-pull-request policy. |
+| `lint -W <FILE> [--workspace-root]` | Parse the workflow and expand its jobs without running them. |
+
+The client uses `PRELOOP_SYSTEM_TOKEN` when it is set. For a loopback server, it can read the engine token from the credential store. Its HTTP timeout is `PRELOOP_CLIENT_TIMEOUT_SECONDS`, default `30`.
+
+## Hidden operator commands
+
+These commands are omitted from `--help`. Release automation and operators who build their own images use them.
+
+| Command | Purpose |
+|---|---|
+| `preloop build-golden --runner-bundle <DIR> --output <PATH>` | Pack a golden image from a base image. `--base-image <REF>` names the image, else `PRELOOP_RUNNER_BASE_IMAGE` or `[golden] base_image`. `--storage-gb <GiB>` sets the guest storage. There is no default base image. See [VM images](/control-plane/operate/vm-images). |
+| `preloop golden-path [--home <PATH>] [--base-image <REF>]` | Print the path where the golden artifact for a base image is stored. |
+| `preloop engine` | The former name for `serve`, kept for existing supervisor units. |
+| `preloop store init-local` | Initialize a brand-new local store as the service account. Used by `server install`. |

@@ -35,6 +35,31 @@ Releases before v0.27.0 predate the changelog.
   ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
   cargo-zigbuild match `release-runner.yml`.
 
+- **Superseded AgentENV volumes are collected automatically.** A runner bundle
+  change publishes a new content-addressed volume and leaves the old one behind;
+  the engine now reclaims the ones nothing needs — unmounted by any sandbox, past
+  the grace period, beyond the newest one kept for a rollback, and not a tree the
+  engine mounts — in a pass after each populate and every six hours (the timer
+  starts with the engine, so an engine that only resumes sandboxes still
+  collects). A pass never deletes a volume a sandbox mounts (AgentENV refuses), a
+  volume whose creation time nothing recorded, or a staging volume a populate is
+  writing, and every deletion is logged with its name, size and reason. A volume
+  AgentENV reports as something other than `ready` is reclaimed once it is past
+  the grace period — including one this engine published and remembers, which it
+  refuses to mount — so a start that would otherwise stay stuck on it populates
+  again. A volume a populate or a start claims between the plan and the deletion
+  is left for the next pass.
+  `PRELOOP_VOLUMES_GC=off` turns the automatic passes off;
+  `PRELOOP_VOLUMES_KEEP_PREVIOUS` (default 1), `PRELOOP_VOLUMES_GC_GRACE_SECS`
+  (default 3600) and `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600) set the
+  retention.
+
+- **`preloop volumes gc [--keep <DIR>]... [--dry-run]`** prints the plan a pass
+  acts on — one row per volume with its size, kind, age and the reason it is kept
+  or deleted — and deletes it unless `--dry-run` is given. A deletion that fails
+  exits nonzero, as `prune` does. `prune` stays as the explicit one-shot for
+  volumes that have no recorded age.
+
 - **`preloop init` workflow readiness checks.** The five-step wizard can ask for
   a stable HTTPS App webhook URL, scan local and configured repositories for
   missing workflow secrets, and report every `runs-on` label against the
@@ -59,6 +84,29 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- **`preloop serve` (and `preloop init --mode foreground`) is the only way an
+  engine starts.** Every command that talks to an
+  engine — `run` and `rerun` included, plus `status`, `logs`, `cancel`,
+  `shell`, `debug`, `dap`, `push` and `webhooks` — requires one that is
+  already running: it probes the endpoint it would use (`PRELOOP_URL`, else
+  the local default) and, when nothing answers, exits non-zero naming that
+  endpoint and how to start one (`preloop serve` in the foreground, `preloop
+  server install` for a supervised service) instead of booting a background
+  engine. Local and administrative commands (`plan`, `store`, `setup`,
+  `doctor`, `secret`, `update`, `version`, `build-golden`, `golden-path`, and
+  `init` outside `--mode foreground`) never contact one. A set `PRELOOP_URL` no
+  longer implies a live engine, and no command falls back to a local one. The
+  refusal keeps the `PRELOOP_UNREACHABLE` marker the pre-push hook fails open
+  on, so a missing engine stays a soft gate. A `PRELOOP_URL` that crosses a
+  network is probed with a longer budget than loopback, so an engine that
+  answers slowly is not reported absent. The brand-new control-database
+  initialization that the background start performed moved to `preloop serve`,
+  so a fresh `PRELOOP_HOME` still serves with no extra step, out of the store
+  `--store` / `PRELOOP_STORE_URL` selects (the same one the boot opens); an
+  existing store is still never migrated implicitly. Fixes defect 3 of
+  [#658](https://github.com/preloopdev/preloop/issues/658): a `preloop run`
+  from the pre-push hook used to start a control plane and a smolVM on the
+  developer's machine. The hook's other two defects are tracked separately.
 - **SmolVM floor and golden pin move to 1.30.1** (`smolvm_min_version` and
   `smolvm_golden_version` in `versions.toml`). The floor now also covers the
   x86_64 virtio device budget SmolVM 1.23.0 raised to 19 MMIO IRQ lines, which
@@ -91,6 +139,18 @@ Releases before v0.27.0 predate the changelog.
   kept in the keychain are copied into the file store the first time they are
   read; the keychain entry is left in place.
 
+- **AgentENV runners mount the runner bundle as a read-only volume**: the
+  complete bundle (including Node externals) is archived once into a
+  content-addressed volume named `preloop-runner-<digest>`, stamped with a
+  `.preloop-bundle.json` manifest saying which runner and Node versions it
+  holds, and clones mount it at start with `aenv start --volume`. Fork bases stay
+  volume-free because AgentENV 0.2.1 cannot snapshot a sandbox with a read-only
+  volume; a new bundle is therefore a new volume rather than a golden rebuild.
+  Writable host mounts are refused, symlinks that would leave the tree and
+  set-user-ID/set-group-ID/sticky bits are stripped, and volume create/populate
+  failures are reported by name with no tar fallback. `preloop volumes list|prune`
+  manages leftovers; `preloop volumes gc` — the plan the engine also runs by
+  itself — collects the superseded ones.
 - **`$BROWSER` is honored when the CLI opens a page.** It is tried first, as
   `xdg-open` reads it, so VS Code and Cursor remote terminals open GitHub's
   setup page on your laptop and forward its port. The platform opener remains
@@ -107,6 +167,29 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Local runs resolve a local composite's nested remote action again** (#649
+  regression from #620): the runner resolves such an action with its job's
+  runtime token and names the job by `system.orchestrationId`
+  (`{planId}.{jobId}.__default`), and the Results identity check refused that
+  plan segment. A job token now names its own plan in that form too; the job
+  UUID must still match, so a token reaches only its own job. Every refusal on
+  the action-download path logs a WARN with its run and reason, and a local
+  composite source that cannot be read is treated as incomplete, never
+  remembered as an empty answer.
+- **GitHub Apps created by the manifest flow now subscribe to
+  `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
+  signal joins the creation-time `default_events`, and `actions: read` joins
+  the manifest's `default_permissions` because GitHub does not render the
+  `workflow_job` checkbox without it (the permission is requested only when the
+  event list actually carries `workflow_job`). The startup subscription
+  read-back now reports a missing `workflow_job` with the permission-gating
+  remediation. GitHub cannot change an App's event subscriptions through its
+  API after creation, so **Apps created before this change need a manual
+  edit**: App settings → Permissions & events → grant Actions: read
+  (installation must accept) → Subscribe to events → tick `workflow_job`.
+  Apps created without `--public-url` were shipped with no webhook and no
+  `default_events` at all, so enabling webhooks on one of those needs the same
+  manual step for every event.
 - **Converted App credentials are `SecretString` end to end.** The private key
   and webhook secret GitHub returns are deserialized into `SecretString`, so
   formatting or logging either one redacts it; the plaintext is exposed only
@@ -220,8 +303,9 @@ Releases before v0.27.0 predate the changelog.
   failed with `config-secrets key conflict`. Preloop now refuses to mint while
   sealed values exist and names what to unlock. A `secrets.key` that disagrees
   with the store is settled by which key opens the sealed values, and the losing
-  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. A failed
-  background engine start now prints the engine's last log lines (#653).
+  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. (The background
+  engine start that logged its last lines on failure was removed with #658; see
+  the entry under *Changed*.)
 
 - **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
   RUSTSEC-2026-0369 (insecure symlink and permission handling during archive

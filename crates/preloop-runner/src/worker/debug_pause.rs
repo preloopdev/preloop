@@ -562,9 +562,9 @@ impl Drop for PauseMarker {
 ///
 /// Restored before a retry so the second attempt starts from the same logical
 /// position as the first. This does **not** rewind the guest filesystem or any
-/// external side effect — see `docs/debug-sessions.md` §4. It exists to stop a
-/// failed attempt's `$GITHUB_ENV` / `$GITHUB_PATH` / `saveState` writes from
-/// being applied twice.
+/// external side effect — see `docs/contributing/debug-sessions-design.md`
+/// ("Workspace changes"). It exists to stop a failed attempt's `$GITHUB_ENV` /
+/// `$GITHUB_PATH` / `saveState` writes from being applied twice.
 #[derive(Debug, Clone)]
 pub struct StepStateSnapshot {
     env: HashMap<String, String>,

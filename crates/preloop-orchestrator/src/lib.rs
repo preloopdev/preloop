@@ -152,6 +152,22 @@ fn runner_volumes(
     }
     Ok(volumes)
 }
+/// Volumes that may be attached to a fork base. AgentENV cannot snapshot a
+/// sandbox while a read-only volume is mounted, so those mounts are attached
+/// to each clone instead.
+fn fork_base_volumes<P: VmProvider>(provider: &P, volumes: Vec<VolumeMount>) -> Vec<VolumeMount> {
+    if provider
+        .capabilities()
+        .fork_bases_may_mount_read_only_volumes
+    {
+        volumes
+    } else {
+        volumes
+            .into_iter()
+            .filter(|volume| !volume.read_only)
+            .collect()
+    }
+}
 
 /// Populate the host-side externals directory, validating the manifest and
 /// binary version for each runtime instead of merely checking for a file.
@@ -285,7 +301,12 @@ fn externals_complete(externals_root: &Path) -> bool {
 /// can run at all — unlike the release directory, which is root-owned when the
 /// engine runs unprivileged.
 fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
-    config.externals_dir.join("runner-bundle")
+    mirror_bundle_dir_in(&config.externals_dir)
+}
+
+/// [`mirror_bundle_dir`] from the externals directory alone.
+fn mirror_bundle_dir_in(externals_dir: &Path) -> PathBuf {
+    externals_dir.join("runner-bundle")
 }
 
 /// The bundle directory actually mounted into guests at `/opt/preloop/bin`.
@@ -298,23 +319,50 @@ fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
 /// `<root>/externals` symlink dangled, so every JS action step failed with
 /// `bundled nodeXX is missing` long after the pool reported itself ready.
 fn effective_runner_bundle(config: &RunnerPoolConfig) -> Result<PathBuf, OrchestratorError> {
-    if externals_complete(&config.runner_bundle.join("externals")) {
-        return Ok(config.runner_bundle.clone());
+    effective_runner_bundle_path(
+        &config.runner_bundle,
+        &config.externals_dir,
+        &config.runner_binary_name,
+    )
+}
+
+/// The bundle [`effective_runner_bundle`] would mount, without a pool config.
+///
+/// Split out so `preloop runner-volumes prune` can name the same tree the engine
+/// mounts — including the engine-owned mirror — and keep its volume.
+pub fn effective_runner_bundle_path(
+    bundle: &Path,
+    externals_dir: &Path,
+    runner_binary_name: &str,
+) -> Result<PathBuf, OrchestratorError> {
+    if externals_complete(&bundle.join("externals")) {
+        return Ok(bundle.to_path_buf());
     }
-    let mirror = mirror_bundle_dir(config);
-    if mirror.join(&config.runner_binary_name).is_file()
-        && externals_complete(&mirror.join("externals"))
-    {
+    let mirror = mirror_bundle_dir_in(externals_dir);
+    if mirror.join(runner_binary_name).is_file() && externals_complete(&mirror.join("externals")) {
         return Ok(mirror);
     }
     Err(OrchestratorError::Config(format!(
         "no runner bundle with complete node externals: release bundle {} and \
          engine-owned mirror {} are both incomplete; check network egress to \
          nodejs.org and the host externals at {}",
-        config.runner_bundle.display(),
+        bundle.display(),
         mirror.display(),
-        config.externals_dir.join("externals").display(),
+        externals_dir.join("externals").display(),
     )))
+}
+
+/// The version pins stamped into every AgentENV runner volume.
+///
+/// `versions.toml` is compiled into this crate (and the CLI) by `build.rs`, not
+/// into `preloop-vm`, which archives the tree — so the provider is handed the
+/// manifest by whoever constructs it.
+pub fn runner_bundle_manifest() -> preloop_vm::agentenv::volume::BundleManifest {
+    preloop_vm::agentenv::volume::BundleManifest::new(
+        RUNNER_VERSION,
+        NODE20_EXTERNALS_VERSION,
+        NODE24_EXTERNALS_VERSION,
+    )
 }
 
 /// Publish an engine-owned bundle carrying the runner binary and the validated
@@ -3988,7 +4036,14 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config, golden, true)?,
+        volumes: fork_base_volumes(
+            provider.as_ref(),
+            runner_volumes(
+                config,
+                golden,
+                !provider.capabilities().runner_bundle_carries_externals,
+            )?,
+        ),
         sockets: config
             .control_socket
             .iter()
@@ -4006,6 +4061,9 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
     await_guest_ready(provider.as_ref(), golden).await?;
     prepare_rosetta_multiarch(provider.as_ref(), golden, false).await?;
     apply_golden_contract(provider.as_ref(), config, golden).await?;
+    if provider.capabilities().runner_bundle_carries_externals {
+        link_runner_externals(provider.as_ref(), golden).await?;
+    }
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         warn!(
             machine = golden.as_str(),
@@ -4064,6 +4122,41 @@ async fn apply_golden_contract<P: VmProvider>(
             warnings = %warnings,
             "golden contract completed with warnings"
         );
+    }
+    Ok(())
+}
+/// AgentENV carries the externals inside the bundle volume. Point the runner
+/// root's conventional externals path at that tree instead of mounting a
+/// second volume under `/home/runner`, which envd cannot create reliably.
+async fn link_runner_externals<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+) -> Result<(), OrchestratorError> {
+    let command = format!(
+        "mkdir -p {root} && rm -rf {root}/externals && \
+         ln -s /opt/preloop/bin/externals {root}/externals",
+        root = RUNNER_ROOT
+    );
+    let output = provider
+        .exec(
+            name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                run_as_root_or_sudo_strict(&command),
+            ],
+        )
+        .await?;
+    if output.exit_code != 0 {
+        return Err(OrchestratorError::Config(format!(
+            "linking runner externals failed on {} (exit {}): {}",
+            name.as_str(),
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown error")
+        )));
     }
     Ok(())
 }
@@ -4255,6 +4348,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // "no runner can ever match these labels".
             ps.set_labels(self.config.labels.clone());
         }
+        // Maintenance the backend owns starts with the pool rather than with the
+        // first runner: a pool that only resumes machines it already has never
+        // reaches the paths that arm it lazily, and what it collects (AgentENV's
+        // superseded runner volumes) would then never be collected.
+        self.provider.start_maintenance();
         // Any error exit below (host externals, artifact prep, stale-machine
         // cleanup, golden bake) must clear the flag again; the guard is
         // disarmed once the warm completes.
@@ -6605,9 +6703,31 @@ async fn provision_runner<P: VmProvider + 'static>(
     // contents nor the contract this pool baked, so it would register as a
     // runner that cannot run the job it was created for. A fork that cannot be
     // recovered here is an error, and the slot retries it with backoff.
+    let fork_volumes = match golden {
+        Some(_)
+            if !provider
+                .capabilities()
+                .fork_bases_may_mount_read_only_volumes =>
+        {
+            runner_volumes(
+                config,
+                name,
+                !provider.capabilities().runner_bundle_carries_externals,
+            )?
+        }
+        _ => Vec::new(),
+    };
     let forked_golden = match golden {
-        Some(golden) => match provider.fork(golden, name).await {
-            Ok(()) => Some(golden),
+        Some(golden) => match provider
+            .fork_with_volumes(golden, name, &fork_volumes)
+            .await
+        {
+            Ok(()) => {
+                if provider.capabilities().runner_bundle_carries_externals {
+                    link_runner_externals(provider.as_ref(), name).await?;
+                }
+                Some(golden)
+            }
             Err(error) if managed_golden(config, golden) => {
                 if fork_base_unusable(&error) {
                     // The base is spent. Re-arm it atomically with forking:
@@ -6625,8 +6745,16 @@ async fn provision_runner<P: VmProvider + 'static>(
                     match provider.rearm_fork_base(golden, Some(name)).await {
                         Ok(true) => {
                             info!(golden = golden.as_str(), "golden fork base re-armed");
-                            match provider.fork(golden, name).await {
-                                Ok(()) => Some(golden),
+                            match provider
+                                .fork_with_volumes(golden, name, &fork_volumes)
+                                .await
+                            {
+                                Ok(()) => {
+                                    if provider.capabilities().runner_bundle_carries_externals {
+                                        link_runner_externals(provider.as_ref(), name).await?;
+                                    }
+                                    Some(golden)
+                                }
                                 Err(retry_error) => {
                                     error!(
                                         machine = name.as_str(),
@@ -6686,8 +6814,16 @@ async fn provision_runner<P: VmProvider + 'static>(
                                 }
                             }
                             if rearmed {
-                                match provider.fork(golden, name).await {
-                                    Ok(()) => Some(golden),
+                                match provider
+                                    .fork_with_volumes(golden, name, &fork_volumes)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        if provider.capabilities().runner_bundle_carries_externals {
+                                            link_runner_externals(provider.as_ref(), name).await?;
+                                        }
+                                        Some(golden)
+                                    }
                                     Err(retry_error) => {
                                         error!(
                                             machine = name.as_str(),
@@ -6740,8 +6876,14 @@ async fn provision_runner<P: VmProvider + 'static>(
                             error = %last_error,
                             "golden fork failed; retrying the fork"
                         );
-                        match provider.fork(golden, name).await {
+                        match provider
+                            .fork_with_volumes(golden, name, &fork_volumes)
+                            .await
+                        {
                             Ok(()) => {
+                                if provider.capabilities().runner_bundle_carries_externals {
+                                    link_runner_externals(provider.as_ref(), name).await?;
+                                }
                                 retried = Some(golden);
                                 break;
                             }
@@ -6804,7 +6946,11 @@ async fn provision_runner<P: VmProvider + 'static>(
             storage_gib: config.storage_gib,
             overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(config, name, !from_packed)?,
+            volumes: runner_volumes(
+                config,
+                name,
+                !from_packed && !provider.capabilities().runner_bundle_carries_externals,
+            )?,
             sockets: config
                 .control_socket
                 .iter()
@@ -6822,6 +6968,9 @@ async fn provision_runner<P: VmProvider + 'static>(
         if !from_packed {
             await_guest_ready(provider.as_ref(), name).await?;
             apply_golden_contract(provider.as_ref(), config, name).await?;
+            if provider.capabilities().runner_bundle_carries_externals {
+                link_runner_externals(provider.as_ref(), name).await?;
+            }
         }
     }
 

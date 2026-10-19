@@ -42,6 +42,12 @@ you can fix and retry from that step. Non-interactive runs (`--detach`, piped
 stdout, CI) never pause; pass `--preserve-on-failure` to keep the failed VM alive
 for a later `preloop shell`.
 
+These commands submit to an engine that is already running — none of them starts
+one (issue #658). Bring one up first with `preloop serve` (foreground) or
+`preloop server install` (supervised service); with none answering they exit
+non-zero, naming the endpoint they probed (`PRELOOP_URL`, else
+`http://127.0.0.1:9090`).
+
 ## Command reference (current CLI)
 
 ### Run workflows

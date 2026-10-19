@@ -1,0 +1,142 @@
+---
+title: "Security and operator policy"
+description: "Keep the control plane private and enforce fork, workflow, token, and secret policies from operator-owned configuration."
+---
+
+Treat the control plane as a privileged service. A runner that can claim a job can receive that job's secrets and GitHub token, so workflow code and dependencies are untrusted even when they run inside isolated microVMs.
+
+## Keep management surfaces private
+
+Bind the engine to loopback or a private network unless GitHub must deliver webhooks. Put a path-filtering proxy in front of it and publish only:
+
+```text
+/api/v1/github/webhooks
+```
+
+Do not publish the whole listener. In particular, protect:
+
+- `/api/v1/*` native management routes and run logs;
+- `/api/v3/actions/runner-registration` and registration-token routes;
+- `/api/v1/github/register` and `/api/v1/github/callback` while App registration is in progress—the callback displays a private key and webhook secret, and both routes return `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`;
+- `/setup/github` and `/setup/github/callback`, which serve the engine-hosted App-creation form and GitHub's redirect; both return `404` unless a setup link is open, and `/api/v1/github/setup-sessions`—the authenticated endpoint that mints that link—is never a public route;
+- runner protocol, broker, artifact, cache, OIDC, and signed blob URLs.
+
+Restrict your proxy or tunnel to `/api/v1/github/webhooks`: a path-filtering proxy or a Cloudflare ingress rule does that by path, while Tailscale Funnel does it by giving the webhook a hostname with nothing else mounted on its port (Funnel publishes the host and port, not just the path). The reason is `POST /api/v3/actions/runner-registration`: the official GitHub runner authenticates there with a registration token **GitHub** issued, which a self-hosted control plane cannot validate, so the safe default (`PRELOOP_REGISTRATION_POLICY=strict`) is what keeps the surface closed.
+
+Native management routes use the system bearer, but the namespace is not uniform: webhooks use `X-Hub-Signature-256`, signed download URLs carry their own credential, and runner protocol routes use job or runner tokens. Do not rely on one blanket `/api/v1` rule in a proxy.
+
+The default `PRELOOP_LISTEN` is `127.0.0.1:9090`. `PRELOOP_SYSTEM_TOKEN` protects native management and is generated into the selected credential store when not supplied explicitly. The mounted Unix socket is mode `0600` and exposes only the runner surface.
+
+Runner registration is strict by default:
+
+| Setting | Behavior |
+|---|---|
+| `PRELOOP_REGISTRATION_POLICY=strict` (default) | TCP registration requires the engine system credential; the mounted socket is strict too. |
+| `PRELOOP_REGISTRATION_POLICY=permissive` | Accepts any nonempty TCP registration credential for conformance replay only. It is rejected on non-loopback listeners; the mounted socket remains strict. |
+
+Legacy provision tokens are single-use and expire after 600 seconds. Never enable permissive registration on a shared or exposed listener.
+
+## Fork pull requests
+
+Fork code is the classic untrusted-code boundary. Keep the policy in the operator's config file, not in a workflow repository:
+
+```toml
+[fork_policy]
+run_fork_workflows = true
+require_approval = false
+```
+
+- `run_fork_workflows = false` drops fork pull-request events before workflow fetch and matching.
+- `require_approval = true` creates the run but holds its jobs in `Pending`. Approve with the native system credential:
+
+  ```sh
+  preloop-runner-client approve-fork RUN_ID --note "reviewed"
+  ```
+
+  The HTTP equivalent is `POST /api/v1/runs/RUN_ID/approve-fork` with an optional `{"note":"..."}` body. An unapproved run fails closed after 24 hours. `pull_request_target` uses base-repository trust and is not covered by this fork approval gate.
+
+Fork jobs never receive stored secrets or the static PAT fallback. Use a separate pool or keep fork workflows disabled when the host also protects App private keys.
+
+## Codified workflow deny policy
+
+There is no `[admin]` table. The operator-owned deny rules live in `[execution_protection]`:
+
+```toml
+[execution_protection]
+mode = "evaluate" # or "enforce"
+
+[[execution_protection.event_rules]]
+event = "pull_request_target"
+workflows = ["deploy.yml"]
+action = "deny"
+
+[[execution_protection.actor_rules]]
+actor = "untrusted-bot"
+workflows = ["release/*.yml"]
+action = "deny"
+```
+
+`evaluate` logs matching rules and continues. `enforce` skips the event or workflow. Omit `workflows` to match every workflow; patterns support `*`, `**`, and `?`, not character classes. Only `deny` is accepted. An absent table carries a default unscoped `pull_request_target` rule in evaluate mode; set `event_rules = []` explicitly to remove it.
+
+Rules can also be managed with the system bearer:
+
+```text
+GET    /api/v1/execution-protection
+PUT    /api/v1/execution-protection/mode
+GET    /api/v1/execution-protection/rules
+POST   /api/v1/execution-protection/rules
+GET    /api/v1/execution-protection/rules/{id}
+PUT    /api/v1/execution-protection/rules/{id}
+DELETE /api/v1/execution-protection/rules/{id}
+```
+
+Rule IDs are per-kind positional values such as `event-0` and `actor-0`; deleting a rule shifts later IDs. Changes are written to the config file and take effect after restart.
+
+## Token ceilings and environment gates
+
+Use an optional ceiling to prevent workflows from requesting more GitHub authority than the operator permits:
+
+```toml
+[token_permissions_ceiling]
+default = "read"
+contents = "read"
+pull-requests = "write"
+allow_create_approve_pr = false
+```
+
+Levels are `none`, `read`, `write`, and `admin`. The table is inactive when omitted. When present, `allow_create_approve_pr = false` caps pull-request permissions at read. See [GitHub tokens](/control-plane/github/tokens) for App-grant narrowing and PAT behavior.
+
+For local environment protection, use `[environment_rules."owner/repo".production]` with `deployment_branches`, `deployment_tags`, `wait_timer_minutes`, and `required_reviewers`. Environment approval uses `POST /api/v1/runs/RUN_ID/jobs/JOB_ID/approve`; the system bearer records an `admin_override` note. Local reviewer counts above one are rejected because the engine has no user identities. With a GitHub App, environment resolution needs Actions and Contents read; team reviewers need Members read; deployment status and Check Run reporting need Deployments write and Checks write.
+
+## Secrets and credentials
+
+Manage secrets without printing values:
+
+```sh
+preloop secret set DOCKERHUB_TOKEN
+preloop secret set AWS_CREDS --repo owner/repo --value '...'
+preloop secret set DB_PASSWORD --repo owner/repo --env production --value '...'
+preloop secret list --repo owner/repo
+preloop secret rm DB_PASSWORD --repo owner/repo --env production
+```
+
+Names are `UPPER_SNAKE`. Repository scopes use `owner/repo`; environment names use ASCII letters, digits, hyphens, and underscores, are at most 255 bytes, and cannot start with `-` or `_`. Precedence is run-supplied values, environment secrets, repository secrets, then global secrets. Fork jobs do not receive stored secrets.
+
+The config file is mode `0600`; file credentials live in a `0700` credentials directory with `0600` entries. `secrets_store = "memory"` keeps secret mutations only in engine memory and loses them at restart. `credential_store = "file"` is the default; `credential_store = "os"` uses the operating-system store. `PRELOOP_CREDENTIAL_STORE` can additionally select the nonpersistent `memory` backend for test-like deployments.
+
+Stored secrets (`[secrets]` in `config.toml`) are sealed with a key that lives in the same credential store. If that key cannot be read—for example while the macOS login keychain is locked—startup fails and names what to unlock. Preloop never generates a replacement key over sealed secrets, because a new key cannot open them. A `secrets.key` file beside the config that disagrees with the store is renamed `secrets.key.orphan-<unix-ts>` rather than deleted.
+
+For systemd, use an encrypted credential rather than plaintext secrets:
+
+```sh
+systemd-creds encrypt --name=preloop-secrets secrets.toml /etc/preloop-secrets.enc
+sudo preloop server install --systemd-credential /etc/preloop-secrets.enc
+```
+
+The credential overlays global, repository, and environment secret maps at startup. To remove a value permanently, edit and re-encrypt the credential; a running `preloop secret rm` cannot remove a value supplied by that credential.
+
+Webhook signatures use per-App secrets. `PRELOOP_WEBHOOK_SECRET` verifies `X-Hub-Signature-256` for the default App; a payload it signs is bound to that App's installation coverage. Set another App's secret against that App's id instead:
+
+```sh
+preloop setup github --via app --app-id 123456 --pem-file ./app.pem --webhook-secret '<webhook-secret>'
+```

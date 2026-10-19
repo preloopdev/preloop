@@ -660,7 +660,12 @@ fn store_webhook_secret(app_id: &str, secret: &str) -> anyhow::Result<String> {
         CredentialWriter::for_config(&config_path(), config.credential_store.as_deref())?;
     let webhook_ref =
         github_reference_with_host("webhook", config.github.server_url.as_deref(), Some(app_id))?;
-    persist_secret(&mut writer, &mut config, &webhook_ref, &SecretString::new(secret))?;
+    persist_secret(
+        &mut writer,
+        &mut config,
+        &webhook_ref,
+        &SecretString::new(secret),
+    )?;
     if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
         existing.legacy_webhook_secret = None;
         existing.webhook_secret_ref = Some(webhook_ref.as_str().to_owned());
@@ -1750,7 +1755,8 @@ mod tests {
         pin_setup_env(home.path());
         // The production order: credentials are saved first, which binds the
         // App id in the config, and the webhook secret is what follows.
-        save_app_credentials("4242", TEST_APP_PEM, None).expect("the credentials must save");
+        save_app_credentials("4242", &SecretString::new(TEST_APP_PEM), None)
+            .expect("the credentials must save");
         let update = WebhookUpdate {
             url: "https://ci.example.com/api/v1/github/webhooks".to_owned(),
             secret: "fresh-secret".to_owned(),
@@ -1786,7 +1792,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let previous = capture_setup_env();
         pin_setup_env(home.path());
-        save_app_credentials("4242", TEST_APP_PEM, None).expect("the credentials must save");
+        save_app_credentials("4242", &SecretString::new(TEST_APP_PEM), None)
+            .expect("the credentials must save");
         let update = WebhookUpdate {
             url: "https://ci.example.com/api/v1/github/webhooks".to_owned(),
             secret: "fresh-secret".to_owned(),

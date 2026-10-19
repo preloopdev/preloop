@@ -16,7 +16,7 @@
 //! | [`VmProvider`] | AgentENV |
 //! |---|---|
 //! | `create` | nothing (records the spec; AgentENV has no defined-but-unstarted sandbox) |
-//! | `start` | `aenv start --cold <image> --cpu --memory --disk-size-mb -d`, or `aenv resume` for a paused sandbox |
+//! | `start` | `aenv start [--cold] <image-or-snapshot> [--volume <guest>=<ro volume>]… -d`, or `aenv resume` for a paused sandbox |
 //! | `start_forkable` | `start` + mark the record as a fork base (the snapshot is taken lazily by the first `fork`) |
 //! | `fork` | `aenv snapshot create <golden> --name <snap>` once, then `aenv start <snap> -d` per clone |
 //! | `stop` | `aenv pause` (the sandbox keeps its id, so `start` resumes it) |
@@ -31,16 +31,15 @@
 //!
 //! # Capability gaps (deliberate, not stubs)
 //!
-//! * **No host bind mounts.** AgentENV volumes are block devices
-//!   (`aenv volume create`, attached as `--volume /guest/path=<volume>`); there
-//!   is no virtiofs/9p host-directory passthrough anywhere in the CLI or HTTP
-//!   API. [`MachineSpec::volumes`] is therefore *materialized*: the host
-//!   directory is streamed into the guest as a tar archive at start time (see
-//!   [`AgentEnvProvider::materialize_volumes`]). Reads inside the guest are
-//!   then local-disk reads rather than virtiofs round trips — faster per
-//!   access, paid for once per machine. Fork clones inherit an already
-//!   materialized filesystem from the snapshot, so the cost lands on the
-//!   golden only.
+//! * **No host bind mounts, so read-only trees become volumes.** AgentENV has
+//!   no virtiofs/9p host-directory passthrough: volumes are block devices
+//!   (`aenv volume create`, attached with `--volume /guest/path=<volume>`). A
+//!   read-only [`MachineSpec::volumes`] entry, such as the runner bundle or the
+//!   Node externals, is archived once into a content-addressed read-only volume
+//!   named `preloop-runner-<digest>`, and every sandbox that needs the tree mounts
+//!   that volume at start (see [`volume`]). Nothing is copied per sandbox, and a
+//!   changed tree is a new volume rather than a rebuilt golden. Writable host
+//!   mounts are refused: a block volume cannot be shared live with the host.
 //! * **No host Unix-socket passthrough.** [`MachineSpec::sockets`] is rejected
 //!   with an explanatory [`VmError::InvalidSpec`]. The engine must run the
 //!   guest control plane over TCP (`RunnerPoolConfig::control_socket = None`),
@@ -57,9 +56,12 @@
 //!   its length.
 //! * **Exec user is the image's.** `aenv exec` has no user flag, so commands run as
 //!   the image's `USER` (uid 1001 on the official runner image). The provider's own
-//!   root-only steps (guest scratch directories, volume extraction, secret-file reads
+//!   root-only steps (the secret directory, the populate step's unpack, secret-file reads
 //!   and removal) run through [`crate::guest_privilege`], which uses `sudo -n` when the
 //!   exec user is not root. Payloads keep the exec user, as a plain `exec` does.
+
+pub mod gc;
+pub mod volume;
 
 use crate::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
 use crate::{
@@ -75,7 +77,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Sandbox lifetime requested from AgentENV, in seconds.
 ///
@@ -91,8 +93,10 @@ const READY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Guest directory holding uploaded secret env files (tmpfs-backed `/run`).
 const GUEST_SECRET_DIR: &str = "/run/preloop-vm-secrets";
-/// Guest staging path for materialized volume archives.
-const GUEST_STAGING_DIR: &str = "/run/preloop-vm-staging";
+/// Where a populate sandbox mounts the exclusive volume it writes a runner tree into.
+const POPULATE_MOUNT: &str = "/mnt/preloop-volume";
+/// Guest directory a populate archive is uploaded to before it is unpacked.
+const GUEST_UPLOAD_DIR: &str = "/tmp";
 
 /// The environment variable that overrides the sandbox TTL.
 const TTL_ENV: &str = "PRELOOP_AENV_TTL_SECS";
@@ -114,8 +118,6 @@ struct MachineRecord {
     fork_snapshot: Option<String>,
     /// Set on a clone: the fork base it was started from.
     golden: Option<String>,
-    /// Whether the volumes in `spec` have been streamed into the guest.
-    volumes_materialized: bool,
 }
 
 /// The persisted name → sandbox mapping.
@@ -131,6 +133,102 @@ struct ListedSandbox {
     sandbox_id: String,
     #[serde(default)]
     state: Option<String>,
+}
+
+/// A volume as `aenv volume inspect` and `aenv volume list` report it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEnvVolume {
+    /// AgentENV's volume id.
+    #[serde(rename = "volumeID", default)]
+    pub volume_id: String,
+    /// The name: for a runner volume, its content address.
+    #[serde(default)]
+    pub name: String,
+    /// `ro` or `exclusive`, fixed at creation.
+    #[serde(default)]
+    pub mode: String,
+    /// Size in MiB.
+    #[serde(rename = "sizeMB", default)]
+    pub size_mb: u64,
+    /// `ready` once the volume can be mounted; `uploading` or `failed` otherwise.
+    #[serde(default)]
+    pub status: String,
+}
+
+/// What [`AgentEnvProvider::prune_volumes`] did, volume by volume.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Deleted by this call.
+    pub deleted: Vec<String>,
+    /// Named in `keep`, so left in place.
+    pub kept: Vec<String>,
+    /// Still mounted by a sandbox, so the server refused the deletion.
+    pub in_use: Vec<String>,
+    /// A dry run's candidates: the volumes a real run would attempt to delete.
+    ///
+    /// A dry run cannot say which of them a sandbox holds. AgentENV reveals a
+    /// reservation only when a delete is attempted (`HTTP 409: volume is
+    /// reserved by sandbox …`) and no read-only API reports it, so the report
+    /// names them as candidates instead of claiming they would be deleted.
+    pub candidates: Vec<String>,
+    /// Refused for another reason, with the reason.
+    pub failed: Vec<(String, String)>,
+}
+
+/// The read-only volume a host tree resolved to, and the fingerprint of the tree
+/// it was archived from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedVolume {
+    /// The tree's fingerprint at the time it was archived.
+    fingerprint: String,
+    /// The content-addressed volume name.
+    name: String,
+}
+
+/// What one populated volume holds, as the local index records it.
+///
+/// The manifest is also stamped inside the volume itself, but AgentENV has no
+/// API that reads inside a volume without mounting it, so `volumes list`
+/// answers from here. `created` lives only here: a timestamp inside the tree
+/// would change the digest of an unchanged bundle on every archive.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedVolume {
+    /// The version pins the tree was archived with.
+    #[serde(default)]
+    pub manifest: volume::BundleManifest,
+    /// Regular files in the archived tree.
+    #[serde(default)]
+    pub bundle_files: u64,
+    /// Summed size of those files, in bytes.
+    #[serde(default)]
+    pub bundle_bytes: u64,
+    /// The host tree the volume was archived from.
+    #[serde(default)]
+    pub host: String,
+    /// When the volume was populated, in Unix seconds.
+    #[serde(default)]
+    pub created: u64,
+}
+
+/// What this host's populated volumes hold, keyed by volume name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeIndex {
+    /// Volume name → what it holds.
+    #[serde(default)]
+    pub volumes: BTreeMap<String, IndexedVolume>,
+}
+
+impl VolumeIndex {
+    /// What `name` holds, when this host populated it.
+    pub fn get(&self, name: &str) -> Option<&IndexedVolume> {
+        self.volumes.get(name)
+    }
+
+    /// Whether the index knows nothing about `name`, which is what a volume
+    /// populated before this index existed, or by another host, looks like.
+    pub fn is_unknown(&self, name: &str) -> bool {
+        !self.volumes.contains_key(name)
+    }
 }
 
 /// The descriptor [`VmProvider::pack`] writes in place of a `.smolmachine`.
@@ -193,6 +291,25 @@ pub struct AgentEnvProvider {
     keepalives: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// One in-flight snapshot creation per fork base.
     fork_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// The read-only volume each archived host tree resolved to, with the
+    /// fingerprint of the tree it was archived from. A start re-derives the
+    /// fingerprint and re-checks that the volume still exists, so an in-place
+    /// bundle update and a `prune` both invalidate the entry.
+    published_volumes: Arc<Mutex<HashMap<PathBuf, PublishedVolume>>>,
+    /// One populate lock per host tree, so different trees archive and populate
+    /// concurrently while repeated starts of one tree wait on the first instead
+    /// of archiving it twice.
+    volume_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    /// The version pins stamped into every volume this provider populates.
+    bundle_manifest: volume::BundleManifest,
+    /// What the populated volumes hold, keyed by volume name.
+    volume_index: Arc<Mutex<VolumeIndex>>,
+    /// Where the index is persisted, when persistence is configured.
+    volume_index_path: Option<PathBuf>,
+    /// Automatic collection of the volumes nothing needs any more: the knobs,
+    /// the staging volumes a populate in this process is writing, and the
+    /// scheduler's own bookkeeping. Nothing is deleted without it.
+    volume_gc: Arc<gc::GcState>,
 }
 
 impl Default for AgentEnvProvider {
@@ -212,6 +329,12 @@ impl AgentEnvProvider {
             registry_path: None,
             keepalives: Arc::new(Mutex::new(HashMap::new())),
             fork_locks: Arc::new(Mutex::new(HashMap::new())),
+            published_volumes: Arc::new(Mutex::new(HashMap::new())),
+            volume_locks: Arc::new(Mutex::new(HashMap::new())),
+            bundle_manifest: volume::BundleManifest::default(),
+            volume_index: Arc::new(Mutex::new(VolumeIndex::default())),
+            volume_index_path: None,
+            volume_gc: Arc::new(gc::GcState::disabled()),
         }
     }
 
@@ -220,7 +343,8 @@ impl AgentEnvProvider {
     /// `PRELOOP_AENV_BINARY` overrides the executable and
     /// `PRELOOP_AENV_TTL_SECS` the sandbox TTL; the registry is persisted under
     /// the effective preloop home so a restarted engine can still enumerate and
-    /// tear down the machines it created.
+    /// tear down the machines it created, and the volume index beside it so
+    /// `volumes list` can say what a volume holds without mounting it.
     pub fn from_environment() -> Self {
         let mut provider = Self::new(binary());
         if let Some(ttl) = std::env::var(TTL_ENV)
@@ -231,9 +355,69 @@ impl AgentEnvProvider {
             provider.ttl_secs = ttl;
         }
         if let Some(home) = crate::effective_preloop_home() {
-            provider = provider.with_registry_path(home.join("agentenv-machines.json"));
+            provider = provider
+                .with_registry_path(home.join("agentenv-machines.json"))
+                .with_volume_index_path(home.join("agentenv-runner-volumes.json"));
         }
-        provider
+        provider.with_volume_gc(gc::GcState::from_environment())
+    }
+
+    /// Stamp `manifest` into every volume this provider populates.
+    ///
+    /// The pins come from the caller because `versions.toml` is compiled into
+    /// the CLI and the orchestrator, not into this crate. A provider that keeps
+    /// the default records `unknown` for every version instead of guessing.
+    pub fn with_bundle_manifest(mut self, manifest: volume::BundleManifest) -> Self {
+        self.bundle_manifest = manifest;
+        self
+    }
+
+    /// Collect the volumes nothing needs with `state`'s policy and snapshot of
+    /// what is being written.
+    ///
+    /// A provider built with [`AgentEnvProvider::new`] collects nothing until it
+    /// is given a state: [`AgentEnvProvider::from_environment`] is the
+    /// constructor that turns it on from `PRELOOP_VOLUMES_GC`.
+    pub fn with_volume_gc(mut self, state: gc::GcState) -> Self {
+        self.volume_gc = Arc::new(state);
+        self
+    }
+
+    /// Persist the volume index at `path`, loading it if it exists.
+    ///
+    /// A missing or malformed file is not fatal: `volumes list` then
+    /// reports the manifest as unknown for every volume. Nothing else depends on
+    /// the index — it exists so an operator can see what a volume holds without
+    /// mounting it, since AgentENV has no API that reads inside a volume.
+    pub fn with_volume_index_path(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<VolumeIndex>(&bytes) {
+                Ok(index) => {
+                    self.volume_index = Arc::new(Mutex::new(index));
+                }
+                Err(error) => warn!(
+                    path = %path.display(), %error,
+                    "AgentENV volume index is unreadable; starting empty"
+                ),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                path = %path.display(), %error,
+                "AgentENV volume index could not be read; starting empty"
+            ),
+        }
+        self.volume_index_path = Some(path);
+        self
+    }
+
+    /// What the volumes this host populated hold, keyed by volume name.
+    ///
+    /// A volume with no entry was populated by an engine that did not keep an
+    /// index (or by another host): `volumes list` says so rather than
+    /// claiming a version.
+    pub async fn volume_index(&self) -> VolumeIndex {
+        self.volume_index.lock().await.clone()
     }
 
     /// Persist the name → sandbox registry at `path`, loading it if it exists.
@@ -460,6 +644,10 @@ impl AgentEnvProvider {
     /// CPU, memory, and disk: template and snapshot starts inherit the
     /// resources baked into the artifact they boot from.
     ///
+    /// `mounts` are the `<guest>=<volume>` pairs of read-only volumes to attach.
+    /// They apply to a fresh start only: a resumed sandbox keeps the mounts it was
+    /// created with.
+    ///
     /// The requested disk size is a *floor*, not a contract. AgentENV refuses
     /// to shrink a guest below its overlaybd base virtual size (Ubuntu 24.04
     /// resolves to 64 GiB), and preloop's specs are written against SmolVM,
@@ -470,6 +658,7 @@ impl AgentEnvProvider {
         &self,
         target: &str,
         cold: Option<&MachineSpec>,
+        mounts: &[String],
         operation: &'static str,
     ) -> Result<String, VmError> {
         let build = |with_disk: bool| {
@@ -489,6 +678,9 @@ impl AgentEnvProvider {
                 }
             } else {
                 args.push(target.to_owned());
+            }
+            for mount in mounts {
+                args.extend(["--volume".into(), mount.clone()]);
             }
             args.extend(["--timeout".into(), self.ttl_secs.to_string()]);
             // Detached: the attaching form of `aenv start` would take over
@@ -531,21 +723,34 @@ impl AgentEnvProvider {
     /// command therefore runs in a detached task that outlives the caller:
     /// on success it hands the id back when the caller is still there, and
     /// [`Self::finish_start`] records it when it is not.
+    ///
+    /// The read-only volumes are resolved inside the same task: resolving one can
+    /// populate it, which takes minutes and must not be abandoned half way.
     async fn start_sandbox_supervised(
         &self,
         name: &MachineName,
         target: &str,
         cold: Option<&MachineSpec>,
+        volumes: &[VolumeMount],
         operation: &'static str,
     ) -> Result<String, VmError> {
         let provider = self.clone();
         let machine = name.clone();
         let target = target.to_owned();
         let cold = cold.cloned();
+        let volumes = volumes.to_vec();
         let handle = tokio::spawn(async move {
-            let result = provider
-                .start_sandbox(&target, cold.as_ref(), operation)
-                .await;
+            let result = match provider
+                .read_only_mounts(&volumes, &target, cold.as_ref())
+                .await
+            {
+                Ok(mounts) => {
+                    provider
+                        .start_sandbox(&target, cold.as_ref(), &mounts, operation)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
             if let Ok(sandbox) = &result {
                 provider.finish_start(&machine, sandbox).await;
             }
@@ -751,103 +956,495 @@ impl AgentEnvProvider {
         }
     }
 
-    // -- volume materialization ---------------------------------------------
+    // -- read-only volumes --------------------------------------------------
 
-    /// Stream every [`MachineSpec::volumes`] entry into the guest.
+    /// Resolve the read-only `volumes` to the `<guest>=<volume>` pairs that
+    /// `aenv start --volume` takes.
     ///
-    /// AgentENV has no host-directory passthrough, so a host mount becomes a
-    /// one-time copy. The copy goes through a single tar stream rather than
-    /// per-file uploads because `aenv upload` refuses symlinks and does not
-    /// preserve modes — both of which the runner bundle and the Node externals
-    /// rely on — and because one transfer beats thousands of gRPC round trips.
-    ///
-    /// A read-only mount is approximated by stripping write bits in the guest.
-    /// That is weaker than virtiofs `:ro` (root inside the guest can restore
-    /// them) and is documented as such: the guest boundary, not the mount flag,
-    /// is what isolates the host here — and unlike SmolVM there is no host
-    /// directory behind it to protect in the first place.
-    async fn materialize_volumes(
+    /// [`validate_spec`] refuses writable mounts at create time. A writable entry
+    /// reaching this point is refused again rather than copied, because a copy
+    /// would silently diverge from the host.
+    async fn read_only_mounts(
         &self,
-        sandbox: &str,
         volumes: &[VolumeMount],
-    ) -> Result<(), VmError> {
+        target: &str,
+        cold: Option<&MachineSpec>,
+    ) -> Result<Vec<String>, VmError> {
+        let mut mounts = Vec::with_capacity(volumes.len());
         for volume in volumes {
-            let archive = tar_directory(&volume.host).await?;
-            let guest_archive =
-                format!("{GUEST_STAGING_DIR}/{}.tar", uuid::Uuid::new_v4().simple());
-            let guest_dir = volume.guest.display().to_string();
-            self.checked(
-                "upload",
+            if !volume.read_only {
+                return Err(VmError::InvalidSpec(format!(
+                    "AgentENV cannot mount the writable host directory {}",
+                    volume.host.display()
+                )));
+            }
+            let name = self
+                .ensure_read_only_volume(&volume.host, target, cold)
+                .await?;
+            mounts.push(format!("{}={name}", volume.guest.display()));
+        }
+        Ok(mounts)
+    }
+
+    /// The read-only volume holding `host`'s tree, created on first use.
+    ///
+    /// The volume name derives from the digest of the archived tree (see
+    /// [`volume`]), so a changed tree resolves to a new volume and an unchanged
+    /// one to the volume already published. A start re-derives the tree's
+    /// fingerprint and re-checks the volume before reusing it, so an in-place
+    /// bundle update and a `prune` that removed the volume are both noticed:
+    /// the tree is archived again and, when the volume is gone, populated again.
+    ///
+    /// The lock is per tree: two starts of the same tree wait for one archive and
+    /// one populate, while starts of different trees proceed in parallel.
+    async fn ensure_read_only_volume(
+        &self,
+        host: &Path,
+        target: &str,
+        cold: Option<&MachineSpec>,
+    ) -> Result<String, VmError> {
+        // An engine that needs a volume is an engine that can collect the ones
+        // nothing needs, on a timer from here on.
+        gc::ensure_scheduled(self);
+        let lock = self.volume_lock(host).await;
+        let _populate = lock.lock().await;
+        let fingerprint = volume::fingerprint_tree(host, &self.bundle_manifest).await?;
+        if let Some(name) = self.published_volume(host, &fingerprint).await? {
+            return Ok(name);
+        }
+        let tree = volume::archive_tree(host, &self.bundle_manifest).await?;
+        let name = volume::volume_name(&tree.digest);
+        if !self.volume_is_ready(&name).await? {
+            let size_mb = volume::volume_size_mb(tree.bytes)?;
+            self.populate_volume(host, &name, &tree, size_mb, target, cold)
+                .await?;
+            info!(
+                volume = %name,
+                bytes = tree.bytes,
+                files = tree.files,
+                host = %host.display(),
+                "populated read-only runner volume"
+            );
+            // Publishing a volume is what supersedes one, so this is where a
+            // pass is worth asking for. It runs in the background.
+            gc::request_pass(self);
+        }
+        self.published_volumes.lock().await.insert(
+            host.to_path_buf(),
+            PublishedVolume {
+                fingerprint,
+                name: name.clone(),
+            },
+        );
+        Ok(name)
+    }
+
+    /// The volume the memo holds for `host`, when it still matches `fingerprint`
+    /// and the server still has the volume.
+    async fn published_volume(
+        &self,
+        host: &Path,
+        fingerprint: &str,
+    ) -> Result<Option<String>, VmError> {
+        let remembered = {
+            let published = self.published_volumes.lock().await;
+            match published.get(host) {
+                Some(entry) if entry.fingerprint == fingerprint => Some(entry.name.clone()),
+                _ => None,
+            }
+        };
+        let Some(name) = remembered else {
+            return Ok(None);
+        };
+        // A remembered name is only reusable while the volume exists: `prune`
+        // can delete an unmounted volume while this engine keeps running.
+        if self.volume_is_ready(&name).await? {
+            Ok(Some(name))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The populate lock for `host`: one per tree, so different trees archive and
+    /// populate concurrently instead of waiting on each other.
+    async fn volume_lock(&self, host: &Path) -> Arc<Mutex<()>> {
+        let mut locks = self.volume_locks.lock().await;
+        Arc::clone(locks.entry(host.to_path_buf()).or_default())
+    }
+
+    /// Record a freshly populated volume in the local index.
+    ///
+    /// Best-effort: the volume is already published and the engine can start
+    /// runners from it, so a failed write is logged and ignored. The index is
+    /// what lets `volumes list` say what a volume holds.
+    async fn remember_volume(&self, host: &Path, tree: &volume::ArchivedTree) {
+        let entry = IndexedVolume {
+            manifest: self.bundle_manifest.clone(),
+            bundle_files: tree.files,
+            bundle_bytes: tree.bytes,
+            host: host.display().to_string(),
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or_default(),
+        };
+        let mut index = self.volume_index.lock().await;
+        index
+            .volumes
+            .insert(volume::volume_name(&tree.digest), entry);
+        self.persist_volume_index(&index);
+    }
+
+    /// Drop volumes `names` from the index, after `prune` deleted them.
+    ///
+    /// Best-effort, like every other index write. Names are content-addressed,
+    /// so a volume re-populated from the same tree records the same entry again.
+    async fn forget_volumes(&self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let mut index = self.volume_index.lock().await;
+        let before = index.volumes.len();
+        index.volumes.retain(|name, _| !names.contains(name));
+        if index.volumes.len() != before {
+            self.persist_volume_index(&index);
+        }
+    }
+
+    /// Persist the volume index, atomically, best-effort.
+    fn persist_volume_index(&self, index: &VolumeIndex) {
+        let Some(path) = &self.volume_index_path else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(parent)?;
+            let temporary = parent.join(format!(
+                ".agentenv-runner-volumes.{}.tmp",
+                std::process::id()
+            ));
+            let bytes = serde_json::to_vec_pretty(index)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            std::fs::write(&temporary, &bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::fs::rename(&temporary, path)
+        };
+        if let Err(error) = write() {
+            warn!(path = %path.display(), %error, "AgentENV volume index write failed");
+        }
+    }
+
+    /// Write `tree` into a new read-only volume named `name`.
+    ///
+    /// Population goes through an exclusive staging volume, so the final name only
+    /// ever refers to a complete tree: a throwaway sandbox writes the archive into
+    /// the staging volume, deleting that sandbox commits the staging volume, and a
+    /// read-only fork of the committed volume takes the final name. Any failure
+    /// deletes the staging volume, and nothing falls back to copying the tree into
+    /// a sandbox.
+    async fn populate_volume(
+        &self,
+        host: &Path,
+        name: &str,
+        tree: &volume::ArchivedTree,
+        size_mb: u64,
+        target: &str,
+        cold: Option<&MachineSpec>,
+    ) -> Result<(), VmError> {
+        let attempt = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let staging = volume::staging_name(&tree.digest, attempt);
+        // Record the staging volume before it exists: a pass that saw the volume
+        // and not the record would treat a populate in flight as a leftover.
+        let _staging = self.volume_gc.begin_staging(&staging, &tree.digest, host);
+        let size = size_mb.to_string();
+        self.checked(
+            "runner_volume",
+            &[
+                "volume".into(),
+                "create".into(),
+                staging.clone(),
+                "--mode".into(),
+                "exclusive".into(),
+                "--size-mb".into(),
+                size.clone(),
+            ],
+        )
+        .await?;
+        if let Err(error) = self.write_staging(&staging, tree, target, cold).await {
+            self.discard_volume(&staging).await;
+            return Err(error);
+        }
+        let frozen = self
+            .checked(
+                "runner_volume",
                 &[
-                    "upload".into(),
-                    sandbox.to_owned(),
-                    archive.path().display().to_string(),
-                    guest_archive.clone(),
+                    "volume".into(),
+                    "create".into(),
+                    name.to_owned(),
+                    "--mode".into(),
+                    "ro".into(),
+                    "--from-volume".into(),
+                    staging.clone(),
+                    "--size-mb".into(),
+                    size,
                 ],
             )
-            .await
-            .map_err(|error| match error {
-                // The staging directory does not exist on a first upload;
-                // `aenv upload` creates parents only for directory transfers.
-                VmError::Command { .. } => error,
-                other => other,
-            })?;
-            // Extraction and cleanup need root: the staging and volume paths are
-            // root-owned. `--no-same-owner` keeps the archive's host uid out of the
-            // guest, and the chown hands the tree to the invoking user (`SUDO_UID`,
-            // or root itself), as the exec user would have owned it.
-            let script = format!(
-                "set -eu; mkdir -p {dir}; tar --no-same-owner -xf {archive} -C {dir}; \
-                 chown -R \"${{SUDO_UID:-0}}:${{SUDO_GID:-0}}\" {dir}; rm -f {archive}{ro}",
-                dir = shell_quote(&guest_dir),
-                archive = shell_quote(&guest_archive),
-                ro = if volume.read_only {
-                    format!(" ; chmod -R a-w {}", shell_quote(&guest_dir))
-                } else {
-                    String::new()
-                },
-            );
-            let output = self.capture(&guest_root_argv(sandbox, &script)).await?;
-            if output.exit_code != 0 {
-                return Err(guest_privilege_error(
-                    self.command_error("materialize_volume", &output),
-                ));
+            .await;
+        match frozen {
+            Ok(_) => {}
+            // Another engine froze this digest first. Its volume holds the same
+            // archive, so it is kept and the staging copy is discarded.
+            Err(VmError::Command { message, .. }) if is_already_exists(&message) => {}
+            Err(error) => {
+                self.discard_volume(&staging).await;
+                return Err(error);
             }
-            debug!(sandbox, guest = %guest_dir, "materialized host volume into guest");
+        }
+        self.discard_volume(&staging).await;
+        // Record the final volume before asking whether it can be mounted: a
+        // volume the server reports as `failed` or `uploading` still carries the
+        // creation time collection needs, or it would look ageless and be kept
+        // forever — and every later start would fail on it, since a volume this
+        // engine remembers is refused unless it is ready.
+        self.remember_volume(host, tree).await;
+        if self.volume_is_ready(name).await? {
+            Ok(())
+        } else {
+            Err(VmError::Command {
+                operation: "runner_volume",
+                exit_code: 1,
+                message: format!("read-only volume {name} is not ready after populate"),
+            })
+        }
+    }
+
+    /// Populate the exclusive `staging` volume with `tree`, then commit it.
+    async fn write_staging(
+        &self,
+        staging: &str,
+        tree: &volume::ArchivedTree,
+        target: &str,
+        cold: Option<&MachineSpec>,
+    ) -> Result<(), VmError> {
+        let mount = format!("{POPULATE_MOUNT}={staging}");
+        let sandbox = self
+            .start_sandbox(target, cold, &[mount], "populate")
+            .await?;
+        let unpacked = match self.await_guest(&sandbox).await {
+            Ok(()) => self.unpack_archive(&sandbox, tree).await,
+            Err(error) => Err(error),
+        };
+        // Deleting the sandbox is what commits its writes to the volume, so it runs
+        // even after a failed unpack, and its own failure fails the populate.
+        let deleted = self
+            .checked("delete", &["delete".into(), sandbox.clone()])
+            .await
+            .map(|_| ());
+        unpacked.and(deleted)
+    }
+
+    /// Upload `tree`'s archive into `sandbox` and unpack it into the populate mount.
+    ///
+    /// The archive is checked against its digest first, so a corrupted upload
+    /// fails here instead of freezing a bad volume. Unpacking runs as root, since
+    /// the mount is root-owned, through the root-or-sudo wrapper.
+    async fn unpack_archive(
+        &self,
+        sandbox: &str,
+        tree: &volume::ArchivedTree,
+    ) -> Result<(), VmError> {
+        let guest_archive = format!(
+            "{GUEST_UPLOAD_DIR}/preloop-volume-{}.tar",
+            uuid::Uuid::new_v4().simple()
+        );
+        self.checked(
+            "upload",
+            &[
+                "upload".into(),
+                sandbox.to_owned(),
+                tree.archive.path().display().to_string(),
+                guest_archive.clone(),
+            ],
+        )
+        .await?;
+        let script = format!(
+            "set -eu; printf '%s  %s\\n' {digest} {archive} | sha256sum -c - >/dev/null; \
+             mkdir -p {mount}; tar --no-same-owner -xf {archive} -C {mount}; sync; \
+             rm -f {archive}",
+            digest = shell_quote(&tree.digest),
+            archive = shell_quote(&guest_archive),
+            mount = shell_quote(POPULATE_MOUNT),
+        );
+        let output = self.capture(&guest_root_argv(sandbox, &script)).await?;
+        if output.exit_code != 0 {
+            return Err(guest_privilege_error(
+                self.command_error("populate_volume", &output),
+            ));
         }
         Ok(())
     }
 
-    /// Create the guest scratch directories the provider uploads into.
+    /// Whether the volume `name` exists and is mountable.
+    ///
+    /// A volume in any other state is an error, not a reason to populate it
+    /// again: its owner may still be writing it.
+    async fn volume_is_ready(&self, name: &str) -> Result<bool, VmError> {
+        let output = self
+            .capture(&["volume".into(), "inspect".into(), name.to_owned()])
+            .await?;
+        if output.exit_code != 0 {
+            return match self.command_error("runner_volume", &output) {
+                VmError::Command { message, .. } if is_absent(&message) => Ok(false),
+                error => Err(error),
+            };
+        }
+        let volume: AgentEnvVolume = serde_json::from_slice(&output.stdout)
+            .map_err(|error| VmError::Protocol(format!("aenv volume inspect: {error}")))?;
+        match volume.status.as_str() {
+            "ready" => Ok(true),
+            "" => Err(VmError::Protocol(format!(
+                "aenv volume inspect {name} reported no status"
+            ))),
+            status => Err(VmError::Command {
+                operation: "runner_volume",
+                exit_code: 1,
+                message: format!(
+                    "read-only volume {name} is `{status}` and cannot be mounted; \
+                     delete it with `aenv volume delete {name}` and start again"
+                ),
+            }),
+        }
+    }
+
+    /// The read-only volume name that `host`'s tree maps to.
+    ///
+    /// Reads the tree but creates nothing, so an operator can name the volumes
+    /// `prune` must keep.
+    pub async fn runner_volume_name(&self, host: &Path) -> Result<String, VmError> {
+        let tree = volume::archive_tree(host, &self.bundle_manifest).await?;
+        Ok(volume::volume_name(&tree.digest))
+    }
+
+    /// Every runner volume AgentENV lists: published volumes and populate
+    /// leftovers alike.
+    pub async fn list_volumes(&self) -> Result<Vec<AgentEnvVolume>, VmError> {
+        let output = self
+            .checked("volume_list", &["volume".into(), "list".into()])
+            .await?;
+        let volumes: Vec<AgentEnvVolume> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| VmError::Protocol(format!("aenv volume list: {error}")))?;
+        Ok(volumes
+            .into_iter()
+            .filter(|volume| volume::is_runner_volume_name(&volume.name))
+            .collect())
+    }
+
+    /// Delete exactly `names` and classify each outcome.
+    ///
+    /// AgentENV refuses a volume a sandbox mounts (`HTTP 409: volume is reserved
+    /// by sandbox …`), which is an outcome rather than a failure, and a volume
+    /// that is already gone counts as deleted. Index entries for what was
+    /// deleted are dropped.
+    ///
+    /// Deleting a set decided by the caller is what an automatic collection pass
+    /// needs: it plans from one listing and then deletes exactly the volumes it
+    /// classified, so a volume another engine publishes in between is never
+    /// deleted unclassified.
+    pub async fn delete_volumes(&self, names: &[String]) -> Result<PruneReport, VmError> {
+        let mut report = PruneReport::default();
+        for name in names {
+            let deletion = self
+                .checked(
+                    "volume_delete",
+                    &["volume".into(), "delete".into(), name.clone()],
+                )
+                .await;
+            match deletion {
+                Ok(_) => report.deleted.push(name.clone()),
+                Err(VmError::Command { message, .. }) if is_absent(&message) => {
+                    report.deleted.push(name.clone());
+                }
+                Err(VmError::Command { message, .. }) if is_mounted(&message) => {
+                    report.in_use.push(name.clone());
+                }
+                Err(error) => report.failed.push((name.clone(), error.to_string())),
+            }
+        }
+        self.forget_volumes(&report.deleted).await;
+        Ok(report)
+    }
+
+    /// Delete every runner volume that is not in `keep` and that no sandbox
+    /// mounts. AgentENV refuses to delete a mounted volume, which is reported as
+    /// in use rather than as a failure. `dry_run` deletes nothing and reports
+    /// candidates instead: the server only reveals a reservation when a delete
+    /// is attempted, so a dry run does not claim those volumes would be deleted.
+    ///
+    /// Safe while an engine is running: a provider revalidates a remembered
+    /// volume before reusing it and repopulates a volume that is gone. It is not
+    /// safe while a volume is being populated — a volume deleted between its
+    /// populate's create and its first mount fails that populate.
+    pub async fn prune_volumes(
+        &self,
+        keep: &[String],
+        dry_run: bool,
+    ) -> Result<PruneReport, VmError> {
+        let mut report = PruneReport::default();
+        let mut doomed = Vec::new();
+        for volume in self.list_volumes().await? {
+            if keep.contains(&volume.name) {
+                report.kept.push(volume.name);
+            } else if dry_run {
+                report.candidates.push(volume.name);
+            } else {
+                doomed.push(volume.name);
+            }
+        }
+        if dry_run {
+            return Ok(report);
+        }
+        let deleted = self.delete_volumes(&doomed).await?;
+        report.deleted = deleted.deleted;
+        report.in_use = deleted.in_use;
+        report.failed = deleted.failed;
+        Ok(report)
+    }
+
+    /// Delete a volume this provider created and no longer needs.
+    ///
+    /// Best-effort: the populate has already succeeded or failed, and a leftover
+    /// staging volume is reclaimed by `preloop runner-volumes prune`.
+    async fn discard_volume(&self, name: &str) {
+        if let Err(error) = self
+            .checked(
+                "runner_volume",
+                &["volume".into(), "delete".into(), name.to_owned()],
+            )
+            .await
+        {
+            warn!(
+                volume = name,
+                %error,
+                "could not delete a runner volume; `preloop runner-volumes prune` will reclaim it"
+            );
+        }
+    }
+
+    /// Create the guest directory that secret env files are uploaded into.
     ///
     /// `/run` is root-owned, so this runs through the root-or-sudo wrapper.
     async fn prepare_guest_dirs(&self, sandbox: &str) -> Result<(), VmError> {
-        let script = format!(
-            "mkdir -p {GUEST_STAGING_DIR} {GUEST_SECRET_DIR} && chmod 700 {GUEST_SECRET_DIR}"
-        );
+        let script = format!("mkdir -p {GUEST_SECRET_DIR} && chmod 700 {GUEST_SECRET_DIR}");
         self.checked("prepare_guest_dirs", &guest_root_argv(sandbox, &script))
             .await
             .map_err(guest_privilege_error)
             .map(|_| ())
-    }
-
-    /// Materialize volume mounts unless a previous start already did.
-    async fn ensure_volumes(
-        &self,
-        name: &MachineName,
-        record: &MachineRecord,
-        sandbox: &str,
-    ) -> Result<(), VmError> {
-        if record.spec.volumes.is_empty() || record.volumes_materialized {
-            return Ok(());
-        }
-        self.materialize_volumes(sandbox, &record.spec.volumes)
-            .await?;
-        self.update(name, |record| {
-            record.volumes_materialized = true;
-        })
-        .await?;
-        Ok(())
     }
 }
 
@@ -891,39 +1488,6 @@ fn guest_privilege_error(error: VmError) -> VmError {
         },
         other => other,
     }
-}
-
-/// Tar `directory` into a temporary host file, preserving modes and symlinks.
-///
-/// Runs on the blocking pool: `tar::Builder` is synchronous and a runner bundle
-/// is large enough that walking it on a reactor thread would stall other slots.
-async fn tar_directory(directory: &Path) -> Result<tempfile::NamedTempFile, VmError> {
-    let directory = directory.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let file = tempfile::Builder::new()
-            .prefix("preloop-volume-")
-            .suffix(".tar")
-            .tempfile()
-            .map_err(|source| VmError::RuntimeIo { source })?;
-        let mut builder = tar::Builder::new(
-            file.reopen()
-                .map_err(|source| VmError::RuntimeIo { source })?,
-        );
-        builder.follow_symlinks(false);
-        builder
-            .append_dir_all(".", &directory)
-            .map_err(|source| VmError::RuntimeIo { source })?;
-        builder
-            .into_inner()
-            .and_then(|mut file| {
-                use std::io::Write as _;
-                file.flush()
-            })
-            .map_err(|source| VmError::RuntimeIo { source })?;
-        Ok(file)
-    })
-    .await
-    .map_err(|error| VmError::Protocol(format!("volume archive task failed: {error}")))?
 }
 
 /// The pack descriptor at `path`, when the path holds one.
@@ -973,15 +1537,37 @@ fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
                 .into(),
         ));
     }
-    for mount in &spec.volumes {
+    for (index, mount) in spec.volumes.iter().enumerate() {
         if !mount.host.is_absolute() || !mount.guest.is_absolute() {
             return Err(VmError::InvalidSpec("volume paths must be absolute".into()));
+        }
+        if mount.guest.as_os_str() == "/" {
+            return Err(VmError::InvalidSpec(
+                "AgentENV cannot mount a volume over the guest root".into(),
+            ));
+        }
+        if !mount.read_only {
+            return Err(VmError::InvalidSpec(format!(
+                "AgentENV cannot share the writable host directory {} with a guest: a volume \
+                 is a block device that cannot follow host writes, so only read-only trees \
+                 are supported",
+                mount.host.display()
+            )));
         }
         if !mount.host.is_dir() {
             return Err(VmError::InvalidSpec(format!(
                 "volume source is not a directory: {}",
                 mount.host.display()
             )));
+        }
+        for other in &spec.volumes[..index] {
+            if mount.guest.starts_with(&other.guest) || other.guest.starts_with(&mount.guest) {
+                return Err(VmError::InvalidSpec(format!(
+                    "volume mounts overlap: {} and {}",
+                    other.guest.display(),
+                    mount.guest.display()
+                )));
+            }
         }
     }
     if matches!(
@@ -1017,9 +1603,22 @@ impl VmProvider for AgentEnvProvider {
             live_host_volumes: false,
             socket_mounts: false,
             file_packs: false,
+            fork_bases_may_mount_read_only_volumes: false,
+            runner_bundle_carries_externals: true,
             fork_inherits_guest_writes: true,
             preserves_runtime_state_on_suspend: true,
         }
+    }
+
+    /// Start the periodic collection pass with the engine, not with the first
+    /// volume it needs.
+    ///
+    /// Collection is otherwise armed where a volume is resolved (a cold start or
+    /// a bundle change), so an engine whose runners are all resumed — or which
+    /// sits idle with nothing queued — would never run a periodic pass and the
+    /// volumes nothing needs would stay on the server indefinitely.
+    fn start_maintenance(&self) {
+        gc::ensure_scheduled(self);
     }
 
     /// Record the machine. AgentENV has no unstarted sandbox to create.
@@ -1046,7 +1645,6 @@ impl VmProvider for AgentEnvProvider {
                 sandbox: None,
                 fork_snapshot: None,
                 golden: None,
-                volumes_materialized: false,
             },
         );
         self.persist(&registry);
@@ -1061,7 +1659,6 @@ impl VmProvider for AgentEnvProvider {
             let states = self.live_sandboxes().await?;
             match states.get(sandbox).map(String::as_str) {
                 Some("running") => {
-                    self.ensure_volumes(name, &record, sandbox).await?;
                     self.spawn_keepalive(name, sandbox).await;
                     return Ok(());
                 }
@@ -1077,7 +1674,6 @@ impl VmProvider for AgentEnvProvider {
                     )
                     .await?;
                     self.await_guest(sandbox).await?;
-                    self.ensure_volumes(name, &record, sandbox).await?;
                     self.spawn_keepalive(name, sandbox).await;
                     return Ok(());
                 }
@@ -1093,18 +1689,24 @@ impl VmProvider for AgentEnvProvider {
         }
         let sandbox = match start_target(&record.spec.image) {
             StartTarget::Artifact(artifact) => {
-                self.start_sandbox_supervised(name, &artifact, None, "start")
+                self.start_sandbox_supervised(name, &artifact, None, &record.spec.volumes, "start")
                     .await?
             }
             StartTarget::Image(image) => {
-                self.start_sandbox_supervised(name, &image, Some(&record.spec), "start")
-                    .await?
+                self.start_sandbox_supervised(
+                    name,
+                    &image,
+                    Some(&record.spec),
+                    &record.spec.volumes,
+                    "start",
+                )
+                .await?
             }
         };
-        // Record the id before anything else can fail: readiness, dir prep,
-        // and volume setup below all run against a live sandbox, and the
-        // orchestrator's provisioning-error cleanup (`delete`) can only tear
-        // down a sandbox it knows about. An unrecorded id leaks the VM.
+        // Record the id before anything else can fail: readiness and dir prep
+        // below all run against a live sandbox, and the orchestrator's
+        // provisioning-error cleanup (`delete`) can only tear down a sandbox it
+        // knows about. An unrecorded id leaks the VM.
         let sandbox_for_record = sandbox.clone();
         self.update(name, move |record| {
             record.sandbox = Some(sandbox_for_record);
@@ -1112,7 +1714,6 @@ impl VmProvider for AgentEnvProvider {
         .await?;
         self.await_guest(&sandbox).await?;
         self.prepare_guest_dirs(&sandbox).await?;
-        self.ensure_volumes(name, &record, &sandbox).await?;
         self.spawn_keepalive(name, &sandbox).await;
         Ok(())
     }
@@ -1134,6 +1735,16 @@ impl VmProvider for AgentEnvProvider {
     /// re-forkable, so concurrent forks are safe — the per-golden lock exists
     /// only to keep two first-forks from building two snapshots.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+        self.fork_with_volumes(golden, clone, &[]).await
+    }
+
+    /// Fork a clone, attaching the caller's read-only volumes at clone start.
+    async fn fork_with_volumes(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        volumes: &[VolumeMount],
+    ) -> Result<(), VmError> {
         let golden_record = self.record(golden).await?;
         let golden_sandbox = golden_record
             .sandbox
@@ -1201,19 +1812,18 @@ impl VmProvider for AgentEnvProvider {
                         name: clone.clone(),
                         // Clones boot from the snapshot, never the image.
                         image: format!("agentenv-snapshot:{snapshot}"),
+                        volumes: volumes.to_vec(),
                         ..golden_record.spec.clone()
                     },
                     sandbox: None,
                     fork_snapshot: None,
                     golden: Some(golden.as_str().to_owned()),
-                    // Inherited from the golden's filesystem via the snapshot.
-                    volumes_materialized: true,
                 },
             );
             self.persist(&registry);
         }
         let sandbox = match self
-            .start_sandbox_supervised(clone, &snapshot, None, "fork")
+            .start_sandbox_supervised(clone, &snapshot, None, volumes, "fork")
             .await
         {
             Ok(sandbox) => sandbox,
@@ -1343,7 +1953,6 @@ impl VmProvider for AgentEnvProvider {
                 let _ = self
                     .update(name, |record| {
                         record.sandbox = None;
-                        record.volumes_materialized = false;
                     })
                     .await;
                 MachineState::Stopped
@@ -1656,6 +2265,20 @@ fn is_absent(message: &str) -> bool {
     message.contains("not found") || message.contains("404")
 }
 
+/// Whether an `aenv volume create` failure means the name is already taken.
+fn is_already_exists(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("already exists") || message.contains("409")
+}
+
+/// Whether an `aenv volume delete` failure is the server refusing a volume that a
+/// sandbox still holds. AgentENV answers `HTTP 409: volume is reserved by sandbox
+/// <id>` for an exclusive or read-only volume that a sandbox mounts.
+fn is_mounted(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("reserved by sandbox") || message.contains("mounted")
+}
+
 /// Whether an `aenv start --cold` failure is only the disk-shrink refusal.
 ///
 /// AgentENV materializes the guest root from an overlaybd base and refuses to
@@ -1695,6 +2318,23 @@ mod tests {
         assert_eq!(split_machine_path("/host/weird:name"), None);
         assert_eq!(split_machine_path("runner-1:relative"), None);
         assert_eq!(split_machine_path("plain-name"), None);
+    }
+
+    /// The refusals and absences `aenv volume` reports, copied from an AgentENV
+    /// 0.2.1 server.
+    #[test]
+    fn volume_errors_are_classified_by_what_the_server_said() {
+        assert!(is_already_exists(
+            "Error: HTTP 409: volume name already exists: preloop-runner-0123456789ab"
+        ));
+        assert!(!is_already_exists("Error: HTTP 404: volume not found: x"));
+        assert!(is_absent(
+            "Error: HTTP 404: volume not found: preloop-runner-0123456789ab"
+        ));
+        assert!(is_mounted(
+            "Error: HTTP 409: volume is reserved by sandbox 01a1419e-058a-7733-baea-3e37a236fe4d"
+        ));
+        assert!(!is_mounted("Error: HTTP 404: volume not found: x"));
     }
 
     #[test]

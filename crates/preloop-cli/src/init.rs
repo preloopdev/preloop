@@ -1968,20 +1968,8 @@ impl Session {
                 if !self.json {
                     println!("starting the engine in the foreground (Ctrl-C to stop)");
                 }
-                // Brand-new installs: initialize the control database so the
-                // first foreground serve works with no extra step. An
-                // existing database is never upgraded here — `preloop store
-                // migrate` is the explicit path.
-                let state_dir = crate::preloop_home().join("state");
-                std::fs::create_dir_all(&state_dir)?;
-                if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)?
-                    && !self.json
-                {
-                    println!(
-                        "initialized the control database at {}",
-                        state_dir.join("preloop.db").display()
-                    );
-                }
+                // First-run preparation (state dir, brand-new control
+                // database) lives in `cmd_engine`.
                 crate::cmd_engine(serve_args_for(public_url), observability).await
             }
             RunMode::Service => {
@@ -2347,7 +2335,7 @@ fn configure_only_hint(config_path: &Path, public_url: Option<&str>) -> Vec<Stri
 /// Why the stable-URL question is asked, and how to get one, in the wizard's
 /// own words. Whatever fronts the engine must publish *only*
 /// `/api/v1/github/webhooks`: the port also serves runner registration, which
-/// no tunnel should expose (docs/self-hosting.md, "Exposure options"). The
+/// no tunnel should expose (docs/control-plane/operate/deploy.mdx, "Exposure options"). The
 /// Funnel wording must not promise that mounting one path keeps the rest
 /// private — Funnel access applies to the whole host and port, so an earlier
 /// root mount would become public with it (tailscale/tailscale#10234).
@@ -2361,7 +2349,7 @@ const PUBLIC_URL_HELP: [&str; 10] = [
     "(use your PRELOOP_LISTEN port in place of 9090; verify with `tailscale funnel status`)",
     "Alternatives: a Cloudflare *named* Tunnel (quick tunnels change on restart and break the",
     "App's webhook) behind a path-filtering proxy, or your own domain + reverse proxy — see",
-    "docs/self-hosting.md, \"Exposure options\".",
+    "docs/control-plane/operate/deploy.mdx, \"Exposure options\".",
 ];
 
 /// A stable HTTPS address detected on this host, and what Tailscale Funnel
@@ -4255,7 +4243,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("docs/self-hosting.md"), "{text}");
+        assert!(text.contains("docs/control-plane/operate/deploy.mdx"), "{text}");
         assert!(text.contains("builder.tail1234.ts.net"), "{text}");
         assert!(text.to_lowercase().contains("cloudflare"), "{text}");
         // F7: the path mount does not keep the other mounts private.

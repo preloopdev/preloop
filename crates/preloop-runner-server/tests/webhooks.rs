@@ -3633,6 +3633,149 @@ async fn results_uuid_spellings_use_canonical_paths_and_metadata_keys() {
     );
 }
 
+/// A runner addresses its own job on the action path with
+/// `system.orchestrationId` as the plan segment (`{planId}.{base}.__default`).
+/// Authorization accepts that spelling, but Results storage stays under the
+/// token's own plan: a replay path or metadata key built from the
+/// orchestration spelling would name a namespace no reader resolves, so the
+/// logs would be written somewhere nothing reads them back from.
+#[tokio::test]
+async fn results_storage_uses_the_tokens_own_plan_not_the_orchestration_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan = uuid::Uuid::new_v4().to_string();
+    let job = uuid::Uuid::new_v4();
+    let canonical = job.to_string();
+    let orchestration = format!("{plan}.build.__default");
+    let token = state.mint_runtime_token(&plan, &job);
+    // Results writes require a live job record.
+    register_live_job(&state, job, &plan).await;
+
+    for (uri, field) in [
+        (
+            "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+            "logs_url",
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+            "logs_url",
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+            "summary_url",
+        ),
+    ] {
+        let payload = request_json_with_bearer(
+            &app,
+            Method::POST,
+            uri,
+            json!({
+                "workflow_run_backend_id": orchestration,
+                "workflow_job_run_backend_id": canonical,
+                "step_backend_id": "step-1",
+            }),
+            &token,
+        )
+        .await;
+        let url = payload[field].as_str().unwrap();
+        assert!(
+            url.contains(&format!("/replay/results/{plan}/{canonical}/")),
+            "the minted path must stay under the token's own plan: {url}"
+        );
+        assert!(
+            !url.contains("__default"),
+            "the orchestration spelling is not a storage namespace: {url}"
+        );
+    }
+
+    // A job-log upload through the minted URL lands where the reader looks.
+    let job_logs = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+        json!({
+            "workflow_run_backend_id": orchestration,
+            "workflow_job_run_backend_id": canonical,
+        }),
+        &token,
+    )
+    .await;
+    let uploaded = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(job_logs["logs_url"].as_str().unwrap())
+                .body(Body::from("merged job log"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    assert_eq!(
+        tokio::fs::read_to_string(
+            temp.path()
+                .join("replay")
+                .join("results")
+                .join(&plan)
+                .join(&canonical)
+                .join("job-logs.txt"),
+        )
+        .await
+        .unwrap(),
+        "merged job log"
+    );
+
+    for (uri, body) in [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "workflow_run_backend_id": orchestration,
+                "workflow_job_run_backend_id": canonical,
+                "step_backend_id": "step-1",
+                "size": 17,
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "workflow_run_backend_id": orchestration,
+                "workflow_job_run_backend_id": canonical,
+                "step_backend_id": "step-1",
+                "line_count": 3,
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_run_backend_id": orchestration,
+                "workflow_job_run_backend_id": canonical,
+                "line_count": 5,
+            }),
+        ),
+    ] {
+        request_json_with_bearer(&app, Method::POST, uri, body, &token).await;
+    }
+    let inner = state.inner.lock().await;
+    let keys = inner
+        .log_metadata
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<String>>();
+    let expected = [
+        format!("results:{plan}:{canonical}:summary:step-1"),
+        format!("results:{plan}:{canonical}:step:step-1"),
+        format!("results:{plan}:{canonical}:job:{canonical}"),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<String>>();
+    assert_eq!(
+        keys, expected,
+        "metadata must stay in the token's plan namespace, never the orchestration spelling"
+    );
+}
+
 #[tokio::test]
 async fn alternate_results_job_spelling_preserves_canonical_log_lookup() {
     let temp = tempfile::tempdir().unwrap();
