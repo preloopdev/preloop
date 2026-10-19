@@ -6052,8 +6052,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     break;
                 }
                 let queued = pending.map_or(0, |p| p.load(Ordering::Acquire));
-                // Runners already registered or booting cover queued jobs; forking past
-                // that only leaves idle runners that never get work.
+                // Runners already registered or booting cover queued jobs;
+                // forking past that only leaves idle runners that never get
+                // work. `building` includes the reservations this loop takes
+                // below, so a queued job counts the fork it is already paying
+                // for.
                 let committed = idle.lock().map_or(0, |n| *n) + building.lock().map_or(0, |n| *n);
                 if queued > committed {
                     break;
@@ -6097,6 +6100,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let permit_slot = Arc::new(std::sync::Mutex::new(Some(permit)));
             let slot_semaphore = semaphore.clone();
             let slot_budget = golden_budget.clone();
+            // Reserve the runner before the task exists: the gate above reads
+            // `building`, which only moves once the spawned task is polled.
+            // Without the reservation this loop forks one runner per free
+            // permit for a single queued job.
+            let reservation =
+                BuildReservation::reserve(building.clone(), self.config.pool_status.clone());
 
             slots.spawn(async move {
                 let result = run_on_demand_slot(
@@ -6107,6 +6116,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_registry,
                     slot_budget,
                     slot_handles,
+                    reservation,
                     slot_semaphore,
                     permit_slot,
                 )
@@ -6672,6 +6682,48 @@ impl Drop for BuildingGuard {
     }
 }
 
+/// Counts one runner the on-demand scheduler has decided to fork.
+///
+/// The scheduling loop reserves the slot synchronously, before the slot task
+/// exists. The spawned task's own gauges (`building` while it provisions,
+/// `idle` once the runner registers) only move after it is polled, so a loop
+/// that waited for them forked one runner per free concurrency permit for a
+/// single queued job — a live cluster forked 13 runners for one queued job.
+/// The reservation carries the count until the runner registers — where
+/// [`IdleGuard`] takes over — or until the slot exits without one.
+struct BuildReservation {
+    active: Arc<std::sync::Mutex<usize>>,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+}
+
+impl BuildReservation {
+    fn reserve(
+        active: Arc<std::sync::Mutex<usize>>,
+        pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    ) -> Self {
+        let mut count = active.lock().unwrap();
+        *count += 1;
+        if let Some(ps) = &pool_status {
+            ps.set_building(*count as u32);
+        }
+        drop(count);
+        Self {
+            active,
+            pool_status,
+        }
+    }
+}
+
+impl Drop for BuildReservation {
+    fn drop(&mut self) {
+        let mut count = self.active.lock().unwrap();
+        *count = count.saturating_sub(1);
+        if let Some(ps) = &self.pool_status {
+            ps.set_building(*count as u32);
+        }
+    }
+}
+
 /// Counts one registered-but-unclaimed runner in the pool-wide `idle` gauge.
 ///
 /// The runner is idle from the moment its registration succeeds (or it is
@@ -7159,6 +7211,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     golden_cache: Arc<GoldenCache>,
     golden_budget: GoldenBudget,
     handles: PoolHandles,
+    reservation: BuildReservation,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
@@ -7170,7 +7223,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     let PoolHandles {
         idle,
         keys,
-        building,
+        building: _,
         provisioning,
     } = handles;
     let preparing = PreparingGuard::enter(
@@ -7199,31 +7252,31 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     let fork = golden
         .as_ref()
         .and_then(|golden| golden_cache.fork_started(golden));
-    // Provision a single-use runner. The build guard reports the fork/boot in
-    // flight exactly as a warm slot does, so `preloop status` sees on-demand
-    // boots as builds rather than as a pool that is idle while it forks.
+    // Provision a single-use runner. The scheduler already reserved this
+    // boot's slot in `building`, so the reservation — not a `BuildingGuard` —
+    // reports the fork/boot in flight, exactly as a warm slot's guard does for
+    // `preloop status`; it is handed to `run_one_runner`, which releases it
+    // when the idle gauge takes over the registered runner.
     let generation = 1_u64;
     // Booting can run for minutes (image pull, guest installs, fork
     // retries); the shutdown token aborts the provision instead of holding the
     // pool's teardown behind it. Whatever the dropped future created carries
     // this pool's name prefix and is deleted by the teardown.
-    let Some(provisioned) = ({
-        let _building = BuildingGuard::enter(building, config.pool_status.clone());
-        unless_shutdown(
+    let Some(provisioned) = unless_shutdown(
+        &shutdown,
+        provision_slot(
+            &provider,
+            &config,
+            slot,
+            generation,
+            golden.as_ref(),
+            &keys,
+            environment.clone(),
             &shutdown,
-            provision_slot(
-                &provider,
-                &config,
-                slot,
-                generation,
-                golden.as_ref(),
-                &keys,
-                environment.clone(),
-                &shutdown,
-            ),
-        )
-        .await
-    }) else {
+        ),
+    )
+    .await
+    else {
         return Ok(());
     };
     let Some(runner) = provisioned? else {
@@ -7260,6 +7313,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         idle.clone(),
         fork.as_ref()
             .map_or_else(CancellationToken::new, GoldenFork::superseded),
+        Some(reservation),
     )
     .await;
     if let Some(watch) = pause_watch {
@@ -7424,6 +7478,7 @@ async fn run_slot<P: VmProvider + 'static>(
             idle.clone(),
             fork.as_ref()
                 .map_or_else(CancellationToken::new, GoldenFork::superseded),
+            None,
         )
         .await;
         if let Err(error) = &job {
@@ -7693,6 +7748,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     idle: Arc<std::sync::Mutex<usize>>,
     superseded: CancellationToken,
+    reservation: Option<BuildReservation>,
 ) -> Result<(), OrchestratorError> {
     let ReadyRunner {
         name,
@@ -7713,6 +7769,10 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // function; the guard publishes it in the pool-wide idle gauge until a job
     // claims it or it is torn down.
     let mut idle = IdleGuard::register(idle, config.pool_status.clone());
+    // The scheduler's reservation counted this runner while it was booting;
+    // the idle gauge counts it from here, so the boot reservation ends now —
+    // not when the job it eventually runs ends.
+    drop(reservation);
     let run_task = tokio::spawn(async move {
         let result = run_until_exit(&run_provider, &run_name, &run, busy_tx, GUEST_LIVENESS).await;
         let _ = done_tx.send(result);
@@ -14517,6 +14577,7 @@ fi"#,
             CancellationToken::new(),
             idle,
             CancellationToken::new(),
+            None,
         )
         .await
         .expect_err("runner failure must propagate");
@@ -14549,6 +14610,10 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             handles,
+            BuildReservation::reserve(
+                Arc::new(std::sync::Mutex::new(0)),
+                config.pool_status.clone(),
+            ),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
         )
@@ -14945,6 +15010,8 @@ fi"#,
         ));
         config.pool_status = Some(pool_status.clone());
         let handles = pool_handles();
+        let reservation =
+            BuildReservation::reserve(handles.building.clone(), config.pool_status.clone());
         let slot = tokio::spawn(run_on_demand_slot(
             provider.clone(),
             config.clone(),
@@ -14953,12 +15020,13 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             handles,
+            reservation,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
         ));
 
         let booting = wait_for_pool_status("the on-demand boot", &pool_status, |snapshot| {
-            snapshot.building == 1
+            snapshot.building == 1 && snapshot.provisioning == 1
         })
         .await;
         assert_eq!(
@@ -14978,6 +15046,96 @@ fi"#,
             (ended.idle, ended.building, ended.provisioning),
             (0, 0, 0),
             "every counter must return to zero after the slot stops"
+        );
+    }
+
+    /// One queued job forks one runner, even with the whole concurrency budget
+    /// free.
+    ///
+    /// The scheduling loop counts the slot before it spawns the task. The
+    /// task's own gauges (`building` while it provisions, `idle` once the
+    /// runner registers, neither while the job runs) only move once it is
+    /// polled, so a loop that waited for them saw `queued > committed` on every
+    /// pass and forked one runner per free permit for the same job — a live
+    /// cluster forked 13 runners for one queued job, and the leftovers could
+    /// still claim a job meant for the new golden after a switch.
+    #[tokio::test]
+    async fn on_demand_loop_forks_one_runner_per_queued_job() {
+        let configure_gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_configure_gate(configure_gate.clone()),
+        );
+        let mut config = test_config(false);
+        config.size = 0;
+        config.pending_jobs = Some(Arc::new(std::sync::atomic::AtomicUsize::new(1)));
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        // SAFETY: test-only env for config validation; the pool never talks to
+        // a real server. Removed again so parallel tests do not see a token
+        // they did not set.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let shutdown = CancellationToken::new();
+        let pool =
+            Arc::new(RunnerPool::new(provider.clone(), config.clone()).expect("pool builds"));
+        unsafe { std::env::remove_var("LIFECYCLE_TEST_TOKEN") };
+        let handles = pool_handles();
+        let task_pool = Arc::clone(&pool);
+        let task_shutdown = shutdown.clone();
+        let loop_task = tokio::spawn(async move {
+            task_pool
+                .run_on_demand(
+                    task_shutdown,
+                    Arc::new(GoldenCache::new(config.name_prefix.clone())),
+                    handles.idle,
+                    handles.keys,
+                    handles.building,
+                )
+                .await
+        });
+
+        // The fork is in flight and gated at configure: one queued job means
+        // one runner booting and nothing else forked.
+        let booting = wait_for_pool_status("the single on-demand boot", &pool_status, |snapshot| {
+            snapshot.building == 1 && snapshot.provisioning == 1
+        })
+        .await;
+        assert_eq!(
+            (booting.idle, booting.provisioning),
+            (0, 1),
+            "the boot is provisioning with nothing registered"
+        );
+        // Give the scheduling loop every chance to fork another runner for the
+        // same queued job before the first one registers.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let creates = provider
+            .events()
+            .await
+            .iter()
+            .filter(|event| event.starts_with("create:"))
+            .count();
+        assert_eq!(
+            (creates, pool_status.snapshot().building),
+            (1, 1),
+            "one queued job forks exactly one runner: {:?}",
+            provider.events().await
+        );
+
+        // Shutdown releases the reservation with the aborted provision, so no
+        // counter is left behind for the queued job the loop never forked.
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), loop_task)
+            .await
+            .expect("the loop stops on shutdown")
+            .expect("the loop task joins")
+            .expect("the loop exits cleanly");
+        let ended = pool_status.snapshot();
+        assert_eq!(
+            (ended.idle, ended.building, ended.provisioning),
+            (0, 0, 0),
+            "every counter returns to zero after shutdown"
         );
     }
 
