@@ -1,0 +1,60 @@
+---
+title: Comparison
+description: Compare Preloop with GitHub-hosted runners, official self-hosted runners, act, agent-ci, and forge-based alternatives.
+---
+
+These options solve different parts of the GitHub Actions problem. The table below separates who runs the control plane, which runner is used, and what this repository can verify instead of treating every option as an equivalent product.
+
+## At a glance
+
+| Option | Control plane | Runner and execution | GitHub relationship |
+|---|---|---|---|
+| GitHub-hosted runners | GitHub operates the scheduler and service endpoints | GitHub operates the runner host | Native GitHub Actions behavior; no Preloop service to operate |
+| `actions/runner` self-hosted | GitHub remains the control plane | You operate the host and run the official runner binary | The official runner connects directly to GitHub |
+| Preloop | You operate the self-hosted control plane and scheduler | Bundled Rust runner in SmolVM guests by default; the official runner can also connect in supported external-runner setups | GitHub App/webhook/check-run integration plus a GitHub-compatible runner protocol |
+| `act` | Local process; no Preloop control plane | Local runner implementation, with results in the checked-in benchmark snapshot | This repository does not verify act's protocol or feature semantics |
+| `agent-ci` | Local process; no Preloop control plane | Local runner implementation, with results in the checked-in benchmark snapshot | This repository does not verify agent-ci's protocol or feature semantics |
+| Gitea/Forgejo Actions | Not assessed in this repository | Not assessed in this repository | A separate alternative; GitHub-protocol behavior is not verified here |
+
+Preloop's distinctive boundary is the server–runner contract. It replaces the control plane and ships a compatible runner, while also accepting the official runner where an external runner is appropriate. See [Compatibility](/compatibility) for the protocol and workflow boundaries.
+
+## Capability comparison
+
+The following rows use behavior implemented in this repository. “Not assessed” means this repository does not contain evidence for the alternative, not that the alternative lacks the capability.
+
+| Capability | Preloop | GitHub-hosted / official self-hosted | `act` and `agent-ci` | Gitea/Forgejo |
+|---|---|---|---|---|
+| GitHub runner protocol | Targeted at `actions/runner` v2.336.0; registration, sessions, broker lifecycle, results, cache, artifacts, and OIDC surfaces are implemented | The official runner is the reference client; GitHub supplies the service side | Not assessed in this repository | Not assessed as a GitHub-protocol implementation |
+| Workflow model | YAML parsing, expressions, matrices, `needs`, reusable workflows, permissions, contexts, file/workflow commands, and action handlers | GitHub's reference behavior | Not assessed in this repository; only benchmark outcomes are recorded | Not assessed in this repository |
+| Job isolation | Jobs run in a microVM forked from a resident golden; SmolVM/libkrun is the default backend and AgentENV is opt-in on Linux/KVM, documented in [MicroVM pool](/control-plane/architecture/sandboxes) | Host and isolation choices belong to GitHub or the self-hosted operator | Not assessed in this repository | Not assessed in this repository |
+| GitHub App and checks | Webhooks, scoped job credentials, Check Runs, workflow/repository dispatch, and workflow/run polling | Native GitHub service integration | Not assessed in this repository | GitHub integration is not established by this repository |
+| OIDC | A local GitHub-compatible OIDC provider with RS256 tokens, discovery, and JWKS | Native GitHub OIDC service | Not assessed in this repository | Not assessed in this repository |
+| Concurrency groups | Queue modes, `cancel-in-progress`, scoped expressions, FIFO promotion, and property coverage | Native GitHub behavior | Not assessed in this repository | Not assessed in this repository |
+| Interactive debugging | DAP bridge with pause, breakpoints, stepping, variables, and retry flows | No Preloop DAP surface | Not assessed in this repository | Not assessed in this repository |
+| Native macOS/Windows pool | Built-in pool supplies Linux guests; matching non-Linux jobs need an external runner | Host platform depends on the selected GitHub runner | Not assessed in this repository | Not assessed in this repository |
+
+## Checked-in benchmark snapshot
+
+The repository includes one 39-entry result file for each local runner. The table reports the raw `passed` field; it is not a service-level guarantee and the files do not include complete host/setup provenance.
+
+| Tool | Recorded entries | `passed: true` | `passed: false` |
+|---|---:|---:|---:|
+| `act` | 39 | 24 | 15 |
+| `agent-ci` | 39 | 24 | 15 |
+| Preloop | 39 | 27 | 12 |
+
+The Preloop result file contains two records with `passed: true` and a non-zero exit code. Treat the `passed` field as the harness's recorded result rather than recomputing a correctness score from process exit codes. The benchmark artifacts are useful for reproducing scenario differences; they are not a promise that every workflow completes identically on every host.
+
+The benchmark also shows why a single “fastest runner” number is misleading: cancellation, service containers, caches, and Docker actions have very different setup and execution costs. Use the per-scenario `duration_ms` fields in the checked-in result files when you need a workload-specific comparison.
+
+## Which boundary fits
+
+| If you need to… | The relevant option is… | Why |
+|---|---|---|
+| Keep the GitHub-managed service with no control-plane operations | GitHub-hosted runners | GitHub operates both the service and runner capacity |
+| Run the official runner on hardware you manage | `actions/runner` self-hosted | The official runner remains the client; you manage its host and lifecycle |
+| Run a self-hosted control plane with isolated Linux jobs and GitHub checks | Preloop | The control plane, bundled runner, microVM pool, App integration, and runner-facing protocol are in one product |
+| Compare local-runner outcomes against the checked-in scenarios | `act` or `agent-ci` | Their 39-entry result files provide a repeatable benchmark reference in this repository |
+| Host Actions-like workflows inside another forge | Gitea/Forgejo Actions | Choose this when Gitea/Forgejo is the forge you operate; its implementation is outside this repository |
+
+Use [Compatibility](/compatibility) for the current limitations before selecting a workflow or host strategy. For installation and runner-specific operations, see [Runner overview](/runner/overview) and [Control plane deployment](/control-plane/operate/deploy).

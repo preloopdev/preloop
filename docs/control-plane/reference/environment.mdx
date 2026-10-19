@@ -1,0 +1,207 @@
+---
+title: Environment variables
+description: Environment variables read by the Preloop control plane and CLI.
+---
+
+Set these variables before starting `preloop serve` or invoking a CLI command. A command-line flag wins over its environment variable. Where a variable mirrors a `config.toml` key, the variable wins over the file; an empty value is usually treated as unset. Invalid values either use the documented fallback or stop startup, as noted below.
+
+Runner-only variables such as `PRELOOP_BRIDGE_*` and `PRELOOP_DISABLE_ACTIONS_PROBES` belong to the [Runner configuration](/runner/configuration).
+
+## Home, connection, and credentials
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PRELOOP_HOME` | `$HOME/.preloop` (or `.preloop` when `HOME` is unavailable) | Persistent state, credentials, sockets, and VM data directory. |
+| `PRELOOP_CONFIG` | `$PRELOOP_HOME/config.toml` when launched through the CLI; otherwise `$HOME/.preloop/config.toml` | TOML configuration path. |
+| `PRELOOP_URL` | `http://127.0.0.1:9090` | Engine URL used by CLI requests. A command that needs an engine probes it and exits non-zero when nothing answers; no command starts an engine on its own (only `preloop serve` and `preloop init --mode foreground` do). |
+| `PRELOOP_SERVER` | `http://127.0.0.1:8080` | Default server URL for `preloop-runner-client`. |
+| `PRELOOP_CLIENT_TIMEOUT_SECONDS` | `30` | HTTP timeout for `preloop-runner-client`. Invalid or non-positive values use `30`. |
+| `PRELOOP_TOKEN` | Falls back to `PRELOOP_SYSTEM_TOKEN`, then the managed engine token | Native API bearer token used by CLI requests. |
+| `PRELOOP_SYSTEM_TOKEN` | Generated and stored when absent | Native API and runner-registration bearer token. Treat it as an administrator credential. |
+| `PRELOOP_LISTEN` | `127.0.0.1:9090` | TCP address where `serve` listens. Must be a socket address. |
+| `PRELOOP_PUBLIC_URL` | `http://127.0.0.1:<listen-port>` | GitHub-facing base URL for webhook delivery and Check links. Also selects engine-hosted App setup for `preloop setup github` (the engine reads its own address from here; a CLI value must name the same origin). |
+| `PRELOOP_STORE_URL` | `$PRELOOP_HOME/state/preloop.db` | SQLite path or a `postgres://`/`postgresql://` durable store URL. |
+| `PRELOOP_UNIX_SOCKET` | Unset for a standalone server; the CLI engine uses `$PRELOOP_HOME/preloop.sock` | Optional native server Unix-socket listener. |
+| `PRELOOP_LOG_FORMAT` | `auto` | `auto`, `pretty`, or `json` process logs. Values are case-insensitive; invalid values use `auto`. |
+| `PRELOOP_CREDENTIAL_STORE` | `file` | Credential backend: `file`, `os`, or `memory`. `memory` is available through this variable only; the config key accepts `file` or `os`. |
+| `PRELOOP_SECRETS_STORE` | `file` | Workflow-secret backend: `file` or `memory`. |
+| `PRELOOP_HMAC_KEY` | `$PRELOOP_HOME/state/hmac-key.bin`, generated when absent | 32-byte cluster key. The variable accepts exactly 64 hexadecimal characters. |
+| `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | `false` | Require job-assignment metadata before dispatching. Boolean values are `1`, `true`, `yes`, `on`, `0`, `false`, `no`, or `off`. |
+| `PRELOOP_REGISTRATION_POLICY` | `strict` | Runner-registration policy: `permissive` allows unregistered runners and is accepted only on a loopback listen address; any other value selects `strict`. |
+| `PRELOOP_TOKEN_TTL_SECS` | `2999` | Lifetime in seconds for short-lived OAuth assertions. Invalid or unset values use `2999`. |
+| `PRELOOP_LOCAL_WORKSPACE` | Unset | Load workflows from a specified local checkout path. |
+
+`PRELOOP_SYSTEM_TOKEN` is generated on first engine startup when no explicit token or stored token exists. Keep it out of shell history and source control.
+
+## Pre-push hook
+
+The generated pre-push hook reads these variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PRELOOP_BIN` | `preloop` | Executable invoked by the hook. |
+| `PRELOOP_HOOK_TIMEOUT_SECS` | `3600` | Maximum seconds the hook waits for a run to finish. |
+
+## GitHub
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PRELOOP_GITHUB_PAT` | Unset | PAT supplied to `setup github --via pat` or `init --auth pat`; otherwise the CLI prompts. |
+| `PRELOOP_GITHUB_TOKEN` | Configured PAT, or unset | Static PAT fallback for GitHub API calls and the explicit `mint_failure = "pat"` policy. |
+| `PRELOOP_GITHUB_APP_ID` | Config-file App ID, or unset | GitHub App ID. |
+| `PRELOOP_GITHUB_APP_PEM` | Config-file App key, or unset | Inline GitHub App private key PEM. |
+| `PRELOOP_GITHUB_APP_PEM_FILE` | Config-file App key, or unset | File containing the GitHub App private key PEM. |
+| `PRELOOP_GITHUB_APP_PRIVATE_KEY` | Config-file App key, or unset | Legacy alias for the inline App key. |
+| `PRELOOP_GITHUB_APP_PRIVATE_KEY_PATH` | Config-file App key, or unset | Legacy alias for the App key file path. |
+| `PRELOOP_GITHUB_APP_INSTALLATION_ID` | Discovered from the App, or unset | Numeric installation ID; skips installation discovery. |
+| `PRELOOP_GITHUB_APP_MINT_FAILURE` | `local` | What happens when App token minting fails: `local` leaves the job without an App token, `error` rejects the run, and `pat` uses `PRELOOP_GITHUB_TOKEN`. |
+| `PRELOOP_GITHUB_APPS_JSON` | The `[github.apps]` list, or empty | JSON array of additional App configurations. Invalid JSON stops startup. |
+| `PRELOOP_WEBHOOK_SECRET` | Configured webhook secret, or unset | Verifies `X-Hub-Signature-256` for the default App, and a payload it signs is bound to that App's installation coverage. Other Apps carry their own secret, set with `preloop setup github --via app --webhook-secret`. |
+| `PRELOOP_GITHUB_SERVER_URL` | `https://github.com` | GitHub server URL exposed to workflows. Point it at a GHES host when required. |
+| `PRELOOP_GITHUB_API_URL` | `https://api.github.com` | GitHub REST API base URL. |
+| `PRELOOP_GITHUB_GRAPHQL_URL` | `https://api.github.com/graphql` | GitHub GraphQL endpoint. |
+| `PRELOOP_GITHUB_CA_FILE` | Unset | PEM bundle containing extra CA roots for outbound GitHub TLS. |
+| `PRELOOP_GITHUB_SKIP_WORKFLOWS` | Empty | Comma-separated workflow names or `.github/workflows/...` paths that GitHub, rather than Preloop, should run on webhook dispatch. |
+| `PRELOOP_GITHUB_REPOSITORY` | Unset | `owner/repo` used by the scheduler's remote startup scan. |
+| `PRELOOP_GITHUB_BREAKER` | Enabled | Set `off`, `0`, `false`, or `disabled` to disable the GitHub API circuit breaker. |
+| `PRELOOP_GITHUB_BREAKER_THRESHOLD` | `3` failures | Positive integer failures needed to open the GitHub circuit breaker. |
+| `PRELOOP_GITHUB_PR_AUTO` | `feature` | Automatic PR policy: `feature` or `never`. |
+| `PRELOOP_GITHUB_PR_DRAFT` | `true` | Whether automatically created pull requests start as drafts. Boolean values are `1`, `true`, `yes`, `0`, `false`, or `no`, case-insensitive. |
+| `PRELOOP_GITHUB_PR_EXCLUDE` | Empty | Comma-separated gitignore-style branch patterns excluded from automatic PR creation. |
+| `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | `push,pull_request,check_run,workflow_job` | Comma-separated events requested by the default App manifest. An empty value restores this default. The list is sent only when the manifest configures the webhook (a public URL), and a list carrying `workflow_job` makes the manifest request `Actions: read` too — GitHub renders no checkbox for that event without the permission. GitHub cannot change subscriptions through its API after creation, so an App created before `workflow_job` joined the defaults, or one created without a public URL (no events at all), needs them ticked by hand under the App's settings → **Permissions & events** → **Subscribe to events**, after granting `Actions: read` there. |
+| `PRELOOP_SETUP_INSTALL_WAIT_SECS` | `300` | How long an engine-hosted App setup waits for the App to be installed on the `--repo` repositories before running the checks. `0` checks immediately. |
+| `PRELOOP_ENABLE_APP_REGISTRATION` | Off | `1`, `true`, or `on` serves the App-manifest pages at `/api/v1/github/register` and `/api/v1/github/callback`. Both routes return `404` otherwise. Register Apps with `preloop setup github --via app` and leave this off; enable it only for a browser-driven registration on a remote engine, then unset it. |
+
+## Retention, limits, and caches
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PRELOOP_RETENTION_DAYS` | `90` | Delete terminal runs and related checks, artifacts, and logs after this many days. `0` disables the sweep. |
+| `PRELOOP_RERUN_WINDOW_DAYS` | `30` | Keep failed runs in live tables for in-place reruns. `0` disables the hold. |
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Reject a run that expands beyond this many jobs. `0` disables the cap. |
+| `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` | `24` | Reap orphaned diagnostic-log staging directories. `0` disables the age-based sweep. |
+| `PRELOOP_OUTBOX_RETENTION_SECONDS` | `3600` | Retain durable outbox rows for slow consumers. |
+| `PRELOOP_SNAPSHOT_RETENTION_SECONDS` | `1800` | Retain terminal workspace snapshots for late checkouts. `0` discards them immediately. |
+| `PRELOOP_MAX_POLL_WINDOW_SECS` | `60` | Maximum runner long-poll wait. Non-positive or invalid values use `60`. |
+| `PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS` | `1800`, floored at three poll windows | Time before an inactive runner is considered stale. |
+| `PRELOOP_RUNNER_VERSION_DEPRECATED` | `false` | Set `1`, `true`, or `yes` to reject message polling by deprecated runners. |
+| `PRELOOP_CHECKOUT_CACHE_MODE` | `off` | Checkout-object cache mode: `off`, `run-scoped`, or `repository`. Unknown values fall back to `off`. |
+| `PRELOOP_CHECKOUT_CACHE_RUN_RETENTION_SECONDS` | `3600` | Retention for run-scoped checkout objects. |
+| `PRELOOP_CHECKOUT_CACHE_REPOSITORY_RETENTION_SECONDS` | `604800` | Retention for repository-scoped checkout objects. |
+| `PRELOOP_CHECKOUT_CACHE_MAX_BYTES` | `107374182400` | Per-repository checkout-cache byte limit. |
+| `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` | `10737418240` | Server-wide finalized Actions-cache byte quota. |
+| `PRELOOP_PG_WRITERS` | `16` | PostgreSQL writer connections per node; `0` is clamped to `1`. |
+| `PRELOOP_PG_READERS` | `16` | PostgreSQL reader connections per node; `0` is clamped to `1`. |
+
+Numeric values in this group are decimal integers. Retention, cache, and job-limit variables fail startup when they are non-numeric; the remaining variables use the fallback shown above.
+
+## Webhook workers and repair
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PRELOOP_WEBHOOK_WORKERS` | `8` | Concurrent webhook delivery workers per node; `0` is clamped to `1`. |
+| `PRELOOP_WEBHOOK_WATCHDOG` | Enabled | Set `off`, `0`, `false`, or `disabled` to stop automatic webhook repair. |
+| `PRELOOP_WEBHOOK_WATCHDOG_INTERVAL_SECS` | `300` (minimum `10`) | Watchdog polling interval. |
+| `PRELOOP_WEBHOOK_WATCHDOG_GRACE_SECS` | `120` | Age before a delivery is eligible for repair. |
+| `PRELOOP_WEBHOOK_WATCHDOG_MAX_ATTEMPTS` | `5` | Maximum redelivery attempts per delivery. |
+| `PRELOOP_WEBHOOK_WATCHDOG_MAX_PAGES` | `5` | GitHub delivery-history pages inspected per watchdog pass. |
+| `PRELOOP_WEBHOOK_HEALTH_INTERVAL_SECS` | `900` (minimum `60`) | Periodic webhook configuration health-check interval. |
+
+## VM pool and golden images
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PRELOOP_RUNNER_POOL_ENABLED` | `false` | Warm idle runner pool switch. When off, the engine still supervises size-zero on-demand provisioning. Boolean values are `1`, `true`, `yes`, `on`, `0`, `false`, `no`, or `off`. |
+| `PRELOOP_RUNNER_POOL_SIZE` | Host-derived when pool is enabled; `0` when disabled | Number of warm runner slots. An explicit `0` keeps on-demand mode. |
+| `PRELOOP_USE_FORK` | `true` | Fork a prepared golden for each job instead of provisioning a fresh VM. |
+| `PRELOOP_RUNNER_CPUS` | `8` | vCPUs per runner VM. Invalid or zero values use `8`. |
+| `PRELOOP_RUNNER_MEMORY_MIB` | `4096` | Runner VM memory ceiling. Values below `1024` use `4096`. |
+| `PRELOOP_RUNNER_STORAGE_GB` | `80` GiB | Persistent runner storage and default golden-builder disk. The builder never uses less than `40` GiB. |
+| `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | `20` GiB | Free space reserved before starting a job VM. `0` disables the reserve. |
+| `PRELOOP_SKIP_DISK_PREFLIGHT` | Off | Bypass disk preflight when set to a value other than empty, `0`, or `false`. |
+| `PRELOOP_GOLDEN_UNPACK_FACTOR` | `6` | Free-space multiple reserved while unpacking a packed golden. Must be at least `1`. |
+| `PRELOOP_RUNNER_OVERLAY_GB` | Provider default | Optional per-runner root-overlay size in GiB. |
+| `PRELOOP_RUNNER_BASE_IMAGE` | Official packed-golden sentinel | Base image for a custom golden. A non-empty value overrides `[golden].base_image`; unset selects the official golden. |
+| `PRELOOP_GOLDEN_URL` | Unset | Verified mirror URL for the packed official golden. It replaces OCI and release-asset discovery. The URL must have a valid `<URL>.sha256` sidecar or a matching `PRELOOP_GOLDEN_SHA256`. |
+| `PRELOOP_GOLDEN_SHA256` | Unset | Expected SHA-256 for a mirror that has no sidecar. It accepts a 64-hex digest, optional `sha256:` prefix, or checksum-file format. |
+| `PRELOOP_GOLDEN_OCI_REF` | Architecture-specific digest-pinned GHCR official golden (`aarch64` or `x86_64`) | Override the official packed-golden OCI reference. Invalid or unavailable OCI values fall back to the release asset. |
+| `PRELOOP_RUNNER_LABELS` | `self-hosted,Linux,<host-arch>` | Comma-separated extra labels advertised by local runners. Empty entries are ignored and labels are case-insensitively deduplicated. |
+| `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Prefix for runner machine names. |
+| `PRELOOP_RUNNER_USER` | `runner` for `serve`; `root` for `build-golden` | Guest account used for job steps. An empty value disables account switching in `serve`; `root` restores root. |
+| `PRELOOP_RUNNER_UID` | `1001` | Numeric guest runner UID. |
+| `PRELOOP_RUNNER_DNS` | `8.8.8.8` | DNS resolver presented to guest networking. |
+| `PRELOOP_RUNNER_PACK_PROXY` | Falls back to `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy` | HTTP proxy for packed-golden export traffic. |
+| `PRELOOP_RUNNER_PACK_NO_PROXY` | Falls back to `NO_PROXY`, `no_proxy` | Proxy bypass list for packed-golden export traffic. |
+| `PRELOOP_RUNNER_BUNDLE` | Auto-discovered Linux `preloop-runner` bundle | Directory containing the Linux guest runner. Invalid paths fall through discovery and then fail startup if no bundle is found. On the AgentENV backend the host tree is archived into a content-addressed read-only volume, so a bundle change publishes a new volume. |
+| `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` for `serve` | Shared read-only Node runtime externals. |
+| `PRELOOP_SMOLVM_NET_BACKEND` | `virtio-net` | SmolVM public-only network backend. Exact lowercase `tsi` selects TSI; any other value selects `virtio-net`. |
+| `PRELOOP_RUNNER_URL` | `http://127.0.0.1:<listen-port>` | Runner-facing engine URL. Set a host-reachable URL for runners on another machine. |
+
+The official packed golden defaults are digest-pinned per architecture. The current references are:
+
+- `aarch64`: `ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:cf50db4cbbb38f47f0a533e1e35b523c6427df30261a3cd5bb49d9ef7e072414`
+- `x86_64`: `ghcr.io/preloopdev/preloop-x86_64-smolvm-golden@sha256:5757a8319aba0604672e62425559f207cc9f21e9380be01e8e80227eaec21914`
+
+## VM backend
+
+The engine boots each job in a microVM through one provider. SmolVM is the default everywhere; AgentENV is opt-in.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PRELOOP_VM_BACKEND` | `smolvm` | `smolvm` or `agentenv` (`aenv` is accepted as an alias). An unrecognized value stops startup rather than falling back. AgentENV needs Linux ≥ 6.8 with `/dev/kvm` and `aenv` on `PATH`. |
+
+<AccordionGroup>
+  <Accordion title="AgentENV backend variables">
+    These apply when `PRELOOP_VM_BACKEND=agentenv`, which drives the `aenv` CLI.
+
+    | Variable | Default | Purpose |
+    |---|---|---|
+    | `PRELOOP_AENV_BINARY` | `aenv` on `PATH` | Path to the `aenv` executable. |
+    | `PRELOOP_AENV_TTL_SECS` | `3600` | Sandbox TTL the provider requests and re-arms. Values below `60` are ignored. |
+    | `PRELOOP_AENV_MANAGE_EGRESS` | `on` | `0`, `false`, `no`, or `off` skips the engine-egress reconciliation with a warning; `dry-run` logs the planned actions and changes nothing. |
+    | `PRELOOP_AENV_ENGINE_IP` | Read from the runner URL | Engine IPv4 address, when the runner URL does not name one and the guest must still reach the engine. |
+    | `PRELOOP_AENV_CONFIG` | `/var/lib/aenv/config/config.toml` | AgentENV node configuration the egress reconciliation reads. |
+    | `PRELOOP_VOLUMES_GC` | `auto` | `auto` or `off`: whether the engine collects superseded runner volumes on its own, after it populates one and every `PRELOOP_VOLUMES_GC_INTERVAL_SECS`. `off` stops those passes and leaves `preloop volumes gc` for manual runs. |
+    | `PRELOOP_VOLUMES_KEEP_PREVIOUS` | `1` | Superseded volumes kept per kind for a rollback. `0` reclaims every superseded volume. |
+    | `PRELOOP_VOLUMES_GC_GRACE_SECS` | `3600` | How long a volume is left alone after it was created. |
+    | `PRELOOP_VOLUMES_GC_INTERVAL_SECS` | `21600` | Period between automatic collection passes; `0` disables the periodic pass. |
+
+    AgentENV sandboxes cannot reach a private engine until the node deny-list and host firewall admit exactly the engine's address and port. The engine reconciles both itself and needs passwordless `sudo` for `iptables` and `systemctl`; set `PRELOOP_AENV_MANAGE_EGRESS=0` to keep the defaults and open them by hand.
+  </Accordion>
+  <Accordion title="Update and golden-build variables">
+    These are mainly for operators building images or running self-updates.
+
+    | Variable | Default | Purpose |
+    |---|---|---|
+    | `PRELOOP_RELEASE_REPOSITORY` | `preloopdev/preloop` | Repository used by `preloop update`. |
+    | `PRELOOP_RELEASES_API` | `https://api.github.com/repos/<repository>/releases` | HTTPS release-metadata endpoint. |
+    | `PRELOOP_NO_SYSTEMD_RESTART` | Off | Any set value suppresses the Linux systemd restart after self-update. |
+    | `PRELOOP_SMOLVM_RELEASE_VERSION` | Latest compatible stable release | Pin the SmolVM runtime version installed by `preloop update`. |
+    | `PRELOOP_VERIFY_BASE_IMAGE` | Off | Enable Cosign signature and SPDX-attestation verification before `build-golden`. Any value except `0` or `false` enables it. |
+    | `PRELOOP_VERIFY_BASE_IMAGE_REPO` | Unset | GitHub `OWNER/NAME` that publishes the base image; required when verification is enabled. |
+    | `PRELOOP_BASE_IMAGE_PUBKEY` | Unset | Key path or key material for Cosign verification. |
+    | `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` | Repo-derived publishing-workflow regexp | Identity regexp for keyless base-image signatures; ignored when a public key is supplied. |
+    | `PRELOOP_REQUIRE_BASE_DIGEST` | `false` | Require `@sha256:` base-image references during `build-golden`. |
+    | `PRELOOP_GOLDEN_NAME_PREFIX` | `preloop-release-golden-<process-id>` | Prefix for temporary golden-build machines. |
+  </Accordion>
+  <Accordion title="Internal process variables">
+    Preloop sets these for a guest or child process. Operators normally leave them alone; they are listed so a process environment is not mistaken for a configuration interface.
+
+    | Variable | Default | Purpose |
+    |---|---|---|
+    | `PRELOOP_ENGINE_ORIGIN` | Foreground detection | Marks an engine as background-started or systemd-managed for lifecycle handling. No preloop command starts an engine on its own, so a background launcher sets this. |
+    | `PRELOOP_CONTROL_UPSTREAM` | Unset | TCP fallback for a guest control bridge when a Unix socket is unavailable. |
+    | `PRELOOP_CONTROL_ORIGIN` | Unset | Guest runner's advertised control-plane origin. |
+    | `PRELOOP_CONTROL_SOCKET` | Unset | Mounted Unix socket used by a guest to reach the engine. |
+    | `PRELOOP_PROVISION_TOKEN` | Unset | One-time pool token binding a runner registration to its queued job. |
+    | `PRELOOP_RUNNER_TOKEN` | Unset | Runner registration credential passed to the guest configure step. |
+    | `PRELOOP_RUNNER_RSA_PARAMS` | Unset | JSON-encoded pre-generated runner keypair; absent means configure generates one. |
+    | `PRELOOP_MACHINE_NAME` | Unset | VM name used by debug-session requests. |
+    | `PRELOOP_FAILURE_MARKER` | Unset | Marker path written when a failed job VM is preserved. |
+    | `PRELOOP_PAUSE_MARKER` | Unset | Guest path identifying a paused debug job. |
+    | `PRELOOP_GOLDEN_BUILD_TOKEN` | Set internally during a golden bake | Build-only registration credential. |
+    | `PRELOOP_BUILD_COMMIT` | Embedded commit or `unknown` | Compile-time build metadata used by update safety checks. |
+  </Accordion>
+</AccordionGroup>
+
+For standalone runner variables, use [Runner configuration](/runner/configuration).

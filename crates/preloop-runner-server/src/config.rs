@@ -2406,6 +2406,27 @@ pub fn env_or<T>(env_value: Option<T>, config_value: Option<T>) -> Option<T> {
 #[cfg(any(test, feature = "test-support"))]
 static CONFIG_PATH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+/// Serializes whole-file config mutations: every "load, change, write back"
+/// cycle on a config file holds this for its whole length.
+///
+/// Atomic renames keep the file itself intact, but two cycles that both start
+/// from the same base snapshot still lose one another's change — the later
+/// rename publishes a document written from the older read. The fronts that
+/// rewrite the file (the secrets API, the execution-protection API, and
+/// engine-hosted App setup) therefore share this one lock rather than one per
+/// API.
+///
+/// Held only around synchronous work, never across an `await`, so an async
+/// caller blocks an executor thread for no longer than a load and a write. It
+/// is process-local, like the mutation locks the HTTP APIs use: two processes
+/// pointed at one config file are still last-writer-wins.
+static CONFIG_MUTATION_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// See [`CONFIG_MUTATION_LOCK`].
+pub fn config_mutation_lock() -> &'static parking_lot::Mutex<()> {
+    &CONFIG_MUTATION_LOCK
+}
+
 #[cfg(any(test, feature = "test-support"))]
 // SAFETY: env write is confined to test builds and runs before parallel
 // tests can observe a torn value (callers hold CONFIG_PATH_LOCK).
