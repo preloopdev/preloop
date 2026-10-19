@@ -352,17 +352,21 @@ async fn validate_installation_online(
 
 /// Fetch and assemble the installation facts for `token` from github.com.
 ///
-/// Both calls go through the credential's breaker. `/installation` runs under
-/// the unnamed-installation bucket — the token's rate-limit identity is the id
-/// this response is about to name, so inventing one would charge another
-/// installation and the PAT's bucket belongs to the operator. The repository
-/// listing then runs under the real installation id.
+/// Both calls go through the credential's breaker, on one bucket: the token
+/// itself, which *is* the rate-limit identity until `/installation` names the
+/// installation. Inventing an id would charge another installation, the PAT's
+/// bucket belongs to the operator, and a single shared unnamed bucket would let
+/// one tenant's throttled token park every other tenant's validation. Keeping
+/// the listing on the same bucket matters: if the `/installation` response
+/// spent the token's last request, the listing must be refused here rather
+/// than sent, because its 403 would otherwise be read as an invalid credential.
 async fn fetch_installation_info(
     state: &crate::state::AppState,
     api_base: &str,
     token: &str,
 ) -> anyhow::Result<InstallationInfo> {
-    let credential = GithubCredential::bearer(token, GithubCredentialBucket::InstallationUnknown);
+    let credential =
+        GithubCredential::bearer(token, GithubCredentialBucket::for_installation_token(token));
     let installation = fetch_json(state, &credential, &format!("{api_base}/installation"))
         .await
         .with_context(|| "GET /installation failed")?;
@@ -401,20 +405,14 @@ async fn fetch_installation_info(
         .unwrap_or("selected");
     // An "all repositories" installation can reach every repo; the list is
     // otherwise the source of truth for access (checked per dispatch target).
+    // The listing stays on the token's own bucket: one validation spends one
+    // token's budget, so a rate limit observed on `/installation` must park
+    // this call instead of letting it spend a request that is guaranteed to
+    // 403 — which the outer validator would read as an invalid credential.
     let accessible_repositories = if repository_selection == "all" {
         None
     } else {
-        Some(
-            fetch_installation_repositories(
-                state,
-                api_base,
-                &GithubCredential::bearer(
-                    token,
-                    GithubCredentialBucket::Installation(installation_id),
-                ),
-            )
-            .await?,
-        )
+        Some(fetch_installation_repositories(state, api_base, &credential).await?)
     };
     Ok(InstallationInfo {
         installation_id,

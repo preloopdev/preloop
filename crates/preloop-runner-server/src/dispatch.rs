@@ -937,7 +937,10 @@ async fn resolve_default_branch(
                 })?;
         let bucket = match app.mint_ledger.lookup(&token) {
             Some(entry) => GithubCredentialBucket::Installation(entry.installation_id),
-            None => GithubCredentialBucket::InstallationUnknown,
+            // The mint succeeded but the ledger cannot name the installation:
+            // never invent an id, and never charge the PAT's budget with an
+            // installation token. The token's own fingerprint is its identity.
+            None => GithubCredentialBucket::for_installation_token(&token),
         };
         GithubCredential::bearer(token, bucket)
     } else {

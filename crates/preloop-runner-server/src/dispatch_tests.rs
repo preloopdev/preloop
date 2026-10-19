@@ -1022,10 +1022,13 @@ async fn open_breaker_refuses_a_third_party_dispatch_without_touching_github() {
     let _env = pin_api_base(&base).await;
 
     // Three dependency failures on the bucket dispatch auth validates an
-    // unattributable installation token under.
-    let breaker = state
-        .github_breakers
-        .breaker_for(crate::github_breaker::GithubCredentialBucket::InstallationUnknown);
+    // unattributable installation token under: the token's own fingerprint,
+    // so parking it cannot refuse any other third-party tenant.
+    let breaker = state.github_breakers.breaker_for(
+        crate::github_breaker::GithubCredentialBucket::for_installation_token(
+            "ghs_third_party_token",
+        ),
+    );
     for _ in 0..3 {
         breaker.record_failure(
             &crate::github_breaker::GithubFailureKind::Unavailable,

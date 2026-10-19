@@ -29,6 +29,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
 
+use crate::credential_store::SecretString;
+
 /// Why a GitHub call counted against the breaker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GithubFailureKind {
@@ -348,14 +350,24 @@ pub enum GithubCredentialBucket {
     /// dispatch auth validating a third-party token, where the id only
     /// arrives in the response being made.
     ///
-    /// Sharing the PAT's bucket would park the operator's own credential on a
-    /// stranger's token, and inventing an id would charge another
-    /// installation's budget, so unattributable installation tokens get one
-    /// bucket of their own. It stays a single bucket on purpose: keying on the
-    /// token (hashed, since the registry never removes breakers) would let a
-    /// caller mint an unbounded number of them with arbitrary bearer values.
-    InstallationUnknown,
-    /// No credential (anonymous API, 60 req/hour/IP).
+    /// Keyed on a fingerprint of the token itself, because the token *is* the
+    /// rate-limit identity until its installation is known. The PAT's bucket
+    /// belongs to the operator and inventing an id would charge another
+    /// installation, so the alternative — one bucket shared by every
+    /// unattributable token — would let one tenant's throttled token park
+    /// every other tenant's dispatch validation. Callers supply arbitrary
+    /// bearer values, so the registry bounds how many of these it keeps.
+    InstallationToken(u64),
+    /// The forge relay's Git smart-HTTP transport.
+    ///
+    /// Git transport is a different dependency from the REST API: for
+    /// github.com it is a different host (`github.com` vs `api.github.com`)
+    /// and it is not metered by the anonymous 60-requests-per-hour API budget.
+    /// Sharing [`GithubCredentialBucket::Anonymous`] would let an exhausted
+    /// REST budget refuse a public checkout, and a failing Git endpoint refuse
+    /// anonymous API calls.
+    Relay,
+    /// No credential on the anonymous REST API (60 req/hour/IP).
     Anonymous,
 }
 
@@ -372,13 +384,28 @@ impl GithubCredentialBucket {
         Self::App(id)
     }
 
+    /// The bucket for an installation token whose installation id the caller
+    /// cannot name, keyed on the token.
+    ///
+    /// The fingerprint is FNV-1a for the same reason [`for_app`] uses it: a
+    /// bucket names a rate-limit budget, and that meaning must survive a
+    /// standard-library upgrade. Tokens are GitHub-minted opaque strings, so
+    /// the digest is not a security boundary and collision resistance is not
+    /// required of it.
+    pub fn for_installation_token(token: &str) -> Self {
+        Self::InstallationToken(fnv1a_64(token.as_bytes()))
+    }
+
     /// Stable label for snapshots and traces.
     pub fn label(&self) -> String {
         match self {
             GithubCredentialBucket::Installation(id) => format!("installation:{id}"),
             GithubCredentialBucket::Pat => "pat".to_owned(),
             GithubCredentialBucket::App(id) => format!("app:{id}"),
-            GithubCredentialBucket::InstallationUnknown => "installation:unknown".to_owned(),
+            GithubCredentialBucket::InstallationToken(fingerprint) => {
+                format!("installation-token:{fingerprint:016x}")
+            }
+            GithubCredentialBucket::Relay => "relay".to_owned(),
             GithubCredentialBucket::Anonymous => "anonymous".to_owned(),
         }
     }
@@ -404,26 +431,60 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 #[derive(Debug)]
 pub struct GithubBreakerRegistry {
     config: BreakerConfig,
-    breakers: parking_lot::Mutex<HashMap<GithubCredentialBucket, Arc<GithubBreaker>>>,
+    inner: parking_lot::Mutex<BreakerRegistryInner>,
+}
+
+/// Unattributable installation-token buckets the registry keeps at once.
+///
+/// Every other bucket is named by something the server chose (an installation
+/// id from the mint ledger, an App id from its own registry, the PAT, the
+/// anonymous and relay buckets), so their number is bounded by the server's
+/// own configuration. An [`GithubCredentialBucket::InstallationToken`] bucket
+/// is named by a bearer a caller supplied, so it needs a bound of its own:
+/// past this many, the least recently used one is dropped. Losing a breaker
+/// costs a backoff streak, never correctness — the next call from that token
+/// simply probes GitHub again.
+const MAX_UNNAMED_INSTALLATION_BUCKETS: usize = 256;
+
+#[derive(Debug)]
+struct BreakerRegistryInner {
+    breakers: HashMap<GithubCredentialBucket, Arc<GithubBreaker>>,
+    /// Outstanding `InstallationToken` buckets, least recently used first.
+    unnamed: std::collections::VecDeque<GithubCredentialBucket>,
 }
 
 impl GithubBreakerRegistry {
     pub fn new(config: BreakerConfig) -> Self {
         Self {
             config,
-            breakers: parking_lot::Mutex::new(HashMap::new()),
+            inner: parking_lot::Mutex::new(BreakerRegistryInner {
+                breakers: HashMap::new(),
+                unnamed: std::collections::VecDeque::new(),
+            }),
         }
     }
 
     /// The breaker for `bucket`, creating it on first use. Breakers are never
-    /// removed: the bucket set is bounded (installations the server actually
-    /// talks to), and dropping one would lose its backoff streak.
+    /// removed except to bound the unnamed-installation set: the bucket set is
+    /// otherwise bounded (installations the server actually talks to), and
+    /// dropping one would lose its backoff streak.
     pub fn breaker_for(&self, bucket: GithubCredentialBucket) -> Arc<GithubBreaker> {
-        let mut breakers = self.breakers.lock();
-        breakers
-            .entry(bucket)
-            .or_insert_with(|| Arc::new(GithubBreaker::new(self.config)))
-            .clone()
+        let mut inner = self.inner.lock();
+        if let Some(existing) = inner.breakers.get(&bucket).cloned() {
+            inner.touch_unnamed(bucket);
+            return existing;
+        }
+        let breaker = Arc::new(GithubBreaker::new(self.config));
+        inner.breakers.insert(bucket, breaker.clone());
+        if matches!(bucket, GithubCredentialBucket::InstallationToken(_)) {
+            inner.unnamed.push_back(bucket);
+            while inner.unnamed.len() > MAX_UNNAMED_INSTALLATION_BUCKETS {
+                if let Some(evicted) = inner.unnamed.pop_front() {
+                    inner.breakers.remove(&evicted);
+                }
+            }
+        }
+        breaker
     }
 
     /// Per-bucket retry hint, for callers that know their credential.
@@ -443,8 +504,9 @@ impl GithubBreakerRegistry {
     /// running is still down. [`GithubBreaker::retry_after`] covers the probe;
     /// [`BreakerSnapshot::open`] covers only the window, so it cannot be used.
     pub fn unavailable_retry_after(&self) -> Option<Duration> {
-        self.breakers
+        self.inner
             .lock()
+            .breakers
             .values()
             .filter(|breaker| !breaker.snapshot().rate_limited)
             .filter_map(|breaker| breaker.retry_after())
@@ -454,8 +516,9 @@ impl GithubBreakerRegistry {
     /// Per-bucket breaker state for the operational snapshot, in stable
     /// bucket-label order.
     pub fn snapshot(&self) -> Vec<GithubBucketSnapshot> {
-        let breakers = self.breakers.lock();
-        let mut snapshots: Vec<GithubBucketSnapshot> = breakers
+        let inner = self.inner.lock();
+        let mut snapshots: Vec<GithubBucketSnapshot> = inner
+            .breakers
             .iter()
             .map(|(bucket, breaker)| GithubBucketSnapshot {
                 bucket: bucket.label(),
@@ -464,6 +527,23 @@ impl GithubBreakerRegistry {
             .collect();
         snapshots.sort_by(|a, b| a.bucket.cmp(&b.bucket));
         snapshots
+    }
+}
+
+impl BreakerRegistryInner {
+    /// Move `bucket` to the most-recently-used end of the unnamed order.
+    fn touch_unnamed(&mut self, bucket: GithubCredentialBucket) {
+        if !matches!(bucket, GithubCredentialBucket::InstallationToken(_)) {
+            return;
+        }
+        if let Some(position) = self
+            .unnamed
+            .iter()
+            .position(|candidate| *candidate == bucket)
+        {
+            self.unnamed.remove(position);
+            self.unnamed.push_back(bucket);
+        }
     }
 }
 
@@ -884,9 +964,13 @@ pub async fn send_observed_labeled(
 /// budget, and passing them separately is how a call ends up observed against
 /// the wrong installation (or, worse, against the anonymous bucket while
 /// spending an installation's budget).
+///
+/// The token is a [`SecretString`], so `Debug` prints `<redacted>`: this value
+/// is logged in every refusal and outage warning, and a bearer in the log is
+/// an operator PAT or a live installation token for whoever can read logs.
 #[derive(Debug, Clone)]
 pub struct GithubCredential {
-    token: Option<String>,
+    token: Option<SecretString>,
     bucket: GithubCredentialBucket,
 }
 
@@ -895,7 +979,19 @@ impl GithubCredential {
     /// JWT.
     pub fn bearer(token: impl Into<String>, bucket: GithubCredentialBucket) -> Self {
         Self {
-            token: Some(token.into()),
+            token: Some(SecretString::new(token)),
+            bucket,
+        }
+    }
+
+    /// No credential of the engine's, charged to `bucket`.
+    ///
+    /// The forge relay needs this: it forwards anonymous Git traffic, which
+    /// the forge meters separately from the anonymous REST budget, so it
+    /// carries no credential but its own bucket.
+    pub fn unauthenticated(bucket: GithubCredentialBucket) -> Self {
+        Self {
+            token: None,
             bucket,
         }
     }
@@ -903,10 +999,7 @@ impl GithubCredential {
     /// No credential at all: public-repository access, charged to GitHub's
     /// 60-requests-per-hour-per-IP anonymous budget.
     pub fn anonymous() -> Self {
-        Self {
-            token: None,
-            bucket: GithubCredentialBucket::Anonymous,
-        }
+        Self::unauthenticated(GithubCredentialBucket::Anonymous)
     }
 
     /// The breaker bucket this credential's calls are keyed on.
@@ -918,10 +1011,11 @@ impl GithubCredential {
     ///
     /// An anonymous credential contributes no header, which is what the forge
     /// relay and the App-manifest exchange need: both must reach GitHub with
-    /// no credential of the engine's attached.
+    /// no credential of the engine's attached. This is the credential's one
+    /// expose, at the header the request is actually sent with.
     pub fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.token.as_deref() {
-            Some(token) => request.header("Authorization", format!("Bearer {token}")),
+        match &self.token {
+            Some(token) => request.header("Authorization", format!("Bearer {}", token.expose())),
             None => request,
         }
     }
@@ -1907,8 +2001,9 @@ mod tests {
     #[tokio::test]
     async fn transport_failures_open_the_credential_breaker() {
         let state = funnel_state().await;
+        let token = "ghs_transport_test";
         let credential =
-            GithubCredential::bearer("ghp_test", GithubCredentialBucket::InstallationUnknown);
+            GithubCredential::bearer(token, GithubCredentialBucket::for_installation_token(token));
         // Port 1 on loopback is closed: connection refused, no HTTP exchange.
         for _ in 0..3 {
             let _ = send_github_json(
@@ -1925,9 +2020,203 @@ mod tests {
         assert!(
             state
                 .github_breakers
-                .breaker_for(GithubCredentialBucket::InstallationUnknown)
+                .breaker_for(GithubCredentialBucket::for_installation_token(token))
                 .is_open(),
             "an unreachable GitHub must open the unnamed-installation bucket"
+        );
+    }
+
+    /// A stub that rate-limits one bearer and answers the other, so a test can
+    /// prove two third-party tokens keep independent budgets.
+    async fn per_token_rate_limit_stub(throttled_bearer: &'static str) -> String {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let hits = Arc::new(AtomicU64::new(0));
+        let app = axum::Router::new().route(
+            "/installation",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let bearer = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    if bearer == format!("Bearer {throttled_bearer}") {
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [(axum::http::header::RETRY_AFTER, "60")],
+                            axum::Json(serde_json::json!({"message": "API rate limit exceeded"})),
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(serde_json::json!({"id": 7})).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    }
+
+    /// One third-party installation token's rate limit parks that token, not
+    /// every other third-party token: unattributable installation tokens are
+    /// partitioned per token, and a 429 is the trigger that used to deny every
+    /// tenant sharing the single unnamed bucket.
+    #[tokio::test]
+    async fn a_rate_limited_third_party_token_does_not_park_another() {
+        let throttled_token = "ghs_throttled";
+        let healthy_token = "ghs_healthy";
+        let base = per_token_rate_limit_stub(throttled_token).await;
+        let state = funnel_state().await;
+        let throttled = GithubCredential::bearer(
+            throttled_token,
+            GithubCredentialBucket::for_installation_token(throttled_token),
+        );
+        let healthy = GithubCredential::bearer(
+            healthy_token,
+            GithubCredentialBucket::for_installation_token(healthy_token),
+        );
+        let url = format!("{base}/installation");
+
+        let error = send_github_json(
+            &state,
+            &throttled,
+            GithubSubsystem::Dispatch,
+            reqwest::Method::GET,
+            &url,
+            None,
+        )
+        .await
+        .expect_err("a 429 must fail");
+        assert_eq!(
+            error
+                .downcast_ref::<GithubApiError>()
+                .map(|error| error.status),
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert!(
+            state
+                .github_breakers
+                .breaker_for(GithubCredentialBucket::for_installation_token(
+                    throttled_token
+                ))
+                .is_open(),
+            "a rate limit must park the token that hit it"
+        );
+
+        // The second token's budget is its own: its call is admitted, reaches
+        // GitHub, and validates while the first one is parked.
+        let body = send_github_json(
+            &state,
+            &healthy,
+            GithubSubsystem::Dispatch,
+            reqwest::Method::GET,
+            &url,
+            None,
+        )
+        .await
+        .expect("another token's bucket must not be open");
+        assert_eq!(body["id"], 7);
+        assert!(
+            !state
+                .github_breakers
+                .breaker_for(GithubCredentialBucket::for_installation_token(
+                    healthy_token
+                ))
+                .is_open(),
+            "a 200 must leave the other token's bucket closed"
+        );
+    }
+
+    /// The relay's Git transport is not the anonymous REST budget: a throttled
+    /// anonymous API must not refuse a public checkout, and the two buckets are
+    /// independent.
+    #[tokio::test]
+    async fn relay_and_anonymous_api_buckets_stay_independent() {
+        let stub = StubGitHub::serve(axum::http::StatusCode::OK, Vec::new(), "{\"ok\":true}").await;
+        let state = funnel_state().await;
+        let anonymous = state
+            .github_breakers
+            .breaker_for(GithubCredentialBucket::Anonymous);
+        for _ in 0..3 {
+            anonymous.record_failure(&GithubFailureKind::Unavailable, "502");
+        }
+        assert!(anonymous.is_open(), "the anonymous API budget is parked");
+
+        let response = send_github(
+            &state,
+            &GithubCredential::unauthenticated(GithubCredentialBucket::Relay),
+            GithubSubsystem::Snapshots,
+            crate::shared_http::CLIENT.get(format!(
+                "{}/o/r/info/refs?service=git-upload-pack",
+                stub.base
+            )),
+        )
+        .await
+        .expect("an exhausted anonymous REST budget must not refuse a public Git fetch");
+        assert!(response.status().is_success());
+        assert_eq!(stub.count(), 1, "the relay call reached the forge");
+        assert!(
+            !state
+                .github_breakers
+                .breaker_for(GithubCredentialBucket::Relay)
+                .is_open(),
+            "the relay's own bucket answers this exchange"
+        );
+        assert_ne!(
+            GithubCredentialBucket::Relay.label(),
+            GithubCredentialBucket::Anonymous.label(),
+            "the two dependencies must not share a bucket"
+        );
+    }
+
+    /// Bearers are operator PATs and live installation tokens: `Debug` (used in
+    /// every refusal and outage log line) must not print them.
+    #[test]
+    fn debug_never_prints_the_bearer() {
+        let credential = GithubCredential::bearer("ghp_secret_value", GithubCredentialBucket::Pat);
+        let rendered = format!("{credential:?}");
+        assert!(
+            !rendered.contains("ghp_secret_value"),
+            "a bearer must not reach Debug output: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "the token must be visibly redacted, not omitted: {rendered}"
+        );
+    }
+
+    /// Callers supply arbitrary bearer values, so the unnamed-installation set
+    /// is bounded: past the cap the least recently used bucket is evicted
+    /// rather than growing the registry without limit.
+    #[test]
+    fn unnamed_installation_buckets_stay_bounded() {
+        let registry = GithubBreakerRegistry::new(test_config());
+        for index in 0..(MAX_UNNAMED_INSTALLATION_BUCKETS + 32) {
+            registry.breaker_for(GithubCredentialBucket::for_installation_token(&format!(
+                "ghs_{index}"
+            )));
+        }
+        let labels = || {
+            registry
+                .snapshot()
+                .into_iter()
+                .filter(|row| row.bucket.starts_with("installation-token:"))
+                .count()
+        };
+        assert_eq!(labels(), MAX_UNNAMED_INSTALLATION_BUCKETS);
+        // The most recent bucket survives; the first one was evicted.
+        assert!(
+            !registry
+                .snapshot()
+                .iter()
+                .any(|row| row.bucket
+                    == GithubCredentialBucket::for_installation_token("ghs_0").label()),
+            "the least recently used bucket must be the one evicted"
         );
     }
 
