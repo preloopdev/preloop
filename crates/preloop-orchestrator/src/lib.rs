@@ -13,7 +13,8 @@ use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_pa
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
 use preloop_observability::deadline;
 use preloop_runner_server::github_breaker::{
-    BreakerOpen, GithubCredentialBucket, GithubFunnel, GithubSubsystem, send_observed_labeled,
+    BreakerOpen, GithubCredentialBucket, GithubFunnel, GithubSubsystem, send_observed_labeled_at,
+    service_origin,
 };
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
@@ -683,23 +684,51 @@ struct GitHubRelease {
 }
 
 /// Send one golden-path request through the engine's GitHub funnel: the
-/// anonymous bucket (every golden lookup and transfer is unauthenticated) and
-/// the `golden` subsystem label.
+/// anonymous bucket (every golden lookup and transfer is unauthenticated) at
+/// the origin `url` reaches, under the `golden` subsystem label.
 ///
-/// An open breaker refuses the request here, with [`BreakerOpen`] naming the
-/// wait, and nothing reaches the network — a golden lookup must not spend its
-/// own 30 s deadline rediscovering an outage the engine already knows about.
-/// Every golden request goes through this one function so the funnel sees the
-/// whole dependency, not the one endpoint someone remembered to instrument.
+/// The origin is part of the partition, not decoration. A golden source is a
+/// service, and the golden path reaches several: the release listing and
+/// release assets on github.com's hosts, GHCR for the packed OCI artifact, a
+/// token realm, and whatever host `PRELOOP_GOLDEN_URL` names. Keying them all
+/// on "anonymous" would let a mirror's outage park the engine's GitHub traffic
+/// and let an open GitHub breaker refuse a mirror that is perfectly healthy —
+/// so each host keeps its own breaker. On the engine's own GitHub origin those
+/// breakers *are* the ones the webhook, dispatch, and check-run paths use, and
+/// `GithubBreakerRegistry::unavailable_retry_after_at` is consulted first:
+/// an outage another bucket already discovered refuses the golden call here,
+/// before a connection is opened and before any of the 30 s metadata deadline
+/// is spent. A host that is not the engine's GitHub is never refused by
+/// GitHub's state and never refuses GitHub's.
+///
+/// A status in `expect` is a step in a protocol the caller is walking — the
+/// `401` challenge before a registry token exchange — and holds no verdict
+/// about reachability.
 async fn golden_send(
     github: &GithubFunnel,
+    url: &str,
+    expect: &[reqwest::StatusCode],
     request: reqwest::RequestBuilder,
 ) -> anyhow::Result<reqwest::Response> {
-    send_observed_labeled(
+    let origin = service_origin(url);
+    // An outage this process already discovered at this origin — usually on an
+    // App or installation bucket of the webhook path — refuses here rather
+    // than spending the golden call's deadline rediscovering it. Rate-limited
+    // buckets are excluded by `unavailable_retry_after_at`, so a throttled
+    // credential still gets the per-bucket answer from `acquire` below.
+    if let Some(retry_after) = github.breakers.unavailable_retry_after_at(&origin) {
+        github
+            .consumption
+            .record_breaker_blocked(GithubSubsystem::Golden);
+        return Err(anyhow::Error::new(BreakerOpen { retry_after }));
+    }
+    send_observed_labeled_at(
         &github.breakers,
+        &origin,
         GithubCredentialBucket::Anonymous,
         &github.consumption,
         GithubSubsystem::Golden,
+        expect,
         request,
     )
     .await
@@ -739,6 +768,8 @@ async fn resolve_latest_golden_tag(
     let url = format!("{api_base}/repos/preloopdev/preloop/releases?per_page=30");
     let releases = match golden_send(
         github,
+        &url,
+        &[],
         client
             .get(&url)
             .header(reqwest::header::ACCEPT, "application/vnd.github+json"),
@@ -746,6 +777,11 @@ async fn resolve_latest_golden_tag(
     .await
     {
         Ok(response) if response.status().is_success() => {
+            // The listing body is consumed below; its advertised size is the
+            // golden subsystem's share of the GitHub API budget.
+            github
+                .consumption
+                .record_advertised_bytes(GithubSubsystem::Golden, &response);
             match response.json::<Vec<GitHubRelease>>().await {
                 Ok(releases) => releases,
                 Err(error) => {
@@ -1610,18 +1646,26 @@ async fn download_release_asset(
         .and_then(|value| parse_sha256_checksum(&value));
     let expected_sha256 = match pinned_sha256 {
         Some(sha256) => Some(sha256),
-        None => match tokio::time::timeout(
-            Duration::from_secs(15),
-            golden_send(github, metadata.get(format!("{url}.sha256"))),
-        )
-        .await
-        {
-            Ok(Ok(res)) if res.status().is_success() => match res.text().await {
-                Ok(text) => parse_sha256_checksum(&text),
-                Err(_) => None,
-            },
-            _ => None,
-        },
+        None => {
+            let checksum_url = format!("{url}.sha256");
+            match tokio::time::timeout(
+                Duration::from_secs(15),
+                golden_send(github, &checksum_url, &[], metadata.get(&checksum_url)),
+            )
+            .await
+            {
+                Ok(Ok(res)) if res.status().is_success() => {
+                    github
+                        .consumption
+                        .record_advertised_bytes(GithubSubsystem::Golden, &res);
+                    match res.text().await {
+                        Ok(text) => parse_sha256_checksum(&text),
+                        Err(_) => None,
+                    }
+                }
+                _ => None,
+            }
+        }
     };
     if expected_sha256.is_none() {
         if require_checksum {
@@ -1635,7 +1679,7 @@ async fn download_release_asset(
         }
         warn!(url = %format!("{url}.sha256"), "no golden checksum published; downloading without verification");
     }
-    let probe = match golden_send(github, client.get(url)).await {
+    let probe = match golden_send(github, url, &[], client.get(url)).await {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
             info!(
@@ -1657,21 +1701,29 @@ async fn download_release_asset(
     let downloaded_bytes = {
         let client = client.clone();
         let url = url.to_owned();
-        let github = github.clone();
-        download_golden_with_resume(&partial, "release", None, Some(probe), move |offset| {
-            let client = client.clone();
-            let url = url.clone();
-            let github = github.clone();
-            Box::pin(async move {
-                let mut request = client.get(&url);
-                if offset > 0 {
-                    request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
-                }
-                golden_send(&github, request)
-                    .await
-                    .map_err(|error| format!("request failed: {error}"))
-            }) as BoxFuture<'static, Result<reqwest::Response, String>>
-        })
+        let funnel = github.clone();
+        download_golden_with_resume(
+            &partial,
+            "release",
+            None,
+            Some(probe),
+            github,
+            move |offset| {
+                let client = client.clone();
+                let url = url.clone();
+                let funnel = funnel.clone();
+                Box::pin(async move {
+                    let mut request = client.get(&url);
+                    if offset > 0 {
+                        request =
+                            request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+                    }
+                    golden_send(&funnel, &url, &[], request)
+                        .await
+                        .map_err(|error| format!("request failed: {error}"))
+                }) as BoxFuture<'static, Result<reqwest::Response, String>>
+            },
+        )
         .await
     };
     let downloaded_bytes = match downloaded_bytes {
@@ -1716,12 +1768,15 @@ async fn download_release_asset(
 /// `request_at` issues the request for a given byte offset; the caller decides
 /// how to authenticate (a plain GET for a release asset, a registry token for
 /// an OCI blob). Returns the bytes the file holds once the server has sent the
-/// whole body.
+/// whole body; every byte the server sent is attributed to the `golden`
+/// subsystem as it arrives, so a multi-gigabyte artifact does not report as
+/// free bandwidth in the consumption snapshot.
 async fn download_golden_with_resume(
     partial: &Path,
     source: &str,
     expected_total_bytes: Option<u64>,
     initial_response: Option<reqwest::Response>,
+    github: &GithubFunnel,
     mut request_at: impl FnMut(u64) -> BoxFuture<'static, Result<reqwest::Response, String>>,
 ) -> Result<u64, String> {
     // Claim the companion lock before creating the payload: a staging file
@@ -1789,6 +1844,7 @@ async fn download_golden_with_resume(
                     offset,
                     source,
                     expected_total_bytes,
+                    github,
                 )
                 .await
                 {
@@ -1818,7 +1874,9 @@ async fn download_golden_with_resume(
 ///
 /// Returns the total bytes the file now holds. The file is left in place on
 /// failure so the next attempt resumes it; the caller's checksum decides
-/// whether what is on disk is usable.
+/// whether what is on disk is usable. Each chunk is charged to the `golden`
+/// subsystem as it arrives — the body is the reason these calls exist, and its
+/// size is measured here, where the resumption arithmetic cannot flatter it.
 async fn stream_golden_body(
     response: reqwest::Response,
     partial: &Path,
@@ -1826,6 +1884,7 @@ async fn stream_golden_body(
     already_have: u64,
     source: &str,
     expected_total_bytes: Option<u64>,
+    github: &GithubFunnel,
 ) -> Result<u64, String> {
     let mut file = if resuming {
         tokio::fs::OpenOptions::new()
@@ -1849,6 +1908,9 @@ async fn stream_golden_body(
         file.write_all(&chunk)
             .await
             .map_err(|error| format!("write failed after {downloaded_bytes} bytes: {error}"))?;
+        github
+            .consumption
+            .record_bytes(GithubSubsystem::Golden, chunk.len() as u64);
         downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
         if downloaded_bytes >= next_progress {
             report_golden_download_progress(source, downloaded_bytes, total_bytes);
@@ -1960,12 +2022,12 @@ async fn download_oci_golden(
         let client = client.clone();
         let blob_url = blob_url.clone();
         let repository = oci.repository.clone();
-        let github = github.clone();
-        download_golden_with_resume(&partial, "OCI", layer_size, None, move |offset| {
+        let funnel = github.clone();
+        download_golden_with_resume(&partial, "OCI", layer_size, None, github, move |offset| {
             let client = client.clone();
             let url = blob_url.clone();
             let repository = repository.clone();
-            let github = github.clone();
+            let funnel = funnel.clone();
             Box::pin(async move {
                 crate::oci::registry_get(
                     &client,
@@ -1974,7 +2036,7 @@ async fn download_oci_golden(
                     "*/*",
                     None,
                     (offset > 0).then_some(offset),
-                    Some(&github),
+                    Some(&funnel),
                 )
                 .await
                 .map_err(|error| error.to_string())
@@ -13742,13 +13804,19 @@ mod golden_download_tests {
         let partial = directory.path().join("golden.smolmachine.partial");
         let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed = Arc::clone(&requested);
-        let result =
-            download_golden_with_resume(&partial, "test", Some(u64::MAX / 2), None, move |_| {
+        let result = download_golden_with_resume(
+            &partial,
+            "test",
+            Some(u64::MAX / 2),
+            None,
+            &test_github(),
+            move |_| {
                 observed.store(true, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async { Err("must not be requested".to_owned()) })
                     as BoxFuture<'static, Result<reqwest::Response, String>>
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(result.is_err(), "an artifact that cannot fit must fail");
         assert!(
             !requested.load(std::sync::atomic::Ordering::SeqCst),
@@ -14082,10 +14150,11 @@ mod golden_download_tests {
         );
     }
 
-    /// G10: an open breaker must refuse the golden release lookup before it
-    /// reaches the network — no connection to `api_base`, and none of the 30 s
-    /// metadata deadline spent — and the same lookup, once the open window
-    /// lapses, must go out again, take the answer, and close the breaker.
+    /// G10: an open breaker at the golden endpoint's own origin must refuse the
+    /// golden release lookup before it reaches the network — no connection to
+    /// `api_base`, and none of the 30 s metadata deadline spent — and the same
+    /// lookup, once the open window lapses, must go out again, take the answer,
+    /// and close the breaker.
     ///
     /// The client is built *before* the breaker is tripped: the first client in
     /// a process waits up to five seconds for the OS certificate store
@@ -14102,25 +14171,7 @@ mod golden_download_tests {
             {"tag_name": "v9.9.9", "assets": [{"name": golden_asset_name()}]}
         ])
         .to_string();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let api_base = format!("http://{}", listener.local_addr().unwrap());
-        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let served = Arc::clone(&hits);
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut request = [0_u8; 1024];
-                let _ = socket.read(&mut request).await;
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\n\r\n",
-                    body.len()
-                );
-                let _ = socket.write_all(head.as_bytes()).await;
-                let _ = socket.write_all(body.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-        });
+        let (api_base, hits) = json_listing_stub(body).await;
 
         // See the doc comment: the TLS roots (and therefore this client) are
         // resolved before the breaker is tripped.
@@ -14139,9 +14190,10 @@ mod golden_download_tests {
             })),
             consumption: Arc::new(GithubConsumption::default()),
         };
-        let breaker = funnel
-            .breakers
-            .breaker_for(GithubCredentialBucket::Anonymous);
+        let breaker = funnel.breakers.breaker_at(
+            &service_origin(&api_base),
+            GithubCredentialBucket::Anonymous,
+        );
         breaker.record_failure(&GithubFailureKind::Unavailable, "503 from api.github.com");
         assert!(breaker.is_open(), "the anonymous bucket starts open");
 
@@ -14218,6 +14270,7 @@ mod golden_download_tests {
             "test",
             Some(body.len() as u64),
             None,
+            &test_github(),
             move |offset| {
                 let url = url.clone();
                 Box::pin(async move {
@@ -14255,6 +14308,187 @@ mod golden_download_tests {
                 .contains(&format!("range: bytes={cut}-")),
             "second attempt must ask for the missing tail: {}",
             requests[1]
+        );
+    }
+
+    /// A release listing served by a stub, counting the connections it accepts.
+    async fn json_listing_stub(body: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (api_base, hits)
+    }
+
+    /// A funnel whose bucket-keyed methods speak for `origin`, with a window
+    /// short enough to wait out inside a test.
+    fn funnel_at(origin: &str) -> GithubFunnel {
+        GithubFunnel {
+            breakers: Arc::new(GithubBreakerRegistry::for_origin(
+                BreakerConfig {
+                    enabled: true,
+                    failure_threshold: 1,
+                    base_open: Duration::from_secs(1),
+                    max_open: Duration::from_secs(1),
+                    probe_timeout: Duration::from_secs(5),
+                },
+                origin,
+            )),
+            consumption: Arc::new(GithubConsumption::default()),
+        }
+    }
+
+    /// G10: an outage the engine already discovered at its own GitHub origin —
+    /// here an App bucket parked by the webhook path — refuses the golden
+    /// lookup before a connection is opened, without spending the metadata
+    /// deadline. The party that discovered it is deliberately *not* the
+    /// anonymous bucket: the point is that golden traffic inherits an outage
+    /// found by another credential's traffic at the same origin.
+    #[tokio::test]
+    async fn engine_origin_outage_refuses_the_lookup_from_another_bucket() {
+        let body = serde_json::json!([
+            {"tag_name": "v9.9.9", "assets": [{"name": golden_asset_name()}]}
+        ])
+        .to_string();
+        let (api_base, hits) = json_listing_stub(body).await;
+        // See the test above: the TLS roots are resolved before the trip.
+        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
+
+        let funnel = funnel_at(&service_origin(&api_base));
+        funnel
+            .breakers
+            .breaker_for(GithubCredentialBucket::App(7))
+            .record_failure(&GithubFailureKind::Unavailable, "502 from api.github.com");
+
+        let started = std::time::Instant::now();
+        let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
+        let waited = started.elapsed();
+
+        assert_eq!(tag, None, "a refused lookup resolves to no tag");
+        assert!(
+            waited < GOLDEN_METADATA_TIMEOUT / 10,
+            "the refusal waited {waited:?}: an outage the engine already knows about must not be \
+             rediscovered on the golden deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refused lookup must not touch the host"
+        );
+        assert_eq!(
+            funnel
+                .consumption
+                .snapshot()
+                .into_iter()
+                .find(|usage| usage.subsystem == "golden")
+                .map(|usage| usage.breaker_blocked),
+            Some(1),
+            "the refusal is golden's, and accounted as such"
+        );
+    }
+
+    /// The other half of the same partition: a GitHub outage says nothing about
+    /// a mirror at another origin. An operator whose `PRELOOP_GOLDEN_URL` points
+    /// at an internal host must still be able to download from it while
+    /// api.github.com is parked — and a mirror's outage must not park GitHub.
+    #[tokio::test]
+    async fn open_github_breaker_does_not_refuse_a_foreign_golden_host() {
+        let body = serde_json::json!([
+            {"tag_name": "v9.9.9", "assets": [{"name": golden_asset_name()}]}
+        ])
+        .to_string();
+        let (api_base, hits) = json_listing_stub(body).await;
+        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
+
+        let funnel = funnel_at("api.github.com");
+        for bucket in [
+            GithubCredentialBucket::Anonymous,
+            GithubCredentialBucket::App(7),
+            GithubCredentialBucket::Installation(42),
+        ] {
+            funnel
+                .breakers
+                .breaker_for(bucket)
+                .record_failure(&GithubFailureKind::Unavailable, "502 from api.github.com");
+        }
+
+        let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
+
+        assert_eq!(
+            tag.as_deref(),
+            Some("v9.9.9"),
+            "a healthy host must still be usable during a GitHub outage"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the lookup must reach the foreign host"
+        );
+    }
+
+    /// The `golden` subsystem reports the bytes it moved, not just its request
+    /// count: a multi-gigabyte transfer that accounted for nothing made the
+    /// per-subsystem consumption snapshot lie about where the bandwidth went.
+    #[tokio::test]
+    async fn golden_download_accounts_the_bytes_it_moved() {
+        let _serialized = GOLDEN_URL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("golden.smolmachine");
+
+        let body: Vec<u8> = (0..1024_u32).map(|i| i as u8).collect();
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(&body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let url = serve_with_checksum(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
+            body.clone(),
+            format!("{digest}  golden\n").into_bytes(),
+        )
+        .await;
+        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
+        let funnel = test_github();
+
+        let downloaded =
+            download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX), &funnel)
+                .await
+                .unwrap();
+
+        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
+        assert!(downloaded);
+        let usage = funnel
+            .consumption
+            .snapshot()
+            .into_iter()
+            .find(|usage| usage.subsystem == "golden")
+            .expect("the golden subsystem is reported");
+        assert!(
+            usage.bytes >= body.len() as u64,
+            "the transfer body must be charged to `golden`, got {} bytes for a {} byte artifact",
+            usage.bytes,
+            body.len()
+        );
+        assert!(
+            usage.requests >= 2,
+            "the checksum and the transfer are two requests, got {}",
+            usage.requests
         );
     }
 

@@ -75,7 +75,15 @@ Releases before v0.27.0 predate the changelog.
   open breaker refuses the metadata lookup before it opens a connection — none
   of its 30-second deadline is spent, and the refusal is not cached as a
   negative tag — while the transfers keep their one-hour budget and only their
-  admission decision changes.
+  admission decision changes. Breaker state is keyed by service origin as well
+  as credential, so the golden hosts an operator names (`PRELOOP_GOLDEN_URL`,
+  a non-GHCR `PRELOOP_GOLDEN_OCI_REF`, a token realm) keep their own breakers:
+  a mirror's outage cannot park GitHub traffic, an open GitHub breaker cannot
+  refuse a healthy mirror, and a GHES install's anonymous calls no longer share
+  a partition with the golden path's public-GitHub calls. A golden lookup also
+  inherits an outage another credential's traffic already discovered at the same
+  origin, and the `golden` subsystem now reports the bytes it moved rather than
+  zero.
 
 - **A hung OS keychain or trust daemon no longer freezes the engine.** On
   macOS, outbound TLS verified every new connection through

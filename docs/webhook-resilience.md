@@ -96,10 +96,24 @@ one deliberate exception: they are not GitHub traffic and spend no GitHub API
 budget.
 
 Breaker state is keyed per credential bucket (installation id, PAT, App id,
-anonymous), because GitHub's budgets are per credential. The runner pool
-resolves its bucket through the same registry `AppState` holds, so a GitHub
-outage the webhook path already discovered refuses the pool's next golden
-lookup instead of being rediscovered with a fresh 30-second wait.
+anonymous) *and* per service origin, because GitHub's budgets are per credential
+per host: a GHES instance, public github.com, GHCR, and a golden mirror are
+independent services, and a `429` or an outage at one must not park traffic to
+another. The bucket-keyed accessors speak for the engine's own GitHub origin
+(`PRELOOP_GITHUB_API_URL`, else `api.github.com`); a call to any other host
+names it. The runner pool resolves its golden calls through the same registry
+`AppState` holds, on the origin each URL actually reaches — so a GitHub outage
+the webhook path already discovered refuses the pool's next golden lookup
+instead of being rediscovered with a fresh 30-second wait, while a healthy
+mirror stays usable during that outage. The operational snapshot labels a
+foreign partition after its host (`anonymous@ghcr.io`); the engine's own keep
+their plain bucket labels.
+
+A response body is accounted too: the `golden` subsystem charges each streamed
+chunk exactly as it arrives (a transfer cut mid-body is charged for what it
+pulled, a resumed one only for the tail) and charges metadata bodies by their
+advertised length, so a multi-gigabyte pull is visible in the consumption
+snapshot instead of reading as free bandwidth.
 
 Three consecutive 5xx/transport failures open it; a `429`, or a `403` with
 `x-ratelimit-remaining: 0`, opens it immediately for exactly as long as
