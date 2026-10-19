@@ -586,16 +586,36 @@ jobs:
       # crates.io asks API clients to identify themselves, and both probes below
       # are read-only: one says whether the name is claimable-by-us yet, the
       # other makes a re-run of an already-published tag a no-op.
+      #
+      # They read the status code rather than `curl -f`: `-f` fails on every
+      # non-2xx, so an outage (5xx, 429, DNS, TLS) would look exactly like a
+      # missing crate — the name probe would skip the publish and still let
+      # `announce` complete at the previous version, and the version probe
+      # would republish a version that already exists. Only a definite 404
+      # means absent; anything else fails the job so the tag is retried.
       - name: Probe the crate
         id: probe
         run: |
           ua="preloop-release-workflow (https://github.com/preloopdev/preloop)"
-          if curl -fsS -A "$ua" https://crates.io/api/v1/crates/preloop > /dev/null; then
-            echo "claimed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "claimed=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=crates.io name unclaimed::preloop is not on crates.io yet — claim it once by hand (packaging/crates-io/README.md). Every later tag publishes automatically."
-          fi
+          probe() {
+            curl -sS -o /dev/null -w '%{http_code}' \
+              --retry 3 --retry-connrefused --max-time 30 \
+              -A "$ua" "$1"
+          }
+          code=$(probe https://crates.io/api/v1/crates/preloop) || code=""
+          case "$code" in
+            200)
+              echo "claimed=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "claimed=false" >> "$GITHUB_OUTPUT"
+              echo "::warning title=crates.io name unclaimed::preloop is not on crates.io yet — claim it once by hand (packaging/crates-io/README.md). Every later tag publishes automatically."
+              ;;
+            *)
+              echo "crates.io name probe returned '${code}', not 200 or 404; cannot tell whether preloop is claimed" >&2
+              exit 1
+              ;;
+          esac
           # The release is one version across every dist package; a split would
           # mean this job cannot tell which version the crate should carry.
           versions=$(echo "$PLAN" | jq --raw-output '[.releases[].app_version] | unique | join(" ")')
@@ -603,12 +623,20 @@ jobs:
             *" "* | "") echo "dist plan is not a single version: '${versions}'" >&2; exit 1 ;;
           esac
           echo "version=${versions}" >> "$GITHUB_OUTPUT"
-          if curl -fsS -A "$ua" "https://crates.io/api/v1/crates/preloop/${versions}" > /dev/null; then
-            echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "preloop ${versions} is already on crates.io; nothing to publish"
-          else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          fi
+          code=$(probe "https://crates.io/api/v1/crates/preloop/${versions}") || code=""
+          case "$code" in
+            200)
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "preloop ${versions} is already on crates.io; nothing to publish"
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "crates.io version probe returned '${code}', not 200 or 404; cannot tell whether preloop ${versions} is published" >&2
+              exit 1
+              ;;
+          esac
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         if: ${{ steps.probe.outputs.claimed == 'true' && steps.probe.outputs.published == 'false' }}
         id: auth
