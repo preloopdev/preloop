@@ -134,6 +134,12 @@ staging variables; otherwise a tmpfs-backed `/tmp` can fail with
 
 ## Publish
 
+`.github/workflows/official-golden.yml` can do the publish for you: dispatch it
+on `main` with `publish_ghcr` enabled. That job holds `packages: write` but
+never runs pull-request code, and it pushes the dated tag first, verifies the
+anonymous pull, and only then promotes `latest`. The default remains the
+host-side recipe below, which must keep the same order.
+
 Authenticate with a mode-600 Docker config containing GHCR `packages:write`
 credentials. Never commit or print the token.
 
