@@ -828,7 +828,10 @@ const EXEC_DEADLINE: Duration = Duration::from_secs(40 * 60);
 ///
 /// `ps ax` on a large CI host and a mount table are well under this; the shared
 /// runner keeps draining past the cap, so a runaway tool is truncated rather
-/// than buffered without limit and cannot block on a full pipe.
+/// than buffered without limit and cannot block on a full pipe. The cap bounds
+/// memory only: `run_host_tool` reports whether it bit, and the tools whose
+/// output is read as a complete table refuse a truncated capture rather than
+/// sweeping from half an inventory (see [`complete_inventory`]).
 const HOST_TOOL_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Child-wait deadlines for the external VM runtimes, one per class of work.
@@ -2911,7 +2914,8 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
         }
         // launchd's PATH has no /sbin, so the mount table tool is named absolutely.
         let mounts = run_host_tool("mount", "/sbin/mount", &[], PROBE_DEADLINE)?;
-        detach_orphaned_layer_mounts_in(&roots, &String::from_utf8_lossy(&mounts.stdout))
+        let mount_table = complete_inventory("/sbin/mount", &mounts)?;
+        detach_orphaned_layer_mounts_in(&roots, &mount_table)
     }
 }
 
@@ -2920,9 +2924,9 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
 #[cfg(target_os = "macos")]
 fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Result<usize, VmError> {
     let ps = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
+    let process_table = complete_inventory("ps", &ps)?;
     let mut detached = 0usize;
-    for mount in orphan_layer_store_mounts(roots, &String::from_utf8_lossy(&ps.stdout), mount_table)
-    {
+    for mount in orphan_layer_store_mounts(roots, &process_table, mount_table) {
         let mount_arg = mount.display().to_string();
         match run_host_tool(
             "hdiutil detach",
@@ -3000,14 +3004,16 @@ pub enum OrphanPurge {
 /// Both host tools it runs (`ps`, `kill`) are bounded by [`PROBE_DEADLINE`]:
 /// this is called from the pool's reconcile loop, where a wedged `ps` on a
 /// thrashing host must not stall the tick that also sweeps data dirs. A tool
-/// that runs out of time is reported; the next tick retries.
+/// that runs out of time is reported; the next tick retries. A `ps` table the
+/// capture cap cut short is reported the same way rather than swept as if it
+/// were complete (see [`complete_inventory`]).
 pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
     let roots = machine_data_roots();
     if roots.is_empty() {
         return Ok(0);
     }
     let output = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = complete_inventory("ps", &output)?;
     let mut killed = 0usize;
     for line in text.lines() {
         if !line.contains(BOOT_VM_PROCESS) {
@@ -3061,7 +3067,7 @@ fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
     }
     let target = canonical_path(data_dir);
     let output = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = complete_inventory("ps", &output)?;
     // Attribute by the boot-config path as written in argv, not by splitting
     // argv on whitespace: `ps` prints the command verbatim, so a data root
     // containing spaces (an operator's PRELOOP_HOME, a worktree path) would
@@ -3655,6 +3661,12 @@ struct HostToolOutput {
     success: bool,
     /// Exit code, or `-1` when the tool died to a signal.
     exit_code: i32,
+    /// Whether [`HOST_TOOL_CAPTURE_LIMIT`] cut either stream short.
+    ///
+    /// The cap exists to bound engine memory. It must not turn into a silent
+    /// licence to act on half an inventory, so the tools whose output is read
+    /// as a complete table ([`complete_inventory`]) refuse a truncated capture.
+    truncated: bool,
 }
 
 /// Run a host tool to completion under `deadline`, blocking.
@@ -3679,14 +3691,34 @@ fn run_host_tool(
     command.args(args);
     let what = format!("{operation} ({program})");
     match deadline::run_command_blocking_capped(command, deadline, &what, HOST_TOOL_CAPTURE_LIMIT) {
-        Ok((output, _truncated)) => Ok(HostToolOutput {
+        Ok((output, truncated)) => Ok(HostToolOutput {
             stdout: output.stdout,
             stderr: output.stderr,
             success: output.status.success(),
             exit_code: output.status.code().unwrap_or(-1),
+            truncated,
         }),
         Err(error) => Err(vm_error_from_command(operation, Path::new(program), error)),
     }
+}
+
+/// The complete standard output of an inventory tool, or the error that says
+/// the capture cap cut it short.
+///
+/// `ps ax` and `/sbin/mount` are read as the whole host — every later parser
+/// derives "no such process" or "not mounted" from their absence. A truncated
+/// capture would hide every entry after the cutoff, and the sweep would report
+/// success over an inventory it never saw. The cap bounds memory; it is not a
+/// licence to act on half a table, so a truncated one fails the tick loudly and
+/// the next tick retries.
+fn complete_inventory(tool: &'static str, output: &HostToolOutput) -> Result<String, VmError> {
+    if output.truncated {
+        return Err(VmError::Protocol(format!(
+            "{tool} wrote more than the {HOST_TOOL_CAPTURE_LIMIT}-byte capture limit; \
+             refusing to sweep from a truncated inventory"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 async fn forward(
@@ -4499,6 +4531,104 @@ mod tests {
             output.stdout.len()
         );
         assert!(String::from_utf8_lossy(&output.stdout).starts_with("line 0 "));
+    }
+
+    /// The capture cap bounds engine memory; it must be reported, not silently
+    /// swallowed. The sweeps read `ps`/`mount` output as a complete table —
+    /// every later decision comes from an entry's absence — so a capture the
+    /// cap cut short must fail the sweep instead of hiding every entry after
+    /// the cutoff.
+    #[test]
+    fn a_truncated_capture_is_reported_and_refused_as_an_inventory() {
+        let output = run_host_tool(
+            "chatty",
+            "awk",
+            &["BEGIN { for (i = 0; i < 120000; i++) \
+                 print \"line \" i \" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }"],
+            std::time::Duration::from_secs(60),
+        )
+        .expect("a chatty tool that exits must not be reported as a hang");
+        assert!(output.success, "chatty tool must exit zero");
+        assert_eq!(
+            output.stdout.len(),
+            HOST_TOOL_CAPTURE_LIMIT,
+            "the cap must bound the capture"
+        );
+        assert!(
+            output.truncated,
+            "a capture that hit the cap must report it"
+        );
+        let refused = complete_inventory("ps", &output)
+            .expect_err("a truncated table must not be accepted as an inventory");
+        assert!(
+            matches!(&refused, VmError::Protocol(message)
+                if message.contains("truncated inventory")),
+            "expected a protocol error naming the truncation, got {refused:?}"
+        );
+    }
+
+    /// The same helper on a table the cap did not touch: the capture is handed
+    /// over as it was read, and the sweep proceeds.
+    #[test]
+    fn a_complete_capture_is_accepted_as_an_inventory() {
+        let output = run_host_tool(
+            "ps",
+            "echo",
+            &["  501 /usr/bin/unrelated"],
+            std::time::Duration::from_secs(30),
+        )
+        .expect("echo must run");
+        assert!(!output.truncated, "a two-line table cannot hit the cap");
+        assert_eq!(
+            complete_inventory("ps", &output).expect("a complete table is accepted"),
+            "  501 /usr/bin/unrelated\n"
+        );
+    }
+
+    /// The runtime executables in the field are wrappers: a script that spawns
+    /// the real `smolvm`/`aenv` and waits for it. Killing only the wrapper pid
+    /// at the deadline would return `TimedOut` and release the lifecycle lock
+    /// while the operation the wrapper started keeps running, so a retry races
+    /// it. The deadline therefore signals the child's whole process group; this
+    /// is the case `exec sleep` in the other deadline tests cannot show, since
+    /// `exec` keeps the runtime on the wrapper's own pid.
+    #[test]
+    fn host_tool_deadline_kills_the_runtime_the_wrapper_spawned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("scratch");
+        let tool = dir.path().join("wrapper-runtime");
+        let record = dir.path().join("wrapper-runtime.pid");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\n\
+             sleep 300 &\n\
+             printf 'pid=%s\\n' \"$!\" > \"$1\"\n\
+             wait\n",
+        )
+        .expect("write the wrapper stand-in");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the wrapper stand-in");
+        // As in the other deadline tests, the budget has to outlast this test
+        // binary's own exec latency before the assertion means anything.
+        let error = run_host_tool(
+            "wedged-wrapper",
+            tool.to_str().unwrap(),
+            &[record.to_str().unwrap()],
+            std::time::Duration::from_secs(8),
+        )
+        .expect_err("a wrapper that waits on a wedged runtime must hit its deadline");
+        assert!(
+            matches!(&error, VmError::TimedOut { operation, .. }
+                if *operation == "wedged-wrapper"),
+            "expected a named deadline error, got {error:?}"
+        );
+        let runtime = recorded_pid(&record);
+        assert!(
+            await_process_gone(runtime, std::time::Duration::from_secs(10)),
+            "the runtime the wrapper spawned (pid {runtime}) outlived the deadline; \
+             a retry would race an operation that never stopped"
+        );
     }
 
     /// The async deadline path: a provider command whose child never exits is
