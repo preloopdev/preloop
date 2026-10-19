@@ -163,22 +163,27 @@ pub fn is_valid_externals_dir(dir: &Path, runtime: &str, expected_version: &str)
     };
 
     if manifest.platform.starts_with(host_os) {
-        // Native binary: probe `bin/node --version` directly.
-        let Some(stdout) = probe_node_version(&node_bin, NODE_VERSION_PROBE_TIMEOUT) else {
-            return false;
-        };
-        stdout == format!("v{expected}")
+        // Native binary: probe `bin/node --version` directly. Nothing excuses a
+        // silent binary here — a native manifest names a binary this host is
+        // supposed to run, so an unanswerable one is invalid either way.
+        match probe_node_version(&node_bin, NODE_VERSION_PROBE_TIMEOUT) {
+            NodeProbe::Version(stdout) => stdout == format!("v{expected}"),
+            NodeProbe::NotRunnable | NodeProbe::TimedOut => false,
+        }
     } else {
         // Non-native guest binary (e.g. linux-arm64 binary on macOS host).
-        // If the binary can be executed locally (e.g. shell scripts in test fixtures), verify version.
-        if let Some(stdout) = probe_node_version(&node_bin, NODE_VERSION_PROBE_TIMEOUT) {
-            return stdout == format!("v{expected}");
+        match probe_node_version(&node_bin, NODE_VERSION_PROBE_TIMEOUT) {
+            NodeProbe::Version(stdout) => stdout == format!("v{expected}"),
+            // A foreign binary the host cannot execute (an ELF on macOS) is
+            // expected, not a failure: validate via manifest provenance and a
+            // non-empty binary file. Only that outcome may fall through — a
+            // probe that timed out means the runtime *ran* and never answered,
+            // which is exactly the wedged directory this re-materializes.
+            NodeProbe::NotRunnable => std::fs::metadata(&node_bin)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false),
+            NodeProbe::TimedOut => false,
         }
-        // Foreign ELF binary cannot be executed on macOS host without virtualization;
-        // validate via manifest provenance and non-empty binary file.
-        std::fs::metadata(&node_bin)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
     }
 }
 
@@ -190,27 +195,43 @@ pub fn is_valid_externals_dir(dir: &Path, runtime: &str, expected_version: &str)
 /// re-materializes the directory instead.
 const NODE_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What a `node --version` probe found.
+#[derive(Debug, PartialEq, Eq)]
+enum NodeProbe {
+    /// The interpreter answered `--version` and exited successfully.
+    Version(String),
+    /// The host could not run the binary, or it failed. For a non-native
+    /// manifest this is the expected case on a host without the guest's
+    /// loader, and it says nothing about the directory.
+    NotRunnable,
+    /// The interpreter started but did not answer before
+    /// [`NODE_VERSION_PROBE_TIMEOUT`], so the probe was killed. Always a wedged
+    /// runtime, never a foreign binary — which is why it is not folded into
+    /// [`NodeProbe::NotRunnable`].
+    TimedOut,
+}
+
 /// `node_bin --version` stdout, when the binary exits successfully within
-/// `timeout`; `None` otherwise.
+/// `timeout`.
 ///
 /// The probe runs through the shared bounded runner, which kills and reaps a
 /// wedged child at the deadline. It stays synchronous because validation is also
-/// called from `preloop-runner configure`, which has no async runtime. Only a
-/// timeout is logged: a binary that cannot be executed on this host (a foreign
-/// guest binary) is expected, not a hang.
-fn probe_node_version(node_bin: &Path, timeout: Duration) -> Option<String> {
+/// called from `preloop-runner configure`, which has no async runtime. A binary
+/// that cannot be executed on this host (a foreign guest binary) is expected and
+/// not logged; a probe that timed out is the interesting one, so it is.
+fn probe_node_version(node_bin: &Path, timeout: Duration) -> NodeProbe {
     let mut probe = Command::new(node_bin);
     probe.arg("--version");
     match deadline::run_command_blocking(probe, timeout, "node --version probe") {
         Ok(output) if output.status.success() => {
-            Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            NodeProbe::Version(String::from_utf8_lossy(&output.stdout).trim().to_owned())
         }
-        Ok(_) => None,
+        Ok(_) => NodeProbe::NotRunnable,
         Err(error) if error.timed_out() => {
             tracing::warn!(%error, "node version probe gave no answer; treating the externals directory as invalid");
-            None
+            NodeProbe::TimedOut
         }
-        Err(_) => None,
+        Err(_) => NodeProbe::NotRunnable,
     }
 }
 
@@ -441,8 +462,7 @@ mod tests {
         );
         write_manifest(&runtime_dir, &manifest).unwrap();
         let fake_node = runtime_dir.join("bin/node");
-        std::fs::write(&fake_node, "#!/bin/sh\necho v24.3.0\n").unwrap();
-        std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_node_stand_in(&fake_node, "echo v24.3.0\n");
         assert!(is_valid_externals_dir(&runtime_dir, "node24", "24.3.0"));
     }
 
@@ -532,7 +552,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(
             probe_node_version(&node, deadline),
-            None,
+            NodeProbe::TimedOut,
             "a probe that never answers must not report a version"
         );
         let waited = started.elapsed();
@@ -564,7 +584,37 @@ mod tests {
         write_node_stand_in(&node, "echo v1.2.3\n");
         assert_eq!(
             probe_node_version(&node, Duration::from_secs(10)),
-            Some("v1.2.3".to_owned())
+            NodeProbe::Version("v1.2.3".to_owned())
+        );
+    }
+
+    /// A non-native manifest whose `node` starts but never answers is not a
+    /// runtime either. The foreign-binary fallback (manifest provenance plus a
+    /// non-empty file) exists for a binary this host *cannot execute*; folding
+    /// a timed-out probe into it would keep exactly the wedged directory the
+    /// timeout is meant to re-materialize. `win-x64` is foreign on every host
+    /// this runs on except Windows, where it is native — both branches must
+    /// still refuse it.
+    #[test]
+    fn a_hung_foreign_node_is_not_taken_for_an_unexecutable_binary() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime_dir = directory.path().join("node24");
+        std::fs::create_dir_all(runtime_dir.join("bin")).unwrap();
+        let manifest =
+            NodeManifest::new("node24", "24.3.0", "win-x64", "abc", "https://example.com");
+        write_manifest(&runtime_dir, &manifest).unwrap();
+        let node = runtime_dir.join("bin/node");
+        write_node_stand_in(&node, "exec sleep 600\n");
+
+        let started = std::time::Instant::now();
+        assert!(
+            !is_valid_externals_dir(&runtime_dir, "node24", "24.3.0"),
+            "a runtime that never answers must not validate"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "validation waited {:?}",
+            started.elapsed()
         );
     }
 }

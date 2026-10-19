@@ -409,16 +409,27 @@ Releases before v0.27.0 predate the changelog.
   heavy-step output after guest temporary-storage pressure.
 
 - **Pool start and golden lookups no longer hang on a stalled dependency.** The
-  host Node externals install is killed after 30 minutes. Each of its curl
-  transfers gives up after 30 seconds to connect and 10 minutes in total (2
-  minutes for the checksum file), and the externals copies are killed after 5
-  minutes, so a stalled nodejs.org fails with an error that names the dependency
-  and the deadline. Golden release, OCI manifest, and checksum lookups give up
-  after 30 seconds instead of sharing the 60-minute download budget; golden
-  downloads keep their 60-minute limit. The orphaned-VM cleanup at startup and on
-  the reconcile interval stops waiting after 10 minutes, the host memory probe
-  after 10 seconds, and a `node --version` check of an externals directory after
-  10 seconds, which counts that directory as invalid.
+  host Node externals install is killed after 30 minutes — as a whole process
+  group, so the `curl`, `tar`, or `node --version` step it is stuck on dies with
+  the shell that started it, and a shutdown that arrives mid-install cancels it
+  the same way instead of waiting out the deadline. Each of its curl transfers
+  gives up after 30 seconds to connect and 10 minutes in total (2 minutes for
+  the checksum file), and the externals copies are killed after 5 minutes, so a
+  stalled nodejs.org fails with an error that names the dependency and the
+  deadline. Golden release, OCI manifest, and checksum lookups give up after 30
+  seconds instead of sharing the 60-minute download budget — the manifest lookup
+  as one budget for the whole resolution, its bearer-token exchange included,
+  and a blob's token exchange runs on that same short-lived client while the
+  transfer keeps its hour. The orphaned-VM cleanup at startup and on the
+  reconcile interval stops waiting after 10 minutes, and each `ps`, `kill`,
+  `hdiutil`, and `/sbin/mount` child it runs is killed after 30 seconds; a
+  startup sweep that outlives its own deadline now fails pool start rather than
+  serving while it could still kill a runner booted after the wait. The orphaned
+  data-directory sweeps carry the same 10-minute bound. The host memory probe
+  gives up after 10 seconds, and a `node --version` check of an externals
+  directory after 10 seconds, which counts that directory as invalid — a
+  non-native manifest whose binary hangs is no longer taken for a foreign binary
+  the host cannot execute.
 
 ## [0.34.4] - 2026-10-13
 
