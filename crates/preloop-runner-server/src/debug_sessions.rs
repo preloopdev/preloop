@@ -95,7 +95,8 @@ pub struct SessionRecord {
     /// against this, so one job's runtime token cannot read, resolve, or
     /// close another job's session.
     pub agent_job_id: uuid::Uuid,
-    /// Verdict awaiting pickup by the worker. Cleared once delivered.
+    /// Verdict awaiting pickup by the worker. Redelivered until the worker
+    /// closes the session; `close` and a new pause clear it.
     pub pending_verdict: Option<Verdict>,
     /// Revert policy the controller chose alongside the verdict.
     pub pending_revert: preloop_gha_protocol::debug_session::RevertPolicy,
@@ -626,14 +627,20 @@ impl DebugSessionRegistry {
     /// and `paused_since` is consumed there, so later polls cannot bank the
     /// same interval twice.
     ///
-    /// Delivery is not take-and-forget for every verdict. A `retry` is consumed
-    /// by pickup: replaying it would re-run steps the controller asked to run
-    /// once. `continue` and `abort` stay pending and are delivered on every poll
-    /// until the worker closes the session (which it does after acting on the
-    /// verdict, making a redelivery idempotent); a lost HTTP response then costs
-    /// a repeat, rather than turning an issued verdict into "no decision" —
-    /// which would keep the failed conclusion, or pause again on the next
-    /// failure. `close` drops whatever is left.
+    /// Delivery is not take-and-forget for any verdict: a verdict stays
+    /// pending, and is redelivered on every poll, until the worker closes the
+    /// session (which it does after acting on it, making a redelivery
+    /// idempotent). A lost HTTP response then costs a repeat, rather than
+    /// turning an issued verdict into "no decision". That is not a symmetric
+    /// trade, it is the only survivable one: a consumed verdict that never
+    /// reached the worker leaves the worker polling a session that will never
+    /// answer, and every one of those polls refreshes `worker_seen_at`, so the
+    /// 90-second abandonment sweep cannot fire either — the failed job is held
+    /// indefinitely, for a decision the controller has already made. A
+    /// `retry` that does arrive is acted on once per pause, because the worker
+    /// leaves the poll loop on the first delivery and closes the session; a
+    /// `retry` that does not is retried instead of being dropped. `close`
+    /// drops whatever is left.
     ///
     /// A session that reached a terminal state without a verdict answers `None`,
     /// exactly like one that no longer exists: the worker treats that as "the
@@ -651,11 +658,7 @@ impl DebugSessionRegistry {
             return None;
         }
         record.worker_seen_at = now;
-        let verdict = match record.pending_verdict {
-            Some(Verdict::Retry) => record.pending_verdict.take(),
-            Some(pending @ (Verdict::Continue | Verdict::Abort)) => Some(pending),
-            None => None,
-        };
+        let verdict = record.pending_verdict;
         if verdict.is_some() {
             record.bank_paused(now);
         }
@@ -666,7 +669,7 @@ impl DebugSessionRegistry {
             version: record.session.version,
             revert: record.pending_revert,
             source_revision: record.pending_revision.clone(),
-            retry_from_step: record.pending_retry_from_step.take(),
+            retry_from_step: record.pending_retry_from_step,
         })
     }
 
@@ -1900,23 +1903,43 @@ mod tests {
     }
 
     #[test]
-    fn a_retry_verdict_is_consumed_by_its_first_pickup() {
+    fn a_retry_verdict_is_redelivered_until_the_worker_closes() {
         let (mut registry, id) = registry_with_session();
         ctrl(
             &mut registry,
             &id,
-            SessionOperation::Retry {
+            SessionOperation::RetryFrom {
+                step_index: 0,
                 revert: Default::default(),
                 source_revision: None,
             },
         );
-        let delivered = registry.take_verdict(&id, at(10)).expect("poll");
-        assert_eq!(delivered.verdict, Some(Verdict::Retry));
-        // Replaying a retry would re-run the failed step, so it is consumed by
-        // the pickup; the session is still open (retrying) and the worker's
-        // next poll is an ordinary empty poll.
+        // The worker may have missed the first response — the connection died
+        // after the server recorded the delivery. A retry consumed by that
+        // pickup would leave the worker polling a session that never answers
+        // again, and every one of those polls refreshes `worker_seen_at`, so
+        // the abandonment sweep could not free the held job either.
+        let first = registry.take_verdict(&id, at(10)).expect("poll");
+        assert_eq!(first.verdict, Some(Verdict::Retry));
+        assert_eq!(first.retry_from_step, Some(0));
         let second = registry.take_verdict(&id, at(20)).expect("poll");
-        assert_eq!(second.verdict, None);
+        assert_eq!(second.verdict, Some(Verdict::Retry));
+        assert_eq!(
+            second.retry_from_step,
+            Some(0),
+            "the step the replay starts from has to survive with its verdict"
+        );
+        // Redelivery must not re-bank the pause: the clock stopped at the
+        // first delivery.
+        assert_eq!(registry.paused_for_request(7, at(60)).as_secs(), 10);
+
+        // The worker acts on the verdict and reports the close; the next poll
+        // has no session to wait on any more.
+        registry.close(&id, SessionState::Resumed, at(30));
+        assert!(
+            registry.take_verdict(&id, at(40)).is_none(),
+            "close must clear the verdict so the next poll sees a closed session"
+        );
     }
 
     #[test]

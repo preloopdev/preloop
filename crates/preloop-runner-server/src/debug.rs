@@ -43,60 +43,48 @@ pub async fn register_dap_port(
     let caller_runner_id = caller
         .runner_id
         .ok_or_else(|| ApiError::forbidden("runner identity is required to register a DAP port"))?;
-    // Backend: run + job status. Node-local: `dap_ports` registration.
-    let statuses = shared
-        .state
-        .backend
-        .run_job_statuses(run_id)
-        .await
-        .map_err(ApiError::from)?;
-    let jobs = statuses.ok_or_else(|| ApiError::not_found("run not found"))?;
-    let status = jobs
-        .iter()
-        .find(|(job_id, _)| *job_id == payload.job_id)
-        .map(|(_, status)| *status)
-        .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
-    if !matches!(status, ExecutionStatus::InProgress) {
-        return Err(ApiError::bad_request(
-            "DAP port can only be registered for an in-progress job",
-        ));
-    }
-    // The attempt records which runner claimed it; that is the machine whose
-    // DAP bridge may publish a port for this job.
-    let request = shared
-        .state
-        .backend
-        .request(crate::control::backend::RequestKey::Job(
-            run_id,
-            payload.job_id.clone(),
-        ))
-        .await
-        .map_err(|error| match error {
-            crate::control::ControlError::NotFound(_) => {
-                ApiError::bad_request("job does not belong to run")
-            }
-            other => ApiError::from(other),
-        })?;
-    if request.owner_runner_id != Some(caller_runner_id) {
-        return Err(ApiError::forbidden(
-            "only the runner serving this job may register its DAP port",
-        ));
-    }
+    // Fast reject, before the node-local lock: the backend reads below must not
+    // make every other control-plane path on this node queue behind a caller
+    // that plainly does not serve this job.
+    dap_registration_statuses(&shared, run_id, &payload.job_id).await?;
+    dap_registration_owner(&shared, run_id, &payload.job_id, caller_runner_id).await?;
     let mut inner = shared.state.inner.lock().await;
-    // Refuse only what would take the channel away from a debug target that
-    // is still live: another job of this run whose status above says it is
-    // still running. Everything else is a replacement — the same job from a
-    // new owner, or a registration whose job is over.
-    if let Some(existing) = inner.dap_ports.get(&run_id)
-        && existing.job_id != payload.job_id
-        && jobs.iter().any(|(job_id, status)| {
-            *job_id == existing.job_id && *status == ExecutionStatus::InProgress
-        })
+    // Both checks are repeated here, under the lock the insert takes, and the
+    // ownership one last. The handoff that moves a job to another runner is a
+    // backend transaction this node's map is not part of, so the checks above
+    // cannot authorize the write: a request can pass them, lose the job, and
+    // still reach `dap_ports.insert`. Re-reading here leaves no await between
+    // the last check and the insert, so a stale request is left only the window
+    // a handoff needs to commit inside those few instructions — a window
+    // queueing requests cannot widen. Registration runs once per DAP bridge
+    // start, so paying for one indexed lookup under the lock is cheap next to
+    // publishing a channel for a job the caller no longer serves.
+    //
+    // Refuse only what would take the channel away from a debug target that is
+    // still live: another job of this run that is still running. Everything
+    // else is a replacement — the same job from a new owner, or a registration
+    // whose job is over — so a dead runner's entry, or one whose job already
+    // finished, must not lock the next owner out. The statuses are read again
+    // here rather than reused from the fast reject above because a job this
+    // run requeued and re-claimed since then is in progress again, and
+    // replacing its channel would cut off a live debug target.
+    if let Some(existing) = inner
+        .dap_ports
+        .get(&run_id)
+        .map(|entry| entry.job_id.clone())
+        && existing != payload.job_id
     {
-        return Err(ApiError::conflict(
-            "another job of this run is already being debugged",
-        ));
+        let jobs = dap_registration_statuses(&shared, run_id, &payload.job_id).await?;
+        if jobs
+            .iter()
+            .any(|(job_id, status)| *job_id == existing && *status == ExecutionStatus::InProgress)
+        {
+            return Err(ApiError::conflict(
+                "another job of this run is already being debugged",
+            ));
+        }
     }
+    dap_registration_owner(&shared, run_id, &payload.job_id, caller_runner_id).await?;
     inner.dap_ports.insert(
         run_id,
         DapPortRegistration {
@@ -112,6 +100,68 @@ pub async fn register_dap_port(
         "Registered DAP port"
     );
     Ok(StatusCode::OK)
+}
+
+/// The run's job statuses, refusing a job that is not in progress.
+///
+/// A registration is only meaningful for a job that is running: a finished
+/// job has no debug adapter to reach, and a queued one has no machine yet.
+async fn dap_registration_statuses(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Result<Vec<(JobId, ExecutionStatus)>, ApiError> {
+    let jobs = shared
+        .state
+        .backend
+        .run_job_statuses(run_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    let status = jobs
+        .iter()
+        .find(|(id, _)| *id == *job_id)
+        .map(|(_, status)| *status)
+        .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
+    if !matches!(status, ExecutionStatus::InProgress) {
+        return Err(ApiError::bad_request(
+            "DAP port can only be registered for an in-progress job",
+        ));
+    }
+    Ok(jobs)
+}
+
+/// Refuse a caller that is not the runner the job's current attempt names as
+/// its owner.
+///
+/// The attempt records which runner claimed the job; that is the machine whose
+/// DAP bridge may publish a port for it.
+async fn dap_registration_owner(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    job_id: &JobId,
+    caller_runner_id: i64,
+) -> Result<(), ApiError> {
+    let request = shared
+        .state
+        .backend
+        .request(crate::control::backend::RequestKey::Job(
+            run_id,
+            job_id.clone(),
+        ))
+        .await
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => {
+                ApiError::bad_request("job does not belong to run")
+            }
+            other => ApiError::from(other),
+        })?;
+    if request.owner_runner_id != Some(caller_runner_id) {
+        return Err(ApiError::forbidden(
+            "only the runner serving this job may register its DAP port",
+        ));
+    }
+    Ok(())
 }
 
 pub async fn ws_dap_debug(
