@@ -127,6 +127,26 @@ impl EnvironmentSpec {
         Self::from_base_with_account(base, user, uid)
     }
 
+    /// Resolve the environment for a base image under an explicit golden
+    /// *source identity*.
+    ///
+    /// [`Self::for_base`] names whatever the host would fetch or bake for this
+    /// base — the pinned official reference, a `PRELOOP_GOLDEN_OCI_REF` /
+    /// `PRELOOP_GOLDEN_URL` override, or the bake contract. That string is the
+    /// golden's identity, and with a *mutable* source (a tag, a mirror URL
+    /// whose bytes change) it stays the same while the bytes it names do not.
+    /// This constructor takes the identity instead, so a caller that resolved
+    /// the source down to a revision can fold that revision in:
+    /// `oci:<ref>@<digest>`, `<url>@sha256:<digest>`. The fingerprint keys the
+    /// packed payload, the golden machine name and its record, so a golden
+    /// published under the same mutable source is then a *new* golden rather
+    /// than a rebuild of the name the previous one occupies — which is what
+    /// makes a rotation stage beside the old golden instead of draining it.
+    pub fn for_base_with_source(base: String, source: String) -> Self {
+        let (user, uid) = resolve_runner_account();
+        Self::from_base_source_and_account(base, source, &user, uid)
+    }
+
     /// Resolve a queued job's base image from its `runs-on` labels.
     ///
     /// Only a supported hosted Ubuntu label selects the official golden.
@@ -164,25 +184,33 @@ impl EnvironmentSpec {
     }
 
     fn from_base_with_account(base: String, user: &str, uid: u32) -> Self {
+        // The official golden is built by the release pipeline from a
+        // published runner image, not here: its identity is whatever source
+        // this host would fetch it from — the digest pinned in
+        // `official_golden_source`, a `PRELOOP_GOLDEN_OCI_REF` override, or the
+        // `PRELOOP_GOLDEN_URL` mirror, which selects a different pack with a
+        // different name. A configured image is baked locally, so its
+        // fingerprint is the bake contract itself — bump a step of
+        // `golden_contract_script` and every golden is rebuilt.
+        let source = if is_official_golden(&base) {
+            crate::official_golden_source()
+        } else {
+            crate::golden_contract_script(user, uid)
+        };
+        Self::from_base_source_and_account(base, source, user, uid)
+    }
+
+    fn from_base_source_and_account(base: String, source: String, _user: &str, _uid: u32) -> Self {
         let normalized = serde_json::json!({
             "base": &base,
             // The pool only rebuilds when the fingerprint-suffixed artifact
             // file is missing, so bake-content changes MUST invalidate the
             // fingerprint or the pool silently keeps the old golden forever.
             //
-            // The official golden is built by the release pipeline from a
-            // published runner image, not here: its identity is whatever
-            // source this host would fetch it from — the digest pinned in
-            // `official_golden_source`, a `PRELOOP_GOLDEN_OCI_REF` override,
-            // or the `PRELOOP_GOLDEN_URL` mirror, which selects a different
-            // pack with a different name. A configured image is baked
-            // locally, so its fingerprint is the bake contract itself — bump
-            // a step of `golden_contract_script` and every golden is rebuilt.
-            "golden": if is_official_golden(&base) {
-                crate::official_golden_source()
-            } else {
-                crate::golden_contract_script(user, uid)
-            },
+            // `golden` is the source identity: the reference, URL, resolved
+            // revision, or bake contract this golden's bytes come from. See
+            // [`Self::for_base_with_source`] for the revision case.
+            "golden": source,
             // Rosetta x86_64 translation exists only on Apple Silicon hosts.
             // The golden prep installs the amd64 loader + libc so dynamically
             // linked x86_64 binaries run under it; the fingerprint records

@@ -2470,6 +2470,7 @@ fn guest_hostname_script_at(hosts: &str) -> String {
     )
 }
 
+
 /// The per-guest **hosted runtime init**: what the hosted image's own init
 /// applies to a job's environment, applied by preloop instead.
 ///
@@ -2507,6 +2508,77 @@ fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str) -> String {
         "set -e; ( {} ); ( {} )",
         guest_hostname_script_at(hosts),
         guest_sysctl_script_at(sysctl_root)
+    )
+}
+
+/// Re-apply the guest resolver step *inside the workload container* after the
+/// last container preparation that precedes a job.
+///
+/// The SmolVM agent (re)writes a persistent workload overlay's
+/// `/etc/resolv.conf` — to the guest's network resolver — whenever it
+/// (re)prepares that overlay (`storage::PersistentOverlay::execute_or_remount`
+/// → `refresh_overlay_resolver`), and the runner's own launch is one of those
+/// preparations. The runtime init's resolver half therefore runs *before* it
+/// and is overwritten: measured on smolvm 1.30.1 in one machine, preloop's
+/// write at 04:17:17.750 and the agent's rewrite at 04:17:18.305. What the
+/// container keeps is the guest's network gateway — the address the job's
+/// Dockerd hands its containers as the embedded DNS's `ExtServers`, which
+/// cannot answer for a compose network's `/etc/hosts` alias, so
+/// `postgres.localhost` came back NXDOMAIN and `db_migrate` failed on the
+/// template run.
+///
+/// Applied *after* the launch and re-checked bounded
+/// ([`CONTAINER_RESOLVER_STUB_ATTEMPTS`]): a refresh that lands while this
+/// step runs must not leave the machine with the gateway resolver silently.
+fn container_resolver_stub_script() -> String {
+    container_resolver_stub_script_at(
+        "/etc/resolv.conf",
+        "/run/systemd/resolve/stub-resolv.conf",
+        "/run/systemd/resolve/resolv.conf",
+        CONTAINER_RESOLVER_STUB_ATTEMPTS,
+        CONTAINER_RESOLVER_STUB_INTERVAL,
+    )
+}
+
+/// `resolv_conf`, `stub` and `upstream_file` are the scratch paths the shell
+/// tests substitute for `/etc/resolv.conf`, the stub's own file and resolved's
+/// upstream list; `attempts` and `interval` are the bounded re-check
+/// ([`CONTAINER_RESOLVER_STUB_ATTEMPTS`], [`CONTAINER_RESOLVER_STUB_INTERVAL`],
+/// shortened by the tests). Production passes the paths above and the
+/// constants' values.
+fn container_resolver_stub_script_at(
+    resolv_conf: &str,
+    stub: &str,
+    upstream_file: &str,
+    attempts: u32,
+    interval: &str,
+) -> String {
+    format!(
+        "prl_tries=0; \
+         while :; do \
+           ( {step} ); \
+           prl_first=$(awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2; exit }}' {conf} 2>/dev/null); \
+           if [ \"$prl_first\" = 127.0.0.53 ]; then \
+             echo \"preloop: the container resolver names the 127.0.0.53 stub first\"; \
+             break; \
+           fi; \
+           prl_tries=$((prl_tries + 1)); \
+           if [ \"$prl_tries\" -ge {attempts} ]; then \
+             echo \"preloop: warning: the container resolver still names '$prl_first' after {attempts} attempts; Docker's embedded DNS will not resolve /etc/hosts aliases\" >&2; \
+             exit 1; \
+           fi; \
+           sleep {interval} 2>/dev/null || true; \
+         done",
+        conf = shell_quote(resolv_conf),
+        step = guest_resolver_stub_script_at(
+            resolv_conf,
+            stub,
+            upstream_file,
+            RESOLVER_STUB_WAIT_ATTEMPTS,
+            RESOLVER_STUB_WAIT_INTERVAL,
+        ),
+        attempts = attempts,
+        interval = shell_quote(interval),
     )
 }
 
@@ -3169,17 +3241,54 @@ impl Drop for GoldenReservation<'_> {
     }
 }
 
-/// The pool's prepared fork bases, keyed by environment fingerprint.
+/// The machine name a golden for `fingerprint` gets.
 ///
-/// Normally one: the pool prepares the configured environment's golden at
-/// startup. A slot that resolves a *different* environment — a
+/// Fingerprint-keyed, not a fixed `{prefix}-golden`: the name is the golden's
+/// identity everywhere SmolVM (registry row, data directory, forks' inherited
+/// record) and this pool's sweeps look at it, so a second golden for the same
+/// environment can exist *beside* the first while a rotation stages. The
+/// twelve hex characters are the fingerprint prefix the pool has always used
+/// for a job-environment golden, and `managed_golden` matches the shape.
+fn fingerprint_golden_name(name_prefix: &str, fingerprint: &str) -> String {
+    format!(
+        "{}-golden-{}",
+        name_prefix,
+        &fingerprint[..12.min(fingerprint.len())]
+    )
+}
+
+/// One prepared fork base, plus the bookkeeping a rotation needs.
+struct GoldenEntry {
+    name: MachineName,
+    /// Forks this golden has served that have not released it yet: a runner
+    /// forked from it that is booting, idle, or running its one job.
+    ///
+    /// A retiring golden is deleted only at zero. This is the whole reason a
+    /// rotation can delete the old golden without draining the pool: the
+    /// delete waits for the job a clone is running instead of stopping it.
+    clones: usize,
+    /// Set once a newer golden superseded this one, or the pool stopped
+    /// resolving it. The entry stays forkable until its clones release it.
+    retiring: bool,
+    /// The fingerprint this golden may *stand in* for while its successor is
+    /// staged: the pool's configured environment keeps forking its previous
+    /// generation instead of refusing to serve until the new one is ready.
+    substitutes: Option<String>,
+}
+
+/// The pool's prepared fork bases, keyed by environment fingerprint, with the
+/// rotation state on top: what each golden is serving, how many forks still
+/// owe it, and which of them must be deleted when they fall idle.
+///
+/// Normally one entry: the pool prepares the configured environment's golden
+/// at startup. A slot that resolves a *different* environment — a
 /// `runs-on: ubuntu-latest` job on a pool whose configured image is custom —
 /// memoizes its golden here instead of rebuilding it per job. Every golden is
 /// prepared the same way (`prepare_fork_base`): from the packed artifact
 /// on a file-pack backend, from the image itself where the backend keeps packs
 /// server-side.
 pub(crate) struct GoldenCache {
-    goldens: RwLock<HashMap<String, MachineName>>,
+    entries: std::sync::Mutex<HashMap<String, GoldenEntry>>,
     /// Per-fingerprint construction locks. A single build lock used to be held
     /// across the whole bake, so one environment's golden build parked every
     /// other slot on the mutex — silently, with no logs — freezing the pool
@@ -3189,14 +3298,24 @@ pub(crate) struct GoldenCache {
     /// any existing machine of that name).
     build_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     name_prefix: String,
+    /// The environment the pool's own golden must be: the configured base with
+    /// its golden source resolved to a revision. Slot resolution maps the
+    /// configured base onto this spec, which is what lets a rotation move the
+    /// pool onto a new golden without editing the process environment.
+    desired: RwLock<Option<EnvironmentSpec>>,
+    /// Woken when a fork releases a golden, so the rotation task can delete a
+    /// retired golden the moment its last clone exits instead of on a timer.
+    released: tokio::sync::Notify,
 }
 
 impl GoldenCache {
     pub fn new(name_prefix: String) -> Self {
         Self {
-            goldens: RwLock::new(HashMap::new()),
+            entries: std::sync::Mutex::new(HashMap::new()),
             build_locks: RwLock::new(HashMap::new()),
             name_prefix,
+            desired: RwLock::new(None),
+            released: tokio::sync::Notify::new(),
         }
     }
 
@@ -3207,7 +3326,268 @@ impl GoldenCache {
 
     /// Get existing golden or return None if not yet prepared.
     pub async fn get(&self, fingerprint: &str) -> Option<MachineName> {
-        self.goldens.read().await.get(fingerprint).cloned()
+        self.entries
+            .lock()
+            .expect("golden ledger is not poisoned")
+            .get(fingerprint)
+            .map(|entry| entry.name.clone())
+    }
+
+    /// Register a prepared golden as the one new forks for `fingerprint` use.
+    pub async fn insert(&self, fingerprint: String, name: MachineName) {
+        self.register(fingerprint, name).await;
+    }
+
+    /// Register `name` as serving `fingerprint`, replacing any earlier entry
+    /// for it. An entry that was standing in for this fingerprint stops doing
+    /// so: the real golden is here.
+    pub async fn register(&self, fingerprint: String, name: MachineName) {
+        let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
+        for entry in entries.values_mut() {
+            if entry.substitutes.as_deref() == Some(fingerprint.as_str()) {
+                entry.substitutes = None;
+            }
+        }
+        entries.insert(
+            fingerprint,
+            GoldenEntry {
+                name,
+                clones: 0,
+                retiring: false,
+                substitutes: None,
+            },
+        );
+    }
+
+    /// Register `name` as the golden new forks use *until* the golden for
+    /// `desired` is ready, recording the substitution so slot resolution can
+    /// find it. Used when the pool starts on an older prepared golden.
+    pub async fn register_substitute(
+        &self,
+        name: MachineName,
+        fingerprint: String,
+        desired: String,
+    ) {
+        let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
+        entries.insert(
+            fingerprint,
+            GoldenEntry {
+                name,
+                clones: 0,
+                retiring: false,
+                substitutes: Some(desired),
+            },
+        );
+    }
+
+    /// The golden serving `fingerprint` as a stand-in for it, if any.
+    pub async fn substitute_for(&self, fingerprint: &str) -> Option<MachineName> {
+        self.entries
+            .lock()
+            .expect("golden ledger is not poisoned")
+            .values()
+            .find(|entry| entry.substitutes.as_deref() == Some(fingerprint))
+            .map(|entry| entry.name.clone())
+    }
+
+    /// The environment the configured golden must be, once resolved.
+    pub async fn set_desired(&self, spec: EnvironmentSpec) {
+        *self.desired.write().await = Some(spec);
+    }
+
+    pub async fn desired(&self) -> Option<EnvironmentSpec> {
+        self.desired.read().await.clone()
+    }
+
+    /// The spec this pool serves for `base`: `resolved` unless rotation owns
+    /// this environment and has moved on to another generation of it.
+    pub async fn current_spec(&self, resolved: EnvironmentSpec) -> EnvironmentSpec {
+        let desired = self.desired.read().await;
+        match desired.as_ref() {
+            Some(spec) if spec.base == resolved.base => spec.clone(),
+            _ => resolved,
+        }
+    }
+
+    /// Count one fork from `name` until the returned guard drops.
+    ///
+    /// Returns `None` for a golden this pool does not track (a re-created
+    /// golden, a machine from another engine), which must not block anything.
+    pub fn fork_started(self: &Arc<Self>, name: &MachineName) -> Option<GoldenFork> {
+        let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
+        let entry = entries.values_mut().find(|entry| entry.name == *name)?;
+        entry.clones += 1;
+        Some(GoldenFork {
+            ledger: self.clone(),
+            name: name.clone(),
+        })
+    }
+
+    fn fork_finished(&self, name: &MachineName) {
+        let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
+        if let Some(entry) = entries.values_mut().find(|entry| entry.name == *name) {
+            entry.clones = entry.clones.saturating_sub(1);
+        }
+        drop(entries);
+        self.released.notify_waiters();
+    }
+
+    /// Mark every registered golden *except* `keep` as retiring: they were
+    /// superseded, or no pool environment resolves them any more. Returns the
+    /// names of those with no clone left to wait for, in retirement order.
+    pub async fn retire_all_but(&self, keep: &[MachineName]) -> Vec<(String, MachineName)> {
+        let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
+        let mut releasable = Vec::new();
+        for (fingerprint, entry) in entries.iter_mut() {
+            if keep.contains(&entry.name) || entry.retiring {
+                continue;
+            }
+            entry.retiring = true;
+            if entry.clones == 0 {
+                releasable.push((fingerprint.clone(), entry.name.clone()));
+            }
+        }
+        releasable
+    }
+
+    /// Mark one golden retiring, returning it if nothing forks from it.
+    pub async fn retire(&self, name: &MachineName) -> Option<(String, MachineName)> {
+        let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
+        let (fingerprint, entry) = entries.iter_mut().find(|(_, entry)| entry.name == *name)?;
+        entry.retiring = true;
+        (entry.clones == 0).then(|| (fingerprint.clone(), entry.name.clone()))
+    }
+
+    /// The retired goldens whose last clone has exited.
+    pub async fn releasable(&self) -> Vec<(String, MachineName)> {
+        self.entries
+            .lock()
+            .expect("golden ledger is not poisoned")
+            .iter()
+            .filter(|(_, entry)| entry.retiring && entry.clones == 0)
+            .map(|(fingerprint, entry)| (fingerprint.clone(), entry.name.clone()))
+            .collect()
+    }
+
+    /// Whether anything is still retiring: a rotation is not finished until
+    /// every superseded golden is gone.
+    pub async fn retiring(&self) -> Vec<(String, MachineName)> {
+        self.entries
+            .lock()
+            .expect("golden ledger is not poisoned")
+            .iter()
+            .filter(|(_, entry)| entry.retiring)
+            .map(|(fingerprint, entry)| (fingerprint.clone(), entry.name.clone()))
+            .collect()
+    }
+
+    /// Drop an entry after its machine and artifacts are gone.
+    pub async fn forget(&self, fingerprint: &str) {
+        self.entries
+            .lock()
+            .expect("golden ledger is not poisoned")
+            .remove(fingerprint);
+    }
+
+    /// Wake the rotation task: a golden may now be deletable.
+    pub fn notify_released(&self) {
+        self.released.notify_waiters();
+    }
+
+    /// Adopt `name` as the golden for `fingerprint` and return the goldens it
+    /// replaced, already marked retiring.
+    ///
+    /// Two entries can be replaced: the one that stood in for `fingerprint`
+    /// while its successor was staged, and the entry registered under the
+    /// previously desired fingerprint. Both stop being fork sources the moment
+    /// the switch lands — new forks resolve to the new fingerprint — and are
+    /// deleted once the clones they already have exit.
+    pub async fn switch_to(
+        &self,
+        fingerprint: String,
+        name: MachineName,
+    ) -> Vec<(String, MachineName)> {
+        let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
+        let mut replaced = Vec::new();
+        for (other_fingerprint, entry) in entries.iter_mut() {
+            if entry.name == name {
+                entry.retiring = false;
+                entry.substitutes = None;
+                continue;
+            }
+            if entry.substitutes.as_deref() != Some(fingerprint.as_str()) {
+                continue;
+            }
+            entry.retiring = true;
+            entry.substitutes = None;
+            if entry.clones == 0 {
+                replaced.push((other_fingerprint.clone(), entry.name.clone()));
+            }
+        }
+        if let Some(entry) = entries.get_mut(&fingerprint) {
+            if entry.name != name {
+                // The same fingerprint under another machine. Unreachable in
+                // practice — the golden's name *is* its fingerprint, and
+                // `prepare_fork_base` deletes that machine before it rebuilds
+                // one — so the older entry can only be a leftover record of a
+                // machine that is already gone.
+                warn!(
+                    machine = entry.name.as_str(),
+                    replacement = name.as_str(),
+                    fingerprint,
+                    "a golden for this fingerprint was replaced by a rebuild"
+                );
+                entry.retiring = true;
+                if entry.clones == 0 {
+                    replaced.push((fingerprint.clone(), entry.name.clone()));
+                }
+            }
+        }
+        entries.insert(
+            fingerprint,
+            GoldenEntry {
+                name,
+                clones: 0,
+                retiring: false,
+                substitutes: None,
+            },
+        );
+        replaced
+    }
+
+    /// Whether a resident golden stands in for `fingerprint`, or holds the
+    /// previous generation's fingerprint: the rotation is a handover, not an
+    /// addition, and must not spend a second golden slot on it.
+    pub async fn replaces(&self, fingerprint: &str, previous: Option<&str>) -> bool {
+        let entries = self.entries.lock().expect("golden ledger is not poisoned");
+        entries
+            .values()
+            .any(|entry| entry.substitutes.as_deref() == Some(fingerprint))
+            || previous.is_some_and(|previous| entries.contains_key(previous))
+    }
+
+    /// Wait for a fork to release a golden.
+    pub async fn released(&self) {
+        self.released.notified().await;
+    }
+
+    /// Number of retained goldens, retiring ones included: each still holds a
+    /// machine and its storage until it is deleted.
+    pub async fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("golden ledger is not poisoned")
+            .len()
+    }
+
+    /// The fingerprints the pool has registered, with their machine names.
+    pub async fn registered(&self) -> Vec<(String, MachineName)> {
+        self.entries
+            .lock()
+            .expect("golden ledger is not poisoned")
+            .iter()
+            .map(|(fingerprint, entry)| (fingerprint.clone(), entry.name.clone()))
+            .collect()
     }
 
     /// Get the golden for `fingerprint`, or construct it via `build`.
@@ -3262,19 +3642,766 @@ impl GoldenCache {
         Ok(Some(name))
     }
 
-    /// Number of retained goldens.
-    pub async fn len(&self) -> usize {
-        self.goldens.read().await.len()
-    }
-
-    /// Register a prepared golden VM for a fingerprint.
-    pub async fn insert(&self, fingerprint: String, name: MachineName) {
-        self.goldens.write().await.insert(fingerprint, name);
-    }
-
     /// Return all registered golden machine names.
     pub async fn all_names(&self) -> Vec<MachineName> {
-        self.goldens.read().await.values().cloned().collect()
+        self.entries
+            .lock()
+            .expect("golden ledger is not poisoned")
+            .values()
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+}
+
+/// One in-flight fork's hold on a golden.
+///
+/// Dropped when the fork's machine is gone — after its one job, or after a
+/// failed provision — which is what releases the golden for deletion. A guard
+/// covers every exit path (`?`, `break`, a cancelled provision) because a
+/// leaked count would strand a retired golden's storage forever.
+pub(crate) struct GoldenFork {
+    ledger: Arc<GoldenCache>,
+    name: MachineName,
+}
+
+impl GoldenFork {
+    /// The golden this fork was taken from.
+    pub fn name(&self) -> &MachineName {
+        &self.name
+    }
+}
+
+impl Drop for GoldenFork {
+    fn drop(&mut self) {
+        self.ledger.fork_finished(&self.name);
+    }
+}
+
+/// How long a graceful shutdown waits for a busy runner to finish its one job.
+///
+/// A runner is single-use: the engine's shutdown is the *only* thing that can
+/// end a job early, and killing a VM mid-job fails a run that was minutes from
+/// its result (`preloop update` restarts the engine, so this is the difference
+/// between a rolling restart and a failed run). The wait is the minimum the
+/// rotation design owes: warm provisioning stops first, so nothing new is
+/// created, and the machines already running their job are given the time.
+///
+/// Bounded because a wedged guest must not pin the engine's stop forever; the
+/// pool's teardown deletes whatever is left when the deadline passes.
+const SHUTDOWN_JOB_GRACE: Duration = Duration::from_secs(600);
+/// Override for [`SHUTDOWN_JOB_GRACE`]: `0` deletes busy runners immediately
+/// (the pre-drain behavior), a larger value waits longer.
+const SHUTDOWN_JOB_GRACE_ENV: &str = "PRELOOP_SHUTDOWN_JOB_GRACE_SECS";
+
+fn shutdown_job_grace() -> Duration {
+    std::env::var(SHUTDOWN_JOB_GRACE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(SHUTDOWN_JOB_GRACE, Duration::from_secs)
+}
+
+/// How often the pool re-resolves the configured golden source, so a golden
+/// published under the same mutable reference (a tag, a mirror URL) is staged
+/// without an operator touching the engine.
+const GOLDEN_POLL_INTERVAL: Duration = Duration::from_secs(300);
+/// Override for [`GOLDEN_POLL_INTERVAL`]; `0` disables live re-resolution, so
+/// a new golden is taken up on the next engine start.
+const GOLDEN_POLL_ENV: &str = "PRELOOP_GOLDEN_POLL_SECS";
+
+fn golden_poll_interval() -> Option<Duration> {
+    match std::env::var(GOLDEN_POLL_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => Some(GOLDEN_POLL_INTERVAL),
+    }
+}
+
+/// The fingerprint a golden machine was prepared for, from its record.
+fn golden_record_fingerprint(config: &RunnerPoolConfig, golden: &MachineName) -> Option<String> {
+    let path = golden_record_path(config, golden)?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|recorded| recorded.trim().to_owned())
+        .filter(|fingerprint| !fingerprint.is_empty())
+}
+
+/// Record of the configured environment's golden this pool last served.
+///
+/// A golden's own record says *what* it was baked from, never *which*
+/// environment of this pool it is: the name shape is the same for the pool's
+/// configured golden and for a job-environment golden a slot built on demand.
+/// Rotation has to tell them apart — the previous generation of the pool's own
+/// environment is what keeps serving while its successor stages, while an
+/// unrelated environment's golden must not be handed to a job that asked for
+/// this one — so the pool keeps this one line of state.
+fn configured_golden_marker_path(config: &RunnerPoolConfig) -> Option<PathBuf> {
+    let directory = config.artifact_stem.parent()?.join("goldens");
+    Some(directory.join("configured.fingerprint"))
+}
+
+fn read_configured_golden_marker(config: &RunnerPoolConfig) -> Option<String> {
+    let path = configured_golden_marker_path(config)?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn write_configured_golden_marker(config: &RunnerPoolConfig, fingerprint: &str) {
+    let Some(path) = configured_golden_marker_path(config) else {
+        return;
+    };
+    let written = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .and_then(|_| std::fs::write(&path, fingerprint));
+    if let Err(error) = written {
+        // Worth a warning: a lost marker costs one extra staging pass on the
+        // next start, never a wrong golden.
+        warn!(path = %path.display(), %error, "configured-golden marker not written");
+    }
+}
+
+/// The packed payload for one environment fingerprint.
+///
+/// Keyed by fingerprint, exactly like `RunnerPoolConfig::artifact_payload`:
+/// a rotation's new payload must land beside the old one, because the old
+/// golden is still serving from its own payload path until it retires.
+fn payload_for_fingerprint(config: &RunnerPoolConfig, fingerprint: &str) -> PathBuf {
+    let mut path = config.artifact_stem.clone().into_os_string();
+    path.push(format!("-{fingerprint}"));
+    PathBuf::from(path)
+}
+
+/// Reclaim the payload (`<stem>-<fingerprint>` and its sidecars) of a golden
+/// that is gone.
+///
+/// SmolVM consumes the pack from this path — the download lands *at* the stem,
+/// a locally built golden leaves the pack in the `<stem>.smolmachine` sidecar —
+/// and the engine's crash recovery keeps a `.sha256` companion when a mirror
+/// published one. All three belong to the retired fingerprint alone.
+fn remove_golden_payload(config: &RunnerPoolConfig, fingerprint: &str) {
+    let payload = payload_for_fingerprint(config, fingerprint);
+    for suffix in ["", ".smolmachine", ".sha256"] {
+        let path = PathBuf::from(format!("{}{suffix}", payload.display()));
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(path = %path.display(), "removed a retired golden's payload"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                path = %path.display(),
+                %error,
+                "failed to remove a retired golden's payload"
+            ),
+        }
+    }
+}
+
+/// The environment this pool must serve: the configured base with its golden
+/// source resolved to whatever revision it currently names.
+///
+/// A mutable source — `PRELOOP_GOLDEN_OCI_REF` naming a tag, a
+/// `PRELOOP_GOLDEN_URL` mirror that republishes — keeps the same string while
+/// the bytes behind it change. Folding the resolved revision into the
+/// environment identity is what makes the new bytes a *new* golden (new
+/// payload path, new machine name, new record) that can be staged beside the
+/// one still serving, instead of a rebuild of the name it occupies.
+///
+/// Resolution failure is not fatal: the source keeps its unresolved identity,
+/// which is exactly the previous behavior, and the golden already prepared for
+/// it keeps serving.
+async fn resolve_configured_environment(config: &RunnerPoolConfig) -> EnvironmentSpec {
+    resolve_configured_source(config).await.0
+}
+
+/// [`resolve_configured_environment`] with the revision that identity came
+/// from, for the paths that can reuse an already-downloaded payload.
+async fn resolve_configured_source(config: &RunnerPoolConfig) -> (EnvironmentSpec, Option<String>) {
+    let base = config.base_image.clone();
+    if !is_official_golden(&base) {
+        // A configured image is baked locally: its identity is the bake
+        // contract, which only a binary upgrade changes.
+        return (EnvironmentSpec::for_base(base), None);
+    }
+    match golden_source_revision().await {
+        Some(source) => (
+            EnvironmentSpec::for_base_with_source(base, source.clone()),
+            Some(source),
+        ),
+        None => (EnvironmentSpec::for_base(base), None),
+    }
+}
+
+/// The revision the configured official golden source names, or `None` when
+/// the source is immutable (or cannot be resolved).
+async fn golden_source_revision() -> Option<String> {
+    if let Some(url) = golden_url_override() {
+        // A mirror's bytes are what its `.sha256` companion describes, and the
+        // downloader refuses an unverified mirror payload anyway (see
+        // `download_release_asset`), so the checksum is the identity.
+        return mirror_revision(&url).await;
+    }
+    let reference = std::env::var("PRELOOP_GOLDEN_OCI_REF")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| default_golden_oci_ref().map(str::to_owned))?;
+    if oci_reference_is_pinned(&reference) {
+        // Already immutable: keep the identity string the engine has always
+        // hashed for it, so an upgrade never re-downloads a golden whose
+        // content cannot have changed.
+        return None;
+    }
+    oci_manifest_digest(&reference)
+        .await
+        .map(|digest| format!("oci:{reference}@{digest}"))
+}
+
+/// Whether an OCI reference pins a digest instead of naming a mutable tag.
+fn oci_reference_is_pinned(reference: &str) -> bool {
+    reference
+        .rsplit_once('@')
+        .is_some_and(|(_, digest)| digest.starts_with("sha256:") && digest.len() == 71)
+}
+
+/// The digest a mutable OCI reference currently resolves to.
+async fn oci_manifest_digest(reference: &str) -> Option<String> {
+    let oci = OciReference::parse(reference).ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()?;
+    match get_manifest(&client, &oci, MANIFEST_ACCEPT, None).await {
+        Ok(resolved) => {
+            // The digest of the platform manifest the pool downloads. A tag that
+            // resolves to a single image names no index entry, and this client does
+            // not expose the registry's content digest for it, so that tag is not
+            // tracked: the pool keeps the golden it already has.
+            let digest = resolved.selected_digest?;
+            info!(reference, digest = %digest, "resolved the mutable golden reference");
+            Some(digest)
+        }
+        Err(error) => {
+            // Keep serving what is already prepared: a registry outage must
+            // not turn into a golden rebuild or a refused start.
+            warn!(reference, %error, "could not resolve the golden reference; keeping the current golden");
+            None
+        }
+    }
+}
+
+/// The revision a mirror URL publishes, from its companion checksum.
+async fn mirror_revision(url: &str) -> Option<String> {
+    if let Ok(pinned) = std::env::var("PRELOOP_GOLDEN_SHA256") {
+        if let Some(digest) = parse_sha256_checksum(&pinned) {
+            return Some(format!("{url}@sha256:{digest}"));
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let response = client.get(format!("{url}.sha256")).send().await.ok()?;
+    if !response.status().is_success() {
+        warn!(
+            url = %format!("{url}.sha256"),
+            status = %response.status(),
+            "mirror publishes no checksum; keeping the current golden"
+        );
+        return None;
+    }
+    let digest = parse_sha256_checksum(&response.text().await.ok()?)?;
+    Some(format!("{url}@sha256:{digest}"))
+}
+
+/// Whether a recorded fingerprint belongs to an environment this pool can
+/// still resolve: its own configured image, or the official golden that a
+/// `runs-on: ubuntu-latest`/`ubuntu-24.04` label selects.
+///
+/// The pool's stated sources are exactly those two (`base_for_labels`), which
+/// is what makes every other fingerprint a golden nothing can prepare again —
+/// a replacement image, a previous release's contract, or a revision of a
+/// mutable source that has moved on. Those are the goldens a rotation
+/// reclaims; anything resolvable is left for the job that may ask for it.
+fn fingerprint_is_resolvable(config: &RunnerPoolConfig, fingerprint: &str) -> bool {
+    [
+        crate::environment::OFFICIAL_GOLDEN,
+        config.base_image.as_str(),
+    ]
+    .iter()
+    .any(|base| EnvironmentSpec::for_base((*base).to_owned()).fingerprint == fingerprint)
+}
+
+/// What the pool found on the host, and what it will serve while staging.
+#[derive(Debug)]
+struct GoldenPlan {
+    /// The environment the pool must reach.
+    desired: EnvironmentSpec,
+    /// A prepared golden new forks can use right now, with its fingerprint.
+    serving: Option<(MachineName, String)>,
+    /// Whether `serving` *is* the desired environment, so nothing is staged.
+    up_to_date: bool,
+    /// Prepared goldens the pool will not serve: superseded generations of its
+    /// own environment, reclaimed before staging starts.
+    surplus: Vec<(String, MachineName)>,
+}
+
+impl GoldenPlan {
+    fn empty(desired: EnvironmentSpec) -> Self {
+        Self {
+            desired,
+            serving: None,
+            up_to_date: false,
+            surplus: Vec::new(),
+        }
+    }
+
+    /// Names the machine sweep must spare: the golden serving this start.
+    ///
+    /// Superseded generations are *not* spared: the plan reclaims them itself,
+    /// and a failed reclamation is retried by the sweep.
+    fn spared(&self) -> Vec<MachineName> {
+        self.serving.iter().map(|(name, _)| name.clone()).collect()
+    }
+}
+
+/// Decide which prepared golden this start serves, and which of the recorded
+/// goldens are superseded.
+///
+/// Three cases, in order:
+///
+/// * a golden whose record is the desired fingerprint — adopted as it is, so a
+///   restart costs no preparation at all;
+/// * the *previous generation* of the pool's own environment (the marker, see
+///   [`configured_golden_marker_path`]) — served while the desired one stages,
+///   which is what keeps a rotation from draining the pool;
+/// * nothing — a cold host, where the desired golden is prepared in the
+///   foreground before any slot starts.
+///
+/// A recorded golden that is neither the desired one nor the marked previous
+/// generation is reclaimed: it can only be a generation this pool has already
+/// replaced. A golden for an *unrelated* environment (a slot's own bake) is
+/// deliberately left alone — nothing says the queue will not ask for it again.
+async fn plan_goldens<P: VmProvider>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    desired: &EnvironmentSpec,
+) -> GoldenPlan {
+    let mut plan = GoldenPlan::empty(desired.clone());
+    let marker = read_configured_golden_marker(config);
+    // The identity this pool's own environment hashed before its golden source
+    // resolved to a revision: a golden prepared by an engine that did not
+    // resolve one is this pool's previous generation, not an unrelated
+    // environment, and must be served rather than left idle during the
+    // upgrade's first staging pass.
+    let unresolved = EnvironmentSpec::for_base(desired.base.clone()).fingerprint;
+    let mut previous: Option<(MachineName, String)> = None;
+    let mut superseded: Vec<(String, MachineName)> = Vec::new();
+    let Ok(machines) = provider.list().await else {
+        warn!("golden inventory failed; preparing the configured golden");
+        return plan;
+    };
+    for name in machines {
+        if !managed_golden(config, &name) {
+            continue;
+        }
+        let Some(fingerprint) = golden_record_fingerprint(config, &name) else {
+            // No record: not adoptable, and the stale-machine sweep owns it.
+            continue;
+        };
+        if !matches!(
+            provider.status(&name).await,
+            Ok(MachineState::Running) | Ok(MachineState::Stopped)
+        ) {
+            continue;
+        }
+        if fingerprint == desired.fingerprint {
+            plan.serving = Some((name, fingerprint));
+        } else if marker.as_deref() == Some(fingerprint.as_str()) || fingerprint == unresolved {
+            previous = Some((name, fingerprint));
+        } else if fingerprint_is_resolvable(config, &fingerprint) {
+            // A golden for an environment this pool can still resolve — the
+            // official golden a `runs-on: ubuntu-…` label selects, or its own
+            // configured image. The queue can ask for it again, so it stays.
+            continue;
+        } else {
+            superseded.push((fingerprint, name));
+        }
+    }
+    if plan.serving.is_none()
+        && let Some((name, fingerprint)) = previous
+    {
+        plan.serving = Some((name, fingerprint));
+    }
+    plan.up_to_date = plan
+        .serving
+        .as_ref()
+        .is_some_and(|(_, fingerprint)| *fingerprint == desired.fingerprint);
+    plan.surplus = superseded;
+    plan
+}
+
+/// Bytes the volume must have free before a second golden is staged beside the
+/// one already serving.
+///
+/// Two full unpack trees at once: the serving golden keeps its own storage for
+/// as long as it serves (the whole point of staging beside it), and the new
+/// pack needs its download plus its extraction on top. A host that cannot
+/// afford both refuses to stage and keeps serving the old golden, which is a
+/// working pool instead of an ENOSPC part-way through a 50 GB write.
+fn rotation_staging_required_bytes(new_pack: Option<u64>, resident_pack: Option<u64>) -> u64 {
+    let estimate = |bytes: Option<u64>| match bytes {
+        Some(bytes) => bytes,
+        None => GOLDEN_UNKNOWN_SIZE_ESTIMATE,
+    };
+    golden_unpack_required_bytes(estimate(new_pack))
+        .saturating_add(golden_unpack_required_bytes(estimate(resident_pack)))
+}
+
+/// Whether `available` bytes can hold the staging of a second golden.
+fn rotation_staging_fits(required: u64, available: u64) -> bool {
+    available >= required
+}
+
+/// Payload size of the golden currently serving, when its file is readable.
+fn serving_payload_bytes(config: &RunnerPoolConfig, fingerprint: &str) -> Option<u64> {
+    let payload = payload_for_fingerprint(config, fingerprint);
+    std::fs::metadata(packed_golden_path(&payload))
+        .ok()
+        .map(|meta| meta.len())
+        .or_else(|| std::fs::metadata(&payload).ok().map(|meta| meta.len()))
+}
+
+/// Whether the volume has room for `spec`'s gray beside the serving golden.
+///
+/// `Ok(())` when it does (or when the preflight is overridden), `Err(reason)`
+/// when staging must be refused. Never waits: a stalled rotation is a pool
+/// that runs on the old golden, which is better than a pool that stalls
+/// between two of them.
+fn rotation_staging_room(
+    config: &RunnerPoolConfig,
+    spec_fingerprint: &str,
+    serving_fingerprint: Option<&str>,
+    available: AvailableSpace,
+) -> Result<(), String> {
+    if disk_preflight_overridden() {
+        return Ok(());
+    }
+    let root = golden_disk_root(config);
+    let new_pack = serving_payload_bytes(config, spec_fingerprint);
+    let resident_pack = serving_fingerprint.and_then(|fp| serving_payload_bytes(config, fp));
+    let required = rotation_staging_required_bytes(new_pack, resident_pack);
+    let free = available(&root).map_err(|error| {
+        format!(
+            "free space on {} is unreadable ({error}); refusing to stage a second golden",
+            root.display()
+        )
+    })?;
+    if rotation_staging_fits(required, free) {
+        return Ok(());
+    }
+    Err(format!(
+        "a second golden needs {} bytes on {} and only {} are free; keeping the golden that \
+         is already serving (override the preflight with {} if the estimate is wrong)",
+        required,
+        root.display(),
+        free,
+        DISK_PREFLIGHT_OVERRIDE
+    ))
+}
+
+/// Reuse an already-downloaded payload for a newly resolved revision.
+///
+/// A mirror or tag that starts publishing a *revision* where the pool hashed
+/// the plain source string moves the payload path; when the bytes at the old
+/// path are exactly the revision the new identity names, renaming the file
+/// keeps the identity change from costing another multi-gigabyte download. The
+/// digest is checked, so a stale or tampered file is never promoted.
+async fn adopt_legacy_payload(
+    config: &RunnerPoolConfig,
+    spec: &EnvironmentSpec,
+    revision: Option<&str>,
+) {
+    let destination = payload_for_fingerprint(config, &spec.fingerprint);
+    if destination.is_file() {
+        return;
+    }
+    let Some(expected) = revision.and_then(|value| value.rsplit_once("@sha256:").map(|(_, d)| d))
+    else {
+        return;
+    };
+    let legacy = config.artifact_payload();
+    if !legacy.is_file() || legacy == destination {
+        return;
+    }
+    let Ok(digest) = sha256_file(&legacy).await else {
+        return;
+    };
+    if !digest.eq_ignore_ascii_case(expected) {
+        return;
+    }
+    if let Err(error) = std::fs::rename(&legacy, &destination) {
+        debug!(%error, "could not reuse the previous payload path");
+        return;
+    }
+    info!(
+        from = %legacy.display(),
+        to = %destination.display(),
+        "reused the payload already downloaded under the previous identity"
+    );
+}
+
+/// Stage the golden for `spec` beside whatever is serving, then switch to it.
+///
+/// The two halves are ordered and never overlap the other way round: the new
+/// golden is fully prepared (unpacked, contract applied, frozen forkable)
+/// before it becomes the one new forks use, and only then do the goldens it
+/// replaced start retiring. A failure anywhere before the switch leaves the
+/// previous golden serving and the pool untouched.
+async fn stage_and_switch_golden<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    cache: &Arc<GoldenCache>,
+    spec: &EnvironmentSpec,
+    revision: Option<&str>,
+    budget: &GoldenBudget,
+    shutdown: &CancellationToken,
+) -> Result<MachineName, OrchestratorError> {
+    let name = MachineName::new(fingerprint_golden_name(
+        cache.name_prefix(),
+        &spec.fingerprint,
+    ))?;
+    let previous = cache.desired().await;
+    let previous_fingerprint = previous.as_ref().map(|spec| spec.fingerprint.as_str());
+    if let Err(reason) = rotation_staging_room(
+        config,
+        &spec.fingerprint,
+        previous_fingerprint,
+        filesystem_available_space,
+    ) {
+        return Err(OrchestratorError::Config(reason));
+    }
+    adopt_legacy_payload(config, spec, revision).await;
+    // Replacing a resident golden is net-zero for the host's memory: the one
+    // that hands over is deleted as soon as its last fork releases it, so the
+    // budget must not block the handover it is counting.
+    let budget = if cache
+        .replaces(&spec.fingerprint, previous_fingerprint)
+        .await
+    {
+        GoldenBudget::unbounded()
+    } else {
+        budget.clone()
+    };
+    let staged = unless_shutdown(
+        shutdown,
+        cache.get_or_prepare(&spec.fingerprint, &budget, {
+            let provider = provider.clone();
+            let config = config.clone();
+            let spec = spec.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                prepare_fork_base(&provider, &config, &name, &spec, &shutdown).await?;
+                Ok(name)
+            }
+        }),
+    )
+    .await
+    .ok_or_else(|| OrchestratorError::Pool("golden staging cancelled by shutdown".into()))??;
+    let Some(name) = staged else {
+        return Err(OrchestratorError::Config(
+            "the host cannot retain another golden; keeping the one that is serving".into(),
+        ));
+    };
+    for (fingerprint, retired) in cache
+        .switch_to(spec.fingerprint.clone(), name.clone())
+        .await
+    {
+        retire_golden(provider, config, cache, &fingerprint, &retired).await;
+    }
+    write_configured_golden_marker(config, &spec.fingerprint);
+    Ok(name)
+}
+
+/// Delete a retired golden: machine, record, payload, extracted layers.
+///
+/// The machine's own storage and its layer store entry are the bulk of a
+/// golden, so this is the step that makes a rotation cost no permanent disk.
+/// A failed machine delete keeps the entry (and its record), so the next
+/// rotation pass — or the next engine start — retries instead of leaking it.
+async fn retire_golden<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    cache: &GoldenCache,
+    fingerprint: &str,
+    name: &MachineName,
+) {
+    let survivors: Vec<MachineName> = provider
+        .list()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|other| {
+            other != name
+                && other
+                    .as_str()
+                    .starts_with(&format!("{}-", config.name_prefix))
+        })
+        .collect();
+    // Stop first: the golden's guest mounts its extracted layers from that
+    // store, so the entry is only removed once nothing can be reading it.
+    if let Err(error) = provider.stop(name).await {
+        debug!(machine = name.as_str(), %error, "stopping the retired golden failed");
+    }
+    // Before the machine goes: the pointer to the extracted layer store lives
+    // inside the machine's directory, and a machine's `delete` takes that
+    // pointer with it. Reclaiming afterwards could only leave the whole
+    // extraction behind with no way to find it.
+    match provider
+        .reclaim_retired_golden_layers(name, &survivors)
+        .await
+    {
+        Ok(0) => {}
+        Ok(bytes) => info!(
+            machine = name.as_str(),
+            reclaimed_bytes = bytes,
+            "reclaimed the retired golden's extracted layers"
+        ),
+        Err(error) => warn!(
+            machine = name.as_str(),
+            %error,
+            "failed to reclaim the retired golden's extracted layers"
+        ),
+    }
+    if let Err(error) = provider.delete(name).await {
+        warn!(
+            machine = name.as_str(),
+            %error,
+            "failed to delete a retired golden; keeping its record for the next attempt"
+        );
+        return;
+    }
+    vm_telemetry_deregister(config, name);
+    remove_golden_record(config, name);
+    remove_golden_payload(config, fingerprint);
+    cache.forget(fingerprint).await;
+    info!(
+        machine = name.as_str(),
+        fingerprint, "retired golden deleted after its last fork exited"
+    );
+}
+
+/// Supervise golden rotation for the life of the pool.
+///
+/// Two duties, one loop: reclaim every retired golden whose last fork has
+/// exited (woken by the release itself, not a timer), and re-resolve the
+/// configured golden source so a republished golden is staged without an
+/// operator touching the engine.
+async fn golden_rotation_task<P: VmProvider + 'static>(
+    provider: Arc<P>,
+    config: RunnerPoolConfig,
+    cache: Arc<GoldenCache>,
+    budget: GoldenBudget,
+    shutdown: CancellationToken,
+) {
+    let poll = golden_poll_interval();
+    // The reap pass runs on every tick, and a release wakes it immediately.
+    // The tick stays bounded even with polling disabled: a notification that
+    // lands between the reap and the wait must not strand a retired golden
+    // until shutdown.
+    let tick = poll.unwrap_or(Duration::from_secs(30));
+    // The first pass runs at once: a restart that changed the configuration
+    // stages its golden now, not one poll interval later.
+    let mut first_pass = true;
+    loop {
+        if !std::mem::replace(&mut first_pass, false) {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = cache.released() => {}
+                _ = tokio::time::sleep(tick) => {}
+            }
+        }
+        if shutdown.is_cancelled() {
+            break;
+        }
+        for (fingerprint, name) in cache.releasable().await {
+            retire_golden(&provider, &config, &cache, &fingerprint, &name).await;
+        }
+        if poll.is_none() {
+            continue;
+        }
+        let (desired, revision) = resolve_configured_source(&config).await;
+        let current = match cache.desired().await {
+            Some(current) => current,
+            None => {
+                cache.set_desired(desired).await;
+                continue;
+            }
+        };
+        if current.fingerprint == desired.fingerprint {
+            continue;
+        }
+        info!(
+            from = %current.fingerprint,
+            to = %desired.fingerprint,
+            base = %desired.base,
+            "golden source changed; staging the new golden beside the serving one"
+        );
+        // The desired spec is what slot resolution maps onto *after* the
+        // switch, so it is published with the switch, never before: until
+        // then the serving golden answers for this environment.
+        match stage_and_switch_golden(
+            &provider,
+            &config,
+            &cache,
+            &desired,
+            revision.as_deref(),
+            &budget,
+            &shutdown,
+        )
+        .await
+        {
+            Ok(name) => {
+                cache.set_desired(desired).await;
+                info!(
+                    machine = name.as_str(),
+                    "golden rotation complete; new runners fork from the new golden"
+                );
+            }
+            Err(error) => warn!(
+                %error,
+                "golden rotation refused or failed; keeping the golden that is serving"
+            ),
+        }
+    }
+}
+
+/// Keeps the rotation task alive exactly as long as the pool serves.
+///
+/// Dropping the guard stops the task, so a pool that is tearing down never
+/// races a rotation into the machine sweep. A rotation already past its
+/// shutdown checks can still finish creating a golden machine; that machine
+/// carries the pool's prefix with no record, so the next start's stale sweep
+/// reclaims it.
+struct RotationGuard {
+    shutdown: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl RotationGuard {
+    /// Stop supervising rotations. The task finishes its current await point
+    /// and returns; the caller uses this before deleting machines.
+    fn stop(&self) {
+        self.shutdown.cancel();
+    }
+}
+
+impl Drop for RotationGuard {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.handle.abort();
     }
 }
 
@@ -4376,7 +5503,46 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if shutdown.is_cancelled() {
             return self.teardown(&golden_cache).await;
         }
+        // What this pool must serve, and which prepared golden can serve it
+        // right now. Both are consulted before the artifact work below: when a
+        // prepared golden already answers for the configured environment's
+        // previous generation, the pool starts on it and stages the configured
+        // one *beside* it, so a config change or an engine restart costs no
+        // capacity at all instead of draining the pool for the length of a
+        // download plus an unpack.
+        let desired = if self.config.use_fork {
+            Some(resolve_configured_environment(&self.config).await)
+        } else {
+            None
+        };
+        let plan = match &desired {
+            Some(desired) => Some(plan_goldens(&self.provider, &self.config, desired).await),
+            None => None,
+        };
+        match &plan {
+            Some(plan) if plan.surplus.is_empty() => {}
+            Some(plan) => {
+                // Generations this pool has already replaced: nothing serves
+                // them again, and reclaiming them here keeps a rotation from
+                // leaving a golden (and its extraction) behind per release.
+                for (fingerprint, name) in &plan.surplus {
+                    retire_golden(
+                        &self.provider,
+                        &self.config,
+                        &golden_cache,
+                        fingerprint,
+                        name,
+                    )
+                    .await;
+                }
+            }
+            None => {}
+        }
+        // The staging path downloads its own payload (in the background), so
+        // the foreground preparation only runs when nothing can serve yet.
+        let needs_foreground_artifact = plan.as_ref().is_none_or(|plan| plan.serving.is_none());
         if self.provider.capabilities().file_packs
+            && needs_foreground_artifact
             && let Err(error) = self.prepare_artifact(&shutdown).await
         {
             // A shutdown issued mid-download reads as a preparation error;
@@ -4395,8 +5561,28 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             }
             return Err(error);
         }
-        self.sweep_stale_artifacts().await;
-        if let Err(error) = self.remove_stale_machines().await {
+        self.sweep_stale_artifacts(&{
+            // Payloads of the identities prepared or served right now: the
+            // resolved one, the unresolved one an upgrade may have left
+            // already downloaded under the same bytes, and whatever the
+            // rotation plan will fork from.
+            let mut keep =
+                vec![EnvironmentSpec::for_base(self.config.base_image.clone()).fingerprint];
+            if let Some(plan) = &plan {
+                keep.push(plan.desired.fingerprint.clone());
+                keep.extend(
+                    plan.serving
+                        .iter()
+                        .map(|(_, fingerprint)| fingerprint.clone()),
+                );
+            }
+            keep.sort();
+            keep.dedup();
+            keep
+        })
+        .await;
+        let spared = plan.as_ref().map(GoldenPlan::spared).unwrap_or_default();
+        if let Err(error) = self.remove_stale_machines(&spared).await {
             // A sweep that failed halfway may have left machines behind; give
             // the teardown a chance to finish the cleanup before reporting
             // the failure.
@@ -4430,49 +5616,98 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // which is the honest signal, where a warn line plus per-runner
         // creation used to look like a working pool that never serves.
         if self.config.use_fork {
-            let environment = EnvironmentSpec::for_base(self.config.base_image.clone());
-            let golden = MachineName::new(format!("{}-golden", golden_cache.name_prefix))?;
-            // A shutdown arriving mid-warm must not wait for the rest of a
-            // multi-gigabyte download or an eleven-minute bake: an operator
-            // restarting the engine should not sit through either. The warm is
-            // idempotent (an interrupted payload is never adopted, and the
-            // next start resumes the download), so abandoning it is safe.
-            // Dropping the preparation mid-boot leaves its machine to the
-            // teardown, which deletes everything carrying the pool's prefix.
-            let Some(prepared) = unless_shutdown(
-                &shutdown,
-                prepare_fork_base(
-                    &self.provider,
-                    &self.config,
-                    &golden,
-                    &environment,
-                    &shutdown,
-                ),
-            )
-            .await
-            else {
-                info!(
-                    machine = golden.as_str(),
-                    "shutdown during golden preparation; stopping the pool"
-                );
-                return self.teardown(&golden_cache).await;
-            };
-            if let Err(error) = prepared {
-                if shutdown.is_cancelled() {
-                    info!(
-                        machine = golden.as_str(),
-                        "shutdown during golden preparation; stopping the pool"
-                    );
-                    return self.teardown(&golden_cache).await;
+            let environment = plan
+                .as_ref()
+                .map(|plan| plan.desired.clone())
+                .expect("a fork pool resolved its configured environment");
+            match plan.as_ref().and_then(|plan| plan.serving.clone()) {
+                // A prepared golden answers for this environment (or for its
+                // previous generation). Register it and start: slots fork from
+                // it immediately, and the configured golden is staged in the
+                // background when it is not already the one serving.
+                Some((golden, fingerprint)) => {
+                    let up_to_date = plan.as_ref().is_some_and(|plan| plan.up_to_date);
+                    if up_to_date {
+                        golden_cache
+                            .insert(fingerprint.clone(), golden.clone())
+                            .await;
+                        write_configured_golden_marker(&self.config, &fingerprint);
+                        info!(
+                            machine = golden.as_str(),
+                            fingerprint, "adopted the prepared golden"
+                        );
+                    } else {
+                        golden_cache
+                            .register_substitute(
+                                golden.clone(),
+                                fingerprint,
+                                environment.fingerprint.clone(),
+                            )
+                            .await;
+                        info!(
+                            machine = golden.as_str(),
+                            desired = %environment.fingerprint,
+                            "serving the previous golden while the configured one stages beside it"
+                        );
+                    }
                 }
-                // A failed bake may have booted the golden: it carries the
-                // pool's prefix, so the teardown deletes it.
-                if let Err(teardown) = self.teardown(&golden_cache).await {
-                    warn!(%teardown, "pool teardown after the golden preparation failed");
+                // Cold host: nothing can serve a job until the configured
+                // golden exists, so its preparation is the warm and belongs in
+                // the foreground (nothing is queued that could run anyway).
+                //
+                // A shutdown arriving mid-warm must not wait for the rest of a
+                // multi-gigabyte download or an eleven-minute bake: an operator
+                // restarting the engine should not sit through either. The warm
+                // is idempotent (an interrupted payload is never adopted, and
+                // the next start resumes the download), so abandoning it is
+                // safe. Dropping the preparation mid-boot leaves its machine to
+                // the teardown, which deletes everything carrying the pool's
+                // prefix.
+                None => {
+                    let golden = MachineName::new(fingerprint_golden_name(
+                        golden_cache.name_prefix(),
+                        &environment.fingerprint,
+                    ))?;
+                    let Some(prepared) = unless_shutdown(
+                        &shutdown,
+                        prepare_fork_base(
+                            &self.provider,
+                            &self.config,
+                            &golden,
+                            &environment,
+                            &shutdown,
+                        ),
+                    )
+                    .await
+                    else {
+                        info!(
+                            machine = golden.as_str(),
+                            "shutdown during golden preparation; stopping the pool"
+                        );
+                        return self.teardown(&golden_cache).await;
+                    };
+                    if let Err(error) = prepared {
+                        if shutdown.is_cancelled() {
+                            info!(
+                                machine = golden.as_str(),
+                                "shutdown during golden preparation; stopping the pool"
+                            );
+                            return self.teardown(&golden_cache).await;
+                        }
+                        // A failed bake may have booted the golden: it carries
+                        // the pool's prefix, so the teardown deletes it.
+                        if let Err(teardown) = self.teardown(&golden_cache).await {
+                            warn!(%teardown, "pool teardown after the golden preparation failed");
+                        }
+                        return Err(error);
+                    }
+                    golden_cache
+                        .insert(environment.fingerprint.clone(), golden)
+                        .await;
+                    write_configured_golden_marker(&self.config, &environment.fingerprint);
                 }
-                return Err(error);
             }
-            golden_cache.insert(environment.fingerprint, golden).await;
+            golden_cache.set_desired(environment).await;
         }
 
         // The warm is done: the pool can now register runners for queued
@@ -4539,6 +5774,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // either fits here or boots its base image directly (see
         // `GoldenBudget`).
         let golden_budget = self.golden_budget(warm_size, &golden_cache).await;
+        let rotation =
+            self.spawn_golden_rotation(golden_cache.clone(), golden_budget.clone(), &shutdown);
         for slot in 0..warm_size {
             let provider = self.provider.clone();
             let config = self.config.clone();
@@ -4592,6 +5829,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // provision in flight included), so this drains instead of waiting
         // out a boot.
         while slots.join_next().await.is_some() {}
+        // Stop staging before the teardown starts deleting machines: a
+        // rotation still creating its golden must not race the sweep.
+        rotation.stop();
         let teardown = self.teardown(&golden_cache).await;
         match slot_failure {
             // The failure is why the pool is stopping: report it rather than
@@ -4628,7 +5868,46 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 );
             }
         }
-        self.remove_stale_machines().await
+        // A golden a rotation had already superseded is not a fork base worth
+        // keeping: its clones are gone with the slots, and the next start must
+        // not resurrect a generation this pool has replaced. Reclaim it (the
+        // machine, its record, its payload and its extracted layers) while the
+        // engine still knows what it was.
+        for (fingerprint, name) in golden_cache.retiring().await {
+            retire_golden(
+                &self.provider,
+                &self.config,
+                golden_cache,
+                &fingerprint,
+                &name,
+            )
+            .await;
+        }
+        self.remove_stale_machines(&[]).await
+    }
+
+    /// Supervise golden rotation for as long as the pool serves.
+    ///
+    /// The caller holds the guard: dropping it stops the task, so a pool that
+    /// is shutting down never stages a golden into its own teardown.
+    fn spawn_golden_rotation(
+        &self,
+        golden_cache: Arc<GoldenCache>,
+        budget: GoldenBudget,
+        shutdown: &CancellationToken,
+    ) -> RotationGuard {
+        let task_shutdown = shutdown.child_token();
+        let handle = tokio::spawn(golden_rotation_task(
+            self.provider.clone(),
+            self.config.clone(),
+            golden_cache,
+            budget,
+            task_shutdown.clone(),
+        ));
+        RotationGuard {
+            shutdown: task_shutdown,
+            handle,
+        }
     }
 
     /// Golden slots the host can still afford alongside `runners` live VMs.
@@ -4691,6 +5970,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // Every concurrent runner above is one resident VM ceiling; only what
         // the host has left may hold a non-default environment golden.
         let golden_budget = self.golden_budget(max_concurrent, &golden_cache).await;
+        let rotation =
+            self.spawn_golden_rotation(golden_cache.clone(), golden_budget.clone(), &shutdown);
         let mut slots = JoinSet::new();
         let mut next_slot: usize = 0;
 
@@ -4802,6 +6083,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
         // Drain remaining runners on shutdown.
         while slots.join_next().await.is_some() {}
+        rotation.stop();
         self.teardown(&golden_cache).await
     }
 
@@ -4819,7 +6101,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .into(),
             ));
         }
-        let payload = self.config.artifact_payload();
+        let payload = payload_for_fingerprint(
+            &self.config,
+            &resolve_configured_environment(&self.config)
+                .await
+                .fingerprint,
+        );
         match std::fs::remove_file(&payload) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4834,8 +6121,22 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         &self,
         shutdown: &CancellationToken,
     ) -> Result<(), OrchestratorError> {
-        let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
-        let payload = self.config.artifact_payload();
+        // The resolved identity, not the raw configuration: a mutable golden
+        // source (a tag, a mirror that republishes) names the pack this start
+        // must fetch, and the payload path has to agree with the golden name
+        // and record the rotation path will use for the same spec. A pool that
+        // never forks has no golden and no rotation — it boots the artifact
+        // directly — so it keeps the unresolved identity its runners ask for.
+        let (env_spec, revision) = if self.config.use_fork {
+            resolve_configured_source(&self.config).await
+        } else {
+            (
+                EnvironmentSpec::for_base(self.config.base_image.clone()),
+                None,
+            )
+        };
+        let payload = payload_for_fingerprint(&self.config, &env_spec.fingerprint);
+        adopt_legacy_payload(&self.config, &env_spec, revision.as_deref()).await;
         ensure_golden_payload(&self.provider, &self.config, &env_spec, &payload, shutdown).await
     }
 
@@ -4852,7 +6153,17 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
     /// ([`retired_golden`]): the curated per-`runs-on` goldens of earlier
     /// releases. Their records would otherwise protect them forever, since
     /// nothing prepares them again.
-    async fn remove_stale_runner_machines(&self) -> Result<(), OrchestratorError> {
+    ///
+    /// `spare` names the goldens this start is about to serve from — the
+    /// rotation's current and previous generation. `retired_golden` reads the
+    /// *configured* fingerprint, so a golden serving the previous generation
+    /// (exactly what keeps a rotation from draining the pool) looks retired
+    /// here; deleting it before the rotation planner can adopt it is the bug
+    /// this parameter exists to prevent.
+    async fn remove_stale_runner_machines(
+        &self,
+        spare: &[MachineName],
+    ) -> Result<(), OrchestratorError> {
         for name in self.provider.list().await? {
             if !name
                 .as_str()
@@ -4860,7 +6171,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             {
                 continue;
             }
-            let retired = retired_golden(&self.config, &name);
+            if spare.contains(&name) {
+                continue;
+            }
+            // The configured generation is never retired, whatever its name says: a
+            // resolved identity's suffix matches neither base, and teardown must
+            // not delete the golden the pool serves.
+            let retired = retired_golden(&self.config, &name)
+                && !golden_record_fingerprint(&self.config, &name)
+                    .zip(read_configured_golden_marker(&self.config))
+                    .is_some_and(|(recorded, marker)| recorded == marker);
             if !retired
                 && golden_record_path(&self.config, &name).is_some_and(|path| path.is_file())
             {
@@ -4891,8 +6211,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         Ok(())
     }
 
-    async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
-        self.remove_stale_runner_machines().await?;
+    async fn remove_stale_machines(&self, spare: &[MachineName]) -> Result<(), OrchestratorError> {
+        self.remove_stale_runner_machines(spare).await?;
         // A crashed server orphans its detached `_boot-vm` hypervisor
         // processes; when the data dir was cleaned out from under them the
         // smolvm DB no longer knows the machines, so the deletes above
@@ -4990,7 +6310,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
     ///
     /// The current payload and the `goldens/` fingerprint directory are
     /// always kept. Runs at pool startup, before `remove_stale_machines`.
-    async fn sweep_stale_artifacts(&self) {
+    async fn sweep_stale_artifacts(&self, keep: &[String]) {
         let Some(directory) = self.config.artifact_stem.parent() else {
             return;
         };
@@ -4999,7 +6319,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             .artifact_stem
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
-        let current_payload = self.config.artifact_payload();
+        // Payloads this start has a use for: the identity the pool resolves
+        // (the fingerprint path it prepared under, which is the resolved
+        // revision for a mutable source) plus the goldens the rotation plan
+        // keeps. A rotation stages beside the payload of the golden it
+        // replaces, so "not the configured payload" stopped meaning
+        // "unreachable" the moment a golden could rotate.
+        let live: Vec<PathBuf> = keep
+            .iter()
+            .map(|fingerprint| payload_for_fingerprint(&self.config, fingerprint))
+            .collect();
         let Ok(entries) = std::fs::read_dir(directory) else {
             return;
         };
@@ -5019,6 +6348,18 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             } else {
                 false
             };
+            // A half-written artifact from a killed extraction or a replace
+            // that died between its two renames: `.partial` staging files and
+            // the `.prefix-stale` leftovers a directory swap leaves behind.
+            // Age-gated like a staging lock, so a live writer's file is never
+            // deleted from under it.
+            let stale_partial = (name.ends_with(".partial")
+                || name.ends_with(".prefix-stale")
+                || name.ends_with(".partial.prefix-stale"))
+                && !path_is_fresh(&path)
+                && !keep.iter().any(|fingerprint| {
+                    golden_partial_path(&payload_for_fingerprint(&self.config, fingerprint)) == path
+                });
             // A stale payload is `<stem>-<64-hex>`: the fingerprint suffix
             // shape keeps the sweep from touching unrelated files that happen
             // to share the stem prefix.
@@ -5028,12 +6369,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                         && suffix.starts_with('-')
                         && suffix[1..].chars().all(|c| c.is_ascii_hexdigit())
                 })
-            }) && path != current_payload;
+            }) && !live.contains(&path);
             // Payloads under a stem this pool no longer produces: the stock
             // Ubuntu bases are not golden sources any more, so no later
             // fingerprint rotation would ever reach them.
-            let retired_payload = is_retired_stock_payload(&name) && path != current_payload;
-            if !stale_tmp && !stale_payload && !retired_payload {
+            let retired_payload = is_retired_stock_payload(&name) && !live.contains(&path);
+            if !stale_tmp && !stale_partial && !stale_payload && !retired_payload {
                 continue;
             }
             match std::fs::remove_file(&path) {
@@ -5057,6 +6398,20 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if swept > 0 {
             info!(swept, directory = %directory.display(), "swept stale golden artifacts");
         }
+    }
+}
+
+/// Whether a file was touched recently enough that a live writer may own it.
+///
+/// An unreadable mtime reads as fresh: deleting on unknown age risks removing
+/// an artifact a concurrent process is still writing.
+fn path_is_fresh(path: &Path) -> bool {
+    match std::fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(mtime) => match mtime.elapsed() {
+            Ok(age) => age < STAGING_LOCK_GRACE,
+            Err(_) => true,
+        },
+        Err(_) => true,
     }
 }
 /// Grace window for a staging-file companion lock: the writer refreshes the
@@ -5590,6 +6945,7 @@ fn debug_marker_active(debug_dir: Option<&Path>, name: &MachineName) -> bool {
 }
 
 /// What a slot's next runner boots from.
+#[derive(Debug)]
 enum SlotSource {
     /// Fork the runner from this environment golden.
     Golden(MachineName),
@@ -5643,26 +6999,49 @@ async fn resolve_slot_environment<P: VmProvider + 'static>(
     };
     // The golden carries the runner contract; the base image still
     // comes from the queued job's `runs-on` labels.
-    let env_spec = EnvironmentSpec::for_base(env_base.clone());
+    let resolved = EnvironmentSpec::for_base(env_base.clone());
+    // The pool's own environment follows its rotation: after a switch, the
+    // configured base resolves to the *new* golden's identity, so a slot never
+    // rebuilds the golden the rotation just replaced.
+    let env_spec = golden_cache.current_spec(resolved).await;
     let fingerprint = env_spec.fingerprint.clone();
     let environment = RunnerEnvironment {
         fingerprint: Some(fingerprint.clone()),
         base: env_base,
         boot_from_pack: true,
     };
+    if let Some(serving) = golden_cache.get(&fingerprint).await {
+        return Ok(SlotEnvironment {
+            source: SlotSource::Golden(serving),
+            environment,
+        });
+    }
+    if let Some(previous) = golden_cache.substitute_for(&fingerprint).await {
+        // A rotation is staging the golden for this fingerprint. The
+        // generation already prepared is the same environment one release
+        // back, so the job runs on it now instead of waiting out a
+        // multi-gigabyte download plus extraction. Slots that resolve a
+        // *different* environment never land here: the substitution is keyed
+        // by the configured fingerprint alone.
+        debug!(
+            machine = previous.as_str(),
+            fingerprint, "serving a rotation's previous golden while its successor stages"
+        );
+        return Ok(SlotEnvironment {
+            source: SlotSource::Golden(previous),
+            environment,
+        });
+    }
     let selected = golden_cache
         .get_or_prepare(&fingerprint, golden_budget, {
             let provider = provider.clone();
             let config = config.clone();
             let name_prefix = golden_cache.name_prefix().to_owned();
             let fp = fingerprint.clone();
+            let spec = env_spec.clone();
             async move {
-                let name = MachineName::new(format!(
-                    "{}-golden-{}",
-                    name_prefix,
-                    &fp[..12.min(fp.len())]
-                ))?;
-                prepare_fork_base(&provider, &config, &name, &env_spec, shutdown).await?;
+                let name = MachineName::new(fingerprint_golden_name(&name_prefix, &fp))?;
+                prepare_fork_base(&provider, &config, &name, &spec, shutdown).await?;
                 Ok(name)
             }
         })
@@ -5900,6 +7279,13 @@ async fn run_slot<P: VmProvider + 'static>(
             SlotSource::Golden(golden) => Some(golden.clone()),
             SlotSource::DirectFromJobBase | SlotSource::DirectNoFork => None,
         };
+        // Count this fork against its golden for as long as the slot's VM
+        // exists. A retired golden is deleted only when the last fork that
+        // boots from it has finished its one job — the property that lets a
+        // rotation (and an engine restart) proceed without killing work.
+        let fork = golden
+            .as_ref()
+            .and_then(|golden| golden_cache.fork_started(golden));
         // One VM per slot per job: fork the runner this iteration will serve
         // with, from the golden the queued job's environment selected. The
         // build guard publishes the fork window; the previous VM was deleted
@@ -5972,6 +7358,17 @@ async fn run_slot<P: VmProvider + 'static>(
         // leaves an extra VM resident alongside a full pool until the next
         // engine start.
         await_machine_gone(&provider, &runner_name, &shutdown).await;
+        if let Some(fork) = fork {
+            if shutdown.is_cancelled() {
+                // The VM may still be alive — teardown deletes it. Retaining
+                // the count keeps a rotation from reclaiming the golden this
+                // fork's disk is based on while it exists; the ledger dies
+                // with the process.
+                std::mem::forget(fork);
+            } else {
+                drop(fork);
+            }
+        }
         if job.is_err() {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -6113,6 +7510,22 @@ async fn provision_slot<P: VmProvider + 'static>(
     }
 }
 
+/// The packed payload a direct (non-forked) create boots.
+///
+/// The pool's own environment is named by its fingerprint — the resolved
+/// golden source once a rotation has one — so the payload is looked up under
+/// that identity first. A pool that resolved nothing (no golden source to
+/// resolve, or a configured image) keeps the configured payload path.
+fn direct_boot_payload(config: &RunnerPoolConfig, environment: &RunnerEnvironment) -> PathBuf {
+    if let Some(fingerprint) = &environment.fingerprint {
+        let payload = payload_for_fingerprint(config, fingerprint);
+        if packed_golden_path(&payload).is_file() || payload.is_file() {
+            return payload;
+        }
+    }
+    config.artifact_payload()
+}
+
 /// Labels a runner booted from `base` can serve beyond the pool's own.
 ///
 /// The official golden *is* the hosted Ubuntu 24.04 image, so a job that says
@@ -6200,7 +7613,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // The runner's completion is observed through this oneshot, never by
     // re-polling the JoinHandle: a completed `&mut JoinHandle` cannot be
     // polled again, and `select!` re-polls its branches.
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
     let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_provider = provider.clone();
     let run_name = name.clone();
@@ -6227,14 +7640,53 @@ async fn run_one_runner<P: VmProvider + 'static>(
 
     let result = tokio::select! {
         _ = shutdown.cancelled() => {
-            // Killing the host-side `smolvm machine exec` process does not
-            // terminate the guest command. Abort the wrapper first, then stop
-            // the VM so deletion cannot wait indefinitely on a live listener.
-            run_task.abort();
-            let _ = run_task.await;
-            provider.stop(name).await.map_err(OrchestratorError::from)
+            if !claimed.load(Ordering::Acquire) {
+                // No job claimed: nothing to preserve. Killing the host-side
+                // `smolvm machine exec` process does not terminate the guest
+                // command. Abort the wrapper first, then stop the VM so
+                // deletion cannot wait indefinitely on a live listener.
+                run_task.abort();
+                let _ = run_task.await;
+                provider.stop(name).await.map_err(OrchestratorError::from)
+            } else {
+                // A job is running on this runner. An engine restart is
+                // routine — a binary update, an operator restart — and killing
+                // the VM fails a run that may be minutes from its result. Warm
+                // provisioning stopped with this token, so this runner is the
+                // last work the pool still owes; let its job finish.
+                //
+                // Bounded, because a wedged guest must not pin the engine's
+                // stop forever: after the grace the VM is stopped and the
+                // teardown reclaims it, exactly as before.
+                let grace = shutdown_job_grace();
+                info!(
+                    machine = name.as_str(),
+                    grace_secs = grace.as_secs(),
+                    "shutdown while a job is running; letting the runner finish it"
+                );
+                match tokio::time::timeout(grace, &mut done_rx).await {
+                    Ok(_) => {
+                        let _ = run_task.await;
+                        info!(
+                            machine = name.as_str(),
+                            "busy runner finished its job during shutdown"
+                        );
+                        Ok(())
+                    }
+                    Err(_) => {
+                        warn!(
+                            machine = name.as_str(),
+                            grace_secs = grace.as_secs(),
+                            "busy runner did not finish within the shutdown grace; stopping it"
+                        );
+                        run_task.abort();
+                        let _ = run_task.await;
+                        provider.stop(name).await.map_err(OrchestratorError::from)
+                    }
+                }
+            }
         },
-        _ = wait_for_environment_change(config, &environment.base, claimed) => {
+        _ = wait_for_environment_change(config, &environment.base, claimed.clone()) => {
             run_task.abort();
             let _ = run_task.await;
             info!(machine = name.as_str(), environment = %environment.base, "replacing idle runner for queued environment");
@@ -6243,7 +7695,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         done = async {
             // The oneshot is polled once by value, so a runner that exits
             // before it reports a job cannot be re-polled into a panic.
-            tokio::join!(done_rx, claim).0
+            tokio::join!(&mut done_rx, claim).0
         } => {
             match done {
                 Ok(Ok(())) => Ok(()),
@@ -6686,6 +8138,21 @@ async fn remove_failed_fork<P: VmProvider + 'static>(provider: &Arc<P>, name: &M
     }
 }
 
+/// Log every non-empty line a guest script printed, under the caller's label.
+///
+/// The scripts provisioning runs report what they did (or why they skipped) on
+/// stdout and stderr and expect the engine to be the only reader; a step that
+/// exits 0 either way is a no-op only observable through these lines.
+fn log_script_output(name: &MachineName, label: &str, output: &preloop_vm::ExecOutput) {
+    for line in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(&output.stderr).lines())
+        .filter(|line| !line.trim().is_empty())
+    {
+        info!(machine = name.as_str(), "{label}: {line}");
+    }
+}
+
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
 ///
 /// The caller owns cleanup: on any error the machine may already exist.
@@ -6927,7 +8394,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         // configured image and runs the contract on the machine itself, since
         // there is no golden to inherit it from.
         let from_packed = environment.boot_from_pack && provider.capabilities().file_packs;
-        let pack = packed_golden_path(&config.artifact_payload());
+        let pack = packed_golden_path(&direct_boot_payload(config, &environment));
         // The packed artifact is the pool's *default* environment's frozen
         // image, so it can only stand in for the plain packed golden. Any
         // other direct create boots the environment this runner serves: the
@@ -7012,6 +8479,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                     .join(", ")
             )));
         }
+
     }
 
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
@@ -7157,6 +8625,36 @@ async fn provision_runner<P: VmProvider + 'static>(
         let _ = std::fs::remove_file(path);
     }
     configure_result?;
+
+    // The workload container's `/etc/resolv.conf` is the file the job's Dockerd
+    // derives its embedded-DNS `ExtServers` from, and the SmolVM agent names the
+    // guest's network gateway in it whenever it (re)prepares the container's
+    // overlay — `configure` above is the last such preparation before a job, so
+    // the runtime init's resolver half has always been overwritten (measured on
+    // smolvm 1.30.1: preloop's write at 04:17:17.750, the agent's rewrite at
+    // 04:17:18.305 in one machine). A name that only exists in the job's
+    // `/etc/hosts` (`postgres.localhost`) then comes back NXDOMAIN through
+    // Docker, which is how `db_migrate` failed on the template run.
+    //
+    // Re-applied and confirmed here: the container is up and the runner has not
+    // been started yet (`run` below), so no job can read the file in between.
+    // See [`container_resolver_stub_script`].
+    {
+        let script = container_resolver_stub_script();
+        let output = provider
+            .exec(name, &["sh".to_owned(), "-c".to_owned(), script])
+            .await?;
+        log_script_output(name, "container resolver", &output);
+        if output.exit_code != 0 {
+            // The machine still runs jobs; only names Docker resolves through
+            // the host file break, so say that instead of failing the slot.
+            warn!(
+                machine = name.as_str(),
+                "container resolver stub was not confirmed after the runner launch; \
+                 jobs on this machine cannot resolve an /etc/hosts-only name through Docker"
+            );
+        }
+    }
 
     info!(machine = name.as_str(), "ephemeral runner ready");
     let mut run = guest_env_prefix(config, name);
@@ -7511,7 +9009,7 @@ mod lifecycle_tests {
     }
 
     #[derive(Debug)]
-    struct TestProvider {
+    pub(super) struct TestProvider {
         machines: Mutex<HashMap<String, MachineState>>,
         events: Mutex<Vec<String>>,
         created_images: Mutex<Vec<(String, String)>>,
@@ -7582,7 +9080,7 @@ mod lifecycle_tests {
     }
 
     impl TestProvider {
-        fn new(
+        pub(super) fn new(
             fail_start: bool,
             fail_install: bool,
             fail_configure: bool,
@@ -7654,7 +9152,7 @@ mod lifecycle_tests {
             self
         }
 
-        fn with_configure_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+        pub(super) fn with_configure_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
             self.configure_gate = Some(gate);
             self
         }
@@ -7716,11 +9214,11 @@ mod lifecycle_tests {
             self
         }
 
-        async fn has_machine(&self, name: &MachineName) -> bool {
+        pub(super) async fn has_machine(&self, name: &MachineName) -> bool {
             self.machines.lock().await.contains_key(name.as_str())
         }
 
-        async fn events(&self) -> Vec<String> {
+        pub(super) async fn events(&self) -> Vec<String> {
             self.events.lock().await.clone()
         }
 
@@ -9242,6 +10740,7 @@ done
             "the hosted sysctl set changed — update official-image.toml and this test together"
         );
     }
+
 
     /// The composed init run end to end against scratch roots: the fork's own
     /// name resolves and the sysctls reach the hosted values in one exec, and
@@ -11719,7 +13218,7 @@ fi"#,
         }
     }
 
-    fn packed_fork_config() -> RunnerPoolConfig {
+    pub(super) fn packed_fork_config() -> RunnerPoolConfig {
         let mut config = test_config(false);
         config.use_fork = true;
         config
@@ -12625,7 +14124,12 @@ fi"#,
         let goldens = vms.join("goldens");
         std::fs::create_dir_all(&goldens).unwrap();
 
-        pool.sweep_stale_artifacts().await;
+        // The pool always names the payload of the identity it resolves; the
+        // sweep keeps exactly those.
+        pool.sweep_stale_artifacts(&[
+            EnvironmentSpec::for_base(config.base_image.clone()).fingerprint
+        ])
+        .await;
 
         assert!(current.is_file(), "current payload survives");
         assert!(!stale_payload.exists(), "stale payload is swept");
@@ -12676,7 +14180,12 @@ fi"#,
             std::fs::write(vms.join(name), b"payload").unwrap();
         }
 
-        pool.sweep_stale_artifacts().await;
+        // The pool always names the payload of the identity it resolves; the
+        // sweep keeps exactly those.
+        pool.sweep_stale_artifacts(&[
+            EnvironmentSpec::for_base(config.base_image.clone()).fingerprint
+        ])
+        .await;
 
         assert!(current.is_file(), "current payload survives");
         for name in &retired {
@@ -12741,7 +14250,7 @@ fi"#,
             write_golden_record(&config, &name, "fp");
         }
 
-        pool.remove_stale_runner_machines().await.unwrap();
+        pool.remove_stale_runner_machines(&[]).await.unwrap();
 
         let left: Vec<String> = provider
             .list()
@@ -12858,7 +14367,12 @@ fi"#,
         let stale_tmp = vms.join(".tmp-golden-stale");
         std::fs::write(&stale_tmp, b"stale").unwrap();
 
-        pool.sweep_stale_artifacts().await;
+        // The pool always names the payload of the identity it resolves; the
+        // sweep keeps exactly those.
+        pool.sweep_stale_artifacts(&[
+            EnvironmentSpec::for_base(config.base_image.clone()).fingerprint
+        ])
+        .await;
 
         assert!(
             active_tmp.is_file(),
@@ -13930,6 +15444,7 @@ mod golden_download_tests {
 #[cfg(test)]
 mod golden_cache_tests {
     use super::*;
+    use crate::lifecycle_tests::{TestProvider, packed_fork_config};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -14051,5 +15566,480 @@ mod golden_cache_tests {
             .expect("the retry fits the freed slot");
         assert_eq!(golden.as_str(), "env-a-golden");
         assert_eq!(budget.free(), 0, "a registered golden keeps its slot");
+    }
+
+    // ---- golden rotation --------------------------------------------------
+
+    /// A golden's name is its fingerprint, so the golden for a new release can
+    /// exist beside the one still serving.
+    #[test]
+    fn golden_names_are_fingerprint_keyed() {
+        assert_eq!(
+            fingerprint_golden_name("pool", &"ab".repeat(32)),
+            "pool-golden-abababababab"
+        );
+        // A short fingerprint (a test fixture) still yields a managed name
+        // instead of panicking on the slice.
+        assert_eq!(fingerprint_golden_name("pool", "abc"), "pool-golden-abc");
+    }
+
+    /// Retirement waits for the forks a golden already served: that is what
+    /// makes deleting the old golden safe while its job still runs.
+    #[tokio::test]
+    async fn a_retired_golden_is_releasable_only_after_its_last_fork() {
+        let cache = Arc::new(GoldenCache::new("pool".to_owned()));
+        let golden = MachineName::new(fingerprint_golden_name("pool", &"aa".repeat(32))).unwrap();
+        cache.insert("fp-a".to_owned(), golden.clone()).await;
+
+        let first = cache.fork_started(&golden).expect("registered golden");
+        let second = cache.fork_started(&golden).expect("registered golden");
+        assert!(
+            cache.retire(&golden).await.is_none(),
+            "two live forks hold the golden"
+        );
+        assert!(cache.releasable().await.is_empty());
+        drop(first);
+        assert!(
+            cache.releasable().await.is_empty(),
+            "one fork still boots from it"
+        );
+        drop(second);
+        assert_eq!(
+            cache.releasable().await,
+            vec![("fp-a".to_owned(), golden)],
+            "the last fork releases the golden for deletion"
+        );
+    }
+
+    /// A fork of a golden the pool does not track cannot block anything: a
+    /// machine from another engine or a re-created golden has no entry.
+    #[tokio::test]
+    async fn a_fork_of_an_unknown_golden_is_not_tracked() {
+        let cache = Arc::new(GoldenCache::new("pool".to_owned()));
+        let unknown = MachineName::new("pool-golden-ffffffffffff").unwrap();
+        assert!(cache.fork_started(&unknown).is_none());
+    }
+
+    /// The switch supersedes the generation it replaces and stops offering it
+    /// as a stand-in — but holds it while its forks are still running.
+    #[tokio::test]
+    async fn a_switch_retires_the_generation_it_replaces() {
+        let cache = Arc::new(GoldenCache::new("pool".to_owned()));
+        let previous = MachineName::new(fingerprint_golden_name("pool", &"aa".repeat(32))).unwrap();
+        let next = MachineName::new(fingerprint_golden_name("pool", &"bb".repeat(32))).unwrap();
+        cache
+            .register_substitute(previous.clone(), "fp-old".to_owned(), "fp-new".to_owned())
+            .await;
+        assert_eq!(cache.substitute_for("fp-new").await, Some(previous.clone()));
+        assert!(
+            cache.replaces("fp-new", None).await,
+            "a handover, not an addition"
+        );
+
+        let fork = cache.fork_started(&previous).expect("the stand-in serves");
+        assert!(
+            cache
+                .switch_to("fp-new".to_owned(), next.clone())
+                .await
+                .is_empty(),
+            "a live fork keeps the old golden until it exits"
+        );
+        assert_eq!(cache.get("fp-new").await, Some(next));
+        assert!(cache.substitute_for("fp-new").await.is_none());
+        assert_eq!(
+            cache.retiring().await,
+            vec![("fp-old".to_owned(), previous.clone())]
+        );
+
+        drop(fork);
+        assert_eq!(
+            cache.releasable().await,
+            vec![("fp-old".to_owned(), previous)]
+        );
+    }
+
+    /// Staging a second golden needs room for *both*: the one serving keeps
+    /// its storage for as long as it serves.
+    #[test]
+    fn rotation_staging_requires_room_for_two_goldens() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            rotation_staging_required_bytes(Some(GIB), Some(2 * GIB)),
+            golden_unpack_required_bytes(GIB) + golden_unpack_required_bytes(2 * GIB)
+        );
+        // An unreadable pack size falls back to the conservative estimate
+        // rather than skipping the gate.
+        assert_eq!(
+            rotation_staging_required_bytes(None, None),
+            2 * golden_unpack_required_bytes(GOLDEN_UNKNOWN_SIZE_ESTIMATE)
+        );
+        let required = rotation_staging_required_bytes(Some(GIB), Some(GIB));
+        assert!(rotation_staging_fits(required, required));
+        assert!(!rotation_staging_fits(required, required - 1));
+        // Saturates instead of wrapping for a maliciously sized payload.
+        assert_eq!(
+            rotation_staging_required_bytes(Some(u64::MAX), Some(u64::MAX)),
+            u64::MAX
+        );
+    }
+
+    /// A volume that cannot hold the second golden refuses to stage and keeps
+    /// serving the old one; it never waits for space to appear.
+    #[tokio::test]
+    async fn rotation_staging_refuses_when_a_second_golden_does_not_fit() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let spec = EnvironmentSpec::for_base(config.base_image.clone());
+        let payload = payload_for_fingerprint(&config, &spec.fingerprint);
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"packed-golden").unwrap();
+
+        let refused =
+            rotation_staging_room(&config, &spec.fingerprint, Some(&spec.fingerprint), |_| {
+                Ok(0)
+            })
+            .expect_err("a full volume must refuse staging");
+        assert!(
+            refused.contains("keeping the golden that is already serving"),
+            "the refusal says what the pool does instead: {refused}"
+        );
+        assert!(
+            rotation_staging_room(&config, &spec.fingerprint, Some(&spec.fingerprint), |_| Ok(
+                u64::MAX / 2
+            ))
+            .is_ok(),
+            "a volume with room stages"
+        );
+        // An unreadable measurement is not a licence to write: it refuses too.
+        assert!(
+            rotation_staging_room(&config, &spec.fingerprint, None, |_| Err(
+                std::io::Error::other("df failed")
+            ))
+            .is_err()
+        );
+    }
+
+    /// The plan serves the previous generation while the configured one is
+    /// staged, reclaims the generations this pool has already replaced, and
+    /// leaves a golden for an environment the queue can still ask for.
+    #[tokio::test]
+    async fn the_plan_serves_the_previous_generation_and_reclaims_superseded_ones() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.base_image = "ghcr.io/acme/runner:ubuntu24".to_owned();
+        config.artifact_stem = scratch.path().join("artifact");
+        std::fs::create_dir_all(scratch.path().join("goldens")).unwrap();
+
+        let previous_spec = EnvironmentSpec::for_base(config.base_image.clone());
+        let desired = EnvironmentSpec::for_base_with_source(
+            config.base_image.clone(),
+            format!(
+                "oci:ghcr.io/acme/runner:ubuntu24@sha256:{}",
+                "ab".repeat(32)
+            ),
+        );
+        // The previous generation, marked as the pool's own by its marker.
+        let previous_name = MachineName::new(fingerprint_golden_name(
+            &config.name_prefix,
+            &previous_spec.fingerprint,
+        ))
+        .unwrap();
+        // The environment a `runs-on: ubuntu-latest` job resolves to: still
+        // reachable, so it is not a candidate for reclamation.
+        let official_spec =
+            EnvironmentSpec::for_base(crate::environment::OFFICIAL_GOLDEN.to_owned());
+        let official_name = MachineName::new(fingerprint_golden_name(
+            &config.name_prefix,
+            &official_spec.fingerprint,
+        ))
+        .unwrap();
+        // A generation two releases back: nothing resolves to it any more.
+        let stale_name = MachineName::new(fingerprint_golden_name(
+            &config.name_prefix,
+            &"cd".repeat(32),
+        ))
+        .unwrap();
+        for (name, fingerprint) in [
+            (&previous_name, &previous_spec.fingerprint),
+            (&official_name, &official_spec.fingerprint),
+            (&stale_name, &"cd".repeat(32)),
+        ] {
+            provider
+                .create(&test_machine_spec(&config, name))
+                .await
+                .unwrap();
+            write_golden_record(&config, name, fingerprint);
+        }
+        write_configured_golden_marker(&config, &previous_spec.fingerprint);
+
+        let plan = plan_goldens(&provider, &config, &desired).await;
+
+        assert_eq!(
+            plan.serving,
+            Some((previous_name.clone(), previous_spec.fingerprint.clone())),
+            "the previous generation keeps serving while the new one stages"
+        );
+        assert!(
+            !plan.up_to_date,
+            "the desired golden is not the one serving"
+        );
+        assert_eq!(
+            plan.surplus,
+            vec![("cd".repeat(32), stale_name.clone())],
+            "only generations nothing resolves to are reclaimed"
+        );
+        assert_eq!(
+            plan.spared(),
+            vec![previous_name],
+            "the serving golden is exempt from the stale-machine sweep"
+        );
+    }
+
+    /// With the desired golden already prepared, the plan adopts it and stages
+    /// nothing — a restart costs no preparation.
+    #[tokio::test]
+    async fn the_plan_adopts_a_prepared_golden_without_staging() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let spec = EnvironmentSpec::for_base(config.base_image.clone());
+        let name = MachineName::new(fingerprint_golden_name(
+            &config.name_prefix,
+            &spec.fingerprint,
+        ))
+        .unwrap();
+        provider
+            .create(&test_machine_spec(&config, &name))
+            .await
+            .unwrap();
+        write_golden_record(&config, &name, &spec.fingerprint);
+
+        let plan = plan_goldens(&provider, &config, &spec).await;
+
+        assert_eq!(plan.serving, Some((name, spec.fingerprint)));
+        assert!(plan.up_to_date, "no staging is needed");
+        assert!(plan.surplus.is_empty());
+    }
+
+    /// A slot whose environment is being rotated forks the generation that is
+    /// ready instead of waiting out the staging — the zero-gap property.
+    #[tokio::test]
+    async fn a_slot_forks_the_previous_golden_while_the_new_one_stages() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = packed_fork_config();
+        let cache = Arc::new(GoldenCache::new(config.name_prefix.clone()));
+        let previous_spec = EnvironmentSpec::for_base(config.base_image.clone());
+        let desired = EnvironmentSpec::for_base_with_source(
+            config.base_image.clone(),
+            format!("oci:base-image@sha256:{}", "ab".repeat(32)),
+        );
+        let previous = MachineName::new(fingerprint_golden_name(
+            &config.name_prefix,
+            &previous_spec.fingerprint,
+        ))
+        .unwrap();
+        cache.set_desired(desired.clone()).await;
+        cache
+            .register_substitute(
+                previous.clone(),
+                previous_spec.fingerprint.clone(),
+                desired.fingerprint.clone(),
+            )
+            .await;
+
+        let resolved = resolve_slot_environment(
+            &provider,
+            &config,
+            &cache,
+            &GoldenBudget::unbounded(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("a prepared previous golden satisfies the slot");
+
+        assert!(
+            matches!(&resolved.source, SlotSource::Golden(name) if *name == previous),
+            "the slot forks the previous generation: {:?}",
+            resolved.source
+        );
+        assert_eq!(
+            resolved.environment.fingerprint.as_deref(),
+            Some(desired.fingerprint.as_str()),
+            "and still answers for the environment the pool was configured for"
+        );
+        assert!(
+            provider.events().await.is_empty(),
+            "nothing had to be prepared for it"
+        );
+    }
+
+    /// A job-environment golden is not a stand-in for the pool's own
+    /// environment: the substitution is keyed by the configured fingerprint.
+    #[tokio::test]
+    async fn a_slot_never_substitutes_a_golden_for_another_environment() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        config.base_image = "ghcr.io/acme/runner:ubuntu24".to_owned();
+        config.next_job_runs_on = Some(Arc::new(std::sync::RwLock::new(vec![
+            "ubuntu-latest".to_owned(),
+        ])));
+        let cache = Arc::new(GoldenCache::new(config.name_prefix.clone()));
+        let configured = EnvironmentSpec::for_base(config.base_image.clone());
+        let job_env = EnvironmentSpec::for_base(crate::environment::OFFICIAL_GOLDEN.to_owned());
+        let desired = EnvironmentSpec::for_base_with_source(
+            config.base_image.clone(),
+            format!(
+                "oci:ghcr.io/acme/runner:ubuntu24@sha256:{}",
+                "ab".repeat(32)
+            ),
+        );
+        cache.set_desired(desired.clone()).await;
+        let prepared = MachineName::new(fingerprint_golden_name(
+            &config.name_prefix,
+            &configured.fingerprint,
+        ))
+        .unwrap();
+        cache
+            .register_substitute(
+                prepared.clone(),
+                configured.fingerprint.clone(),
+                desired.fingerprint.clone(),
+            )
+            .await;
+        // The golden exists for real, so a wrong substitution would show up as
+        // a fork of it rather than as a preparation.
+        provider
+            .create(&test_machine_spec(&config, &prepared))
+            .await
+            .unwrap();
+        write_golden_record(&config, &prepared, &configured.fingerprint);
+        // The job's own environment has to be prepared from its own pack.
+        let job_payload = payload_for_fingerprint(&config, &job_env.fingerprint);
+        std::fs::create_dir_all(job_payload.parent().unwrap()).unwrap();
+        std::fs::write(&job_payload, b"packed-golden").unwrap();
+
+        let resolved = resolve_slot_environment(
+            &provider,
+            &config,
+            &cache,
+            &GoldenBudget::unbounded(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the job's own environment resolves");
+
+        assert_eq!(
+            resolved.environment.base, job_env.base,
+            "the job's labels select their own environment"
+        );
+        assert!(
+            !matches!(&resolved.source, SlotSource::Golden(name) if *name == prepared),
+            "a golden for the pool's configuration must not serve another environment"
+        );
+        assert!(
+            matches!(
+                &resolved.source,
+                SlotSource::Golden(name)
+                    if *name
+                        == MachineName::new(fingerprint_golden_name(
+                            &config.name_prefix,
+                            &job_env.fingerprint
+                        ))
+                        .unwrap()
+            ),
+            "the job's environment gets its own golden: {:?}",
+            resolved.source
+        );
+    }
+
+    /// Staging a rotation is abandoned by a shutdown without touching the
+    /// golden that is serving: the pool keeps working on the old one.
+    #[tokio::test]
+    async fn shutdown_during_staging_keeps_the_serving_golden() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_configure_gate(Arc::new(tokio::sync::Notify::new())),
+        );
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let serving_spec = EnvironmentSpec::for_base(config.base_image.clone());
+        let desired = EnvironmentSpec::for_base_with_source(
+            config.base_image.clone(),
+            format!("oci:base-image@sha256:{}", "ab".repeat(32)),
+        );
+        let payload = payload_for_fingerprint(&config, &desired.fingerprint);
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"packed-golden").unwrap();
+        // The staging preflight measures the pool's own payload too; keep both
+        // small so the gate is about the code path, not the test host's disk.
+        let existing = payload_for_fingerprint(&config, &serving_spec.fingerprint);
+        std::fs::write(&existing, b"packed-golden").unwrap();
+
+        let cache = Arc::new(GoldenCache::new(config.name_prefix.clone()));
+        let serving = MachineName::new(fingerprint_golden_name(
+            &config.name_prefix,
+            &serving_spec.fingerprint,
+        ))
+        .unwrap();
+        provider
+            .create(&test_machine_spec(&config, &serving))
+            .await
+            .unwrap();
+        cache
+            .insert(serving_spec.fingerprint.clone(), serving.clone())
+            .await;
+        cache.set_desired(serving_spec.clone()).await;
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let staged = stage_and_switch_golden(
+            &provider,
+            &config,
+            &cache,
+            &desired,
+            None,
+            &GoldenBudget::unbounded(),
+            &shutdown,
+        )
+        .await;
+        assert!(staged.is_err(), "a cancelled staging reports the stop");
+        assert_eq!(
+            cache.get(&serving_spec.fingerprint).await,
+            Some(serving),
+            "the serving golden is still the one new forks use"
+        );
+        assert!(
+            cache.get(&desired.fingerprint).await.is_none(),
+            "a golden that never finished is not registered"
+        );
+        assert!(
+            cache.releasable().await.is_empty() && cache.retiring().await.is_empty(),
+            "nothing is retired: the rotation never reached its switch"
+        );
+    }
+
+    /// A machine specification for the lifecycle fixtures.
+    fn test_machine_spec(config: &RunnerPoolConfig, name: &MachineName) -> MachineSpec {
+        MachineSpec {
+            name: name.clone(),
+            image: "pack".to_owned(),
+            cpus: config.cpus,
+            memory_mib: config.memory_mib,
+            storage_gib: config.storage_gib,
+            overlay_gib: None,
+            network: NetworkPolicy::PublicOnly,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
+        }
     }
 }
