@@ -4243,7 +4243,10 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("docs/control-plane/operate/deploy.mdx"), "{text}");
+        assert!(
+            text.contains("docs/control-plane/operate/deploy.mdx"),
+            "{text}"
+        );
         assert!(text.contains("builder.tail1234.ts.net"), "{text}");
         assert!(text.to_lowercase().contains("cloudflare"), "{text}");
         // F7: the path mount does not keep the other mounts private.
