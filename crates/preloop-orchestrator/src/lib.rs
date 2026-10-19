@@ -3280,6 +3280,8 @@ struct GoldenEntry {
     /// staged: the pool's configured environment keeps forking its previous
     /// generation instead of refusing to serve until the new one is ready.
     substitutes: Option<String>,
+    /// Cancelled once a newer golden supersedes this one: idle forks of it are released.
+    superseded: CancellationToken,
 }
 
 /// The pool's prepared fork bases, keyed by environment fingerprint, with the
@@ -3312,6 +3314,8 @@ pub(crate) struct GoldenCache {
     /// Woken when a fork releases a golden, so the rotation task can delete a
     /// retired golden the moment its last clone exits instead of on a timer.
     released: tokio::sync::Notify,
+    /// Delete refusals already logged, by machine name: the first is a warning, retries are debug.
+    refused: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl GoldenCache {
@@ -3322,7 +3326,15 @@ impl GoldenCache {
             name_prefix,
             desired: RwLock::new(None),
             released: tokio::sync::Notify::new(),
+            refused: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Whether this golden's delete refusal is being logged for the first time.
+    fn first_refusal(&self, name: &MachineName) -> bool {
+        self.refused
+            .lock()
+            .is_ok_and(|mut seen| seen.insert(name.as_str().to_owned()))
     }
 
     /// Return the name prefix used for golden VM names.
@@ -3360,6 +3372,7 @@ impl GoldenCache {
                 name,
                 clones: 0,
                 retiring: false,
+                superseded: CancellationToken::new(),
                 substitutes: None,
             },
         );
@@ -3381,6 +3394,7 @@ impl GoldenCache {
                 name,
                 clones: 0,
                 retiring: false,
+                superseded: CancellationToken::new(),
                 substitutes: Some(desired),
             },
         );
@@ -3440,6 +3454,7 @@ impl GoldenCache {
         Some(GoldenFork {
             ledger: self.clone(),
             name: name.clone(),
+            superseded: entry.superseded.clone(),
         })
     }
 
@@ -3463,6 +3478,7 @@ impl GoldenCache {
                 continue;
             }
             entry.retiring = true;
+            entry.superseded.cancel();
             if entry.clones == 0 {
                 releasable.push((fingerprint.clone(), entry.name.clone()));
             }
@@ -3475,6 +3491,7 @@ impl GoldenCache {
         let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
         let (fingerprint, entry) = entries.iter_mut().find(|(_, entry)| entry.name == *name)?;
         entry.retiring = true;
+        entry.superseded.cancel();
         (entry.clones == 0).then(|| (fingerprint.clone(), entry.name.clone()))
     }
 
@@ -3545,6 +3562,7 @@ impl GoldenCache {
                 continue;
             }
             entry.retiring = true;
+            entry.superseded.cancel();
             entry.substitutes = None;
             if entry.clones == 0 {
                 replaced.push((other_fingerprint.clone(), entry.name.clone()));
@@ -3564,6 +3582,7 @@ impl GoldenCache {
                     "a golden for this fingerprint was replaced by a rebuild"
                 );
                 entry.retiring = true;
+                entry.superseded.cancel();
                 if entry.clones == 0 {
                     replaced.push((fingerprint.clone(), entry.name.clone()));
                 }
@@ -3575,6 +3594,7 @@ impl GoldenCache {
                 name,
                 clones: 0,
                 retiring: false,
+                superseded: CancellationToken::new(),
                 substitutes: None,
             },
         );
@@ -3688,6 +3708,15 @@ impl GoldenCache {
 pub(crate) struct GoldenFork {
     ledger: Arc<GoldenCache>,
     name: MachineName,
+    superseded: CancellationToken,
+}
+
+impl GoldenFork {
+    /// Cancelled once the golden this fork was taken from is superseded: an idle
+    /// runner forked from it is released instead of holding the golden.
+    pub fn superseded(&self) -> CancellationToken {
+        self.superseded.clone()
+    }
 }
 
 impl GoldenFork {
@@ -4302,11 +4331,17 @@ async fn retire_golden<P: VmProvider + 'static>(
         ),
     }
     if let Err(error) = provider.delete(name).await {
-        warn!(
-            machine = name.as_str(),
-            %error,
-            "failed to delete a retired golden; keeping its record for the next attempt"
-        );
+        // smolvm refuses until the last clone is gone; the rotation tick retries. Log the
+        // first refusal, then debug the retries.
+        if cache.first_refusal(name) {
+            warn!(
+                machine = name.as_str(),
+                %error,
+                "failed to delete a retired golden; keeping its record for the next attempt"
+            );
+        } else {
+            debug!(machine = name.as_str(), %error, "a retired golden is still refused; retrying");
+        }
         return;
     }
     vm_telemetry_deregister(config, name);
@@ -6017,7 +6052,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     break;
                 }
                 let queued = pending.map_or(0, |p| p.load(Ordering::Acquire));
-                if queued > 0 {
+                // Runners already registered or booting cover queued jobs; forking past
+                // that only leaves idle runners that never get work.
+                let committed = idle.lock().map_or(0, |n| *n) + building.lock().map_or(0, |n| *n);
+                if queued > committed {
                     break;
                 }
                 tokio::select! {
@@ -7158,6 +7196,9 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         SlotSource::Golden(golden) => Some(golden.clone()),
         SlotSource::DirectFromJobBase | SlotSource::DirectNoFork => None,
     };
+    let fork = golden
+        .as_ref()
+        .and_then(|golden| golden_cache.fork_started(golden));
     // Provision a single-use runner. The build guard reports the fork/boot in
     // flight exactly as a warm slot does, so `preloop status` sees on-demand
     // boots as builds rather than as a pool that is idle while it forks.
@@ -7217,6 +7258,8 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         runner,
         shutdown.clone(),
         idle.clone(),
+        fork.as_ref()
+            .map_or_else(CancellationToken::new, GoldenFork::superseded),
     )
     .await;
     if let Some(watch) = pause_watch {
@@ -7379,6 +7422,8 @@ async fn run_slot<P: VmProvider + 'static>(
             runner,
             shutdown.clone(),
             idle.clone(),
+            fork.as_ref()
+                .map_or_else(CancellationToken::new, GoldenFork::superseded),
         )
         .await;
         if let Err(error) = &job {
@@ -7623,6 +7668,18 @@ async fn wait_for_environment_change(
     }
 }
 
+/// Resolves once the golden a runner was forked from is superseded while the runner
+/// is still idle. A runner that has claimed its job is left to finish it.
+async fn wait_superseded(
+    superseded: &CancellationToken,
+    claimed: Arc<std::sync::atomic::AtomicBool>,
+) {
+    superseded.cancelled().await;
+    if claimed.load(Ordering::Acquire) {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Run one job on a provisioned runner, then delete the runner.
 ///
 /// The runner is single-use: it serves exactly one job, and the slot forks its
@@ -7635,6 +7692,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
     runner: ReadyRunner,
     shutdown: CancellationToken,
     idle: Arc<std::sync::Mutex<usize>>,
+    superseded: CancellationToken,
 ) -> Result<(), OrchestratorError> {
     let ReadyRunner {
         name,
@@ -7719,6 +7777,12 @@ async fn run_one_runner<P: VmProvider + 'static>(
                     }
                 }
             }
+        },
+        _ = wait_superseded(&superseded, claimed.clone()) => {
+            run_task.abort();
+            let _ = run_task.await;
+            info!(machine = name.as_str(), "retiring an idle runner forked from a superseded golden");
+            provider.stop(name).await.map_err(OrchestratorError::from)
         },
         _ = wait_for_environment_change(config, &environment.base, claimed.clone()) => {
             run_task.abort();
@@ -14446,9 +14510,16 @@ fi"#,
         .expect("provisioning succeeds")
         .expect("a runner is provisioned");
         let idle = Arc::new(std::sync::Mutex::new(0));
-        let error = run_one_runner(provider, &config, runner, CancellationToken::new(), idle)
-            .await
-            .expect_err("runner failure must propagate");
+        let error = run_one_runner(
+            provider,
+            &config,
+            runner,
+            CancellationToken::new(),
+            idle,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("runner failure must propagate");
         assert!(
             error
                 .to_string()
@@ -15652,6 +15723,53 @@ mod golden_cache_tests {
         let cache = Arc::new(GoldenCache::new("pool".to_owned()));
         let unknown = MachineName::new("pool-golden-ffffffffffff").unwrap();
         assert!(cache.fork_started(&unknown).is_none());
+    }
+
+    /// A switch releases the forks of the generation it replaces: their tokens are
+    /// cancelled, while the fork of the generation it publishes is not.
+    #[tokio::test]
+    async fn a_switch_releases_the_forks_of_the_generation_it_replaces() {
+        let cache = Arc::new(GoldenCache::new("pool".to_owned()));
+        let previous = MachineName::new(fingerprint_golden_name("pool", &"aa".repeat(32))).unwrap();
+        let next = MachineName::new(fingerprint_golden_name("pool", &"bb".repeat(32))).unwrap();
+        cache.insert("fp-old".to_owned(), previous.clone()).await;
+        let old_fork = cache
+            .fork_started(&previous)
+            .expect("the served golden is tracked");
+        assert!(!old_fork.superseded().is_cancelled());
+        cache
+            .switch_to("fp-new".to_owned(), next.clone(), Some("fp-old"))
+            .await;
+        assert!(
+            old_fork.superseded().is_cancelled(),
+            "the replaced generation's forks are released"
+        );
+        let new_fork = cache
+            .fork_started(&next)
+            .expect("the new golden is tracked");
+        assert!(!new_fork.superseded().is_cancelled());
+    }
+
+    /// An idle runner is released once its golden is superseded; a runner that has
+    /// claimed its job is left alone to finish it.
+    #[tokio::test]
+    async fn an_idle_runner_is_released_by_a_superseded_golden_and_a_busy_one_is_not() {
+        let superseded = CancellationToken::new();
+        superseded.cancel();
+        let idle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        tokio::time::timeout(Duration::from_secs(1), wait_superseded(&superseded, idle))
+            .await
+            .expect("an idle runner is released");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                wait_superseded(&superseded, busy)
+            )
+            .await
+            .is_err(),
+            "a claimed runner finishes its job"
+        );
     }
 
     /// The switch supersedes the generation it replaces and stops offering it
