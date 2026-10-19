@@ -131,6 +131,11 @@ async fn mutate_policy(
     mutate: impl FnOnce(&mut ExecutionProtectionConfig) -> Result<serde_json::Value, ApiError>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let _guard = shared.state.policy_mutation.lock().await;
+    // The file itself is shared with the secrets API and engine-hosted App
+    // setup, so the whole cycle holds the one config-mutation lock too: each
+    // of them writes a whole document, and only a lock held across the read
+    // and the write stops the later rename from publishing a stale snapshot.
+    let _config_mutation = crate::config::config_mutation_lock().lock();
     let mut config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     // `secrets_store = "memory"` only governs where secret values are kept;

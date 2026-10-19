@@ -1,0 +1,210 @@
+---
+title: Using Preloop from coding agents
+description: Let a coding agent run safe checks, consume structured events, and drive a failed-job debug session before a human pushes.
+---
+
+Preloop gives coding agents a local CI loop without granting them GitHub push power. An agent can inspect a workflow's job graph, run selected check jobs, stream NDJSON events, read logs, and repair a paused job. Publishing a branch or opening a pull request stays with the person who owns the change.
+
+## Prepare the engine yourself
+
+Install the CLI and matching runner/runtime, then run `preloop init` yourself. The initialization flow stores the GitHub credential; do not ask an agent to handle that credential. See [Control plane installation](/control-plane/install) for host setup.
+
+The CLI uses `PRELOOP_URL`, defaulting to `http://127.0.0.1:9090`. For native API calls it checks `PRELOOP_TOKEN`, then `PRELOOP_SYSTEM_TOKEN`, then the managed engine credential.
+
+## Run checks before a push
+
+<Steps>
+<Step title="Commit and inspect the graph">
+
+Commit the change before running checks when possible. `preloop run` snapshots the working tree, including uncommitted changes, but a commit makes the tree that the agent tests explicit.
+
+Inspect the expanded job graph without executing it:
+
+```sh
+preloop plan -f .github/workflows/ci.yml --json
+```
+
+Each job entry contains its ID, name, runner selection, `needs`, matrix data, and a step count. The plan does not include step commands, `environment:`, `permissions:`, or secret reads, so read the workflow before selecting jobs.
+
+</Step>
+<Step title="Select only check jobs">
+
+Choose tests, lint, builds, and a gate job that collects them. Skip jobs that deploy, publish, release, push, or read secrets other than `GITHUB_TOKEN`. Treat `environment:`, `secrets.`, `deploy`, and `pages` as reasons to inspect a job carefully. Also skip jobs whose effective `GITHUB_TOKEN` permissions include `write` or `write-all`.
+
+`--job` includes that job's `needs:` closure. Inspect every job in the closure before running it.
+
+</Step>
+<Step title="Run each selected job non-interactively">
+
+```sh
+preloop run \
+  -f .github/workflows/ci.yml \
+  --job test \
+  --event pull_request \
+  --base origin/main \
+  --payload /path/to/pull-request-payload.json \
+  < /dev/null
+```
+
+`--base` supplies the branch used for `branches:` filters and the base used to calculate `paths:` changes. A local `pull_request` run otherwise does not invent pull-request fields such as a number, labels, or review state. Pass `--payload` when a condition reads those fields; otherwise a skipped step can make an incomplete check look green. Use `--event push` for workflows that only trigger on pushes.
+
+</Step>
+<Step title="Inspect failures before pushing">
+
+Read a failed job's output:
+
+```sh
+preloop logs RUN_ID --job test
+preloop logs RUN_ID --job test --step 2
+```
+
+For a live debug session, submit with `--debug`. A non-terminal invocation does not wait for an interactive prompt; inspect the paused session and issue a verdict from another process:
+
+```sh
+preloop debug --json RUN_ID
+preloop debug RUN_ID --verdict retry --revert untracked
+```
+
+For a completed failure that only needs a shell, use `--preserve-on-failure` and then `preloop shell` on the host that owns the VM. After a fix, commit it and submit a fresh run. `preloop rerun RUN_ID --failed` replays the originally captured tree, so it is useful for a flaky failure and does not include a later source fix.
+
+</Step>
+</Steps>
+
+The default checkout snapshot retention is 1,800 seconds. The in-place rerun window is 30 days when enabled by the control plane. A local check is a pre-push guard, not the record of the pull request's CI run.
+
+## Consume NDJSON events
+
+The native event feed requires a bearer token and returns `application/x-ndjson`:
+
+```sh
+curl -N -H "Authorization: Bearer $PRELOOP_TOKEN" \
+  "$PRELOOP_URL/api/v1/runs/$RUN_ID/events.ndjson"
+```
+
+The response starts with a snapshot of the run's current statuses and persisted events, then stays open for live events until the run is terminal. A stalled connection closes after five minutes. Reconnect and de-duplicate lines because a new connection receives a fresh snapshot.
+
+Each line is a JSON object with a `type` field:
+
+| Type | Important fields |
+|---|---|
+| `run_accepted` | `run_id`, `queued_jobs` |
+| `run_status` | `run_id`, `status`, optional `reason` |
+| `job_status` | `run_id`, `job_id`, `status`, optional `reason` |
+| `log` | `run_id`, `job_id`, `line` |
+| `annotation` | `run_id`, `job_id`, `level`, `message`, and optional source location/title fields |
+| `job_completed` | `run_id`, `job_id`, `status`, `outputs` |
+| `check_run_created` | `run_id` |
+
+Run and job statuses are `queued`, `pending`, `in_progress`, `success`, `failure`, `skipped`, or `cancelled`. For a point-in-time response, use `GET /api/v1/runs/RUN_ID` or `preloop status RUN_ID --json`.
+
+## Pre-push CI gate
+
+An interactive `preloop run` offers to install the repository's advisory `pre-push` hook. The hook holds a push of the checked-out branch's current commit while it runs Preloop CI. Tags and deletions pass; a push of another branch passes with a warning because the hook can only validate the checked-out tree. The hook never performs the Git push itself.
+
+The hook also:
+
+- bypasses the gate when any pushed commit message contains `[skip ci]`;
+- caches a verdict by remote, engine endpoint, and commit, then checks the recorded run's live terminal status before reusing it;
+- fails open with a warning only when the Preloop engine is unreachable, identified by the CLI's `PRELOOP_UNREACHABLE` marker;
+- preserves an existing hook as `pre-push.preloop-prev`, chains it first, and respects Git's `core.hooksPath`.
+
+This is a per-machine advisory gate. A push from another machine or the GitHub UI does not run it.
+
+## Push-back and auto-PR
+
+Agents should not use `--push` or `--create-pr`. These are the human-controlled publish paths. For reference, push-back ends at:
+
+```text
+POST /api/v1/runs/RUN_ID/push
+{"create_pr": true, "draft": true}
+```
+
+The client first pushes the tested commit with local Git credentials. The server verifies the tested tree, reuses or creates the branch PR, and reports Check Runs. The endpoint is idempotent; a repeated `preloop push RUN_ID` is safe.
+
+A separate auto-PR path runs only for successful webhook-delivered push runs. Configure it under `[github.pr]` or with environment variables:
+
+| Setting | Values and default |
+|---|---|
+| `auto` / `PRELOOP_GITHUB_PR_AUTO` | `feature` by default; `never` disables automatic PRs. |
+| `draft` / `PRELOOP_GITHUB_PR_DRAFT` | `true` by default for new PRs. |
+| `exclude` / `PRELOOP_GITHUB_PR_EXCLUDE` | Comma-separated branch patterns that never get an auto-PR. |
+
+The head commit message can override policy: `[no-pr]` always skips, `[draft]` requests a draft, and `[pr]` forces creation even with `auto = never`. Labels are read from the head commit only. Auto-PR needs `pull_requests: write`; a missing credential leaves the workflow result intact and skips PR creation.
+
+## Drive a debug session over HTTP
+
+The native session API lets an agent control a paused job with its bearer token:
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/debug/sessions` | List paused sessions. |
+| `GET` | `/api/v1/debug/sessions/SESSION_ID` | Read one session projection. |
+| `POST` | `/api/v1/debug/sessions/SESSION_ID/lease` | Acquire the single mutating lease. |
+| `GET` | `/api/v1/debug/sessions/SESSION_ID/events?after=N&wait=30` | Poll structured events after a cursor. |
+| `POST` | `/api/v1/debug/sessions/SESSION_ID/operations` | Retry, retry from a step, continue, or abort. |
+| `GET` | `/api/v1/debug/sessions/SESSION_ID/audit` | Read the bounded audit trail. |
+| `DELETE` | `/api/v1/debug/sessions/SESSION_ID/lease` | Release the lease. |
+
+Acquire a lease with a caller identity, then send an operation with a request ID and the version observed by the lease:
+
+```json
+{
+  "request_id": "agent-retry-1",
+  "expected_version": 4,
+  "lease_id": "lease-from-acquire",
+  "operation": {
+    "operation": "retry",
+    "revert": "untracked"
+  }
+}
+```
+
+Use `retry_from` with a zero-based `step_index`, or use `continue` and `abort`. Repeating a request ID returns its original result; a stale `expected_version` is rejected.
+
+## DAP prompt for an agent
+
+The built-in client is `preloop dap RUN_ID`. The prompt below matches the recorded `omp` demo and uses `submit.sh` plus the `dapctl` reference client.
+
+<Accordion title="Copyable DAP agent prompt">
+
+```text
+You are a CI debugger agent. A workflow run on the local Preloop engine is failing. Find the root cause with DAP, fix it, and re-run until the workflow is green.
+
+Environment:
+- Engine: ${PRELOOP_URL:-http://127.0.0.1:9090}
+- Native API token: $PRELOOP_SYSTEM_TOKEN
+- Working directory: <demo-directory>
+- Workflow: <demo-directory>/workflow.yml
+- Payload files: <demo-directory>/payload-failing.json and payload-fixed.json
+
+Tools:
+- ./submit.sh [workflow] [event] [payload.json] submits a debugger-enabled run and prints its run ID.
+- Start one DAP daemon per run:
+  nohup ./dapctl daemon --url ws://<engine>/api/v1/runs/<RUN_ID>/debug --token "$PRELOOP_SYSTEM_TOKEN" >/tmp/dapd.log 2>&1 &
+- Drive the daemon with:
+  ./dapctl init
+  ./dapctl ready
+  ./dapctl wait 20
+  ./dapctl source
+  ./dapctl scopes
+  ./dapctl vars <reference>
+  ./dapctl eval '<expression>'
+  ./dapctl continue
+  ./dapctl quit
+- Read status with GET /api/v1/runs/<RUN_ID> and logs with GET /api/v1/runs/<RUN_ID>/logs.
+
+Task:
+1. Read the workflow and the failing payload.
+2. Submit the failing run and attach DAP promptly.
+3. Inspect scopes and variables. The runtime event payload is evidence; inspect the github scope's event value.
+4. State the root cause using the DAP evidence.
+5. Fix the workflow or submit the corrected payload, and explain the choice.
+6. Attach to the corrected run, resume it, and confirm conclusion=success.
+7. Report the DAP evidence, root cause, fix, and final result.
+
+Do not skip DAP inspection or infer the diagnosis only from the workflow file.
+```
+
+</Accordion>
+
+For normal loops, keep the GitHub credential and publish decisions outside the agent's control.

@@ -1,0 +1,158 @@
+---
+title: Runner configuration
+description: Every command, flag, environment variable, and file of the standalone preloop-runner, with the official runner equivalents.
+---
+
+This page is the reference for `preloop-runner`: its commands, flags, environment variables, and the files it keeps in the runner root. Each table lists the official `actions/runner` equivalent where one exists. `preloop-runner --help` and `preloop-runner <command> --help` show the same flags.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `configure` | Registers the runner and writes its configuration files. |
+| `run` | Listens for jobs and runs them until you stop it, or until it reaches its single-job limit. |
+| `remove` | Deregisters the runner and deletes its configuration files. |
+| `lint` | Parses a workflow file and expands its jobs. Nothing runs. |
+
+`preloop-runner --version` prints the runner version and the runner protocol version it targets.
+
+## Global flags
+
+These flags apply to every command.
+
+| Flag | Default | Description | Official runner |
+|---|---|---|---|
+| `--runner-root <DIR>` | Current directory | Directory for the configuration files, `_work/`, and `externals/`. | None |
+| `--ca-bundle <FILE>` | Unset. Falls back to `SSL_CERT_FILE`. | PEM file of extra CA certificates for HTTPS requests. | None |
+
+## configure
+
+| Flag | Default | Description | Official runner |
+|---|---|---|---|
+| `--url <URL>` | Required | `https://github.com/OWNER/REPO` or `https://github.com/ORG` for GitHub. Or a Preloop control plane's base URL. | `--url` |
+| `--token <TOKEN>` | Required. Falls back to `PRELOOP_RUNNER_TOKEN`. | Registration token from GitHub, or the control plane's system token. | `--token` |
+| `--name <NAME>` | Host name | Runner name shown in GitHub. | `--name` |
+| `--labels <LIST>` | None | Extra labels, separated by commas. | `--labels` |
+| `--runner-group <NAME>` | `default` | Runner group recorded in the runner's settings, for organization runners. | `--runnergroup` |
+| `--work <DIR>` | `_work` | Work directory name. See the notes below. | `--work` |
+| `--replace` | Off | Replaces an existing local configuration, and a runner of the same name that registration finds on the server. | `--replace` |
+| `--ephemeral` | Off | The runner exits after one job. | `--ephemeral` |
+| `--no-externals` | Off | Skips the Node 20 and Node 24 download. | None |
+| `--unattended` | Off | Accepted for compatibility. `configure` never prompts, so this changes nothing. | `--unattended` |
+
+- `configure` stops when the runner root is already configured, or when a runner with the same name exists. Pass `--replace` to proceed.
+- The runner always adds the labels `self-hosted`, the OS (`Linux` or `macOS`), and the architecture (`X64` or `ARM64`). Labels match case-insensitively, so duplicates are dropped. No flag removes the defaults.
+
+### Match labels the GitHub way
+
+`runs-on` labels are requirements joined by AND. A runner must advertise every
+requested label, and matching is case-insensitive; extra labels do not hurt.
+`--labels` adds labels to the defaults, which are `self-hosted`, the host OS,
+and the host architecture.
+
+GitHub-hosted labels such as `ubuntu-latest` do not make a standalone host
+equivalent to a GitHub-hosted image. Use labels that describe the host and its
+capabilities, or change `runs-on` to match the labels you actually advertise.
+For a control-plane-managed runner, add labels with `PRELOOP_RUNNER_LABELS`;
+for this standalone runner, pass them to `configure --labels`.
+
+- `--runner-group` is stored in the runner's settings; it does not change the pool registration targets.
+- `--work` is saved in `.runner`, but job workspaces are always created under `_work/` in the runner root. Changing this value does not move them.
+- With `--no-externals`, JavaScript actions use the `node` found on `PATH`. Its major version must match the action's Node version, or the action fails.
+
+## run
+
+| Flag | Default | Description | Official runner |
+|---|---|---|---|
+| `--once` | Off | Exits after the first job finishes. | `run.sh --once` |
+| `--via` | `broker` | Protocol path. `broker` is GitHub's job service path. `azdo` is the older distributed-task path. | None |
+
+- Ctrl-C or SIGTERM stops the runner. A running job gets 60 seconds to wind down, then the runner stops it and reports it canceled.
+- A runner configured with `--ephemeral` exits after one job, the same as `--once`.
+
+## remove
+
+| Flag | Default | Description | Official runner |
+|---|---|---|---|
+| `--token <TOKEN>` | Required | Remove token from GitHub. | `config.sh remove --token` |
+
+`remove` deregisters the runner with the server, then deletes `.runner`, `.credentials`, and `.credentials_rsaparams`. It leaves `_work/` and `externals/` in place. If the server cannot deregister the runner, it warns and deletes the local files anyway, so remove the runner in the repository or organization settings as well.
+
+## lint
+
+| Flag | Default | Description | Official runner |
+|---|---|---|---|
+| `-W, --workflow <FILE>` | Required | Workflow file to check. | None |
+| `--workspace-root <DIR>` | Unset | Repository root. Reusable workflows in its `.github/workflows` directory resolve from it. | None |
+
+Remote reusable workflows are fetched from the GitHub API. Set `PRELOOP_GITHUB_TOKEN` for private repositories, and `PRELOOP_GITHUB_API_URL` to use another API base. Nesting is limited to four levels.
+
+## Environment variables
+
+Set these in the runner's environment. For a service, use `Environment=` in the unit file.
+
+| Variable | Used by | Effect |
+|---|---|---|
+| `PRELOOP_RUNNER_TOKEN` | `configure` | Default for `--token`. |
+| `SSL_CERT_FILE` | All commands | Default for `--ca-bundle`. |
+| `RUST_LOG` | All commands | Log filter. Defaults to `info`. |
+| `PRELOOP_LOG_FORMAT` | All commands | `auto` (the default), `pretty`, or `json`. |
+| `PRELOOP_GITHUB_TOKEN` | `lint` | Token for fetching remote reusable workflows. |
+| `PRELOOP_GITHUB_API_URL` | `lint` | API base URL. Defaults to `https://api.github.com`. |
+| `ACTIONS_RUNNER_HOOK_JOB_STARTED` | `run` | Path to a script that runs as the first step of every job. |
+| `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` | `run` | Path to a script that runs as the last step of every job. |
+
+Hook steps run even when earlier steps failed. A failing hook does not fail the job, and each hook has a 10-minute limit.
+
+Set these in a workflow's `env` or in the runner's environment.
+
+| Variable | Effect |
+|---|---|
+| `ACTIONS_STEP_DEBUG` or `RUNNER_DEBUG` | Set to `true` or `1` to get step debug logs. Either variable works, in either place. |
+| `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` | Set to `true` to run `node20` JavaScript actions on Node 24. A value in the workflow's `env` overrides the runner's environment. |
+| `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` | Set to `true` to allow Node 20 when the runner would otherwise force Node 24. |
+
+If `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` and `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` are both `true` in the same place, the runner logs a warning and uses the default Node version.
+
+<Accordion title="Managed-runner environment variables">
+
+These variables are used by Preloop-managed runners and are not needed for a normal GitHub self-hosted install.
+
+| Variable | Effect |
+|---|---|
+| `PRELOOP_RUNNER_RSA_PARAMS` | JSON-encoded pre-generated RSA keypair used by `configure` instead of generating one. |
+| `PRELOOP_PROVISION_TOKEN` | One-time pool-provisioning token forwarded during agent registration. |
+| `PRELOOP_CONTROL_SOCKET` | Unix socket for the managed control-plane bridge. |
+| `PRELOOP_CONTROL_ORIGIN` | Origin advertised by that bridge. Requires a socket or `PRELOOP_CONTROL_UPSTREAM`. |
+| `PRELOOP_CONTROL_UPSTREAM` | TCP upstream for the managed control-plane bridge. |
+| `PRELOOP_BRIDGE_MAX_CONNECTIONS` | Maximum concurrent bridge connections; the default is 256. |
+| `PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS` | Bridge idle timeout in seconds; the default is 300. |
+| `PRELOOP_DISABLE_ACTIONS_PROBES` | `1`, `true`, or `$true` disables external Actions-service probes. |
+| `PRELOOP_RUNNER_BIN` | Path to the runner executable used when spawning a worker child. |
+| `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Managed job identity values used for `USER`, `LOGNAME`, and `XDG_RUNTIME_DIR`. |
+| `PRELOOP_MACHINE_NAME` / `PRELOOP_PAUSE_MARKER` | Debug-session machine metadata and pause-marker path. |
+| `PRELOOP_FAILURE_MARKER` | Marker path used when a managed run requests failure preservation. |
+| `ACTIONS_RUNNER_ALLOW_ARTIFACTS_FILE` | Truthy value enables the Actions artifacts-list file. |
+
+</Accordion>
+
+## Files in the runner root
+
+| Path | Written by | Contents |
+|---|---|---|
+| `.runner` | `configure` | Runner identity, server endpoints, work folder, and the ephemeral flag. |
+| `.credentials` | `configure` | OAuth client ID and authorization URL. |
+| `.credentials_rsaparams` | `configure` | RSA private key the runner uses to request access tokens. |
+| `externals/node20`, `externals/node24` | `configure` | Node runtimes for JavaScript actions. |
+| `_work/` | Jobs | Job workspaces, downloaded actions, and temporary files. |
+| `_work/_tool` | Jobs | Tool cache. The runner uses `/opt/hostedtoolcache` instead when that directory exists and is writable. |
+
+The configuration files are created with `0600` permissions. Treat them as secrets. Anyone with `.credentials_rsaparams` can request access tokens as this runner.
+
+## Limitations
+
+- `--work` does not change where job workspaces are created.
+- The default labels cannot be turned off.
+- The runner does not update itself. Install a newer binary to upgrade.
+- Jobs run on the host, as the runner's user, unless a step runs in a container. For isolation, use the [control plane](/control-plane/quickstart) and its microVM pool.
+- Windows hosts are not supported natively. Use WSL2 with the Linux binary.

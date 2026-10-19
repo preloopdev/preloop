@@ -125,7 +125,7 @@ fn configure(conn: &mut Connection) -> Result<(), ControlError> {
 /// ledger is the sole version authority, and anything else (a legacy store,
 /// a foreign file, a pre-ledger control schema, an older/newer/divergent
 /// migration set) refuses with the recovery command. `preloop store migrate`
-/// (refinery over `migrations/sqlite`, see `docs/control-migrations.md`) is
+/// (refinery over `migrations/sqlite`, see `docs/contributing/control-migrations.md`) is
 /// the only writer of schema state.
 fn ensure_usable(conn: &mut Connection) -> Result<(), ControlError> {
     let ledger = super::migrations::sqlite_ledger(conn).map_err(db)?;
@@ -166,7 +166,7 @@ impl LiteBackend {
                 "control database {} is not initialized (no migration ledger). Run \
                  `preloop store migrate` before starting the server; the server never \
                  creates, migrates or recreates the control schema itself \
-                 (docs/control-migrations.md).",
+                 (docs/control-plane/operate/storage.mdx).",
                 path.display()
             )));
         }

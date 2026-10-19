@@ -1,0 +1,209 @@
+---
+title: "Deploy the control plane"
+description: "Install, expose, operate, and upgrade a self-hosted Preloop control plane."
+---
+
+`preloop serve` runs the control plane and its microVM runner pool in one process. Keep the listener private by default, expose only the webhook path when GitHub needs inbound access, and use a separate runner origin only for remote runners.
+
+## Requirements
+
+| Resource | Guidance |
+|---|---|
+| Host | Linux with KVM on x86_64 or arm64 for production microVMs. macOS on Apple Silicon supports local development and x86_64 guests through Rosetta 2. |
+| Memory | Leave at least 2 GiB for the host and control plane. The pool's memory guard accounts for the golden and caps concurrent VMs. |
+| CPU | Each VM defaults to 8 vCPUs. Avoid configuring more concurrent VM vCPUs than the host can schedule. |
+| Disk | Keep room for packed goldens, unpacked VM state, caches, snapshots, and artifacts. The default VM storage ceiling is 80 GiB and the free-disk reserve is 20 GiB. |
+| GitHub | An App is recommended for repository-scoped job tokens and Check Runs. A webhook secret is required for webhook delivery. |
+
+For a runner pool, install the Linux `preloop-runner` bundle as part of the release installation. A missing bundle disables the pool after its queue grace period; see [VM images](/control-plane/operate/vm-images).
+
+## Install and run
+
+Use a tagged release rather than piping an unreviewed branch into a shell:
+
+```sh
+ver=v0.34.0
+curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+less install.sh
+sudo -H env PREFIX=/usr/local sh install.sh
+```
+
+The installer verifies release checksums and installs the CLI, Linux guest runner, and SmolVM runtime. Then configure the App and run the engine:
+
+```sh
+preloop setup github --via app --public-url https://ci.example.com
+preloop serve --listen 127.0.0.1:9090 --public-url https://ci.example.com
+```
+
+`PRELOOP_LISTEN` defaults to `127.0.0.1:9090`. `PRELOOP_HOME` defaults to `$HOME/.preloop` and contains the state directory, credentials, VM artifacts, and socket. `PRELOOP_PUBLIC_URL` is the GitHub-facing base and defaults to the loopback listen URL when `serve` starts without an override.
+
+## Run as a service
+
+On Linux, install hardened systemd units with socket activation:
+
+```sh
+sudo preloop server install \
+  --public-url https://ci.example.com \
+  --github-app-id 123456 \
+  --github-app-key /etc/preloop/app.pem \
+  --github-app-installation-id 7654321 \
+  --webhook-secret "$WEBHOOK_SECRET" \
+  --home /var/lib/preloop
+```
+
+This writes `preloop.service` and `preloop.socket`, a private environment file, and—unless `--no-update-timer` is set—`preloop-update.service` and `preloop-update.timer`. The socket listens on the configured port and starts the service on demand. The update timer waits 10 minutes after boot, then checks hourly with a randomized delay of up to 30 minutes.
+
+The system install uses a dedicated `preloop` account, keeps state in `/var/lib/preloop` by default, delegates CPU/memory/PID cgroups to the VM launcher, and restarts the service after failure. On Linux it also adds that account to the host's `kvm` group when `/dev/kvm` exists, because the VMM opens the device as the service identity; it warns instead when there is no `kvm` group or the change fails. Use `--systemd-credential PATH` to mount an encrypted secret file with `LoadCredentialEncrypted`; create it with:
+
+```sh
+systemd-creds encrypt --name=preloop-secrets secrets.toml /etc/preloop-secrets.enc
+```
+
+Use `--dry-run` to inspect changes. `--user` installs a systemd user unit or macOS LaunchAgent without root; on Linux, enable lingering if it must survive logout:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+On macOS, installation uses a LaunchDaemon for a system service or a LaunchAgent for `--user`. Remove units without deleting data:
+
+```sh
+sudo preloop server uninstall --home /var/lib/preloop
+```
+
+Add `--purge-data` only when the state directory should also be removed.
+
+## What must be reachable
+
+| Traffic | Direction | Reachability |
+|---|---|---|
+| VM jobs and local runners | In-host | Use the mounted control socket and loopback bridge; no public address. |
+| GitHub webhooks | GitHub → engine | A stable HTTPS URL is required for webhook-triggered runs. |
+| Check Runs and GitHub API | Engine → GitHub | Outbound HTTPS; no inbound port is required. |
+| Native API and CLI | Operator → engine | Keep on loopback or a private network protected by the system token. |
+| Remote runners | Runner → engine | Set `PRELOOP_RUNNER_URL` to an address the remote runner can reach. |
+
+`PRELOOP_PUBLIC_URL` is not the runner data path. `PRELOOP_RUNNER_URL` defaults to the loopback engine URL and carries broker, results, cache, artifact, OIDC, and live-log links. Do not point it at a public tunnel for local VM jobs.
+
+## Exposure options
+
+Keep the engine on `127.0.0.1:9090` and path-filter an ingress to `/api/v1/github/webhooks`.
+
+**Caddy:**
+
+```caddy
+ci.example.com {
+    @webhook path /api/v1/github/webhooks
+    handle @webhook {
+        reverse_proxy 127.0.0.1:9090
+    }
+    handle { respond 404 }
+}
+```
+
+**Cloudflare Tunnel:** use an ingress rule with `path: ^/api/v1/github/webhooks$` and a final `http_status:404` rule. A catch-all tunnel publishes runner registration and management APIs.
+
+**Tailscale:** use Tailscale Serve for tailnet-only access:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:9090
+PRELOOP_PUBLIC_URL=https://<host>.<tailnet>.ts.net
+```
+
+That URL is reachable only by tailnet members permitted by the Tailscale ACL, and it is not a GitHub webhook endpoint: enabling Funnel on this hostname can make this whole route public too, so give the webhook a hostname of its own or remove this mount first.
+
+For public webhook delivery through Funnel, do **not** publish the whole engine port — Funnel would then expose the unauthenticated runner-registration surface. Funnel's access covers the **host and port**, not just the path you mount: adding a mount to a hostname that already serves something else — the Tailscale Serve root route above, for instance — can make that whole route public as well ([tailscale#10234](https://github.com/tailscale/tailscale/issues/10234)). Give the webhook a hostname of its own (its own node), or remove every other mount from this one first:
+
+```sh
+tailscale funnel reset          # clears this node's Funnel mounts
+tailscale serve reset           # …and the tailnet-only ones
+tailscale funnel --set-path=/api/v1/github/webhooks --bg \
+    http://127.0.0.1:9090/api/v1/github/webhooks
+tailscale funnel status         # verify: the webhook path must be the only route listed
+PRELOOP_PUBLIC_URL=https://<host>.<tailnet>.ts.net
+```
+
+`tailscale funnel status` is the check that matters: it lists every route that is actually public on this node, so anything else it names is open to the internet. `preloop init` makes the same check before it offers that URL as the suggested answer: it reads the name from `tailscale status --json` and accepts Enter on it only when `tailscale funnel status --json` shows the webhook path as the sole public route here. A name that is not Funnel-published (or one whose Funnel also publishes other mounts) is still shown, but only as a hint — blank keeps webhooks off.
+
+If you also need other authenticated paths (run pages, for example), put a path-filtering proxy in front and publish only its port. Keep Preloop on loopback and place the proxy on a separate local port — the Caddy example above does it — then expose only that proxy port through Funnel, not the engine listener, and only on a hostname with nothing else mounted on the same port:
+
+```sh
+tailscale funnel --bg 8080
+```
+
+A private/VPN-only URL can serve Check Run links to authorized operators, but GitHub cannot deliver webhooks to it. Without inbound access, trigger work with `preloop run` or the REST dispatch API.
+
+### Exposing the App-setup routes
+
+`preloop setup github --via app` uses `PRELOOP_PUBLIC_URL` when it hosts the App-creation form itself: the browser loads `/setup/github` and GitHub redirects to `/setup/github/callback`. Those two routes answer `404` except while a setup link is open, and the link works once for ten minutes. Your browser must reach the URL to finish the setup, but GitHub also validates the webhook URL in the App manifest, so the address needs to be one GitHub can reach.
+
+The engine only accepts a setup for an origin it can vouch for: with `PRELOOP_PUBLIC_URL` set, `--public-url` (or the environment fallback) has to name that same origin, and a plain-`http` address is refused unless it is loopback. `POST /api/v1/github/setup-sessions` — which hands out the one-time setup link — needs no inbound route of its own: the CLI calls it on the engine's own address.
+
+If you publish only the webhook path (the pattern above), let the two browser routes through the same proxy while a setup runs, and nothing else:
+
+```caddy
+127.0.0.1:8080 {
+    @webhook path /api/v1/github/webhooks
+    handle @webhook {
+        reverse_proxy 127.0.0.1:9090
+    }
+    # Browser-facing App setup: the form and GitHub's redirect. Neither
+    # serves anything unless a setup link is open, and neither carries the
+    # engine's API surface.
+    @setup path /setup/github /setup/github/callback
+    handle @setup {
+        reverse_proxy 127.0.0.1:9090
+    }
+    handle {
+        respond 404
+    }
+}
+```
+
+Do not publish `/api/v1/github/setup-sessions`: it is the authenticated endpoint that mints the setup link, and the CLI reaches it over the engine's own address or your existing authenticated ingress.
+
+Two operational notes for the hosted flow:
+
+- The engine reads its own public address from `PRELOOP_PUBLIC_URL`, and nothing a CLI sends can change a running process's environment. A setup opened for another address therefore warns: the App's webhook points at the CLI's URL while the delivery-drift check keeps expecting the engine's, so `preloop status` reports drift until you set the same value for `preloop serve`.
+- `--repo` checks wait up to five minutes for the App to be installed on those repositories before checking them. `PRELOOP_SETUP_INSTALL_WAIT_SECS` changes the wait (`0` checks immediately).
+
+## Operating and upgrading
+
+```sh
+preloop status
+preloop status --json
+preloop logs RUN_ID
+preloop update --check
+sudo preloop update
+sudo systemctl status preloop.service preloop.socket
+sudo journalctl -u preloop.service -f
+```
+
+`preloop status` reads queue health and recent runs. The native status endpoint requires the system bearer; keep `PRELOOP_SYSTEM_TOKEN` in the credential store or another protected environment. After updating SmolVM or the binary under a system install, rerun `sudo preloop server install` so the service's protected runtime prefix is refreshed atomically.
+
+Only one engine can own a state directory. A second `preloop serve` on the same `PRELOOP_HOME` exits at once; when the operating system can prove which process owns `serve.lock`, the error names the engine and the way to stop it:
+
+- **Started in the background** by a launcher that set `PRELOOP_ENGINE_ORIGIN=background` — no preloop command starts an engine on its own (issue #658): `kill <pid>` stops it, and then `preloop serve` can run in this terminal.
+- **A systemd service:** stop both units. Stopping only `preloop.service` is not enough, because `preloop.socket` starts it again on the next connection. Per-user installs use `systemctl --user`.
+
+Stop both units before starting a replacement:
+
+```sh
+sudo systemctl stop preloop.socket preloop.service
+```
+
+A normal restart reconciles claims: jobs returned to `ready` can be delivered again, while terminal or unclaimable work is settled. Pool VMs are not resumed across a process restart; rerun the affected workflow when needed.
+
+## Common problems
+
+| Symptom | Action |
+|---|---|
+| Webhook delivery is `401` | Check the App secret and `X-Hub-Signature-256`; an empty secret is not accepted. |
+| Webhooks are absent | Check the public URL, proxy path, TLS, and App event subscriptions. |
+| Webhook delivered but nothing runs | Confirm the webhook secret matches the App (`PRELOOP_WEBHOOK_SECRET` for the default App; `preloop setup github --via app --webhook-secret` for any other), and that the workflow's `on:` matches the event. |
+| Webhook never fires at all | Check the App's webhook is **Active** under the App's Webhook settings. GitHub's API cannot set that flag, so `preloop setup github` points the hook at the engine and leaves the checkbox to you. |
+| Checks remain queued | Confirm the runner bundle, pool labels, available disk, and memory cap. |
+| VM compiler is killed | Increase `PRELOOP_RUNNER_MEMORY_MIB` and reduce pool concurrency. |
+| `401` from CLI | Match the CLI bearer (`PRELOOP_TOKEN`) to the engine's system credential. |
+| Snapshot publish reports `EXDEV` | Keep the state directory on one filesystem; do not split it across bind-mounted devices. |
+| A second engine refuses to start | Stop the service and socket units for that state directory, then retry. |

@@ -144,7 +144,7 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Official actions/runner release pin in versions.toml. The bump PR is the tripwire: it is labeled protocol-sync, and .github/workflows/runner-sync.yml runs watch-pipeline stages on it and opens the tiered PRs (docs/conformance.md). It must never auto-merge.",
+      "description": "Official actions/runner release pin in versions.toml. The bump PR is the tripwire: it is labeled protocol-sync, and .github/workflows/runner-sync.yml runs watch-pipeline stages on it and opens the tiered PRs (docs/contributing/conformance.md). It must never auto-merge.",
       "fileMatch": [
         "^versions\\.toml$"
       ],

@@ -87,8 +87,10 @@ pub(crate) struct InstallArgs {
 
     /// Externally reachable base URL (GitHub webhook + Checks links). GitHub
     /// must be able to reach it: a public domain with DNS + reverse proxy for
-    /// production, or a tunnel (cloudflared, ngrok, Tailscale Funnel) to try
-    /// it out. See docs/setup.md "Exposing the engine to GitHub".
+    /// production, or a tunnel that publishes *only*
+    /// `/api/v1/github/webhooks` to try it out — a path-scoped Tailscale
+    /// Funnel, or a *named* Cloudflare Tunnel behind a path-filtering proxy.
+    /// See docs/control-plane/operate/deploy.mdx "Exposure options".
     #[arg(long, value_name = "URL")]
     public_url: Option<String>,
 
@@ -166,11 +168,15 @@ pub(crate) fn run(args: ServerArgs) -> Result<()> {
 /// A `server install` invocation for callers that own the surrounding flow
 /// (`preloop init --mode service`): the CLI's own defaults, with an explicit
 /// state home only when the operator set one — so a system install keeps
-/// defaulting to [`DEFAULT_HOME`] instead of silently following `PRELOOP_HOME`.
-pub(crate) fn install_args(home: Option<PathBuf>) -> ServerArgs {
+/// defaulting to [`DEFAULT_HOME`] instead of silently following `PRELOOP_HOME`
+/// — and the engine's public URL when the caller resolved one (it becomes a
+/// `PRELOOP_PUBLIC_URL` line in the service's environment file: the service
+/// does not inherit the installing shell's environment).
+pub(crate) fn install_args(home: Option<PathBuf>, public_url: Option<String>) -> ServerArgs {
     ServerArgs {
         command: ServerCommand::Install(InstallArgs {
             home,
+            public_url,
             ..InstallArgs::default()
         }),
     }
@@ -278,7 +284,19 @@ fn install(args: InstallArgs) -> Result<()> {
                 .with_context(|| format!("grant the service read access to {}", key.display()))?;
         }
     }
-    let env_lines = config_env_lines(&args, staged_key.as_deref())?;
+    let runner_base_image = runner_base_image_override();
+    let env_lines = config_env_lines(&args, staged_key.as_deref(), runner_base_image.as_deref())?;
+    // The engine resolves `PRELOOP_RUNNER_BASE_IMAGE` before the config file,
+    // and the line above is what hands it to the service. Saying so here is
+    // what keeps the install summary truthful: the service's jobs fork from
+    // that image, not from `[golden]`.
+    if let Some(image) = &runner_base_image {
+        eprintln!(
+            "[preloop] runner golden: PRELOOP_RUNNER_BASE_IMAGE={image} goes into the service \
+             environment file — the service forks every job from it, not from config.toml's \
+             [golden]"
+        );
+    }
     if let Some(path) = &args.systemd_credential {
         #[cfg(not(target_os = "linux"))]
         {
@@ -1496,9 +1514,15 @@ fn webhook_hint(public_url: Option<&str>) -> String {
         Some(_) => String::new(),
         None => "\n\
              \x20 webhooks:  no --public-url set — GitHub can't reach the engine yet.\n\
-             \x20          Re-run with --public-url (tunnel: `cloudflared tunnel --url\n\
-             \x20          http://127.0.0.1:9090`; production: DNS + reverse proxy).\n\
-             \x20          See docs/setup.md \"Exposing the engine to GitHub\"."
+             \x20          Re-run with --public-url once the webhook path is published:\n\
+             \x20          `tailscale funnel --set-path=/api/v1/github/webhooks --bg\n\
+             \x20          http://127.0.0.1:9090/api/v1/github/webhooks` on a hostname\n\
+             \x20          dedicated to it — Funnel publishes the whole host and port, not\n\
+             \x20          the path, so check `tailscale funnel status` for what else it\n\
+             \x20          exposes — a *named* Cloudflare Tunnel (a quick tunnel's URL\n\
+             \x20          changes on restart and breaks the App's webhook), or your own\n\
+             \x20          domain + reverse proxy.\n\
+             \x20          See docs/control-plane/operate/deploy.mdx \"Exposure options\"."
             .to_owned(),
     }
 }
@@ -1604,17 +1628,29 @@ fn render_launchd_plist(exe: &Path, home: &Path, env_lines: &[String]) -> Result
 
 /// Environment-file lines for the config the operator supplied. Keys are the
 /// names `preloop serve` / the server already read (`PRELOOP_LISTEN`,
-/// `PRELOOP_PUBLIC_URL`, `PRELOOP_GITHUB_APP_*`, `PRELOOP_WEBHOOK_SECRET`).
+/// `PRELOOP_PUBLIC_URL`, `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_GITHUB_APP_*`,
+/// `PRELOOP_WEBHOOK_SECRET`).
 /// `app_key` is the path the environment file should reference — the staged
 /// service-owned copy on Linux system installs, the caller's original
-/// elsewhere; `None` falls back to `args.github_app_key`.
-fn config_env_lines(args: &InstallArgs, app_key: Option<&Path>) -> Result<Vec<String>> {
+/// elsewhere; `None` falls back to `args.github_app_key`. `runner_base_image`
+/// is the process's non-blank `PRELOOP_RUNNER_BASE_IMAGE` (see
+/// [`runner_base_image_override`]): the engine resolves it before the config
+/// file, so the service must be handed it or it would fork from a golden other
+/// than the one this install was described as using.
+fn config_env_lines(
+    args: &InstallArgs,
+    app_key: Option<&Path>,
+    runner_base_image: Option<&str>,
+) -> Result<Vec<String>> {
     let mut lines = Vec::new();
     if let Some(listen) = args.listen {
         lines.push(env_line("PRELOOP_LISTEN", &listen.to_string())?);
     }
     if let Some(url) = &args.public_url {
         lines.push(env_line("PRELOOP_PUBLIC_URL", url)?);
+    }
+    if let Some(image) = runner_base_image {
+        lines.push(env_line("PRELOOP_RUNNER_BASE_IMAGE", image)?);
     }
     if let Some(id) = &args.github_app_id {
         lines.push(env_line("PRELOOP_GITHUB_APP_ID", id)?);
@@ -1650,6 +1686,17 @@ fn config_env_lines(args: &InstallArgs, app_key: Option<&Path>) -> Result<Vec<St
         lines.push(env_line("PRELOOP_WEBHOOK_SECRET", secret)?);
     }
     Ok(lines)
+}
+
+/// The runner base image override this process carries, if any: the engine's
+/// own first source for the golden
+/// ([`preloop_runner_server::config::golden_base_image`] reads
+/// `PRELOOP_RUNNER_BASE_IMAGE` before the config file). Blank counts as unset,
+/// exactly as the engine resolves it.
+fn runner_base_image_override() -> Option<String> {
+    std::env::var(preloop_runner_server::config::BASE_IMAGE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn env_line(key: &str, value: &str) -> Result<String> {
@@ -2518,7 +2565,7 @@ WantedBy=multi-user.target
             user: false,
             dry_run: false,
         };
-        let lines = config_env_lines(&args, None).unwrap();
+        let lines = config_env_lines(&args, None, None).unwrap();
         assert_eq!(
             lines,
             vec![
@@ -2534,6 +2581,102 @@ WantedBy=multi-user.target
         assert!(env_line("A", "x\ny").is_err());
         assert!(env_line("A", "x\0y").is_err());
         assert_eq!(env_line("A", "x=y=z").unwrap(), "A=x=y=z");
+    }
+
+    /// `preloop init --mode service` resolves the engine's public URL itself
+    /// (flag, prompt, or environment) and hands it to the installer here: it
+    /// has to become the service's own `PRELOOP_PUBLIC_URL`, because the
+    /// service does not inherit the installing shell's environment — dropping
+    /// it would leave Check Run links and the webhook health check on the
+    /// loopback default.
+    #[test]
+    fn init_install_args_carry_the_public_url_into_the_env_file() {
+        let ServerArgs {
+            command: ServerCommand::Install(args),
+        } = install_args(None, Some("https://ci.example.com".to_owned()))
+        else {
+            panic!("install_args must build an install command");
+        };
+        assert_eq!(args.public_url.as_deref(), Some("https://ci.example.com"));
+        assert!(
+            args.home.is_none(),
+            "no operator-set home means the default"
+        );
+        assert_eq!(
+            config_env_lines(&args, None, None).unwrap(),
+            vec!["PRELOOP_PUBLIC_URL=https://ci.example.com".to_owned()]
+        );
+
+        let ServerArgs {
+            command: ServerCommand::Install(args),
+        } = install_args(None, None)
+        else {
+            panic!("install_args must build an install command");
+        };
+        assert_eq!(args.public_url, None);
+        assert!(config_env_lines(&args, None, None).unwrap().is_empty());
+    }
+
+    /// `PRELOOP_RUNNER_BASE_IMAGE` outranks the config file's `[golden]`
+    /// everywhere the engine resolves a golden, so a service that does not
+    /// inherit the installing shell has to be handed it in its own
+    /// environment file — the label report and `init`'s done JSON describe the
+    /// override, and the service must run on the same image. Unset (or blank)
+    /// writes no line at all: the service keeps resolving the config file.
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_runner_base_image_override_reaches_the_env_file_only_when_set() {
+        let args = match install_args(None, Some("https://ci.example.com".to_owned())) {
+            ServerArgs {
+                command: ServerCommand::Install(args),
+            } => args,
+            _ => panic!("install_args must build an install command"),
+        };
+        assert_eq!(
+            config_env_lines(&args, None, Some("ghcr.io/acme/base@sha256:abc")).unwrap(),
+            vec![
+                "PRELOOP_PUBLIC_URL=https://ci.example.com".to_owned(),
+                "PRELOOP_RUNNER_BASE_IMAGE=ghcr.io/acme/base@sha256:abc".to_owned(),
+            ]
+        );
+        assert_eq!(
+            config_env_lines(&args, None, None).unwrap(),
+            vec!["PRELOOP_PUBLIC_URL=https://ci.example.com".to_owned()]
+        );
+
+        // The installer reads that value off its own process environment, the
+        // only place it can come from: `PRELOOP_RUNNER_BASE_IMAGE` is exported
+        // by the installing shell. Blank behaves like unset.
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let previous = std::env::var_os(preloop_runner_server::config::BASE_IMAGE_ENV);
+        unsafe { std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV) };
+        assert_eq!(runner_base_image_override(), None);
+        unsafe {
+            std::env::set_var(
+                preloop_runner_server::config::BASE_IMAGE_ENV,
+                "ghcr.io/acme/base:1",
+            )
+        };
+        assert_eq!(
+            runner_base_image_override().as_deref(),
+            Some("ghcr.io/acme/base:1")
+        );
+        unsafe { std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, " ") };
+        assert_eq!(
+            runner_base_image_override(),
+            None,
+            "a blank override is unset"
+        );
+        // SAFETY: restores the value read above; TEST_ENV_LOCK serializes this
+        // process-global env access.
+        unsafe {
+            match previous {
+                Some(value) => {
+                    std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, value)
+                }
+                None => std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV),
+            }
+        }
     }
 
     #[test]
@@ -2614,7 +2757,7 @@ WantedBy=multi-user.target
             dry_run: false,
             ..args.clone()
         };
-        let lines = config_env_lines(&env_args, None).unwrap();
+        let lines = config_env_lines(&env_args, None, None).unwrap();
         let canonical_staged = std::fs::canonicalize(&staged).unwrap();
         assert!(
             lines.iter().any(|line| line
@@ -2635,7 +2778,7 @@ WantedBy=multi-user.target
             "dry-run must not create the staged copy"
         );
         // Dry-run renders the staged path without a canonicalize round-trip.
-        let dry_lines = config_env_lines(&dry_args, Some(&dry_staged)).unwrap();
+        let dry_lines = config_env_lines(&dry_args, Some(&dry_staged), None).unwrap();
         assert!(
             dry_lines
                 .iter()

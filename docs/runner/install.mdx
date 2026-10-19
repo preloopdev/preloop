@@ -1,0 +1,185 @@
+---
+title: Install the runner
+description: Install preloop-runner, register it with GitHub or a Preloop control plane, run it as a service, and remove it.
+---
+
+This page installs `preloop-runner` on a Linux or macOS host, registers it with a GitHub repository, organization, or Preloop control plane, and starts it. You need a registration token and outbound HTTPS access to GitHub. Check [platform support](/runner/overview) first.
+
+## Requirements
+
+- Linux (x86_64 or arm64) or macOS (Apple Silicon or Intel).
+- `git` on the host. The runner uses it to fetch actions and check out code.
+- Docker, only for jobs that use `container:`, `services:`, or Docker actions.
+- Outbound HTTPS to GitHub, including `api.github.com` and `*.actions.githubusercontent.com`. `configure` also downloads Node 20 and Node 24 from `nodejs.org` unless you pass `--no-externals`.
+
+## Install the binary
+
+<Steps>
+<Step title="Run the installer">
+
+Fetch the installer at a release tag, read it, then run it with `--runner`. That installs only `preloop-runner`, with no control plane or VM tooling.
+
+```sh
+ver=v0.34.4   # any release tag v0.33.7 or newer; see https://github.com/preloopdev/preloop/releases
+curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+less install.sh
+sh install.sh --runner
+```
+
+The installer checks the binary against the release's SHA-256 file and puts it in `~/.local/bin`. Pass `--prefix <dir>` to install under `<dir>/bin` instead.
+
+</Step>
+<Step title="Or download the binary">
+
+Each release publishes one binary per platform, with a `.sha256` file and a CycloneDX SBOM.
+
+| Host | Asset |
+|---|---|
+| Linux x86_64 | `preloop-runner-x86_64-unknown-linux-gnu` |
+| Linux arm64 | `preloop-runner-aarch64-unknown-linux-gnu` |
+| macOS Apple Silicon | `preloop-runner-aarch64-apple-darwin` |
+| macOS Intel | `preloop-runner-x86_64-apple-darwin` |
+
+```sh
+triple=x86_64-unknown-linux-gnu   # the asset for your host
+base=https://github.com/preloopdev/preloop/releases/latest/download
+curl -fsSLO "$base/preloop-runner-$triple"
+curl -fsSLO "$base/preloop-runner-$triple.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "preloop-runner-$triple" | awk '{print $1}')
+else
+  actual=$(shasum -a 256 "preloop-runner-$triple" | awk '{print $1}')
+fi
+test "$actual" = "$(awk '{print $1}' "preloop-runner-$triple.sha256")"
+install -m 0755 "preloop-runner-$triple" ~/.local/bin/preloop-runner
+```
+
+</Step>
+</Steps>
+
+Check the install with `preloop-runner --version`.
+
+## Get a registration token
+
+Create the token right before you configure the runner. In the repository or organization settings, open **Actions → Runners → New self-hosted runner**, or use the GitHub CLI:
+
+- Repository: `gh api --method POST /repos/OWNER/REPO/actions/runners/registration-token --jq .token`
+- Organization: `gh api --method POST /orgs/ORG/actions/runners/registration-token --jq .token`
+
+## Configure and run
+
+<Steps>
+<Step title="Configure the runner">
+
+Run `configure` from the directory the runner will live in. That directory is the runner root. It holds the runner's configuration, `_work/` for job workspaces, and `externals/` for Node.
+
+```sh
+mkdir -p ~/actions-runner && cd ~/actions-runner
+preloop-runner configure \
+  --url https://github.com/OWNER/REPO \
+  --token <REGISTRATION_TOKEN> \
+  --name my-runner \
+  --labels gpu,fast
+```
+
+For an organization runner, use `--url https://github.com/ORG`. `configure` registers the runner, downloads Node 20 and Node 24, and writes `.runner`, `.credentials`, and `.credentials_rsaparams`. Those files are readable only by the owner.
+
+</Step>
+<Step title="Start the runner">
+
+```sh
+preloop-runner run
+```
+
+The runner connects to GitHub and waits for jobs. Press Ctrl-C to stop it. A running job gets 60 seconds to wind down before the runner stops it and reports it as canceled.
+
+</Step>
+<Step title="Run it as a service (Linux)">
+
+Create `/etc/systemd/system/preloop-runner.service`. This example expects the binary at `/usr/local/bin/preloop-runner`, so copy it there or change `ExecStart`.
+
+```ini
+[Unit]
+Description=preloop GitHub Actions runner
+After=network.target
+
+[Service]
+Type=simple
+User=runner
+WorkingDirectory=/home/runner/actions-runner
+ExecStart=/usr/local/bin/preloop-runner run
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now preloop-runner
+```
+
+`WorkingDirectory` must be the runner root. Do not combine this unit with `--once` or `--ephemeral`. `Restart=always` starts the runner again after every exit.
+
+</Step>
+</Steps>
+
+## Single-job runners
+
+A runner configured with `--ephemeral` exits after its first job. `run --once` does the same for any configured runner. Use either on hosts that you provision for one job.
+
+```sh
+preloop-runner configure --url https://github.com/OWNER/REPO --token <REGISTRATION_TOKEN> --ephemeral
+preloop-runner run --once
+```
+
+## Connect to a Preloop control plane
+
+Point `configure` at the control plane's base URL. Use the control plane's system token as `--token`, not a GitHub registration token. The control plane accepts only that credential for registration.
+
+```sh
+preloop-runner configure --url https://preloop.example.com --token <SYSTEM_TOKEN> --name my-runner
+preloop-runner run
+```
+
+<Note>
+
+The control plane gives the runner the address of its runner service, built from its public URL (`PRELOOP_PUBLIC_URL` on the control plane). Set that URL to an address the runner host can reach. See [control plane configuration](/control-plane/configuration).
+
+</Note>
+
+## Run in a container
+
+The image `ghcr.io/preloopdev/preloop-runner` supports `linux/amd64` and `linux/arm64`. Its entrypoint is `preloop-runner` and its default command is `run`, so the container does not configure itself. Keep the runner state in a volume, and pass `--runner-root` to each command.
+
+```sh
+docker run --rm -v preloop-runner:/runner ghcr.io/preloopdev/preloop-runner:latest \
+  --runner-root /runner configure --url https://github.com/OWNER/REPO --token <REGISTRATION_TOKEN>
+
+docker run -d --name preloop-runner -v preloop-runner:/runner \
+  ghcr.io/preloopdev/preloop-runner:latest --runner-root /runner run
+```
+
+The image includes `git`, `curl`, CA certificates, and the Docker CLI with buildx. Container jobs need a Docker daemon that the container can reach.
+
+## Remove the runner
+
+Deregister the runner with a remove token, not a registration token:
+
+```sh
+gh api --method POST /repos/OWNER/REPO/actions/runners/remove-token --jq .token
+preloop-runner remove --token <REMOVE_TOKEN>
+```
+
+`remove` deregisters the runner and deletes `.runner`, `.credentials`, and `.credentials_rsaparams`. It leaves `_work/` and `externals/` in place, so delete those yourself. If the server cannot deregister the runner, `remove` warns and deletes the local files anyway; remove the runner in the repository or organization runner settings to clear the leftover registration.
+
+## Troubleshooting
+
+| Message | Cause | Fix |
+|---|---|---|
+| `Runner is already configured in ... Use --replace` | The runner root already contains `.runner`. | Pass `--replace`, or use a different `--runner-root`. |
+| `Runner '<name>' already exists` | A runner with that name is already registered. | Pass `--replace`, or choose another `--name`. |
+| `loading runner configuration ... run preloop-runner configure first` | `run` found no configuration in the runner root. | Run from the runner root, or pass `--runner-root`. |
+| `bundled node20 is missing` | You configured with `--no-externals`, and the `node` on `PATH` does not match the action's Node version. | Install the matching Node version, or run `configure` without `--no-externals`. |

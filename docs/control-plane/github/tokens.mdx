@@ -1,0 +1,109 @@
+---
+title: "GitHub tokens"
+description: "Understand the local runner credentials, job GITHUB_TOKEN, App installation tokens, and PAT fallback."
+---
+
+Preloop gives each job a local runtime credential and, separately, an optional GitHub credential. The runtime credential authenticates to the control plane; `GITHUB_TOKEN` authenticates to GitHub and may be empty.
+
+## Two credentials, two destinations
+
+| Credential | Job-facing name | Source | Where it works |
+|---|---|---|---|
+| Runtime credential | `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | A per-job local HS256 JWT | Preloop cache, artifacts, logs, results, OIDC, snapshots, and broker endpoints |
+| GitHub credential | `GITHUB_TOKEN`, `${{ github.token }}` | An App installation token, an eligible PAT, or empty | GitHub API calls made by workflow steps and actions |
+
+The runtime JWT uses the key at `<state-dir>/hmac-key.bin` by default. `PRELOOP_HMAC_KEY` can provide a shared 32-byte key as 64 hexadecimal characters. Its job claims identify the job and its Results scope. GitHub rejects this JWT; it is never substituted for `GITHUB_TOKEN`.
+
+At claim time, Preloop writes the same GitHub credential to `github_token` and `contextData.github.token`. Therefore `${{ secrets.GITHUB_TOKEN }}` and `${{ github.token }}` agree in runner-time `env:`, `with:`, and `run:` values, local composite-action inputs, job environment expressions, and container or service credentials. Acquire-time job `env:` values and reusable-workflow `secrets:` maps are filled after that claim patch as well.
+
+`ACTIONS_ID_TOKEN_REQUEST_URL` is present only when the job has `id-token: write`. OIDC tokens are signed by Preloop and use the configured issuer, not GitHub's token service.
+
+## What works with no GitHub token
+
+These features use Preloop's own runtime credential or run locally:
+
+| Capability | Requirement |
+|---|---|
+| Local `actions/checkout` | `PRELOOP_LOCAL_WORKSPACE`; the engine serves an immutable snapshot over authenticated Git smart HTTP. |
+| Cache and artifacts | The local runtime token; both v1 and supported v2/v4 protocol surfaces are local. |
+| Shell steps, matrices, `needs`, expressions, annotations, and summaries | No GitHub credential. |
+| Container and service jobs | The runner resolves the job plan and pulls images from the guest. |
+| OIDC | `permissions: id-token: write`, plus a cloud provider configured to trust the Preloop issuer and JWKS. |
+| Public actions in `uses:` | The engine can download public action archives anonymously; `PRELOOP_GITHUB_TOKEN` avoids GitHub's anonymous rate limit. |
+
+A step that calls `api.github.com` directly—`gh`, `actions/github-script`, a PR or issue action, or a private remote checkout—needs a real GitHub credential. Public unauthenticated reads may still succeed; private and write operations do not.
+
+## Local checkout behavior
+
+When the submission uses `PRELOOP_LOCAL_WORKSPACE`, the default checkout action is rewritten to the run's immutable snapshot endpoint. The engine pins the job's runtime JWT as the checkout token, so local checkout works even when `GITHUB_TOKEN` is empty. Local snapshot checkout intentionally replaces its default `token` input with the local engine credential; that transport credential is not the job's GitHub token.
+
+The rewrite applies only when checkout inputs are default-equivalent. A non-default repository, ref, `github-server-url`, `fetch-depth`, or `fetch-tags` keeps remote behavior. An explicit nonempty checkout `token` also keeps remote behavior; Preloop does not replace a credential the workflow explicitly supplied.
+
+## Recommended setup: a GitHub App
+
+```sh
+preloop setup github --via app --public-url https://ci.example.com
+```
+
+The command stores the App ID, private key, and webhook secret in the credential store. When you attach an existing App—or register one through the engine's browser flow—pass `--webhook-secret` so the secret is bound to that App's id; `PRELOOP_WEBHOOK_SECRET` remains the single default-App slot and cannot address a second App. See [GitHub App](/control-plane/github/app) for the registration walkthrough.
+
+An App installation token is minted per job, scoped to the repository and the job's effective `permissions:`. The engine requests one repository and an explicit permission map, never the installation's entire repository set. Installation discovery pages 100 installations at a time, up to 10 pages, and caches only the installation ID for the process lifetime. Tokens themselves are not reused.
+
+Relevant settings are:
+
+| Setting | Purpose |
+|---|---|
+| `PRELOOP_GITHUB_APP_ID` | App ID. |
+| `PRELOOP_GITHUB_APP_PEM` | Inline private key; highest precedence. |
+| `PRELOOP_GITHUB_APP_PEM_FILE` | Private-key file. |
+| `PRELOOP_GITHUB_APP_PRIVATE_KEY` / `_PATH` | Older inline/file aliases. |
+| `PRELOOP_GITHUB_APP_INSTALLATION_ID` | Pin an installation and skip owner discovery. |
+| `PRELOOP_GITHUB_APP_MINT_FAILURE` | `local` (default), `error`, or `pat`. |
+| `PRELOOP_GITHUB_TOKEN` | Static PAT for supported server-side calls and fallback behavior. |
+| `PRELOOP_GITHUB_API_URL` | Upstream GitHub REST base; defaults to `https://api.github.com`. |
+
+The first nonblank PEM setting wins. PKCS#1 and PKCS#8 PEMs are accepted, and literal `\n` sequences are restored when an environment variable flattened the key. An App ID without a key is a warning and disables minting; an unreadable or invalid key paired with an App ID is a startup error. Unknown mint-failure values are startup errors.
+
+The App JWT is RS256, backdated 60 seconds, and expires after 10 minutes. A GitHub `422` for unavailable permissions causes Preloop to read the installation grants, narrow the request, and retry once. The resulting permissions are visible in `system.github.token.permissions`.
+
+App-JWT breaker state is partitioned by App id. An outage for one registered App therefore does not block minting through another; an open bucket for an App still invokes the configured mint-failure policy for that App.
+
+## Permission mapping and fallback
+
+Workflow-level `permissions:` is replaced—not merged—by job-level `permissions:`. `read-all` and `write-all` expand to the known scopes. YAML names use kebab case, the runner wire map uses PascalCase, and GitHub's installation-token request uses snake case. `none`, `id-token`, and `models` are omitted from the App request. If all requested scopes are omitted, the request contains `metadata: read`.
+
+Without a `permissions:` declaration, the App request states GitHub's restricted default: `contents: read`, `metadata: read`, and `packages: read`. The optional operator ceiling is applied before minting:
+
+```toml
+[token_permissions_ceiling]
+default = "read"
+contents = "read"
+pull-requests = "write"
+allow_create_approve_pr = false
+```
+
+The ceiling is inactive until the table exists. When active, levels are `none < read < write < admin`; `allow_create_approve_pr = false` caps pull-request writes at read. PAT fallback is not narrowed by this ceiling.
+
+| `PRELOOP_GITHUB_APP_MINT_FAILURE` | Job behavior |
+|---|---|
+| `local` | Do not use an App token. A later common broker fallback may still provide a verified static PAT. Remove the PAT or use `error` when fail-closed behavior is required. |
+| `error` | Fail the claimed job instead of running after an App mint failure. |
+| `pat` | Use the configured PAT without per-job or repository narrowing. |
+
+Fork pull-request jobs never receive the PAT fallback. They keep the local runtime credential even when App minting fails.
+
+## PAT fallback
+
+With no default App, Preloop checks a classic PAT's `X-OAuth-Scopes` header and performs a coarse read/write admission check against the job's effective permissions. Fine-grained PATs normally omit that header, so they are withheld from jobs in this path, although they may still serve supported server-side operations. An explicit `pat` mint-failure policy bypasses this normal admission check and gives the static PAT directly.
+
+The PAT may fetch remote reusable workflows, action metadata and archives, pull-request changed files, and other supported server-side GitHub data. Check Run publication also attempts a resolved static PAT when App minting is unavailable, but an App with `checks: write` is the reliable least-privilege configuration.
+
+## Credential priority
+
+For an ordinary trusted job, the effective order is:
+
+1. App installation token, scoped to the repository and effective permissions.
+2. A verified static PAT, subject to the selected mint-failure policy and normal admission checks.
+3. An empty `GITHUB_TOKEN`; anonymous public API reads may still work.
+
+The runtime JWT remains separate at every step. It continues to authenticate cache, artifacts, logs, OIDC, and local checkout.

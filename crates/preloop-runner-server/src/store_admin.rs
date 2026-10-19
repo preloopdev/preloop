@@ -180,14 +180,23 @@ pub async fn status(target: StoreTarget) -> anyhow::Result<StoreStatus> {
 }
 
 /// First-run preparation for a local install: initialize ONLY a brand-new
-/// (absent or empty) SQLite control database so `preloop run` stays
-/// zero-config. An existing database — any state other than empty — is left
-/// untouched: upgrading is `preloop store migrate`, never implicit.
+/// (absent or empty) SQLite control database, so a fresh `PRELOOP_HOME`
+/// serves with no extra step. An existing database — any state other than
+/// empty — is left untouched: upgrading is `preloop store migrate`, never
+/// implicit.
 ///
 /// Returns whether the database was created. A Postgres store is never
 /// initialized here (the operator runs `store migrate`). Synchronous on
 /// purpose: the installer calls it outside any runtime, and the work is one
 /// file check plus (only on a fresh install) the embedded migrations.
+///
+/// `store_url` is the caller's explicit selection (`preloop serve --store`);
+/// `None` falls back to `PRELOOP_STORE_URL` and then to `<state_dir>/preloop.db`.
+/// That is [`StoreTarget::resolve`]'s precedence — the one the boot itself
+/// uses — so the preparation initializes the database the server will open:
+/// prepared against anything else, `preloop serve --store sqlite:///elsewhere.db`
+/// on a fresh home would create the state-dir default and then refuse the
+/// empty store it was pointed at.
 ///
 /// The database path is never followed: a symlink there would aim the
 /// create, the migration and the chmod at its target, so one is refused when
@@ -198,15 +207,9 @@ pub async fn status(target: StoreTarget) -> anyhow::Result<StoreStatus> {
 /// attack one level up. `preloop server install` no longer takes that path —
 /// it runs the preparation as the service account itself, so root never
 /// creates, writes or chmods anything inside the service-owned tree.
-pub fn prepare_brand_new_local(state_dir: &Path) -> anyhow::Result<bool> {
-    let raw = std::env::var(STORE_URL_ENV).unwrap_or_default();
-    let StoreUrl::Sqlite(path) = parse_store_url(&raw)? else {
+pub fn prepare_brand_new_local(state_dir: &Path, store_url: Option<&str>) -> anyhow::Result<bool> {
+    let StoreTarget::Sqlite(path) = StoreTarget::resolve(store_url, state_dir)? else {
         return Ok(false);
-    };
-    let path = if path.as_os_str().is_empty() {
-        state_dir.join("preloop.db")
-    } else {
-        path
     };
     // Brand-new means absent or empty, judged with `symlink_metadata` (never
     // `exists`/`metadata`, which follow links — the very move this refuses):
@@ -219,8 +222,8 @@ pub fn prepare_brand_new_local(state_dir: &Path) -> anyhow::Result<bool> {
                 return Ok(false);
             }
             anyhow::bail!(
-                "refusing to initialize {}: it is a symlink; remove it, or point \
-                 {STORE_URL_ENV} at the real path",
+                "refusing to initialize {}: it is a symlink; remove it, or select \
+                 the real path (`--store` / {STORE_URL_ENV})",
                 path.display()
             );
         }
