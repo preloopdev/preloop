@@ -6313,7 +6313,13 @@ mod tests {
             Self::with_workspace(temp, ws_dir).await
         }
 
+        /// Build the fixture's engine.
+        ///
+        /// Completes the process-wide outbound client first, so its one-time
+        /// TLS root build cannot land inside a poll budget one of these tests
+        /// asserts on (same reasoning as [`poll_only_shared`]).
         async fn with_workspace(temp: &tempfile::TempDir, ws_dir: std::path::PathBuf) -> Self {
+            std::sync::LazyLock::force(&crate::shared_http::CLIENT);
             let event_sha = if ws_dir.join(".github/workflows").is_dir() {
                 commit_workspace(&ws_dir)
             } else {
@@ -7874,7 +7880,20 @@ mod tests {
 
     /// Engine state for driving [`poll_fresh_merge`] directly: a poll schedule
     /// and the environment's stubbed API, with no repository or merge needed.
+    ///
+    /// Also builds the process-wide outbound client before any caller starts a
+    /// poll budget. [`crate::shared_http::CLIENT`] is a `LazyLock` whose first
+    /// use pays for the TLS root set — the bundled Mozilla anchors, the OS
+    /// certificate store ([`crate::shared_http::tls_roots`] reads it through a
+    /// daemon with a deadline of its own), and any `PRELOOP_GITHUB_CA_FILE` /
+    /// `SSL_CERT_FILE` bundle. On a host with a slow trust store the *first*
+    /// probe spends the budget inside that build, no second poll happens, and
+    /// "the probe is retried within the budget" fails on the certificate store
+    /// instead of on the poll schedule. Warming here is test-only and keeps
+    /// every assertion in this family measuring the schedule the poll code is
+    /// written to honour; the engine's own client build is untouched.
     async fn poll_only_shared(temp: &tempfile::TempDir, budget: Duration) -> Arc<SharedState> {
+        std::sync::LazyLock::force(&crate::shared_http::CLIENT);
         let mut state = AppState::new(temp.path().join("state")).await.unwrap();
         state.fresh_merge_poll = FreshMergePoll {
             budget,

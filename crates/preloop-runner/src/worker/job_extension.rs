@@ -864,6 +864,7 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
             env,
             raw: step.clone(),
             is_background,
+            post_of: Vec::new(),
         });
     }
 
@@ -875,7 +876,9 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 /// Official runner builds three lists:
 /// - pre steps: declared order, `pre-if` defaults to `always()`
 /// - main steps: the workflow steps
-/// - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`
+/// - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`;
+///   each names its action step in `post_of`, and `run_steps` runs it only once that
+///   step has started (the official runner registers post hooks at run time)
 ///
 /// State context (`GITHUB_STATE` file) is wired so pre can communicate to post
 /// via `save-state`; `StepContext::build_env()` exposes those values as
@@ -919,12 +922,19 @@ pub fn build_step_list_with_lifecycle(
         // post cleanup is still registered. Keep this aligned with the pinned source
         // (ActionRunner.cs, `RunAsync`, lines 105-110).
         // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L105-L110
+        // Steps whose action handler registers the post hook: the main step, and
+        // the pre step when the action declares `pre:`. `ActionRunner.RunAsync`
+        // registers the post job step for the Pre stage as well as the Main one,
+        // so a pre step that ran must remain able to clean up after itself even
+        // when the main step is skipped.
+        let mut post_registrations = vec![step.context_name.clone()];
         if !is_local_action {
             // Pre step
             if let Some(pre_main) = &manifest.runs_pre {
                 let pre_if = manifest.runs_pre_if.as_deref().unwrap_or("always()");
                 let pre_context = format!("__pre_{}", step.context_name);
                 let pre_id = format!("__pre_{}", step.id);
+                post_registrations.push(pre_context.clone());
                 pre_steps.push(Step {
                     id: pre_id,
                     context_name: pre_context,
@@ -943,6 +953,7 @@ pub fn build_step_list_with_lifecycle(
                         "uses": uses,
                     }),
                     is_background: false,
+                    post_of: Vec::new(),
                 });
             }
         }
@@ -973,6 +984,7 @@ pub fn build_step_list_with_lifecycle(
                     "uses": uses,
                 }),
                 is_background: false,
+                post_of: post_registrations,
             });
         }
     }
