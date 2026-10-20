@@ -12,6 +12,7 @@
 //! owns the git operations and their credentials.
 
 use super::*;
+use crate::github_breaker::{GithubCredential, GithubCredentialBucket, GithubSubsystem};
 
 /// Result of a completed sync, returned to the client.
 #[derive(Debug, Clone, Serialize)]
@@ -248,8 +249,8 @@ pub async fn push_run_to_github(
         .strip_prefix("refs/heads/")
         .expect("validated above to be a branch ref");
 
-    let token = match push_token(shared, &repository).await {
-        Some(token) => token,
+    let credential = match push_credential(shared, &repository).await {
+        Some(credential) => credential,
         None => {
             let message =
                 "no GitHub credentials configured (GitHub App or PRELOOP_GITHUB_TOKEN)".to_owned();
@@ -271,7 +272,8 @@ pub async fn push_run_to_github(
     //      commit and reject the materialized push with a tree mismatch).
     let commit = if dirty {
         match github_json(
-            &token,
+            shared,
+            &credential,
             &repository,
             "GET",
             &format!("commits/{branch}"),
@@ -290,7 +292,16 @@ pub async fn push_run_to_github(
             }
         }
     } else {
-        match github_json(&token, &repository, "GET", &format!("commits/{sha}"), None).await {
+        match github_json(
+            shared,
+            &credential,
+            &repository,
+            "GET",
+            &format!("commits/{sha}"),
+            None,
+        )
+        .await
+        {
             Ok(commit) => commit,
             Err(error) => {
                 let message =
@@ -335,14 +346,15 @@ pub async fn push_run_to_github(
             .map(str::to_owned)
             .unwrap_or_else(|| base.clone()),
         None => {
-            let repo_info = match github_json(&token, &repository, "GET", "", None).await {
-                Ok(info) => info,
-                Err(error) => {
-                    let message = format!("could not read repository metadata: {error}");
-                    mark_blocked(shared, run_id, message.clone()).await;
-                    return Err(classify(&message));
-                }
-            };
+            let repo_info =
+                match github_json(shared, &credential, &repository, "GET", "", None).await {
+                    Ok(info) => info,
+                    Err(error) => {
+                        let message = format!("could not read repository metadata: {error}");
+                        mark_blocked(shared, run_id, message.clone()).await;
+                        return Err(classify(&message));
+                    }
+                };
             match repo_info.get("default_branch").and_then(|b| b.as_str()) {
                 Some(base) => base.to_owned(),
                 None => {
@@ -370,19 +382,27 @@ pub async fn push_run_to_github(
     let head = format!("{owner}:{branch}");
     let query = serde_urlencoded::to_string([("head", head.as_str()), ("state", "open")])
         .expect("url-encoding cannot fail for str pairs");
-    let pr_number =
-        match github_json(&token, &repository, "GET", &format!("pulls?{query}"), None).await {
-            Ok(pulls) => pulls
-                .as_array()
-                .and_then(|list| list.first())
-                .and_then(|pr| pr.get("number"))
-                .and_then(|number| number.as_u64()),
-            Err(error) => {
-                let message = format!("could not look up pull requests: {error}");
-                mark_blocked(shared, run_id, message.clone()).await;
-                return Err(classify(&message));
-            }
-        };
+    let pr_number = match github_json(
+        shared,
+        &credential,
+        &repository,
+        "GET",
+        &format!("pulls?{query}"),
+        None,
+    )
+    .await
+    {
+        Ok(pulls) => pulls
+            .as_array()
+            .and_then(|list| list.first())
+            .and_then(|pr| pr.get("number"))
+            .and_then(|number| number.as_u64()),
+        Err(error) => {
+            let message = format!("could not look up pull requests: {error}");
+            mark_blocked(shared, run_id, message.clone()).await;
+            return Err(classify(&message));
+        }
+    };
     let pr_number = if let Some(number) = pr_number {
         Some(number)
     } else if create_pr {
@@ -396,7 +416,8 @@ pub async fn push_run_to_github(
                 .unwrap_or_else(|| "local server (no public URL configured)".to_owned())
         );
         match github_json(
-            &token,
+            shared,
+            &credential,
             &repository,
             "POST",
             "pulls",
@@ -546,15 +567,22 @@ pub fn validate_push_target(
     Ok(())
 }
 
-/// Installation token covering everything the sync touches, or the ambient
-/// PAT when no App is configured.
+/// Installation-token credential covering everything the sync touches, or the
+/// ambient PAT when no App is configured.
 ///
 /// The PAT is resolved through `AppState`, which already applies the
 /// env-then-config precedence every other credential here uses. Reading
 /// `PRELOOP_GITHUB_TOKEN` directly instead would leave a server configured
 /// by `preloop setup github --via pat` able to run CI but never able to push
 /// its result back, because that flow only ever writes the config file.
-pub async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<String> {
+///
+/// The bucket travels with the token: push and auto-PR calls are observed
+/// against the installation that minted the token (from the mint ledger, which
+/// is local and exact), or the PAT that backs them.
+pub async fn push_credential(
+    shared: &Arc<SharedState>,
+    repository: &str,
+) -> Option<GithubCredential> {
     let permissions = std::collections::BTreeMap::from([
         ("checks".to_owned(), "write".to_owned()),
         ("pull_requests".to_owned(), "write".to_owned()),
@@ -565,23 +593,39 @@ pub async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<S
     // (e.g. a selected-repositories installation), and a later App can.
     for app_creds in crate::github_app::candidate_apps_for_repo(shared, repository).await {
         match crate::github_app::get_or_mint_token(&app_creds, repository, &permissions).await {
-            Ok(token) => return Some(token),
+            Ok(token) => {
+                let bucket = match app_creds.mint_ledger.lookup(&token) {
+                    Some(entry) => GithubCredentialBucket::Installation(entry.installation_id),
+                    // The mint succeeded but the ledger cannot name the
+                    // installation: never invent an id, and never charge the
+                    // PAT's budget with an installation token. The token's own
+                    // fingerprint is its identity.
+                    None => GithubCredentialBucket::for_installation_token(&token),
+                };
+                return Some(GithubCredential::bearer(token, bucket));
+            }
             Err(error) => tracing::warn!(%repository, %error, "push token mint failed"),
         }
     }
-    shared.state.static_github_pat()
+    shared
+        .state
+        .static_github_pat()
+        .map(|pat| GithubCredential::bearer(pat, GithubCredentialBucket::Pat))
 }
 
-/// One GitHub REST call returning the parsed JSON body. Errors carry the
-/// HTTP status so [`classify`] can tell user mistakes from outages.
+/// One GitHub REST call returning the parsed JSON body, through the
+/// credential's breaker. Errors carry the HTTP status (typed, and in the
+/// message) so [`classify`] can tell user mistakes from outages, and a refusal
+/// while the breaker is open is a [`crate::github_breaker::BreakerOpen`] error
+/// that never reached GitHub.
 pub async fn github_json(
-    token: &str,
+    shared: &Arc<SharedState>,
+    credential: &GithubCredential,
     repository: &str,
     method: &str,
     path: &str,
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
-    let client = crate::shared_http::CLIENT.clone();
     let url = format!(
         "{}/repos/{}{}",
         crate::github::github_api_base(),
@@ -592,37 +636,21 @@ pub async fn github_json(
             format!("/{path}")
         }
     );
-    let request = client
-        .request(
-            reqwest::Method::from_bytes(method.as_bytes()).expect("fixed methods"),
-            &url,
-        )
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json");
-    let request = match body {
-        Some(body) => request.json(&body),
-        None => request,
-    };
-    let response = request.send().await?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow::anyhow!(
-            "GitHub API {} {path} failed with status {}: {}",
-            method,
-            status.as_u16(),
-            text
-        ));
-    }
-    serde_json::from_str(&text)
-        .map_err(|error| anyhow::anyhow!("unparsable GitHub response: {error}"))
+    crate::github_breaker::send_github_json(
+        &shared.state,
+        credential,
+        GithubSubsystem::PushBack,
+        reqwest::Method::from_bytes(method.as_bytes()).expect("fixed methods"),
+        &url,
+        body.as_ref(),
+    )
+    .await
 }
 
 /// Map an upstream failure to the right HTTP answer: GitHub being down
-/// (5xx, transport) is a gateway failure; everything else — a missing
-/// commit, a divergent branch, a tree mismatch — is the client's problem
-/// and reads better as a 4xx.
+/// (5xx, transport, or a refusal while the breaker was open) is a gateway
+/// failure; everything else — a missing commit, a divergent branch, a tree
+/// mismatch — is the client's problem and reads better as a 4xx.
 fn classify(message: &str) -> ApiError {
     let text = message.to_lowercase();
     let transient = [
@@ -631,6 +659,9 @@ fn classify(message: &str) -> ApiError {
         "timeout",
         "temporary failure",
         "dns",
+        // A breaker refusal is the same gateway failure as a transport error:
+        // the call was not made because GitHub is known to be down.
+        "circuit breaker is open",
     ]
     .iter()
     .any(|needle| text.contains(needle));
