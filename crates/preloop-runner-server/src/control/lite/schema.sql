@@ -545,7 +545,8 @@ CREATE TABLE webhook_deliveries (
     attempts                INTEGER NOT NULL DEFAULT 0,
     lease_until             INTEGER,
     lease_token             TEXT,
-    last_error              TEXT
+    last_error              TEXT,
+    signer_app_id           TEXT
 );
 CREATE INDEX webhook_deliveries_claim ON webhook_deliveries(received_at)
     WHERE state IN ('received','processing');

@@ -47,10 +47,25 @@ Releases before v0.27.0 predate the changelog.
   called `GET /repos/{owner}/{repo}/installation` on every signed delivery
   before enqueueing it, so each delivery paid a GitHub API round trip inside
   the ingress' upload slot and spent one request of the App's rate limit.
-  Coverage answers are now cached in memory per App: a positive for ten
-  minutes, a definitive 404 for one minute, so a repository added to the
-  installation starts delivering soon. A transport error, rate limit, or
-  other non-answer is still rejected fail-closed and is never cached.
+  Only a validated positive is retained, for ten minutes. A definitive 404,
+  timeout, rate limit, 5xx, unparseable body, missing/mismatched `app_id`, or
+  suspended installation denies that delivery without being cached, so the
+  next delivery can discover a new grant immediately. Simultaneous deliveries
+  for one repository share one lookup; unrelated repositories and Apps do not
+  serialize. Signature-verified `installation` and `installation_repositories`
+  events invalidate the signer's affected answers before ordinary gating —
+  deleted/suspended installations clear all of that App's answers, and
+  added/removed repositories are re-confirmed on the next ordinary delivery.
+  Lifecycle payloads never grant access, and a payload's `app_id` is never
+  used in place of the verified signer. The cache is process-local: a
+  lifecycle event missed by a process leaves its positive valid for at most
+  the ten-minute fallback TTL, so this is not immediate distributed
+  revocation. At capacity the oldest checked answer is evicted individually,
+  and setup/doctor installation checks stay uncached.
+- **Webhook processing keeps the verified signer's App identity.** The signer
+  App id is persisted with the durable delivery and pins downstream App
+  selection, so a delivery signed by App B cannot mint or act with unrelated
+  App A's installation credentials when both cover the repository.
 
 ## [0.35.0] - 2026-10-19
 
