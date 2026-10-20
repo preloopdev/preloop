@@ -6224,6 +6224,14 @@ async fn run_one_runner<P: VmProvider + 'static>(
         .pool_status
         .as_ref()
         .map(|status| status.subscribe_runner_completion());
+    // The server commits the claim in the control store and publishes it
+    // before the guest is expected to print anything. Subscribe before the
+    // claim-set probe so a claim landing in between is seen by one or the
+    // other, never by neither.
+    let mut server_claim = config
+        .pool_status
+        .as_ref()
+        .map(|status| status.subscribe_runner_claim());
     let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_provider = provider.clone();
     let run_name = name.clone();
@@ -6231,6 +6239,21 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // function; the guard publishes it in the pool-wide idle gauge until a job
     // claims it or it is torn down.
     let mut idle = IdleGuard::register(idle, config.pool_status.clone());
+    // Provisioning and registration can complete before this function runs,
+    // and the server may already have handed this machine a job. The claim
+    // set is authoritative and closes that window.
+    if config
+        .pool_status
+        .as_ref()
+        .is_some_and(|status| status.runner_is_claimed(name.as_str()))
+    {
+        info!(
+            machine = name.as_str(),
+            "runner already has a committed claim before its idle grace started"
+        );
+        claimed.store(true, Ordering::Release);
+        idle.release();
+    }
     let run_task = tokio::spawn(async move {
         let result = run_until_exit(
             &run_provider,
@@ -6244,20 +6267,70 @@ async fn run_one_runner<P: VmProvider + 'static>(
         let _ = done_tx.send(result);
     });
 
-    // The guest announces the job it accepted on stdout. From that moment the
-    // runner is busy, not idle; a runner that exits without taking one leaves
-    // the guard to this function's teardown.
+    // Busy has two authoritative-in-practice sources: the guest's stdout
+    // sentinel (fast when it arrives) and the server's committed claim
+    // (always, even when the guest is silent or its output is buffered). The
+    // claim is the one the idle grace must trust; the sentinel only lets the
+    // pool report busy a little earlier.
     let claim_claimed = claimed.clone();
     let claim = async {
-        if busy_rx.await.is_err() {
+        if claim_claimed.load(Ordering::Acquire) {
             return;
         }
-        claim_claimed.store(true, Ordering::Release);
-        idle.release();
+        let stdout = async { busy_rx.await.is_ok() };
+        let server = async {
+            let Some(events) = server_claim.as_mut() else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            loop {
+                match events.recv().await {
+                    Ok(event) if event.runner_name == name.as_str() => {
+                        info!(
+                            machine = name.as_str(),
+                            runner_id = event.runner_id,
+                            "server claim event marks runner busy"
+                        );
+                        return;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        std::future::pending::<()>().await
+                    }
+                }
+            }
+        };
+        if tokio::select! {
+            acquired = stdout => acquired,
+            _ = server => true,
+        } {
+            claim_claimed.store(true, Ordering::Release);
+            idle.release();
+        }
     };
 
-    let idle_deadline = tokio::time::sleep(UNCLAIMED_RUNNER_IDLE_GRACE);
-    tokio::pin!(idle_deadline);
+    // The grace expires only when the control store has no claim for this
+    // machine. Re-read the authoritative set at the instant the timer fires:
+    // an event that is queued but not yet polled must not lose to the timer.
+    let idle_claimed = claimed.clone();
+    let idle_grace = async {
+        tokio::time::sleep(UNCLAIMED_RUNNER_IDLE_GRACE).await;
+        let claimed_now = config
+            .pool_status
+            .as_ref()
+            .is_some_and(|status| status.runner_is_claimed(name.as_str()));
+        if claimed_now {
+            idle_claimed.store(true, Ordering::Release);
+            std::future::pending::<()>().await;
+        } else {
+            info!(
+                machine = name.as_str(),
+                idle_secs = UNCLAIMED_RUNNER_IDLE_GRACE.as_secs(),
+                "unclaimed-runner grace expired; releasing idle VM"
+            );
+        }
+    };
+    tokio::pin!(idle_grace);
 
     let result = tokio::select! {
         _ = shutdown.cancelled() => {
@@ -6274,7 +6347,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
             info!(machine = name.as_str(), environment = %environment.base, "replacing idle runner for queued environment");
             provider.stop(name).await.map_err(OrchestratorError::from)
         },
-        _ = &mut idle_deadline, if !claimed.load(Ordering::Acquire) => {
+        _ = &mut idle_grace, if !claimed.load(Ordering::Acquire) => {
             info!(
                 machine = name.as_str(),
                 idle_secs = UNCLAIMED_RUNNER_IDLE_GRACE.as_secs(),
@@ -6346,6 +6419,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         if let Err(error) = delete_machine(provider.as_ref(), name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
+        forget_runner_claim(config, name);
         return result;
     }
 
@@ -6355,7 +6429,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
     let delete_result = delete_machine(provider.as_ref(), name)
         .await
         .map_err(OrchestratorError::from);
+    // Machine names are never reused, but a claim with no completion must not
+    // survive its VM. Completion normally clears this already.
+    forget_runner_claim(config, name);
     result.and(delete_result)
+}
+
+/// Drop the server-claim marker for a machine that is being torn down.
+fn forget_runner_claim(config: &RunnerPoolConfig, name: &MachineName) {
+    if let Some(status) = &config.pool_status {
+        status.clear_runner_claim(name.as_str());
+    }
 }
 
 /// Delete a machine, retrying the transient provider failures.
@@ -13247,6 +13331,90 @@ fi"#,
         );
         assert!(!crashed_lock.exists(), "stale companion lock is swept");
         assert!(!stale_tmp.exists(), "lockless staging file is swept");
+    }
+
+    /// A server-committed claim, not a guest stdout sentinel, keeps a silent
+    /// runner alive. The fake runner never prints the busy marker and holds
+    /// its run gate for the whole 90-second window; advancing past the 30s
+    /// idle grace must not tear the slot down. Completion still releases it.
+    #[tokio::test(start_paused = true)]
+    async fn server_claim_keeps_a_silent_runner_past_the_idle_grace() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).with_run_gate(gate.clone()),
+        );
+        let mut config = test_config(false);
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        let runner = provision_slot(
+            &provider,
+            &config,
+            0,
+            1,
+            None,
+            &Arc::new(KeyPool::new()),
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                boot_from_pack: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("provisioning succeeds")
+        .expect("a runner is provisioned");
+        let name = runner.name.clone();
+        let idle = Arc::new(std::sync::Mutex::new(0));
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            let config = config.clone();
+            let name = name.clone();
+            async move {
+                run_one_runner(provider, &config, runner, CancellationToken::new(), idle)
+                    .await
+                    .inspect_err(|error| panic!("{name:?}: {error}"))
+            }
+        });
+
+        // The control plane commits the claim at delivery time; the guest is
+        // deliberately silent. Give the spawned slot a turn to subscribe and
+        // start the run first.
+        tokio::task::yield_now().await;
+        pool_status.notify_runner_claim(1, name.as_str().to_owned());
+        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "the server claim must cancel the 30s idle grace even with silent stdout"
+        );
+        assert!(
+            !provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event == &format!("delete:{}", name.as_str())),
+            "the claimed machine must not be deleted by the idle grace"
+        );
+
+        // Completion is authoritative and releases the single-use slot.
+        pool_status.notify_runner_completion(1, name.as_str().to_owned());
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("completion releases the runner")
+            .expect("runner task must not panic");
+        result.expect("the completed runner tears down cleanly");
+        assert!(
+            provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event == &format!("delete:{}", name.as_str())),
+            "completion must still delete the machine"
+        );
+        gate.notify_waiters();
     }
 
     /// A runner that announced its exit while a descendant kept the exec

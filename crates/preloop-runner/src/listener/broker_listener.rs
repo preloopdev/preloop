@@ -579,6 +579,11 @@ pub async fn run_broker_loop(
                                 }
                             }
                             BrokerMessageKind::PipelineAgentJobRequest => {
+                                // The AzDO-compatible delivery is still a job
+                                // hand-off: the supervising pool must stop
+                                // treating this machine as idle immediately,
+                                // exactly as for RunnerJobRequest.
+                                announce_busy();
                                 if let Some(mut prev) = active_job.take() {
                                     // Same cancel-immediately pattern for AzDO path
                                     info!(

@@ -66,6 +66,14 @@ pub async fn next_message(
                 job_id,
                 next_runs_on,
             } => {
+                // The committed claim is the pool's busy signal, independent
+                // of any guest stdout. Resolve the session's runner once and
+                // publish it before rendering the (potentially slow) message.
+                if let Ok(Some((runner_id, _))) =
+                    shared.state.backend.session_owner(&session_id).await
+                {
+                    crate::distributed_task::notify_runner_claim(&shared, runner_id).await;
+                }
                 // Refresh the next-job labels from the committed claim,
                 // exactly like the broker claim path. The ready-queue depth
                 // itself now comes from the 5s sampler snapshot.
@@ -435,15 +443,12 @@ pub async fn agent_request_ack(
     Ok(StatusCode::OK)
 }
 
-/// Notify the co-hosted runner pool after a terminal completion is committed.
+/// Resolve a registered runner id to the name the VM pool knows it by.
 ///
-/// The broker endpoint identifies the reporting runner by numeric id while
-/// the VM pool identifies it by the configured runner name (the machine name).
-/// Resolve the name while the registration is still present, then publish the
-/// advisory event. The persisted completion remains authoritative if the
-/// registration disappeared during teardown.
-pub(crate) async fn notify_runner_completion(shared: &Arc<SharedState>, runner_id: i64) {
-    let runner_name = shared
+/// The broker/DistTask endpoints identify the runner numerically while the VM
+/// pool identifies it by the configured name (the machine name).
+async fn registered_runner_name(shared: &Arc<SharedState>, runner_id: i64) -> Option<String> {
+    shared
         .state
         .backend
         .list_runners(None)
@@ -455,8 +460,15 @@ pub(crate) async fn notify_runner_completion(shared: &Arc<SharedState>, runner_i
                 .into_iter()
                 .find(|runner| runner.id == runner_id)
         })
-        .map(|runner| runner.name);
-    if let Some(runner_name) = runner_name {
+        .map(|runner| runner.name)
+}
+
+/// Notify the co-hosted runner pool after a terminal completion is committed.
+///
+/// The persisted completion is authoritative even if the registration
+/// disappeared during teardown; that case only skips the advisory event.
+pub(crate) async fn notify_runner_completion(shared: &Arc<SharedState>, runner_id: i64) {
+    if let Some(runner_name) = registered_runner_name(shared, runner_id).await {
         shared
             .state
             .pool_status
@@ -465,6 +477,31 @@ pub(crate) async fn notify_runner_completion(shared: &Arc<SharedState>, runner_i
         tracing::debug!(
             runner_id,
             "runner completion committed after its registration disappeared"
+        );
+    }
+}
+
+/// Notify the co-hosted runner pool when the server commits a job claim.
+///
+/// This is the authoritative busy signal: it is published before the runner
+/// is expected to emit anything on stdout, so the pool can cancel its
+/// unclaimed-runner grace even when the guest is silent or its output is
+/// buffered.
+pub(crate) async fn notify_runner_claim(shared: &Arc<SharedState>, runner_id: i64) {
+    if let Some(runner_name) = registered_runner_name(shared, runner_id).await {
+        tracing::info!(
+            runner_id,
+            runner_name,
+            "publishing committed job claim to the runner pool"
+        );
+        shared
+            .state
+            .pool_status
+            .notify_runner_claim(runner_id, runner_name);
+    } else {
+        tracing::warn!(
+            runner_id,
+            "job claimed but its runner registration was not found; pool cannot mark it busy"
         );
     }
 }
