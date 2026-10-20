@@ -23,6 +23,7 @@ use crate::client::azdo::AzdoClient;
 use crate::client::http::{HttpClient, HttpError};
 use crate::client::results::ResultsClient;
 use crate::client::run_service::RunServiceClient;
+use crate::settings::RunnerRegistration;
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
 use std::sync::Arc;
@@ -187,14 +188,19 @@ fn create_reporting_context(
 
 /// Execute a job from the deserialized message.
 ///
-/// Sets up the workspace, prepares actions, runs steps, and reports completion
-/// using `via`. Container and service expression tokens are evaluated against
-/// the job context before workspace setup; evaluation errors propagate.
+/// `registration` is the `.runner` state the worker validated after accepting
+/// the job and before calling this function; it supplies the control plane and
+/// `RUNNER_NAME`, so this function never re-reads runner metadata from the
+/// current directory. Sets up the workspace, prepares actions, runs steps, and
+/// reports completion using `via`. Container and service expression tokens are
+/// evaluated against the job context before workspace setup; evaluation errors
+/// propagate.
 /// Workspace setup, reporting-client creation, and completion-reporting errors
 /// also propagate. Action-preparation and step-execution failures are reported
 /// as job results, so `Ok(())` does not imply a successful job conclusion.
 pub async fn run_job(
     job_message: serde_json::Value,
+    registration: RunnerRegistration,
     via: ProtocolPath,
     cancel_rx: watch::Receiver<bool>,
     timing: LeaseTiming,
@@ -227,6 +233,20 @@ pub async fn run_job(
         variables,
         context_data,
     );
+    // Official `HostContext` registers proxy passwords as secrets before any
+    // job output, so no job log line carries them.
+    for mask in super::steps_runner::proxy_password_masks(|name| std::env::var(name).ok()) {
+        job_ctx.add_mask(&mask);
+    }
+    // The worker resolved and validated `.runner` before calling `run_job`;
+    // use that state here and everywhere downstream. Container/service
+    // expressions are evaluated before workspace setup calls
+    // `inject_github_env`, but `${{ github.token }}` has the same
+    // control-plane semantics there as it does in steps.
+    job_ctx.control_plane = registration.control_plane;
+    job_ctx
+        .env
+        .insert("RUNNER_NAME".to_owned(), registration.runner_name);
     // v2.336.0 (#4546/#4550): Announce locked dependencies in Setup Job log
     if let Some(deps) = job_message
         .get("actionsDependencies")
@@ -320,7 +340,8 @@ pub async fn run_job(
     // touches the workspace.
     let workspace = super::job_extension::setup_workspace(&job_message)?;
     job_ctx.workspace = Some(workspace.clone());
-    super::job_extension::inject_github_env(&mut job_ctx, &job_message);
+    let control_plane = job_ctx.control_plane;
+    super::job_extension::inject_github_env(&mut job_ctx, &job_message, control_plane);
     let main_steps = super::job_extension::build_step_list(&steps, &job_message);
     let action_paths =
         match prepare_remote_actions(&job_message, &workspace, &main_steps, &plan_id).await {

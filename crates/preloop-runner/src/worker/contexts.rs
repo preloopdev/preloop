@@ -78,6 +78,13 @@ pub struct JobContext {
     /// v2.336.0 (#4527): Job-scoped artifact subjects from $GITHUB_ARTIFACTS.
     /// Keyed by canonical subject name; value is (digest, kind).
     pub artifact_subjects: IndexMap<String, ArtifactSubject>,
+    /// Control plane this runner registered against (`.runner` `controlPlane`),
+    /// set by `run_job` from the registration the worker validated and
+    /// reasserted by `inject_github_env`. Decides whether the
+    /// `system.github.token` variable is a usable GitHub credential
+    /// (github.com) or the claim's GitHub credential slot, which must stay
+    /// off the step surface (engine, the default).
+    pub control_plane: crate::settings::ControlPlane,
 }
 
 impl std::fmt::Debug for JobContext {
@@ -146,6 +153,22 @@ impl JobContext {
                     masks.insert(base64::engine::general_purpose::STANDARD_NO_PAD.encode(val));
                     masks.insert(base64::engine::general_purpose::URL_SAFE.encode(val));
                     masks.insert(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val));
+                    // actions/runner `ExecutionContext.InitializeJob` also
+                    // registers `base64("x-access-token:{token}")` for the
+                    // job's GitHub token: that is the git extraheader
+                    // actions/checkout persists, and it would otherwise leak
+                    // verbatim in a log that echoes remote/auth config.
+                    // Resolution accepts `system.github.token` and its
+                    // `github_token` alias case-insensitively, so the derived
+                    // mask has to cover every spelling it can export.
+                    if k.eq_ignore_ascii_case("system.github.token")
+                        || k.eq_ignore_ascii_case("github_token")
+                    {
+                        masks.insert(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(format!("x-access-token:{val}")),
+                        );
+                    }
                     // Register each non-empty trimmed CR/LF-delimited
                     // line too. Log masking runs per assembled line, so
                     // a multiline initial secret (PEM key, JSON blob)
@@ -192,6 +215,7 @@ impl JobContext {
             deprecated_node20_actions: Vec::new(),
             node20_warning_emitted: false,
             artifact_subjects: IndexMap::new(),
+            control_plane: crate::settings::ControlPlane::default(),
         }
     }
 
@@ -240,6 +264,17 @@ impl JobContext {
             }
         }
         None
+    }
+
+    /// The first non-empty value among `keys` (case-insensitive), if any.
+    ///
+    /// "Present but empty" is not a credential: the job builder writes empty
+    /// `isSecret` slots for `github_token` and `system.github.token` before the
+    /// claim fills them, so treating such a slot as authoritative would shadow
+    /// the token a sibling alias carries in the same message.
+    pub fn first_nonempty_variable(&self, keys: &[&str]) -> Option<&str> {
+        keys.iter()
+            .find_map(|key| self.get_variable(key).filter(|value| !value.is_empty()))
     }
 
     /// Get a variable parsed as boolean. Does not throw if not found or null.
@@ -399,10 +434,37 @@ impl JobContext {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .is_empty()
-                && let Some(token) = self.env.get("GITHUB_TOKEN")
                 && let Some(obj) = gh.as_object_mut()
             {
-                obj.insert("token".to_string(), serde_json::json!(token));
+                // The official runner fills `github.token` from the
+                // `system.github.token` variable before overlaying
+                // `contextData.github` (`ExecutionContext.InitializeJob`).
+                // That variable is only a GitHub credential when the control
+                // plane is GitHub; on a preloop engine it is the control
+                // plane's own slot, which the claim fills with the credential
+                // it minted (and patches into the context read above) or
+                // leaves empty.
+                //
+                // `job.env` is deliberately not consulted: a workflow- or
+                // job-level `env: GITHUB_TOKEN` (and a `GITHUB_ENV` write)
+                // replaces the variable the step process sees, but it is not
+                // the job's GitHub credential, and upstream never reads it
+                // back into the context.
+                let variable_token = if self.control_plane == crate::settings::ControlPlane::GitHub
+                {
+                    self.first_nonempty_variable(&["system.github.token", "github_token"])
+                        .unwrap_or("")
+                } else {
+                    ""
+                };
+                if !variable_token.is_empty() {
+                    obj.insert("token".to_string(), serde_json::json!(variable_token));
+                } else if !obj.contains_key("token") {
+                    // `StringContextData(null)` in the official runner
+                    // renders as the empty string; keep the key present when
+                    // no credential exists instead of exposing a null.
+                    obj.insert("token".to_string(), serde_json::json!(""));
+                }
             }
             tracing::info!(
                 context_token_len,
@@ -436,12 +498,11 @@ impl JobContext {
                 .unwrap_or_default()
         });
         let runner_workspace = self.workspace.clone().unwrap_or_default();
-        let runner_name = self.env.get("RUNNER_NAME").cloned().unwrap_or_else(|| {
-            crate::settings::RunnerConfig::load(std::path::Path::new("."))
-                .ok()
-                .map(|c| c.settings.agent_name)
-                .unwrap_or_else(|| self.job_name.clone())
-        });
+        let runner_name = self
+            .env
+            .get("RUNNER_NAME")
+            .cloned()
+            .unwrap_or_else(|| self.job_name.clone());
         let runner_ctx = serde_json::json!({
             "name": runner_name,
             "os": current_os(),

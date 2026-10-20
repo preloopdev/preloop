@@ -3672,6 +3672,106 @@ pub(crate) mod suite {
         }
     }
 
+    /// A retry (runner death → `retry_attempt`) mints a fresh `agent_job_id`
+    /// and re-derives `plan.planId`, but the runner-visible
+    /// `system.orchestrationId` must be re-prefixed too. The runner sends
+    /// that value as the plan segment of `runnerresolve/actions`; a stale
+    /// prefix from the abandoned attempt makes the engine refuse the retried
+    /// job's own runtime token with HTTP 403.
+    ///
+    /// Backend-neutral: exercises the lite and pg retry paths.
+    pub(crate) async fn retry_reprefies_orchestration_id(backend: &dyn ControlBackend) {
+        use preloop_gha_protocol::azdo::VariableValue;
+
+        let run_id = RunId::new();
+        let agent_job_id = uuid::Uuid::new_v4();
+        let mut job = submit_job(run_id, "build", 1);
+        job.request = Some(request_record_with_agent(run_id, "build", 1, agent_job_id));
+        job.queued.message.job_id = agent_job_id;
+        job.queued.message.plan.plan_id = agent_job_id.to_string();
+        job.queued.message.variables.insert(
+            "system.orchestrationId".to_owned(),
+            VariableValue::new(format!("{agent_job_id}.build.__default")),
+        );
+        backend
+            .submit_run(submit_run(run_id, vec![job]))
+            .await
+            .unwrap();
+
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => {
+                assert_eq!(claimed.request.agent_job_id, agent_job_id)
+            }
+            other => panic!("expected initial claim, got {other:?}"),
+        }
+
+        // The runner dies after claiming; recovery replaces the attempt.
+        backend.purge_runner(runner.runner.id).await.unwrap();
+
+        let runner2 = backend
+            .register_runner(register_runner("r2"))
+            .await
+            .unwrap();
+        let session2 = backend
+            .create_session(create_session(runner2.runner.id))
+            .await
+            .unwrap();
+        let retried = match backend
+            .poll_session(poll(&session2.session_id, runner2.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected retry claim, got {other:?}"),
+        };
+        let retry_agent_job_id = retried.request.agent_job_id;
+        assert_ne!(
+            retry_agent_job_id, agent_job_id,
+            "a retry must mint a fresh runtime identity"
+        );
+
+        let context = backend
+            .acquire_context(retried.request.request_id)
+            .await
+            .unwrap();
+        let message = context.message;
+        assert_eq!(message.job_id, retry_agent_job_id);
+        assert_eq!(message.plan.plan_id, retry_agent_job_id.to_string());
+        let orchestration = message
+            .variables
+            .get("system.orchestrationId")
+            .and_then(|value| value.value.as_deref())
+            .expect("the retried message keeps system.orchestrationId");
+        assert_eq!(
+            orchestration,
+            format!("{retry_agent_job_id}.build.__default"),
+            "the retried message must name the retry's plan prefix"
+        );
+        assert!(
+            crate::auth::results_identity_binds_job(
+                &crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
+                    plan_id: retry_agent_job_id.to_string(),
+                    job_id: retry_agent_job_id,
+                }),
+                orchestration,
+                &retry_agent_job_id.to_string(),
+            ),
+            "the retried job's own token must bind to the orchestration path it sends"
+        );
+    }
+
     /// The job → check-run mapping: set reports whether it changed, a
     /// re-report of the same id is a no-op, clear is conditional on the id
     /// still recorded, and jobs outside the run are never mapped. Every
@@ -8784,6 +8884,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn retry_reprefies_orchestration_id() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::retry_reprefies_orchestration_id(&backend).await;
+    }
+
+    #[tokio::test]
     async fn check_run_mapping() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -10510,6 +10618,11 @@ mod lite {
     #[tokio::test]
     async fn purge_requeues_ownerless_claim() {
         suite::purge_requeues_ownerless_claim(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn retry_reprefies_orchestration_id() {
+        suite::retry_reprefies_orchestration_id(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

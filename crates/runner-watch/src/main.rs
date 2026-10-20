@@ -4926,11 +4926,40 @@ mod tests {
         );
     }
 
-    /// Golden corpus version these tests read, taken from `versions.toml`'s
-    /// `runner_version` so fixtures track the shipped runner instead of a
-    /// hardcoded version that rots when the pin moves.
+    /// Golden corpus version these tests read: the shipped `runner_version`
+    /// when its flat scenario-07 capture exists, otherwise the newest corpus
+    /// that has one.
+    ///
+    /// The pin can move ahead of the flat corpus (the compatibility pin is
+    /// bumped before the flows are recorded — see #710, whose `v2.337.0`
+    /// directory holds only nested `gh-official/*` captures), and reading the
+    /// pin blindly turns this replay test into "No such file or directory".
     fn golden_runner_version() -> String {
-        pinned_runner_version()
+        let pinned = pinned_runner_version();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.runner-watch/golden");
+        let has = |version: &str| {
+            root.join(format!("v{version}/07-step-failure/flows.jsonl"))
+                .is_file()
+        };
+        if has(&pinned) {
+            return pinned;
+        }
+        let mut versions: Vec<String> = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|name| name.strip_prefix('v').map(str::to_owned))
+            .filter(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+            .filter(|version| has(version))
+            .collect();
+        versions.sort_by_key(|version| {
+            let mut parts = version
+                .split('.')
+                .map(|part| part.parse::<u64>().unwrap_or(0));
+            (parts.next(), parts.next(), parts.next())
+        });
+        versions.pop().unwrap_or(pinned)
     }
 
     /// Minimal isolated temp directory (runner-watch has no tempfile dev-dep;

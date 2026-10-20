@@ -1,5 +1,6 @@
 use super::*;
 use crate::worker::contexts::JobContext;
+use crate::worker::execution_context::HookRegistrations;
 use crate::worker::server_queue::ServerQueue;
 use crate::worker::step_conditions::contains_status_check_function;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ fn test_step(name: &str, condition: Option<&str>) -> Step {
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     }
 }
 
@@ -146,6 +148,7 @@ fn synthetic_classification_follows_declared_step_membership() {
         env: Default::default(),
         raw,
         is_background: false,
+        post_of: Vec::new(),
     };
 
     for (case, id, context, raw, expected) in [
@@ -1561,6 +1564,491 @@ async fn post_step_executes_for_node_action_with_post_entrypoint() {
     );
 }
 
+/// Stages a `node24` runtime under the runner root `root`: the host Node when
+/// one is on PATH, otherwise `mock` as the executable, so the test does not
+/// depend on the host Node version.
+fn stage_node24_runtime(root: &std::path::Path, mock: &str) {
+    let externals_bin = root.join("externals").join("node24").join("bin");
+    std::fs::create_dir_all(&externals_bin).unwrap();
+    let host_node = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
+            candidate.is_file().then_some(candidate)
+        })
+    });
+    if let Some(host_node) = host_node {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&host_node, externals_bin.join("node")).unwrap();
+        #[cfg(windows)]
+        std::fs::copy(&host_node, externals_bin.join("node.exe")).unwrap();
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mock_path = externals_bin.join("node");
+        std::fs::write(&mock_path, mock).unwrap();
+        std::fs::set_permissions(&mock_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn post_hook_waits_for_a_registration_from_its_action_step() {
+    let mut hook = test_step("__post_action", None);
+    hook.post_of = vec!["action-id".to_string(), "__pre_action-id".to_string()];
+    let hooks = HookRegistrations::default();
+    assert!(post_hook_orphaned(&hook, &hooks));
+    // Either stage registers the hook: the official runner registers a post job
+    // step from the Pre stage as well as the Main stage.
+    hooks.register("__pre_action-id");
+    assert!(!post_hook_orphaned(&hook, &hooks));
+    hooks.unregister("__pre_action-id");
+    assert!(post_hook_orphaned(&hook, &hooks));
+    hooks.register("action-id");
+    assert!(!post_hook_orphaned(&hook, &hooks));
+    assert!(!post_hook_orphaned(
+        &test_step("plain", None),
+        &HookRegistrations::default()
+    ));
+}
+
+/// A `node` shim that appends `<action directory> <entry file>` to `$EXEC_LOG`
+/// for each `.js` entry point it is handed, so a test can see which action entry
+/// points executed, and in what order.
+const EXEC_LOG_NODE_SHIM: &str = "#!/bin/sh\n\
+     for a in \"$@\"; do\n\
+       case \"$a\" in\n\
+         *.js) echo \"$(basename \"$(dirname \"$a\")\") $(basename \"$a\")\" >> \"$EXEC_LOG\" ;;\n\
+       esac\n\
+     done\n";
+
+/// Stage a node24 action whose `main`, and `post` (`pre` too when asked) entry
+/// points append `<action directory> <entry file>` to `$EXEC_LOG`.
+fn stage_lifecycle_action(action_dir: &std::path::Path, name: &str, pre: bool) {
+    std::fs::create_dir_all(action_dir).unwrap();
+    let pre_entry = if pre { "  pre: pre.js\n" } else { "" };
+    std::fs::write(
+        action_dir.join("action.yml"),
+        format!(
+            "name: {name}\ndescription: test\nruns:\n  using: node24\n  main: main.js\n{pre_entry}  post: post.js\n"
+        ),
+    )
+    .unwrap();
+    for entry in ["main.js", "post.js", "pre.js"] {
+        if entry == "pre.js" && !pre {
+            continue;
+        }
+        std::fs::write(
+            action_dir.join(entry),
+            format!(
+                "require('fs').appendFileSync(process.env.EXEC_LOG, \
+                 require('path').basename(__dirname) + ' {entry}\\n');\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
+/// Action entry points that executed, in order. Missing log reads as none.
+fn executed_entries(exec_log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(exec_log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A job whose workspace is `workspace` and whose `$EXEC_LOG` is `exec_log`.
+fn action_job(workspace: &std::path::Path, exec_log: &std::path::Path) -> JobContext {
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    job.workspace = Some(workspace.to_str().unwrap().to_string());
+    job.env.insert(
+        "EXEC_LOG".to_string(),
+        exec_log.to_str().unwrap().to_string(),
+    );
+    job
+}
+
+/// `<name>` as an action step for the local action at `<workspace>/<name>`.
+fn local_action_step(name: &str, condition: Option<&str>) -> Step {
+    let mut step = test_step(name, condition);
+    step.step_type = StepType::Action {
+        uses: format!("./{name}"),
+        with: serde_json::json!({}),
+    };
+    step
+}
+
+/// Recorded conclusion of `context_name`, absent when the step left no row.
+fn conclusion_of(job: &JobContext, context_name: &str) -> Option<String> {
+    job.steps
+        .get(context_name)
+        .map(|step| step.conclusion.clone())
+}
+
+/// A post hook whose action never started must not run, even though its
+/// `post-if` defaults to `always()`, and must be recorded as skipped. The fake
+/// workflow skips `action-a` with `if: false`, runs `action-b`, fails on `boom`,
+/// and skips `action-c` behind that failure. Only `action-b` may execute.
+#[tokio::test]
+async fn post_hooks_of_skipped_actions_are_recorded_skipped_and_never_run() {
+    use crate::worker::server_queue::{step_conclusion, step_status};
+
+    let dir = TempDir::new().unwrap();
+    let workspace = dir.path().join("work").join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let exec_log = dir.path().join("exec.log");
+    stage_node24_runtime(dir.path(), EXEC_LOG_NODE_SHIM);
+    for name in ["action-a", "action-b", "action-c"] {
+        stage_lifecycle_action(&workspace.join(name), name, false);
+    }
+
+    let mut job = action_job(&workspace, &exec_log);
+
+    let mut boom = test_step("boom", None);
+    boom.step_type = StepType::Script {
+        script: "exit 1".to_string(),
+        shell: Some("bash".to_string()),
+        working_directory: None,
+    };
+    let ordered = crate::worker::job_extension::build_step_list_with_lifecycle(
+        vec![
+            local_action_step("action-a", Some("false")),
+            local_action_step("action-b", None),
+            boom,
+            local_action_step("action-c", None),
+        ],
+        workspace.to_str().unwrap(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(ordered.len(), 7, "four main steps and three post hooks");
+
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+    let result = run_steps(
+        &ordered,
+        &mut job,
+        workspace.to_str().unwrap(),
+        cancel_rx,
+        queue.clone(),
+        None,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, "Failed");
+
+    // Only action-b's entry points executed; action-a and action-c never started.
+    assert_eq!(
+        executed_entries(&exec_log),
+        ["action-b main.js", "action-b post.js"]
+    );
+
+    for (key, expected) in [
+        ("action-a", "Skipped"),
+        ("__post_action-a", "Skipped"),
+        ("action-b", "Success"),
+        ("__post_action-b", "Success"),
+        ("action-c", "Skipped"),
+        ("__post_action-c", "Skipped"),
+    ] {
+        assert_eq!(
+            conclusion_of(&job, key).as_deref(),
+            Some(expected),
+            "recorded conclusion of {key}"
+        );
+    }
+
+    let updates = queue.lock().await;
+    let reported = |name: &str| {
+        updates
+            .all_queued_updates()
+            .iter()
+            .rev()
+            .find(|update| update.name == name && update.status == step_status::COMPLETED)
+            .map(|update| update.conclusion)
+    };
+    assert_eq!(reported("Post action-a"), Some(step_conclusion::SKIPPED));
+    assert_eq!(reported("Post action-b"), Some(step_conclusion::SUCCEEDED));
+    assert_eq!(reported("Post action-c"), Some(step_conclusion::SKIPPED));
+}
+
+/// An action step whose step environment cannot be evaluated never reaches its
+/// action handler, so it registers no post hook: the hook is skipped instead of
+/// running cleanup against state the action never produced.
+#[tokio::test]
+async fn post_hook_is_skipped_when_the_action_fails_before_its_handler() {
+    let dir = TempDir::new().unwrap();
+    let workspace = dir.path().join("work").join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let exec_log = dir.path().join("exec.log");
+    stage_node24_runtime(dir.path(), EXEC_LOG_NODE_SHIM);
+    stage_lifecycle_action(&workspace.join("action-a"), "action-a", false);
+
+    let mut job = action_job(&workspace, &exec_log);
+    let mut action_step = local_action_step("action-a", None);
+    action_step.env.insert(
+        "BROKEN".to_string(),
+        "${{ not_a_real_function() }}".to_string(),
+    );
+    let ordered = crate::worker::job_extension::build_step_list_with_lifecycle(
+        vec![action_step],
+        workspace.to_str().unwrap(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(ordered.len(), 2, "the action and its post hook");
+
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+    let result = run_steps(
+        &ordered,
+        &mut job,
+        workspace.to_str().unwrap(),
+        cancel_rx,
+        queue.clone(),
+        None,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, "Failed");
+
+    assert!(
+        executed_entries(&exec_log).is_empty(),
+        "neither the action nor its post hook ran"
+    );
+    assert_eq!(conclusion_of(&job, "action-a").as_deref(), Some("Failure"));
+    assert_eq!(
+        conclusion_of(&job, "__post_action-a").as_deref(),
+        Some("Skipped")
+    );
+}
+
+/// File-command initialization runs before the action handler, so a failure
+/// there leaves the action's post hook unregistered and the hook skipped.
+#[tokio::test]
+async fn post_hook_is_skipped_when_file_command_setup_fails() {
+    let dir = TempDir::new().unwrap();
+    let work = dir.path().join("work");
+    let workspace = work.join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // `_temp` is the directory the step's file commands are created in; a file
+    // in its place fails `FileCommandManager.InitializeFiles`.
+    std::fs::write(work.join("_temp"), b"").unwrap();
+    let exec_log = dir.path().join("exec.log");
+    stage_node24_runtime(dir.path(), EXEC_LOG_NODE_SHIM);
+    stage_lifecycle_action(&workspace.join("action-a"), "action-a", false);
+
+    let mut job = action_job(&workspace, &exec_log);
+    let ordered = crate::worker::job_extension::build_step_list_with_lifecycle(
+        vec![local_action_step("action-a", None)],
+        workspace.to_str().unwrap(),
+        &std::collections::HashMap::new(),
+    );
+
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+    run_steps(
+        &ordered,
+        &mut job,
+        workspace.to_str().unwrap(),
+        cancel_rx,
+        queue.clone(),
+        None,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        executed_entries(&exec_log).is_empty(),
+        "neither the action nor its post hook ran"
+    );
+    assert_eq!(conclusion_of(&job, "action-a").as_deref(), Some("Failure"));
+    assert_eq!(
+        conclusion_of(&job, "__post_action-a").as_deref(),
+        Some("Skipped")
+    );
+}
+
+/// An action that declares `pre:` registers its post hook while the pre step
+/// runs, so the hook still runs when the main step is skipped — the official
+/// runner registers cleanup from `ActionRunner.RunAsync` in the Pre stage too.
+#[tokio::test]
+async fn post_hook_runs_when_its_action_pre_step_ran_but_the_main_step_did_not() {
+    use crate::worker::server_queue::{step_conclusion, step_status};
+
+    let dir = TempDir::new().unwrap();
+    let workspace = dir.path().join("work").join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let exec_log = dir.path().join("exec.log");
+    stage_node24_runtime(dir.path(), EXEC_LOG_NODE_SHIM);
+    let action_dir = dir
+        .path()
+        .join("work")
+        .join("_actions")
+        .join("acme")
+        .join("example");
+    stage_lifecycle_action(&action_dir, "example", true);
+
+    let mut job = action_job(&workspace, &exec_log);
+    let mut action_step = test_step("action-a", Some("false"));
+    action_step.step_type = StepType::Action {
+        uses: "acme/example@v1".to_string(),
+        with: serde_json::json!({}),
+    };
+    let mut action_paths = std::collections::HashMap::new();
+    action_paths.insert(
+        "acme/example@v1".to_string(),
+        action_dir.to_string_lossy().to_string(),
+    );
+    // Job preparation resolves every `uses:` before the steps run; the handler
+    // refuses a remote reference it cannot resolve.
+    job.action_paths.extend(action_paths.clone());
+    let ordered = crate::worker::job_extension::build_step_list_with_lifecycle(
+        vec![action_step],
+        workspace.to_str().unwrap(),
+        &action_paths,
+    );
+    assert_eq!(ordered.len(), 3, "pre, main and post");
+    assert_eq!(
+        ordered[2].post_of,
+        ["action-a", "__pre_action-a"],
+        "the pre step and the main step both register the post hook"
+    );
+
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+    let result = run_steps(
+        &ordered,
+        &mut job,
+        workspace.to_str().unwrap(),
+        cancel_rx,
+        queue.clone(),
+        None,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, "Succeeded");
+
+    // The pre step ran under its `always()` default, the main step was skipped,
+    // and the post hook registered by the pre step ran.
+    assert_eq!(
+        executed_entries(&exec_log),
+        ["example pre.js", "example post.js"]
+    );
+    assert_eq!(
+        conclusion_of(&job, "__pre_action-a").as_deref(),
+        Some("Success")
+    );
+    assert_eq!(conclusion_of(&job, "action-a").as_deref(), Some("Skipped"));
+    assert_eq!(
+        conclusion_of(&job, "__post_action-a").as_deref(),
+        Some("Success")
+    );
+
+    let updates = queue.lock().await;
+    let reported = |name: &str| {
+        updates
+            .all_queued_updates()
+            .iter()
+            .rev()
+            .find(|update| update.name == name && update.status == step_status::COMPLETED)
+            .map(|update| update.conclusion)
+    };
+    assert_eq!(reported("Pre action-a"), Some(step_conclusion::SUCCEEDED));
+    assert_eq!(reported("Post action-a"), Some(step_conclusion::SUCCEEDED));
+}
+
+/// A post hook whose action never ran is still recorded, and reported skipped,
+/// when the action's `pre:` step is what would have registered it — and the pre
+/// step did not run either.
+#[tokio::test]
+async fn post_hook_of_an_action_with_an_unrun_pre_step_is_skipped() {
+    let dir = TempDir::new().unwrap();
+    let workspace = dir.path().join("work").join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let exec_log = dir.path().join("exec.log");
+    stage_node24_runtime(dir.path(), EXEC_LOG_NODE_SHIM);
+    let action_dir = dir
+        .path()
+        .join("work")
+        .join("_actions")
+        .join("acme")
+        .join("example");
+    stage_lifecycle_action(&action_dir, "example", true);
+    // The action's pre step is skipped by its own `pre-if` (a condition string).
+    let manifest = std::fs::read_to_string(action_dir.join("action.yml"))
+        .unwrap()
+        .replace("  pre: pre.js\n", "  pre: pre.js\n  pre-if: \"false\"\n");
+    std::fs::write(action_dir.join("action.yml"), manifest).unwrap();
+
+    let mut job = action_job(&workspace, &exec_log);
+    let mut action_step = test_step("action-a", Some("false"));
+    action_step.step_type = StepType::Action {
+        uses: "acme/example@v1".to_string(),
+        with: serde_json::json!({}),
+    };
+    let mut action_paths = std::collections::HashMap::new();
+    action_paths.insert(
+        "acme/example@v1".to_string(),
+        action_dir.to_string_lossy().to_string(),
+    );
+    job.action_paths.extend(action_paths.clone());
+    let ordered = crate::worker::job_extension::build_step_list_with_lifecycle(
+        vec![action_step],
+        workspace.to_str().unwrap(),
+        &action_paths,
+    );
+    assert_eq!(ordered[0].condition.as_deref(), Some("false"));
+
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+    run_steps(
+        &ordered,
+        &mut job,
+        workspace.to_str().unwrap(),
+        cancel_rx,
+        queue.clone(),
+        None,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(executed_entries(&exec_log).is_empty(), "nothing ran");
+    assert_eq!(
+        conclusion_of(&job, "__pre_action-a").as_deref(),
+        Some("Skipped")
+    );
+    assert_eq!(conclusion_of(&job, "action-a").as_deref(), Some("Skipped"));
+    assert_eq!(
+        conclusion_of(&job, "__post_action-a").as_deref(),
+        Some("Skipped")
+    );
+}
+
 #[test]
 fn proxy_setup_line_strips_userinfo() {
     // Round-3 §9 regression: an authenticated egress proxy's credentials must
@@ -1581,4 +2069,90 @@ fn proxy_setup_line_strips_userinfo() {
     // No userinfo: unchanged.
     let plain = proxy_setup_line("ts", "HTTPS", "https://proxy.example:8443");
     assert!(plain.contains("https://proxy.example:8443"), "{plain}");
+}
+
+#[test]
+fn proxy_password_is_masked_in_job_logs() {
+    // #395, ADR 0263: "A password provided for a proxy will be masked in the
+    // logs." Job start registers the password as the official `HostContext`
+    // does, so neither the setup line nor a step echoing the inherited proxy
+    // URL carries it in cleartext.
+    let proxy = "http://proxyuser:s3cr3t-pw@proxy.corp:8080";
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    for mask in proxy_password_masks(|name| (name == "https_proxy").then(|| proxy.to_string())) {
+        job.add_mask(&mask);
+    }
+
+    let setup = job.mask_secrets(&proxy_setup_line("ts", "HTTPS", proxy));
+    assert_eq!(
+        setup,
+        "ts Runner is running behind proxy server 'http://proxy.corp:8080' for all HTTPS requests."
+    );
+    let echoed = job.mask_secrets(&format!("proxy: {proxy}"));
+    assert_eq!(echoed, "proxy: http://proxyuser:***@proxy.corp:8080");
+}
+
+/// Formatted tracing output, appended to a shared buffer.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn container_step_log_is_masked_for_every_sink() {
+    // #395: the "Initialize containers" and "Stop containers" lines carry the
+    // `docker create -e HTTPS_PROXY=<url>` command line and service
+    // `docker logs` output. The runner log replay and the step log content
+    // must both be the masked copy.
+    let proxy = "http://proxyuser:s3cr3t-pw@proxy.corp:8080";
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    for mask in proxy_password_masks(|name| (name == "HTTPS_PROXY").then(|| proxy.to_string())) {
+        job.add_mask(&mask);
+    }
+    let lines = vec![
+        format!("##[command]/usr/bin/docker create --name job -e HTTPS_PROXY={proxy} alpine"),
+        format!("HTTPS_PROXY={proxy}"),
+    ];
+
+    let captured = CapturedLog::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let step_log =
+        tracing::subscriber::with_default(subscriber, || replay_container_log(&job, &lines));
+    let runner_log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+
+    for sink in [&step_log, &runner_log] {
+        assert!(!sink.contains("s3cr3t-pw"), "{sink}");
+        assert!(
+            sink.contains("HTTPS_PROXY=http://proxyuser:***@proxy.corp:8080 alpine"),
+            "{sink}"
+        );
+        assert!(
+            sink.lines()
+                .any(|line| line.ends_with("HTTPS_PROXY=http://proxyuser:***@proxy.corp:8080")),
+            "{sink}"
+        );
+    }
 }
