@@ -498,7 +498,7 @@ async fn kill_and_reap(child: &mut Child, pgid: Option<u32>) {
 
 async fn wait_with_capture(
     mut child: Child,
-    pgid: Option<u32>,
+    mut group: ProcessGroup,
     deadline: Duration,
     started: Instant,
     what: &str,
@@ -532,16 +532,28 @@ async fn wait_with_capture(
         ))
     };
     match tokio::time::timeout(remaining, capture).await {
-        // The child finished before the deadline: the ordinary result.
-        Ok(Ok(finished)) if started.elapsed() < deadline => Ok(finished),
+        // The child finished before the deadline: the ordinary result, and the
+        // group has drained, so its id must not be signalled again.
+        Ok(Ok(finished)) if started.elapsed() < deadline => {
+            group.disarm();
+            Ok(finished)
+        }
         // The child finished *after* the deadline. The deadline covers the
         // whole operation, and the synchronous runner fails an operation that
         // outran it, so this expiry is reported the same way instead of
-        // pretending the bound held. Nothing is left to kill: the capture
-        // reached EOF on both pipes.
-        Ok(Ok(_)) => Err(timeout_error(what, program, deadline)),
-        Ok(Err(error)) => Err(error),
+        // pretending the bound held. Signal the group before dropping it, in
+        // case a daemonized descendant closed the pipes and outlived the wait.
+        Ok(Ok(_)) => {
+            let pgid = group.take();
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, program, deadline))
+        }
+        Ok(Err(error)) => {
+            group.kill();
+            Err(error)
+        }
         Err(_) => {
+            let pgid = group.take();
             kill_and_reap(&mut child, pgid).await;
             Err(timeout_error(what, program, deadline))
         }
@@ -628,8 +640,8 @@ async fn run_command_with_limit(
     cmd.stderr(Stdio::piped());
     isolate_process_group(&mut cmd);
     let child = spawn_bounded(cmd, deadline, started, what, &program).await?;
-    let pgid = child.id();
-    wait_with_capture(child, pgid, deadline, started, what, &program, max_capture).await
+    let group = ProcessGroup::of(&child);
+    wait_with_capture(child, group, deadline, started, what, &program, max_capture).await
 }
 
 /// Run a command with bytes written to its stdin, bounded by `deadline`.
@@ -652,7 +664,7 @@ pub async fn run_command_with_stdin(
     cmd.stderr(Stdio::piped());
     isolate_process_group(&mut cmd);
     let mut child = spawn_bounded(cmd, deadline, started, what, &program).await?;
-    let pgid = child.id();
+    let mut group = ProcessGroup::of(&child);
 
     let remaining = deadline.saturating_sub(started.elapsed());
     let mut stdin = child.stdin.take();
@@ -696,11 +708,22 @@ pub async fn run_command_with_stdin(
         })
     };
     match tokio::time::timeout(remaining, exchange).await {
-        Ok(Ok(output)) if started.elapsed() < deadline => Ok(output),
+        Ok(Ok(output)) if started.elapsed() < deadline => {
+            group.disarm();
+            Ok(output)
+        }
         // Finished after the deadline; see `wait_with_capture`.
-        Ok(Ok(_)) => Err(timeout_error(what, &program, deadline)),
-        Ok(Err(error)) => Err(error),
+        Ok(Ok(_)) => {
+            let pgid = group.take();
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, &program, deadline))
+        }
+        Ok(Err(error)) => {
+            group.kill();
+            Err(error)
+        }
         Err(_) => {
+            let pgid = group.take();
             kill_and_reap(&mut child, pgid).await;
             Err(timeout_error(what, &program, deadline))
         }
@@ -725,7 +748,7 @@ pub async fn run_command_status(
     cmd.stdin(Stdio::null());
     isolate_process_group(&mut cmd);
     let mut child = spawn_bounded(cmd, deadline, started, what, &program).await?;
-    let pgid = child.id();
+    let mut group = ProcessGroup::of(&child);
     let remaining = deadline.saturating_sub(started.elapsed());
     let exchange = async {
         let stdout = child.stdout.take();
@@ -739,11 +762,22 @@ pub async fn run_command_status(
         status
     };
     match tokio::time::timeout(remaining, exchange).await {
-        Ok(Ok(status)) if started.elapsed() < deadline => Ok(status),
+        Ok(Ok(status)) if started.elapsed() < deadline => {
+            group.disarm();
+            Ok(status)
+        }
         // Finished after the deadline; see `wait_with_capture`.
-        Ok(Ok(_)) => Err(timeout_error(what, &program, deadline)),
-        Ok(Err(source)) => Err(CommandError::io(what, &program, source)),
+        Ok(Ok(_)) => {
+            let pgid = group.take();
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, &program, deadline))
+        }
+        Ok(Err(source)) => {
+            group.kill();
+            Err(CommandError::io(what, &program, source))
+        }
         Err(_) => {
+            let pgid = group.take();
             kill_and_reap(&mut child, pgid).await;
             Err(timeout_error(what, &program, deadline))
         }
@@ -1683,6 +1717,86 @@ mod tests {
         );
         let pid = recorded_pid(&path).await;
         assert_gone(&pid, "the grandchild of a dropped group runner").await;
+    }
+
+    /// Dropping `run_command` is the cancellation the snapshot capture uses:
+    /// its outer `tokio::time::timeout` drops this future. The direct child is
+    /// killed by `kill_on_drop`, but a shell wrapper's grandchild — a `git`
+    /// transport or `index-pack` in the real call — must die with the group
+    /// before the caller releases its cache lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_runner_takes_the_group_with_a_dropped_future() {
+        let path = pid_file("command-dropped");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 600 & echo $! > '{}'; wait", path.display()),
+        ]);
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(300),
+            run_command(cmd, Duration::from_secs(30), "dropped command runner"),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the outer timeout must have dropped the runner"
+        );
+        let pid = recorded_pid(&path).await;
+        assert_gone(&pid, "the grandchild of a dropped command runner").await;
+    }
+
+    /// Same cancellation contract for the stdin variant, which the snapshot
+    /// path uses for `update-ref --stdin`/`cat-file --batch-check`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_command_runner_takes_the_group_with_a_dropped_future() {
+        let path = pid_file("stdin-dropped");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 600 & echo $! > '{}'; wait", path.display()),
+        ]);
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(300),
+            run_command_with_stdin(
+                cmd,
+                b"ignored",
+                Duration::from_secs(30),
+                "dropped stdin runner",
+            ),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the outer timeout must have dropped the runner"
+        );
+        let pid = recorded_pid(&path).await;
+        assert_gone(&pid, "the grandchild of a dropped stdin runner").await;
+    }
+
+    /// Same cancellation contract for the status variant, which the
+    /// orchestrator and other installers use.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_command_runner_takes_the_group_with_a_dropped_future() {
+        let path = pid_file("status-dropped");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 600 & echo $! > '{}'; wait", path.display()),
+        ]);
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(300),
+            run_command_status(cmd, Duration::from_secs(30), "dropped status runner"),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the outer timeout must have dropped the runner"
+        );
+        let pid = recorded_pid(&path).await;
+        assert_gone(&pid, "the grandchild of a dropped status runner").await;
     }
 
     #[cfg(unix)]

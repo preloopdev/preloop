@@ -43,6 +43,23 @@ Releases before v0.27.0 predate the changelog.
   the client gave up. Git's stdin is now written while stdout and stderr are
   drained concurrently.
 
+- **Snapshot capture is bounded end to end, and the shared object cache has a
+  ceiling.** One run's merge attach, local workspace capture, or remote
+  checkout fetch now runs under a single 90-minute backstop; on expiry only
+  that run's unaccepted staging and run-local repositories are removed, and
+  the submission fails with an operator message instead of queueing jobs.
+  Cancelling a capture kills the whole Git process group (a hung transport or
+  `index-pack` included); the per-cache refresh lock is released when
+  `ensure_object_cache` returns, a cache pin bridges the interval until the
+  snapshot publishes its alternates, and staging cleanup waits for in-flight
+  blocking copies before removing the tree. The shared snapshot object cache
+  (`<state>/snapshot-object-cache`) is pruned oldest-first at startup and
+  after each successful capture to
+  `PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES` (default 100 GiB, `0` disables).
+  An entry is retired only under the same per-entry lock a refresh takes, and
+  never while a capture pin or an alternates reference protects it; clone
+  hardlinks make the ceiling soft.
+
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution

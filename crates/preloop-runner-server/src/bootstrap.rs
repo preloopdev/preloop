@@ -1843,6 +1843,16 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::snapshots::sweep_workspace_snapshots(&snapshot_sweep_shared).await;
     });
+    // The shared object cache is never garbage-collected in place (a live
+    // snapshot alternates to it), so its ceiling is enforced here and after
+    // each successful capture. The single-flight permit is taken before the
+    // spawn, so this startup request coalesces with a concurrent post-capture
+    // one instead of walking the cache twice.
+    crate::snapshots::spawn_snapshot_object_cache_sweep(
+        &shared.state.snapshot_object_cache_sweep,
+        shared.state.state_dir.clone(),
+        shared.state.snapshot_object_cache_max_bytes,
+    );
     let archive_shared = shared.clone();
     tokio::spawn(async move { run_history_archiver(archive_shared).await });
     let flusher_shared = shared.clone();
