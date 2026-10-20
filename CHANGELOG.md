@@ -10,6 +10,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Workspace snapshots build when the state directory is on another
+  filesystem.** The snapshot object cache initialized itself with
+  `git clone --bare --local`, which hardlinks object files; a workspace on a
+  bind mount, overlay or shared volume makes the kernel refuse the link with
+  `EXDEV` ("Invalid cross-device link"), and the submission failed with a 500
+  before any job ran. The clone now copies objects (`--no-hardlinks`) when the
+  workspace and the cache root are on different devices, and retries as a copy
+  if a hardlinked clone fails anyway, keeping the same-filesystem fast path.
+
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
