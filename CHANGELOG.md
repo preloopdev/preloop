@@ -452,6 +452,23 @@ Releases before v0.27.0 predate the changelog.
   engine start that logged its last lines on failure was removed with #658; see
   the entry under *Changed*.)
 
+- **Every engine GitHub call now goes through the credential's circuit
+  breaker.** Thirteen call sites still sent straight through the shared HTTP
+  client: dispatch auth's installation-token round-trip and actor lookups,
+  push-back and auto-PR REST calls, dispatch's default-branch lookup, the
+  startup PAT scope probe, the App-manifest code exchange, the startup
+  schedule scan, snapshot repository-metadata lookups, and the anonymous
+  forge Git/tarball relay. A GitHub outage therefore cost one round trip per
+  caller for its whole duration instead of one probe per credential. They now
+  all funnel through `send_github` / `send_github_json`, so the breaker sees
+  the dependency on the budget each call actually spends — partitioning an
+  installation token that cannot be named yet, and a third-party token, away
+  from the operator's PAT. Callers keep their own error mapping: dispatch auth
+  still fails closed on a refusal while the breaker is open, push-back still
+  answers 502 for it, and the best-effort relay, schedule-scan, and
+  metadata lookups still degrade quietly. Presigned cross-host LFS downloads
+  stay outside the breaker by design: they spend no GitHub API budget.
+
 - **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
   RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
   extraction) flagged by `cargo audit`.
