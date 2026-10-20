@@ -322,9 +322,19 @@ impl LiteBackend {
                         }
                     }
                 }
-                if let Some(last_renewed_at) = request.last_renewed_at {
-                    let elapsed = now.duration_since(last_renewed_at).unwrap_or_default();
-                    let lease_seconds = if request.session_live {
+                // A claimed attempt with no first renewal yet is bounded by
+                // the claim stamp and the short startup/hung-worker window,
+                // not the 45-minute runner-facing lock. Otherwise a token
+                // copied at acquire and a worker killed before its first
+                // renewjob would keep authority far longer than the stated
+                // reaper bound.
+                let lease_anchor = request
+                    .last_renewed_at
+                    .map(|renewed| (renewed, request.session_live))
+                    .or_else(|| request.started_at.map(|claimed| (claimed, true)));
+                if let Some((anchor, session_live)) = lease_anchor {
+                    let elapsed = now.duration_since(anchor).unwrap_or_default();
+                    let lease_seconds = if session_live {
                         crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
                     } else {
                         crate::distributed_task::DEAD_SESSION_LEASE_SECONDS

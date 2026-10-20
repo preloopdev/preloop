@@ -2549,10 +2549,10 @@ async fn live_log_websocket_rejects_a_settled_jobs_credential() {
         loop {
             {
                 let inner = state.inner.lock().await;
-                if let Some(job_lines) = inner.live_log_lines.get(&agent_a)
-                    && job_lines.lock().await.lines.len() == 1
-                {
-                    break;
+                if let Some(job_lines) = inner.live_log_lines.get(&agent_a) {
+                    if job_lines.lock().await.lines.len() == 1 {
+                        break;
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

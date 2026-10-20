@@ -378,6 +378,19 @@ fn claim_one(
                 now_us()
             ])
             .map_err(db)?;
+        if claimed > 0
+            && let Some(runner_id) = runner_id
+        {
+            // Lifetime fact, committed with the claim: archival or a failed
+            // cleanup can never make this single-use identity fresh again.
+            tx.prepare_cached(
+                "UPDATE runners SET ephemeral_spent = 1 \
+                 WHERE runner_id = ?1 AND ephemeral AND ephemeral_spent = 0",
+            )
+            .map_err(db)?
+            .execute([runner_id])
+            .map_err(db)?;
+        }
         Ok(claimed > 0)
     };
     // The assigned tier first (see `assigned_sql`): the runner's own fresh

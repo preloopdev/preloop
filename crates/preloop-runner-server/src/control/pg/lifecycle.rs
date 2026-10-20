@@ -693,8 +693,7 @@ impl PgBackend {
                     && tx
                         .query_opt(
                             "SELECT 1 FROM runners r WHERE r.runner_id = $1 AND r.ephemeral \
-                         AND EXISTS (SELECT 1 FROM job_requests q \
-                                     WHERE q.runner_id = r.runner_id AND q.result IS NOT NULL) \
+                         AND r.ephemeral_spent \
                          AND NOT EXISTS (SELECT 1 FROM job_requests q \
                                          WHERE q.runner_id = r.runner_id AND q.result IS NULL)",
                             &[&runner_id],

@@ -54,9 +54,9 @@ pub(super) fn runner_credentials_usable_tx(
 ) -> Result<bool, ControlError> {
     tx.prepare_cached(
         "SELECT EXISTS (SELECT 1 FROM runners r WHERE r.runner_id = ?1 AND (\
-            NOT r.ephemeral OR NOT EXISTS (\
+            NOT r.ephemeral OR r.ephemeral_spent = 0 OR EXISTS (\
                 SELECT 1 FROM job_requests q \
-                WHERE q.runner_id = r.runner_id AND q.result IS NOT NULL)))",
+                WHERE q.runner_id = r.runner_id AND q.result IS NULL)))",
     )
     .map_err(db)?
     .query_row([runner_id], |row| row.get(0))
@@ -74,8 +74,7 @@ pub(super) fn runner_can_claim_tx(
 ) -> Result<bool, ControlError> {
     tx.prepare_cached(
         "SELECT EXISTS (SELECT 1 FROM runners r WHERE r.runner_id = ?1 AND (\
-            NOT r.ephemeral OR NOT EXISTS (\
-                SELECT 1 FROM job_requests q WHERE q.runner_id = r.runner_id)))",
+            NOT r.ephemeral OR r.ephemeral_spent = 0))",
     )
     .map_err(db)?
     .query_row([runner_id], |row| row.get(0))

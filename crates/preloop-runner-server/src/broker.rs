@@ -1741,6 +1741,34 @@ pub async fn broker_complete_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
+    // A single-use runner's registration may already be gone (immediate
+    // post-terminal purge) while the runner retries a completion the server
+    // already accepted. Permit only the exact, already-settled attempt as a
+    // no-op: nothing is written, no credential is revived, and the token
+    // still may not claim or read anything.
+    if let Some(bearer) = crate::auth::bearer_from_headers(&headers)
+        && let Some(job) = shared.state.job_uuid_from_token(bearer)
+        && job == request.job_id
+        && let Ok(record) = shared
+            .state
+            .backend
+            .request(crate::control::backend::RequestKey::AgentJobId(job))
+            .await
+        && record.result.is_some()
+        && record.owner_runner_id == Some(runner_id)
+        && shared
+            .state
+            .verify_local_jwt_claims(bearer)
+            .and_then(|claims| {
+                claims
+                    .get("scp")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .is_some_and(|scope| scope == format!("Actions.Results:{}:{}", record.plan_id, job))
+    {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     authenticated_runner_id_for_job(
         &shared,
         &headers,

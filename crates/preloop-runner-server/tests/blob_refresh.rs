@@ -60,7 +60,7 @@ fn jwt_jti(token: &str) -> String {
     let payload = token.split('.').nth(1).unwrap();
     let bytes = {
         let mut s = payload.replace('-', "+").replace('_', "/");
-        while !s.len().is_multiple_of(4) {
+        while s.len() % 4 != 0 {
             s.push('=');
         }
         base64::engine::general_purpose::STANDARD

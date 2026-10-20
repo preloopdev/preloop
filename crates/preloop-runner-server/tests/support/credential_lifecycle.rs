@@ -118,6 +118,20 @@ async fn signed_blob_urls_die_with_their_job_and_reject_cross_owner_bearers() {
         StatusCode::OK,
         "a live owner's download URL must serve"
     );
+    // A blob JWT is a URL capability, not a protocol credential. Presenting
+    // it to a generic protected route must fail while the job is live...
+    assert_eq!(
+        request(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools",
+            Vec::new(),
+            Some(&read_jwt),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a live blob URL token is not a protocol bearer"
+    );
 
     let (write_jwt, _jti) = mint_blob_jwt(&state, "artifact", &owner.to_string(), "write");
     let write_uri = format!("/twirp-blob/artifact/{write_jwt}");
@@ -140,6 +154,18 @@ async fn signed_blob_urls_die_with_their_job_and_reject_cross_owner_bearers() {
         request(&app, Method::GET, &read_uri, Vec::new(), None).await,
         StatusCode::FORBIDDEN,
         "a completed job's download URL must be rejected"
+    );
+    assert_eq!(
+        request(
+            &app,
+            Method::GET,
+            "/runner/server/_apis/distributedtask/pools",
+            Vec::new(),
+            Some(&read_jwt),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a copied blob URL token is not a protocol bearer after settlement either"
     );
     assert_eq!(
         request(&app, Method::PUT, &write_uri, vec![b'y'; 16], None).await,
@@ -400,6 +426,34 @@ async fn timeout_cancel_and_expired_lease_revoke_job_credentials() {
         request(&app, Method::GET, &uri, Vec::new(), None).await,
         StatusCode::FORBIDDEN,
         "a lease older than the reaper window must revoke before settlement"
+    );
+
+    // Claimed but no first renewal yet: anchor on the claim stamp, not the
+    // 45-minute runner-facing lock. Remove the lease row to model a worker
+    // killed immediately after acquirejob.
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "DELETE FROM job_leases WHERE request_id = \
+                 (SELECT request_id FROM job_requests WHERE agent_job_id = ?1)",
+                (job.to_string(),),
+            )?;
+            tx.execute(
+                "UPDATE job_requests SET claimed_at = ?2 WHERE agent_job_id = ?1",
+                (
+                    job.to_string(),
+                    crate::store::now_us()
+                        - (crate::distributed_task::HUNG_WORKER_LEASE_SECONDS as i64 + 1)
+                            * 1_000_000,
+                ),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&app, Method::GET, &uri, Vec::new(), None).await,
+        StatusCode::FORBIDDEN,
+        "a claimed-but-never-renewed token must die at the startup window"
     );
 }
 

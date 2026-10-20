@@ -1145,9 +1145,9 @@ impl PgBackend {
         Ok(client
             .query_opt(
                 "SELECT 1 FROM runners r WHERE r.runner_id = $1 AND (\
-                    NOT r.ephemeral OR NOT EXISTS (\
+                    NOT r.ephemeral OR NOT r.ephemeral_spent OR EXISTS (\
                         SELECT 1 FROM job_requests q \
-                        WHERE q.runner_id = r.runner_id AND q.result IS NOT NULL))",
+                        WHERE q.runner_id = r.runner_id AND q.result IS NULL))",
                 &[&runner_id],
             )
             .await
@@ -1166,9 +1166,7 @@ impl PgBackend {
         Ok(client
             .query_opt(
                 "SELECT 1 FROM runners r WHERE r.runner_id = $1 AND (\
-                    NOT r.ephemeral OR NOT EXISTS (\
-                        SELECT 1 FROM job_requests q \
-                        WHERE q.runner_id = r.runner_id)) FOR UPDATE",
+                    NOT r.ephemeral OR NOT r.ephemeral_spent) FOR UPDATE",
                 &[&runner_id],
             )
             .await

@@ -126,8 +126,10 @@ The runtime JWT remains separate at every step. It continues to authenticate cac
 
 Every installation token minted for a dispatched job is recorded before it
 enters the job message, bound to the execution attempt and the token's GitHub
-`expires_at`. The record holds the token sealed with the control-plane cluster
-key (the same envelope used for sealed configuration secrets) because GitHub's
+`expires_at`. The record holds the token sealed with a key derived from the
+control-plane cluster key, using the same versioned AEAD+HMAC
+`store::Envelope` format as sealed configuration secrets (those use a
+separate config-secrets data key), because GitHub's
 `DELETE /installation/token` must be authenticated **by the token being
 revoked**; the App private key cannot stand in for it.
 

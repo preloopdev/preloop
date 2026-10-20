@@ -6,35 +6,76 @@ pub async fn require_protocol_bearer(
     next: Next,
 ) -> Result<Response, ApiError> {
     let bearer = bearer_token(&request).map(str::to_owned);
-    let authorized = bearer.as_deref().is_some_and(|token| {
-        token == shared.state.system_token || shared.state.verify_local_jwt_claims(token).is_some()
-    });
-    if !authorized {
+    let Some(token) = bearer.as_deref() else {
         return Err(ApiError::unauthorized(
             "runner or job protocol token required",
         ));
+    };
+    if token == shared.state.system_token {
+        return Ok(next.run(request).await);
+    }
+    let Some(claims) = shared.state.verify_local_jwt_claims(token) else {
+        return Err(ApiError::unauthorized(
+            "runner or job protocol token required",
+        ));
+    };
+    // This middleware fronts both runner and results routes, so it accepts
+    // only the credential classes those routes actually speak. In particular,
+    // URL-capability JWTs (blob read/write tokens) are not protocol bearers:
+    // they are minted for `/twirp-blob` only, and accepting one here would
+    // revive a copied terminal URL on generic routes until the JWT expires.
+    if claims.get("sub").and_then(|value| value.as_str()) == Some("preloop-blob") {
+        return Err(ApiError::unauthorized(
+            "blob URL credentials are not protocol bearers",
+        ));
+    }
+    // A registration grant exchanged from a VM's one-time provision token is
+    // bound to that token; once it is consumed, the copied grant must not
+    // reach any generic protected route. Unbound operator/RunnerManage grants
+    // are unchanged.
+    if claims.get("pvt_hash").is_some() {
+        if !runner_registration_bearer_authorized(&shared.state, token) {
+            return Err(ApiError::unauthorized(
+                "registration grant has already been consumed",
+            ));
+        }
+        return Ok(next.run(request).await);
+    }
+    // A listen token is only as good as the registration behind it: a spent
+    // ephemeral runner or a purged identity must fail here too, not only in
+    // the scoped handlers.
+    if runner_listen_claims(&claims) {
+        if registered_runner_id(&shared, token).await.is_none() {
+            return Err(ApiError::unauthorized(
+                "runner registration is no longer valid",
+            ));
+        }
+        return Ok(next.run(request).await);
+    }
+    // Unbound operator/runner-manager grants keep their management semantics.
+    if runner_registration_claims(&claims) {
+        return Ok(next.run(request).await);
     }
     // A job runtime token is a bearer that workflow code can read (the runner
     // exports it as `ACTIONS_RUNTIME_TOKEN`), so it must stop authenticating
     // once its attempt is no longer live. Final-reporting routes are the one
     // exception: they settle or idempotently re-report the attempt that the
     // token already owns, and denying them would strand a timed-out job.
-    if let Some(job) = bearer
-        .as_deref()
-        .and_then(|token| shared.state.job_uuid_from_token(token))
-        && !is_final_reporting_route(request.method(), request.uri().path())
-    {
-        require_live_job(&shared.state, job).await?;
+    if let Some(job) = shared.state.job_uuid_from_token(token) {
+        if !is_final_reporting_route(request.method(), request.uri().path()) {
+            require_live_job(&shared.state, job).await?;
+        }
+        return Ok(next.run(request).await);
     }
     // Debug-worker tokens name a job too, and the same revocation rule
     // applies: a completed attempt must not keep driving its debug session.
-    if let Some(job) = bearer
-        .as_deref()
-        .and_then(|token| shared.state.job_uuid_from_debug_token(token))
-    {
+    if let Some(job) = shared.state.job_uuid_from_debug_token(token) {
         require_live_job(&shared.state, job).await?;
+        return Ok(next.run(request).await);
     }
-    Ok(next.run(request).await)
+    Err(ApiError::unauthorized(
+        "unsupported protocol credential class",
+    ))
 }
 
 /// Whether a route is the attempt's final-reporting path.
@@ -386,9 +427,10 @@ pub async fn require_live_results_job(
 ///   * the request record exists (a purged or unknown job is not live);
 ///   * it has not settled to a terminal result;
 ///   * the reaper has not flagged its deadline (`timeout_triggered`);
-///   * its runner has renewed within [`HUNG_WORKER_LEASE_SECONDS`] (or, when
-///     no renewal has ever landed, the lock the runner was given has not
-///     expired); and
+///   * its runner has renewed within [`HUNG_WORKER_LEASE_SECONDS`]; a claimed
+///     attempt with no first renewal is bounded by `claimed_at` plus the same
+///     startup window, and only an unclaimed request falls back to the
+///     runner-facing lock; and
 ///   * its logical job has not been settled terminal — cancellation projects
 ///     `jobs` to Cancelled immediately while the request row stays unsettled
 ///     until the runner reports, and the old rule admitted that whole window.
@@ -428,6 +470,23 @@ pub async fn job_is_live(state: &AppState, job_uuid: uuid::Uuid) -> Result<bool,
     if let Some(renewed_at) = record.last_renewed_at {
         let elapsed = std::time::SystemTime::now()
             .duration_since(renewed_at)
+            .unwrap_or_default();
+        if elapsed
+            >= std::time::Duration::from_secs(crate::distributed_task::HUNG_WORKER_LEASE_SECONDS)
+        {
+            return Ok(false);
+        }
+    } else if let Some(claimed_at) = record
+        .claimed_at
+        .filter(|claimed| *claimed > std::time::UNIX_EPOCH)
+    {
+        // Claim happened, first renewjob has not. The runner-facing lock is
+        // 45 minutes, so anchor this case on the claim stamp and the same
+        // short window the reaper uses; otherwise a token copied at acquire
+        // and a worker killed before the first renewal would outlive the
+        // stated 180-second bound.
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(claimed_at)
             .unwrap_or_default();
         if elapsed
             >= std::time::Duration::from_secs(crate::distributed_task::HUNG_WORKER_LEASE_SECONDS)
@@ -643,6 +702,17 @@ pub async fn require_runner_bearer(
     }
     Err(ApiError::unauthorized("runner listen token required"))
 }
+fn runner_listen_claims(claims: &serde_json::Value) -> bool {
+    claims
+        .get("scp")
+        .and_then(|value| value.as_str())
+        .is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .any(|value| value == "ActionsRuntime.RunnerListen")
+        })
+}
+
 fn runner_manager_claims(claims: &serde_json::Value) -> bool {
     claims
         .get("scp")

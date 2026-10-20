@@ -883,15 +883,10 @@ impl LiteBackend {
                     if !exists {
                         false
                     } else {
-                        let ephemeral: bool = tx
-                            .prepare_cached("SELECT ephemeral FROM runners WHERE runner_id = ?1")
-                            .map_err(db)?
-                            .query_row([runner_id], |row| row.get(0))
-                            .map_err(db)?;
-                        let settled: bool = tx
+                        let spent: bool = tx
                             .prepare_cached(
-                                "SELECT EXISTS (SELECT 1 FROM job_requests \
-                                 WHERE runner_id = ?1 AND result IS NOT NULL)",
+                                "SELECT ephemeral AND ephemeral_spent FROM runners \
+                                 WHERE runner_id = ?1",
                             )
                             .map_err(db)?
                             .query_row([runner_id], |row| row.get(0))
@@ -904,7 +899,7 @@ impl LiteBackend {
                             .map_err(db)?
                             .query_row([runner_id], |row| row.get(0))
                             .map_err(db)?;
-                        ephemeral && settled && !active
+                        spent && !active
                     }
                 }
             };

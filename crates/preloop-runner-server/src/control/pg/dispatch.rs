@@ -5762,6 +5762,19 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
+        if claimed > 0
+            && let Some(runner_id) = runner_id
+        {
+            // Lifetime fact, committed with the claim: archival or a failed
+            // cleanup can never make this single-use identity fresh again.
+            tx.execute(
+                "UPDATE runners SET ephemeral_spent = true \
+                 WHERE runner_id = $1 AND ephemeral AND NOT ephemeral_spent",
+                &[&runner_id],
+            )
+            .await
+            .map_err(db)?;
+        }
         Ok(claimed > 0)
     }
 

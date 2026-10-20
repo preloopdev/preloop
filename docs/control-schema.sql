@@ -497,7 +497,10 @@ CREATE TABLE runners (
     rsa_public_key          bytea,
     pool_proven             boolean NOT NULL DEFAULT false,
     registered_at           timestamptz NOT NULL DEFAULT now(),
-    last_seen_at            timestamptz
+    last_seen_at            timestamptz,
+    -- Irreversible lifetime fact: set atomically on the first claim. Kept on
+    -- the identity so it survives attempt/run archival and a failed purge.
+    ephemeral_spent         boolean NOT NULL DEFAULT false
 );
 
 CREATE TABLE runner_sessions (

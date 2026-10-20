@@ -428,7 +428,9 @@ CREATE TABLE runners (
     pool_proven             INTEGER NOT NULL DEFAULT 0,
     registered_at           INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     last_seen_at            INTEGER
-);
+    -- Irreversible lifetime fact: set atomically on the first claim. Kept on
+    -- the identity so it survives attempt/run archival and a failed purge.
+, ephemeral_spent         INTEGER NOT NULL DEFAULT 0);
 
 CREATE TABLE runner_sessions (
     session_id              TEXT PRIMARY KEY,

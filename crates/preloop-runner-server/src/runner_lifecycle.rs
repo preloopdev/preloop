@@ -727,13 +727,29 @@ pub async fn register_runner_compat(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned)
     });
-    let bearer_authorized = bearer.is_some_and(|token| {
-        crate::auth::runner_registration_bearer_authorized(&shared.state, token)
-    });
+    // A provision-bound grant may authorize ONLY by consuming its one-time
+    // token in this request. Do not let a stale pre-consumption authorization
+    // check stand in when a concurrent request won the consume: that would
+    // register an extra (and possibly non-ephemeral) runner without pairing.
+    let bearer_bound = bearer
+        .and_then(|token| shared.state.verify_local_jwt_claims(token))
+        .is_some_and(|claims| claims.get("pvt_hash").is_some());
+    let bearer_authorized = !bearer_bound
+        && bearer.is_some_and(|token| {
+            crate::auth::runner_registration_bearer_authorized(&shared.state, token)
+        });
     let provision_issued_at = provision_token
         .as_deref()
         .and_then(|token| crate::auth::consume_pending_provision_token(&shared.state, token));
     let provision_authorized = provision_issued_at.is_some();
+    if provision_authorized && !ephemeral {
+        if let (Some(token), Some(issued_at)) = (provision_token.as_deref(), provision_issued_at) {
+            crate::auth::restore_pending_provision_token(&shared.state, token, issued_at);
+        }
+        return Err(ApiError::bad_request(
+            "provisioned runner registrations must be ephemeral",
+        ));
+    }
     if !bearer_authorized && !provision_authorized {
         return Err(ApiError::unauthorized(
             "runner registration credential required",

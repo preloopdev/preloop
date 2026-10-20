@@ -11,11 +11,12 @@ pub async fn github_registration_token(
     // The runner sends `Authorization: RemoteAuth <token>` (the official
     // runner does the same against GitHub, where the token is one GitHub
     // issued). GitHub validates because it issued the token; this control
-    // plane cannot validate third-party credentials, so the only credential
-    // it accepts is its own system token. The conformance harness replays
-    // goldens that carry a real GitHub-issued registration token, which this
-    // control plane could never have minted; that harness opts into
-    // permissive mode explicitly (PRELOOP_REGISTRATION_POLICY=permissive).
+    // plane cannot validate third-party credentials, so it accepts its own
+    // system token or a pending one-time provision credential (the pool's
+    // guest configure path). The conformance harness replays goldens that
+    // carry a real GitHub-issued registration token, which this control plane
+    // could never have minted; that harness opts into permissive mode
+    // explicitly (PRELOOP_REGISTRATION_POLICY=permissive).
     let auth = request
         .headers()
         .get("authorization")
