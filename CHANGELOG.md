@@ -374,6 +374,36 @@ Releases before v0.27.0 predate the changelog.
   affected: `preloop store migrate` opens its own connection without these
   guards, and the one migration a serving process can run (test-support
   schema creation) lifts them to migration-scoped values.
+- **The CLI can no longer hang on a wedged engine, daemon, or registry.**
+  The engine client every command uses had no timeouts at all, so the incident's
+  exact symptom — a process that accepts the TCP connection and never answers —
+  held `preloop status`, `preloop run`, `preloop logs`, `preloop push` and the
+  rest open indefinitely. It now has a 10 s connect deadline and a 10-minute
+  idle-read bound (above the engine's own 5-minute live-log liveness window, so
+  a quiet long job is never cut), with per-command totals on top: 30 s for
+  one-shot control calls, 5 minutes for a durable log fetch, and 15 minutes for
+  a git-bundle upload. The streaming paths (`logs --follow`, the run event feed)
+  keep no total on purpose and rely on the idle bound.
+  The same pass bounds the CLI's other external waits: `cosign` verification of
+  a base image (10 minutes, killed at the deadline), the AgentENV guest probes
+  behind `preloop debug` (30 s each, 2 minutes to become ready), the AgentENV
+  egress reconciliation's `sudo`/`systemctl` calls, `launchctl` during
+  `preloop server install`, `docker`/`podman` build, save and inspect during
+  `preloop init`, the release/GitHub clients in `preloop update` and
+  `preloop setup app-manifest`, and `git push` in `preloop push`, which is also
+  now run with every interactive credential path disabled
+  (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS`/`SSH_ASKPASS` neutralised,
+  `GCM_INTERACTIVE=never`) while the developer's own keychain/ssh-agent
+  credentials keep working. A push that expires its own deadline is retried on
+  the existing transient schedule instead of failing the run.
+  `preloop store migrate` bounds its Postgres connect
+  (10 s, covering the handshake *and* session setup, not the handshake alone)
+  and replaces the indefinite `pg_advisory_lock` wait with a 10-minute
+  `pg_try_advisory_lock` retry — each probe itself bounded by what is left of
+  that wait, so a connection that stops answering mid-query cannot outlive it —
+  that names the other holder instead of hanging.
+  Every deadline is a named constant, and every timeout error names the
+  dependency and the deadline, so a hang is distinguishable from a failure.
 - **A hung OS keychain or trust daemon no longer freezes the engine.** On
   macOS, outbound TLS verified every new connection through
   `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked
@@ -567,6 +597,28 @@ Releases before v0.27.0 predate the changelog.
   representation when one exists. This preserves mutation and other
   heavy-step output after guest temporary-storage pressure.
 
+- **Pool start and golden lookups no longer hang on a stalled dependency.** The
+  host Node externals install is killed after 30 minutes — as a whole process
+  group, so the `curl`, `tar`, or `node --version` step it is stuck on dies with
+  the shell that started it, and a shutdown that arrives mid-install cancels it
+  the same way instead of waiting out the deadline. Each of its curl transfers
+  gives up after 30 seconds to connect and 10 minutes in total (2 minutes for
+  the checksum file), and the externals copies are killed after 5 minutes, so a
+  stalled nodejs.org fails with an error that names the dependency and the
+  deadline. Golden release, OCI manifest, and checksum lookups give up after 30
+  seconds instead of sharing the 60-minute download budget — the manifest lookup
+  as one budget for the whole resolution, its bearer-token exchange included,
+  and a blob's token exchange runs on that same short-lived client while the
+  transfer keeps its hour. The orphaned-VM cleanup at startup and on the
+  reconcile interval stops waiting after 10 minutes, and each `ps`, `kill`,
+  `hdiutil`, and `/sbin/mount` child it runs is killed after 30 seconds; a
+  startup sweep that outlives its own deadline now fails pool start rather than
+  serving while it could still kill a runner booted after the wait. The orphaned
+  data-directory sweeps carry the same 10-minute bound. The host memory probe
+  gives up after 10 seconds, and a `node --version` check of an externals
+  directory after 10 seconds, which counts that directory as invalid — a
+  non-native manifest whose binary hangs is no longer taken for a foreign binary
+  the host cannot execute.
 - **Post hooks of skipped actions no longer run**: a workflow step that did
   not run, because its `if:` was false or an earlier step failed, no longer
   runs its action's `post` hook. The official runner registers a post hook

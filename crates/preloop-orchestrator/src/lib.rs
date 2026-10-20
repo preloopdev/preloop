@@ -11,6 +11,7 @@ use crate::environment::{EnvironmentSpec, is_official_golden};
 use crate::keys::{KeyPool, StagedKey};
 use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
+use preloop_observability::deadline;
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
 /// `VmProvider` implementation can model the handshake this pool relies on.
@@ -169,6 +170,82 @@ fn fork_base_volumes<P: VmProvider>(provider: &P, volumes: Vec<VolumeMount>) -> 
     }
 }
 
+/// Deadline for the whole host node-externals install: the shell routine
+/// [`node_externals_at`] builds. It fetches two Node archives (about 57 MB and
+/// 47 MB) and a 3 KB checksum file from nodejs.org.
+///
+/// Long work, sized from the worst honest case rather than from a probe. Each
+/// curl transfer carries its own limit ([`NODE_FETCH_LIMITS`]); if every fetch
+/// stalls, those limits add up to 24 minutes. This budget sits above that sum,
+/// so a stalled install reports curl's own error first, and only a hang the
+/// per-transfer limits cannot see reaches this deadline. A healthy install
+/// takes well under a minute.
+///
+/// The install runs in its own process group
+/// ([`deadline::run_command_status_in_group`]): the routine's real work is in
+/// grandchildren (`curl`, `shasum`, `tar`, the cached `node --version`), so
+/// killing the shell alone would leave the one hanging step running behind a
+/// failure the pool already reported.
+const HOST_EXTERNALS_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Deadline for one `cp -a` of the externals tree, into the runner bundle or
+/// into the engine-owned mirror.
+///
+/// The tree is a few hundred megabytes of local files, a second or two on any
+/// host this engine runs on. The budget covers a cold page cache or a release
+/// directory behind a network mount; it exists so a wedged filesystem cannot
+/// hold pool start.
+const HOST_EXTERNALS_COPY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Deadline for a read-only host query run as a child process (`sysctl -n
+/// hw.memsize`). The kernel answers in milliseconds; this only has to survive a
+/// badly loaded host.
+const HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for the orphaned-VM cleanup in `remove_stale_machines` and
+/// `reconcile_orphans`: `ps`, `kill`, `/sbin/mount`, and `hdiutil detach`, run
+/// through `preloop-vm`. `preloop-vm` bounds each of those children at 30 s and
+/// kills it on expiry, so the total grows with the number of orphans, one child
+/// each. Ten minutes covers roughly eighteen children that each hit their own
+/// bound; past that the caller stops waiting, and the sweep finishes on its own,
+/// still bounded per child.
+const HOST_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// `cp -a` the host externals tree into `dest`, bounded by
+/// [`HOST_EXTERNALS_COPY_TIMEOUT`] through the shared runner, which kills and
+/// reaps the child at the deadline.
+///
+/// Real directories, never symlinks: virtiofs exports a symlink node verbatim
+/// and the guest kernel would then resolve its target in the guest namespace.
+async fn copy_externals_into(
+    source: &Path,
+    dest: &Path,
+) -> Result<std::process::ExitStatus, deadline::CommandError> {
+    let mut copy = tokio::process::Command::new("cp");
+    copy.arg("-a").arg(source.join(".")).arg(dest);
+    deadline::run_command_status(
+        copy,
+        HOST_EXTERNALS_COPY_TIMEOUT,
+        "host node externals copy",
+    )
+    .await
+}
+
+/// Drop runtime directories a newer pinned version has superseded.
+///
+/// Run before a copy so `cp -a` cannot leave a mix of stale and new runtimes in
+/// the destination — which `externals_complete` would refuse anyway, but only
+/// after the copy had made a second copy of gigabytes.
+fn prune_stale_externals(externals_root: &Path) {
+    for (runtime, version) in crate::node_externals::expected_runtimes() {
+        let plain = version.trim_start_matches('v');
+        let dest = externals_root.join(runtime);
+        if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain) && dest.exists() {
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+    }
+}
+
 /// Populate the host-side externals directory, validating the manifest and
 /// binary version for each runtime instead of merely checking for a file.
 ///
@@ -178,7 +255,15 @@ fn fork_base_volumes<P: VmProvider>(provider: &P, volumes: Vec<VolumeMount>) -> 
 /// re-downloaded when its `preloop-node.json` is missing, its version is stale,
 /// or `bin/node --version` disagrees. Permissions are still normalized on every
 /// call.
-fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
+///
+/// Every subprocess it runs goes through `preloop_observability::deadline`, so
+/// the install and the bundle copies are bounded and their children are killed
+/// at the deadline — the install's whole process group, so the `curl` or `tar`
+/// it is waiting on dies with it. This is called from `RunnerPool::run`, and an
+/// unbounded wait here would stop every machine the pool would create; a
+/// shutdown there cancels this future outright, which kills the group for the
+/// same reason.
+async fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
     let externals = config.externals_dir.join("externals");
     let needs_host = crate::node_externals::expected_runtimes()
         .iter()
@@ -194,15 +279,19 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
             ))
         })?;
         for command in node_externals_at(config.externals_dir.to_string_lossy().as_ref()) {
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command[2])
-                .status()
-                .map_err(|error| {
-                    OrchestratorError::Config(format!(
-                        "failed to spawn host externals install: {error}"
-                    ))
-                })?;
+            let mut install = tokio::process::Command::new(&command[0]);
+            install.args(&command[1..]);
+            // The install is a shell routine whose real work (curl, tar, shasum)
+            // runs in grandchildren, so it starts its own process group: the
+            // runner kills that whole group at the deadline, and dropping the
+            // future kills it too — which is what `RunnerPool::run` does when a
+            // shutdown wins the race.
+            let status = deadline::run_command_status_in_group(
+                install,
+                HOST_EXTERNALS_INSTALL_TIMEOUT,
+                "host node externals install (nodejs.org)",
+            )
+            .await?;
             if !status.success() {
                 return Err(OrchestratorError::Config(
                     "host node externals install failed; \
@@ -236,31 +325,24 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     let bundle_externals = config.runner_bundle.join("externals");
     if !externals_complete(&bundle_externals) {
         // Ensure bundle parent exists before copy.
-        let copy = std::fs::create_dir_all(&bundle_externals).and_then(|()| {
-            // For stale manifests, remove the stale runtime dirs in the bundle first
-            // so `cp -a` does not leave a mix of stale/new.
-            for (runtime, version) in crate::node_externals::expected_runtimes() {
-                let plain = version.trim_start_matches('v');
-                let dest = bundle_externals.join(runtime);
-                if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain)
-                    && dest.exists()
-                {
-                    let _ = std::fs::remove_dir_all(&dest);
-                }
+        let copy = match std::fs::create_dir_all(&bundle_externals) {
+            Ok(()) => {
+                // For stale manifests, remove the stale runtime dirs in the bundle
+                // first so `cp -a` does not leave a mix of stale/new.
+                prune_stale_externals(&bundle_externals);
+                copy_externals_into(&externals, &bundle_externals)
+                    .await
+                    .map_err(OrchestratorError::from)
             }
-            std::process::Command::new("cp")
-                .arg("-a")
-                .arg(externals.join("."))
-                .arg(&bundle_externals)
-                .output()
-        });
+            Err(error) => Err(OrchestratorError::Io(error)),
+        };
         match copy {
-            Ok(output) if output.status.success() => info!(
+            Ok(status) if status.success() => info!(
                 bundle = %bundle_externals.display(),
                 "Materialized node externals into runner bundle"
             ),
-            Ok(output) => warn!(
-                status = %output.status,
+            Ok(status) => warn!(
+                %status,
                 bundle = %bundle_externals.display(),
                 "Could not materialize bundle externals in place; publishing an engine-owned mirror bundle"
             ),
@@ -277,7 +359,7 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     if externals_complete(&bundle_externals) {
         return Ok(());
     }
-    materialize_mirror_bundle(config, &externals)
+    materialize_mirror_bundle(config, &externals).await
 }
 
 /// Whether `externals_root` carries every expected runtime at its pinned
@@ -371,7 +453,7 @@ pub fn runner_bundle_manifest() -> preloop_vm::agentenv::volume::BundleManifest 
 /// Fails when the mirror still does not validate: a pool that starts without
 /// resolvable externals reports itself ready and then fails every JS action
 /// step, which is far more expensive to diagnose than a refused startup.
-fn materialize_mirror_bundle(
+async fn materialize_mirror_bundle(
     config: &RunnerPoolConfig,
     host_externals: &Path,
 ) -> Result<(), OrchestratorError> {
@@ -379,27 +461,19 @@ fn materialize_mirror_bundle(
     let mirror_externals = mirror.join("externals");
     let runner_source = config.runner_bundle.join(&config.runner_binary_name);
     let runner_target = mirror.join(&config.runner_binary_name);
-    let published = std::fs::create_dir_all(&mirror_externals).and_then(|()| {
-        for (runtime, version) in crate::node_externals::expected_runtimes() {
-            let plain = version.trim_start_matches('v');
-            let dest = mirror_externals.join(runtime);
-            if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain)
-                && dest.exists()
-            {
-                let _ = std::fs::remove_dir_all(&dest);
-            }
-        }
+    let published: Result<(), OrchestratorError> = async {
+        std::fs::create_dir_all(&mirror_externals)?;
+        prune_stale_externals(&mirror_externals);
         // `cp -a` for both halves: the runner binary must keep its exec bit and
         // the externals must arrive as real directories, since virtiofs exports
         // a symlink node verbatim and the guest would resolve it in its own
-        // namespace.
+        // namespace. A `cp` that exits non-zero is left to the completeness
+        // check below.
         std::fs::copy(&runner_source, &runner_target)?;
-        std::process::Command::new("cp")
-            .arg("-a")
-            .arg(host_externals.join("."))
-            .arg(&mirror_externals)
-            .output()
-    });
+        copy_externals_into(host_externals, &mirror_externals).await?;
+        Ok(())
+    }
+    .await;
     if let Err(error) = published {
         return Err(OrchestratorError::Config(format!(
             "node externals are missing from the runner bundle {} and the \
@@ -502,7 +576,7 @@ fn relax_externals_permissions(_externals: &Path) {}
 /// `/proc/meminfo`, a non-Linux/non-macOS host) falls back to CPU-only
 /// sizing rather than refusing to run.
 #[cfg(target_os = "linux")]
-fn host_memory_mib() -> Option<u64> {
+async fn host_memory_mib() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let kib: u64 = meminfo.lines().find_map(|line| {
         let line = line.trim();
@@ -513,12 +587,24 @@ fn host_memory_mib() -> Option<u64> {
 }
 
 /// Total physical memory in MiB, or `None` when it cannot be determined.
+///
+/// The value comes from `sysctl`, a child process, run through the shared
+/// bounded runner with [`HOST_PROBE_TIMEOUT`]. A wedged probe is killed at the
+/// deadline and reads as unknown, so the pool is sized by CPU alone instead of
+/// parking pool start.
 #[cfg(target_os = "macos")]
-fn host_memory_mib() -> Option<u64> {
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()?;
+async fn host_memory_mib() -> Option<u64> {
+    let mut sysctl = tokio::process::Command::new("sysctl");
+    sysctl.args(["-n", "hw.memsize"]);
+    let output =
+        match deadline::run_command(sysctl, HOST_PROBE_TIMEOUT, "host memory probe (sysctl)").await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                warn!(%error, "host memory probe failed; sizing the pool by CPU only");
+                return None;
+            }
+        };
     let bytes: u64 = String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
@@ -528,7 +614,7 @@ fn host_memory_mib() -> Option<u64> {
 
 /// Total physical memory in MiB, or `None` when it cannot be determined.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn host_memory_mib() -> Option<u64> {
+async fn host_memory_mib() -> Option<u64> {
     None
 }
 
@@ -663,7 +749,8 @@ struct GitHubRelease {
 /// `/releases/latest/download/…` 404s there while a usable golden sits one
 /// release back. Stable releases win over prereleases; drafts are ignored.
 /// Best effort: any failure returns `None` and the caller falls through to the
-/// `latest` redirect.
+/// `latest` redirect. `client` must carry [`GOLDEN_METADATA_TIMEOUT`]; a listing
+/// under the download budget would let a stalled API hold start for an hour.
 async fn resolve_latest_golden_tag(client: &reqwest::Client, api_base: &str) -> Option<String> {
     static CACHE: std::sync::OnceLock<GoldenTagCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -1139,18 +1226,33 @@ async fn reconcile_orphans<P: VmProvider + 'static>(
         }
         // Sweep first, so a data dir removed on this tick has the hypervisor
         // still holding its blocks released by the purge below, in the same
-        // tick, instead of an interval later.
-        match provider.sweep_orphaned_data_dirs().await {
-            Ok(swept) if swept > 0 => info!(swept, "removed orphaned machine data directories"),
-            Ok(_) => {}
-            Err(error) => warn!(%error, "periodic orphaned data-dir sweep failed"),
+        // tick, instead of an interval later. Bounded like the purge: the
+        // provider walks the registry and the data roots and can shell out for
+        // each machine, so a stalled sweep would stop this reconciler from ever
+        // reaching its deadline-protected work.
+        match tokio::time::timeout(HOST_CLEANUP_TIMEOUT, provider.sweep_orphaned_data_dirs()).await
+        {
+            Ok(Ok(swept)) if swept > 0 => info!(swept, "removed orphaned machine data directories"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "periodic orphaned data-dir sweep failed"),
+            Err(_) => warn!(
+                deadline = ?HOST_CLEANUP_TIMEOUT,
+                "periodic orphaned data-dir sweep abandoned at its deadline"
+            ),
         }
-        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::RemovedDataDir) {
-            Ok(killed) if killed > 0 => {
+        match deadline::run_blocking(
+            HOST_CLEANUP_TIMEOUT,
+            "periodic orphaned hypervisor purge",
+            || preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::RemovedDataDir),
+        )
+        .await
+        {
+            Ok(Ok(killed)) if killed > 0 => {
                 info!(killed, "purged orphaned SmolVM hypervisor processes")
             }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "periodic orphaned hypervisor purge failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "periodic orphaned hypervisor purge failed"),
+            Err(error) => warn!(%error, "periodic orphaned hypervisor purge abandoned"),
         }
     }
 }
@@ -1198,6 +1300,24 @@ const GOLDEN_OCI_REF_X86_64: &str = "ghcr.io/preloopdev/preloop-x86_64-smolvm-go
 /// ordinary connection cannot serve — it killed the transfer around two-thirds
 /// through, and the artifact then read as missing.
 const GOLDEN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Deadline for a golden metadata lookup: the GitHub release listing, an OCI
+/// manifest and its bearer token, and a `.sha256` sidecar. All three bodies are
+/// small. A listing of thirty releases is far below a megabyte, and a manifest or
+/// sidecar is a few kilobytes at most, so 30 s covers a slow link with room to
+/// spare. Every lookup is best effort and falls through to the next source on
+/// failure, so giving up early costs a fallback and never a failed start. These
+/// lookups used to share the 60-minute download client, so a stalled
+/// `api.github.com` could hold pool start for an hour.
+const GOLDEN_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// HTTP client for golden transfers and lookups: the shared TLS roots with the
+/// given total deadline. Transfers pass [`GOLDEN_DOWNLOAD_TIMEOUT`]; lookups
+/// pass [`GOLDEN_METADATA_TIMEOUT`].
+fn golden_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder().timeout(timeout))
+        .build()
+}
+
 /// Transfer attempts for one golden source before it is abandoned.
 ///
 /// Each attempt resumes from the bytes already on disk, so a link that drops
@@ -1421,11 +1541,14 @@ async fn download_prebaked_golden_with_space(
         }
     }
 
-    let client = match preloop_runner_server::shared_http::with_tls_roots(
-        reqwest::Client::builder().timeout(GOLDEN_DOWNLOAD_TIMEOUT),
-    )
-    .build()
-    {
+    let metadata = match golden_http_client(GOLDEN_METADATA_TIMEOUT) {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(%error, "Could not create golden metadata client");
+            return Ok(false);
+        }
+    };
+    let client = match golden_http_client(GOLDEN_DOWNLOAD_TIMEOUT) {
         Ok(client) => client,
         Err(error) => {
             warn!(%error, "Could not create golden download client");
@@ -1437,7 +1560,7 @@ async fn download_prebaked_golden_with_space(
     // common case needs no API call, and an unauthenticated lookup is rate
     // limited.
     let resolved_tag = if forced_url.is_none() {
-        resolve_latest_golden_tag(&client, GITHUB_API_BASE).await
+        resolve_latest_golden_tag(&metadata, GITHUB_API_BASE).await
     } else {
         None
     };
@@ -1455,7 +1578,9 @@ async fn download_prebaked_golden_with_space(
         // `linux-amd64`/`linux-arm64` assets we release ourselves are the only
         // source allowed to skip verification (a missing sidecar there is an
         // accident, and refusing would strand every host that updates first).
-        if download_release_asset(&client, &url, payload, available_space, mirror).await? {
+        if download_release_asset(&client, &metadata, &url, payload, available_space, mirror)
+            .await?
+        {
             return Ok(true);
         }
     }
@@ -1468,6 +1593,7 @@ async fn download_prebaked_golden_with_space(
 /// dropped connection costs the bytes in flight rather than the artifact.
 async fn download_release_asset(
     client: &reqwest::Client,
+    metadata: &reqwest::Client,
     url: &str,
     payload: &Path,
     available_space: AvailableSpace,
@@ -1489,7 +1615,7 @@ async fn download_release_asset(
         Some(sha256) => Some(sha256),
         None => match tokio::time::timeout(
             Duration::from_secs(15),
-            client.get(format!("{url}.sha256")).send(),
+            metadata.get(format!("{url}.sha256")).send(),
         )
         .await
         {
@@ -1769,11 +1895,16 @@ async fn download_oci_golden(
         warn!(reference, "invalid OCI golden reference");
         return Ok(false);
     };
-    let client = match preloop_runner_server::shared_http::with_tls_roots(
-        reqwest::Client::builder().timeout(GOLDEN_DOWNLOAD_TIMEOUT),
-    )
-    .build()
-    {
+    // The manifest and its bearer token are small lookups: they get the short
+    // metadata deadline. The blob below is the download and keeps the long one.
+    let metadata = match golden_http_client(GOLDEN_METADATA_TIMEOUT) {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(%error, "Could not create OCI golden metadata client");
+            return Ok(false);
+        }
+    };
+    let client = match golden_http_client(GOLDEN_DOWNLOAD_TIMEOUT) {
         Ok(client) => client,
         Err(error) => {
             warn!(%error, "Could not create OCI golden download client");
@@ -1784,10 +1915,29 @@ async fn download_oci_golden(
     // under an OCI index, so the digest/tags resolve to one indirection. The
     // shared client follows that one level, taking the first listed manifest
     // (our packs publish exactly one platform entry).
-    let resolved = match get_manifest(&client, &oci, MANIFEST_ACCEPT, None).await {
-        Ok(resolved) => resolved,
-        Err(error) => {
+    //
+    // One budget for the whole resolution, not the client's per-request one:
+    // an index costs two manifest fetches and possibly a bearer-token
+    // exchange, and each request would otherwise get its own
+    // [`GOLDEN_METADATA_TIMEOUT`], so a registry that dribbles `HEAD`-like
+    // answers could hold startup for a multiple of the advertised budget.
+    let resolved = match tokio::time::timeout(
+        GOLDEN_METADATA_TIMEOUT,
+        get_manifest(&metadata, &oci, MANIFEST_ACCEPT, None),
+    )
+    .await
+    {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => {
             warn!(reference, %error, "OCI golden manifest unavailable");
+            return Ok(false);
+        }
+        Err(_) => {
+            warn!(
+                reference,
+                deadline = ?GOLDEN_METADATA_TIMEOUT,
+                "OCI golden metadata lookup abandoned at its deadline"
+            );
             return Ok(false);
         }
     };
@@ -1828,15 +1978,21 @@ async fn download_oci_golden(
     let partial = golden_partial_path(payload);
     let downloaded = {
         let client = client.clone();
+        // The blob's 401 handshake goes to the metadata client: the token
+        // lookup is a small request, and answering it on the transfer client
+        // would give it the download's hour.
+        let token_client = metadata.clone();
         let blob_url = blob_url.clone();
         let repository = oci.repository.clone();
         download_golden_with_resume(&partial, "OCI", layer_size, None, move |offset| {
             let client = client.clone();
+            let token_client = token_client.clone();
             let url = blob_url.clone();
             let repository = repository.clone();
             Box::pin(async move {
                 crate::oci::registry_get(
                     &client,
+                    &token_client,
                     &url,
                     &repository,
                     "*/*",
@@ -2011,7 +2167,57 @@ const GUEST_NOFILE_ULIMIT: &str = GOLDEN_NOFILE_ULIMIT_RAISE;
 /// strict form above and fail loudly.
 const GUEST_NOFILE_ULIMIT_BEST_EFFORT: &str = GOLDEN_NOFILE_ULIMIT_RAISE_BEST_EFFORT;
 
+/// Time limits on the curl calls in the host externals install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeFetchLimits {
+    /// Seconds to establish the TCP and TLS connection.
+    connect_secs: u32,
+    /// Seconds for one Node archive transfer, body included.
+    archive_max_secs: u32,
+    /// Seconds for the `SHASUMS256.txt` transfer.
+    shasums_max_secs: u32,
+}
+
+/// Production limits for [`node_externals_at`]. Every transfer carries a total
+/// budget, so a stalled nodejs.org ends in curl's error instead of holding pool
+/// start.
+///
+/// - Connect, 30 s: a TCP and TLS handshake to nodejs.org takes well under a
+///   second; 30 s covers a slow proxy without waiting out a black-holed route.
+/// - Archive, 10 min: the archives are 57 MB and 47 MB. Ten minutes needs about
+///   0.8 Mbps sustained for the larger one, and a healthy link takes under a
+///   minute.
+/// - Checksum file, 2 min: a 3 KB file.
+const NODE_FETCH_LIMITS: NodeFetchLimits = NodeFetchLimits {
+    connect_secs: 30,
+    archive_max_secs: 10 * 60,
+    shasums_max_secs: 2 * 60,
+};
+
+/// Where the host externals install fetches Node from.
+const NODE_DIST_BASE: &str = "https://nodejs.org/dist";
+
+/// The host externals install script for `runner_root`, with the production
+/// download root and curl limits. See [`node_externals_script`].
 fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
+    node_externals_script(runner_root, NODE_DIST_BASE, NODE_FETCH_LIMITS)
+}
+
+/// The shell routine that installs Node externals under `runner_root`, fetching
+/// from `dist_base` with the curl limits in `limits`.
+///
+/// The download root and the limits are parameters so a test can run this exact
+/// script against a local listener with short limits.
+fn node_externals_script(
+    runner_root: &str,
+    dist_base: &str,
+    limits: NodeFetchLimits,
+) -> Vec<Vec<String>> {
+    let NodeFetchLimits {
+        connect_secs,
+        archive_max_secs,
+        shasums_max_secs,
+    } = limits;
     // Pinned SHA per runtime+platform, derived from versions.toml via build.rs.
     // Empty string means no pinned entry — SHASUMS verification still applies.
     let n20_plain = NODE20_EXTERNALS_VERSION.trim_start_matches('v');
@@ -2053,10 +2259,10 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
                 ARCH=$(uname -m); \
                 if [ \"$ARCH\" = \"aarch64\" ] || [ \"$ARCH\" = \"arm64\" ]; then NODE_ARCH=linux-arm64; else NODE_ARCH=linux-x64; fi; \
                 ARCHIVE=\"node-$VERSION-$NODE_ARCH.tar.gz\"; \
-                URL=\"https://nodejs.org/dist/$VERSION/$ARCHIVE\"; \
-                SHASUMS_URL=\"https://nodejs.org/dist/$VERSION/SHASUMS256.txt\"; \
+                URL=\"{dist_base}/$VERSION/$ARCHIVE\"; \
+                SHASUMS_URL=\"{dist_base}/$VERSION/SHASUMS256.txt\"; \
                 TMP_ARCHIVE=$(mktemp \"$RUNNER_EXTERNALS/.$NAME.archive.XXXXXX.tar.gz\"); \
-                if ! curl -fsSL -o \"$TMP_ARCHIVE\" \"$URL\"; then echo \"FAILED fetching $NAME $VERSION\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                if ! curl -fsSL --connect-timeout {connect_secs} --max-time {archive_max_secs} -o \"$TMP_ARCHIVE\" \"$URL\"; then echo \"FAILED fetching $NAME $VERSION\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
                 ACTUAL=$(shasum -a 256 \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); \
                 if [ -z \"$ACTUAL\" ]; then ACTUAL=$(sha256sum \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); fi; \
                 if [ -z \"$ACTUAL\" ]; then echo \"no sha256 tool available\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
@@ -2075,7 +2281,7 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
                   VERIFIED=1; \
                 fi; \
                 SHASUMS_TMP=$(mktemp \"$RUNNER_EXTERNALS/.SHASUMS.XXXXXX\"); \
-                if curl -fsSL -o \"$SHASUMS_TMP\" \"$SHASUMS_URL\" 2>/dev/null; then \
+                if curl -fsSL --connect-timeout {connect_secs} --max-time {shasums_max_secs} -o \"$SHASUMS_TMP\" \"$SHASUMS_URL\" 2>/dev/null; then \
                   EXPECTED_SHASUMS=$(grep -F \" $ARCHIVE\" \"$SHASUMS_TMP\" | awk '{{print $1}}'); \
                   if [ -n \"$EXPECTED_SHASUMS\" ] && [ \"$ACTUAL\" != \"$EXPECTED_SHASUMS\" ]; then echo \"ERROR: $NAME $VERSION SHASUMS256.txt mismatch (got $ACTUAL expected $EXPECTED_SHASUMS)\" >&2; rm -f \"$TMP_ARCHIVE\" \"$SHASUMS_TMP\"; rm -rf \"$TEMP\"; exit 1; fi; \
                   if [ -n \"$EXPECTED_SHASUMS\" ]; then VERIFIED=1; fi; \
@@ -3427,6 +3633,10 @@ pub enum OrchestratorError {
     /// Host filesystem failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A host command (install script, copy) failed, or hit its deadline and was
+    /// killed. The message names the dependency and the deadline.
+    #[error(transparent)]
+    Dependency(#[from] deadline::CommandError),
     /// The destination filesystem cannot hold the golden plus operating
     /// headroom. This is fatal rather than a local-build fallback: baking
     /// requires substantially more space than downloading.
@@ -4438,6 +4648,26 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
     Ok(())
 }
 
+/// What an `OrphanPurge::All` sweep that outlived its deadline means to its
+/// caller.
+///
+/// `All` is the only scope that may kill a *live* hypervisor, so it is only
+/// ever used where nothing of ours can be running: pool startup and pool
+/// teardown ([`preloop_vm::purge_orphaned_vms`]). Those two moments differ in
+/// what an abandoned sweep costs, which is all this decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanPurgeDuty {
+    /// The pool is about to boot machines. The sweep is bounded per child now,
+    /// but a caller that stopped waiting cannot know it finished, and it kills
+    /// from a process table it read after that: a runner booted in the
+    /// meantime is in it. Do not serve on that.
+    BeforeServing,
+    /// The pool is stopping, and this process is going away with the sweep
+    /// thread. An unfinished sweep is worth a warning, not an error that turns
+    /// an intentional stop into a reported failure.
+    WhileStopping,
+}
+
 impl<P: VmProvider + 'static> RunnerPool<P> {
     /// Construct a runner pool.
     pub fn new(provider: Arc<P>, config: RunnerPoolConfig) -> Result<Self, OrchestratorError> {
@@ -4470,10 +4700,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             pool_status: self.config.pool_status.clone(),
             armed: true,
         };
-        ensure_host_externals(&self.config)?;
         // Every machine the phases below create before a shutdown is torn
         // down by `teardown`, so the cache exists from the first one on.
         let golden_cache = Arc::new(GoldenCache::new(self.config.name_prefix.clone()));
+        // A stop that arrives during the install must not wait out its
+        // 30-minute deadline: the install runs in its own process group, so
+        // dropping it here takes the shell, its `curl`, and its `tar` with it,
+        // and the next start redoes only what is still missing.
+        let Some(installed) = unless_shutdown(&shutdown, ensure_host_externals(&self.config)).await
+        else {
+            info!("shutdown during host externals install; stopping the pool");
+            return self.teardown(&golden_cache).await;
+        };
+        installed?;
         // A backend whose packs are not host files (AgentENV keeps them as
         // server-side snapshots) has no artifact to build, download, or
         // relocate: its golden is prepared directly from the base image by
@@ -4505,7 +4744,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             return Err(error);
         }
         self.sweep_stale_artifacts().await;
-        if let Err(error) = self.remove_stale_machines().await {
+        if let Err(error) = self
+            .remove_stale_machines(OrphanPurgeDuty::BeforeServing)
+            .await
+        {
             // A sweep that failed halfway may have left machines behind; give
             // the teardown a chance to finish the cleanup before reporting
             // the failure.
@@ -4618,7 +4860,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // golden — so the host must fit one runner ceiling per slot. Sizing
         // down at startup is safer than OOMing mid-run;
         // `PRELOOP_RUNNER_POOL_SIZE` remains an explicit override that wins.
-        let warm_size = match host_memory_mib() {
+        let warm_size = match host_memory_mib().await {
             Some(total) => self
                 .config
                 .size
@@ -4737,7 +4979,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 );
             }
         }
-        self.remove_stale_machines().await
+        self.remove_stale_machines(OrphanPurgeDuty::WhileStopping)
+            .await
     }
 
     /// Golden slots the host can still afford alongside `runners` live VMs.
@@ -4748,7 +4991,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
     /// left is what another environment may bake into. A host whose memory
     /// cannot be read keeps the previous unbounded behaviour.
     async fn golden_budget(&self, runners: usize, golden_cache: &GoldenCache) -> GoldenBudget {
-        let Some(total) = host_memory_mib() else {
+        let Some(total) = host_memory_mib().await else {
             return GoldenBudget::unbounded();
         };
         let capacity = host_vm_capacity(total, u64::from(self.config.memory_mib));
@@ -4785,7 +5028,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // and OOM the whole control plane. Reserve the golden's memory
             // plus host headroom, then fit the remainder with per-runner
             // ceilings. A host we cannot measure falls back to CPU-only.
-            match host_memory_mib() {
+            match host_memory_mib().await {
                 Some(total) => by_cpu.min(on_demand_memory_cap(
                     total,
                     u64::from(self.config.memory_mib),
@@ -5000,7 +5243,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         Ok(())
     }
 
-    async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
+    /// Sweep the machines a previous engine left behind, then the hypervisors
+    /// and layer mounts they orphaned.
+    ///
+    /// `purge_duty` decides what an unfinished `All` orphan purge means to the
+    /// caller; see [`OrphanPurgeDuty`].
+    async fn remove_stale_machines(
+        &self,
+        purge_duty: OrphanPurgeDuty,
+    ) -> Result<(), OrchestratorError> {
         self.remove_stale_runner_machines().await?;
         // A crashed server orphans its detached `_boot-vm` hypervisor
         // processes; when the data dir was cleaned out from under them the
@@ -5011,11 +5262,33 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // nothing of ours can be running. The periodic reconcile the pool
         // runs while serving uses `RemovedDataDir`, which spares any process
         // whose boot config still exists.
-        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
-            Ok(killed) if killed > 0 => {
+        match deadline::run_blocking(HOST_CLEANUP_TIMEOUT, "orphaned hypervisor purge", || {
+            preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All)
+        })
+        .await
+        {
+            Ok(Ok(killed)) if killed > 0 => {
                 info!(killed, "purged orphaned SmolVM hypervisor processes")
             }
-            _ => {}
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "orphaned hypervisor purge failed"),
+            // `All` kills every hypervisor under this home, so a sweep this
+            // caller stopped waiting for is still a sweep that will kill: it
+            // reads the process table *after* the wait gave up, and a machine
+            // booted in the meantime is in that table. Continuing into machine
+            // creation would hand it exactly that.
+            Err(error) => match purge_duty {
+                OrphanPurgeDuty::BeforeServing => {
+                    return Err(OrchestratorError::Pool(format!(
+                        "orphaned hypervisor purge did not finish, so the host's hypervisor \
+                         state is unknown and an `All` sweep still running would kill the \
+                         runners booted next: {error}"
+                    )));
+                }
+                OrphanPurgeDuty::WhileStopping => {
+                    warn!(%error, "orphaned hypervisor purge abandoned")
+                }
+            },
         }
         // Killing a hypervisor releases its storage but not its layer mount:
         // the `pack/layers-cs` sparseimage stays attached to the host, and
@@ -5024,23 +5297,41 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // hypervisor just died is collectable in the same pass. A mount whose
         // hypervisor is still alive is skipped (a spared golden), and
         // `hdiutil` refuses a busy volume, so a running machine is safe.
-        match preloop_vm::detach_orphaned_layer_mounts() {
-            Ok(detached) if detached > 0 => {
+        match deadline::run_blocking(
+            HOST_CLEANUP_TIMEOUT,
+            "orphaned layer-mount detach",
+            preloop_vm::detach_orphaned_layer_mounts,
+        )
+        .await
+        {
+            Ok(Ok(detached)) if detached > 0 => {
                 info!(detached, "detached orphaned SmolVM layer mounts")
             }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "orphaned layer-mount detach failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "orphaned layer-mount detach failed"),
+            Err(error) => warn!(%error, "orphaned layer-mount detach abandoned"),
         }
         // The registry sweep above cannot see a machine whose registry row is
         // gone but whose data dir survived (smolvm's delete drops the row
         // first; a failed remove_dir_all or a crashed engine strands the
-        // files). Reconcile the filesystem against the registry.
-        match self.provider.sweep_orphaned_data_dirs().await {
-            Ok(swept) if swept > 0 => {
+        // files). Reconcile the filesystem against the registry, bounded like
+        // every other step here: the sweep walks the data roots and can shell
+        // out per machine.
+        match tokio::time::timeout(
+            HOST_CLEANUP_TIMEOUT,
+            self.provider.sweep_orphaned_data_dirs(),
+        )
+        .await
+        {
+            Ok(Ok(swept)) if swept > 0 => {
                 info!(swept, "removed orphaned machine data directories")
             }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "orphaned data-dir sweep failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "orphaned data-dir sweep failed"),
+            Err(_) => warn!(
+                deadline = ?HOST_CLEANUP_TIMEOUT,
+                "orphaned data-dir sweep abandoned at its deadline"
+            ),
         }
         self.sweep_pack_intermediates().await;
         Ok(())
@@ -10935,8 +11226,8 @@ fi"#,
 
     /// A release directory the engine cannot write must not strand the pool
     /// without node: the engine publishes its own bundle and mounts that.
-    #[test]
-    fn mirror_bundle_is_published_when_the_release_bundle_lacks_externals() {
+    #[tokio::test]
+    async fn mirror_bundle_is_published_when_the_release_bundle_lacks_externals() {
         let home = tempfile::tempdir().unwrap();
         let release = tempfile::tempdir().unwrap();
         std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -10958,6 +11249,7 @@ fi"#,
         );
 
         materialize_mirror_bundle(&config, &host_externals)
+            .await
             .expect("the engine-owned mirror is publishable");
 
         let mirror = mirror_bundle_dir(&config);
@@ -10972,8 +11264,8 @@ fi"#,
 
     /// Starting a pool whose bundle cannot resolve node reports ready and then
     /// fails every JS action step, so publishing must fail loudly instead.
-    #[test]
-    fn mirror_bundle_publication_fails_when_host_externals_are_incomplete() {
+    #[tokio::test]
+    async fn mirror_bundle_publication_fails_when_host_externals_are_incomplete() {
         let home = tempfile::tempdir().unwrap();
         let release = tempfile::tempdir().unwrap();
         std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -10986,6 +11278,7 @@ fi"#,
         config.externals_dir = home.path().to_path_buf();
 
         let error = materialize_mirror_bundle(&config, &host_externals)
+            .await
             .expect_err("an unusable bundle must refuse to start the pool");
         assert!(
             format!("{error}").contains("incomplete"),
@@ -11001,8 +11294,8 @@ fi"#,
     /// sequence — `ensure_host_externals` materializing the bundle, then
     /// `runner_volumes` selecting it — must hand the golden a bundle that
     /// carries node, never an externals-less mount.
-    #[test]
-    fn startup_materializes_bundle_before_golden_volumes_are_computed() {
+    #[tokio::test]
+    async fn startup_materializes_bundle_before_golden_volumes_are_computed() {
         let home = tempfile::tempdir().unwrap();
         let release = tempfile::tempdir().unwrap();
         std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -11015,7 +11308,9 @@ fi"#,
         config.externals_dir = home.path().join("externals");
 
         // Startup order: install/materialize first, then compute volumes.
-        ensure_host_externals(&config).expect("bundle materialization must succeed");
+        ensure_host_externals(&config)
+            .await
+            .expect("bundle materialization must succeed");
         assert!(
             externals_complete(&release.path().join("externals")),
             "the release bundle must be materialized before any golden is created"
@@ -13960,6 +14255,37 @@ mod golden_download_tests {
         );
     }
 
+    /// G10: a golden metadata lookup against a listener that accepts the
+    /// connection and never answers must give up at [`GOLDEN_METADATA_TIMEOUT`],
+    /// not at the 60-minute download budget. Paused time reaches the deadline at
+    /// once, so the test reads the time the lookup actually waited.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_golden_release_lookup_gives_up_at_the_metadata_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let tag = resolve_latest_golden_tag(&client, &api_base).await;
+        let waited = started.elapsed();
+
+        assert_eq!(tag, None, "a lookup that never answers resolves to no tag");
+        assert!(
+            waited >= GOLDEN_METADATA_TIMEOUT,
+            "gave up after {waited:?}, before the metadata deadline"
+        );
+        assert!(
+            waited < GOLDEN_DOWNLOAD_TIMEOUT / 10,
+            "waited {waited:?}: the lookup ran on the download budget"
+        );
+    }
+
     #[tokio::test]
     async fn interrupted_golden_transfer_resumes_instead_of_restarting() {
         let directory = tempfile::tempdir().unwrap();
@@ -14211,5 +14537,107 @@ mod golden_cache_tests {
             .expect("the retry fits the freed slot");
         assert_eq!(golden.as_str(), "env-a-golden");
         assert_eq!(budget.free(), 0, "a registered golden keeps its slot");
+    }
+}
+
+#[cfg(test)]
+mod host_externals_bound_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// Whether a process with `pid` still exists (`kill -0`).
+    fn process_exists(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// A fake externals step that never finishes. It records its pid, then
+    /// sleeps; `exec` makes the sleeping process the one that pid names, so the
+    /// deadline has to kill that exact process.
+    #[tokio::test]
+    async fn a_hung_host_externals_step_is_killed_at_its_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("pid");
+        let script = format!("echo $$ > '{}' && exec sleep 600", pid_file.display());
+        let mut step = tokio::process::Command::new("sh");
+        step.args(["-c", script.as_str()]);
+
+        let started = std::time::Instant::now();
+        let error =
+            deadline::run_command_status(step, Duration::from_secs(2), "fake externals install")
+                .await
+                .expect_err("a step that never finishes must time out");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited {:?} for a 2s deadline",
+            started.elapsed()
+        );
+        assert!(error.timed_out(), "{error}");
+        assert_eq!(error.what(), "fake externals install");
+        let pid = std::fs::read_to_string(&pid_file).expect("the fake step recorded its pid");
+        let pid = pid.trim();
+        for _ in 0..100 {
+            if !process_exists(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("pid {pid} still running after its deadline");
+    }
+
+    /// The real install script against a listener that accepts and never
+    /// answers. curl's own `--max-time` must end the stalled transfer, and the
+    /// failed fetch must publish no runtime. The backstop deadline only exists
+    /// so a regression fails this test instead of hanging it.
+    #[tokio::test]
+    async fn a_stalled_node_download_ends_at_curl_max_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dist = format!("http://{}/dist", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let limits = NodeFetchLimits {
+            connect_secs: 1,
+            archive_max_secs: 1,
+            shasums_max_secs: 1,
+        };
+        let command = node_externals_script(directory.path().to_str().unwrap(), &dist, limits)
+            .pop()
+            .unwrap();
+        let mut install = tokio::process::Command::new(&command[0]);
+        install.args(&command[1..]);
+
+        let started = std::time::Instant::now();
+        let status =
+            deadline::run_command_status(install, Duration::from_secs(120), "stalled node install")
+                .await
+                .expect("curl's own limit must end the stalled transfer before the backstop");
+
+        assert!(
+            !status.success(),
+            "a stalled download must fail the install"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "waited {:?} for a 1s curl limit",
+            started.elapsed()
+        );
+        let externals = directory.path().join("externals");
+        assert!(
+            !externals.join("node20").exists(),
+            "no runtime may be published"
+        );
+        assert!(
+            !externals.join("node24").exists(),
+            "no runtime may be published"
+        );
     }
 }
