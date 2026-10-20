@@ -4280,6 +4280,18 @@ jobs:
                 .any(|(path, git_ref, _)| path == ".github/setup/action.yml" && git_ref == SHA),
             "the subpath manifest must be read: {contents:?}"
         );
+
+        // Keeping the directory must not widen the allowlist: an action the
+        // workflow and the subpath manifest never name stays denied.
+        let error = enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &[("attacker/unlisted".to_owned(), Some(SHA.to_owned()))],
+        )
+        .await
+        .expect_err("an action in neither the workflow nor the manifest must stay denied");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
     }
 
     /// A failed contents read adds nothing, so the nested action stays denied.
