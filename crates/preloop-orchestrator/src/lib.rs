@@ -12495,8 +12495,6 @@ fi"#,
                 sockets: Vec::new(),
                 dns: None,
                 rosetta: false,
-                guest_volumes: Vec::new(),
-                workload_init: None,
             })
             .await
             .expect("create test machine");
