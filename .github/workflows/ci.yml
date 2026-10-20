@@ -153,7 +153,14 @@ jobs:
             upstream="https://github.com/${GITHUB_REPOSITORY}.git"
             git remote add preloop-lfs-upstream "$upstream" 2>/dev/null || \
               git remote set-url preloop-lfs-upstream "$upstream"
-            git lfs pull preloop-lfs-upstream --include="$includes"
+            git -c lfs.url="$upstream/info/lfs" lfs fetch preloop-lfs-upstream \
+              --include="$includes"
+            for scenario in \
+              06-multi-step 07-step-failure 08-job-outputs-needs \
+              10-uses-checkout 11-cache-roundtrip 12-artifact \
+              13-composite-action 14-annotations 15-oidc-id-token; do
+              git lfs checkout "$root/v${version}/${scenario}/flows.jsonl"
+            done
           fi
           for scenario in \
             06-multi-step 07-step-failure 08-job-outputs-needs \
