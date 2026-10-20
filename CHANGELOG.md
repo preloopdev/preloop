@@ -41,6 +41,17 @@ Releases before v0.27.0 predate the changelog.
   registration state validated at worker startup rather than re-reading
   `.runner` per job.
 
+### Changed
+
+- **Webhook installation-coverage lookups are cached per App.** The receiver
+  called `GET /repos/{owner}/{repo}/installation` on every signed delivery
+  before enqueueing it, so each delivery paid a GitHub API round trip inside
+  the ingress' upload slot and spent one request of the App's rate limit.
+  Coverage answers are now cached in memory per App: a positive for ten
+  minutes, a definitive 404 for one minute, so a repository added to the
+  installation starts delivering soon. A transport error, rate limit, or
+  other non-answer is still rejected fail-closed and is never cached.
+
 ## [0.35.0] - 2026-10-19
 
 ### Security

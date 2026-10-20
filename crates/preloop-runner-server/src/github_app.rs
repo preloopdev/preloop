@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
 use base64::Engine;
@@ -68,6 +68,27 @@ const INSTALLATION_MISS_TTL: std::time::Duration = std::time::Duration::from_sec
 /// Bound on remembered installation misses, so requests naming many owners
 /// cannot grow the map without limit. Clearing it only costs a fresh lookup.
 const MAX_CACHED_INSTALLATION_MISSES: usize = 1024;
+
+/// How long a positive exact-repository coverage answer is reused.
+///
+/// The webhook receiver asks for coverage on every signed delivery, and the
+/// answer costs one App-JWT round trip (`GET /repos/{owner}/{repo}/installation`).
+/// Coverage changes only when the App is installed, suspended, or uninstalled,
+/// so a positive is kept across the deliveries of a working period. A stale
+/// positive is harmless: an uninstalled App stops receiving deliveries for that
+/// repository.
+const REPOSITORY_COVERAGE_TTL: Duration = Duration::from_secs(600);
+
+/// How long a definitive "not installed on this repository" answer is reused.
+///
+/// Short on purpose, like [`INSTALLATION_MISS_TTL`]: a repository added to the
+/// installation must start delivering soon, and until this expires the receiver
+/// rejects its deliveries with 403.
+const REPOSITORY_COVERAGE_MISS_TTL: Duration = Duration::from_secs(60);
+
+/// Bound on cached coverage answers, so deliveries naming many repositories
+/// cannot grow the map without limit. Clearing it only costs fresh lookups.
+const MAX_CACHED_REPOSITORY_COVERAGE: usize = 1024;
 
 /// Workflow permission scopes with no GitHub App counterpart. `id-token`
 /// controls Actions OIDC issuance and `models` controls GitHub Models access;
@@ -238,6 +259,44 @@ pub fn fallback_token(
     }
 }
 
+/// Exact-repository installation coverage, cached per App.
+///
+/// The webhook receiver asks [`app_covers_repository`] once per signed
+/// delivery, and the answer costs an App-JWT round trip
+/// (`GET /repos/{owner}/{repo}/installation`). Coverage changes only when the
+/// App is installed, suspended, or uninstalled, so answers are cached by
+/// lowercased `owner/repo`: a positive for [`REPOSITORY_COVERAGE_TTL`], a
+/// definitive miss for [`REPOSITORY_COVERAGE_MISS_TTL`]. A lookup that could
+/// not answer is never stored — the receiver fails closed instead, so a GitHub
+/// outage cannot become a cached 403.
+#[derive(Clone)]
+struct RepositoryCoverageCache {
+    entries: Arc<RwLock<HashMap<String, (bool, Instant)>>>,
+    positive_ttl: Duration,
+    negative_ttl: Duration,
+    capacity: usize,
+}
+
+impl RepositoryCoverageCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            positive_ttl: REPOSITORY_COVERAGE_TTL,
+            negative_ttl: REPOSITORY_COVERAGE_MISS_TTL,
+            capacity,
+        }
+    }
+
+    /// The lifetime of a cached answer, which depends on which answer it is.
+    fn ttl(&self, covers: bool) -> Duration {
+        if covers {
+            self.positive_ttl
+        } else {
+            self.negative_ttl
+        }
+    }
+}
+
 /// GitHub App credentials for minting installation tokens.
 #[derive(Clone)]
 pub struct GitHubAppCredentials {
@@ -266,6 +325,13 @@ pub struct GitHubAppCredentials {
     /// installation added later must still be noticed, which is why a miss is
     /// never treated as permanent.
     installation_misses: Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    /// Exact-repository installation coverage, keyed by lowercased
+    /// `owner/repo`.
+    ///
+    /// The webhook signer binding asks this per signed delivery, and the
+    /// lookup is an App-JWT round trip whose answer only changes on
+    /// install/uninstall. See [`RepositoryCoverageCache`].
+    repository_coverage: RepositoryCoverageCache,
     /// Every installation token this App has minted, keyed by token hash.
     /// The GitHub-compatible dispatch API consults it to validate a token
     /// offline — without a github.com round-trip — when github.com is
@@ -462,6 +528,7 @@ impl GitHubAppCredentials {
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             installation_misses: Arc::new(RwLock::new(HashMap::new())),
+            repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
@@ -570,6 +637,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
                 pat_fallback: pat_fallback.clone(),
                 installation_cache: Arc::new(RwLock::new(HashMap::new())),
                 installation_misses: Arc::new(RwLock::new(HashMap::new())),
+                repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
                 mint_ledger: Arc::new(MintLedger::default()),
                 // The primary slot's webhook secret belongs to this App — it
                 // is the default App's secret — so a payload it signs is bound
@@ -659,6 +727,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
             pat_fallback: pat_fallback.clone(),
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             installation_misses: Arc::new(RwLock::new(HashMap::new())),
+            repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret,
             installation_id: app.installation_id,
@@ -824,11 +893,44 @@ pub async fn candidate_apps_for_repo_inner(
 /// repository outside its installation.
 ///
 /// Fail-closed: any transport error, unexpected status, or app-id mismatch
-/// returns false (the caller rejects with 403). Webhook deliveries are
-/// low-volume relative to App rate limits, so this lookup is not cached; the
-/// owner-granularity installation id it complements stays cached per App.
+/// returns false (the caller rejects with 403). Answers are cached per App —
+/// a positive for [`REPOSITORY_COVERAGE_TTL`], a definitive miss for
+/// [`REPOSITORY_COVERAGE_MISS_TTL`] — so steady state costs one lookup per
+/// repository; a lookup that could not answer is never cached.
 pub async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str) -> bool {
-    app_covers_repository_on(&api_base(), app, repository).await
+    app_covers_repository_cached(&api_base(), app, repository).await
+}
+
+/// [`app_covers_repository`] against an explicit API base, consulting the
+/// App's coverage cache first.
+async fn app_covers_repository_cached(
+    api_base: &str,
+    app: &GitHubAppCredentials,
+    repository: &str,
+) -> bool {
+    let key = repository.to_ascii_lowercase();
+    {
+        let cache = app.repository_coverage.entries.read().await;
+        if let Some((covers, checked_at)) = cache.get(&key)
+            && checked_at.elapsed() < app.repository_coverage.ttl(*covers)
+        {
+            return *covers;
+        }
+    }
+    match app_covers_repository_on(api_base, app, repository).await {
+        Ok(covers) => {
+            let mut cache = app.repository_coverage.entries.write().await;
+            if cache.len() >= app.repository_coverage.capacity {
+                cache.clear();
+            }
+            cache.insert(key, (covers, Instant::now()));
+            covers
+        }
+        // An outage, a rate limit, or a 5xx is not an answer: reject this
+        // delivery (fail closed) without teaching the cache that the App is
+        // not installed.
+        Err(_) => false,
+    }
 }
 
 /// Whether the App built from raw `app_id`/`pem` is installed on
@@ -856,23 +958,24 @@ pub async fn app_covers_repository_at(
             return false;
         }
     };
-    app_covers_repository_on(api_base, &app, repository).await
+    app_covers_repository_on(api_base, &app, repository)
+        .await
+        .unwrap_or(false)
 }
 
 /// [`app_covers_repository`] against an explicit API base.
+///
+/// `Ok(true)` means the App's installation covers the repository,
+/// `Ok(false)` a definitive "not installed", and `Err` that the lookup did
+/// not answer (transport, rate limit, unexpected status). Callers fail closed
+/// on `Err`; only the two `Ok` answers are cacheable.
 async fn app_covers_repository_on(
     api_base: &str,
     app: &GitHubAppCredentials,
     repository: &str,
-) -> bool {
-    let (owner, repo) = match split_repository(repository) {
-        Ok(parts) => parts,
-        Err(_) => return false,
-    };
-    let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
-        Ok(jwt) => jwt,
-        Err(_) => return false,
-    };
+) -> anyhow::Result<bool> {
+    let (owner, repo) = split_repository(repository)?;
+    let app_jwt = sign_app_jwt(&app.app_id, &app.private_key)?;
     let url = format!("{api_base}/repos/{owner}/{repo}/installation");
     let request = CLIENT
         .get(&url)
@@ -890,21 +993,26 @@ async fn app_covers_repository_on(
         Ok(response) => response,
         Err(error) => {
             warn!(app_id = %app.app_id, repository = %repository, ?error, "repository installation lookup failed");
-            return false;
+            return Err(anyhow!("repository installation lookup failed: {error}"));
         }
     };
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return false;
+        return Ok(false);
     }
     if !response.status().is_success() {
         warn!(app_id = %app.app_id, repository = %repository, status = %response.status(), "repository installation lookup returned unexpected status");
-        return false;
+        return Err(anyhow!(
+            "repository installation lookup returned {}",
+            response.status()
+        ));
     }
     let body: serde_json::Value = match response.json().await {
         Ok(body) => body,
         Err(error) => {
             warn!(app_id = %app.app_id, repository = %repository, ?error, "cannot parse repository installation response");
-            return false;
+            return Err(anyhow!(
+                "cannot parse repository installation response: {error}"
+            ));
         }
     };
     // Defense in depth: App-JWT auth already scopes GitHub's response to
@@ -917,7 +1025,7 @@ async fn app_covers_repository_on(
     if !covers {
         warn!(app_id = %app.app_id, repository = %repository, "repository installation belongs to a different App");
     }
-    covers
+    Ok(covers)
 }
 
 /// Select the App whose installation covers `repository`'s owner.
@@ -2115,6 +2223,7 @@ fn credentials_for(app_id: &str, pem: &str) -> anyhow::Result<GitHubAppCredentia
         pat_fallback: None,
         installation_cache: Arc::new(RwLock::new(HashMap::new())),
         installation_misses: Arc::new(RwLock::new(HashMap::new())),
+        repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
         mint_ledger: Arc::new(MintLedger::default()),
         webhook_secret: None,
         installation_id: None,
@@ -2556,6 +2665,7 @@ mod tests {
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             installation_misses: Arc::new(RwLock::new(HashMap::new())),
+            repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
@@ -2681,6 +2791,7 @@ mod tests {
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             installation_misses: Arc::new(RwLock::new(HashMap::new())),
+            repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
@@ -3515,6 +3626,130 @@ mod tests {
             candidate_apps_for_repo(&shared, "owner/repo").await.len(),
             1,
             "the non-fail-closed adapter retains the sole App for minting"
+        );
+    }
+
+    /// A stub GitHub API answering
+    /// `GET /repos/{owner}/{repo}/installation` with `status` and counting
+    /// lookups, so cache behavior is observable as a request count.
+    async fn stub_coverage_api(
+        status: Arc<std::sync::atomic::AtomicU16>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&calls);
+        let stub = Router::new().route(
+            "/repos/{owner}/{repo}/installation",
+            get(move || {
+                let served = Arc::clone(&served);
+                let status = status.load(Ordering::Relaxed);
+                async move {
+                    served.fetch_add(1, Ordering::Relaxed);
+                    let status =
+                        axum::http::StatusCode::from_u16(status).expect("stub status code");
+                    (status, Json(json!({ "id": 77, "app_id": 424 })))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+        (api_base, calls)
+    }
+
+    /// Coverage is one App-JWT round trip per delivery, so a positive answer is
+    /// reused (case-insensitively, as GitHub repository names are) until its
+    /// TTL expires.
+    #[tokio::test]
+    async fn repository_coverage_positive_is_cached_until_its_ttl() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+
+        let (api_base, calls) = stub_coverage_api(Arc::new(AtomicU16::new(200))).await;
+        let mut creds =
+            GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
+        creds.repository_coverage.positive_ttl = Duration::from_millis(50);
+
+        assert!(
+            app_covers_repository_cached(&api_base, &creds, "Preloop/preloop").await,
+            "the stub App covers the repository"
+        );
+        assert!(
+            app_covers_repository_cached(&api_base, &creds, "preloop/PRELOOP").await,
+            "a cached positive is reused regardless of case"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "a fresh positive must not be looked up twice"
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(app_covers_repository_cached(&api_base, &creds, "preloop/preloop").await);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "an expired positive must be looked up again"
+        );
+    }
+
+    /// A definitive 404 is an answer: cached for the short miss TTL so a
+    /// repository added to the installation starts delivering soon, while a
+    /// delivery burst against a known-missing repository costs one lookup.
+    #[tokio::test]
+    async fn repository_coverage_miss_is_cached_until_its_ttl() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+
+        let (api_base, calls) = stub_coverage_api(Arc::new(AtomicU16::new(404))).await;
+        let mut creds =
+            GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
+        creds.repository_coverage.negative_ttl = Duration::from_millis(50);
+
+        assert!(!app_covers_repository_cached(&api_base, &creds, "preloop/preloop").await);
+        assert!(!app_covers_repository_cached(&api_base, &creds, "preloop/preloop").await);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "a fresh definitive miss must not be looked up twice"
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!app_covers_repository_cached(&api_base, &creds, "preloop/preloop").await);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "an expired miss must be looked up again"
+        );
+    }
+
+    /// A 5xx is not an answer. The delivery is rejected (fail closed), but the
+    /// failure is not cached, so the next delivery retries the lookup instead
+    /// of inheriting a transient outage as a cached 403.
+    #[tokio::test]
+    async fn repository_coverage_failure_is_not_cached() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+
+        let status = Arc::new(AtomicU16::new(500));
+        let (api_base, calls) = stub_coverage_api(Arc::clone(&status)).await;
+        let creds = GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
+
+        assert!(
+            !app_covers_repository_cached(&api_base, &creds, "preloop/preloop").await,
+            "a lookup failure fails closed"
+        );
+        status.store(200, Ordering::Relaxed);
+        assert!(
+            app_covers_repository_cached(&api_base, &creds, "preloop/preloop").await,
+            "the next call retries rather than reusing the failure"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "a failed lookup must not suppress the next attempt"
         );
     }
 }
