@@ -150,8 +150,10 @@ jobs:
             # The repository is public; fetch the same fixtures directly from
             # GitHub instead of failing every shard on an engine-cache miss.
             echo "note: snapshot LFS miss; retrying from GitHub" >&2
-            git config --local lfs.url "https://github.com/${GITHUB_REPOSITORY}.git/info/lfs"
-            git lfs pull --include="$includes"
+            upstream="https://github.com/${GITHUB_REPOSITORY}.git"
+            git remote add preloop-lfs-upstream "$upstream" 2>/dev/null || \
+              git remote set-url preloop-lfs-upstream "$upstream"
+            git lfs pull preloop-lfs-upstream --include="$includes"
           fi
           for scenario in \
             06-multi-step 07-step-failure 08-job-outputs-needs \
