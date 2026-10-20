@@ -79,9 +79,12 @@ Releases before v0.27.0 predate the changelog.
   revocation. At capacity the oldest checked answer is evicted individually,
   and setup/doctor installation checks stay uncached.
 - **Webhook processing keeps the verified signer's App identity.** The signer
-  App id is persisted with the durable delivery and pins downstream App
-  selection, so a delivery signed by App B cannot mint or act with unrelated
-  App A's installation credentials when both cover the repository.
+  App id is persisted with the durable delivery and pins credential selection
+  throughout that delivery's processing (including its spawned processing task
+  and check-run reporting), so a delivery signed by App B is not processed with
+  another App's installation credentials just because that App sorts first in
+  the registry. Job-runtime token minting remains a separate repository-scoped
+  selection path; this change does not alter it.
 
 ## [0.35.0] - 2026-10-19
 
