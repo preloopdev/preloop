@@ -14,9 +14,11 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use preloop_observability::deadline::run_command_blocking;
 
 #[cfg(any(target_os = "linux", test))]
 use crate::set_private_file_permissions;
@@ -63,6 +65,28 @@ const LAUNCHD_LABEL: &str = "dev.preloop.server";
 const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/dev.preloop.server.plist";
 #[cfg(target_os = "linux")]
 const SYSTEMD_DIR: &str = "/etc/systemd/system";
+
+/// One `launchctl` control command (`bootstrap`, `load -w`, `bootout`).
+///
+/// launchd may legitimately be slow while it drains many services, so the
+/// bound is not tight — but a wedged launchd must not hang the installer. The
+/// call is made in-process by `preloop server install`, and a CLI blocked in a
+/// child cannot be Ctrl-C'd cleanly out of it, so without a deadline the
+/// operator is left with an install that neither finishes nor stops. A
+/// `bootstrap` that times out still falls through to the `load -w` fallback
+/// below, so a slow-but-alive launchd is not declared broken until both verbs
+/// have run out of time.
+#[cfg(target_os = "macos")]
+const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One `systemctl` control command (`daemon-reload`, `enable --now`,
+/// `disable --now`, `is-active`, `try-restart`) in the install/uninstall path.
+///
+/// A minute leaves room for a busy systemd — install drives several units and
+/// a `--now` start waits for the unit to settle — while still ending a control
+/// plane that has stopped answering instead of hanging the install.
+#[cfg(target_os = "linux")]
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Parser)]
 pub(crate) struct ServerArgs {
@@ -430,6 +454,7 @@ fn install_systemd(
         &systemctl_args(args.user, &["try-restart", "preloop.service"]),
         dry,
         "restart a running preloop.service onto the new unit",
+        SYSTEMCTL_TIMEOUT,
     );
     run_systemctl(
         &systemctl_args(
@@ -1074,13 +1099,19 @@ fn uninstall_systemd(args: &UninstallArgs, home: &Path) -> Result<()> {
         &systemctl_args(args.user, &["disable", "--now", "preloop-update.timer"]),
         dry,
         "disable the update timer",
+        SYSTEMCTL_TIMEOUT,
     );
     // Belt and braces: verify nothing is left running before removing units.
     if !dry {
-        let status = Command::new("systemctl")
-            .args(systemctl_args(args.user, &["is-active", "preloop.service"]))
-            .status()
-            .context("check preloop.service state")?;
+        let mut command = Command::new("systemctl");
+        command.args(systemctl_args(args.user, &["is-active", "preloop.service"]));
+        let status = run_command_blocking(
+            command,
+            SYSTEMCTL_TIMEOUT,
+            "systemctl is-active preloop.service",
+        )
+        .context("check preloop.service state")?
+        .status;
         if status.success() {
             bail!("preloop.service is still active after disable --now — aborting uninstall");
         }
@@ -1104,6 +1135,7 @@ fn uninstall_systemd(args: &UninstallArgs, home: &Path) -> Result<()> {
         &systemctl_args(args.user, &["daemon-reload"]),
         dry,
         "reload systemd",
+        SYSTEMCTL_TIMEOUT,
     );
     // Secrets outlive --purge-data otherwise: for a system install the
     // environment file and the staged App key live in the root-owned config
@@ -1442,21 +1474,41 @@ fn install_launchd(
     }
 
     if !dry {
-        let boot = Command::new("launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&plist_path)
-            .status();
+        let mut bootstrap = Command::new("launchctl");
+        bootstrap.args(["bootstrap", &domain]).arg(&plist_path);
+        let boot = run_command_blocking(bootstrap, LAUNCHCTL_TIMEOUT, "launchctl bootstrap");
         match boot {
-            Ok(status) if status.success() => {}
+            Ok(output) if output.status.success() => {}
+            // Any failure — including a bootstrap that timed out because
+            // launchd is wedged — still tries the deprecated `load -w`, which
+            // is what a launchd that does not know `bootstrap` needs.
             _ => {
-                let load = Command::new("launchctl")
-                    .args(["load", "-w"])
-                    .arg(&plist_path)
-                    .status();
+                let mut load = Command::new("launchctl");
+                load.args(["load", "-w"]).arg(&plist_path);
+                let load = run_command_blocking(load, LAUNCHCTL_TIMEOUT, "launchctl load -w");
                 match load {
-                    Ok(status) if status.success() => {}
-                    other => bail!(
-                        "launchctl could not start the daemon ({other:?}); \
+                    Ok(output) if output.status.success() => {}
+                    // The runner captures the streams that used to be
+                    // inherited, so launchd's own diagnostic has to be put
+                    // back into the error the operator sees.
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stderr = stderr.trim();
+                        if stderr.is_empty() {
+                            bail!(
+                                "launchctl could not start the daemon ({}); \
+                                 check `launchctl print system/{LAUNCHD_LABEL}`",
+                                output.status
+                            );
+                        }
+                        bail!(
+                            "launchctl could not start the daemon ({}: {stderr}); \
+                             check `launchctl print system/{LAUNCHD_LABEL}`",
+                            output.status
+                        );
+                    }
+                    Err(error) => bail!(
+                        "launchctl could not start the daemon ({error}); \
                          check `launchctl print system/{LAUNCHD_LABEL}`"
                     ),
                 }
@@ -1538,6 +1590,7 @@ fn uninstall_launchd(args: &UninstallArgs, home: &Path) -> Result<()> {
         &["bootout".to_owned(), bootout],
         dry,
         "unload the daemon",
+        LAUNCHCTL_TIMEOUT,
     );
     remove_path(&plist_path, dry)?;
     eprintln!(
@@ -1911,30 +1964,71 @@ fn remove_path(path: &Path, dry_run: bool) -> Result<()> {
     }
 }
 
+/// Re-emit a captured child's streams on this process's own, byte for byte,
+/// so a command that used to inherit the terminal still shows its progress
+/// messages (`Created symlink …`, `Running …`).
+fn echo_captured(output: &std::process::Output) {
+    use std::io::Write;
+
+    if !output.stdout.is_empty() {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(&output.stdout);
+        let _ = stdout.flush();
+    }
+    if !output.stderr.is_empty() {
+        let _ = std::io::stderr().write_all(&output.stderr);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn run_systemctl(args: &[String], dry_run: bool) -> Result<()> {
     if dry_run {
         eprintln!("[preloop] would run: systemctl {}", args.join(" "));
         return Ok(());
     }
-    let status = Command::new("systemctl")
-        .args(args)
-        .status()
-        .with_context(|| format!("run systemctl {}", args.join(" ")))?;
-    if !status.success() {
-        bail!("systemctl {} failed ({status})", args.join(" "));
+    let mut command = Command::new("systemctl");
+    command.args(args);
+    let output = run_command_blocking(
+        command,
+        SYSTEMCTL_TIMEOUT,
+        &format!("systemctl {}", args.join(" ")),
+    )?;
+    // The runner captures what these commands used to inherit, so systemd's
+    // own progress ("Created symlink …", "Running …") is echoed back to the
+    // operator — on success and failure alike, exactly as when it was
+    // inherited.
+    echo_captured(&output);
+    if !output.status.success() {
+        bail!("systemctl {} failed ({})", args.join(" "), output.status);
     }
     Ok(())
 }
 
-fn run_ok(program: &str, args: &[String], dry_run: bool, what: &str) {
+/// Run a best-effort service-manager command, warning instead of failing.
+///
+/// `deadline` bounds the child through the shared synchronous deadline runner
+/// (`/dev/null` stdin, drained pipes, kill-and-reap at the deadline):
+/// `systemctl`/`launchctl` are the only programs this drives, and a daemon
+/// control call that never returns must not wedge the install (or the
+/// uninstall) it is part of.
+fn run_ok(program: &str, args: &[String], dry_run: bool, what: &str, deadline: Duration) {
     if dry_run {
         eprintln!("[preloop] would run: {program} {}", args.join(" "));
         return;
     }
-    match Command::new(program).args(args).status() {
-        Ok(status) if status.success() => {}
-        other => eprintln!("[preloop] warning: {what} ({other:?}); continuing"),
+    // Failures here are tolerated with a warning, so an unbounded wait would
+    // be a pure hang with no upside.
+    let target = format!("{program} {}", args.join(" "));
+    let mut command = Command::new(program);
+    command.args(args);
+    match run_command_blocking(command, deadline, &target) {
+        Ok(output) => {
+            echo_captured(&output);
+            if !output.status.success() {
+                eprintln!("[preloop] warning: {what} ({}); continuing", output.status);
+            }
+        }
+        Err(error) => eprintln!("[preloop] warning: {what} ({error}); continuing"),
     }
 }
 
