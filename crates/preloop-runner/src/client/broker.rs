@@ -51,10 +51,14 @@ impl BrokerClient {
     }
 
     /// Delete a broker session.
+    ///
+    /// v2.338.0: `BrokerHttpClient.DeleteSessionAsync` sends
+    /// `DELETE {broker}/session?sessionId={id}` — the session id moved from
+    /// the `X-Actions-Session` header to the query string.
     pub async fn delete_session(&self, token: &str, session_id: &str) -> Result<()> {
-        let url = format!("{}/session", self.base_url);
+        let url = format!("{}/session?sessionId={session_id}", self.base_url);
         self.http
-            .delete_with_token_header(&url, token, "X-Actions-Session", session_id)
+            .delete_with_token(&url, token)
             .await
             .context("deleting broker session")
     }
