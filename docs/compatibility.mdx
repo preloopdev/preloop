@@ -17,7 +17,7 @@ Compatibility does not mean reproducing GitHub's internal service topology. Prel
 
 ## Protocol target
 
-The current protocol target is **`actions/runner` v2.336.0**, pinned by `runner_version` in `versions.toml`. The bundled `preloop-runner` follows the official Listener/Worker split; the control plane can also accept an official runner in supported external-runner configurations.
+The current protocol target is **`actions/runner` v2.337.0**, pinned by `runner_version` in `versions.toml`. The bundled `preloop-runner` follows the official Listener/Worker split; the control plane can also accept an official runner in supported external-runner configurations.
 
 A GitHub App can trigger the compatible REST surface with:
 
@@ -41,7 +41,7 @@ To replay the configured golden set locally, use `just conform`. A runner-watch 
 
 ```sh
 runner-watch conform \
-  --runner 2.336.0 \
+  --runner 2.337.0 \
   --preloop-url http://127.0.0.1:9090
 ```
 
@@ -55,7 +55,7 @@ These are current behaviors users can encounter on public/main. They are separat
 |---|---|
 | Runner binary updates | `preloop-runner` acknowledges refresh messages and can refresh settings, but it does not replace its own binary. Update the installed Preloop runner with the product release. |
 | Background-step controls | Background steps and result aggregation are supported; explicit background cancel-control steps are not complete. Workflows using those controls can diverge from the official runner. |
-| Remote actions inside local composites | The control plane admits a remote action only when the run's workflow or an admitted remote composite declares it. A remote `uses:` referenced solely from inside a local composite action is refused with `403`; declare it in the workflow as well. |
+| Undeclared remote actions | Action-download tickets are minted only for remotes the workflow declares, plus remotes nested under readable local composite manifests and admitted remote composites. Any other remote `uses:` fails the batch with `403`. If a local composite's manifest cannot be read (missing snapshot, forge access, or traversal budget), its nested remotes stay denied. |
 | Action-download telemetry | Action downloads report basic information such as archive size; the structured upstream telemetry payload is not emitted. |
 | Hosted service topology | The control plane exposes 30 runner-facing service definitions, not the complete GitHub/Azure hosted location catalog. Actions that require an unimplemented hosted service can fail. |
 | macOS and Windows jobs | The built-in pool provides Linux guests. A job requiring a matching macOS or Windows runner needs an external runner registered with the corresponding labels. |

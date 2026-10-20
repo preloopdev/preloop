@@ -26,9 +26,18 @@ pub fn tls_roots() -> &'static [CertificateDer<'static>] {
     &ROOT_CERTS
 }
 
-static ROOT_CERTS: LazyLock<Vec<CertificateDer<'static>>> = LazyLock::new(build_root_certs);
+static ROOT_CERTS: LazyLock<Vec<CertificateDer<'static>>> =
+    LazyLock::new(|| root_certs_from(process_env));
 
-fn build_root_certs() -> Vec<CertificateDer<'static>> {
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// Resolve the whole set: bundled Mozilla anchors, then the OS store (bounded
+/// by [`NATIVE_ROOTS_DEADLINE`]), then the environment CA bundles. `env` is a
+/// parameter so tests can drive the bundle path without mutating
+/// process-global environment.
+fn root_certs_from(env: impl Fn(&str) -> Option<String>) -> Vec<CertificateDer<'static>> {
     let mut roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS.to_vec();
     // A store that never answers costs at most the deadline; see
     // [`load_native_root_certs`].
@@ -36,7 +45,7 @@ fn build_root_certs() -> Vec<CertificateDer<'static>> {
         NATIVE_ROOTS_DEADLINE,
         rustls_native_certs::load_native_certs,
     ));
-    roots.extend(ca_certificates());
+    roots.extend(ca_certificates(&env));
     roots
 }
 
@@ -99,10 +108,10 @@ fn load_native_root_certs(
 /// store, all unioned once per process in [`tls_roots`]. A missing or
 /// unreadable file fails closed (the client simply has no extra roots) — we
 /// log rather than abort startup, since TLS verification itself stays on.
-fn ca_certificates() -> Vec<CertificateDer<'static>> {
+fn ca_certificates(env: impl Fn(&str) -> Option<String>) -> Vec<CertificateDer<'static>> {
     let mut out = Vec::new();
     for var in ["PRELOOP_GITHUB_CA_FILE", "SSL_CERT_FILE"] {
-        let Ok(path) = std::env::var(var) else {
+        let Some(path) = env(var) else {
             continue;
         };
         if path.trim().is_empty() {
@@ -138,12 +147,10 @@ fn load_ca_bundle(path: &std::path::Path, env: &str) -> Vec<CertificateDer<'stat
     }
 }
 
-/// Install the process-wide root set from [`tls_roots`] on `builder` via
-/// `tls_certs_only`, so the client verifies against that fixed list instead
-/// of delegating the handshake to the OS platform verifier. Use this for
-/// every outbound HTTPS client.
-pub fn with_tls_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    let certs = tls_roots()
+/// The root set as reqwest `Certificate`s, skipping anything reqwest rejects
+/// so one bad keychain item cannot fail every client.
+fn reqwest_certificates(roots: &[CertificateDer<'static>]) -> Vec<reqwest::Certificate> {
+    roots
         .iter()
         .filter_map(|der| match reqwest::Certificate::from_der(der.as_ref()) {
             Ok(cert) => Some(cert),
@@ -152,8 +159,39 @@ pub fn with_tls_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder
                 None
             }
         })
-        .collect::<Vec<_>>();
-    builder.tls_certs_only(certs)
+        .collect()
+}
+
+/// Install the process-wide root set from [`tls_roots`] on an async `builder`
+/// via `tls_certs_only`, so the client verifies against that fixed list
+/// instead of delegating the handshake to the OS platform verifier. Use this
+/// for every outbound HTTPS client.
+pub fn with_tls_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    install_roots(builder, tls_roots())
+}
+
+fn install_roots(
+    builder: reqwest::ClientBuilder,
+    roots: &[CertificateDer<'static>],
+) -> reqwest::ClientBuilder {
+    builder.tls_certs_only(reqwest_certificates(roots))
+}
+
+/// Blocking equivalent of [`with_tls_roots`], for the OTLP exporters (which
+/// run on plain SDK worker threads and use a blocking reqwest client) and any
+/// other blocking client that must trust the same anchors. Pass it to
+/// `preloop_observability::ObservabilityConfig::with_otel_client_builder`.
+pub fn with_tls_roots_blocking(
+    builder: reqwest::blocking::ClientBuilder,
+) -> reqwest::blocking::ClientBuilder {
+    install_roots_blocking(builder, tls_roots())
+}
+
+fn install_roots_blocking(
+    builder: reqwest::blocking::ClientBuilder,
+    roots: &[CertificateDer<'static>],
+) -> reqwest::blocking::ClientBuilder {
+    builder.tls_certs_only(reqwest_certificates(roots))
 }
 
 /// Build a reqwest client with the shared timeouts and the root set from
@@ -183,33 +221,14 @@ pub static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::n
 mod tests {
     use super::*;
 
-    fn write_self_signed_pem(path: &std::path::Path) {
-        let key = std::env::temp_dir().join("ghsim_ca_test_key.pem");
-        let _ = std::process::Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                key.to_str().unwrap(),
-                "-out",
-                path.to_str().unwrap(),
-                "-days",
-                "1",
-                "-nodes",
-                "-subj",
-                "/CN=gh-simulate-test",
-            ])
-            .output();
-    }
-
     #[test]
     fn parses_pem_bundle() {
         let p = std::env::temp_dir().join("ghsim_ca_file.pem");
-        write_self_signed_pem(&p);
+        let cert = rcgen::generate_simple_self_signed(vec!["gh-simulate-test".to_owned()])
+            .expect("generate a test cert");
+        std::fs::write(&p, cert.cert.pem()).unwrap();
         let certs = load_ca_bundle(&p, "TEST");
-        assert!(!certs.is_empty());
+        assert_eq!(certs.len(), 1);
     }
 
     #[test]
@@ -247,5 +266,125 @@ mod tests {
             "a hung OS store must be abandoned at the deadline, waited {:?}",
             started.elapsed()
         );
+    }
+
+    /// Behavioural check of the whole mechanism: the blocking client built
+    /// from this root set completes a TLS handshake against a server whose CA
+    /// arrives through the same `PRELOOP_GITHUB_CA_FILE` path the engine uses,
+    /// and the same client refuses that server without the bundle. No OS trust
+    /// store, no real network: a throwaway CA generated in-process plus a
+    /// loopback TLS server.
+    #[test]
+    fn blocking_client_trusts_the_shared_roots_including_the_env_ca_bundle() {
+        let dir = std::env::temp_dir().join(format!("preloop-tls-roots-{}", std::process::id()));
+        let fixture = make_test_ca(&dir);
+        let port = spawn_tls_server(&fixture).expect("start the loopback TLS server");
+        let url = format!("https://localhost:{port}/");
+
+        let without_bundle = install_roots_blocking(
+            reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS,
+        )
+        .build()
+        .unwrap();
+        assert!(
+            without_bundle.get(&url).send().is_err(),
+            "the test CA must not be trusted without PRELOOP_GITHUB_CA_FILE"
+        );
+
+        // Exactly the set `with_tls_roots_blocking` installs, with the CA
+        // arriving through the same environment override the engine honours.
+        let bundle_path = fixture.ca_pem.to_string_lossy().into_owned();
+        let lookup =
+            move |name: &str| (name == "PRELOOP_GITHUB_CA_FILE").then(|| bundle_path.clone());
+        let mut roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS.to_vec();
+        roots.extend(ca_certificates(&lookup));
+        let with_bundle = install_roots_blocking(
+            reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)),
+            &roots,
+        )
+        .build()
+        .unwrap();
+        let response = with_bundle
+            .get(&url)
+            .send()
+            .expect("the CA named by PRELOOP_GITHUB_CA_FILE must be trusted");
+        assert_eq!(response.status(), 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct TestCa {
+        /// PEM file the client is pointed at through `PRELOOP_GITHUB_CA_FILE`.
+        ca_pem: std::path::PathBuf,
+        /// `leaf, CA` chain the server presents.
+        chain: Vec<CertificateDer<'static>>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+    }
+
+    /// A CA and a `localhost` leaf signed by it, generated in-process so the
+    /// test needs neither the `openssl` CLI nor a real network.
+    fn make_test_ca(dir: &std::path::Path) -> TestCa {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "preloop tls-roots test CA");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+
+        let leaf_key = KeyPair::generate().expect("generate leaf key");
+        let leaf_params =
+            CertificateParams::new(vec!["localhost".to_owned()]).expect("leaf params");
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("CA-signed leaf");
+
+        let ca_pem = dir.join("ca.pem");
+        std::fs::create_dir_all(dir).expect("create test CA dir");
+        std::fs::write(&ca_pem, ca_cert.pem()).expect("write CA PEM");
+        TestCa {
+            ca_pem,
+            chain: vec![leaf_cert.der().clone(), ca_cert.der().clone()],
+            key: rustls::pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+        }
+    }
+
+    /// Serve one HTTP response over TLS on a loopback port for as long as the
+    /// test binary lives.
+    fn spawn_tls_server(fixture: &TestCa) -> std::io::Result<u16> {
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(std::io::Error::other)?
+        .with_no_client_auth()
+        .with_single_cert(fixture.chain.clone(), fixture.key.clone_key())
+        .map_err(std::io::Error::other)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let Ok(connection) =
+                    rustls::ServerConnection::new(std::sync::Arc::new(config.clone()))
+                else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                let mut request = [0u8; 1024];
+                // A refused handshake (the client not trusting our CA)
+                // surfaces here; only a complete request gets a response.
+                if std::io::Read::read(&mut tls, &mut request).is_err() {
+                    continue;
+                }
+                let _ = std::io::Write::write_all(
+                    &mut tls,
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                );
+            }
+        });
+        Ok(port)
     }
 }

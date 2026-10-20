@@ -66,6 +66,12 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         );
     }
 
+    // Reject a malformed registration URL before any network call: the same
+    // classification is persisted as `controlPlane`, and guessing a plane for
+    // an unparseable URL would silently fence (or widen) the token surface.
+    let control_plane = crate::settings::control_plane_for_url(&args.url)
+        .context("classifying registration URL from --url")?;
+
     let http = HttpClient::new(global.ca_bundle.as_deref())?;
 
     // Step 1: Runner registration — get OAuth token and service URL
@@ -298,6 +304,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             skip_session_recover: false,
             monitor_socket_address: None,
             use_runner_admin_flow: false,
+            control_plane: Some(control_plane),
         },
         credentials: CredentialData {
             scheme: "OAuth".to_string(),
