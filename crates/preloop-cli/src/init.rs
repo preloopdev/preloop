@@ -1238,7 +1238,7 @@ impl Session {
                     .docker_context
                     .clone()
                     .unwrap_or_else(|| dockerfile_context(&dockerfile));
-                self.record_dockerfile(&dockerfile, &context)
+                self.record_dockerfile(&dockerfile, &context).await
             }
             GoldenChoice::File => {
                 let path = answer
@@ -1342,7 +1342,7 @@ impl Session {
         })
     }
 
-    fn record_dockerfile(
+    async fn record_dockerfile(
         &mut self,
         dockerfile: &Path,
         context: &Path,
@@ -1353,8 +1353,8 @@ impl Session {
             )));
         }
         let engine = container_engine().expect("checked by dockerfile_unavailable_reason");
-        let built = build_base_tar(engine, dockerfile, context, self.json)?;
-        let arch_ok = built_image_arch(engine, &built.tag, self.json);
+        let built = build_base_tar(engine, dockerfile, context, self.json).await?;
+        let arch_ok = built_image_arch(engine, &built.tag, self.json).await;
         let archive_warnings: Vec<String> =
             oversized_archive_warning(built.bytes, "the saved image tar")
                 .into_iter()
@@ -2971,14 +2971,25 @@ fn dockerfile_unavailable_reason(dockerfile: &Path) -> Option<String> {
     None
 }
 
+/// How long the `sysctl` hypervisor probe may take.
+///
+/// `sysctl kern.hv_support` is a local kernel read that answers in
+/// milliseconds; ten seconds leaves room for a loaded machine while still
+/// ending a wedged probe instead of stalling `init` (and `--probe`) forever.
+#[cfg(target_os = "macos")]
+const SYSCTL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Whether this host can boot microVMs, and what provides that.
 fn hypervisor_state() -> (bool, String) {
     #[cfg(target_os = "macos")]
     {
-        match std::process::Command::new("sysctl")
-            .args(["-n", "kern.hv_support"])
-            .output()
-        {
+        let mut command = std::process::Command::new("sysctl");
+        command.args(["-n", "kern.hv_support"]);
+        match preloop_observability::deadline::run_command_blocking(
+            command,
+            SYSCTL_PROBE_TIMEOUT,
+            "sysctl kern.hv_support",
+        ) {
             Ok(output) if output.status.success() => {
                 let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
                 (
@@ -3242,11 +3253,32 @@ struct BuiltBase {
     bytes: u64,
 }
 
+/// How long the engine's `build` may run before it is killed.
+///
+/// A build legitimately downloads packages and compiles layers, so an hour is
+/// deliberately generous; it still ends a build wedged on a hung daemon or a
+/// registry that stopped answering.
+const CONTAINER_BUILD_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// How long the engine's `save` may run before it is killed.
+///
+/// Saving writes the whole image to a tar: tens of minutes for a multi-GB
+/// image, seconds normally, so thirty minutes covers the realistic worst case
+/// without letting a stuck write hold `init` forever.
+const CONTAINER_SAVE_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// How long `image inspect --format {{.Architecture}}` may run before it is
+/// treated as "the engine could not say".
+///
+/// This is a metadata control op that answers in milliseconds when the daemon
+/// is healthy; a minute only distinguishes a slow daemon from a wedged one.
+const CONTAINER_INSPECT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// `docker build` the context, then `docker save` it to a tar under the
 /// preloop home. The tar *is* the base image: smolvm image inputs are registry
 /// references, docker-save tars, and packs, and only a `.tar` name routes to
 /// its `--image` branch.
-fn build_base_tar(
+async fn build_base_tar(
     engine: &str,
     dockerfile: &Path,
     context: &Path,
@@ -3266,26 +3298,30 @@ fn build_base_tar(
     std::fs::create_dir_all(&goldens).with_context(|| format!("creating {}", goldens.display()))?;
     let tar = goldens.join(format!("{}.tar", tag.replace(':', "-")));
 
+    let mut build = tokio::process::Command::new(engine);
+    build
+        .arg("build")
+        .arg("--file")
+        .arg(&dockerfile)
+        .arg("--tag")
+        .arg(&tag)
+        .arg(&context);
     run_container(
-        std::process::Command::new(engine)
-            .arg("build")
-            .arg("--file")
-            .arg(&dockerfile)
-            .arg("--tag")
-            .arg(&tag)
-            .arg(&context),
+        build,
+        CONTAINER_BUILD_TIMEOUT,
         json,
         &format!("{engine} build"),
-    )?;
+    )
+    .await?;
+    let mut save = tokio::process::Command::new(engine);
+    save.arg("save").arg("--output").arg(&tar).arg(&tag);
     run_container(
-        std::process::Command::new(engine)
-            .arg("save")
-            .arg("--output")
-            .arg(&tar)
-            .arg(&tag),
+        save,
+        CONTAINER_SAVE_TIMEOUT,
         json,
         &format!("{engine} save"),
-    )?;
+    )
+    .await?;
     let bytes = std::fs::metadata(&tar)
         .with_context(|| format!("reading the saved image {}", tar.display()))?
         .len();
@@ -3301,12 +3337,34 @@ fn build_base_tar(
 /// Ask the image the engine just built what architecture it is (`inspect`
 /// takes an image reference, not a saved tar). `None` means the engine could
 /// not say — never a claim about the image.
-fn built_image_arch(engine: &str, tag: &str, json: bool) -> Option<bool> {
-    let output = std::process::Command::new(engine)
+async fn built_image_arch(engine: &str, tag: &str, json: bool) -> Option<bool> {
+    let mut command = tokio::process::Command::new(engine);
+    command
         .args(["image", "inspect", "--format", "{{.Architecture}}"])
-        .arg(tag)
-        .output()
-        .ok()?;
+        .arg(tag);
+    // The shared runner owns the process policy — `/dev/null` stdin, both
+    // streams piped and drained while it waits, kill and reap at the deadline.
+    let what = format!("{engine} image inspect {tag}");
+    let output = match preloop_observability::deadline::run_command(
+        command,
+        CONTAINER_INSPECT_TIMEOUT,
+        &what,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            // Only an expiry earns a note: a spawn or wait failure is the
+            // same "the engine could not say" answer as a non-zero exit.
+            if json && error.timed_out() {
+                eprintln!(
+                    "preloop init: `{engine} image inspect {tag}` did not answer within \
+                     {CONTAINER_INSPECT_TIMEOUT:?}; the container engine is unresponsive"
+                );
+            }
+            return None;
+        }
+    };
     if !output.status.success() {
         if json {
             eprintln!(
@@ -3322,26 +3380,46 @@ fn built_image_arch(engine: &str, tag: &str, json: bool) -> Option<bool> {
     Some(host_arch_aliases().contains(&arch.as_str()))
 }
 
-/// Run a container-engine command. In `--json` mode its output is captured and
-/// echoed on stderr, so the one-object-per-line contract on stdout survives a
-/// long build log.
-fn run_container(
-    command: &mut std::process::Command,
+/// Run a container-engine command under a wall-clock deadline. In `--json`
+/// mode its output is captured and echoed on stderr, so the one-object-per-line
+/// contract on stdout survives a long build log; otherwise stdio is inherited
+/// so the log streams to the terminal live.
+///
+/// The wait itself — kill and reap at the deadline, `/dev/null` stdin, pipes
+/// drained while the child runs — belongs to
+/// [`preloop_observability::deadline`]; this function only decides what the
+/// engine's output means and turns a failure into `init`'s coded build error.
+async fn run_container(
+    command: tokio::process::Command,
+    deadline: Duration,
     json: bool,
     what: &str,
 ) -> anyhow::Result<()> {
+    let timed_out = || {
+        build_error(format!(
+            "`{what}` did not finish within {deadline:?} and was killed: the container engine is \
+             unresponsive"
+        ))
+    };
     if !json {
-        let status = command
-            .status()
-            .with_context(|| format!("running `{what}`"))?;
-        if !status.success() {
-            return Err(build_error(format!("`{what}` failed ({status})")));
-        }
-        return Ok(());
+        // `run_command_status` keeps the caller's stdio — inherited, so the
+        // build log streams to the terminal — and only bounds the wait.
+        return match preloop_observability::deadline::run_command_status(command, deadline, what)
+            .await
+        {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(build_error(format!("`{what}` failed ({status})"))),
+            Err(error) if error.timed_out() => Err(timed_out()),
+            Err(error) => Err(build_error(format!("`{what}` could not be run: {error}"))),
+        };
     }
-    let output = command
-        .output()
-        .with_context(|| format!("running `{what}`"))?;
+    // `run_command` pipes and drains both streams while the child runs, so a
+    // chatty build log cannot fill a pipe and wedge the build.
+    let output = match preloop_observability::deadline::run_command(command, deadline, what).await {
+        Ok(output) => output,
+        Err(error) if error.timed_out() => return Err(timed_out()),
+        Err(error) => return Err(build_error(format!("`{what}` could not be run: {error}"))),
+    };
     for stream in [&output.stdout, &output.stderr] {
         let text = String::from_utf8_lossy(stream);
         if !text.trim().is_empty() {
@@ -4493,6 +4571,42 @@ mod tests {
         assert!(
             !without_url[0].contains("PRELOOP_PUBLIC_URL"),
             "{without_url:?}"
+        );
+    }
+
+    /// A container engine that never exits must be killed at the deadline and
+    /// must not leave `init` waiting on it: the old synchronous `.status()`
+    /// call waited the script's full 30 seconds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn container_engine_calls_end_at_the_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("fake-engine");
+        std::fs::write(&engine, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let deadline = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let command = tokio::process::Command::new(&engine);
+        let error = run_container(command, deadline, false, "fake-engine build")
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("fake-engine build"),
+            "names the command: {message}"
+        );
+        assert!(
+            message.contains(&format!("{deadline:?}")),
+            "names the deadline: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "returned only after {elapsed:?}"
         );
     }
 
