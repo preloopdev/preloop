@@ -178,6 +178,11 @@ impl PgBackend {
 
         // ── Timeout + lease expiry over active requests ───────────────
         for request in &active {
+            // A timeout flagged on this tick queues the cancellation that
+            // asks the runner to stop. Settling the same attempt for an
+            // expired lease in the same tick would clear that queued message,
+            // so defer lease expiry to the next tick.
+            let mut timeout_flagged_now = false;
             if let Some(started_at) = request.started_at {
                 // Already timed out: the arm is spent, but the lease check
                 // below still applies (trait doc `reap_sweep` step 3 is
@@ -211,6 +216,7 @@ impl PgBackend {
                         {
                             outcome.cancellations += 1;
                         }
+                        timeout_flagged_now = flagged > 0;
                     }
                 }
             }
@@ -220,7 +226,7 @@ impl PgBackend {
                 .last_renewed_at
                 .map(|renewed| (renewed, request.session_live))
                 .or_else(|| request.started_at.map(|claimed| (claimed, true)));
-            if let Some((anchor, session_live)) = lease_anchor {
+            if !timeout_flagged_now && let Some((anchor, session_live)) = lease_anchor {
                 let elapsed = now.duration_since(anchor).unwrap_or_default();
                 let lease_seconds = if session_live {
                     crate::distributed_task::HUNG_WORKER_LEASE_SECONDS

@@ -288,6 +288,12 @@ impl LiteBackend {
             for request in &active {
                 let (request_id, run_id, job_id) =
                     (request.request_id, request.run_id, request.job_id.clone());
+                // A timeout flagged on this tick queues the cancellation that
+                // asks the runner to stop. Settling the same attempt for an
+                // expired lease in the same tick would clear that queued
+                // message (settlement drops the session's cancellations), so
+                // defer lease expiry to the next tick.
+                let mut timeout_flagged_now = false;
                 if let Some(started_at) = request.started_at
                     && !request.timeout_triggered
                 {
@@ -320,6 +326,7 @@ impl LiteBackend {
                         if queue_job_cancellation(tx, run_id, &job_id)? {
                             cancellations += 1;
                         }
+                        timeout_flagged_now = true;
                     }
                 }
                 // A claimed attempt with no first renewal yet is bounded by
@@ -332,7 +339,9 @@ impl LiteBackend {
                     .last_renewed_at
                     .map(|renewed| (renewed, request.session_live))
                     .or_else(|| request.started_at.map(|claimed| (claimed, true)));
-                if let Some((anchor, session_live)) = lease_anchor {
+                if !timeout_flagged_now
+                    && let Some((anchor, session_live)) = lease_anchor
+                {
                     let elapsed = now.duration_since(anchor).unwrap_or_default();
                     let lease_seconds = if session_live {
                         crate::distributed_task::HUNG_WORKER_LEASE_SECONDS

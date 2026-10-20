@@ -1729,7 +1729,7 @@ async fn legacy_runner_aliases_require_registration_and_bound_runner_credentials
                 .header("x-preloop-provision-token", "one-time-provision")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({"name": "provisioned", "labels": []}).to_string(),
+                    json!({"name": "provisioned", "labels": [], "ephemeral": true}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -1996,7 +1996,7 @@ async fn legacy_provision_token_is_consumed_atomically() {
             .header("x-preloop-provision-token", "concurrent-provision")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                json!({"name": "concurrent", "labels": []}).to_string(),
+                json!({"name": "concurrent", "labels": [], "ephemeral": true}).to_string(),
             ))
             .unwrap()
     };
