@@ -732,27 +732,31 @@ pub type ActionArchiveSha256Pins =
     std::sync::Mutex<std::collections::HashMap<(String, String, String), String>>;
 
 /// Nested `uses:` of a composite action's manifest: (`owner`, `repo`,
-/// `ref`) (owner/repo lowercased) → normalized `owner/repo` scopes nested
-/// inside the action's `action.yml`/`action.yaml`. Populated lazily from
-/// the forge contents API the first time a run asks to resolve an action
-/// that is not directly declared in its workflow (composite actions stage
-/// their nested `uses:` in later waves, after the parent's own download).
+/// `ref`, manifest directory) (owner/repo lowercased) → normalized
+/// `owner/repo` scopes nested inside the action's `action.yml`/`action.yaml`.
+/// Populated lazily from the forge contents API the first time a run asks to
+/// resolve an action that is not directly declared in its workflow
+/// (composite actions stage their nested `uses:` in later waves, after the
+/// parent's own download). The directory component keeps `owner/repo/path@ref`
+/// composites pointed at `path/action.yml` instead of the repository root.
 /// Only definitive answers are cached — a 200 (even with no nested uses)
 /// or a 404 (no manifest). Transient failures are not cached, so the next
 /// adjudication retries instead of failing closed for the process lifetime.
 pub type ActionManifestNestedUses = std::sync::Mutex<
-    std::collections::HashMap<(String, String, String), std::collections::BTreeSet<String>>,
+    std::collections::HashMap<(String, String, String, String), std::collections::BTreeSet<String>>,
 >;
 
-/// Per-run action-resolution ledger: `RunId` → (`owner/repo`, `ref`)
-/// triples this run has already resolved tickets for. Lets the
-/// declared-action allowlist extend transitively: a composite action's
-/// nested `uses:` arrive in later resolution waves, after the parent's
-/// download, and are permitted when a manifest fetched for an already
-/// resolved parent names them. Bounded; a run resolving more distinct
-/// actions than the cap keeps only the most recent.
+/// Per-run action-resolution ledger: `RunId` → (`owner/repo`, `ref`,
+/// manifest directory) triples this run has already resolved tickets for.
+/// Lets the declared-action allowlist extend transitively: a composite
+/// action's nested `uses:` arrive in later resolution waves, after the
+/// parent's download, and are permitted when a manifest fetched for an
+/// already resolved parent names them. The directory keeps a subpath
+/// composite (`owner/repo/sub/dir@ref`) pointed at its own manifest. Bounded;
+/// a run resolving more distinct actions than the cap keeps only the most
+/// recent.
 pub type ActionResolvedUses =
-    std::sync::Mutex<std::collections::HashMap<RunId, Vec<(String, String)>>>;
+    std::sync::Mutex<std::collections::HashMap<RunId, Vec<(String, String, Option<String>)>>>;
 
 /// Maximum (`owner/repo`, `ref`) triples remembered per run in
 /// [`ActionResolvedUses`].

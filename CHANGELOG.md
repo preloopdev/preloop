@@ -10,6 +10,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Subpath composite actions no longer deny their nested actions.** A step
+  that names `owner/repo/path@ref` (the router workflow's
+  `TanStack/config/.github/setup`) had its manifest read from the repository
+  root, where none exists, so the `uses:` inside it — `pnpm/action-setup`,
+  `actions/setup-node` — were rejected as "not declared in the run's
+  workflow" and the job failed before its first step. The allowlist now keeps
+  the action's directory, reads `path/action.yml`, and records that directory
+  in the per-run resolution ledger for later download waves.
+
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution

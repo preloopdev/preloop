@@ -834,6 +834,35 @@ pub fn normalize_action_owner_repo(uses: &str) -> Option<String> {
     Some(format!("{}/{}", owner.to_lowercase(), repo.to_lowercase()))
 }
 
+/// The repository subdirectory holding a remote action's manifest.
+///
+/// A step may name a composite action stored in a subdirectory
+/// (`owner/repo/.github/setup@ref`); its `action.yml` sits beside that path,
+/// not at the repository root. Returns `None` for root actions and for
+/// paths that cannot be fetched safely (dynamic expressions, `.`/`..`
+/// segments): the conservative answer is the root manifest, which never
+/// authorizes anything the reference did not already name.
+fn action_manifest_directory(uses: &str) -> Option<String> {
+    let repo_part = uses.split('@').next().unwrap_or(uses);
+    let mut segments = repo_part.split('/');
+    segments.next()?;
+    segments.next()?;
+    let mut directory: Vec<&str> = Vec::new();
+    for segment in segments {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.contains('\\')
+            || segment.contains('\0')
+            || segment.contains("${{")
+        {
+            return None;
+        }
+        directory.push(segment);
+    }
+    (!directory.is_empty()).then(|| directory.join("/"))
+}
+
 /// Normalize a bare `owner/repo` slug (e.g. the run's repository) to its
 /// lowercased form, or `None` when it is not exactly two clean segments.
 fn normalize_repo_slug(slug: &str) -> Option<String> {
@@ -1997,19 +2026,21 @@ async fn read_snapshot_file(
 }
 
 /// Nested `uses:` scopes from a composite action's manifest, memoized per
-/// (`owner`, `repo`, `ref`). Only definitive answers are cached (see
-/// [`ActionManifestNestedUses`]); a transient failure returns an empty set
-/// uncached so the next adjudication retries.
+/// (`owner`, `repo`, `ref`, directory). Only definitive answers are cached
+/// (see [`ActionManifestNestedUses`]); a transient failure returns an empty
+/// set uncached so the next adjudication retries.
 async fn nested_action_uses(
     state: &AppState,
     owner: &str,
     repo: &str,
+    directory: Option<&str>,
     git_ref: &str,
 ) -> BTreeSet<String> {
     let key = (
         owner.to_lowercase(),
         repo.to_lowercase(),
         git_ref.to_owned(),
+        directory.unwrap_or_default().to_owned(),
     );
     if let Ok(cache) = state.action_manifest_nested_uses.lock()
         && let Some(cached) = cache.get(&key)
@@ -2020,7 +2051,9 @@ async fn nested_action_uses(
     // without poisoning the cache — the next wave retries the fetch.
     // Definitive answers (even empty: a non-composite action, or a repo
     // with no manifest, never grows nested uses at this ref) are cached.
-    let Some(nested) = fetch_action_manifest_nested_uses(state, owner, repo, git_ref).await else {
+    let Some(nested) =
+        fetch_action_manifest_nested_uses(state, owner, repo, directory, git_ref).await
+    else {
         return BTreeSet::new();
     };
     if let Ok(mut cache) = state.action_manifest_nested_uses.lock() {
@@ -2029,15 +2062,16 @@ async fn nested_action_uses(
     nested
 }
 
-/// Fetch `action.yml`/`action.yaml` for (`owner`, `repo`, `ref`) through
-/// the forge contents API and extract nested `uses:` scopes when the action
-/// is composite. Returns `None` on transient failures (not cached);
-/// `Some` (possibly empty) for definitive answers: a manifest was read, or
-/// no manifest exists (404), or the forge definitively refused.
+/// Fetch `action.yml`/`action.yaml` at `directory` for (`owner`, `repo`,
+/// `ref`) through the forge contents API and extract nested `uses:` scopes
+/// when the action is composite. Returns `None` on transient failures (not
+/// cached); `Some` (possibly empty) for definitive answers: a manifest was
+/// read, or no manifest exists (404), or the forge definitively refused.
 async fn fetch_action_manifest_nested_uses(
     state: &AppState,
     owner: &str,
     repo: &str,
+    directory: Option<&str>,
     git_ref: &str,
 ) -> Option<BTreeSet<String>> {
     // The (owner, repo) pair reaching here was already resolved for this run
@@ -2047,9 +2081,17 @@ async fn fetch_action_manifest_nested_uses(
     let api_base = state.github_urls.api_url.trim_end_matches('/').to_owned();
     let enc_owner = percent_encode_path_segment(owner);
     let enc_repo = percent_encode_path_segment(repo);
+    let directory_prefix = directory.map_or_else(String::new, |directory| {
+        let encoded = directory
+            .split('/')
+            .map(percent_encode_path_segment)
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{encoded}/")
+    });
     for manifest in ["action.yml", "action.yaml"] {
         let url = format!(
-            "{api_base}/repos/{enc_owner}/{enc_repo}/contents/{manifest}?ref={}",
+            "{api_base}/repos/{enc_owner}/{enc_repo}/contents/{directory_prefix}{manifest}?ref={}",
             percent_encode_path_segment(git_ref)
         );
         let mut request = crate::shared_http::CLIENT.get(&url);
@@ -2206,31 +2248,38 @@ async fn enforce_declared_actions(
     declared: &BTreeSet<String>,
     requests: &[(String, Option<String>)],
 ) -> Result<(), ApiError> {
-    // (batch index, owner/repo, ref) for requests naming a remote action.
-    let mut remote: Vec<(usize, String, String)> = Vec::new();
+    // (batch index, owner/repo, ref, manifest directory) for requests
+    // naming a remote action.
+    let mut remote: Vec<(usize, String, String, Option<String>)> = Vec::new();
     for (index, (action, version)) in requests.iter().enumerate() {
         if let Some(owner_repo) = normalize_action_owner_repo(action) {
-            remote.push((index, owner_repo, version.clone().unwrap_or_default()));
+            remote.push((
+                index,
+                owner_repo,
+                version.clone().unwrap_or_default(),
+                action_manifest_directory(action),
+            ));
         }
     }
 
     let mut admitted: BTreeSet<usize> = BTreeSet::new();
-    // (`owner/repo`, `ref`) triples whose manifests may authorize nested
-    // uses: this batch's direct hits plus earlier batches' ledger.
-    let mut manifest_sources: Vec<(String, String)> = Vec::new();
-    for (index, owner_repo, git_ref) in &remote {
+    // (`owner/repo`, `ref`, manifest directory) triples whose manifests may
+    // authorize nested uses: this batch's direct hits plus earlier batches'
+    // ledger.
+    let mut manifest_sources: Vec<(String, String, Option<String>)> = Vec::new();
+    for (index, owner_repo, git_ref, directory) in &remote {
         if declared.contains(owner_repo) {
             admitted.insert(*index);
-            manifest_sources.push((owner_repo.clone(), git_ref.clone()));
+            manifest_sources.push((owner_repo.clone(), git_ref.clone(), directory.clone()));
         }
     }
 
     // Fast path: everything directly declared — no manifest fetch needed.
     // The transitive closure below only runs when some request is not
     // directly declared, so ordinary job setups never pay for it.
-    let mut unadmitted: Vec<(usize, String, String)> = remote
+    let mut unadmitted: Vec<(usize, String, String, Option<String>)> = remote
         .iter()
-        .filter(|(index, _, _)| !admitted.contains(index))
+        .filter(|(index, _, _, _)| !admitted.contains(index))
         .cloned()
         .collect();
     if !unadmitted.is_empty() {
@@ -2244,12 +2293,16 @@ async fn enforce_declared_actions(
         }
         // Transitive composite closure, to a fixpoint within the batch: each
         // newly admitted action's manifest may admit further nested actions.
-        let mut checked: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut checked: BTreeSet<(String, String, String)> = BTreeSet::new();
         loop {
             let mut nested_union: BTreeSet<String> = BTreeSet::new();
             let mut newly_checked = false;
-            for (owner_repo, git_ref) in &manifest_sources {
-                if !checked.insert((owner_repo.clone(), git_ref.clone())) {
+            for (owner_repo, git_ref, directory) in &manifest_sources {
+                if !checked.insert((
+                    owner_repo.clone(),
+                    git_ref.clone(),
+                    directory.clone().unwrap_or_default(),
+                )) {
                     continue;
                 }
                 newly_checked = true;
@@ -2257,16 +2310,18 @@ async fn enforce_declared_actions(
                 let (owner, repo) = owner_repo
                     .split_once('/')
                     .unwrap_or((owner_repo.as_str(), ""));
-                nested_union.extend(nested_action_uses(state, owner, repo, git_ref).await);
+                nested_union.extend(
+                    nested_action_uses(state, owner, repo, directory.as_deref(), git_ref).await,
+                );
             }
             if !newly_checked {
                 break;
             }
             let mut progressed = false;
-            unadmitted.retain(|(index, owner_repo, git_ref)| {
+            unadmitted.retain(|(index, owner_repo, git_ref, _directory)| {
                 if nested_union.contains(owner_repo) {
                     admitted.insert(*index);
-                    manifest_sources.push((owner_repo.clone(), git_ref.clone()));
+                    manifest_sources.push((owner_repo.clone(), git_ref.clone(), None));
                     progressed = true;
                     false
                 } else {
@@ -2281,8 +2336,8 @@ async fn enforce_declared_actions(
 
     let denied: Vec<String> = remote
         .iter()
-        .filter(|(index, _, _)| !admitted.contains(index))
-        .map(|(_, owner_repo, git_ref)| {
+        .filter(|(index, _, _, _)| !admitted.contains(index))
+        .map(|(_, owner_repo, git_ref, _)| {
             if git_ref.is_empty() {
                 owner_repo.clone()
             } else {
@@ -2305,9 +2360,10 @@ async fn enforce_declared_actions(
     // Ledger this batch's admitted triples for later waves' closures.
     if let Ok(mut ledger) = state.action_resolved_uses.lock() {
         let entry = ledger.entry(run_id).or_default();
-        for (index, owner_repo, git_ref) in &remote {
-            if admitted.contains(index) && !entry.contains(&(owner_repo.clone(), git_ref.clone())) {
-                entry.push((owner_repo.clone(), git_ref.clone()));
+        for (index, owner_repo, git_ref, directory) in &remote {
+            let resolved = (owner_repo.clone(), git_ref.clone(), directory.clone());
+            if admitted.contains(index) && !entry.contains(&resolved) {
+                entry.push(resolved);
             }
         }
         if entry.len() > crate::state::MAX_RESOLVED_USES_PER_RUN {
@@ -4079,6 +4135,72 @@ jobs:
             assert!(!path.contains(".."), "read escaped the tree: {path}");
             assert_eq!(git_ref, &snapshot.commit_sha);
         }
+    }
+
+    /// A composite action stored in a subdirectory (`owner/repo/path@ref`)
+    /// keeps that path when its manifest is fetched. The router's
+    /// `TanStack/config/.github/setup@ref` names its pnpm and Node setup
+    /// steps there; reading the repository root instead 404s and denied both
+    /// nested actions at download time.
+    #[tokio::test]
+    async fn subpath_composite_dependency_is_admitted_from_its_directory() {
+        let setup = composite_manifest(&[
+            "pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0",
+            "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+        ]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[(".github/setup/action.yml", setup.as_str())]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let declared: BTreeSet<String> = ["tanstack/config".to_owned()].into();
+
+        // The parent downloads in one wave and is ledgered with its
+        // directory.
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &[(
+                "TanStack/config/.github/setup".to_owned(),
+                Some(SHA.to_owned()),
+            )],
+        )
+        .await
+        .expect("the subpath composite itself is directly declared");
+
+        // Its nested actions arrive in a later wave; the ledger entry must
+        // fetch `.github/setup/action.yml`, not the repository root.
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &[
+                (
+                    "pnpm/action-setup".to_owned(),
+                    Some("739bfe42ca9233c5e6aca07c1a25a9d34aca49b0".to_owned()),
+                ),
+                (
+                    "actions/setup-node".to_owned(),
+                    Some("48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e".to_owned()),
+                ),
+            ],
+        )
+        .await
+        .expect("nested actions of a subpath composite must be admitted");
+
+        let contents = fixture.stub.contents.lock().clone();
+        assert!(
+            contents
+                .iter()
+                .any(|(path, git_ref, _)| path == ".github/setup/action.yml" && git_ref == SHA),
+            "the subpath manifest must be read: {contents:?}"
+        );
     }
 
     /// A failed contents read adds nothing, so the nested action stays denied.
