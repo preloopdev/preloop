@@ -6474,6 +6474,44 @@ async fn delete_machine<P: VmProvider + 'static>(
     }
 }
 
+/// What the liveness probe knows about the runner's guest besides `exec`.
+#[derive(Clone, Debug)]
+struct RunnerActivity {
+    /// When the guest last produced a chunk of output on its exec stream.
+    ///
+    /// The stream is the engine's only live view into the guest. A heavy
+    /// in-VM step — a Rust build, a nested sandbox boot — can leave the guest
+    /// silent for minutes while it is provably working, and under that load
+    /// the AgentENV gateway returns `502 client error (Connect)` for
+    /// `aenv exec` because the guest cannot accept a new connection. Probe
+    /// failures alone therefore say nothing about a guest that is still
+    /// writing job output.
+    last_output: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+impl RunnerActivity {
+    fn new() -> Self {
+        Self {
+            last_output: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        }
+    }
+
+    /// Record output from the guest; called from the stream watcher.
+    fn note_output(&self) {
+        if let Ok(mut last) = self.last_output.lock() {
+            *last = std::time::Instant::now();
+        }
+    }
+
+    /// How long the guest has been silent.
+    fn silent_for(&self) -> std::time::Duration {
+        self.last_output
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or_default()
+    }
+}
+
 /// How the runner stream checks that its guest is still alive.
 #[derive(Clone, Copy, Debug)]
 struct GuestLiveness {
@@ -6481,39 +6519,85 @@ struct GuestLiveness {
     interval: std::time::Duration,
     /// A probe that takes longer than this counts as failed.
     timeout: std::time::Duration,
-    /// Consecutive failed probes that mark the guest as wedged.
+    /// Consecutive failed probes that make the guest a wedge *candidate*.
     failures: u32,
+    /// How long the guest must also have been silent before it is wedged.
+    ///
+    /// A guest that keeps emitting job output is working, even when `exec`
+    /// probes cannot reach it; only a guest that has gone both unreachable
+    /// and quiet is safe to tear down.
+    silence: std::time::Duration,
 }
 
-/// Three failed probes a minute apart: at least three minutes of silence,
-/// matching the server's 180-second hung-worker cutoff, so a busy guest that
-/// is merely slow to answer one probe is not torn down mid-job.
+/// Three failed probes a minute apart, plus ten minutes without a single
+/// chunk of guest output. The AgentENV single-node e2e job compiles inside
+/// its sandbox for minutes at a time: its step output goes quiet for 5m23s
+/// while `aenv exec` returns 502, and the job then continues normally. A
+/// policy that only counted probes killed that healthy guest every ~11
+/// minutes. Ten minutes of silence still bounds a genuinely dead guest to
+/// ten minutes; a VM that actually dies usually ends its exec stream too,
+/// releasing the slot sooner.
 const GUEST_LIVENESS: GuestLiveness = GuestLiveness {
     interval: std::time::Duration::from_secs(60),
     timeout: std::time::Duration::from_secs(30),
     failures: 3,
+    silence: std::time::Duration::from_secs(600),
 };
 
-/// Resolve once the guest has failed `liveness.failures` probes in a row.
+/// Resolve once the guest has failed `liveness.failures` probes in a row and
+/// has been silent for `liveness.silence`.
 async fn guest_unresponsive<P: VmProvider + 'static>(
     provider: &Arc<P>,
     name: &MachineName,
     liveness: GuestLiveness,
+    activity: &RunnerActivity,
 ) -> VmError {
     let probe = ["true".to_owned()];
     let mut failures = 0;
     loop {
         tokio::time::sleep(liveness.interval).await;
         match tokio::time::timeout(liveness.timeout, provider.exec(name, &probe)).await {
-            Ok(Ok(_)) => failures = 0,
-            Ok(Err(_)) | Err(_) => failures += 1,
+            Ok(Ok(_)) => {
+                failures = 0;
+                continue;
+            }
+            Ok(Err(error)) => {
+                failures += 1;
+                debug!(
+                    machine = name.as_str(),
+                    failures, %error, "guest liveness probe failed"
+                );
+            }
+            Err(_) => {
+                failures += 1;
+                debug!(
+                    machine = name.as_str(),
+                    failures,
+                    timeout_ms = liveness.timeout.as_millis(),
+                    "guest liveness probe timed out"
+                );
+            }
         }
-        if failures >= liveness.failures {
+        if failures < liveness.failures {
+            continue;
+        }
+        let silent = activity.silent_for();
+        if silent >= liveness.silence {
             return VmError::GuestUnresponsive {
                 machine: name.as_str().to_owned(),
                 probes: failures,
             };
         }
+        // Fresh output is proof of life: the guest is busy, not wedged, and
+        // the next streak starts from zero.
+        info!(
+            machine = name.as_str(),
+            probes = failures,
+            silent_ms = silent.as_millis(),
+            silence_ms = liveness.silence.as_millis(),
+            "guest output is live; failed liveness probes do not make it wedged"
+        );
+        failures = 0;
     }
 }
 
@@ -6554,6 +6638,8 @@ async fn run_until_exit<P: VmProvider + 'static>(
     let (chunks, mut receiver) = mpsc::channel(64);
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     let machine = name.as_str().to_owned();
+    let activity = RunnerActivity::new();
+    let stream_activity = activity.clone();
     let watcher = tokio::spawn(async move {
         let mut busy = Some(busy);
         let mut completion = completion;
@@ -6602,6 +6688,11 @@ async fn run_until_exit<P: VmProvider + 'static>(
             let Some(chunk) = chunk else {
                 break;
             };
+            // Every chunk is proof the guest is still running. The liveness
+            // probe treats fresh output as authoritative over its own
+            // timeouts: a guest that is compiling for ten minutes cannot
+            // answer `aenv exec` between compiler invocations.
+            stream_activity.note_output();
             let (bytes, is_stdout) = match chunk {
                 OutputChunk::Stdout(bytes) => (bytes, true),
                 OutputChunk::Stderr(bytes) => (bytes, false),
@@ -6677,7 +6768,7 @@ async fn run_until_exit<P: VmProvider + 'static>(
             watcher.abort();
             Ok::<i32, VmError>(exit)
         },
-        error = guest_unresponsive(provider, name, liveness) => {
+        error = guest_unresponsive(provider, name, liveness, &activity) => {
             warn!(machine = name.as_str(), %error, "runner guest is wedged; abandoning its stream");
             watcher.abort();
             return Err(error);
@@ -7743,6 +7834,14 @@ mod lifecycle_tests {
         /// Model a guest whose agent stopped answering: the runner stream
         /// never closes and liveness probes never return.
         wedged_guest: bool,
+        /// Hang only the liveness probe (`exec true`), while the runner
+        /// stream keeps running — a guest too busy to accept `aenv exec`
+        /// but still producing job output.
+        probe_hangs: bool,
+        /// When set, the runner stream emits a chunk every interval until
+        /// the gate fires. Combined with `probe_hangs`, models a guest that
+        /// cannot answer exec probes while its job is visibly progressing.
+        live_output: Option<(std::time::Duration, Arc<tokio::sync::Notify>)>,
         /// Report live clones to `rearm_fork_base`; true by default so a spent
         /// base with dependents is never re-armed in tests either.
         live_forks: Mutex<bool>,
@@ -7819,6 +7918,8 @@ mod lifecycle_tests {
                 fail_fork_once_spent: Mutex::new(false),
                 fail_fork_once: Mutex::new(false),
                 wedged_guest: false,
+                probe_hangs: false,
+                live_output: None,
                 live_forks: Mutex::new(true),
                 drain_live_forks_after: Mutex::new(0),
                 fail_start,
@@ -7929,6 +8030,19 @@ mod lifecycle_tests {
         /// Model a guest whose agent stopped answering.
         fn with_wedged_guest(mut self) -> Self {
             self.wedged_guest = true;
+            self
+        }
+
+        /// Model a guest that cannot answer `exec` probes (`aenv exec` 502s
+        /// under load) while its runner keeps emitting job output until the
+        /// gate fires.
+        fn with_live_output_and_dead_probes(
+            mut self,
+            every: std::time::Duration,
+            gate: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            self.probe_hangs = true;
+            self.live_output = Some((every, gate));
             self
         }
 
@@ -11411,7 +11525,7 @@ fi"#,
                     ..test_output()
                 });
             }
-            if self.wedged_guest && argv == ["true"] {
+            if (self.wedged_guest || self.probe_hangs) && argv == ["true"] {
                 std::future::pending::<()>().await;
             }
             if argv.len() == 3
@@ -11490,6 +11604,22 @@ fi"#,
                     ))
                     .await
                     .unwrap();
+            }
+            if let Some((every, gate)) = &self.live_output {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(*every) => {
+                            if output
+                                .send(OutputChunk::Stdout(b"still building\n".to_vec()))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(0);
+                            }
+                        }
+                        _ = gate.notified() => break,
+                    }
+                }
             }
             if let Some(gate) = &self.run_gate {
                 gate.notified().await;
@@ -12072,6 +12202,7 @@ fi"#,
             interval: std::time::Duration::from_millis(5),
             timeout: std::time::Duration::from_millis(5),
             failures: 3,
+            silence: std::time::Duration::ZERO,
         };
 
         let result = tokio::time::timeout(
@@ -12083,6 +12214,88 @@ fi"#,
 
         assert!(
             matches!(result, Err(VmError::GuestUnresponsive { probes: 3, .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A guest that cannot answer `exec` probes but keeps producing job
+    /// output is working, not wedged. This is the AgentENV e2e shape: under a
+    /// nested Rust build `aenv exec` returns `502 client error (Connect)`
+    /// every probe while the job's log stream stays alive.
+    #[tokio::test]
+    async fn a_guest_with_live_output_is_not_wedged_by_failed_probes() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).with_live_output_and_dead_probes(
+                std::time::Duration::from_millis(10),
+                gate.clone(),
+            ),
+        );
+        let name = MachineName::new("lifecycle-test-0-6b").unwrap();
+        let (busy, _busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_millis(5),
+            timeout: std::time::Duration::from_millis(5),
+            failures: 2,
+            silence: std::time::Duration::from_millis(150),
+        };
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            let name = name.clone();
+            async move {
+                run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness).await
+            }
+        });
+
+        // Several failure streaks fit here; only fresh output keeps the
+        // guest alive past them.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "failed probes with fresh output must not release the slot"
+        );
+        let events = provider.events().await;
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("exec:") && event.ends_with("[\"true\"]"))
+                .count()
+                >= 2,
+            "the probe must have failed more than once: {events:?}"
+        );
+
+        gate.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the runner stream ends when the job finishes")
+            .expect("runner task must not panic");
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// The same failed probes with no output for the silence window are a
+    /// real wedge: the guest is unreachable and quiet.
+    #[tokio::test]
+    async fn a_silent_guest_is_wedged_after_the_silence_window() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).with_wedged_guest());
+        let name = MachineName::new("lifecycle-test-0-6c").unwrap();
+        let (busy, _busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_millis(5),
+            timeout: std::time::Duration::from_millis(5),
+            failures: 2,
+            silence: std::time::Duration::from_millis(50),
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
+        )
+        .await
+        .expect("a silent, unreachable guest must not pin the runner stream");
+
+        assert!(
+            matches!(result, Err(VmError::GuestUnresponsive { ref probes, .. }) if *probes >= 2),
             "{result:?}"
         );
     }
@@ -12105,6 +12318,7 @@ fi"#,
             interval: std::time::Duration::from_secs(60),
             timeout: std::time::Duration::from_secs(30),
             failures: 3,
+            silence: std::time::Duration::ZERO,
         };
 
         let result = tokio::time::timeout(
@@ -12133,6 +12347,7 @@ fi"#,
             interval: std::time::Duration::from_secs(60),
             timeout: std::time::Duration::from_secs(30),
             failures: 3,
+            silence: std::time::Duration::ZERO,
         };
 
         let result = tokio::time::timeout(
@@ -12175,6 +12390,7 @@ fi"#,
             interval: std::time::Duration::from_secs(60),
             timeout: std::time::Duration::from_secs(30),
             failures: 3,
+            silence: std::time::Duration::ZERO,
         };
         let task = tokio::spawn({
             let provider = provider.clone();
@@ -12282,6 +12498,7 @@ fi"#,
             interval: std::time::Duration::from_secs(60),
             timeout: std::time::Duration::from_secs(30),
             failures: 3,
+            silence: std::time::Duration::ZERO,
         };
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(3),
