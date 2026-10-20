@@ -1,6 +1,8 @@
 //! Job execution contexts (github, runner, job, steps, env, secrets).
 
 use indexmap::IndexMap;
+use preloop_gha_protocol::azdo::{MaskHint, MaskType};
+use preloop_gha_protocol::masking::PatternMasker;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -27,6 +29,11 @@ pub struct JobContext {
     /// Shared read-view of masks for live-log callbacks that need to see
     /// `::add-mask::` additions mid-step without rebuilding the callback.
     pub live_masks: Arc<RwLock<HashSet<String>>>,
+    /// Compiled `MaskHint` pattern maskers (`MaskType::Regex`) registered for
+    /// this job, shared with the live-log drain path through
+    /// [`JobContext::live_mask_set`]. Matches are redacted alongside value
+    /// masks; see [`JobContext::apply_mask_hints`].
+    pub pattern_masks: Arc<RwLock<Vec<Arc<dyn PatternMasker>>>>,
     /// Job-level outputs collected from steps.
     pub outputs: HashMap<String, String>,
     /// Job status for status functions (success/failure/cancelled).
@@ -122,6 +129,40 @@ pub enum JobStatus {
     Cancelled,
 }
 
+/// The job's mask sources as seen by live-log consumers.
+///
+/// Value masks are a `HashSet<String>` and cannot express a
+/// `MaskType::Regex` hint, so the live-log queue keeps both shared handles
+/// and drain-path masking redacts pattern matches alongside values. Built
+/// with [`JobContext::live_mask_set`].
+#[derive(Clone, Default)]
+pub struct LiveMaskSet {
+    /// Value masks; the same handle as [`JobContext::live_masks`].
+    pub values: Arc<RwLock<HashSet<String>>>,
+    /// Compiled pattern maskers; the same handle as
+    /// [`JobContext::pattern_masks`].
+    pub patterns: Arc<RwLock<Vec<Arc<dyn PatternMasker>>>>,
+}
+
+/// A `regex::Regex` registered as a [`PatternMasker`] from a job `MaskHint`
+/// of `MaskType::Regex` — the compiled form the official worker builds in
+/// `Worker.cs` `InitializeSecretMasker`.
+pub(crate) struct RegexMasker(regex::Regex);
+
+impl RegexMasker {
+    /// Compile `pattern`. The caller decides how an invalid pattern is
+    /// reported; nothing here panics.
+    pub(crate) fn compile(pattern: &str) -> Result<Self, regex::Error> {
+        regex::Regex::new(pattern).map(Self)
+    }
+}
+
+impl PatternMasker for RegexMasker {
+    fn find_spans(&self, haystack: &str, spans: &mut Vec<(usize, usize)>) {
+        spans.extend(self.0.find_iter(haystack).map(|m| (m.start(), m.end())));
+    }
+}
+
 impl JobContext {
     /// Create a new job context from the job message fields.
     pub fn new(
@@ -196,6 +237,7 @@ impl JobContext {
             steps: IndexMap::new(),
             masks: masks.clone(),
             live_masks: Arc::new(RwLock::new(masks)),
+            pattern_masks: Arc::new(RwLock::new(Vec::new())),
             outputs: HashMap::new(),
             job_status: JobStatus::Success,
             step_annotations: HashMap::new(),
@@ -314,6 +356,54 @@ impl JobContext {
         added
     }
 
+    /// Register the job message's `MaskHint`s, mirroring the official
+    /// worker's `Worker.cs` `InitializeSecretMasker`:
+    ///
+    /// * [`MaskType::Regex`] — the pattern is compiled once and registered
+    ///   as a pattern masker, so secret-shaped spans are redacted even when
+    ///   no exact value was registered. A pattern that does not compile is
+    ///   skipped with a warning; a hint must never fail or panic the job.
+    /// * [`MaskType::Variable`] — the named variable's current value is
+    ///   masked through [`Self::add_mask`]. Unknown or empty variables are
+    ///   skipped.
+    pub fn apply_mask_hints(&mut self, hints: &[MaskHint]) {
+        for hint in hints {
+            match hint.hint_type {
+                MaskType::Regex => match RegexMasker::compile(&hint.value) {
+                    Ok(masker) => {
+                        // Recover a poisoned guard: dropping the masker would
+                        // leak every span the pattern matches.
+                        self.pattern_masks
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(Arc::new(masker));
+                    }
+                    Err(error) => tracing::warn!(
+                        pattern = %hint.value,
+                        %error,
+                        "skipping mask hint: pattern does not compile"
+                    ),
+                },
+                MaskType::Variable => {
+                    if let Some(value) = self.get_variable(&hint.value).map(str::to_owned) {
+                        self.add_mask(&value);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The shared mask handles for live-log consumers
+    /// ([`crate::worker::live_logs::LiveLogQueue`] and
+    /// `process_line_callback`), so drain-path masking sees both the value
+    /// masks and the compiled `MaskType::Regex` hints.
+    pub fn live_mask_set(&self) -> LiveMaskSet {
+        LiveMaskSet {
+            values: Arc::clone(&self.live_masks),
+            patterns: Arc::clone(&self.pattern_masks),
+        }
+    }
+
     /// Like [`Self::mask_secrets`], but a secret spanning N lines is
     /// replaced with one `***` per line instead of a single marker, so the
     /// physical record count of the output is unchanged.
@@ -327,11 +417,48 @@ impl JobContext {
         } else {
             &[]
         };
-        preloop_gha_protocol::masking::mask_secrets_preserving_lines_transform_aware(
+        let guard = self.pattern_masks.read();
+        let empty: &[Arc<dyn PatternMasker>] = &[];
+        // A poisoned lock degrades to value-only masking rather than
+        // skipping redaction entirely.
+        let patterns = match &guard {
+            Ok(patterns) => patterns.as_slice(),
+            Err(_) => empty,
+        };
+        preloop_gha_protocol::masking::mask_secrets_preserving_lines_transform_aware_with_patterns(
             input,
             secrets.iter().map(String::as_str),
+            patterns.iter().map(|pattern| &**pattern),
             exclude,
         )
+    }
+
+    /// Does any registered `MaskType::Regex` hint match `text`?
+    ///
+    /// The environment-URL guard asks the same question the mask scan asks —
+    /// would this text disclose something the job's hints call secret — without
+    /// rewriting the text (the official `JobExtension.FinalizeJob` drops a URL
+    /// whose masked form differs from the raw value). Value masks cover only
+    /// registered values, so a URL matching only a pattern hint (the engine's
+    /// `scheme://user:password@host` shape, say) would otherwise be published
+    /// while the same span is redacted from the logs.
+    pub fn matches_pattern_mask(&self, text: &str) -> bool {
+        let guard = self.pattern_masks.read();
+        let patterns = match &guard {
+            Ok(patterns) => patterns.as_slice(),
+            // A poisoned lock degrades to value-only masking, like
+            // [`Self::mask_secrets`].
+            Err(_) => return false,
+        };
+        let mut spans = Vec::new();
+        for pattern in patterns {
+            spans.clear();
+            pattern.find_spans(text, &mut spans);
+            if !spans.is_empty() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Mask secret values in a string (longest secrets first to prevent partial matches).
@@ -346,9 +473,18 @@ impl JobContext {
         } else {
             &[]
         };
-        preloop_gha_protocol::masking::mask_secrets_transform_aware(
+        let guard = self.pattern_masks.read();
+        let empty: &[Arc<dyn PatternMasker>] = &[];
+        // A poisoned lock degrades to value-only masking rather than
+        // skipping redaction entirely.
+        let patterns = match &guard {
+            Ok(patterns) => patterns.as_slice(),
+            Err(_) => empty,
+        };
+        preloop_gha_protocol::masking::mask_secrets_transform_aware_with_patterns(
             input,
             self.masks.iter().map(String::as_str),
+            patterns.iter().map(|pattern| &**pattern),
             exclude,
         )
     }
@@ -756,3 +892,87 @@ fn current_arch() -> &'static str {
 #[cfg(test)]
 #[path = "contexts_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod mask_hint_tests {
+    use super::*;
+
+    fn job(variables: serde_json::Value) -> JobContext {
+        JobContext::new(
+            "job1".to_string(),
+            "Test".to_string(),
+            variables,
+            serde_json::json!({}),
+        )
+    }
+
+    fn regex_hint(pattern: &str) -> MaskHint {
+        MaskHint {
+            hint_type: MaskType::Regex,
+            value: pattern.to_string(),
+        }
+    }
+
+    #[test]
+    fn regex_mask_hint_masks_span_value_masking_misses() {
+        let mut ctx = job(serde_json::json!({}));
+        let input = "login user:hunter2@host ok";
+        // Without the hint the span survives: `hunter2` is not a registered
+        // value, and even registering it only masks the interior word.
+        assert_eq!(ctx.mask_secrets(input), input);
+        ctx.add_mask("hunter2");
+        assert_eq!(ctx.mask_secrets(input), "login user:***@host ok");
+
+        ctx.apply_mask_hints(&[regex_hint(r"user:[^@\s]+@host")]);
+        assert_eq!(ctx.mask_secrets(input), "login *** ok");
+    }
+
+    #[test]
+    fn variable_mask_hint_masks_named_variable_value() {
+        let mut ctx = job(serde_json::json!({
+            "MY_SECRET": { "value": "tok-9f3k2", "isSecret": false },
+        }));
+        assert_eq!(ctx.mask_secrets("val=tok-9f3k2"), "val=tok-9f3k2");
+        ctx.apply_mask_hints(&[
+            MaskHint {
+                hint_type: MaskType::Variable,
+                value: "MY_SECRET".to_string(),
+            },
+            // An unknown variable is skipped without effect.
+            MaskHint {
+                hint_type: MaskType::Variable,
+                value: "NOT_A_VARIABLE".to_string(),
+            },
+        ]);
+        assert_eq!(ctx.mask_secrets("val=tok-9f3k2"), "val=***");
+    }
+
+    #[test]
+    fn invalid_regex_mask_hint_is_skipped_and_masking_continues() {
+        let mut ctx = job(serde_json::json!({
+            "PLAIN": { "value": "value-secret", "isSecret": true },
+        }));
+        // Must not panic: the broken pattern is skipped with a warning.
+        ctx.apply_mask_hints(&[regex_hint("("), regex_hint(r"user:[^@\s]+@host")]);
+        assert_eq!(ctx.mask_secrets("value-secret"), "***");
+        assert_eq!(ctx.mask_secrets("see user:hunter2@host"), "see ***");
+    }
+
+    #[test]
+    fn regex_mask_hint_masks_across_lines_preserving_records() {
+        let mut ctx = job(serde_json::json!({}));
+        ctx.apply_mask_hints(&[regex_hint(r"(?s)BEGIN.*END")]);
+        assert_eq!(
+            ctx.mask_secrets_preserving_lines_with("l1\nBEGIN\nsecret\nEND\nl2", &[]),
+            "l1\n***\n***\n***\nl2"
+        );
+    }
+
+    #[test]
+    fn no_mask_hints_leave_masking_unchanged() {
+        let mut ctx = job(serde_json::json!({}));
+        ctx.apply_mask_hints(&[]);
+        let input = "plain user:hunter2@host output";
+        assert_eq!(ctx.mask_secrets(input), input);
+    }
+}

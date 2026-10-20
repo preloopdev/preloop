@@ -55,6 +55,10 @@ golden_sysctl_fs_inotify_max_user_instances = "1280"
 # The machine's own name must resolve to an address the machine owns
 # (loopback or a local-interface address), the way a hosted runner's does.
 golden_hostname_resolves_locally = "true"
+# Newest successfully baked golden may be at most this old. The weekly
+# official-golden schedule starts a bake past it, and the daily security scan
+# fails when the latest artifact exceeds it.
+golden_max_age_days = "21"
 # Environment keys a hosted step's environment does not carry: the terminal
 # identity, which the guest's exec channel would otherwise leak into steps.
 golden_step_env_unset = "TERM,COLORTERM"

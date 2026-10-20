@@ -6,4 +6,15 @@
 # *signing* in the local control plane (GitHub App tokens), not a
 # network-facing RSA decryption oracle, which is the exposure the Marvin
 # workaround targets. Revisit when rsa 0.10 stabilizes.
-ignore = ["RUSTSEC-2023-0071"]
+#
+# RUSTSEC-2026-0381 (crate `webpki-roots`, "distrusted emSign intermediates"):
+# the advisory is patched in `>=1.0.10`, and `webpki-roots 0.26.11` — the last
+# release of the 0.26 line — is a version-number match only. Its entire source is
+# `pub use parent::TLS_SERVER_ROOTS;` over `webpki-roots ^1`, which Cargo.lock
+# resolves to 1.0.10, the release that removes `emSign ECC Root CA - G3`. The
+# anchors that line serves are therefore the patched ones. It cannot be bumped
+# on its own: `tokio-tungstenite 0.30` and `preloop-runner` still depend on
+# `webpki-roots ^0.26`. Remove this entry once they move to 1.x (the shim then
+# leaves the tree). The sibling advisory RUSTSEC-2026-0383 (`webpki-root-certs`)
+# is a real exposure and is fixed by the 1.0.10 lock bump, not ignored.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0381"]
