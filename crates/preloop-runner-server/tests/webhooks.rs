@@ -3076,7 +3076,11 @@ async fn control_socket_surface_denies_native_and_test_apis() {
     // in-VM runner PUTs step logs to the signed `/replay/results/*` URLs its
     // Twirp handlers minted, so the guard must not turn them into 404s — the
     // URL ticket (not the surface) is what authorises the write.
-    let replay_path = "/replay/results/plan/job/step-1.txt";
+    let replay_plan = uuid::Uuid::new_v4().to_string();
+    let replay_job = uuid::Uuid::new_v4();
+    let replay_path = format!("/replay/results/{replay_plan}/{replay_job}/step-1.txt");
+    register_live_job(&state, replay_job, &replay_plan).await;
+    let replay_path = replay_path.as_str();
     let unsigned = socket_app
         .clone()
         .oneshot(
@@ -3136,6 +3140,14 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
     let plan = uuid::Uuid::new_v4().to_string();
     let job = uuid::Uuid::new_v4().to_string();
     let path = format!("/replay/results/{plan}/{job}/step-1.txt");
+    // The valid upload below must reach the ticket check, not fail the
+    // branch's new liveness gate on an unknown attempt.
+    register_live_job(
+        &state,
+        job.parse().expect("job path segment is a UUID"),
+        &plan,
+    )
+    .await;
 
     // No credential at all: previously the blob was written; the ticket check
     // must refuse it.

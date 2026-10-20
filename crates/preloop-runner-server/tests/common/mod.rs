@@ -1546,7 +1546,12 @@ pub async fn register_runner_with_token(
         .oneshot(
             builder
                 .body(Body::from(
-                    json!({"name": name, "labels": labels_json}).to_string(),
+                    json!({
+                        "name": name,
+                        "labels": labels_json,
+                        "ephemeral": provision_token.is_some(),
+                    })
+                    .to_string(),
                 ))
                 .unwrap(),
         )
