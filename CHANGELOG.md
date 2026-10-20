@@ -10,6 +10,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A SmolVM guest that walks its image no longer loses the ability to open
+  files.** SmolVM's virtiofs passthrough holds one host file descriptor per
+  image inode the guest has looked up, released only when the guest evicts the
+  inode, and every VMM inherits the engine unit's descriptor limit — systemd's
+  default 524288 hard. The x86_64 golden carries ~985k entries, so a `find /`
+  in a runner pinned 520,071 host descriptors in that runner's VMM, after which
+  every uncached open or exec failed with `EMFILE`/`ESTALE`. The system-scope
+  unit now sets `LimitNOFILE=2097152`; user-scope units are unchanged because a
+  user manager cannot raise a hard limit above its own.
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution

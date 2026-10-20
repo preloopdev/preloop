@@ -39,6 +39,12 @@ CapabilityBoundingSet=
 # Delegate the cgroup subtree so each SmolVM `_boot-vm` can place itself in a
 # per-VM capped leaf (cpu/pids/memory) via SMOLVM_CGROUP_ROOT.
 Delegate=cpu memory pids
+# Every VMM inherits this limit, and SmolVM's virtiofs passthrough holds one
+# host fd per image inode the guest has looked up. The x86_64 golden carries
+# ~985k entries; systemd's default hard limit (524288) let a guest `find /`
+# exhaust it, after which every uncached open or exec in that guest failed
+# (EMFILE/ESTALE).
+LimitNOFILE=2097152
 StateDirectory=preloop
 StateDirectoryMode=0700
 

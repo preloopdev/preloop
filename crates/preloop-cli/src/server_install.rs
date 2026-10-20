@@ -1171,7 +1171,15 @@ fn render_systemd_service(
         // Delegate this unit's cgroup subtree so `_boot-vm` can place each VM
         // in its own capped `vm-<pid>` leaf (cpu/pids/memory). The provider
         // only passes SMOLVM_CGROUP_ROOT when it observes this delegation.
-        "Delegate=cpu memory pids\n".to_owned()
+        //
+        // Every VMM inherits this unit's descriptor limit, and SmolVM's
+        // virtiofs passthrough holds one host fd per image inode the guest has
+        // looked up, released only when the guest evicts it. The x86_64 golden
+        // carries ~985k entries, so systemd's default hard limit (524288) let a
+        // guest `find /` exhaust it, after which every uncached open or exec in
+        // that guest failed with EMFILE/ESTALE. System scope only: a user unit
+        // cannot raise its hard limit above its manager's and would not start.
+        "Delegate=cpu memory pids\nLimitNOFILE=2097152\n".to_owned()
     };
     Ok(format!(
         r#"[Unit]
@@ -2043,6 +2051,7 @@ LockPersonality=true
 RestrictRealtime=true
 CapabilityBoundingSet=
 Delegate=cpu memory pids
+LimitNOFILE=2097152
 StateDirectory=preloop
 StateDirectoryMode=0700
 [Install]
@@ -2070,6 +2079,10 @@ WantedBy=multi-user.target
         assert!(unit.contains("StateDirectory=preloop"));
         assert!(unit.contains("StateDirectoryMode=0700"));
         assert!(unit.contains("Delegate=cpu memory pids"));
+        // Every VMM inherits the unit's descriptor limit, and SmolVM's virtiofs
+        // passthrough holds one host fd per image inode the guest looked up, so
+        // the systemd default (524288) is below an x86_64 golden's inode count.
+        assert!(unit.contains("LimitNOFILE=2097152"));
         assert!(unit.contains("ProtectKernelModules=true"));
         assert!(unit.contains("ProtectKernelLogs=true"));
         assert!(unit.contains("ProtectClock=true"));
@@ -2095,6 +2108,7 @@ WantedBy=multi-user.target
         assert!(!user_unit.contains("User=preloop"));
         assert!(!user_unit.contains("StateDirectory="));
         assert!(!user_unit.contains("Delegate="));
+        assert!(!user_unit.contains("LimitNOFILE="));
         assert!(!user_unit.contains("SMOLVM_DATA_DIR="));
     }
 
