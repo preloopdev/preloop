@@ -150,18 +150,47 @@ jobs:
             # The repository is public; fetch the same fixtures directly from
             # GitHub instead of failing every shard on an engine-cache miss.
             echo "note: snapshot LFS miss; retrying from GitHub" >&2
-            upstream="https://github.com/${GITHUB_REPOSITORY}.git"
-            # Fetch through a fresh shallow clone: the snapshot checkout's
-            # remote/LFS config (and any checkout-time overrides) can keep
-            # pointing every fetch at the snapshot, even with an explicit
-            # remote or `lfs.url`. The clone is pointer-only until the
-            # include list is fetched.
-            tmp=$(mktemp -d)
-            git clone --quiet --no-checkout --depth=1 "$upstream" "$tmp/repo"
-            git -C "$tmp/repo" lfs fetch origin --include="$includes"
-            mkdir -p .git/lfs/objects
-            cp -a "$tmp/repo/.git/lfs/objects/." .git/lfs/objects/
-            rm -rf "$tmp"
+            # The runner rewrites every GitHub URL to the snapshot, so a
+            # clone or `git lfs fetch` still lands on the snapshot's LFS
+            # endpoint. Talk to the public LFS batch API directly instead.
+            VERSION="$version" GITHUB_REPOSITORY="$GITHUB_REPOSITORY" python3 - <<'PY'
+          import json, os, pathlib, urllib.request
+          
+          version = os.environ["VERSION"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          scenarios = [
+              "06-multi-step", "07-step-failure", "08-job-outputs-needs",
+              "10-uses-checkout", "11-cache-roundtrip", "12-artifact",
+              "13-composite-action", "14-annotations", "15-oidc-id-token",
+          ]
+          objects = []
+          for scenario in scenarios:
+              path = pathlib.Path(f".runner-watch/golden/v{version}/{scenario}/flows.jsonl")
+              lines = path.read_text().splitlines()
+              if not lines or not lines[0].startswith("version https://git-lfs.github.com/spec/"):
+                  continue
+              fields = dict(line.split(" ", 1) for line in lines if " " in line)
+              oid = fields["oid"].removeprefix("sha256:")
+              objects.append({"oid": oid, "size": int(fields["size"])})
+          if objects:
+              request = urllib.request.Request(
+                  f"https://github.com/{repo}.git/info/lfs/objects/batch",
+                  data=json.dumps({"operation": "download", "objects": objects}).encode(),
+                  headers={
+                      "Accept": "application/vnd.git-lfs+json",
+                      "Content-Type": "application/vnd.git-lfs+json",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  batch = json.load(response)
+              for item in batch["objects"]:
+                  with urllib.request.urlopen(item["actions"]["download"]["href"], timeout=60) as response:
+                      data = response.read()
+                  oid = item["oid"]
+                  destination = pathlib.Path(f".git/lfs/objects/{oid[:2]}/{oid[2:4]}/{oid}")
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(data)
+          PY
             for scenario in \
               06-multi-step 07-step-failure 08-job-outputs-needs \
               10-uses-checkout 11-cache-roundtrip 12-artifact \
