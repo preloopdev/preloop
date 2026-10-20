@@ -12,9 +12,51 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::Duration;
 use tar::Archive;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+
+/// TCP connect deadline for the release client (api.github.com and the
+/// asset CDN).
+///
+/// Both hosts complete a TCP handshake in milliseconds when they are
+/// reachable, so 10s tells "the network is down" apart from "the request is
+/// still going somewhere": without it a SYN sent into a black hole leaves
+/// `preloop update` blocked on the OS's own multi-minute connect timeout.
+const RELEASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle read deadline for the release client.
+///
+/// Release assets are hundreds of megabytes and a legitimate download can
+/// outlast any fixed total, so the bound is on silence instead of duration:
+/// while bytes keep arriving the transfer is alive, but two minutes without
+/// a single byte means the connection is dead and the update must fail.
+const RELEASE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Total deadline for one JSON metadata call to the releases API
+/// (`releases/latest`, `releases/tags/<tag>`, `compare`).
+///
+/// Those responses are a few kilobytes and GitHub serves them in
+/// milliseconds; a request unanswered after 30s is a hung connection or an
+/// overloaded endpoint, not a slow one.
+const RELEASE_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Total deadline for one `smolvm --version` / `machine create --help`
+/// probe.
+///
+/// The probe is a local exec that answers in milliseconds; 10s covers a cold
+/// page cache and a first-run wrapper script, while a binary that never
+/// answers (a wedged mount, a broken shim, a wrapper waiting on a lock) is
+/// reported and treated as unusable instead of blocking the update forever.
+const SMOLVM_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total deadline for one `systemctl is-active` / `try-restart` call.
+///
+/// `systemctl` talks to PID 1 over D-Bus and blocks while the daemon is
+/// unresponsive — which is exactly the state in which an operator runs
+/// `preloop update`. The service state is informational, so 30s is ample;
+/// past it the update reports the hang instead of waiting on it.
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
 const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
@@ -138,6 +180,8 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
     let client = preloop_runner_server::shared_http::with_tls_roots(Client::builder())
         .user_agent(USER_AGENT)
         .redirect(updater_redirect_policy())
+        .connect_timeout(RELEASE_CONNECT_TIMEOUT)
+        .read_timeout(RELEASE_IDLE_TIMEOUT)
         .build()
         .context("build release API client")?;
     if args.ensure_runtime {
@@ -389,39 +433,72 @@ fn smolvm_platform() -> Option<&'static str> {
 /// an old binary, so the flag's presence in the help text is the reliable
 /// check (the same probe preloop-vm runs before provisioning).
 async fn probe_mount_socket(binary: &Path) -> bool {
+    probe_mount_socket_with(binary, SMOLVM_PROBE_TIMEOUT).await
+}
+
+/// [`probe_mount_socket`] with an explicit deadline, so the timeout path is
+/// testable without waiting [`SMOLVM_PROBE_TIMEOUT`].
+async fn probe_mount_socket_with(binary: &Path, deadline: Duration) -> bool {
     let mut command = tokio::process::Command::new(binary);
-    command
-        .args(["machine", "create", "--help"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    let stdout = child.stdout.take();
-    let Ok(status) = child.wait().await else {
-        return false;
-    };
-    if !status.success() {
-        return false;
+    command.args(["machine", "create", "--help"]);
+    // The shared runner pipes and drains both streams while it waits, so
+    // neither a silent child (blocked on an input nobody will ever answer) nor
+    // a chatty one (filling a pipe buffer, then looking hung) can stall the
+    // probe, and a grandchild left holding the pipe cannot extend it either.
+    // At the deadline the child is killed and reaped.
+    match preloop_observability::deadline::run_command(
+        command,
+        deadline,
+        "smolvm machine create --help",
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).contains("--mount-socket")
+        }
+        Ok(_) => false,
+        Err(error) if error.timed_out() => {
+            eprintln!(
+                "smolvm `machine create --help` did not answer within {deadline:?} and was \
+                 killed; treating the binary as unusable"
+            );
+            false
+        }
+        // A spawn or I/O failure is not a deadline: it stays as quiet as the
+        // old spawn-failure path (the binary is unusable either way, and a
+        // smolvm that is simply not installed is not worth reporting).
+        Err(_) => false,
     }
-    let Some(mut stdout) = stdout else {
-        return false;
-    };
-    let mut output = String::new();
-    stdout.read_to_string(&mut output).await.is_ok() && output.contains("--mount-socket")
 }
 
 async fn probe_smolvm_version(binary: &Path) -> Option<String> {
+    probe_smolvm_version_with(binary, SMOLVM_PROBE_TIMEOUT).await
+}
+
+/// [`probe_smolvm_version`] with an explicit deadline, so the timeout path is
+/// testable without waiting [`SMOLVM_PROBE_TIMEOUT`].
+async fn probe_smolvm_version_with(binary: &Path, deadline: Duration) -> Option<String> {
     let mut command = tokio::process::Command::new(binary);
-    command
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = command.output().await.ok()?;
+    command.arg("--version");
+    // The runner drains both pipes while it waits, so the one deadline covers
+    // the whole probe — spawn, exit, and the read — and at expiry it kills and
+    // reaps the child instead of leaving it behind.
+    let output =
+        match preloop_observability::deadline::run_command(command, deadline, "smolvm --version")
+            .await
+        {
+            Ok(output) => output,
+            Err(error) if error.timed_out() => {
+                eprintln!(
+                    "smolvm `--version` did not answer within {deadline:?} and was killed; \
+                 treating the binary as unusable"
+                );
+                return None;
+            }
+            // Spawn and wait failures stay silent: a missing or broken binary is a
+            // normal "not installed" answer, not a hang.
+            Err(_) => return None,
+        };
     if !output.status.success() {
         return None;
     }
@@ -729,6 +806,7 @@ async fn fetch_release(
     };
     let response = client
         .get(&url)
+        .timeout(RELEASE_METADATA_TIMEOUT)
         .send()
         .await
         .with_context(|| format!("poll GitHub releases API: {url}"))?;
@@ -746,6 +824,10 @@ async fn download(client: &Client, url: &str, destination: &Path) -> anyhow::Res
     // Asset URLs come from release metadata — never fetch over HTTP.
     require_https_url(url)?;
     let mut response = client
+        // No `.timeout()` here: an asset is a multi-hundred-megabyte stream
+        // whose legitimate duration is unbounded, so the client's
+        // RELEASE_IDLE_TIMEOUT is the bound — it only fails the transfer once
+        // it stops making progress.
         .get(url)
         .send()
         .await
@@ -778,6 +860,9 @@ async fn verify_checksum(
         expected
     } else if let Some(asset) = checksum_asset {
         let response = client
+            // A few dozen bytes of text, streamed like the asset it
+            // describes: the client's RELEASE_IDLE_TIMEOUT bounds it, and a
+            // total would be wrong for a slow-but-live connection.
             .get(&asset.browser_download_url)
             .send()
             .await?
@@ -858,6 +943,9 @@ async fn verify_release_signature(
         )
     })?;
     let signature = client
+        // A few hundred bytes of sidecar, read like the asset and checksum
+        // fetches above: bounded by the client's RELEASE_IDLE_TIMEOUT rather
+        // than a per-request total.
         .get(&signature_asset.browser_download_url)
         .send()
         .await
@@ -980,6 +1068,7 @@ async fn resolve_same_version(
     let url = compare_url(api_url, installed_commit, release_tag);
     let response = client
         .get(&url)
+        .timeout(RELEASE_METADATA_TIMEOUT)
         .send()
         .await
         .with_context(|| format!("poll GitHub compare API: {url}"))?;
@@ -1282,19 +1371,50 @@ async fn restart_systemd_service() -> anyhow::Result<()> {
     if !cfg!(target_os = "linux") || std::env::var_os("PRELOOP_NO_SYSTEMD_RESTART").is_some() {
         return Ok(());
     }
-    let active = tokio::process::Command::new("systemctl")
-        .args(["is-active", "--quiet", "preloop.service"])
-        .status()
-        .await
-        .context("check preloop systemd service")?;
+    let mut is_active = tokio::process::Command::new("systemctl");
+    is_active.args(["is-active", "--quiet", "preloop.service"]);
+    // `run_command_status` leaves this command's stdio alone (inherited) and
+    // bounds only the wait: `systemctl` never has its output piped here.
+    let active = match preloop_observability::deadline::run_command_status(
+        is_active,
+        SYSTEMCTL_TIMEOUT,
+        "systemctl is-active preloop.service",
+    )
+    .await
+    {
+        Ok(status) => status,
+        // The deadline text is what the operator needs from this one; a spawn
+        // failure is reported as itself, under the operation's context.
+        Err(error) if error.timed_out() => {
+            bail!("systemctl is-active preloop.service did not answer within {SYSTEMCTL_TIMEOUT:?}")
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("check preloop systemd service"));
+        }
+    };
     if !active.success() {
         return Ok(());
     }
-    let result = tokio::process::Command::new("systemctl")
-        .args(["try-restart", "--no-block", "preloop.service"])
-        .status()
-        .await
-        .context("restart preloop systemd service")?;
+    let mut try_restart = tokio::process::Command::new("systemctl");
+    try_restart.args(["try-restart", "--no-block", "preloop.service"]);
+    // A timeout here is reported, never swallowed: the caller has just
+    // replaced the running binary, so "the service may still be running the
+    // old one" is information the operator needs.
+    let result = match preloop_observability::deadline::run_command_status(
+        try_restart,
+        SYSTEMCTL_TIMEOUT,
+        "systemctl try-restart preloop.service",
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(error) if error.timed_out() => bail!(
+            "systemctl try-restart preloop.service did not answer within {SYSTEMCTL_TIMEOUT:?}"
+        ),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("restart preloop systemd service"));
+        }
+    };
     if !result.success() {
         bail!("systemctl try-restart preloop.service failed with {result}");
     }
@@ -1607,6 +1727,43 @@ mod tests {
                 "version={version}, flag={flag}"
             );
         }
+    }
+
+    /// A smolvm that never answers must end the probe at its deadline rather
+    /// than hang the update.
+    ///
+    /// `preloop update` probes the resolved binary on every run; before the
+    /// deadline existed, a hung wrapper (a wedged mount, a shim waiting on a
+    /// lock) left the probe waiting on the child forever — the same shape as
+    /// the frozen CI engine, and the fail-before evidence for this fix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn smolvm_probes_end_at_the_deadline_instead_of_hanging() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("smolvm-hung");
+        std::fs::write(&executable, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let deadline = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        assert!(
+            !probe_mount_socket_with(&executable, deadline).await,
+            "a probe that never answers must report an unusable binary"
+        );
+        assert!(
+            probe_smolvm_version_with(&executable, deadline)
+                .await
+                .is_none(),
+            "a probe that never answers must report no version"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "both probes must give up at {deadline:?}, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

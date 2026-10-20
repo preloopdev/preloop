@@ -86,7 +86,7 @@ runner-watch record-golden --runner /path/to/actions-runner --scenario <name>
 
 # Replay a captured scenario against a running preloop server and diff every
 # request/response pair:
-runner-watch conform --runner 2.336.0 --preloop-url http://127.0.0.1:9090
+runner-watch conform --runner 2.337.0 --preloop-url http://127.0.0.1:9090
 
 # The older mitm worktree variant (still used for ad-hoc captures):
 experiments/mitm/bin/conform.sh --golden .runner-watch/golden/v2.336.0/01-register-and-idle \
@@ -152,7 +152,7 @@ campaign runs.
 
 ## Tracking new official runner versions
 
-The pinned target is `versions.toml` (`runner_version = "2.336.0"`), and
+The pinned target is `versions.toml` (`runner_version = "2.337.0"`), and
 `runner-watch` keeps the repo from silently desyncing when upstream ships a
 new release. The pipeline is watch → diff → triage → implement → review →
 record → conform → PR:
@@ -175,7 +175,7 @@ runner-watch implement  # Codex implements the specs (dry-run: prompts only)
 runner-watch review     # Claude reviews the diffs
 
 runner-watch record-golden --runner /path/to/actions-runner --scenario <name>
-runner-watch conform --runner 2.336.0 --preloop-url http://127.0.0.1:9090
+runner-watch conform --runner 2.337.0 --preloop-url http://127.0.0.1:9090
                         # record official bytes for the new version and replay
                         # them against the built server
 
@@ -225,10 +225,11 @@ the reconstruction and replay gate: its 27 captures all contain a populated
 not silently presented as official-runner provenance.
 
 `benchmarks/conformance/targets.toml` is the single CI target list. The
-conformance workflow starts one replay server and currently iterates only the
-shipped v2.336.0 target. The recovered v2.337.0 cell is intentionally omitted
-until its reconstructed workflows have protocol-equivalent provenance. Adding
-a future verified version is one target entry, not another workflow job.
+conformance workflow starts one replay server and currently still iterates the
+flat v2.336.0 corpus there. The recovered v2.337.0 cell remains comparison
+material until its reconstructed workflows have protocol-equivalent
+provenance suitable for the green gate. Adding a future verified version is
+one target entry, not another workflow job.
 
 `experiments/mitm/bin/reconstruct_scenario.py` decodes the first populated
 `acquirejob` response and emits the workflow plus the standard submit/wait
@@ -441,12 +442,13 @@ changes against the official runner (golden replay), per the PR template.
 
 ## Compatibility targets
 
-- Protocol: official `actions/runner` v2.336.0, pinned in `versions.toml` and
+- Protocol: official `actions/runner` v2.337.0, pinned in `versions.toml` and
 tracked through the watch→diff→triage→conform pipeline in
 [Tracking new official runner versions](#tracking-new-official-runner-versions).
 - Upstream reference: `ChristopherHX/runner.server` at the pinned commit,
   per [fidelity-gap.md](fidelity-gap.md).
-- Current status (2026-09): the official runner's v2.336.0 corpus has 36 gated
-  captures; three captures are quarantined by the corpus checks. The full
-  broker lifecycle is covered by the recorded conformance material.
+- Current status: `versions.toml` names v2.337.0; the green-gate replay list in
+  `benchmarks/conformance/targets.toml` still points at the flat v2.336.0
+  corpus (36 gated captures, three quarantined). The v2.337.0 cell stays
+  comparison material until it has protocol-equivalent provenance.
 

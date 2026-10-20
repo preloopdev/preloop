@@ -24,6 +24,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Context;
+use preloop_observability::deadline::run_command_blocking;
 
 /// Node config path, unless `PRELOOP_AENV_CONFIG` overrides it (testing).
 const DEFAULT_CONFIG_PATH: &str = "/var/lib/aenv/config/config.toml";
@@ -36,6 +37,25 @@ const ENGINE_IP_ENV: &str = "PRELOOP_AENV_ENGINE_IP";
 const CONFIG_ENV: &str = "PRELOOP_AENV_CONFIG";
 /// Fallback sandbox pools when the node config does not name them.
 const DEFAULT_POOLS: [&str; 2] = ["10.11.0.0/16", "10.12.0.0/16"];
+
+/// One privileged command under `sudo -n` (`iptables`, `nft`, `ip`, `cp`,
+/// `mv`, `systemctl`).
+///
+/// `sudo -n` means "fail immediately rather than prompt", so the commands that
+/// must fail already do; the programs themselves are fast. A minute is
+/// therefore a wedge bound, not a work bound: it catches the cases where the
+/// call goes quiet — a locked tty, a slow NSS/LDAP lookup inside sudo, a hung
+/// kernel netlink operation behind `iptables` — instead of blocking the engine
+/// startup that reconciles egress.
+const SUDO_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One `systemctl` control command (`is-active`, `restart`) for the local
+/// `aenv` service.
+///
+/// Local systemd answers in milliseconds; 30 seconds only catches a control
+/// plane that has stopped answering (systemd busy draining units, or a wedged
+/// dbus) during the post-restart readiness poll.
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An IPv4 CIDR: address masked to `prefix` length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,13 +233,17 @@ fn config_path() -> PathBuf {
 
 /// Run `program` with `sudo -n` (never interactive: either the operator
 /// granted NOPASSWD for it or the engine must fail loudly, not hang).
+///
+/// `-n` removes the password prompt but not every way a privileged call can
+/// stop answering (a locked tty, a slow NSS lookup inside sudo, a hung kernel
+/// netlink op behind `iptables`), so the call is bounded by the shared
+/// synchronous deadline runner: `/dev/null` stdin, both pipes drained on their
+/// own threads, and kill-and-reap at [`SUDO_TIMEOUT`].
 fn sudo(program: &str, args: &[&str]) -> anyhow::Result<std::process::Output> {
-    let output = Command::new("sudo")
-        .args(["-n", "--", program])
-        .args(args)
-        .output()
-        .with_context(|| format!("spawning sudo {program}"))?;
-    Ok(output)
+    let mut command = Command::new("sudo");
+    command.args(["-n", "--", program]).args(args);
+    run_command_blocking(command, SUDO_TIMEOUT, &format!("sudo {program}"))
+        .map_err(anyhow::Error::from)
 }
 
 fn sudo_ok(program: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
@@ -235,10 +259,10 @@ fn sudo_ok(program: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
 }
 
 fn service_active() -> bool {
-    Command::new("systemctl")
-        .args(["is-active", "--quiet", "aenv"])
-        .status()
-        .is_ok_and(|status| status.success())
+    let mut command = Command::new("systemctl");
+    command.args(["is-active", "--quiet", "aenv"]);
+    run_command_blocking(command, SYSTEMCTL_TIMEOUT, "systemctl is-active aenv")
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Ensure the engine at `server_url` is reachable from AgentENV sandboxes:

@@ -80,7 +80,7 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
         return Ok(false);
     }
 
-    let token = crate::github_push::push_token(shared, &repository)
+    let credential = crate::github_push::push_credential(shared, &repository)
         .await
         .ok_or_else(|| anyhow::anyhow!("no GitHub credentials configured"))?;
 
@@ -91,7 +91,8 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
     let query = serde_urlencoded::to_string([("head", head.as_str()), ("state", "open")])
         .expect("url-encoding cannot fail for str pairs");
     let existing = crate::github_push::github_json(
-        &token,
+        shared,
+        &credential,
         &repository,
         "GET",
         &format!("pulls?{query}"),
@@ -110,7 +111,8 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
             .unwrap_or_else(|| "local server (no public URL configured)".to_owned())
     );
     let pr = crate::github_push::github_json(
-        &token,
+        shared,
+        &credential,
         &repository,
         "POST",
         "pulls",

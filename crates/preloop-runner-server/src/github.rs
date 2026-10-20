@@ -5573,7 +5573,7 @@ pub async fn github_callback(
         ));
     };
 
-    let credentials = match exchange_manifest_code(code).await {
+    let credentials = match exchange_manifest_code(&shared.state, code).await {
         Ok(credentials) => credentials,
         Err(status) => {
             warn!("GitHub App manifest code exchange failed");
@@ -5606,8 +5606,15 @@ pub async fn github_callback(
 
 /// Exchange the one-time manifest `code` for the App's credentials. The code is
 /// caller-supplied, so it is encoded as a single path segment.
-async fn exchange_manifest_code(code: &str) -> Result<AppManifestConversion, StatusCode> {
-    let client = crate::shared_http::CLIENT.clone();
+///
+/// The call is anonymous — the code itself is the only credential — so it is
+/// observed against GitHub's anonymous budget, under the App-auth subsystem
+/// that owns App registration. Everything still maps to a 500 for the handoff
+/// page, including a refusal while the breaker is open.
+async fn exchange_manifest_code(
+    state: &crate::state::AppState,
+    code: &str,
+) -> Result<AppManifestConversion, StatusCode> {
     let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
         .unwrap_or_else(|_| "https://api.github.com".to_owned());
     let url = format!(
@@ -5615,20 +5622,17 @@ async fn exchange_manifest_code(code: &str) -> Result<AppManifestConversion, Sta
         api_base,
         crate::actions::percent_encode_path_segment(code)
     );
-    let res = client
-        .post(&url)
-        .header("User-Agent", "preloop")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if !res.status().is_success() {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    res.json::<AppManifestConversion>()
-        .await
+    let value = crate::github_breaker::send_github_json(
+        state,
+        &crate::github_breaker::GithubCredential::anonymous(),
+        crate::github_breaker::GithubSubsystem::AppAuth,
+        reqwest::Method::POST,
+        &url,
+        None,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    serde_json::from_value::<AppManifestConversion>(value)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -6313,7 +6317,13 @@ mod tests {
             Self::with_workspace(temp, ws_dir).await
         }
 
+        /// Build the fixture's engine.
+        ///
+        /// Completes the process-wide outbound client first, so its one-time
+        /// TLS root build cannot land inside a poll budget one of these tests
+        /// asserts on (same reasoning as [`poll_only_shared`]).
         async fn with_workspace(temp: &tempfile::TempDir, ws_dir: std::path::PathBuf) -> Self {
+            std::sync::LazyLock::force(&crate::shared_http::CLIENT);
             let event_sha = if ws_dir.join(".github/workflows").is_dir() {
                 commit_workspace(&ws_dir)
             } else {
@@ -7874,7 +7884,20 @@ mod tests {
 
     /// Engine state for driving [`poll_fresh_merge`] directly: a poll schedule
     /// and the environment's stubbed API, with no repository or merge needed.
+    ///
+    /// Also builds the process-wide outbound client before any caller starts a
+    /// poll budget. [`crate::shared_http::CLIENT`] is a `LazyLock` whose first
+    /// use pays for the TLS root set — the bundled Mozilla anchors, the OS
+    /// certificate store ([`crate::shared_http::tls_roots`] reads it through a
+    /// daemon with a deadline of its own), and any `PRELOOP_GITHUB_CA_FILE` /
+    /// `SSL_CERT_FILE` bundle. On a host with a slow trust store the *first*
+    /// probe spends the budget inside that build, no second poll happens, and
+    /// "the probe is retried within the budget" fails on the certificate store
+    /// instead of on the poll schedule. Warming here is test-only and keeps
+    /// every assertion in this family measuring the schedule the poll code is
+    /// written to honour; the engine's own client build is untouched.
     async fn poll_only_shared(temp: &tempfile::TempDir, budget: Duration) -> Arc<SharedState> {
+        std::sync::LazyLock::force(&crate::shared_http::CLIENT);
         let mut state = AppState::new(temp.path().join("state")).await.unwrap();
         state.fresh_merge_poll = FreshMergePoll {
             budget,
@@ -10367,7 +10390,14 @@ jobs:
             .unwrap()
             .as_secs()
             + 60;
-        let (api, requests) = start_github_stub(move |_, _, _| {
+        let (api, requests) = start_github_stub(move |_, path, _| {
+            // Only the actions path is throttled. Everything else — notably
+            // the submit-time PAT scope probe, which shares this credential's
+            // breaker and would otherwise park the bucket before the test
+            // parks it — answers normally.
+            if path != "/repos/o/r/tarball/main" {
+                return (200, vec![], serde_json::json!({}));
+            }
             (
                 429,
                 vec![("x-ratelimit-reset", reset.to_string())],

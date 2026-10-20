@@ -9,7 +9,13 @@
 //! Rules shared by every helper:
 //!
 //! - The deadline covers the whole operation, including process spawn, output
-//!   draining, and reaping; it is not restarted per step.
+//!   draining, and reaping; it is not restarted per step. Spawn itself runs on
+//!   a helper thread, because `fork`/`exec` blocks in the kernel — resolving
+//!   the program on an unresponsive filesystem, a caller's `pre_exec` hook —
+//!   and that wait must not outrank the deadline. A spawn that outruns the
+//!   deadline cannot be cancelled, so its thread lives until the kernel
+//!   returns and the child it eventually produces is killed rather than
+//!   orphaned (the same trade-off [`run_blocking`] documents).
 //! - Child output is drained concurrently with the wait. A child that fills a
 //!   64 KiB pipe buffer blocks on `write` and looks exactly like a hang, so a
 //!   naive wait would either time out spuriously or deadlock on the pipe.
@@ -19,10 +25,17 @@
 //!   deadlock.
 //! - Expiry kills the child, then reaps it under a short grace period. The
 //!   error names the caller's `what` and the deadline so an operator can tell
-//!   which dependency hung. [`run_command_status_in_group`] kills the child's
-//!   whole process group instead, for shells whose real work is in a
-//!   grandchild; dropping any of these futures is the same cancellation as
-//!   expiry, so the guard kills with it.
+//!   which dependency hung.
+//! - On Unix the child is placed in its own process group and expiry signals
+//!   the whole group: a killed `git fetch` takes its `index-pack`, transport,
+//!   and credential helpers with it instead of leaving them running against
+//!   the repository after the caller's lock has been released. Other platforms
+//!   signal the direct child only. The group is named by the id captured at
+//!   spawn, so a helper that outlives its parent is still reached when the
+//!   direct child has already been reaped. [`run_command_status_in_group`]
+//!   exposes the same whole-group cancellation explicitly for shell wrappers;
+//!   dropping these futures is the same cancellation as expiry, so the group
+//!   guard kills with it.
 //! - Nothing here configures environment variables. Callers apply their own
 //!   non-interactive policy (`GIT_TERMINAL_PROMPT`, `GIT_ASKPASS`, …) to the
 //!   [`Command`] they pass in.
@@ -133,7 +146,6 @@ impl CommandError {
             program: program.to_owned(),
         }
     }
-
     fn spawn(what: &str, program: String, source: io::Error) -> Self {
         Self::Spawn {
             what: what.to_owned(),
@@ -180,6 +192,25 @@ impl CommandError {
             Self::Spawn { .. } | Self::Io { .. } => None,
         }
     }
+}
+
+/// The timeout error plus the journal line an operator sees when a hung
+/// dependency is killed.
+///
+/// The message is the same text as the returned error — `what`, the deadline,
+/// and the program — so a caller that wraps or discards the error still leaves
+/// the reason in the engine's log. `process_group` records whether the kill
+/// reached the child's own workers.
+fn timeout_error(what: &str, program: &str, deadline: Duration) -> CommandError {
+    let error = CommandError::timeout_error(what, program, deadline);
+    tracing::warn!(
+        what = %what,
+        program = %program,
+        deadline_ms = deadline.as_millis() as u64,
+        process_group = cfg!(unix),
+        "{error}",
+    );
+    error
 }
 
 impl fmt::Display for CommandError {
@@ -283,9 +314,182 @@ async fn read_pipe<R: AsyncRead + Unpin>(
     Ok((captured, truncated))
 }
 
+/// Put the child in its own process group so that expiry can signal the whole
+/// tree it may spawn, not just the direct child.
+#[cfg(unix)]
+fn isolate_process_group(cmd: &mut Command) {
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group(_cmd: &mut Command) {}
+
+/// The synchronous twin of [`isolate_process_group`].
+#[cfg(unix)]
+fn isolate_process_group_blocking(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group_blocking(_cmd: &mut std::process::Command) {}
+
+/// SIGKILL one process group.
+///
+/// `pgid` is the id of a child that was spawned through
+/// [`isolate_process_group`], i.e. the child's pid and its group id.
+/// `-pgid` therefore names exactly the group that child leads, and no other
+/// process: the engine never joins a group led by one of its children.
+///
+/// The id is captured at spawn, because a reaped child has no id left to read
+/// while its workers may still be holding the pipes. That leaves the standard
+/// pid-reuse window: if the group has emptied and the id has been handed to a
+/// new process that leads its own group, this signal reaches that stranger.
+/// The window is accepted — the alternative is leaving the child's workers
+/// running against the repository after the caller's deadline.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_process_group(pgid: u32) {
+    // SAFETY: `kill(2)` takes two integers and reads no memory this process
+    // owns. The target is a process group created for the child by
+    // `process_group(0)`, so signalling it cannot reach the engine or its
+    // siblings; `pgid` comes from a live `Child::id()`. SIGKILL is 9 on every
+    // Unix this engine targets, and the literal keeps the module free of a
+    // libc dependency.
+    const SIGKILL: i32 = 9;
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let _ = unsafe { kill(-(pgid as i32), SIGKILL) };
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: u32) {}
+
+/// Kill a child whose caller has already given up on it: its group first, so
+/// the workers it spawned do not outlive the deadline either.
+fn abandon_spawned_child(mut child: Child) {
+    if let Some(pid) = child.id() {
+        kill_process_group(pid);
+    }
+    let _ = child.start_kill();
+    // `kill_on_drop` is set by every public runner, so the drop below reaps it
+    // instead of leaving a zombie.
+}
+
+/// Kill and reap a child the synchronous runner has given up on.
+fn abandon_spawned_child_blocking(mut child: std::process::Child) {
+    kill_process_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Spawn `cmd` on a blocking thread, so a `fork`/`exec` that blocks in the
+/// kernel — resolving the program on an unresponsive filesystem, a caller's
+/// `pre_exec` hook — cannot hold the caller past `deadline`.
+///
+/// The kernel call itself cannot be cancelled, so a spawn that outruns the
+/// deadline keeps its thread (exactly like an expired [`run_blocking`] closure)
+/// and the child it eventually produces is killed, group and all, instead of
+/// being orphaned behind a caller that stopped waiting.
+async fn spawn_bounded(
+    mut cmd: Command,
+    deadline: Duration,
+    started: Instant,
+    what: &str,
+    program: &str,
+) -> Result<Child, CommandError> {
+    let remaining = deadline.saturating_sub(started.elapsed());
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    // The handle is dropped immediately: a blocking task is never cancelled,
+    // and its answer is read from the channel.
+    drop(tokio::task::spawn_blocking(move || match cmd.spawn() {
+        Ok(child) => {
+            if let Err(Ok(child)) = sender.send(Ok(child)) {
+                abandon_spawned_child(child);
+            }
+        }
+        Err(source) => {
+            let _ = sender.send(Err(source));
+        }
+    }));
+    match tokio::time::timeout(remaining, receiver).await {
+        Ok(Ok(Ok(child))) => Ok(child),
+        Ok(Ok(Err(source))) => Err(CommandError::spawn(what, program.to_owned(), source)),
+        Ok(Err(_cancelled)) => Err(CommandError::io(
+            what,
+            program,
+            io::Error::other("the spawn task was cancelled"),
+        )),
+        Err(_) => Err(timeout_error(what, program, deadline)),
+    }
+}
+
+/// What a bounded synchronous spawn produced.
+enum SyncSpawn {
+    /// The process started inside the deadline.
+    Child(std::process::Child),
+    /// The process itself could not be started.
+    Failed(io::Error),
+    /// The helper thread that performs the spawn could not be started.
+    Unavailable(io::Error),
+    /// The deadline expired while the kernel was still starting the process.
+    TimedOut,
+}
+
+/// The synchronous twin of [`spawn_bounded`].
+///
+/// A blocking caller has no executor to park on, so the spawn moves to a
+/// short-lived helper thread and the caller waits on a channel. That costs one
+/// thread per call; the alternative is a `fork`/`exec` wedged in the kernel
+/// outranking the deadline entirely. A child that arrives after the caller
+/// gave up is killed, group and all, on the helper thread.
+fn spawn_bounded_blocking(
+    mut cmd: std::process::Command,
+    deadline: Duration,
+    started: Instant,
+) -> SyncSpawn {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let helper = std::thread::Builder::new()
+        .name("deadline-spawn".to_owned())
+        .spawn(move || match cmd.spawn() {
+            Ok(child) => {
+                if let Err(returned) = sender.send(Ok(child))
+                    && let Ok(child) = returned.0
+                {
+                    abandon_spawned_child_blocking(child);
+                }
+            }
+            Err(source) => {
+                let _ = sender.send(Err(source));
+            }
+        });
+    if let Err(source) = helper {
+        return SyncSpawn::Unavailable(source);
+    }
+    match receiver.recv_timeout(deadline.saturating_sub(started.elapsed())) {
+        Ok(Ok(child)) => SyncSpawn::Child(child),
+        Ok(Err(source)) => SyncSpawn::Failed(source),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => SyncSpawn::TimedOut,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => SyncSpawn::Unavailable(
+            io::Error::other("the spawn thread exited without reporting"),
+        ),
+    }
+}
+
 /// Kill the child and reap it, but never block the caller past the grace
 /// period. A grandchild holding the pipe open does not extend the wait.
-async fn kill_and_reap(child: &mut Child) {
+///
+/// `pgid` is the id captured when the child was spawned: `Child::id()` is
+/// `None` once the direct child has been reaped, and a worker that outlived it
+/// still has to die, so the group is named by the value from spawn rather than
+/// by a lookup that may already have gone stale.
+async fn kill_and_reap(child: &mut Child, pgid: Option<u32>) {
+    // The group signal takes the child's own workers down with it; the direct
+    // kill below keeps non-Unix platforms and a racing exit covered.
+    if let Some(pgid) = pgid {
+        kill_process_group(pgid);
+    }
     // `kill_on_drop` is set by every public runner, but an explicit kill
     // returns the error to the caller instead of relying on drop timing.
     let _ = child.start_kill();
@@ -294,6 +498,7 @@ async fn kill_and_reap(child: &mut Child) {
 
 async fn wait_with_capture(
     mut child: Child,
+    pgid: Option<u32>,
     deadline: Duration,
     started: Instant,
     what: &str,
@@ -327,10 +532,18 @@ async fn wait_with_capture(
         ))
     };
     match tokio::time::timeout(remaining, capture).await {
-        Ok(result) => result,
+        // The child finished before the deadline: the ordinary result.
+        Ok(Ok(finished)) if started.elapsed() < deadline => Ok(finished),
+        // The child finished *after* the deadline. The deadline covers the
+        // whole operation, and the synchronous runner fails an operation that
+        // outran it, so this expiry is reported the same way instead of
+        // pretending the bound held. Nothing is left to kill: the capture
+        // reached EOF on both pipes.
+        Ok(Ok(_)) => Err(timeout_error(what, program, deadline)),
+        Ok(Err(error)) => Err(error),
         Err(_) => {
-            kill_and_reap(&mut child).await;
-            Err(CommandError::timeout_error(what, program, deadline))
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, program, deadline))
         }
     }
 }
@@ -343,11 +556,12 @@ async fn wait_with_capture(
 /// the wait. Everything else — program, arguments, working directory, the
 /// complete environment — belongs to the caller.
 ///
-/// `deadline` covers spawn, output capture, and waiting. On expiry the child
-/// is killed and reaped within a short grace period, and the returned
-/// [`CommandError`] names `what`, the program, and the deadline. Captured
-/// output is returned even for a non-zero exit status; success is the
-/// caller's decision.
+/// `deadline` covers spawn, output capture, and waiting; the spawn runs on a
+/// blocking thread so a `fork`/`exec` blocked in the kernel cannot outrank the
+/// deadline. On expiry the child is killed and reaped within a short grace
+/// period, and the returned [`CommandError`] names `what`, the program, and the
+/// deadline. Captured output is returned even for a non-zero exit status;
+/// success is the caller's decision.
 ///
 /// Output is unbounded. Callers that must cap what a chatty child can make the
 /// engine buffer use [`run_command_capped`], which still drains the pipes to
@@ -412,10 +626,10 @@ async fn run_command_with_limit(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let child = cmd
-        .spawn()
-        .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
-    wait_with_capture(child, deadline, started, what, &program, max_capture).await
+    isolate_process_group(&mut cmd);
+    let child = spawn_bounded(cmd, deadline, started, what, &program).await?;
+    let pgid = child.id();
+    wait_with_capture(child, pgid, deadline, started, what, &program, max_capture).await
 }
 
 /// Run a command with bytes written to its stdin, bounded by `deadline`.
@@ -436,9 +650,9 @@ pub async fn run_command_with_stdin(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
+    isolate_process_group(&mut cmd);
+    let mut child = spawn_bounded(cmd, deadline, started, what, &program).await?;
+    let pgid = child.id();
 
     let remaining = deadline.saturating_sub(started.elapsed());
     let mut stdin = child.stdin.take();
@@ -446,8 +660,21 @@ pub async fn run_command_with_stdin(
         let write = async {
             match stdin.take() {
                 Some(mut pipe) => {
-                    pipe.write_all(input).await?;
-                    pipe.shutdown().await
+                    let result = async {
+                        pipe.write_all(input).await?;
+                        pipe.shutdown().await
+                    }
+                    .await;
+                    match result {
+                        // The child closed its stdin early — `head -c N`, a
+                        // `git` subcommand that rejects its arguments — so
+                        // there is no reader left for the rest of `input`.
+                        // That is a normal end of input, not a failure: the
+                        // exit status and captured output are still the
+                        // caller's result.
+                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                        other => other,
+                    }
                 }
                 None => Ok(()),
             }
@@ -469,21 +696,24 @@ pub async fn run_command_with_stdin(
         })
     };
     match tokio::time::timeout(remaining, exchange).await {
-        Ok(result) => result,
+        Ok(Ok(output)) if started.elapsed() < deadline => Ok(output),
+        // Finished after the deadline; see `wait_with_capture`.
+        Ok(Ok(_)) => Err(timeout_error(what, &program, deadline)),
+        Ok(Err(error)) => Err(error),
         Err(_) => {
-            kill_and_reap(&mut child).await;
-            Err(CommandError::timeout_error(what, &program, deadline))
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, &program, deadline))
         }
     }
 }
 
 /// Run a command and return only its exit status, bounded by `deadline`.
 ///
-/// Unlike [`run_command`], output is not captured: the caller's `stdout` and
-/// `stderr` configuration is left untouched (inherited by default). This is
-/// the variant for long-running installers whose output should reach the
-/// engine's own streams. Do not set piped stdio here — nothing drains it, so a
-/// chatty child would fill the pipe and stall; use [`run_command`] instead.
+/// Unlike [`run_command`], output is not returned: streams the caller left
+/// inherited reach the engine's own `stdout`/`stderr`, and streams the caller
+/// piped are drained and discarded, so a chatty child cannot stall on a full
+/// pipe. This is the variant for long-running installers whose output should
+/// reach the engine's logs.
 pub async fn run_command_status(
     mut cmd: Command,
     deadline: Duration,
@@ -493,16 +723,29 @@ pub async fn run_command_status(
     let program = program_name(&cmd);
     cmd.kill_on_drop(true);
     cmd.stdin(Stdio::null());
-    let mut child = cmd
-        .spawn()
-        .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
+    isolate_process_group(&mut cmd);
+    let mut child = spawn_bounded(cmd, deadline, started, what, &program).await?;
+    let pgid = child.id();
     let remaining = deadline.saturating_sub(started.elapsed());
-    match tokio::time::timeout(remaining, child.wait()).await {
-        Ok(Ok(status)) => Ok(status),
+    let exchange = async {
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        // A piped stream is drained and thrown away (the signature returns no
+        // output) — leaving it undrained would stall a healthy but chatty
+        // child until the deadline. Inherited streams are `None` here and stay
+        // the caller's.
+        let (status, _stdout, _stderr) =
+            tokio::join!(child.wait(), read_pipe(stdout, 0), read_pipe(stderr, 0),);
+        status
+    };
+    match tokio::time::timeout(remaining, exchange).await {
+        Ok(Ok(status)) if started.elapsed() < deadline => Ok(status),
+        // Finished after the deadline; see `wait_with_capture`.
+        Ok(Ok(_)) => Err(timeout_error(what, &program, deadline)),
         Ok(Err(source)) => Err(CommandError::io(what, &program, source)),
         Err(_) => {
-            kill_and_reap(&mut child).await;
-            Err(CommandError::timeout_error(what, &program, deadline))
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, &program, deadline))
         }
     }
 }
@@ -525,36 +768,35 @@ pub async fn run_command_status_in_group(
     deadline: Duration,
     what: &str,
 ) -> Result<ExitStatus, CommandError> {
-    #[cfg(unix)]
-    cmd.process_group(0);
+    // `run_command_status` already isolates and kills the group on expiry.
+    // Keep this explicit variant for callers that also cancel by dropping the
+    // future: `ProcessGroup`'s guard closes that cancellation path.
     let started = Instant::now();
     let program = program_name(&cmd);
     cmd.kill_on_drop(true);
     cmd.stdin(Stdio::null());
-    let mut child = cmd
-        .spawn()
-        .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
-    // Declared after `child`, so a dropped future signals the group before the
-    // child's own kill-on-drop runs.
+    isolate_process_group(&mut cmd);
+    let mut child = spawn_bounded(cmd, deadline, started, what, &program).await?;
     let mut group = ProcessGroup::of(&child);
     let remaining = deadline.saturating_sub(started.elapsed());
     match tokio::time::timeout(remaining, child.wait()).await {
-        Ok(Ok(status)) => {
-            // Collected: the group has no live leader left to sweep, and its id
-            // may already belong to somebody else.
+        Ok(Ok(status)) if started.elapsed() < deadline => {
             group.disarm();
             Ok(status)
         }
+        Ok(Ok(_)) => {
+            let pgid = group.take();
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, &program, deadline))
+        }
         Ok(Err(source)) => {
-            // The wait failed, so the child's state is unknown; sweep the group
-            // rather than leave whatever it spawned behind the error.
             group.kill();
             Err(CommandError::io(what, &program, source))
         }
         Err(_) => {
-            group.kill();
-            kill_and_reap(&mut child).await;
-            Err(CommandError::timeout_error(what, &program, deadline))
+            let pgid = group.take();
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, &program, deadline))
         }
     }
 }
@@ -565,54 +807,32 @@ pub async fn run_command_status_in_group(
 /// one: without it, only the direct child dies and the group's other members
 /// are reparented and outlive the wait.
 struct ProcessGroup {
-    #[cfg(unix)]
-    id: Option<i32>,
+    id: Option<u32>,
 }
 
 impl ProcessGroup {
     /// The group of a freshly spawned leader, or an inert guard when none can
     /// be addressed.
     fn of(child: &Child) -> Self {
-        #[cfg(unix)]
-        {
-            // `process_group(0)` makes the child the leader of a fresh group,
-            // so its pid *is* the group id. That id cannot be this process's
-            // own group: a live member pins its group's id — we are one — so
-            // the number cannot be handed to a new process. `kill` reads an id
-            // of zero or less as "this process's own group", which is why a
-            // non-positive id is never used, and a child whose group attribute
-            // silently did not apply leaves a pid that names no group: the
-            // signal then reaches nobody, which is the safe direction.
-            let id = child
-                .id()
-                .and_then(|id| i32::try_from(id).ok())
-                .filter(|id| *id > 0);
-            Self { id }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = child;
-            Self {}
-        }
+        Self { id: child.id() }
     }
 
     /// Stop signalling on drop: the leader was collected, so the group is
     /// drained and its id is free for the OS to hand to somebody else.
     fn disarm(&mut self) {
-        #[cfg(unix)]
-        {
-            self.id = None;
-        }
+        self.id = None;
+    }
+
+    /// Take the group id for an explicit kill-and-reap path.
+    fn take(&mut self) -> Option<u32> {
+        self.id.take()
     }
 
     /// SIGKILL every member now. An error means the group has already drained,
     /// which is the outcome the caller wanted anyway.
     fn kill(&mut self) {
-        #[cfg(unix)]
-        {
-            if let Some(id) = self.id.take() {
-                kill_process_group(id);
-            }
+        if let Some(id) = self.id.take() {
+            kill_process_group(id);
         }
     }
 }
@@ -621,23 +841,6 @@ impl Drop for ProcessGroup {
     fn drop(&mut self) {
         self.kill();
     }
-}
-
-/// SIGKILL a whole process group, by id.
-///
-/// The direct call would be `libc::killpg` (or its safe wrapper, `nix`), and
-/// neither is available here: the workspace forbids `unsafe`, and a dependency
-/// change may not share a pull request with source, so this crate carries no
-/// signal dependency. `kill` with a negative pid is the same call
-/// [`run_command_status_in_group`]'s callers need, and the same tool
-/// `preloop-vm` already uses as `kill -9 <pid>` for orphaned hypervisors. It
-/// runs through [`run_command_blocking`] like every other child here: bounded,
-/// with the pipes drained so a chatty `kill` cannot stall the deadline path.
-#[cfg(unix)]
-fn kill_process_group(id: i32) {
-    let mut kill = std::process::Command::new("kill");
-    kill.arg("-9").arg(format!("-{id}"));
-    let _ = run_command_blocking(kill, KILL_REAP_GRACE, "process-group SIGKILL");
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +898,7 @@ fn spawn_pipe_reader<R: io::Read + Send + 'static>(
 /// Kill the child and poll for its reaping, never blocking past the grace
 /// period.
 fn kill_and_reap_blocking(child: &mut std::process::Child) {
+    kill_process_group(child.id());
     let _ = child.kill();
     let reap_deadline = Instant::now() + KILL_REAP_GRACE;
     loop {
@@ -719,8 +923,13 @@ fn kill_and_reap_blocking(child: &mut std::process::Child) {
 ///
 /// Output collection also stays inside the deadline: if a descendant inherits
 /// the pipes and keeps them open after the direct child exits, the call fails
-/// rather than waiting on that descendant forever. Reader threads are detached
-/// on expiry and exit when the pipes finally close.
+/// rather than waiting on that descendant forever, and it signals the child's
+/// process group on the way out so the descendant stops holding them. Reader
+/// threads are detached on expiry and exit at EOF once those pipes close.
+///
+/// Starting the process is bounded too: the spawn runs on a short-lived helper
+/// thread, so a `fork`/`exec` wedged in the kernel cannot hold the caller past
+/// the deadline.
 ///
 /// Output is unbounded; use [`run_command_blocking_capped`] to bound what a
 /// chatty child can make the engine buffer.
@@ -749,9 +958,18 @@ pub fn run_command_blocking_capped(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
+    isolate_process_group_blocking(&mut cmd);
+    let mut child = match spawn_bounded_blocking(cmd, deadline, started) {
+        SyncSpawn::Child(child) => child,
+        SyncSpawn::Failed(source) => {
+            return Err(CommandError::spawn(what, program.clone(), source));
+        }
+        SyncSpawn::Unavailable(source) => {
+            return Err(CommandError::io(what, &program, source));
+        }
+        // The kernel was still starting the process when the deadline passed.
+        SyncSpawn::TimedOut => return Err(timeout_error(what, &program, deadline)),
+    };
 
     let (sender, receiver) = std::sync::mpsc::channel();
     let readers = (|| -> io::Result<()> {
@@ -788,7 +1006,7 @@ pub fn run_command_blocking_capped(
         let elapsed = started.elapsed();
         if elapsed >= deadline {
             kill_and_reap_blocking(&mut child);
-            return Err(CommandError::timeout_error(what, &program, deadline));
+            return Err(timeout_error(what, &program, deadline));
         }
         std::thread::sleep(POLL_INTERVAL.min(deadline - elapsed));
     };
@@ -797,6 +1015,7 @@ pub fn run_command_blocking_capped(
     // pipe ends close, which the observed exit guarantees for well-behaved
     // children. A descendant holding a pipe open cannot extend this past the
     // overall deadline.
+    let child_pid = child.id();
     let mut stdout = None;
     let mut stderr = None;
     while stdout.is_none() || stderr.is_none() {
@@ -813,13 +1032,19 @@ pub fn run_command_blocking_capped(
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 let remaining = deadline.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
-                    return Err(CommandError::timeout_error(what, &program, deadline));
+                    // The direct child is gone but something still holds its
+                    // pipes: signal the group so the descendant stops holding
+                    // them (and the capture threads reach EOF) instead of
+                    // reporting a kill that never happened.
+                    kill_process_group(child_pid);
+                    return Err(timeout_error(what, &program, deadline));
                 }
                 match receiver.recv_timeout(remaining) {
                     Ok((PipeKind::Stdout, result)) => stdout = Some(result),
                     Ok((PipeKind::Stderr, result)) => stderr = Some(result),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        return Err(CommandError::timeout_error(what, &program, deadline));
+                        kill_process_group(child_pid);
+                        return Err(timeout_error(what, &program, deadline));
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         return Err(CommandError::io(
@@ -1062,6 +1287,65 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// Whether `pid` no longer runs. A zombie counts as gone: it holds no
+    /// memory and the OS reaps it once its parent does.
+    #[cfg(unix)]
+    fn process_is_gone(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let stat = String::from_utf8_lossy(&output.stdout);
+                let stat = stat.trim();
+                stat.is_empty() || stat.starts_with('Z')
+            }
+            // `ps` reports nothing for a pid that no longer exists.
+            _ => true,
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_exit(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_gone(pid) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &std::path::Path) -> u32 {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("parsing {}: {error}", path.display()))
+    }
+
+    /// A script that records the child's and a background worker's pids, then
+    /// waits on the worker like `git fetch` waits on its transport helpers.
+    #[cfg(unix)]
+    fn pidfile_script(child: &std::path::Path, grandchild: &std::path::Path) -> String {
+        format!(
+            "echo $$ > {}; sleep 300 & echo $! > {}; wait",
+            child.display(),
+            grandchild.display()
+        )
+    }
+
+    /// A script that records a background worker's pid and exits at once, so
+    /// the worker alone holds the inherited pipes — the shape that used to
+    /// leave the worker running (and the capture threads blocked) after expiry.
+    #[cfg(unix)]
+    fn orphan_script(grandchild: &std::path::Path) -> String {
+        format!("sleep 300 & echo $! > {}; exit 0", grandchild.display())
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn async_command_is_killed_at_the_deadline() {
         let mut cmd = Command::new("sh");
@@ -1086,6 +1370,92 @@ mod tests {
         assert!(text.contains("sh"), "missing program: {text}");
     }
 
+    /// Expiry must take the child's own workers with it: a killed `git fetch`
+    /// leaves `index-pack`/transport helpers behind otherwise, and they keep
+    /// writing into the repository after the caller has released its lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_expiry_kills_the_childs_process_group() {
+        let dir = std::env::temp_dir();
+        let stamp = format!("{}-{}", std::process::id(), line!());
+        let child_pid = dir.join(format!("deadline-child-{stamp}"));
+        let grandchild_pid = dir.join(format!("deadline-grandchild-{stamp}"));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &pidfile_script(&child_pid, &grandchild_pid)]);
+        let error = run_command(cmd, Duration::from_millis(400), "group kill")
+            .await
+            .unwrap_err();
+        assert!(error.timed_out(), "expected a timeout: {error}");
+        let child = read_pid(&child_pid);
+        let grandchild = read_pid(&grandchild_pid);
+        assert!(
+            wait_for_pid_exit(child),
+            "the direct child {child} survived expiry"
+        );
+        assert!(
+            wait_for_pid_exit(grandchild),
+            "the grandchild {grandchild} survived expiry"
+        );
+        let _ = std::fs::remove_file(&child_pid);
+        let _ = std::fs::remove_file(&grandchild_pid);
+    }
+
+    /// The direct child can exit first and leave its worker holding both
+    /// pipes. Expiry must still reach the worker — through the group id
+    /// captured at spawn, since the reaped child has no id left — or the
+    /// worker keeps running and the capture threads stay blocked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_expiry_kills_a_descendant_that_outlives_the_child() {
+        let dir = std::env::temp_dir();
+        let stamp = format!("{}-{}", std::process::id(), line!());
+        let grandchild_pid = dir.join(format!("deadline-orphan-{stamp}"));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &orphan_script(&grandchild_pid)]);
+        let error = run_command(cmd, Duration::from_millis(400), "orphaned worker")
+            .await
+            .unwrap_err();
+        assert!(error.timed_out(), "expected a timeout: {error}");
+        let grandchild = read_pid(&grandchild_pid);
+        assert!(
+            wait_for_pid_exit(grandchild),
+            "the descendant {grandchild} survived expiry"
+        );
+        let _ = std::fs::remove_file(&grandchild_pid);
+    }
+
+    /// A spawn that blocks in the kernel must still return at the deadline:
+    /// the synchronous `spawn` call itself is what `tokio::time::timeout`
+    /// cannot interrupt, so it happens off the caller's thread.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    #[tokio::test]
+    async fn async_command_with_a_blocking_spawn_returns_at_the_deadline() {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 0"]);
+        // `pre_exec` runs in the forked child before `exec`, and the parent's
+        // `spawn` waits for that exec to finish. Sleeping here models a hook
+        // wedged in the kernel.
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(())
+            });
+        }
+        let started = Instant::now();
+        let error = run_command(cmd, Duration::from_millis(200), "blocked spawn")
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(error.timed_out(), "expected a timeout: {error}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the blocked spawn held the caller past the deadline: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn async_command_captures_both_streams() {
         let mut cmd = Command::new("sh");
@@ -1100,6 +1470,7 @@ mod tests {
 
     /// A child that writes far more than a pipe buffer must not be mistaken
     /// for a hang: both pipes are drained while the waiter waits.
+    #[cfg(unix)]
     #[tokio::test]
     async fn async_command_drains_a_chatty_child() {
         let mut cmd = Command::new("sh");
@@ -1116,6 +1487,7 @@ mod tests {
 
     /// A capped capture discards the excess but keeps reading, so the child
     /// reaches EOF and exits instead of blocking on a full pipe.
+    #[cfg(unix)]
     #[tokio::test]
     async fn capped_command_discards_the_excess_and_reports_truncation() {
         let mut cmd = Command::new("sh");
@@ -1133,6 +1505,7 @@ mod tests {
         assert_eq!(output.stderr.len(), 1024);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn capped_command_keeps_small_output_and_clears_the_flag() {
         let mut cmd = Command::new("sh");
@@ -1145,6 +1518,7 @@ mod tests {
         assert_eq!(output.stdout, b"small");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_with_stdin_writes_input_and_captures_output() {
         let mut cmd = Command::new("cat");
@@ -1159,6 +1533,7 @@ mod tests {
         assert_eq!(output.stdout, b"hello stdin");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_with_stdin_is_bounded_when_the_child_never_reads() {
         let mut cmd = Command::new("sh");
@@ -1176,6 +1551,27 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
+    /// A child that stops reading and exits must not turn the call into an
+    /// I/O error: `head -c 5` closes stdin after five bytes, and its status
+    /// and captured output are still the caller's result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_with_stdin_tolerates_a_child_that_stops_reading() {
+        let mut cmd = Command::new("head");
+        cmd.args(["-c", "5"]);
+        let output = run_command_with_stdin(
+            cmd,
+            &[b'x'; 1024 * 1024],
+            Duration::from_secs(10),
+            "early stdin close",
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, b"xxxxx");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn status_command_is_bounded_and_returns_the_exit_code() {
         let mut cmd = Command::new("sh");
@@ -1195,6 +1591,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
+    #[cfg(unix)]
     /// A pid file for one group test: unique per test so the two of them can
     /// run in parallel.
     fn pid_file(name: &str) -> std::path::PathBuf {
@@ -1204,6 +1601,7 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
     /// The pid the script recorded, once it has written it.
     async fn recorded_pid(path: &std::path::Path) -> String {
         for _ in 0..200 {
@@ -1218,6 +1616,7 @@ mod tests {
         panic!("no pid was recorded at {}", path.display());
     }
 
+    #[cfg(unix)]
     /// Whether `pid` still exists. The null signal answers it without
     /// delivering anything; a zombie is reaped by init, so it does not hold
     /// this open.
@@ -1229,6 +1628,7 @@ mod tests {
             .is_ok_and(|status| status.success())
     }
 
+    #[cfg(unix)]
     async fn assert_gone(pid: &str, what: &str) {
         for _ in 0..100 {
             if !process_alive(pid) {
@@ -1239,6 +1639,7 @@ mod tests {
         panic!("{what} (pid {pid}) outlived its process group");
     }
 
+    #[cfg(unix)]
     /// A shell wrapper's real work is a grandchild, and killing only the shell
     /// leaves it running: the group runner must take the grandchild with it.
     #[tokio::test]
@@ -1259,6 +1660,7 @@ mod tests {
         assert_gone(&pid, "the grandchild of a timed-out group runner").await;
     }
 
+    #[cfg(unix)]
     /// A caller that stops waiting drops the runner's future — a `select!`
     /// losing to a shutdown token. That is a cancellation like any other, and
     /// the group has to go with it.
@@ -1283,6 +1685,7 @@ mod tests {
         assert_gone(&pid, "the grandchild of a dropped group runner").await;
     }
 
+    #[cfg(unix)]
     #[test]
     fn blocking_command_is_killed_at_the_deadline() {
         let mut cmd = std::process::Command::new("sh");
@@ -1302,6 +1705,7 @@ mod tests {
         assert!(text.contains("250ms"), "missing deadline: {text}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn blocking_command_drains_a_chatty_child() {
         let mut cmd = std::process::Command::new("sh");
@@ -1316,6 +1720,56 @@ mod tests {
         assert_eq!(output.stderr.len(), 524_288);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn blocking_expiry_kills_the_childs_process_group() {
+        let dir = std::env::temp_dir();
+        let stamp = format!("{}-{}", std::process::id(), line!());
+        let child_pid = dir.join(format!("deadline-sync-child-{stamp}"));
+        let grandchild_pid = dir.join(format!("deadline-sync-grandchild-{stamp}"));
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &pidfile_script(&child_pid, &grandchild_pid)]);
+        let error =
+            run_command_blocking(cmd, Duration::from_millis(400), "sync group kill").unwrap_err();
+        assert!(error.timed_out(), "expected a timeout: {error}");
+        let child = read_pid(&child_pid);
+        let grandchild = read_pid(&grandchild_pid);
+        assert!(
+            wait_for_pid_exit(child),
+            "the direct child {child} survived expiry"
+        );
+        assert!(
+            wait_for_pid_exit(grandchild),
+            "the grandchild {grandchild} survived expiry"
+        );
+        let _ = std::fs::remove_file(&child_pid);
+        let _ = std::fs::remove_file(&grandchild_pid);
+    }
+
+    /// The synchronous twin of `async_expiry_kills_a_descendant_that_outlives_
+    /// the_child`: the capture has to signal the group it named at spawn before
+    /// it reports the timeout, or the worker keeps both pipes and both reader
+    /// threads stay blocked on a call that has already returned.
+    #[cfg(unix)]
+    #[test]
+    fn blocking_expiry_kills_a_descendant_that_outlives_the_child() {
+        let dir = std::env::temp_dir();
+        let stamp = format!("{}-{}", std::process::id(), line!());
+        let grandchild_pid = dir.join(format!("deadline-sync-orphan-{stamp}"));
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &orphan_script(&grandchild_pid)]);
+        let error =
+            run_command_blocking(cmd, Duration::from_millis(400), "sync orphan").unwrap_err();
+        assert!(error.timed_out(), "expected a timeout: {error}");
+        let grandchild = read_pid(&grandchild_pid);
+        assert!(
+            wait_for_pid_exit(grandchild),
+            "the descendant {grandchild} survived expiry"
+        );
+        let _ = std::fs::remove_file(&grandchild_pid);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn blocking_capped_command_discards_the_excess() {
         let mut cmd = std::process::Command::new("sh");
@@ -1329,6 +1783,32 @@ mod tests {
         assert!(truncated);
         assert_eq!(output.stdout.len(), 1024);
         assert_eq!(output.stderr.len(), 1024);
+    }
+
+    /// A blocked `fork`/`exec` must not hold a synchronous caller either: the
+    /// spawn happens on a helper thread, so the deadline still applies.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    #[test]
+    fn blocking_command_with_a_blocking_spawn_returns_at_the_deadline() {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exit 0"]);
+        unsafe {
+            cmd.pre_exec(|| {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(())
+            });
+        }
+        let started = Instant::now();
+        let error = run_command_blocking(cmd, Duration::from_millis(200), "sync blocked spawn")
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(error.timed_out(), "expected a timeout: {error}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the blocked spawn held the caller past the deadline: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
