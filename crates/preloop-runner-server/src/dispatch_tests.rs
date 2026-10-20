@@ -2206,8 +2206,7 @@ impl WebhookCoverageStub {
                         }
                         match raw {
                             Some((status, body)) => (
-                                axum::http::StatusCode::from_u16(status)
-                                    .expect("stub status code"),
+                                axum::http::StatusCode::from_u16(status).expect("stub status code"),
                                 body,
                             )
                                 .into_response(),
@@ -2288,9 +2287,7 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
 /// installation answers served by the loopback stub.
 async fn webhook_coverage_fixture() -> (tempfile::TempDir, AppState, Router) {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().join("state"))
-        .await
-        .unwrap();
+    let mut state = AppState::new(temp.path().join("state")).await.unwrap();
     let (mut registry, _) = two_app_registry();
     registry.apps[0].webhook_secret = Some("default-secret".to_owned());
     state.webhook_secret = Some("legacy-secret".to_owned());
@@ -2365,7 +2362,13 @@ async fn signed_lifecycle_events_invalidate_only_their_own_app_coverage() {
 
     // The signer's own verified removal invalidates its answer.
     assert_eq!(
-        deliver_webhook(&app, "installation_repositories", &removal, "default-secret").await,
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &removal,
+            "default-secret"
+        )
+        .await,
         StatusCode::ACCEPTED
     );
     assert_eq!(
@@ -2380,7 +2383,13 @@ async fn signed_lifecycle_events_invalidate_only_their_own_app_coverage() {
     // The signer reports the repository revoked; the next delivery must see
     // the 404 immediately rather than reuse the re-confirmed positive.
     assert_eq!(
-        deliver_webhook(&app, "installation_repositories", &removal, "default-secret").await,
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &removal,
+            "default-secret"
+        )
+        .await,
         StatusCode::ACCEPTED
     );
     stub.set("org-a/repo", 404, json!({ "message": "Not Found" }));
@@ -2526,7 +2535,12 @@ async fn slow_positive_after_invalidation_neither_repopulates_nor_authorizes() {
     });
     let lifecycle = tokio::time::timeout(
         Duration::from_secs(2),
-        deliver_webhook(&app, "installation_repositories", &removal, "default-secret"),
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &removal,
+            "default-secret",
+        ),
     )
     .await
     .expect("the lifecycle request must not wait behind the blocked lookup");
@@ -2585,7 +2599,13 @@ async fn simultaneous_webhook_deliveries_coalesce_by_repository() {
     let other = tokio::spawn({
         let app = app.clone();
         async move {
-            deliver_webhook(&app, "ping", &coverage_ping("org-a/other"), "default-secret").await
+            deliver_webhook(
+                &app,
+                "ping",
+                &coverage_ping("org-a/other"),
+                "default-secret",
+            )
+            .await
         }
     });
     assert_eq!(

@@ -373,12 +373,7 @@ impl RepositoryCoverageCache {
             .unwrap_or(0)
     }
 
-    async fn covers(
-        &self,
-        api_base: &str,
-        app: &GitHubAppCredentials,
-        repository: &str,
-    ) -> bool {
+    async fn covers(&self, api_base: &str, app: &GitHubAppCredentials, repository: &str) -> bool {
         let key = repository.to_ascii_lowercase();
         loop {
             let (flight, leader) = {
@@ -399,9 +394,7 @@ impl RepositoryCoverageCache {
                 }
             };
             if leader {
-                return self
-                    .lead(api_base, app, repository, &key, flight)
-                    .await;
+                return self.lead(api_base, app, repository, &key, flight).await;
             }
             // Share the leader's answer. An error or a 404 denies this
             // delivery; a positive is re-checked against the cache because an
@@ -1243,9 +1236,7 @@ async fn app_covers_repository_on(
     // answer, and the next delivery must retry.
     let Some(returned_app_id) = body.get("app_id").and_then(serde_json::Value::as_u64) else {
         warn!(app_id = %app.app_id, repository = %repository, "repository installation response has no app_id");
-        return Err(anyhow!(
-            "repository installation response has no app_id"
-        ));
+        return Err(anyhow!("repository installation response has no app_id"));
     };
     if returned_app_id.to_string() != app.app_id {
         warn!(app_id = %app.app_id, repository = %repository, returned_app_id, "repository installation belongs to a different App");
@@ -1299,9 +1290,7 @@ pub async fn select_app_for_repo(
     // the verified signer; if it no longer covers the repository, fail closed
     // rather than fall through to a sibling App.
     if let Ok(verified) = VERIFIED_WEBHOOK_APP.try_with(Clone::clone) {
-        return candidates
-            .into_iter()
-            .find(|app| app.app_id == verified);
+        return candidates.into_iter().find(|app| app.app_id == verified);
     }
     candidates.into_iter().next()
 }
@@ -4366,21 +4355,14 @@ mod tests {
     #[tokio::test]
     async fn verified_signer_pins_app_selection() {
         let owner = "owner";
-        let first = GitHubAppCredentials::for_tests(
-            "424",
-            test_key(),
-            MintFailurePolicy::LocalJwt,
-        );
+        let first = GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
         first
             .installation_cache
             .write()
             .await
             .insert(owner.to_owned(), 1);
-        let second = GitHubAppCredentials::for_tests(
-            "525",
-            test_key(),
-            MintFailurePolicy::LocalJwt,
-        );
+        let second =
+            GitHubAppCredentials::for_tests("525", test_key(), MintFailurePolicy::LocalJwt);
         second
             .installation_cache
             .write()
@@ -4408,10 +4390,7 @@ mod tests {
             "without delivery context, registry order selects"
         );
         let pinned = VERIFIED_WEBHOOK_APP
-            .scope(
-                "525".to_owned(),
-                select_app_for_repo(&shared, "owner/repo"),
-            )
+            .scope("525".to_owned(), select_app_for_repo(&shared, "owner/repo"))
             .await
             .expect("the verified signer covers the owner");
         assert_eq!(
@@ -4420,10 +4399,7 @@ mod tests {
         );
         assert!(
             VERIFIED_WEBHOOK_APP
-                .scope(
-                    "999".to_owned(),
-                    select_app_for_repo(&shared, "owner/repo"),
-                )
+                .scope("999".to_owned(), select_app_for_repo(&shared, "owner/repo"),)
                 .await
                 .is_none(),
             "a signer that no longer covers the owner fails closed"
@@ -4437,5 +4413,4 @@ mod tests {
             "the task-local must not leak out of the delivery scope"
         );
     }
-
 }

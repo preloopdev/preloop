@@ -3437,15 +3437,15 @@ pub async fn handle_github_webhook(
                 event = event_name,
                 "installation lifecycle event invalidated cached repository coverage"
             );
-        } else if let Some(claimed) = claimed_repository(&body) {
-            if !crate::github_app::app_covers_repository(app, &claimed).await {
-                warn!(
-                    app_id = %app_id,
-                    repository = %claimed,
-                    "webhook signer is not installed on the claimed repository; rejecting"
-                );
-                return Err(StatusCode::FORBIDDEN);
-            }
+        } else if let Some(claimed) = claimed_repository(&body)
+            && !crate::github_app::app_covers_repository(app, &claimed).await
+        {
+            warn!(
+                app_id = %app_id,
+                repository = %claimed,
+                "webhook signer is not installed on the claimed repository; rejecting"
+            );
+            return Err(StatusCode::FORBIDDEN);
         }
     }
     // `WebhookSigner::Legacy`: the single shared secret is the only trust
