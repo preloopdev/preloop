@@ -19,6 +19,14 @@ Releases before v0.27.0 predate the changelog.
   workspace and the cache root are on different devices, and retries as a copy
   if a hardlinked clone fails anyway, keeping the same-filesystem fast path.
 
+- **Submissions for repositories with thousands of refs no longer hang while
+  staging the snapshot.** `git cat-file --batch-check` was fed thousands of
+  object ids over a pipe and its answer was read only after every id had been
+  written; once the 64 KiB stdout pipe filled, the child stopped reading stdin
+  and the parent stopped draining stdout, so the submission sat there until
+  the client gave up. Git's stdin is now written while stdout and stderr are
+  drained concurrently.
+
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution

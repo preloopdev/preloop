@@ -2681,21 +2681,51 @@ async fn run_git_with_stdin(
     let mut stdin = child.stdin.take().ok_or_else(|| {
         ApiError::internal(format!("failed to {operation}: Git stdin was not piped"))
     })?;
-    stdin
-        .write_all(input)
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        ApiError::internal(format!("failed to {operation}: Git stdout was not piped"))
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        ApiError::internal(format!("failed to {operation}: Git stderr was not piped"))
+    })?;
+    // Drain the child's output while its stdin is still being written. A
+    // write-all-then-read sequence deadlocks as soon as both pipes fill:
+    // `cat-file --batch-check` over a repository with thousands of refs (the
+    // router workspace sends ~4800 object ids) answers per line, so once the
+    // 64 KiB stdout pipe is full the child stops reading stdin, and the
+    // parent waits forever for a write the child will never accept.
+    let write = async move {
+        let written = stdin.write_all(input).await;
+        drop(stdin);
+        written
+    };
+    let read_stdout = async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    };
+    let read_stderr = async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    };
+    let (written, stdout, stderr, status) =
+        tokio::join!(write, read_stdout, read_stderr, child.wait());
+    let status =
+        status.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let stdout =
+        stdout.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let stderr =
+        stderr.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let output = std::process::Output {
+        status,
+        stdout,
+        stderr,
+    };
     if !output.status.success() {
         return Err(ApiError::internal(format!(
             "failed to {operation}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
+    written.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
     Ok(output)
 }
 
@@ -2759,7 +2789,7 @@ async fn clone_object_cache(
     hardlink: bool,
 ) -> Result<(), ApiError> {
     let mut clone = Command::new("git");
-    clone.args(["clone", "--bare", "--quiet"]);
+    clone.args(["clone", "--bare", "--local", "--quiet"]);
     if !hardlink {
         clone.arg("--no-hardlinks");
     }
@@ -7694,6 +7724,31 @@ mod object_cache_tests {
             2,
             "the same-filesystem clone hardlinks the workspace's objects"
         );
+    }
+}
+
+#[cfg(test)]
+mod git_stdin_tests {
+    use super::*;
+
+    /// Pin the pipe deadlock behind the router submission: `cat` echoes as it
+    /// reads, so writing a megabyte before reading a byte filled both pipes —
+    /// the child stopped reading stdin once stdout filled, and the parent
+    /// stopped reading stdout once stdin filled. `present_objects` sends
+    /// ~4800 object ids to `git cat-file --batch-check`, which is enough to
+    /// trigger the same standoff.
+    #[tokio::test]
+    async fn large_stdin_payload_is_drained_while_written() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "cat"]);
+        let input = vec![b'x'; 1024 * 1024];
+
+        let output = run_git_with_stdin(&mut command, &input, "echo large input")
+            .await
+            .expect("a large stdin payload must not deadlock against its output");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, input);
     }
 }
 
