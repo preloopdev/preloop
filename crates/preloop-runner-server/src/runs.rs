@@ -351,11 +351,11 @@ pub fn expire_pat_scope_cache() {
 /// and fail every GitHub fetch the submit-time checkout routing assumed it
 /// could make. `None` when the scopes cannot be established (the PAT stays
 /// withheld, as before).
-pub async fn verified_pat_scopes(pat: &str) -> Option<Vec<String>> {
+pub async fn verified_pat_scopes(state: &crate::state::AppState, pat: &str) -> Option<Vec<String>> {
     if let Some(scopes) = cached_pat_scopes(pat) {
         return Some(scopes);
     }
-    match pat_oauth_scopes(pat).await {
+    match pat_oauth_scopes(state, pat).await {
         PatScopeOutcome::Known(scopes) => Some(scopes),
         PatScopeOutcome::Unverifiable { reason } => {
             tracing::warn!(%reason, "withholding PAT at dispatch: scopes unverifiable");
@@ -379,8 +379,8 @@ pub async fn verified_pat_scopes(pat: &str) -> Option<Vec<String>> {
 /// Failures are logged, never fatal: a server that cannot reach the GitHub API
 /// still serves, and the run path withholds the credential instead of
 /// embedding one whose bounds nobody established.
-pub async fn warm_pat_scope_cache(pat: &str) {
-    match pat_oauth_scopes(pat).await {
+pub async fn warm_pat_scope_cache(state: &crate::state::AppState, pat: &str) {
+    match pat_oauth_scopes(state, pat).await {
         PatScopeOutcome::Known(scopes) => {
             tracing::info!(
                 scope_count = scopes.len(),
@@ -476,7 +476,10 @@ enum PatScopeOutcome {
 }
 
 /// Introspect the static PAT's classic OAuth scopes via the `X-OAuth-Scopes`
-/// response header on an authenticated API-root request.
+/// response header on an authenticated API-root request, through the PAT's own
+/// breaker: while GitHub is known to be down the probe is refused instead of
+/// spending a request on a guaranteed failure, and the verdict is the same
+/// `Unverifiable` one an unreachable API gives.
 ///
 /// Returns [`PatScopeOutcome::Known`] with the scope list when GitHub answers
 /// successfully with an `X-OAuth-Scopes` header. An *absent* header is
@@ -484,7 +487,7 @@ enum PatScopeOutcome {
 /// for fine-grained PATs, so absence means the token's bounds are unknown
 /// rather than narrow. Results are cached per PAT (SHA-256 of the token) for
 /// [`PAT_SCOPE_CACHE_TTL`].
-async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
+async fn pat_oauth_scopes(state: &crate::state::AppState, pat: &str) -> PatScopeOutcome {
     use sha2::Digest as _;
     let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
     if let Ok(cache) = PAT_SCOPE_CACHE.lock()
@@ -511,12 +514,18 @@ async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
         };
     }
     let url = format!("{}/", crate::github::github_api_base());
-    let response = match crate::shared_http::CLIENT
-        .get(&url)
-        .header("Authorization", format!("Bearer {pat}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
+    let response = match crate::github_breaker::send_github(
+        state,
+        &crate::github_breaker::GithubCredential::bearer(
+            pat,
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        ),
+        crate::github_breaker::GithubSubsystem::Credentials,
+        crate::shared_http::CLIENT
+            .get(&url)
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await
     {
         Ok(response) => response,
         Err(error) => {
@@ -1597,7 +1606,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // the PAT's classic OAuth scopes and refuse the run on mismatch;
         // an invalid PAT is refused outright, and a PAT whose bounds
         // cannot be verified is withheld rather than embedded at acquire.
-        match pat_oauth_scopes(&pat).await {
+        match pat_oauth_scopes(&shared.state, &pat).await {
             PatScopeOutcome::Known(scopes) => {
                 enforce_pat_permissions(&jobs, &submission, &scopes)?;
                 tracing::warn!(
