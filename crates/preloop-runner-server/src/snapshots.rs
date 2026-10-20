@@ -288,7 +288,7 @@ async fn resolve_github_repo_meta(
     // Prefer the App registry: a private repository configured App-only has
     // no PAT, and the installation token is the only credential that can
     // read its metadata.
-    let mut app_token: Option<String> = None;
+    let mut app_credential: Option<crate::github_breaker::GithubCredential> = None;
     let mut api_url = "https://api.github.com".to_owned();
     if let Some(shared) = shared {
         api_url = shared
@@ -299,22 +299,59 @@ async fn resolve_github_repo_meta(
             .to_owned();
         if let Some(app) = crate::github_app::select_app_for_repo(shared, slug).await {
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-            app_token = crate::github_app::get_or_mint_token(&app, slug, &permissions)
-                .await
-                .ok();
+            if let Ok(token) = crate::github_app::get_or_mint_token(&app, slug, &permissions).await
+            {
+                // The mint ledger names the installation locally, so the call
+                // is observed on the installation that minted it; an
+                // unnameable one never borrows the PAT's budget and is keyed
+                // on the token itself.
+                let bucket = match app.mint_ledger.lookup(&token) {
+                    Some(entry) => crate::github_breaker::GithubCredentialBucket::Installation(
+                        entry.installation_id,
+                    ),
+                    None => crate::github_breaker::GithubCredentialBucket::for_installation_token(
+                        &token,
+                    ),
+                };
+                app_credential = Some(crate::github_breaker::GithubCredential::bearer(
+                    token, bucket,
+                ));
+            }
         }
     }
-    let mut request = crate::shared_http::CLIENT
+    let credential = app_credential.unwrap_or_else(|| match github_pat {
+        Some(pat) => crate::github_breaker::GithubCredential::bearer(
+            pat,
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        ),
+        None => crate::github_breaker::GithubCredential::anonymous(),
+    });
+    // The 10 s per-request bound stays on the request: this lookup is
+    // best-effort for a run that is being created, so it must give up long
+    // before the shared client's own timeout.
+    let request = crate::shared_http::CLIENT
         .get(format!("{api_url}/repos/{slug}"))
         .header("User-Agent", "preloop-runner-server")
         .header("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(10));
-    if let Some(token) = app_token.as_deref().or(github_pat) {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(_) => return (None, None),
+    let response = match shared {
+        Some(shared) => crate::github_breaker::send_github(
+            &shared.state,
+            &credential,
+            crate::github_breaker::GithubSubsystem::Snapshots,
+            request,
+        )
+        .await
+        .ok(),
+        // Callers with no engine state (snapshots taken for a bare local
+        // directory) have no breaker registry to consult, so only the breaker
+        // is bypassed: the credential still reaches the wire, or a private
+        // repository's metadata would be looked up anonymously and the run
+        // would lose its repository id, visibility and private-upstream path.
+        None => credential.authorize(request).send().await.ok(),
+    };
+    let Some(response) = response else {
+        return (None, None);
     };
     if !response.status().is_success() {
         return (None, None);
@@ -5184,8 +5221,17 @@ static FORGE_RELAY_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
 /// status and response with only [`FORGE_RELAY_RESPONSE_HEADERS`] carried
 /// over — `www-authenticate` deliberately stays behind so an upstream 401
 /// (private repo) surfaces to the job as a fetch failure, not a git
-/// credential prompt.
-async fn forge_relay_forward(request: Request, upstream: &str) -> Result<Response<Body>, ApiError> {
+/// credential prompt. Credential-free by construction: `bucket` is the
+/// dependency the caller's upstream spends — [`GithubCredentialBucket::Relay`]
+/// for the Git smart-HTTP transport, which the forge does not meter on the
+/// anonymous REST budget, and [`GithubCredentialBucket::Anonymous`] for the
+/// anonymous API and tarball lookups.
+async fn forge_relay_forward(
+    state: &AppState,
+    request: Request,
+    upstream: &str,
+    bucket: crate::github_breaker::GithubCredentialBucket,
+) -> Result<Response<Body>, ApiError> {
     let permit = FORGE_RELAY_PERMITS
         .try_acquire()
         .map_err(|_| ApiError::service_unavailable("forge relay is at capacity; retry shortly"))?;
@@ -5200,10 +5246,14 @@ async fn forge_relay_forward(request: Request, upstream: &str) -> Result<Respons
         .await
         .map_err(|error| ApiError::bad_request(format!("invalid relay request body: {error}")))?;
     builder = builder.body(body);
-    let response = builder
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("forge relay request failed: {error}")))?;
+    let response = crate::github_breaker::send_github(
+        state,
+        &crate::github_breaker::GithubCredential::unauthenticated(bucket),
+        crate::github_breaker::GithubSubsystem::Snapshots,
+        builder,
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("forge relay request failed: {error}")))?;
     let status = response.status();
     let mut out = Response::builder().status(status.as_u16());
     for name in FORGE_RELAY_RESPONSE_HEADERS {
@@ -5271,7 +5321,15 @@ pub async fn forge_git_http(
     } else {
         format!("{upstream}?{query}")
     };
-    forge_relay_forward(request, &upstream).await
+    forge_relay_forward(
+        &shared.state,
+        request,
+        &upstream,
+        // Git smart-HTTP is its own dependency: the anonymous REST budget does
+        // not meter it, and a REST 429 must not refuse a public checkout.
+        crate::github_breaker::GithubCredentialBucket::Relay,
+    )
+    .await
 }
 
 /// REST archive endpoint for checkouts that cannot run Git.
@@ -5330,7 +5388,15 @@ pub async fn forge_api_repo_tarball(
         .trim_end_matches('/')
         .to_owned();
     let upstream = format!("{api_base}/repos/{owner}/{repo}/tarball/{git_ref}");
-    forge_relay_forward(request, &upstream).await
+    // A tarball lookup is an anonymous API call on the api host, so it stays
+    // on the anonymous REST budget rather than the Git transport's.
+    forge_relay_forward(
+        &shared.state,
+        request,
+        &upstream,
+        crate::github_breaker::GithubCredentialBucket::Anonymous,
+    )
+    .await
 }
 
 /// `git archive` of a run's local-workspace snapshot, shaped like the forge's
@@ -5535,7 +5601,15 @@ pub async fn forge_api_repo(
         .trim_end_matches('/')
         .to_owned();
     let upstream = format!("{api_base}/repos/{owner}/{repo}");
-    forge_relay_forward(request, &upstream).await
+    // The `api/v3` passthrough is a REST call on the api host, so it spends
+    // the anonymous REST budget, not the Git transport's.
+    forge_relay_forward(
+        &shared.state,
+        request,
+        &upstream,
+        crate::github_breaker::GithubCredentialBucket::Anonymous,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -8214,7 +8288,28 @@ mod archive_tests {
             .body(Body::empty())
             .unwrap();
         let upstream = format!("{forge_base}/repos/owner/repo/tarball/main");
-        let response = forge_relay_forward(request, &upstream).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        // An exhausted anonymous REST budget must not refuse the relay: it is
+        // a different dependency from the anonymous API bucket.
+        let anonymous = state
+            .github_breakers
+            .breaker_for(crate::github_breaker::GithubCredentialBucket::Anonymous);
+        for _ in 0..3 {
+            anonymous.record_failure(
+                &crate::github_breaker::GithubFailureKind::Unavailable,
+                "502",
+            );
+        }
+        assert!(anonymous.is_open());
+        let response = forge_relay_forward(
+            &state,
+            request,
+            &upstream,
+            crate::github_breaker::GithubCredentialBucket::Relay,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();

@@ -15,8 +15,9 @@
 //!    - minted by preloop itself: validated against the in-memory mint ledger
 //!      (offline-safe, no round-trip);
 //!    - third-party: validated with a github.com round-trip
-//!      (`GET /installation`, `GET /installation/repositories`), cached with a
-//!      short TTL, and failing **closed** on network errors.
+//!      (`GET /installation`, `GET /installation/repositories`) through the
+//!      credential's circuit breaker, cached with a short TTL, and failing
+//!      **closed** on network errors.
 //! 5. Anything else — 401.
 //!
 //! The middleware inserts a [`DispatchIdentity`] extension; handlers use it
@@ -39,6 +40,9 @@ use tracing::warn;
 use crate::ApiError;
 use crate::events::trust_tier::TrustTier;
 use crate::github_app::{MintLedgerEntry, MintRejected};
+use crate::github_breaker::{
+    GithubApiError, GithubCredential, GithubCredentialBucket, GithubSubsystem,
+};
 use crate::state::SharedState;
 
 /// How long validated installation-token facts stay cached. The token itself
@@ -317,7 +321,7 @@ async fn validate_installation_online(
         return Ok(info);
     }
     let api_base = crate::github::github_api_base();
-    let info = match fetch_installation_info(&api_base, token).await {
+    let info = match fetch_installation_info(&shared.state, &api_base, token).await {
         Ok(info) => info,
         Err(error) => {
             if let Some(rejected) = error.downcast_ref::<MintRejected>()
@@ -347,8 +351,23 @@ async fn validate_installation_online(
 }
 
 /// Fetch and assemble the installation facts for `token` from github.com.
-async fn fetch_installation_info(api_base: &str, token: &str) -> anyhow::Result<InstallationInfo> {
-    let installation = fetch_json(&format!("{api_base}/installation"), token)
+///
+/// Both calls go through the credential's breaker, on one bucket: the token
+/// itself, which *is* the rate-limit identity until `/installation` names the
+/// installation. Inventing an id would charge another installation, the PAT's
+/// bucket belongs to the operator, and a single shared unnamed bucket would let
+/// one tenant's throttled token park every other tenant's validation. Keeping
+/// the listing on the same bucket matters: if the `/installation` response
+/// spent the token's last request, the listing must be refused here rather
+/// than sent, because its 403 would otherwise be read as an invalid credential.
+async fn fetch_installation_info(
+    state: &crate::state::AppState,
+    api_base: &str,
+    token: &str,
+) -> anyhow::Result<InstallationInfo> {
+    let credential =
+        GithubCredential::bearer(token, GithubCredentialBucket::for_installation_token(token));
+    let installation = fetch_json(state, &credential, &format!("{api_base}/installation"))
         .await
         .with_context(|| "GET /installation failed")?;
     let installation_id = installation
@@ -386,10 +405,14 @@ async fn fetch_installation_info(api_base: &str, token: &str) -> anyhow::Result<
         .unwrap_or("selected");
     // An "all repositories" installation can reach every repo; the list is
     // otherwise the source of truth for access (checked per dispatch target).
+    // The listing stays on the token's own bucket: one validation spends one
+    // token's budget, so a rate limit observed on `/installation` must park
+    // this call instead of letting it spend a request that is guaranteed to
+    // 403 — which the outer validator would read as an invalid credential.
     let accessible_repositories = if repository_selection == "all" {
         None
     } else {
-        Some(fetch_installation_repositories(api_base, token).await?)
+        Some(fetch_installation_repositories(state, api_base, &credential).await?)
     };
     Ok(InstallationInfo {
         installation_id,
@@ -403,8 +426,9 @@ async fn fetch_installation_info(api_base: &str, token: &str) -> anyhow::Result<
 
 /// Paginated `GET /installation/repositories` full-name list.
 async fn fetch_installation_repositories(
+    state: &crate::state::AppState,
     api_base: &str,
-    token: &str,
+    credential: &GithubCredential,
 ) -> anyhow::Result<Vec<String>> {
     let mut repositories = Vec::new();
     // `total_count` (from the first response) is the authoritative stop point
@@ -415,8 +439,9 @@ async fn fetch_installation_repositories(
     let mut total_count: Option<usize> = None;
     for page in 1u32.. {
         let body = fetch_json(
+            state,
+            credential,
             &format!("{api_base}/installation/repositories?per_page=100&page={page}"),
-            token,
         )
         .await
         .with_context(|| format!("GET /installation/repositories (page {page}) failed"))?;
@@ -448,31 +473,32 @@ async fn fetch_installation_repositories(
     Ok(repositories)
 }
 
-/// GET a JSON resource with `token` as the bearer, folding non-success
-/// statuses into a [`MintRejected`] so the caller can distinguish a
-/// credential refusal from a transport failure.
-async fn fetch_json(url: &str, token: &str) -> anyhow::Result<serde_json::Value> {
-    let response = crate::shared_http::CLIENT
-        .get(url)
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let message = response.text().await.unwrap_or_default();
-        return Err(MintRejected {
-            status,
-            message: message.chars().take(1024).collect(),
-        }
-        .into());
-    }
-    response
-        .json()
-        .await
-        .with_context(|| format!("GET {url} returned a non-JSON body"))
+/// GET a JSON resource with `credential` as the bearer, through the
+/// credential's breaker, folding non-success statuses into a [`MintRejected`]
+/// so the caller can distinguish a credential refusal from a transport
+/// failure. A refusal while the breaker is open stays a transport-shaped
+/// error: dispatch auth must fail closed on it, not read it as a bad token.
+async fn fetch_json(
+    state: &crate::state::AppState,
+    credential: &GithubCredential,
+    url: &str,
+) -> anyhow::Result<serde_json::Value> {
+    crate::github_breaker::send_github_json(
+        state,
+        credential,
+        GithubSubsystem::Dispatch,
+        reqwest::Method::GET,
+        url,
+        None,
+    )
+    .await
+    .map_err(|error| match error.downcast::<GithubApiError>() {
+        Ok(api) => anyhow::Error::new(MintRejected {
+            status: api.status,
+            message: api.body,
+        }),
+        Err(other) => other.context(format!("GET {url}")),
+    })
 }
 
 /// Verify an RS256 GitHub App JWT: three dot-separated segments, `alg: RS256`
@@ -544,7 +570,8 @@ async fn resolve_pat_actor(shared: &Arc<SharedState>, pat: &str) -> String {
         return actor;
     }
     let api_base = crate::github::github_api_base();
-    match fetch_json(&format!("{api_base}/user"), pat).await {
+    let credential = GithubCredential::bearer(pat, GithubCredentialBucket::Pat);
+    match fetch_json(&shared.state, &credential, &format!("{api_base}/user")).await {
         Ok(user) => {
             let Some(actor) = user
                 .get("login")
@@ -584,7 +611,11 @@ async fn resolve_app_actor(shared: &Arc<SharedState>, app_id: &str) -> String {
                 Err(_) => return format!("{app_id}[bot]"),
             };
             let api_base = crate::github::github_api_base();
-            match fetch_json(&format!("{api_base}/app"), &jwt).await {
+            // The App's own JWT spends that App's unauthenticated budget:
+            // each App is its own rate-limit identity.
+            let credential =
+                GithubCredential::bearer(jwt, GithubCredentialBucket::for_app(&app.app_id));
+            match fetch_json(&shared.state, &credential, &format!("{api_base}/app")).await {
                 Ok(app) => {
                     let slug = app
                         .get("slug")

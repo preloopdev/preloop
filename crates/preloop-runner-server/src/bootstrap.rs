@@ -1508,7 +1508,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if state.github_app.is_none()
         && let Some(pat) = state.static_github_pat()
     {
-        crate::runs::warm_pat_scope_cache(&pat).await;
+        crate::runs::warm_pat_scope_cache(&state, &pat).await;
     }
     // Resolve the effective store URL exactly once, mirroring `open_store`
     // precedence: the explicit URL wins, then the environment, then SQLite at

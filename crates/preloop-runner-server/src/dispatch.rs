@@ -30,6 +30,7 @@ use crate::dispatch_auth::DispatchIdentity;
 use crate::events::EventAdapter;
 use crate::events::trust_tier::TrustTier;
 use crate::github::resolve_ref_protected;
+use crate::github_breaker::{GithubCredential, GithubCredentialBucket, GithubSubsystem};
 use crate::state::SharedState;
 use crate::{ApiError, RunAccepted, WorkflowSubmission, errors::ApiErrorKind};
 use preloop_gha_protocol::JobId;
@@ -919,31 +920,48 @@ async fn resolve_default_branch(
         return Ok("main".to_owned());
     }
     let api_base = crate::github::github_api_base();
-    let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await
+    // The bucket follows the credential: an App mint is observed against the
+    // installation the mint ledger records, the ambient PAT against the PAT's
+    // own budget.
+    let credential = if let Some(app) =
+        crate::github_app::select_app_for_repo(shared, repository).await
     {
         let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-        crate::github_app::get_or_mint_token_at(&api_base, &app, repository, &permissions)
-            .await
-            .map_err(|error| {
-                ApiError::not_found(format!(
-                    "{repository} is not accessible to preloop's GitHub credential ({error})"
-                ))
-            })?
+        let token =
+            crate::github_app::get_or_mint_token_at(&api_base, &app, repository, &permissions)
+                .await
+                .map_err(|error| {
+                    ApiError::not_found(format!(
+                        "{repository} is not accessible to preloop's GitHub credential ({error})"
+                    ))
+                })?;
+        let bucket = match app.mint_ledger.lookup(&token) {
+            Some(entry) => GithubCredentialBucket::Installation(entry.installation_id),
+            // The mint succeeded but the ledger cannot name the installation:
+            // never invent an id, and never charge the PAT's budget with an
+            // installation token. The token's own fingerprint is its identity.
+            None => GithubCredentialBucket::for_installation_token(&token),
+        };
+        GithubCredential::bearer(token, bucket)
     } else {
-        std::env::var("PRELOOP_GITHUB_TOKEN").ok().ok_or_else(|| {
+        let token = std::env::var("PRELOOP_GITHUB_TOKEN").ok().ok_or_else(|| {
             ApiError::not_found(format!(
                 "{repository} is not accessible: no GitHub credential is configured"
             ))
-        })?
+        })?;
+        GithubCredential::bearer(token, GithubCredentialBucket::Pat)
     };
-    let response = crate::shared_http::CLIENT
-        .get(format!("{api_base}/repos/{repository}"))
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("failed to fetch {repository}: {error}")))?;
+    let response = crate::github_breaker::send_github(
+        &shared.state,
+        &credential,
+        GithubSubsystem::Dispatch,
+        crate::shared_http::CLIENT
+            .get(format!("{api_base}/repos/{repository}"))
+            .header("User-Agent", "preloop")
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await
+    .map_err(|error| ApiError::bad_gateway(format!("failed to fetch {repository}: {error}")))?;
     if !response.status().is_success() {
         return Err(ApiError::not_found(format!(
             "repository {repository} not found or not accessible"
