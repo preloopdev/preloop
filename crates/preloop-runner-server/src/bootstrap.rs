@@ -287,6 +287,16 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     let booted_at = now
         .checked_sub(shared.state.started_at.elapsed())
         .unwrap_or(std::time::UNIX_EPOCH);
+    // A pool runner is already executing an earlier job. Any ready job that
+    // cannot match a registered runner is waiting for that permit to free,
+    // not starving: the sweeps below reset its observation clock instead of
+    // failing it. This is also the window where the executing runner has
+    // gone away (a wedged guest is abandoned before its attempt is requeued):
+    // the queue is still capacity-blocked by the unfinished attempt.
+    let capacity_blocked = inputs
+        .active
+        .iter()
+        .any(|request| request.started_at.is_some());
 
     // ── Active attempts + the ready queue (from `inputs`) ────────────────
     let queued_jobs = inputs.ready.clone();
@@ -347,6 +357,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                     + Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
                 first_seen: marks.get(&key).copied(),
                 any_runner_matches,
+                capacity_blocked,
             };
             match crate::control::logic::starvation_verdict(
                 &candidate,
@@ -358,10 +369,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 crate::control::logic::StarvationVerdict::ClearMark => {
                     marks.remove(&key);
                 }
-                // Provisioning protection re-stamps the observation clock;
-                // ordinary unmatched jobs keep the first observation.
+                // Provisioning protection and an occupied permit re-stamp
+                // the observation clock; ordinary unmatched jobs keep the
+                // first observation.
                 crate::control::logic::StarvationVerdict::Mark { first_seen } => {
-                    if pool_preparing {
+                    if pool_preparing || capacity_blocked {
                         marks.insert(key, first_seen);
                     } else {
                         marks.entry(key).or_insert(first_seen);
@@ -422,6 +434,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             active: inputs.active.clone(),
             paused: paused_credits,
             pool_preparing,
+            capacity_blocked,
             booted_at,
             pool_labels: pool_status.labels.clone(),
             first_seen,

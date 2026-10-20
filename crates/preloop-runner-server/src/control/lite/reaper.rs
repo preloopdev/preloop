@@ -218,6 +218,7 @@ impl LiteBackend {
                 active,
                 paused,
                 pool_preparing,
+                capacity_blocked,
                 booted_at,
                 pool_labels,
                 first_seen,
@@ -241,6 +242,7 @@ impl LiteBackend {
                     any_runner_matches: runner_labels.iter().any(|labels| {
                         crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                     }),
+                    capacity_blocked,
                 };
                 let verdict = logic::starvation_verdict(
                     &candidate,

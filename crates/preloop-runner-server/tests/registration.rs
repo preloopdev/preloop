@@ -1873,6 +1873,134 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
 }
 
 #[tokio::test]
+async fn queued_job_behind_an_occupied_permit_does_not_starve() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    // Capacity one: the only registered runner claims job A and stays busy.
+    let (runner_id, token) =
+        register_runner_with_token(&app, "only-runner", &["self-hosted"], None).await;
+    let (status, session) = create_disttask_session(&app, &token, runner_id).await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::CREATED,
+        "session creation must succeed (got {status})"
+    );
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+    let accepted_a = submit_simple_run(&app).await;
+    let run_a: RunId = accepted_a["run_id"].as_str().unwrap().parse().unwrap();
+    assert!(
+        !poll_message(&app, &token, &session_id).await.is_null(),
+        "the only runner must claim job A"
+    );
+    let request_a = *state
+        .test_tx()
+        .await
+        .session_active_requests
+        .get(&session_id)
+        .expect("job A must be pinned to the only runner's session");
+    // Job A has been executing for longer than the short grace window.
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE job_requests SET started_at = ?1 WHERE request_id = ?2",
+                rusqlite::params![crate::store::now_us() - 300_000_000, request_a],
+            )
+            .unwrap();
+        })
+        .await;
+    // Job B requires a runner the occupied permit does not provide; it waits
+    // in the ready queue behind A.
+    let accepted_b = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_b: RunId = accepted_b["run_id"].as_str().unwrap().parse().unwrap();
+    let job_b = JobId("build".to_owned());
+    // B has waited past both the short grace and the absolute ceiling; only
+    // the occupied permit keeps it queued.
+    state
+        .test_db_mutate(|tx| {
+            tx.set_job_enqueued_us(run_b, &job_b, Some(crate::store::now_us() - 7_200_000_000))
+                .unwrap();
+        })
+        .await;
+    reap_once(&shared).await;
+    state.inner.lock().await.reaper_first_seen.insert(
+        (run_b, job_b.clone()),
+        SystemTime::now() - Duration::from_secs(7_200),
+    );
+    reap_once(&shared).await;
+    {
+        let inner = state.test_tx().await;
+        assert!(
+            inner
+                .ready()
+                .any(|job| job.run_id == run_b && job.job_id == job_b),
+            "a job queued behind an occupied on-demand permit must stay queued"
+        );
+        assert_eq!(
+            inner.runs[&run_b].jobs[&job_b],
+            ExecutionStatus::Queued,
+            "waiting for capacity must not fail the job as starving"
+        );
+    }
+    // A completes and frees the permit.
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_a}"),
+        json!({}),
+        &token,
+    )
+    .await;
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_a}"),
+        json!({"result": "Succeeded"}),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        state.test_tx().await.runs[&run_a].jobs[&JobId("build".to_owned())],
+        ExecutionStatus::Success,
+        "job A must complete"
+    );
+    // A runner matching B appears: B is claimable rather than failed.
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "ubuntu-runner", &["ubuntu-latest"], None).await;
+    let (status, session_b) = create_disttask_session(&app, &token_b, runner_b).await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::CREATED,
+        "session creation must succeed (got {status})"
+    );
+    let session_b_id = session_b["sessionId"].as_str().unwrap().to_owned();
+    assert!(
+        !poll_message(&app, &token_b, &session_b_id).await.is_null(),
+        "job B must be claimed once capacity frees"
+    );
+    assert!(
+        state
+            .test_tx()
+            .await
+            .claimed_jobs
+            .contains_key(&(run_b, job_b.clone())),
+        "the claim must be job B's"
+    );
+}
+#[tokio::test]
 async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window() {
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();

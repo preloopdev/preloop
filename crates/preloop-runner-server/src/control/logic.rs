@@ -105,6 +105,9 @@ pub(crate) struct StarvationCandidate<'a> {
     pub(crate) enqueued_at: SystemTime,
     pub(crate) first_seen: Option<SystemTime>,
     pub(crate) any_runner_matches: bool,
+    /// A runner is already executing another job, so the ready queue is
+    /// capacity-blocked: this job's turn cannot come until that job finishes.
+    pub(crate) capacity_blocked: bool,
 }
 
 /// Starvation outcome: clear, mark, or fail the ready job.
@@ -226,6 +229,10 @@ pub(crate) fn concludes_at_submit(
 /// from boot. Ages are measured on this node's clock; an instant another
 /// node stamped slightly in the future counts as age zero rather than as
 /// expired.
+///
+/// A candidate whose pool is still executing an earlier job is
+/// `capacity_blocked`: the job is waiting for a turn, so its observation
+/// clock is reset instead of being measured against either grace window.
 pub(crate) fn starvation_verdict(
     job: &StarvationCandidate<'_>,
     now: SystemTime,
@@ -247,9 +254,18 @@ pub(crate) fn starvation_verdict(
         if let Some(reason) = pool_unsatisfiable_reason(job.runs_on, pool_labels) {
             return StarvationVerdict::Unschedulable { reason };
         }
-        if within_ceiling {
-            return StarvationVerdict::ClearMark;
-        }
+    }
+    // A pool that is still executing an earlier job occupies the permit this
+    // job needs. Waiting behind an occupied permit is queueing, not
+    // starvation: reset the observation clock every tick so neither the
+    // short grace nor the absolute ceiling can fail this job while capacity
+    // is genuinely in use. When the running job finishes, this job is
+    // claimable, or it starts a fresh grace window if no runner appears.
+    if job.capacity_blocked {
+        return StarvationVerdict::Mark { first_seen: now };
+    }
+    if !pool_labels.is_empty() && within_ceiling {
+        return StarvationVerdict::ClearMark;
     }
     let grace = if pool_preparing {
         if within_ceiling {
@@ -1251,6 +1267,7 @@ mod decision_tests {
             enqueued_at: now - enqueued_ago,
             first_seen: first_seen_ago.map(|ago| now - ago),
             any_runner_matches: false,
+            capacity_blocked: false,
         }
     }
 
@@ -1306,6 +1323,56 @@ mod decision_tests {
         };
         assert_eq!(grace, QUEUED_JOB_GRACE);
         assert!(reason.contains("within 120s"));
+    }
+
+    #[test]
+    fn capacity_blocked_queue_resets_every_grace_window() {
+        let now = SystemTime::now();
+        let linux = labels(&["ubuntu-latest"]);
+        // Job B has waited behind a running job for longer than both the
+        // short grace and the absolute ceiling. Time spent behind an
+        // occupied permit is queueing, not starvation: the verdict must
+        // reset the observation clock instead of failing the job.
+        let waiting = starvation_candidate(
+            &linux,
+            Duration::from_secs(7_200),
+            Some(Duration::from_secs(7_200)),
+            now,
+        );
+        let mut job = waiting.clone();
+        job.capacity_blocked = true;
+        assert_eq!(
+            starvation_verdict(&job, now, false, LONG_UP, &[]),
+            StarvationVerdict::Mark { first_seen: now }
+        );
+        // Pool labels the job can satisfy do not change that: the permit is
+        // still occupied.
+        let pool = labels(&["self-hosted", "ubuntu-latest"]);
+        assert_eq!(
+            starvation_verdict(&job, now, false, LONG_UP, &pool),
+            StarvationVerdict::Mark { first_seen: now }
+        );
+        // A job the pool can never satisfy still fails fast while capacity
+        // is blocked.
+        let gpu = labels(&["gpu"]);
+        let mut unschedulable = starvation_candidate(&gpu, Duration::from_secs(1), None, now);
+        unschedulable.capacity_blocked = true;
+        assert!(matches!(
+            starvation_verdict(&unschedulable, now, false, LONG_UP, &pool),
+            StarvationVerdict::Unschedulable { .. }
+        ));
+        // The permit frees: the job keeps the fresh mark instead of starving
+        // on the clock it accumulated while the earlier job was running.
+        let freed = starvation_candidate(
+            &linux,
+            Duration::from_secs(7_200),
+            Some(Duration::ZERO),
+            now,
+        );
+        assert_eq!(
+            starvation_verdict(&freed, now, false, LONG_UP, &[]),
+            StarvationVerdict::Mark { first_seen: now }
+        );
     }
 
     #[test]
