@@ -650,10 +650,20 @@ pub fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
     }
 }
 
-/// Every secret value a completion payload must not disclose, from the
-/// SecretProvider: every stored tier (over-masking another repository's
-/// value is harmless) plus this run's submission-supplied tier.
-fn completion_secret_values(shared: &SharedState, run_id: RunId) -> Result<Vec<String>, ApiError> {
+/// Every secret value a completion payload must not disclose: every stored
+/// provider tier (over-masking another repository's value is harmless), this
+/// run's submission-supplied tier, and the node-local plan/run scopes the log
+/// egresses mask with.
+///
+/// The provider tiers alone miss two classes of value: environment-tier
+/// secrets merged into the plan scope at claim, and runtime-minted values
+/// (the OIDC `id_token` is registered at mint), so both join here through the
+/// same union [`crate::timeline_logs::resolve_plan_secret_list`] serves to the
+/// log paths.
+async fn completion_secret_values(
+    shared: &SharedState,
+    run_id: RunId,
+) -> Result<Vec<String>, ApiError> {
     let provider = shared.state.secret_provider.as_ref();
     let provider_error = |error: anyhow::Error| {
         ApiError::internal(format!(
@@ -665,6 +675,17 @@ fn completion_secret_values(shared: &SharedState, run_id: RunId) -> Result<Vec<S
     values.extend(preloop_gha_protocol::masking::expose_values(
         provider.run_tier(run_id).map_err(provider_error)?.values(),
     ));
+    // An archived run resolves to no plan keys (NotFound → empty set); the
+    // run scope still covers the runtime registry.
+    let plan_ids = crate::memory_caps::RunNodeKeys::resolve(&shared.state.backend, run_id)
+        .await
+        .map_err(ApiError::from)?
+        .plan_ids;
+    let run_scope = run_id.to_string();
+    let mut scopes: Vec<&str> = Vec::with_capacity(plan_ids.len() + 1);
+    scopes.push(run_scope.as_str());
+    scopes.extend(plan_ids.iter().map(String::as_str));
+    values.extend(crate::timeline_logs::registered_mask_values(shared, &scopes).await);
     Ok(values)
 }
 
@@ -682,11 +703,11 @@ fn completion_secret_values(shared: &SharedState, run_id: RunId) -> Result<Vec<S
 /// the official runner and other clients can report a URL carrying a secret
 /// they never loaded — so the same check runs here against every known
 /// value. A URL that would disclose one is dropped, never stored.
-fn mask_completion_payload(
+async fn mask_completion_payload(
     shared: &SharedState,
     completion: &mut JobCompletion,
 ) -> Result<(), ApiError> {
-    let secrets = completion_secret_values(shared, completion.run_id)?;
+    let secrets = completion_secret_values(shared, completion.run_id).await?;
     completion.annotations = preloop_gha_protocol::mask_annotations(
         std::mem::take(&mut completion.annotations),
         secrets.iter().map(String::as_str),
@@ -782,7 +803,7 @@ pub(crate) async fn complete_job_settling(
             "job completion status must be terminal",
         ));
     }
-    mask_completion_payload(&shared, &mut completion)?;
+    mask_completion_payload(&shared, &mut completion).await?;
     let outcome = shared
         .state
         .backend
@@ -1183,6 +1204,194 @@ jobs:
         assert_eq!(
             row.environment_url, None,
             "server must drop a completion URL containing a secret"
+        );
+    }
+
+    /// Mint an OIDC id_token for the job exactly as a step reading
+    /// `ACTIONS_ID_TOKEN_REQUEST_URL` would.
+    async fn mint_id_token(
+        app: &Router,
+        state: &AppState,
+        plan_id: &str,
+        agent_job_id: &uuid::Uuid,
+    ) -> String {
+        let runtime_token = state.mint_runtime_token(plan_id, agent_job_id);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://mask-test"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "the mint must succeed");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()["value"]
+            .as_str()
+            .expect("the mint response carries the token")
+            .to_owned()
+    }
+
+    /// The queued job's `(plan_id, agent_job_id)` — the mint endpoint's keys.
+    async fn queued_job_keys(state: &AppState) -> (String, uuid::Uuid) {
+        let tx = state.test_tx().await;
+        tx.ready()
+            .next()
+            .or_else(|| tx.pending_jobs.front())
+            .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
+            .expect("the submitted job must be queued")
+    }
+
+    /// A minted id_token is a bearer credential: once it can reach the job,
+    /// a completion annotation or `environment_url` echoing it must be
+    /// redacted by the same plan/run mask scope the log egresses use — the
+    /// SecretProvider tiers alone never learn it.
+    #[tokio::test]
+    async fn minted_id_token_in_completion_payload_is_redacted() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = test_app(state.clone(), CancellationToken::new());
+
+        let accepted = test_request(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\npermissions:\n  id-token: write\njobs:\n  build:\n    runs-on: self-hosted\n    environment: staging\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+        let (plan_id, agent_job_id) = queued_job_keys(&state).await;
+        let jwt = mint_id_token(&app, &state, &plan_id, &agent_job_id).await;
+
+        let response = test_request(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure",
+                "outputs": {},
+                "annotations": [
+                    {"message": format!("worker crashed: {jwt} leaked"), "level": "failure"}
+                ],
+                "environmentUrl": format!("https://deploy.example/?token={jwt}")
+            }),
+        )
+        .await;
+
+        let response_message = response["jobs_list"][0]["annotations"][0]["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !response_message.contains(&jwt),
+            "completion response must not carry the raw id_token: {response_message}"
+        );
+        assert_eq!(
+            response_message, "worker crashed: *** leaked",
+            "the minted id_token must be redacted, not the whole annotation"
+        );
+
+        let stored = test_request(
+            &app,
+            Method::GET,
+            &format!("/api/v1/runs/{run_id}"),
+            Value::Null,
+        )
+        .await;
+        let stored_message = stored["jobs_list"][0]["annotations"][0]["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !stored_message.contains(&jwt),
+            "persisted run must not carry the raw id_token: {stored_message}"
+        );
+
+        let row = state
+            .backend
+            .environment_deployment(
+                run_id.parse().unwrap(),
+                &preloop_gha_protocol::JobId("build".into()),
+            )
+            .await
+            .unwrap()
+            .expect("environment completion must retain the deployment row");
+        assert_eq!(
+            row.environment_url, None,
+            "server must drop a completion URL containing the minted id_token"
+        );
+    }
+
+    /// Registering the id_token must widen the completion mask scope, not
+    /// blanket it: unrelated annotation text and a clean environment URL pass
+    /// through unchanged.
+    #[tokio::test]
+    async fn minted_id_token_leaves_unrelated_completion_content_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = test_app(state.clone(), CancellationToken::new());
+
+        let accepted = test_request(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\npermissions:\n  id-token: write\njobs:\n  build:\n    runs-on: self-hosted\n    environment: staging\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+        let (plan_id, agent_job_id) = queued_job_keys(&state).await;
+        let jwt = mint_id_token(&app, &state, &plan_id, &agent_job_id).await;
+        assert!(!jwt.is_empty());
+
+        let response = test_request(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure",
+                "outputs": {},
+                "annotations": [
+                    {"message": "worker crashed: out of memory", "level": "failure"}
+                ],
+                "environmentUrl": "https://deploy.example/?run=42"
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response["jobs_list"][0]["annotations"][0]["message"],
+            "worker crashed: out of memory"
+        );
+
+        let row = state
+            .backend
+            .environment_deployment(
+                run_id.parse().unwrap(),
+                &preloop_gha_protocol::JobId("build".into()),
+            )
+            .await
+            .unwrap()
+            .expect("environment completion must retain the deployment row");
+        assert_eq!(
+            row.environment_url.as_deref(),
+            Some("https://deploy.example/?run=42"),
+            "a URL unrelated to the id_token must be kept"
         );
     }
 

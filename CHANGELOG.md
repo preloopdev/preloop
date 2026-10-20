@@ -8,6 +8,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **Webhook ingress bounds and times out body uploads.** The GitHub webhook
+  route buffers at most eight request bodies (each up to the 32 MiB route
+  limit) at once, so an unauthenticated caller can no longer use the ingress
+  as a memory amplifier before the HMAC check. An upload is cut off with 408
+  if it is still arriving after 10 s, or if it stops sending for 3 s — holding
+  a slot now costs an actual transfer instead of just a connection — and a
+  delivery that arrives while every slot is taken waits up to 1 s for one
+  rather than being shed outright. Those budgets cover the upload alone: once
+  the body is in, the handler keeps its own acknowledgement budget, so a slow
+  but valid delivery is still recorded. A shed or timed-out request never
+  reached the store and has no local payload to replay, so recovering one
+  means redelivering it from GitHub's delivery log; `preloop webhooks replay`
+  cannot help. With `--record-flows`, the webhook body is no longer buffered
+  by the flow recorder ahead of the route's own admission.
+### Fixed
+
+- **Retries preserve nested-action authorization.** Retrying a claimed job now
+  updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
+  Previously it still named the abandoned attempt, so nested action resolution
+  rejected the retried job's otherwise valid runtime token with HTTP 403.
+- **`github.token` and `GITHUB_TOKEN` populate on github.com registrations**
+  (#626): `preloop-runner configure` now records which control plane the
+  runner registered against (`.runner` `controlPlane`, derived from the
+  `--url` host), and a `.runner` written before that field existed is
+  classified from the `gitHubUrl` it already carries, so an upgraded runner
+  recovers the token surface without re-registering. On a github.com
+  registration, `github.token` and the `GITHUB_TOKEN` env var resolve from
+  the job's `system.github.token` variable (or its `github_token` alias) —
+  mirroring the official runner, which builds `githubContext["token"]` from
+  that variable in `ExecutionContext.InitializeJob` — so `gh`,
+  `github-script`, and checkout's `${{ github.token }}` default authenticate
+  instead of seeing an empty value. Engine registrations keep the fence:
+  there the claim owns that slot, holding the GitHub credential it minted
+  (which the runner reads from the `github.token` context) or nothing at all,
+  and it is never exported to a step. The job-scoped runtime JWT is delivered
+  through `SystemVssConnection` and never enters that variable or the step
+  environment. On both planes a workflow's own `env: GITHUB_TOKEN` no longer
+  replaces `${{ github.token }}`, and the
+  `base64("x-access-token:<token>")` header actions/checkout persists is
+  masked for either alias. `secrets.GITHUB_TOKEN` resolution is unchanged in
+  both modes. Missing, unreadable, or malformed `.runner` metadata now fails
+  the job before any workflow, container, or service work instead of silently
+  selecting the engine plane; an unknown `controlPlane` value or an
+  unparseable `gitHubUrl` is an error, and job execution reuses the
+  registration state validated at worker startup rather than re-reading
+  `.runner` per job.
+
+## [0.35.0] - 2026-10-19
+
+### Security
+
+- **Log masking covers base64 alignment shifts.** A secret piped through
+  `base64` with a short prefix in front of it (`printf 'x%s' "$SECRET" |
+  base64`) no longer reaches a masked log. Masked log paths now redact
+  base64 encodings of a registered secret at any byte alignment, including
+  tokens that straddle 76-column wrapped lines and tokens split across write
+  chunks in server-side log persistence. Percent- and hex-encodings of such
+  a shifted payload are still not covered by this pass; register the exact
+  value when a workflow prints it that way.
+
 ### Added
 
 - **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or
@@ -183,6 +245,48 @@ Releases before v0.27.0 predate the changelog.
   the action-download path logs a WARN with its run and reason, and a local
   composite source that cannot be read is treated as incomplete, never
   remembered as an empty answer.
+
+- **Runner mask hints are now applied in job logs.** The engine already stamped
+  `maskHints` (regex and variable) into every job message, but the runner
+  ignored the list, so pattern-shaped redaction the official runner performs
+  never happened. `run_job` now consumes it: regex hints compile once per job
+  and join the same scan as value masks on every runner egress — durable step
+  logs, check-run annotations, the live-log drain, and the retroactive re-mask —
+  and variable hints mask the named variable's value. The assembled step log
+  (`log_content`, and every slice and upload derived from it) additionally takes
+  the pattern pass over the whole text with line preservation, so a hint whose
+  pattern spans a newline still redacts it while the record count — and every
+  line checkpoint — stays intact. A hint whose pattern does not compile is
+  skipped with a warning. The completion `environment.url` guard applies the
+  hint patterns too, so a URL matching one is dropped rather than published.
+
+- **Credential-shaped container and service `env:` values are masked.** A
+  service declared as `services: db: env: POSTGRES_PASSWORD: …` showed the value
+  verbatim on the `##[command]docker create … -e` line, in the docker debug
+  trace, and in service `docker logs` output. Values whose `env` name matches
+  PASSWORD, PASSWD, SECRET, TOKEN, API_KEY, APIKEY, PRIVATE_KEY, CREDENTIAL, or
+  ACCESS_KEY (case-insensitive) are now registered as job masks before the first
+  recorded docker line, so every sink shows `***`; an empty workflow value is
+  passed as a bare `-e KEY`, which makes Docker inherit the key from the runner
+  process, so the runner's own value for a credential-shaped key is registered
+  too. The match deliberately over-masks (a `TOKEN_BUDGET=5` becomes `***`) —
+  documented at the registration site. The container-create error paths that
+  embed docker output mask it as well.
+
+- **Minted OIDC `id_token`s are redacted from logs.** A step that curls
+  `ACTIONS_ID_TOKEN_REQUEST_URL` and echoes the response leaked the bearer JWT
+  into its log. The token endpoint now registers each minted `id_token` into the
+  job's server-side mask scope before the response is sent, widening the running
+  stream masker in place (the withheld tail is flushed through the rebuilt
+  masker, so no log bytes are dropped), so both the live feed and the persisted
+  log show `***`. Unrelated content is unchanged. Registration is node-local,
+  like the existing claim-time scope merges, and bounded: each scope keeps the
+  64 most recent registrations and drops the oldest first, so a job that mints a
+  token per call cannot grow the scope — or rebuild every live masker from a
+  longer list on each mint — for the run's life. Retention removes the run's own
+  scope entry with its plan scopes. The per-log masker mutex is held across the
+  append of a widened masker's flushed tail, so a concurrent append never
+  interleaves with it.
 - **GitHub Apps created by the manifest flow now subscribe to
   `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
   signal joins the creation-time `default_events`, and `actions: read` joins
@@ -264,6 +368,22 @@ Releases before v0.27.0 predate the changelog.
   gets a 10 s deadline, and after one unanswered call the store is treated as
   unavailable for the rest of the process. Platform revocation checks no longer
   apply; a CA added to the OS store is picked up on restart.
+
+- **Every remaining outbound client uses the in-process TLS roots, and the
+  macOS keychain probe is killed at its deadline.** The OTLP exporter's
+  blocking client (including the engine hosted by `preloop serve`, whose CLI
+  installs the same builder), the runner's engine/GitHub clients, and
+  `preloop-runner lint`'s remote-workflow fetch now verify against the same
+  process-wide roots as the engine (bundled Mozilla, the OS store read with a
+  5 s deadline, and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`) instead of
+  reqwest's platform verifier, so a hung `trustd`/`securityd` can no longer
+  stall them. `preloop runner lint` also gains a 30 s request / 10 s connect
+  deadline. The login-keychain writability probe's cleanup delete (`security
+  delete-generic-password`) is now killed after 2 s instead of leaking its
+  child and guard thread forever, and the secrets/policy API config
+  load-and-write (which can reach the keychain for the sealing key) runs on
+  the blocking pool, so a 10 s store wait no longer parks an async worker
+  while the mutation lock is held.
 
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
@@ -400,6 +520,16 @@ Releases before v0.27.0 predate the changelog.
   merged upload, and the logs endpoint falls back to the larger per-step
   representation when one exists. This preserves mutation and other
   heavy-step output after guest temporary-storage pressure.
+
+- **Post hooks of skipped actions no longer run**: a workflow step that did
+  not run, because its `if:` was false or an earlier step failed, no longer
+  runs its action's `post` hook. The official runner registers a post hook
+  while the action's handler runs — for the action's `Pre` step as well as its
+  main step — but the engine ran every post hook under its `always()` default,
+  so cleanup hooks of skipped steps ran for minutes and their failures were
+  recorded beside the real first failure. A post hook whose action never
+  reached its handler is now recorded as `skipped`; hooks of actions that ran,
+  and hooks whose action's `pre:` step ran, are unchanged.
 
 ## [0.34.4] - 2026-10-13
 
@@ -2849,7 +2979,8 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.33.7...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.0...HEAD
+[0.35.0]: https://github.com/preloopdev/preloop/compare/v0.34.4...v0.35.0
 [0.33.7]: https://github.com/preloopdev/preloop/compare/v0.33.6...v0.33.7
 [0.33.6]: https://github.com/preloopdev/preloop/compare/v0.33.5...v0.33.6
 [0.33.5]: https://github.com/preloopdev/preloop/compare/v0.33.2...v0.33.5

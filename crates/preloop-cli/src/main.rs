@@ -1216,8 +1216,17 @@ async fn main() -> anyhow::Result<()> {
     // `RUST_LOG` defaults to `info` (the old `fmt::init()` default of ERROR hid
     // pool provisioning faults). The runtime is held for the life of `main`
     // and flushed with a bounded 2s shutdown on exit.
+    //
+    // OTLP goes through the OTLP-only exporter client builder: this process
+    // hosts the engine (`preloop serve`), and without the customizer the
+    // blocking exporter client falls back to reqwest's platform verifier —
+    // on macOS `SecTrustEvaluateWithError` asks `trustd`/`securityd` with no
+    // deadline, so a hung trust daemon would stall the export thread and the
+    // shutdown flush. Same installer `preloop-runner` and
+    // `preloop-runner-server` pass.
     let obs_config = preloop_observability::ObservabilityConfig::from_env()
-        .with_service_version(env!("CARGO_PKG_VERSION"));
+        .with_service_version(env!("CARGO_PKG_VERSION"))
+        .with_otel_client_builder(preloop_runner_server::shared_http::with_tls_roots_blocking);
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();

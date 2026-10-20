@@ -109,8 +109,12 @@ fn policy_view(policy: &ExecutionProtectionConfig) -> serde_json::Value {
 
 /// Load the operator's current `[execution_protection]` table from the
 /// config file — the same file the engine read at startup.
-fn load_policy(shared: &Arc<SharedState>) -> Result<ExecutionProtectionConfig, ApiError> {
-    let config = crate::config::load_config_from(&shared.state.config_path)
+/// The load may reach the OS credential store for the `[secrets]` sealing key,
+/// bounded by `credential_store`'s 10 s guard; `config_blocking` keeps that
+/// bound off the async workers.
+async fn load_policy(shared: &Arc<SharedState>) -> Result<ExecutionProtectionConfig, ApiError> {
+    let config = crate::config_blocking::load_config(&shared.state.config_path)
+        .await
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     Ok(config.execution_protection)
 }
@@ -128,32 +132,46 @@ fn load_policy(shared: &Arc<SharedState>) -> Result<ExecutionProtectionConfig, A
 /// effect on restart, exactly like hand-editing the file.
 async fn mutate_policy(
     shared: &Arc<SharedState>,
-    mutate: impl FnOnce(&mut ExecutionProtectionConfig) -> Result<serde_json::Value, ApiError>,
+    mutate: impl FnOnce(&mut ExecutionProtectionConfig) -> Result<serde_json::Value, ApiError>
+    + Send
+    + 'static,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let _guard = shared.state.policy_mutation.lock().await;
+    let shared_for_section = shared.clone();
     // The file itself is shared with the secrets API and engine-hosted App
     // setup, so the whole cycle holds the one config-mutation lock too: each
     // of them writes a whole document, and only a lock held across the read
     // and the write stops the later rename from publishing a stale snapshot.
-    let _config_mutation = crate::config::config_mutation_lock().lock();
-    let mut config = crate::config::load_config_from(&shared.state.config_path)
-        .map_err(|error| ApiError::internal(format!("{error:#}")))?;
-    // `secrets_store = "memory"` only governs where secret values are kept;
-    // execution-protection rules are operator policy, not secrets, so they
-    // always persist to the config file, exactly as the task requires.
-    let response = mutate(&mut config.execution_protection)?;
-    crate::config::validate_execution_protection_rules(&config.execution_protection)
-        .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
-    crate::config::write_config_to(&shared.state.config_path, &config)
-        .map_err(|error| ApiError::internal(format!("{error:#}")))?;
-    Ok(Json(response))
+    // That lock is a `parking_lot` guard, so it cannot span an await: the
+    // whole section runs on the blocking pool, where the OS credential store's
+    // 10 s guard costs a blocking thread instead of an async worker.
+    let response: Result<serde_json::Value, ApiError> = crate::config_blocking::run_section(
+        "execution protection policy write (config file / OS credential store)",
+        move || {
+            let _config_mutation = crate::config::config_mutation_lock().lock();
+            let mut config = crate::config::load_config_from(&shared_for_section.state.config_path)
+                .map_err(|error| ApiError::internal(format!("{error:#}")))?;
+            // `secrets_store = "memory"` only governs where secret values are kept;
+            // execution-protection rules are operator policy, not secrets, so they
+            // always persist to the config file, exactly as the task requires.
+            let response = mutate(&mut config.execution_protection)?;
+            crate::config::validate_execution_protection_rules(&config.execution_protection)
+                .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+            crate::config::write_config_to(&shared_for_section.state.config_path, &config)
+                .map_err(|error| ApiError::internal(format!("{error:#}")))?;
+            Ok(response)
+        },
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("{error:#}")))?;
+    Ok(Json(response?))
 }
 
 /// Read the whole execution-protection policy: mode plus every rule.
 pub async fn get_execution_protection_policy(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(policy_view(&load_policy(&shared)?)))
+    Ok(Json(policy_view(&load_policy(&shared).await?)))
 }
 
 #[derive(Deserialize)]
@@ -176,7 +194,7 @@ pub async fn set_execution_protection_mode(
             )));
         }
     };
-    mutate_policy(&shared, |policy| {
+    mutate_policy(&shared, move |policy| {
         policy.mode = mode;
         Ok(serde_json::json!({ "mode": policy.mode }))
     })
@@ -187,7 +205,7 @@ pub async fn set_execution_protection_mode(
 pub async fn list_execution_protection_rules(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let policy = load_policy(&shared)?;
+    let policy = load_policy(&shared).await?;
     let rules: Vec<RuleView> = policy
         .event_rules
         .iter()
@@ -289,7 +307,7 @@ pub async fn create_execution_protection_rule(
     Json(body): Json<RuleBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let new_rule = validate_rule_body(&body)?;
-    mutate_policy(&shared, |policy| {
+    mutate_policy(&shared, move |policy| {
         let view = match new_rule {
             NewRule::Event(rule) => {
                 let index = policy.event_rules.len();
@@ -314,10 +332,13 @@ pub async fn get_execution_protection_rule(
     State(shared): State<Arc<SharedState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let policy = load_policy(&shared)?;
-    let (kind, index) = parse_rule_id(&id)
-        .ok_or_else(|| ApiError::not_found(format!("no execution protection rule {id:?}")))?;
-    let view = match kind {
+    let policy = load_policy(&shared).await?;
+    let id_for_message = id.clone();
+    let (kind, index) = parse_rule_id(&id).ok_or_else(|| {
+        ApiError::not_found(format!("no execution protection rule {id_for_message:?}"))
+    })?;
+    let kind = kind.to_owned();
+    let view = match kind.as_str() {
         "event" => policy
             .event_rules
             .get(index)
@@ -328,7 +349,9 @@ pub async fn get_execution_protection_rule(
             .map(|rule| actor_rule_view(index, rule)),
         _ => None,
     }
-    .ok_or_else(|| ApiError::not_found(format!("no execution protection rule {id:?}")))?;
+    .ok_or_else(|| {
+        ApiError::not_found(format!("no execution protection rule {id_for_message:?}"))
+    })?;
     Ok(Json(serde_json::to_value(view).map_err(|error| {
         ApiError::internal(format!("{error:#}"))
     })?))
@@ -341,20 +364,23 @@ pub async fn update_execution_protection_rule(
     Path(id): Path<String>,
     Json(body): Json<RuleBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (kind, index) = parse_rule_id(&id)
-        .ok_or_else(|| ApiError::not_found(format!("no execution protection rule {id:?}")))?;
+    let id_for_message = id.clone();
+    let (kind, index) = parse_rule_id(&id).ok_or_else(|| {
+        ApiError::not_found(format!("no execution protection rule {id_for_message:?}"))
+    })?;
+    let kind = kind.to_owned();
     let new_rule = validate_rule_body(&body)?;
-    mutate_policy(&shared, |policy| {
-        let list_len = match kind {
+    mutate_policy(&shared, move |policy| {
+        let list_len = match kind.as_str() {
             "event" => policy.event_rules.len(),
             _ => policy.actor_rules.len(),
         };
         if index >= list_len {
             return Err(ApiError::not_found(format!(
-                "no execution protection rule {id:?}"
+                "no execution protection rule {id_for_message:?}"
             )));
         }
-        let view = match (kind, new_rule) {
+        let view = match (kind.as_str(), new_rule) {
             ("event", NewRule::Event(rule)) => {
                 policy.event_rules[index] = rule;
                 serde_json::to_value(event_rule_view(index, &policy.event_rules[index]))
@@ -365,7 +391,7 @@ pub async fn update_execution_protection_rule(
             }
             _ => {
                 return Err(ApiError::bad_request(format!(
-                    "rule {id:?} is a {kind} rule; the body describes a different kind"
+                    "rule {id_for_message:?} is a {kind} rule; the body describes a different kind"
                 )));
             }
         }
@@ -382,10 +408,13 @@ pub async fn delete_execution_protection_rule(
     State(shared): State<Arc<SharedState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (kind, index) = parse_rule_id(&id)
-        .ok_or_else(|| ApiError::not_found(format!("no execution protection rule {id:?}")))?;
-    mutate_policy(&shared, |policy| {
-        let removed = match kind {
+    let id_for_message = id.clone();
+    let (kind, index) = parse_rule_id(&id).ok_or_else(|| {
+        ApiError::not_found(format!("no execution protection rule {id_for_message:?}"))
+    })?;
+    let kind = kind.to_owned();
+    mutate_policy(&shared, move |policy| {
+        let removed = match kind.as_str() {
             "event" => {
                 if index < policy.event_rules.len() {
                     policy.event_rules.remove(index);
@@ -405,7 +434,7 @@ pub async fn delete_execution_protection_rule(
         };
         if !removed {
             return Err(ApiError::not_found(format!(
-                "no execution protection rule {id:?}"
+                "no execution protection rule {id_for_message:?}"
             )));
         }
         Ok(serde_json::json!({ "ok": true }))

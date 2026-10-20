@@ -1307,6 +1307,7 @@ mod tests {
                 skip_session_recover: false,
                 monitor_socket_address: None,
                 use_runner_admin_flow: false,
+                control_plane: Some(crate::settings::ControlPlane::Engine),
             },
             credentials: crate::settings::CredentialData {
                 scheme: "OAuth".to_string(),
