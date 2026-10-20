@@ -378,14 +378,25 @@ Releases before v0.27.0 predate the changelog.
   submission for the same repository queued behind it until the engine
   restarted. Every engine Git child now runs under a deadline — 60 s for ref,
   config, and index plumbing, 15 min for whole-repository work (`add`,
-  `write-tree`, `fsck`, `archive`), 30 min for anything that reaches a remote —
-  and is killed when the deadline expires, which releases the cache lock with
-  it. Git's own terminal prompt was already disabled; the credential-helper
-  list is now cleared and both askpass programs are neutralised as well,
-  because `GIT_TERMINAL_PROMPT=0` alone does not stop a configured helper. The
-  error names the operation and the deadline (`git fetch remote checkout
-  snapshot timed out after 30m: killed the hung git process`) so a hang reads
-  differently from a failure.
+  `write-tree`, `merge-tree`, `commit-tree`, `fsck`, `archive`), 30 min for
+  anything that reaches a remote — and is killed when the deadline expires,
+  which releases the cache lock with it. Git's own terminal prompt was already
+  disabled; both askpass programs are now neutralised and
+  `GCM_INTERACTIVE=never` set as well, because `GIT_TERMINAL_PROMPT=0` alone
+  does not stop a configured helper, and the helper list is cleared wherever
+  the engine stages its own GitHub header. A workspace's own remote keeps the
+  operator's helper — that credential is the only one the engine has for a
+  GitLab, enterprise, or PAT-less GitHub origin, and resetting it made the
+  deepen fail, after which the snapshot rewrote history and submitted SHAs the
+  forge had never seen; the deadline and the non-interactive policy still
+  bound it. Staged tokens now ride in `GIT_CONFIG_*` in the child's environment
+  instead of `-c` on its argv, which a process listing exposes. A child killed
+  at its deadline cannot unlink the `*.lock` it held, so locks left by a
+  killed fetch are swept before the next one: those in a repository the engine
+  holds exclusively right away, and any older than the longest possible fetch
+  elsewhere. The error names the operation and the deadline (`git fetch timed
+  out after 1800s: killed the hung git process`) so a hang reads differently
+  from a failure.
 - **Every remaining outbound client uses the in-process TLS roots, and the
   macOS keychain probe is killed at its deadline.** The OTLP exporter's
   blocking client (including the engine hosted by `preloop serve`, whose CLI

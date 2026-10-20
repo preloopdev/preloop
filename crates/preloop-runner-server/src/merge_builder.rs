@@ -473,9 +473,9 @@ async fn fetch_into_mirror_within(
         .args(["fetch", "--quiet", "--no-tags"])
         .arg(url)
         .arg(refspec);
-    // `what` carries the program name here because the message is the one an
-    // operator sees for a stalled forge: "git fetch timed out after 30m:
-    // killed the hung git process".
+    // `what` names the fetch and the deadline, the message an operator sees
+    // for a stalled forge: "git fetch timed out after 1800s: killed the hung
+    // git process".
     let output = Box::pin(preloop_observability::deadline::run_command(
         command,
         deadline,
