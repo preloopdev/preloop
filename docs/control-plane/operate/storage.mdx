@@ -16,6 +16,8 @@ Precedence is `preloop serve --store URL`, then `PRELOOP_STORE_URL`, then the SQ
 
 Postgres uses 16 writer and 16 reader connections by default, plus one dedicated wake listener. Set `PRELOOP_PG_WRITERS` and `PRELOOP_PG_READERS` to size the pools; each value is clamped to at least one. Queue claims use row locks with `SKIP LOCKED`, and notifications are wake hints rather than the source of truth.
 
+Every engine session opens under a 10 s connect deadline covering resolution, TCP, TLS, authentication, and the session setup, so a database that accepts connections and then stops answering fails engine startup, a pooled reconnect, and the wake listener — which then retries with backoff — instead of parking them forever. Sessions also carry `statement_timeout` 30 s, `lock_timeout` 15 s, and `idle_in_transaction_session_timeout` 60 s: a control statement that runs, or waits for a lock, longer than that is cancelled with an error naming the timeout, which is what keeps a stuck transaction from holding a run's row locks and every command behind it. `preloop store migrate` is not affected — it opens its own connection without those guards, so schema work and backfills are not cut short.
+
 ## Apply schema migrations
 
 The control schema uses embedded, forward-only refinery migrations. A fresh local SQLite store is initialized by the supported setup paths (`preloop serve` on a fresh `$PRELOOP_HOME`, `preloop init`, `preloop server install`); existing stores are upgraded explicitly:
