@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 pub use preloop_gha_protocol::SecretString;
-use preloop_observability::deadline::{DeadlineGuard, GuardError};
+use preloop_observability::deadline::{DeadlineGuard, GuardError, run_command_blocking};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -311,13 +311,17 @@ fn deny_helpful_error(error: keyring::Error, reference: &CredentialRef, op: &str
 /// probe is cheap and the fallback (the file store) is always safe.
 #[cfg(target_os = "macos")]
 fn macos_keychain_writable() -> Result<()> {
-    use std::io::Read;
-    use std::time::{Duration, Instant};
-
     /// Kept below `OS_STORE_TIMEOUT` so a wedged keychain fails the probe
     /// ("not writable", the store reports itself unavailable) before the
     /// enclosing call deadline would mark the whole store unresponsive.
     const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Budget for deleting the throwaway probe item. A healthy keychain
+    /// answers in milliseconds; the two-second bound keeps
+    /// `PROBE_TIMEOUT + PROBE_CLEANUP_TIMEOUT` below [`OS_STORE_TIMEOUT`] so a
+    /// wedged `securityd` still lets the guard report the store unavailable
+    /// (instead of the caller abandoning the thread mid-cleanup) and the
+    /// killed child cannot outlive it.
+    const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
     /// Throwaway item used to prove `SecItemAdd` completes in this session.
     /// Distinct service/account so it can never collide with a real entry.
     const PROBE_SERVICE: &str = "dev.preloop.writability-probe";
@@ -332,8 +336,13 @@ fn macos_keychain_writable() -> Result<()> {
     // One probe command: write a throwaway item, then delete it. Both go
     // through the same SecItemAdd/SecItemDelete path a real credential write
     // takes, so a locked keychain hangs or fails here exactly as it would on
-    // the engine-token migration.
-    let mut child = std::process::Command::new("security")
+    // the engine-token migration. Both run through the shared bounded child
+    // runner, which kills and reaps a `security` stuck in `securityd` IPC at
+    // the deadline — a plain `.status()` here would keep this guard thread
+    // (already abandoned by the caller at `OS_STORE_TIMEOUT`) and the child
+    // alive for the rest of the process.
+    let mut probe = std::process::Command::new("security");
+    probe
         .arg("add-generic-password")
         .arg("-s")
         .arg(PROBE_SERVICE)
@@ -341,44 +350,41 @@ fn macos_keychain_writable() -> Result<()> {
         .arg(PROBE_ACCOUNT)
         .arg("-w")
         .arg("probe")
-        .arg(&keychain)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("probing login keychain writability")?;
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    let status = loop {
-        match child.try_wait().context("waiting on keychain probe")? {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!(
-                    "login keychain write probe timed out after {}s (keychain locked or \
-                     securityd unreachable); using the file credential store",
-                    PROBE_TIMEOUT.as_secs()
-                );
+        .arg(&keychain);
+    let probe_output = run_command_blocking(probe, PROBE_TIMEOUT, "login keychain write probe")
+        .map_err(|error| {
+            if error.timed_out() {
+                anyhow::anyhow!(
+                    "{error} (keychain locked or securityd unreachable); using the file \
+                     credential store"
+                )
+            } else {
+                anyhow::Error::new(error).context("probing login keychain writability")
             }
-            None => std::thread::sleep(Duration::from_millis(25)),
-        }
-    };
+        })?;
+
     // Best-effort cleanup of the probe item regardless of outcome; a leftover
     // is harmless (distinct service name, no secret value).
-    let _ = std::process::Command::new("security")
+    let mut cleanup = std::process::Command::new("security");
+    cleanup
         .arg("delete-generic-password")
         .arg("-s")
         .arg(PROBE_SERVICE)
         .arg("-a")
         .arg(PROBE_ACCOUNT)
-        .arg(&keychain)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    if !status.success() {
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
+        .arg(&keychain);
+    if let Err(error) = run_command_blocking(
+        cleanup,
+        PROBE_CLEANUP_TIMEOUT,
+        "keychain probe item cleanup",
+    ) {
+        tracing::warn!(%error,
+            "keychain probe cleanup did not complete (the throwaway probe item may remain in \
+             the login keychain)");
+    }
+
+    if !probe_output.status.success() {
+        let stderr = String::from_utf8_lossy(&probe_output.stderr);
         anyhow::bail!(
             "login keychain is not writable in this session ({}); \
              using the file credential store",

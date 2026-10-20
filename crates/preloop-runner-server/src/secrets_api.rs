@@ -249,10 +249,39 @@ pub async fn set_secret(
     // execution-protection rules) from publishing a document built from a
     // stale read over this one, and it is held across synchronous work only.
     let _mutation = shared.state.secret_mutation.lock().await;
+    let shared_for_section = shared.clone();
+    let repo = body.repo.clone();
+    let env = body.env.clone();
+    // The load reaches the OS credential store for the `[secrets]` sealing key
+    // and the write may seal values there; both are bounded by
+    // `credential_store`'s 10 s guard, so the whole locked section runs on the
+    // blocking pool (`config_mutation` cannot span an await) instead of
+    // parking an async worker.
+    crate::config_blocking::run_section(
+        "secret set (config file / OS credential store)",
+        move || set_secret_locked(&shared_for_section, repo, env, name, value),
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("{error:#}")))??;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// The synchronous critical section of [`set_secret`].
+///
+/// Runs under the caller's `secret_mutation` guard and takes `config_mutation`
+/// itself, so the load → mutate → persist → publish sequence is one critical
+/// section even though it is executed on the blocking pool.
+fn set_secret_locked(
+    shared: &Arc<SharedState>,
+    repo: Option<String>,
+    env: Option<String>,
+    name: String,
+    value: String,
+) -> Result<(), ApiError> {
     let _config_mutation = crate::config::config_mutation_lock().lock();
     let mut config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
-    match (&body.repo, &body.env) {
+    match (&repo, &env) {
         (Some(repo), Some(env)) => {
             config
                 .env_secrets
@@ -261,9 +290,6 @@ pub async fn set_secret(
                 .entry(env.clone())
                 .or_default()
                 .insert(name.clone(), value.clone());
-            // No environment registry to update: environments are created
-            // on demand by `environment:` (GitHub semantics), so storing a
-            // secret for one only defines that environment's secret tier.
         }
         (Some(repo), None) => {
             config
@@ -285,7 +311,7 @@ pub async fn set_secret(
     }
 
     let mut store = shared.state.secrets.write();
-    match (&body.repo, &body.env) {
+    match (&repo, &env) {
         (Some(repo), Some(env)) => {
             store
                 .env
@@ -307,7 +333,7 @@ pub async fn set_secret(
         }
         (None, Some(_)) => unreachable!("env without repo rejected above"),
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(())
 }
 
 /// Remove a stored secret. 404 when the name is not stored in that scope.
@@ -354,6 +380,30 @@ pub async fn delete_secret(
     // deleted name in the file. Lock order: `secret_mutation` → `secrets`,
     // with `config_mutation` innermost.
     let _mutation = shared.state.secret_mutation.lock().await;
+    let shared_for_section = shared.clone();
+    let repo = query.repo.clone();
+    let env = query.env.clone();
+    // Same blocking-pool rationale as `set_secret`: the load may read the OS
+    // credential store for the sealing key, and `config_mutation` cannot span
+    // an await, so the whole locked section runs on the blocking pool.
+    crate::config_blocking::run_section(
+        "secret delete (config file / OS credential store)",
+        move || delete_secret_locked(&shared_for_section, repo, env, name),
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("{error:#}")))??;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// The synchronous critical section of [`delete_secret`]. `NotFound` is
+/// returned as an [`ApiError`] so the handler keeps its 404 behaviour.
+fn delete_secret_locked(
+    shared: &Arc<SharedState>,
+    repo: Option<String>,
+    env: Option<String>,
+    name: String,
+) -> Result<(), ApiError> {
+    let query = SecretQuery { repo, env };
     let _config_mutation = crate::config::config_mutation_lock().lock();
     let config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
@@ -370,7 +420,7 @@ pub async fn delete_secret(
         if !remove_from_store(&mut store, &query, &name) {
             return Err(not_found_error(&name, &query));
         }
-        return Ok(Json(serde_json::json!({ "ok": true })));
+        return Ok(());
     }
 
     let mut config = config;
@@ -425,7 +475,7 @@ pub async fn delete_secret(
     let mut store = shared.state.secrets.write();
     let _ = scope_key;
     let _ = remove_from_store(&mut store, &query, &name);
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(())
 }
 
 /// Remove a secret from the runtime store by scope, pruning empty maps.
@@ -575,5 +625,104 @@ mod tests {
             "REPO"
         ));
         assert!(!credential_scope_conflict(&credential, None, None, "NOPE"));
+    }
+
+    /// Reproduction for this PR's config-offload fix: a handler whose config
+    /// load blocks — on an operator host that is the OS credential store the
+    /// `[secrets]` sealing key is read from — used to park the async worker it
+    /// ran on, so a single wedged request froze the API on a single-threaded
+    /// runtime. The same blocking read is reproducible without a hung keychain:
+    /// point the handler at a FIFO whose read is held open for a while and
+    /// assert that a task scheduled on that runtime still runs inside the
+    /// window.
+    ///
+    /// Before the offload the read happens on the runtime thread, nothing else
+    /// on the runtime is polled for the whole hold, and the assertion below
+    /// fails. The hold is bounded on purpose: a read that never answers would
+    /// hang the process instead of failing it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_blocked_config_read_does_not_park_the_async_worker() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Instant;
+
+        /// How long the FIFO read is left unanswered.
+        const HOLD: std::time::Duration = std::time::Duration::from_secs(4);
+        /// A task on a free runtime runs in milliseconds; a runtime parked for
+        /// the whole hold cannot meet this.
+        const PROGRESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+        /// Sentinel for "the task never ran".
+        const NEVER: u64 = u64::MAX;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("config.toml");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be on PATH (coreutils)");
+        assert!(made.success(), "mkfifo {} failed", fifo.display());
+        // The engine's systemd credential is an operator-machine input; keep the
+        // handler from reading an ambient one. Memory mode keeps the section
+        // from writing back into the FIFO once the read completes.
+        let _credentials = crate::state::TestEnvVar::unset(crate::config::CREDENTIALS_ENV);
+        let _store_mode = crate::state::TestEnvVar::set(crate::config::SECRETS_STORE_ENV, "memory");
+        // Built against a config path that does not exist (the FIFO would park
+        // the constructor instead), then pointed at the FIFO for the call.
+        let mut state = crate::state::AppState::new_with_config(
+            dir.path().join("state"),
+            dir.path().join("absent.toml"),
+        )
+        .await
+        .expect("build the state");
+        state.config_path = fifo.clone();
+        let shared = Arc::new(SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+
+        // The writer meets the section's read on the FIFO, holds it open for
+        // `HOLD`, then hands over a config in memory mode so the section can
+        // finish. It never touches this test's runtime.
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open the FIFO for writing");
+                std::thread::sleep(HOLD);
+                std::io::Write::write_all(&mut file, b"secrets_store = \"memory\"\n")
+                    .expect("write the config into the FIFO");
+            })
+        };
+
+        let started = Instant::now();
+        let progressed = Arc::new(AtomicU64::new(NEVER));
+        let flag = Arc::clone(&progressed);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(NEVER);
+            flag.store(micros, Ordering::SeqCst);
+        });
+
+        let result = set_secret(
+            State(shared),
+            Path("TOKEN".to_owned()),
+            Json(SetSecretBody {
+                value: Some("v".to_owned()),
+                repo: None,
+                env: None,
+            }),
+        )
+        .await;
+        let finished = started.elapsed();
+        writer.join().unwrap();
+        let _ = result.expect("the offloaded section must complete");
+        let flagged = std::time::Duration::from_micros(progressed.load(Ordering::SeqCst));
+        assert!(
+            flagged < PROGRESS_DEADLINE,
+            "another task on the runtime first ran {flagged:?} into a {finished:?} handler call: \
+             the blocked config read parked the async worker"
+        );
     }
 }

@@ -7,6 +7,16 @@ use super::super::action_preparation::parse_remote_uses;
 use super::*;
 use tokio::sync::watch;
 
+/// Registration state a worker would have loaded from `.runner` before
+/// calling `run_job`. Tests that care about GitHub-plane token handling build
+/// the other variant explicitly.
+fn engine_registration() -> crate::settings::RunnerRegistration {
+    crate::settings::RunnerRegistration {
+        control_plane: crate::settings::ControlPlane::Engine,
+        runner_name: "test-runner".to_string(),
+    }
+}
+
 #[test]
 fn any_step_failed_counts_continue_on_error_failures() {
     use crate::worker::contexts::StepResult;
@@ -367,6 +377,7 @@ async fn first_renew_gate_404_abandons_without_running_steps() {
     let (_tx, cancel_rx) = watch::channel(false);
     let res = run_job(
         payload,
+        engine_registration(),
         ProtocolPath::Broker,
         cancel_rx,
         LeaseTiming::default(),
@@ -414,7 +425,14 @@ async fn step_failure_reports_failed_conclusion_on_completejob() {
         }]),
     );
     let (_tx, cancel_rx) = watch::channel(false);
-    let res = run_job(payload, ProtocolPath::Broker, cancel_rx, fast_timing()).await;
+    let res = run_job(
+        payload,
+        engine_registration(),
+        ProtocolPath::Broker,
+        cancel_rx,
+        fast_timing(),
+    )
+    .await;
     assert!(res.is_ok(), "run_job failed: {res:?}");
 
     let reqs = requests.lock().await.clone();
@@ -458,7 +476,14 @@ async fn cancelled_job_reports_canceled_conclusion_on_completejob() {
         }
         let _ = cancel_tx.send(true);
     });
-    let res = run_job(payload, ProtocolPath::Broker, cancel_rx, fast_timing()).await;
+    let res = run_job(
+        payload,
+        engine_registration(),
+        ProtocolPath::Broker,
+        cancel_rx,
+        fast_timing(),
+    )
+    .await;
     assert!(res.is_ok(), "run_job failed: {res:?}");
 
     let reqs = requests.lock().await.clone();
@@ -490,7 +515,14 @@ async fn first_renew_gate_abandons_after_retry_budget() {
         }]),
     );
     let (_tx, cancel_rx) = watch::channel(false);
-    let res = run_job(payload, ProtocolPath::Broker, cancel_rx, fast_timing()).await;
+    let res = run_job(
+        payload,
+        engine_registration(),
+        ProtocolPath::Broker,
+        cancel_rx,
+        fast_timing(),
+    )
+    .await;
     assert!(res.is_ok(), "run_job failed: {res:?}");
 
     let reqs = requests.lock().await.clone();
@@ -536,6 +568,7 @@ async fn first_renew_gate_cancellation_completes_canceled() {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let handle = tokio::spawn(run_job(
         payload,
+        engine_registration(),
         ProtocolPath::Broker,
         cancel_rx,
         fast_timing(),
@@ -579,7 +612,14 @@ async fn mid_job_lease_loss_reports_abandoned() {
         }]),
     );
     let (_tx, cancel_rx) = watch::channel(false);
-    let res = run_job(payload, ProtocolPath::Broker, cancel_rx, fast_timing()).await;
+    let res = run_job(
+        payload,
+        engine_registration(),
+        ProtocolPath::Broker,
+        cancel_rx,
+        fast_timing(),
+    )
+    .await;
     assert!(res.is_ok(), "run_job failed: {res:?}");
 
     let reqs = requests.lock().await.clone();
@@ -670,6 +710,7 @@ async fn first_renew_cancel_preempts_stalled_renew_http() {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let handle = tokio::spawn(run_job(
         payload,
+        engine_registration(),
         ProtocolPath::Broker,
         cancel_rx,
         fast_timing(),
@@ -714,6 +755,7 @@ async fn first_renew_gate_failure_does_not_clear_existing_workspace() {
     let (_tx, cancel_rx) = watch::channel(false);
     let res = run_job(
         payload,
+        engine_registration(),
         ProtocolPath::Broker,
         cancel_rx,
         LeaseTiming::default(),
