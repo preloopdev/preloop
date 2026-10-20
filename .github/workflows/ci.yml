@@ -151,10 +151,17 @@ jobs:
             # GitHub instead of failing every shard on an engine-cache miss.
             echo "note: snapshot LFS miss; retrying from GitHub" >&2
             upstream="https://github.com/${GITHUB_REPOSITORY}.git"
-            git remote add preloop-lfs-upstream "$upstream" 2>/dev/null || \
-              git remote set-url preloop-lfs-upstream "$upstream"
-            git -c lfs.url="$upstream/info/lfs" lfs fetch preloop-lfs-upstream \
-              --include="$includes"
+            # Fetch through a fresh shallow clone: the snapshot checkout's
+            # remote/LFS config (and any checkout-time overrides) can keep
+            # pointing every fetch at the snapshot, even with an explicit
+            # remote or `lfs.url`. The clone is pointer-only until the
+            # include list is fetched.
+            tmp=$(mktemp -d)
+            git clone --quiet --no-checkout --depth=1 "$upstream" "$tmp/repo"
+            git -C "$tmp/repo" lfs fetch origin --include="$includes"
+            mkdir -p .git/lfs/objects
+            cp -a "$tmp/repo/.git/lfs/objects/." .git/lfs/objects/
+            rm -rf "$tmp"
             for scenario in \
               06-multi-step 07-step-failure 08-job-outputs-needs \
               10-uses-checkout 11-cache-roundtrip 12-artifact \
