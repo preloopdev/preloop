@@ -6,4 +6,12 @@
 # *signing* in the local control plane (GitHub App tokens), not a
 # network-facing RSA decryption oracle, which is the exposure the Marvin
 # workaround targets. Revisit when rsa 0.10 stabilizes.
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0381 (webpki-roots 0.26.11 trusts distrusted emSign
+# intermediates): the 0.26 line has no fixed release — the fix is webpki-roots
+# 1.0.10 — and tokio-tungstenite 0.30 (the latest release) still pins 0.26.
+# The engine's own clients build their roots from webpki-root-certs 1.0.10
+# (`preloop_observability::tls_roots` / the runner's bounded loader), so this
+# exception covers only tokio-tungstenite's built-in WebSocket connector.
+# Revisit when tokio-tungstenite ships a webpki-roots 1.x feature or a 0.31
+# release.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0381"]
