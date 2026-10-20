@@ -2497,17 +2497,69 @@ fn guest_hostname_script_at(hosts: &str) -> String {
 /// `sudo: unable to resolve host` into the apply's stderr before the name is
 /// fixed.
 pub fn guest_hosted_runtime_init_script() -> String {
-    hosted_runtime_init_script_at("/etc/hosts", "/proc/sys")
+    hosted_runtime_init_script_at("/etc/hosts", "/proc/sys", "/etc/ca-certificates.conf")
 }
 
-/// `hosts` and `sysctl_root` are the scratch paths the shell tests substitute
-/// for `/etc/hosts` and `/proc/sys`; production passes those.
-fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str) -> String {
+/// `hosts`, `sysctl_root` and `ca_conf` are the scratch paths the shell tests
+/// substitute; production passes the real ones.
+fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str, ca_conf: &str) -> String {
     format!(
-        "set -e; ( {} ); ( {} )",
+        "set -e; ( {} ); ( {} ); ( {} )",
         guest_hostname_script_at(hosts),
-        guest_sysctl_script_at(sysctl_root)
+        guest_sysctl_script_at(sysctl_root),
+        guest_ca_distrust_script(ca_conf)
     )
+}
+
+/// The third half: published goldens predate the 2026-10-20 eMudhra
+/// intermediate CA compromise and still anchor the revoked chain. Clients
+/// that ignore revocation data keep trusting it, so drop the two roots from
+/// the guest bundle before the runner registers. Idempotent: a bundle whose
+/// package already removed them is left untouched.
+fn guest_ca_distrust_script(ca_conf: &str) -> String {
+    format!(
+        r#"conf={ca_conf}
+if [ -f "$conf" ] && grep -qE '^mozilla/(emSign_ECC_Root_CA_-_G3|Comodo_AAA_Services_root)\.crt$' "$conf"; then
+  sed -i.bak \
+    -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
+    -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' \
+    "$conf"
+  rm -f "$conf.bak"
+  if [ "$(id -u)" -eq 0 ]; then
+    update-ca-certificates
+  else
+    sudo -n update-ca-certificates
+  fi
+  echo "preloop: disabled revoked eMudhra CA roots" >&2
+fi"#
+    )
+}
+
+/// Apply only the Ubuntu security pocket before a golden is packed.
+///
+/// The base is an upstream snapshot that can be days old; this closes the gap
+/// to the bake date without a blanket `apt-get upgrade` (which would also move
+/// packages the image deliberately pins). `unattended-upgrade` handles the
+/// dpkg/grub/conffile mechanics and exits non-zero when an update fails, so a
+/// bake that cannot reach the security state fails instead of shipping.
+pub fn golden_security_update_script() -> &'static str {
+    r#"set -eu
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v unattended-upgrade >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends unattended-upgrades
+fi
+cat > /etc/apt/apt.conf.d/99preloop-security-only <<'EOF'
+#clear Unattended-Upgrade::Allowed-Origins;
+Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Package-Blacklist {};
+EOF
+apt-get update -qq
+unattended-upgrade --verbose
+apt-get clean
+"#
 }
 
 /// The guest bootstrap script, one shell round trip.
@@ -4259,6 +4311,63 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
         // root) must not produce an artifact.
         let _ = provider.delete(&name).await;
         return Err(error);
+    }
+    // Apply the security pocket before packing. The rootfs is an upstream
+    // snapshot; this is the only place a golden picks up Ubuntu security
+    // fixes published after that snapshot, without waiting for the next
+    // upstream image rebuild and without a blanket `apt-get upgrade`.
+    let output = provider
+        .exec(
+            &name,
+            &[
+                "sudo".to_owned(),
+                "-n".to_owned(),
+                "sh".to_owned(),
+                "-c".to_owned(),
+                golden_security_update_script().to_owned(),
+            ],
+        )
+        .await?;
+    if output.exit_code != 0 {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "security update during golden bake failed (exit {}): {}",
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown")
+        )));
+    }
+    let manifest = provider
+        .exec(
+            &name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\n' | LC_ALL=C sort"
+                    .to_owned(),
+            ],
+        )
+        .await?;
+    if manifest.exit_code != 0 {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "reading the baked package manifest failed (exit {}): {}",
+            manifest.exit_code,
+            String::from_utf8_lossy(&manifest.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown")
+        )));
+    }
+    let manifest_path = PathBuf::from(format!("{}.apt-manifest.txt", payload.display()));
+    if let Err(error) = std::fs::write(&manifest_path, &manifest.stdout) {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "writing baked package manifest {} failed: {error}",
+            manifest_path.display()
+        )));
     }
     // Bake the externals *pointer*, not the externals: the packed rootfs
     // gets `<root>/externals -> /opt/preloop/bin/externals` so node rides
@@ -9080,6 +9189,36 @@ done
         assert!(script.contains("root='/proc/sys'"), "{script}");
     }
 
+    /// The init must disable the roots revoked by the 2026-10-20 eMudhra
+    /// intermediate compromise; a golden that still anchors them lets a
+    /// forged leaf validate in every client that ignores revocation.
+    #[test]
+    fn hosted_runtime_init_disables_revoked_emudhra_roots() {
+        let script = guest_hosted_runtime_init_script();
+        for root in [
+            "mozilla/emSign_ECC_Root_CA_-_G3.crt",
+            "mozilla/Comodo_AAA_Services_root.crt",
+        ] {
+            assert!(script.contains(root), "missing {root}: {script}");
+        }
+        assert!(script.contains("update-ca-certificates"), "{script}");
+        assert!(
+            script.contains("sudo -n update-ca-certificates"),
+            "{script}"
+        );
+    }
+
+    /// Bake-time security updates are security-pocket only. A blanket
+    /// `apt-get upgrade` would also move packages the image deliberately
+    /// pins, so the script must stay on `unattended-upgrade`.
+    #[test]
+    fn golden_security_updates_use_unattended_upgrade_not_apt_upgrade() {
+        let script = golden_security_update_script();
+        assert!(script.contains("unattended-upgrade --verbose"), "{script}");
+        assert!(script.contains("-security"), "{script}");
+        assert!(!script.contains("apt-get upgrade"), "{script}");
+    }
+
     /// The expected golden runtime lives in `official-image.toml`, and
     /// `build.rs` compiles every flat key into a constant. This fails if the
     /// code and the config drift apart: a hand-edited literal, a key renamed
@@ -9244,16 +9383,18 @@ done
     }
 
     /// The composed init run end to end against scratch roots: the fork's own
-    /// name resolves and the sysctls reach the hosted values in one exec, and
-    /// a second run changes nothing. Textual order alone would not catch a
-    /// half whose `exit 0` swallows the other — this runs both halves in one
-    /// shell, the way provisioning does.
+    /// name resolves, the sysctls reach the hosted values, and the revoked CA
+    /// roots are disabled in one exec, and a second run changes nothing.
+    /// Textual order alone would not catch a half whose `exit 0` swallows the
+    /// other — this runs all three halves in one shell, the way provisioning
+    /// does.
     #[cfg(unix)]
     #[test]
-    fn hosted_runtime_init_applies_both_halves_in_one_run() {
+    fn hosted_runtime_init_applies_all_halves_in_one_run() {
         let temp = tempfile::tempdir().unwrap();
         let hosts = temp.path().join("hosts");
         let root = temp.path().join("sys");
+        let ca_conf = temp.path().join("ca-certificates.conf");
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(root.join("vm")).unwrap();
         std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
@@ -9262,6 +9403,13 @@ done
         std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_watches"), "655360").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_instances"), "128").unwrap();
+        std::fs::write(
+            &ca_conf,
+            "mozilla/emSign_ECC_Root_CA_-_G3.crt\n\
+             mozilla/Comodo_AAA_Services_root.crt\n\
+             mozilla/Other.crt\n",
+        )
+        .unwrap();
         // The sysctl half's procps is absent here, so the apply writes the
         // scratch tree directly — the same branch a guest without procps
         // takes. Every other tool both halves call is linked in, so the test
@@ -9288,8 +9436,13 @@ done
             ),
         );
         hostname_harness_stub(&bin.join("sudo"), SUDO_STUB);
+        hostname_harness_stub(&bin.join("update-ca-certificates"), "#!/bin/sh\nexit 0\n");
 
-        let script = hosted_runtime_init_script_at(hosts.to_str().unwrap(), root.to_str().unwrap());
+        let script = hosted_runtime_init_script_at(
+            hosts.to_str().unwrap(),
+            root.to_str().unwrap(),
+            ca_conf.to_str().unwrap(),
+        );
         let run = || {
             std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
@@ -9316,6 +9469,13 @@ done
         assert_eq!(
             std::fs::read_to_string(root.join("fs/inotify/max_user_instances")).unwrap(),
             "1280"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ca_conf).unwrap(),
+            "!mozilla/emSign_ECC_Root_CA_-_G3.crt\n\
+             !mozilla/Comodo_AAA_Services_root.crt\n\
+             mozilla/Other.crt\n",
+            "the CA half must disable exactly the revoked roots"
         );
         // Idempotent: the second run writes nothing at all.
         let second = run();

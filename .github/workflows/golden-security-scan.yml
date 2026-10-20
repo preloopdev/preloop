@@ -1,0 +1,96 @@
+name: golden-security-scan
+
+# Scan the newest baked golden's package SBOM against Ubuntu advisories.
+# The bake attaches `<golden>.apt-sbom.cdx.json`; this workflow downloads the
+# most recent `golden-x86_64` artifact and fails on high/critical findings that
+# already have a fixed package. `--only-fixed` keeps "Ubuntu has not patched
+# it yet" out of the red build; those are tracked exceptions.
+on:
+  schedule:
+    # 05:00 UTC daily, after the weekly official-golden drift job.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: golden-security-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Scan newest golden SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Find and age-check the newest golden
+        id: golden
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          max_age="$(awk -F'"' '/^golden_max_age_days = / { print $2; exit }' official-image.toml)"
+          test -n "$max_age"
+          latest='[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last'
+          created="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=golden-x86_64&per_page=100" \
+            --jq "${latest} | .created_at // empty")"
+          run_id="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=golden-x86_64&per_page=100" \
+            --jq "${latest} | .workflow_run.id // empty")"
+          if [ -z "$created" ] || [ -z "$run_id" ]; then
+            echo "::error::no unexpired golden-x86_64 artifact to scan"
+            exit 1
+          fi
+          age=$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))
+          echo "newest golden artifact: ${created} (${age}d old, max ${max_age}d), run ${run_id}"
+          if [ "$age" -gt "$max_age" ]; then
+            echo "::error::latest golden is ${age}d old, past the ${max_age}d maximum; bake a fresh one"
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download baked SBOM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ steps.golden.outputs.run_id }}" \
+            -n golden-sbom-x86_64 -D dist
+          test -s dist/preloop-ubuntu-24.04-x86_64.apt-sbom.cdx.json
+
+      - name: Install pinned Grype
+        run: |
+          set -euo pipefail
+          version=0.121.0
+          base="https://github.com/anchore/grype/releases/download/v${version}"
+          archive="grype_${version}_linux_amd64.tar.gz"
+          curl -fsSL -o "$archive" "$base/$archive"
+          curl -fsSL -o grype_checksums.txt "$base/grype_${version}_checksums.txt"
+          grep "  ${archive}\$" grype_checksums.txt | sha256sum -c -
+          tar -xzf "$archive" grype
+          sudo install -m 0755 grype /usr/local/bin/grype
+          grype version
+
+      - name: Scan for fixed high/critical findings
+        run: |
+          set -euo pipefail
+          sbom="dist/preloop-ubuntu-24.04-x86_64.apt-sbom.cdx.json"
+          grype "sbom:$sbom" \
+            -o table -o json=dist/grype.json \
+            --only-fixed --fail-on high
+
+      - name: Upload scan result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: grype-scan-${{ github.run_id }}
+          path: dist/grype.json
+          retention-days: 30
+          if-no-files-found: warn

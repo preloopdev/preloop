@@ -627,6 +627,24 @@ impl<'a> StepContext<'a> {
                     }
                 }
             }
+            // eMudhra intermediate CA compromise (2026-10-20): Node's
+            // bundled Mozilla roots still trust the revoked eMudhra
+            // intermediates. Point Node and certifi-based Python at the
+            // system store, which the guest init and bake blacklist keep
+            // clean. Linux-only: host-run runners on other platforms have no
+            // known-clean system bundle at this path. Workflows that set
+            // these themselves keep their values.
+            #[cfg(target_os = "linux")]
+            {
+                if std::path::Path::new("/etc/ssl/certs/ca-certificates.crt").exists() {
+                    env.entry("NODE_OPTIONS".to_owned())
+                        .or_insert_with(|| "--use-openssl-ca".to_owned());
+                    env.entry("PIP_CERT".to_owned())
+                        .or_insert_with(|| "/etc/ssl/certs/ca-certificates.crt".to_owned());
+                    env.entry("REQUESTS_CA_BUNDLE".to_owned())
+                        .or_insert_with(|| "/etc/ssl/certs/ca-certificates.crt".to_owned());
+                }
+            }
             // GitHub-hosted parity: hosted runners run steps as a dedicated
             // user in a systemd session, so USER/LOGNAME (the runner account)
             // and XDG_RUNTIME_DIR (to /run/user/<uid>, existing) are present
@@ -866,6 +884,58 @@ mod tests {
         let env = ctx.build_env();
         assert_eq!(env.get("STEP_VAR").unwrap(), "from_step");
         assert_eq!(env.get("JOB_VAR").unwrap(), "overridden");
+    }
+
+    /// The 2026-10-20 eMudhra CA compromise hotfix: jobs must default to the
+    /// system trust store (kept clean by the guest init and the bake
+    /// blacklist), not Node's bundled roots or certifi's copy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_env_defaults_to_system_ca_store() {
+        let mut job = make_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert_eq!(
+            env.get("NODE_OPTIONS").map(String::as_str),
+            Some("--use-openssl-ca")
+        );
+        assert_eq!(
+            env.get("PIP_CERT").map(String::as_str),
+            Some("/etc/ssl/certs/ca-certificates.crt")
+        );
+        assert_eq!(
+            env.get("REQUESTS_CA_BUNDLE").map(String::as_str),
+            Some("/etc/ssl/certs/ca-certificates.crt")
+        );
+    }
+
+    #[test]
+    fn build_env_keeps_explicit_node_options() {
+        let mut job = make_job();
+        job.env
+            .insert("NODE_OPTIONS".into(), "--max-old-space-size=4096".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert_eq!(
+            env.get("NODE_OPTIONS").map(String::as_str),
+            Some("--max-old-space-size=4096")
+        );
+    }
+
+    /// Host-run runners outside Linux have no golden CA bundle; leave their
+    /// CA environment untouched.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn build_env_leaves_host_ca_env_alone() {
+        let mut job = make_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert!(!env.contains_key("NODE_OPTIONS"));
+        assert!(!env.contains_key("PIP_CERT"));
+        assert!(!env.contains_key("REQUESTS_CA_BUNDLE"));
     }
 
     /// A managed runner (orchestrator set PRELOOP_RUNNER_USER/UID) gets the
