@@ -46,6 +46,49 @@ const REPO_META_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// not stall every run creation on the full request timeout.
 const REPO_META_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The Git executable every engine Git command runs.
+///
+/// A single name, so tests that must prove a hung Git is killed can hand the
+/// same bounded runner a fake program without touching the process `PATH`.
+pub(crate) const GIT_PROGRAM: &str = "git";
+
+/// Deadline for Git plumbing that only touches refs, config, the index, or one
+/// small object: `init`, `config`, `update-ref`, `rev-parse`, `cat-file`,
+/// `check-ignore`, `for-each-ref`, `symbolic-ref`, `ls-files`, `merge-tree`,
+/// `commit-tree`. These finish in milliseconds on any healthy repository, so a
+/// minute is pure headroom; past it the process is hung (a lost `index.lock`,
+/// a wedged filesystem, a credential helper reading from a terminal) rather
+/// than merely slow. Several of these run while a per-repository cache lock is
+/// held, so every second here is a second the next submission waits.
+pub(crate) const GIT_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Deadline for local Git commands whose cost scales with the repository:
+/// `add --all`, `write-tree`, `commit`, `fsck`, `rev-list --objects --all`,
+/// `hash-object`, `archive`. Snapshot capture is "seconds to minutes even for
+/// large repositories" (see [`SNAPSHOT_STAGING_GRACE`]); fifteen minutes sits
+/// an order of magnitude above the slowest real capture, so a big workspace
+/// never trips it, while a hung Git still ends well inside one submission's
+/// patience.
+pub(crate) const GIT_WORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Deadline for Git commands that reach a remote — the forge, or a workspace's
+/// own `origin`: `clone`, `fetch`, `--unshallow`.
+///
+/// The everyday cases are small: the checkout-cache fetch is one commit at
+/// `--depth=1`, and a pull-request mirror fetches a branch tip. The worst
+/// legitimate case is a full-history refresh of a large monorepo over a slow
+/// link, which is comparable to the engine's other large downloads, so thirty
+/// minutes — six times the 300 s LFS relay ceiling and far above any healthy
+/// transfer — keeps a real download safe. What it does bound is the thing that
+/// froze the macOS engine: how long one hung forge fetch can pin a snapshot and
+/// hold that repository's cache lock against every other run.
+pub(crate) const GIT_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Deadline for `du`, which the snapshot stats walk over a run-owned
+/// repository directory. A metadata walk of one repository, not of the state
+/// directory; a minute is generous and still finite.
+const DIRECTORY_WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Storage lifetime for one snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -391,10 +434,9 @@ async fn detect_workspace_upstream(
     shared: Option<&SharedState>,
     github_pat: Option<&str>,
 ) -> Option<(String, Option<u64>, Option<bool>)> {
-    let output = tokio::process::Command::new("git")
-        .args(["remote", "-v"])
-        .current_dir(workspace)
-        .output()
+    let mut command = git_command();
+    command.args(["remote", "-v"]).current_dir(workspace);
+    let output = git_output_within(command, "read workspace remotes", GIT_CONTROL_TIMEOUT)
         .await
         .ok()?;
     if !output.status.success() {
@@ -545,7 +587,7 @@ pub async fn create_workspace_snapshot(
         before_sha,
         merge,
     } = result?;
-    let timing = match snapshot_repo_timing(&final_repository) {
+    let timing = match snapshot_repo_timing(&final_repository).await {
         Ok(mut stats) => {
             stats.duration_ms = started.elapsed().as_millis() as u64;
             Some(stats)
@@ -588,11 +630,12 @@ pub async fn create_workspace_snapshot(
 
 /// `remote.origin.url` of the workspace, when it has one.
 async fn workspace_origin_url(workspace: &FsPath) -> Option<String> {
-    let output = tokio::process::Command::new("git")
+    let mut command = git_command();
+    command
         .arg("-C")
         .arg(workspace)
-        .args(["config", "--get", "remote.origin.url"])
-        .output()
+        .args(["config", "--get", "remote.origin.url"]);
+    let output = git_output_within(command, "read workspace origin url", GIT_CONTROL_TIMEOUT)
         .await
         .ok()?;
     if !output.status.success() {
@@ -962,6 +1005,56 @@ async fn fetch_lfs_object_into_cache(
     Ok(true)
 }
 
+/// Fetch one immutable commit from the forge into a checkout-cache repository.
+///
+/// The caller holds that repository's cache lock across this call, so it must
+/// return. A forge that accepts the connection and then stalls — or a
+/// credential helper waiting on a keychain dialog — used to block here
+/// forever, which kept the lock (and every future submission for the same
+/// repository) unavailable until the engine restarted. `deadline` bounds the
+/// whole fetch, and expiry kills the child, so nothing keeps writing into the
+/// cache after the lock is released.
+///
+/// `auth_header` is an origin-scoped `http.<url>.extraheader` value from
+/// [`scoped_fetch_auth_header`]. It is staged in the child *environment*
+/// ([`stage_git_auth_header`]) — the value is a live bearer token and argv is
+/// world-readable — while the non-secret credential-helper reset rides on the
+/// command line ([`git_command_for`]). Nothing here needs a helper: the header
+/// is the credential.
+///
+/// Expiry is a `SIGKILL`, which Git cannot catch, so a fetch killed during a
+/// ref, `shallow`, or `packed-refs` update leaves its lock file behind. The
+/// caller holds this repository's cache lock, so every lock file found here is
+/// a corpse of a previous kill and is removed before the fetch; otherwise one
+/// timed-out submission would fail every later one with "File exists".
+async fn fetch_checkout_cache_commit(
+    program: impl AsRef<std::ffi::OsStr>,
+    deadline: std::time::Duration,
+    repository: &FsPath,
+    upstream: &str,
+    commit_sha: &str,
+    auth_header: Option<(&str, &str)>,
+) -> Result<(), ApiError> {
+    // A previous fetch in this repository may have been killed at its
+    // deadline, and its lock files would fail this one. The cache lock is
+    // held, so nothing else is inside the repository.
+    remove_stale_git_locks(repository, std::time::Duration::ZERO);
+    let mut fetch = git_command_for(program);
+    if let Some((key, value)) = auth_header {
+        stage_git_auth_header(&mut fetch, key, value);
+    }
+    fetch
+        .arg("--git-dir")
+        .arg(repository)
+        .arg("fetch")
+        .arg("--no-tags")
+        .arg("--depth=1")
+        .arg(upstream)
+        .arg(commit_sha);
+    run_git_within(fetch, "fetch remote checkout snapshot", deadline).await?;
+    Ok(())
+}
+
 /// Fetch a webhook run's immutable commit into the configured checkout cache.
 ///
 /// The control plane alone writes this repository. Jobs only reach it through
@@ -1047,9 +1140,9 @@ pub async fn create_remote_checkout_snapshot(
     let _guard = acquire_cache_lock(&lock).await?;
 
     if !repository.is_dir() {
-        let mut init = Command::new("git");
+        let mut init = git_command();
         init.arg("init").arg("--bare").arg(&repository);
-        run_git(&mut init, "initialize remote checkout cache").await?;
+        run_git(init, "initialize remote checkout cache").await?;
     }
 
     let upstream = format!(
@@ -1057,32 +1150,32 @@ pub async fn create_remote_checkout_snapshot(
         shared.state.github_urls.server_url.trim_end_matches('/'),
         submission.repository
     );
-    let mut fetch = Command::new("git");
-    fetch
-        .arg("--git-dir")
-        .arg(&repository)
-        .arg("fetch")
-        .arg("--no-tags")
-        .arg("--depth=1")
-        .arg(&upstream)
-        .arg(commit_sha)
-        .env("GIT_TERMINAL_PROMPT", "0");
-    if let Some(token) = upstream_token.as_deref() {
-        // Scope the credential to the upstream origin: a command-wide header
-        // would also ride along on redirects to unvouched hosts.
-        if let Some((key, value)) = scoped_fetch_auth_header(&upstream, token) {
-            fetch
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", key)
-                .env("GIT_CONFIG_VALUE_0", value);
-        } else if upstream.contains("://") {
-            warn!(
-                %run_id,
-                "checkout-cache upstream URL has no usable origin; fetching without credentials"
-            );
+    let auth_header = match upstream_token.as_deref() {
+        Some(token) => {
+            // Scope the credential to the upstream origin: a command-wide
+            // header would also ride along on redirects to unvouched hosts.
+            let header = scoped_fetch_auth_header(&upstream, token);
+            if header.is_none() && upstream.contains("://") {
+                warn!(
+                    %run_id,
+                    "checkout-cache upstream URL has no usable origin; fetching without credentials"
+                );
+            }
+            header
         }
-    }
-    run_git(&mut fetch, "fetch remote checkout snapshot").await?;
+        None => None,
+    };
+    fetch_checkout_cache_commit(
+        GIT_PROGRAM,
+        GIT_TRANSFER_TIMEOUT,
+        &repository,
+        &upstream,
+        commit_sha,
+        auth_header
+            .as_ref()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .await?;
 
     let snapshot_ref = format!("refs/preloop/runs/{run_id}");
     let mut update_ref = Command::new("git");
@@ -1092,7 +1185,7 @@ pub async fn create_remote_checkout_snapshot(
         .arg("update-ref")
         .arg(&snapshot_ref)
         .arg(commit_sha);
-    run_git(&mut update_ref, "publish remote checkout snapshot").await?;
+    run_git(update_ref, "publish remote checkout snapshot").await?;
     // Serving rules differ by scope. A run-scoped repository holds exactly
     // one run's commit, so arbitrary wants cannot escape it and its refs
     // stay advertised. A shared repository retains many runs' commits: hide
@@ -1105,7 +1198,7 @@ pub async fn create_remote_checkout_snapshot(
             .arg("config")
             .arg("uploadpack.hideRefs")
             .arg("refs/preloop/runs");
-        run_git(&mut hide, "hide cached run refs").await?;
+        run_git(hide, "hide cached run refs").await?;
     }
     let mut configure = Command::new("git");
     configure.arg("--git-dir").arg(&repository).arg("config");
@@ -1114,7 +1207,7 @@ pub async fn create_remote_checkout_snapshot(
     } else {
         configure.arg("uploadpack.allowAnySHA1InWant").arg("true");
     }
-    run_git(&mut configure, "configure remote checkout cache").await?;
+    run_git(configure, "configure remote checkout cache").await?;
 
     let mut tree = Command::new("git");
     tree.arg("--git-dir")
@@ -1122,7 +1215,7 @@ pub async fn create_remote_checkout_snapshot(
         .arg("rev-parse")
         .arg(format!("{commit_sha}^{{tree}}"));
     let tree_sha = output_text(
-        &run_git(&mut tree, "resolve remote checkout tree").await?,
+        &run_git(tree, "resolve remote checkout tree").await?,
         "resolve remote checkout tree",
     )?;
     let storage_repository = repository
@@ -1169,29 +1262,50 @@ pub async fn create_remote_checkout_snapshot(
 /// `rev-list --objects --all` (includes alternates). Stored bytes are the
 /// run-owned repository directory (`du`), the incremental storage the run
 /// added to the state directory.
-fn snapshot_repo_timing(repository: &FsPath) -> anyhow::Result<crate::models::SnapshotTiming> {
-    use std::process::Command;
-    let count = Command::new("git")
+async fn snapshot_repo_timing(
+    repository: &FsPath,
+) -> anyhow::Result<crate::models::SnapshotTiming> {
+    let mut count = git_command();
+    count
         .arg("--git-dir")
         .arg(repository)
-        .args(["rev-list", "--objects", "--all"])
-        .output()?;
-    if !count.status.success() {
-        anyhow::bail!(
-            "git rev-list failed: {}",
-            String::from_utf8_lossy(&count.stderr).trim()
-        );
-    }
+        .args(["rev-list", "--objects", "--all"]);
+    // Walks every reachable object, alternates included, so it is bounded like
+    // the other whole-repository work instead of blocking a runtime worker.
+    let count = run_git_within(count, "count snapshot objects", GIT_WORK_TIMEOUT)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     let object_count = count.stdout.iter().filter(|byte| **byte == b'\n').count() as u64;
-    let du = Command::new("du").arg("-sk").arg(repository).output()?;
-    let size_kib = if du.status.success() {
-        String::from_utf8_lossy(&du.stdout)
+    // `du` is an external process too, and the caller is on the request path.
+    // It goes through the shared bounded runner rather than a bare timeout:
+    // dropping a `du.output()` future leaves the walk running, so repeated
+    // snapshots would accumulate walkers. The shared runner kills and reaps
+    // the child at the deadline. It measures stats, so a deadline expiry
+    // costs a number, not the snapshot.
+    let mut du = Command::new("du");
+    du.arg("-sk").arg(repository);
+    let size_kib = match preloop_observability::deadline::run_command(
+        du,
+        DIRECTORY_WALK_TIMEOUT,
+        "measure the snapshot repository size",
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .split_whitespace()
             .next()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0)
-    } else {
-        0
+            .unwrap_or(0),
+        Ok(_) => 0,
+        Err(error) if error.timed_out() => {
+            warn!(
+                path = %repository.display(),
+                %error,
+                "du timed out measuring the snapshot repository; reporting zero stored bytes"
+            );
+            0
+        }
+        Err(error) => return Err(anyhow::anyhow!("failed to run du: {error}")),
     };
     Ok(crate::models::SnapshotTiming {
         duration_ms: 0, // filled by the caller
@@ -1208,7 +1322,12 @@ async fn missing_snapshot_objects(repository: &FsPath) -> Result<u64, ApiError> 
     verify
         .env("GIT_DIR", repository)
         .args(["rev-list", "--objects", "--all", "--missing=print"]);
-    let output = run_git(&mut verify, "verify snapshot object cache completeness").await?;
+    let output = run_git_within(
+        verify,
+        "verify snapshot object cache completeness",
+        GIT_WORK_TIMEOUT,
+    )
+    .await?;
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| line.starts_with('?'))
@@ -1237,7 +1356,7 @@ async fn create_workspace_snapshot_inner(
         .args(["init", "--bare", "--quiet", "--template="])
         .arg(staging_repository);
     let (init, probe) = tokio::join!(
-        run_git(&mut init_command, "initialize snapshot repository"),
+        run_git(init_command, "initialize snapshot repository"),
         probe_workspace(workspace),
     );
     init?;
@@ -1335,6 +1454,7 @@ async fn create_workspace_snapshot_inner(
                         source_head.as_deref().expect("checked above"),
                     ],
                     "list shallow history",
+                    GIT_WORK_TIMEOUT,
                 )
                 .await?;
                 for sha in output_text(&rev_list, "list shallow history")?.lines() {
@@ -1350,9 +1470,12 @@ async fn create_workspace_snapshot_inner(
                             &cached_objects,
                         );
                         cat.args(["cat-file", "commit", sha]);
-                        let output = cat.output().await.map_err(|error| {
-                            ApiError::internal(format!("read commit {sha}: {error}"))
-                        })?;
+                        let output = git_output_within(
+                            cat,
+                            &format!("read commit {sha}"),
+                            GIT_CONTROL_TIMEOUT,
+                        )
+                        .await?;
                         if !output.status.success() {
                             return Err(ApiError::internal(format!(
                                 "failed to read commit {sha}: {}",
@@ -1422,30 +1545,13 @@ async fn create_workspace_snapshot_inner(
                         args.push(parent.clone());
                     }
                     commit_tree.args(args);
-                    let mut child = commit_tree
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()
-                        .map_err(|error| {
-                            ApiError::internal(format!("spawn commit-tree: {error}"))
-                        })?;
-                    AsyncWriteExt::write_all(
-                        child.stdin.as_mut().expect("stdin is piped"),
+                    let output = run_git_with_stdin(
+                        commit_tree,
                         body.as_bytes(),
+                        &format!("rewrite commit {sha}"),
+                        GIT_WORK_TIMEOUT,
                     )
-                    .await
-                    .map_err(|error| ApiError::internal(format!("write commit body: {error}")))?;
-                    let output = child
-                        .wait_with_output()
-                        .await
-                        .map_err(|error| ApiError::internal(format!("run commit-tree: {error}")))?;
-                    if !output.status.success() {
-                        return Err(ApiError::internal(format!(
-                            "failed to rewrite commit {sha}: {}",
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        )));
-                    }
+                    .await?;
                     let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
                     history_rewrite.insert(sha.to_owned(), rewritten);
                 }
@@ -1476,6 +1582,7 @@ async fn create_workspace_snapshot_inner(
             &cached_objects,
             ["read-tree", "--reset", head],
             "seed snapshot index",
+            GIT_WORK_TIMEOUT,
         )
         .await?;
     }
@@ -1507,7 +1614,7 @@ async fn create_workspace_snapshot_inner(
         }
         _ => {}
     }
-    run_git(&mut add, "stage local workspace state").await?;
+    run_git_within(add, "stage local workspace state", GIT_WORK_TIMEOUT).await?;
 
     // A local workspace can carry gitlink entries for submodules that were
     // never registered in `.gitmodules` — a nested clone added by hand, or a
@@ -1525,6 +1632,7 @@ async fn create_workspace_snapshot_inner(
         &cached_objects,
         ["ls-files", "--stage", "-z"],
         "list staged paths",
+        GIT_CONTROL_TIMEOUT,
     )
     .await?;
     let gitlinks = gitlink_paths(&staged.stdout);
@@ -1544,7 +1652,7 @@ async fn create_workspace_snapshot_inner(
             );
             remove.args(["update-index", "--force-remove", "--"]);
             remove.args(&unresolvable);
-            run_git(&mut remove, "drop unresolvable submodule gitlinks").await?;
+            run_git(remove, "drop unresolvable submodule gitlinks").await?;
         }
     }
 
@@ -1555,6 +1663,7 @@ async fn create_workspace_snapshot_inner(
         &cached_objects,
         ["write-tree"],
         "write snapshot tree",
+        GIT_WORK_TIMEOUT,
     )
     .await?;
     let tree = output_text(&tree_output, "write snapshot tree")?;
@@ -1620,7 +1729,7 @@ async fn create_workspace_snapshot_inner(
             "preloop workspace snapshot",
         ]);
     }
-    let commit_output = run_git(&mut commit, "create snapshot commit").await?;
+    let commit_output = run_git_within(commit, "create snapshot commit", GIT_WORK_TIMEOUT).await?;
     let commit_sha = output_text(&commit_output, "create snapshot commit")?;
     if commit_sha.len() != 40 || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ApiError::internal(format!(
@@ -1637,9 +1746,10 @@ async fn create_workspace_snapshot_inner(
     update_refs.args(["update-ref", "--stdin"]);
     let update_input = format!("update {SNAPSHOT_REF} {commit_sha}\n");
     run_git_with_stdin(
-        &mut update_refs,
+        update_refs,
         update_input.as_bytes(),
         "publish snapshot ref",
+        GIT_CONTROL_TIMEOUT,
     )
     .await?;
     let mut update_head = snapshot_git_command(
@@ -1649,7 +1759,7 @@ async fn create_workspace_snapshot_inner(
         &cached_objects,
     );
     update_head.args(["symbolic-ref", "HEAD", SNAPSHOT_REF]);
-    run_git(&mut update_head, "publish snapshot HEAD").await?;
+    run_git(update_head, "publish snapshot HEAD").await?;
 
     let alternate_file = staging_repository.join("objects/info/alternates");
     tokio::fs::create_dir_all(alternate_file.parent().expect("alternates parent"))
@@ -1684,7 +1794,12 @@ async fn create_workspace_snapshot_inner(
             "--connectivity-only",
             "--no-dangling",
         ]);
-        run_git(&mut fsck, "verify incremental snapshot repository").await?;
+        run_git_within(
+            fsck,
+            "verify incremental snapshot repository",
+            GIT_WORK_TIMEOUT,
+        )
+        .await?;
     }
 
     // Advertise the workspace's own branches and tags so changed-file actions
@@ -1699,17 +1814,19 @@ async fn create_workspace_snapshot_inner(
     // resolves its `head` via `origin/<branch>` must land on the same commit
     // the runner has checked out — otherwise the diff (base..head) silently
     // excludes the local changes the submission is meant to represent.
-    let workspace_refs = Command::new("git")
-        .env("GIT_DIR", &common_dir)
-        .args([
-            "for-each-ref",
-            "--format=%(refname) %(objectname)",
-            "refs/heads",
-            "refs/tags",
-        ])
-        .output()
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to list workspace refs: {error}")))?;
+    let mut workspace_refs = git_command();
+    workspace_refs.env("GIT_DIR", &common_dir).args([
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/heads",
+        "refs/tags",
+    ]);
+    let workspace_refs =
+        git_output_within(workspace_refs, "list workspace refs", GIT_CONTROL_TIMEOUT)
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("failed to list workspace refs: {error:?}"))
+            })?;
     if workspace_refs.status.success() {
         let refs = String::from_utf8_lossy(&workspace_refs.stdout);
         // `update-ref --stdin` is atomic: one ref whose target is missing
@@ -1778,9 +1895,10 @@ async fn create_workspace_snapshot_inner(
         }
         if !publish_input.is_empty() {
             run_git_with_stdin(
-                &mut publish,
+                publish,
                 publish_input.as_bytes(),
                 "publish workspace refs",
+                GIT_CONTROL_TIMEOUT,
             )
             .await?;
         }
@@ -1824,13 +1942,18 @@ async fn create_workspace_snapshot_inner(
             // is not on origin. Import its objects into the merge mirror
             // before the shared builder resolves the head; only the base is
             // fetched from the forge.
-            let mut import = Command::new("git");
+            let mut import = git_command();
             import
                 .env("GIT_DIR", &mirror)
                 .args(["fetch", "--no-tags"])
                 .arg(staging_repository.as_os_str())
                 .arg(&commit_sha);
-            run_git(&mut import, "import dirty snapshot into merge mirror").await?;
+            run_git_within(
+                import,
+                "import dirty snapshot into merge mirror",
+                GIT_WORK_TIMEOUT,
+            )
+            .await?;
         }
         let source = crate::merge_builder::MergeSource {
             mirror,
@@ -1861,7 +1984,7 @@ async fn create_workspace_snapshot_inner(
                     &format!("refs/heads/{}", local.base_branch),
                     &merged.base_sha,
                 ]);
-                if let Err(error) = run_git(&mut publish_base, "publish merge base ref").await {
+                if let Err(error) = run_git(publish_base, "publish merge base ref").await {
                     warn!(error = ?error, "failed to publish the fetched base tip in the snapshot");
                 }
                 Some(SnapshotMerge {
@@ -1903,7 +2026,7 @@ async fn create_workspace_snapshot_inner(
         .env("GIT_DIR", staging_repository)
         .args(["config", "uploadpack.allowReachableSHA1InWant", "true"]);
     run_git(
-        &mut uploadpack_reachable,
+        uploadpack_reachable,
         "allow reachable sha wants in snapshot upload-pack",
     )
     .await?;
@@ -1914,7 +2037,7 @@ async fn create_workspace_snapshot_inner(
         "true",
     ]);
     run_git(
-        &mut uploadpack_tip,
+        uploadpack_tip,
         "allow tip sha wants in snapshot upload-pack",
     )
     .await?;
@@ -1925,7 +2048,7 @@ async fn create_workspace_snapshot_inner(
         "true",
     ]);
     run_git(
-        &mut uploadpack_filter,
+        uploadpack_filter,
         "allow filtered wants in snapshot upload-pack",
     )
     .await?;
@@ -2136,20 +2259,18 @@ struct WorkspaceRevision {
 /// Process spawns dominate snapshot creation, so the three questions the
 /// snapshot needs are asked together rather than one process each.
 async fn probe_workspace(workspace: &FsPath) -> Result<WorkspaceRevision, ApiError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args([
-            "rev-parse",
-            "--is-inside-work-tree",
-            "--git-common-dir",
-            "HEAD",
-            "HEAD^{tree}",
-        ])
-        .output()
+    let mut probe = git_command();
+    probe.arg("-C").arg(workspace).args([
+        "rev-parse",
+        "--is-inside-work-tree",
+        "--git-common-dir",
+        "HEAD",
+        "HEAD^{tree}",
+    ]);
+    let output = git_output_within(probe, "inspect local Git workspace", GIT_CONTROL_TIMEOUT)
         .await
         .map_err(|error| {
-            ApiError::internal(format!("failed to inspect local Git workspace: {error}"))
+            ApiError::internal(format!("failed to inspect local Git workspace: {error:?}"))
         })?;
     // An unborn HEAD makes `rev-parse` exit non-zero after it has already
     // printed the answers that do resolve, so the lines are parsed either way.
@@ -2196,21 +2317,24 @@ async fn probe_workspace(workspace: &FsPath) -> Result<WorkspaceRevision, ApiErr
     };
     // Best-effort probes: a detached or unborn HEAD, or a depth-1 shallow
     // clone, legitimately lacks these and the snapshot works without them.
-    let default_branch = Command::new("git")
+    let mut branch_probe = git_command();
+    branch_probe
         .arg("-C")
         .arg(workspace)
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|branch| !branch.is_empty() && branch != "HEAD");
-    let parent_sha = Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"]);
+    let default_branch =
+        git_output_within(branch_probe, "read workspace branch", GIT_CONTROL_TIMEOUT)
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|branch| !branch.is_empty() && branch != "HEAD");
+    let mut parent_probe = git_command();
+    parent_probe
         .arg("-C")
         .arg(workspace)
-        .args(["rev-parse", "HEAD^"])
-        .output()
+        .args(["rev-parse", "HEAD^"]);
+    let parent_sha = git_output_within(parent_probe, "read workspace parent", GIT_CONTROL_TIMEOUT)
         .await
         .ok()
         .filter(|output| output.status.success())
@@ -2231,7 +2355,7 @@ fn snapshot_git_command(
     index: &FsPath,
     source_objects: &FsPath,
 ) -> Command {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command
         .current_dir(workspace)
         .env("GIT_DIR", repository)
@@ -2565,19 +2689,17 @@ fn gitlink_paths(staged: &[u8]) -> Vec<String> {
 /// deliberately excluded from the set. Empty set when the file is absent or
 /// git cannot parse it, matching git's own treatment of such a file.
 async fn configured_submodule_urls(workspace: &FsPath) -> BTreeSet<String> {
-    let output = Command::new("git")
-        .current_dir(workspace)
-        .args([
-            "config",
-            "-f",
-            ".gitmodules",
-            "-z",
-            "--get-regexp",
-            "^submodule\\..*\\.(path|url)$",
-        ])
-        .output()
-        .await;
-    let Ok(output) = output else {
+    let mut command = git_command();
+    command.current_dir(workspace).args([
+        "config",
+        "-f",
+        ".gitmodules",
+        "-z",
+        "--get-regexp",
+        "^submodule\\..*\\.(path|url)$",
+    ]);
+    let Ok(output) = git_output_within(command, "read submodule urls", GIT_CONTROL_TIMEOUT).await
+    else {
         return BTreeSet::new();
     };
     if !output.status.success() {
@@ -2636,13 +2758,13 @@ async fn configured_submodule_urls(workspace: &FsPath) -> BTreeSet<String> {
 /// clean "ignored" answer is treated as not ignored, which keeps the explicit
 /// exclusion in place and is the safe direction.
 async fn path_is_ignored(workspace: &FsPath, relative: &str) -> bool {
-    Command::new("git")
+    let mut command = git_command();
+    command
         .current_dir(workspace)
-        .args(["check-ignore", "--quiet", "--", relative])
-        .status()
+        .args(["check-ignore", "--quiet", "--", relative]);
+    git_output_within(command, "check ignore rules", GIT_CONTROL_TIMEOUT)
         .await
-        .map(|status| status.code() == Some(0))
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.code() == Some(0))
 }
 
 async fn run_snapshot_git<const N: usize>(
@@ -2652,17 +2774,245 @@ async fn run_snapshot_git<const N: usize>(
     source_objects: &FsPath,
     args: [&str; N],
     operation: &str,
+    deadline: std::time::Duration,
 ) -> Result<std::process::Output, ApiError> {
     let mut command = snapshot_git_command(workspace, repository, index, source_objects);
     command.args(args);
-    run_git(&mut command, operation).await
+    run_git_within(command, operation, deadline).await
 }
 
-async fn run_git(command: &mut Command, operation: &str) -> Result<std::process::Output, ApiError> {
-    let output = command
-        .output()
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+/// Policy every Git child the engine starts runs under.
+///
+/// `kill_on_drop(true)` matters as much as the deadline: when a bounded wait
+/// expires the child is killed, so a hung `git fetch` cannot keep writing into
+/// a cache repository after its per-repository lock has been released and the
+/// next submission has taken it.
+///
+/// Prompting is disabled end to end, not just Git's own terminal prompt.
+/// `GIT_TERMINAL_PROMPT=0` only silences that one; a *configured credential
+/// helper* (osxkeychain on a stock macOS install, Git Credential Manager, a
+/// company wrapper) still runs and can block indefinitely on a locked
+/// keychain, a stalled securityd, or a GUI dialog — verified against git 2.x:
+/// with a helper configured, a fetch that needs credentials executes it even
+/// with `GIT_TERMINAL_PROMPT=0` and even with stdin on `/dev/null`. Engine Git
+/// never needs a helper: fetches authenticate with an
+/// `http.<url>.extraheader` token (see [`stage_git_auth_header`]) or with URL
+/// userinfo, both of which bypass the credential subsystem. So the askpass
+/// programs are pointed at `false` (which exits non-zero at once whether Git
+/// runs it through a shell — it does for askpass — or execs it directly) and
+/// `GCM_INTERACTIVE=never` closes GCM's own interactive path. The helper list
+/// itself is reset by [`git_command_for`], which is where the empty
+/// `credential.helper=` entry goes.
+///
+/// An operator who deliberately configures a helper for engine Git does not
+/// need one here: nothing in the snapshot or merge paths reads credentials
+/// from a store.
+///
+/// Deliberately silent on `GIT_CONFIG_*`: that environment is the only
+/// channel a call site may stage a *secret* through
+/// ([`stage_git_auth_header`]), so this function must not claim it.
+pub(crate) fn apply_git_child_policy(command: &mut Command) {
+    command
+        .kill_on_drop(true)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "false")
+        .env("SSH_ASKPASS", "false")
+        .env("GCM_INTERACTIVE", "never");
+}
+
+/// A Git command with the engine's child policy applied.
+///
+/// Two placements, chosen by whether the value is a secret:
+///
+/// * the credential-helper reset rides on the command line (`-c
+///   credential.helper=`), whose empty value costs nothing if a process
+///   listing shows it. A command-line `-c` entry is appended after every
+///   config file, so the empty value resets the helper list whatever the
+///   operator's global or system config defines — and Git requires global
+///   options before the subcommand, so it has to be appended here, before the
+///   caller adds anything;
+/// * everything else is environment ([`apply_git_child_policy`]).
+///
+/// Every engine Git child is created here or by [`git_command`], its
+/// [`GIT_PROGRAM`] twin. The runners deliberately do *not* re-apply the
+/// policy: that is what lets a call site stage its own `GIT_CONFIG_*` after
+/// this returns ([`stage_git_auth_header`]) without it being clobbered.
+pub(crate) fn git_command_for(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.arg("-c").arg("credential.helper=");
+    apply_git_child_policy(&mut command);
+    command
+}
+
+/// A Git command for [`GIT_PROGRAM`].
+///
+/// Sites that must `spawn()` by hand (the snapshot Git HTTP backend) use this
+/// rather than `Command::new("git")`, so they inherit the killed-on-drop and
+/// no-prompting policy too.
+fn git_command() -> Command {
+    git_command_for(GIT_PROGRAM)
+}
+
+/// Stage an origin-scoped credential header for a fetch.
+///
+/// The child *environment*, never the command line: `GIT_CONFIG_*` is readable
+/// only by the process owner, while argv is world-readable through process
+/// listings on the platforms the engine runs on — and the value staged here is
+/// a live GitHub bearer token. Git reads `GIT_CONFIG_*` as `-c`, so it carries
+/// the same precedence, and [`apply_git_child_policy`]/[`git_command_for`]
+/// deliberately leave these variables alone for exactly this.
+///
+/// Call it on a command built by [`git_command_for`]; it uses the index-0
+/// slot.
+pub(crate) fn stage_git_auth_header(command: &mut Command, key: &str, value: &str) {
+    command
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", key)
+        .env("GIT_CONFIG_VALUE_0", value);
+}
+
+/// A Git command for a fetch against the *workspace's own* remote.
+///
+/// Unlike [`git_command_for`] this does not reset Git's credential-helper
+/// list. The engine holds no credential for a GitLab, enterprise, or PAT-less
+/// GitHub origin — [`github_auth_header_for_remote`] covers GitHub and nothing
+/// else — so for a private workspace whose only credential is a configured
+/// helper, the helper *is* the credential. Resetting it fails the deepen,
+/// and the caller then rewrites history and submits SHAs the forge has never
+/// seen, which breaks every workflow that fetches those SHAs back.
+///
+/// The helper stays bounded, not unprompted-forever: the askpass programs are
+/// still pointed at `false` and `GIT_TERMINAL_PROMPT=0`/`GCM_INTERACTIVE=never`
+/// still apply ([`apply_git_child_policy`]), stdin is `/dev/null`, the wait is
+/// the caller's deadline, and expiry kills the child's whole process group —
+/// so a helper that blocks costs its fetch's deadline, never the engine.
+fn workspace_git_command() -> Command {
+    let mut command = Command::new(GIT_PROGRAM);
+    apply_git_child_policy(&mut command);
+    command
+}
+
+/// Remove the Git lock files a child killed at its deadline left behind.
+///
+/// The deadline is a `SIGKILL`, which Git cannot catch, so a fetch killed
+/// during a ref, config, `shallow`, or `packed-refs` update never unlinks the
+/// `*.lock` it held. Git then refuses every later operation in that repository
+/// with "Unable to create '…lock': File exists", so a single timed-out fetch
+/// would poison a persistent cache for every later submission.
+///
+/// `older_than` is the concurrency rule, and it is the whole safety argument:
+///
+/// * [`std::time::Duration::ZERO`] removes every lock file, which is correct
+///   only while the caller holds the repository's exclusive engine lock (the
+///   checkout cache, the snapshot object cache). No other engine child can be
+///   inside the repository then, so any lock file is a corpse.
+/// * A longer age is for a repository with no engine lock (the merge mirror):
+///   no engine fetch may hold a lock beyond its own deadline, so a lock older
+///   than that cannot belong to a live child. Anything younger is left alone
+///   rather than stolen from a fetch that is still running.
+///
+/// Best effort: a failed removal is logged and the caller proceeds, where Git
+/// reports the lock itself with a better message than this can.
+pub(crate) fn remove_stale_git_locks(repository: &FsPath, older_than: std::time::Duration) {
+    let now = std::time::SystemTime::now();
+    // Only the trees Git takes lock files in: walking the object fanout
+    // directories holds no locks and would cost more than the fetch's own
+    // control commands.
+    for (directory, recursive) in [
+        (repository.to_path_buf(), false),
+        (repository.join("refs"), true),
+        (repository.join("logs"), true),
+        (repository.join("objects").join("pack"), false),
+    ] {
+        remove_lock_files(&directory, recursive, older_than, now);
+    }
+}
+
+fn remove_lock_files(
+    directory: &FsPath,
+    recursive: bool,
+    older_than: std::time::Duration,
+    now: std::time::SystemTime,
+) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if recursive {
+                remove_lock_files(&path, true, older_than, now);
+            }
+            continue;
+        }
+        if path.extension().is_none_or(|extension| extension != "lock") {
+            continue;
+        }
+        if !older_than.is_zero() {
+            let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+                continue;
+            };
+            if now.duration_since(modified).unwrap_or_default() < older_than {
+                continue;
+            }
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => warn!(
+                path = %path.display(),
+                "removed a Git lock file left by a process killed at its deadline"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                path = %path.display(),
+                %error,
+                "could not remove a stale Git lock file"
+            ),
+        }
+    }
+}
+
+/// Run `command` under `deadline` and return its output whatever the exit
+/// status was, through the engine-wide bounded runner
+/// ([`preloop_observability::deadline::run_command`]): the child is killed and
+/// reaped when the deadline expires, and it cannot look hung merely because it
+/// filled a pipe.
+///
+/// A Git process that has not finished inside its deadline is treated as hung,
+/// not slow. `operation` names what it was doing, so the error names the
+/// dependency, the operation, and the deadline — an operator reading the log
+/// can tell a hang from a failure.
+///
+/// `command` must come from [`git_command_for`]; the policy is applied there,
+/// not here, so a call site that staged `GIT_CONFIG_*` after building it keeps
+/// what it staged.
+async fn git_output_within(
+    command: Command,
+    operation: &str,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, ApiError> {
+    // Boxed on purpose: this future is awaited deep inside the snapshot and
+    // submit handlers, and inlining the spawn/drain/timeout machinery into
+    // every one of those state machines is what tips a debug-build handler
+    // future over the runtime's stack. One small allocation per git process,
+    // which costs a fraction of the process spawn it feeds.
+    let output = Box::pin(preloop_observability::deadline::run_command(
+        command, deadline, operation,
+    ))
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(output)
+}
+
+/// [`git_output_within`] plus the usual "a non-zero exit is an error" check.
+async fn run_git_within(
+    command: Command,
+    operation: &str,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, ApiError> {
+    let output = git_output_within(command, operation, deadline).await?;
     if !output.status.success() {
         return Err(ApiError::internal(format!(
             "failed to {operation}: {}",
@@ -2670,6 +3020,15 @@ async fn run_git(command: &mut Command, operation: &str) -> Result<std::process:
         )));
     }
     Ok(output)
+}
+
+/// Run a Git control command: refs, config, the index, one small object.
+///
+/// See [`GIT_CONTROL_TIMEOUT`] for why the deadline is a minute; use
+/// [`run_git_within`] with [`GIT_WORK_TIMEOUT`] or [`GIT_TRANSFER_TIMEOUT`]
+/// for commands whose cost scales with the repository or with a remote.
+async fn run_git(command: Command, operation: &str) -> Result<std::process::Output, ApiError> {
+    run_git_within(command, operation, GIT_CONTROL_TIMEOUT).await
 }
 
 fn output_text(output: &std::process::Output, operation: &str) -> Result<String, ApiError> {
@@ -2703,66 +3062,34 @@ fn output_path_text(value: &str, workspace: &FsPath) -> Result<PathBuf, ApiError
     })
 }
 
+/// Run `command`, feed `input` to its stdin, and collect its output, through
+/// the engine-wide bounded runner
+/// ([`preloop_observability::deadline::run_command_with_stdin`]).
+///
+/// The deadline covers the whole interaction — spawn, the stdin write (which
+/// blocks once the pipe buffer is full if the child never reads), and the
+/// wait — because any of the three can be the one that hangs. On expiry the
+/// child is killed and reaped.
 async fn run_git_with_stdin(
-    command: &mut Command,
+    command: Command,
     input: &[u8],
     operation: &str,
+    deadline: std::time::Duration,
 ) -> Result<std::process::Output, ApiError> {
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        ApiError::internal(format!("failed to {operation}: Git stdin was not piped"))
-    })?;
-    let mut stdout = child.stdout.take().ok_or_else(|| {
-        ApiError::internal(format!("failed to {operation}: Git stdout was not piped"))
-    })?;
-    let mut stderr = child.stderr.take().ok_or_else(|| {
-        ApiError::internal(format!("failed to {operation}: Git stderr was not piped"))
-    })?;
-    // Drain the child's output while its stdin is still being written. A
-    // write-all-then-read sequence deadlocks as soon as both pipes fill:
-    // `cat-file --batch-check` over a repository with thousands of refs (the
-    // router workspace sends ~4800 object ids) answers per line, so once the
-    // 64 KiB stdout pipe is full the child stops reading stdin, and the
-    // parent waits forever for a write the child will never accept.
-    let write = async move {
-        let written = stdin.write_all(input).await;
-        drop(stdin);
-        written
-    };
-    let read_stdout = async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-    };
-    let read_stderr = async move {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
-    };
-    let (written, stdout, stderr, status) =
-        tokio::join!(write, read_stdout, read_stderr, child.wait());
-    let status =
-        status.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
-    let stdout =
-        stdout.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
-    let stderr =
-        stderr.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
-    let output = std::process::Output {
-        status,
-        stdout,
-        stderr,
-    };
+    // The shared runner writes stdin while draining stdout and stderr
+    // concurrently, so a chatty `git` cannot deadlock on a full pipe. Boxed to
+    // keep the process machinery out of every enclosing handler future.
+    let output = Box::pin(preloop_observability::deadline::run_command_with_stdin(
+        command, input, deadline, operation,
+    ))
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
     if !output.status.success() {
         return Err(ApiError::internal(format!(
             "failed to {operation}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    written.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
     Ok(output)
 }
 
@@ -2785,15 +3112,17 @@ struct ObjectCache {
 /// Any failure to ask counts as "does not hold it": the caller answers by
 /// fetching, which is the safe direction.
 async fn cache_holds_commit(repository: &FsPath, sha: &str) -> bool {
-    Command::new("git")
+    let mut command = git_command();
+    command
         .arg("--git-dir")
         .arg(repository)
-        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")]);
+    // Any failure — a non-zero exit, a spawn error, or an expired deadline —
+    // counts as "does not hold it": the caller answers by fetching, which is
+    // the safe direction.
+    git_output_within(command, "check cached commit", GIT_CONTROL_TIMEOUT)
         .await
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Whether a local clone can hardlink object files from the workspace.
@@ -2831,7 +3160,7 @@ async fn clone_object_cache(
         clone.arg("--no-hardlinks");
     }
     clone.arg(workspace).arg(staging);
-    run_git(&mut clone, "initialize snapshot object cache")
+    run_git(clone, "initialize snapshot object cache")
         .await
         .map(|_| ())
 }
@@ -2854,6 +3183,11 @@ async fn ensure_object_cache(
         ApiError::internal(format!("failed to create snapshot object cache: {error}"))
     })?;
     let _guard = acquire_cache_lock(&lock).await?;
+    // The lock covers the whole cache, so a lock file left by a `git` this
+    // engine killed at its deadline is a corpse, not a live writer. Removing it
+    // here is what keeps one timed-out deepen from failing every later
+    // snapshot of this workspace with "Unable to create '…lock': File exists".
+    remove_stale_git_locks(&repository, std::time::Duration::ZERO);
     let mut last_head = repository.as_os_str().to_os_string();
     last_head.push(".last-head");
     let last_head = PathBuf::from(last_head);
@@ -2889,7 +3223,7 @@ async fn ensure_object_cache(
         disable_gc
             .env("GIT_DIR", &staging)
             .args(["config", "gc.auto", "0"]);
-        run_git(&mut disable_gc, "disable snapshot cache auto-gc").await?;
+        run_git(disable_gc, "disable snapshot cache auto-gc").await?;
         match tokio::fs::rename(&staging, &repository).await {
             Ok(()) => cloned = true,
             Err(error) if repository.is_dir() => {
@@ -2943,7 +3277,9 @@ async fn ensure_object_cache(
             if source_head.is_some() {
                 fetch.arg("HEAD");
             }
-            run_git(&mut fetch, "refresh snapshot object cache").await?;
+            // A local-path fetch: Git copies objects from the workspace's own
+            // object store, so this is disk work rather than a transfer.
+            run_git_within(fetch, "refresh snapshot object cache", GIT_WORK_TIMEOUT).await?;
             record_cache_head(&last_head, source_head).await?;
             refreshed = true;
         }
@@ -3020,8 +3356,13 @@ async fn present_objects(
     let mut command =
         snapshot_git_command(workspace, staging_repository, staging_index, cached_objects);
     command.args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]);
-    let output =
-        run_git_with_stdin(&mut command, query.as_bytes(), "check snapshot objects").await?;
+    let output = run_git_with_stdin(
+        command,
+        query.as_bytes(),
+        "check snapshot objects",
+        GIT_CONTROL_TIMEOUT,
+    )
+    .await?;
     let text = output_text(&output, "check snapshot objects")?;
     let mut present = std::collections::BTreeSet::new();
     for line in text.lines() {
@@ -3065,13 +3406,13 @@ async fn deepen_object_cache_from_remote(
     workspace: &FsPath,
     github_pat: Option<&str>,
 ) -> bool {
-    let remote = Command::new("git")
+    let mut probe = git_command();
+    probe
         .arg("-C")
         .arg(workspace)
-        .args(["config", "--get", "remote.origin.url"])
-        .output()
-        .await;
-    let Ok(remote) = remote else {
+        .args(["config", "--get", "remote.origin.url"]);
+    let Ok(remote) = git_output_within(probe, "read workspace origin", GIT_CONTROL_TIMEOUT).await
+    else {
         return false;
     };
     if !remote.status.success() {
@@ -3082,10 +3423,27 @@ async fn deepen_object_cache_from_remote(
         return false;
     }
     let shallow_marker = repository.join("shallow");
-    let mut fetch = Command::new("git");
-    fetch
-        .env("GIT_DIR", repository)
-        .args(["fetch", "--quiet", "--force", "--no-tags"]);
+    let auth_header = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat));
+    // With the engine's own credential the helper list is reset as usual — the
+    // header is the credential and no helper is consulted. Without one, this
+    // fetch is the operator's own workspace remote, whose only credential may
+    // be a configured helper, so that list is left alone.
+    let mut fetch = match auth_header.is_some() {
+        true => git_command(),
+        false => workspace_git_command(),
+    };
+    fetch.env("GIT_DIR", repository);
+    if let Some((key, value)) = auth_header {
+        // A private remote rejects the anonymous unshallow; the engine's own
+        // GitHub credential (already used for action downloads) closes it.
+        // Scoped by `github_auth_header_for_remote` so the PAT is never sent
+        // to a host the operator did not configure it for.
+        //
+        // Staged in the environment: the value is a live token, and command
+        // lines are world-readable.
+        stage_git_auth_header(&mut fetch, key, &value);
+    }
+    fetch.args(["fetch", "--quiet", "--force", "--no-tags"]);
     if shallow_marker.is_file() {
         fetch.arg("--unshallow");
     } else {
@@ -3093,21 +3451,10 @@ async fn deepen_object_cache_from_remote(
         // Refetch asks Git to transfer those promisor objects too.
         fetch.arg("--refetch");
     }
-    if let Some((key, value)) = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat))
-    {
-        // A private remote rejects the anonymous unshallow; the engine's own
-        // GitHub credential (already used for action downloads) closes it.
-        // Scoped by `github_auth_header_for_remote` so the PAT is never sent
-        // to a host the operator did not configure it for.
-        fetch
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", key)
-            .env("GIT_CONFIG_VALUE_0", value);
-    }
     fetch
         .arg(&url)
         .arg("+refs/heads/*:refs/remotes/preloop-upstream/*");
-    match run_git(&mut fetch, "deepen snapshot object cache").await {
+    match run_git_within(fetch, "deepen snapshot object cache", GIT_TRANSFER_TIMEOUT).await {
         Ok(_) => !shallow_marker.is_file(),
         Err(error) => {
             // The remote URL can embed a credential in its userinfo, and
@@ -3522,7 +3869,7 @@ pub async fn release_remote_checkout_snapshot(
                 .arg("update-ref")
                 .arg("-d")
                 .arg(format!("refs/preloop/runs/{run_id}"));
-            if let Err(error) = run_git(&mut delete, "release merge mirror run ref").await {
+            if let Err(error) = run_git(delete, "release merge mirror run ref").await {
                 debug!(%run_id, error = ?error, "Failed to drop merge mirror run ref");
             }
         }
@@ -3552,7 +3899,7 @@ pub async fn release_remote_checkout_snapshot(
                 .arg("update-ref")
                 .arg("-d")
                 .arg(format!("refs/preloop/runs/{run_id}"));
-            if let Err(error) = run_git(&mut delete, "release repository checkout ref").await {
+            if let Err(error) = run_git(delete, "release repository checkout ref").await {
                 debug!(%run_id, error = ?error, "Failed to drop repository checkout ref");
             }
         }
@@ -3673,7 +4020,7 @@ async fn cache_entry_is_live(path: &FsPath, root: &FsPath) -> bool {
         .arg("for-each-ref")
         .arg("--format=%(refname)")
         .arg("refs/preloop/runs");
-    match run_git(&mut refs, "list cached run refs").await {
+    match run_git(refs, "list cached run refs").await {
         Ok(output) => !output.stdout.is_empty(),
         // An unreadable repository serves nothing; let the sweep reclaim it.
         Err(_) => false,
@@ -4625,7 +4972,12 @@ pub async fn snapshot_git_http(
         );
     }
 
-    let mut command = Command::new("git");
+    // Deliberately not deadline-bounded: this child streams one job's pack
+    // into the response body, so its lifetime is the request's, and cloning a
+    // large repository is legitimate long work. The child policy still
+    // applies — if the client disconnects and the response stream is dropped,
+    // the child is killed instead of left fetching into a closed pipe.
+    let mut command = git_command();
     command
         .arg("http-backend")
         .env("GIT_PROJECT_ROOT", project_root)
@@ -5187,14 +5539,20 @@ async fn write_snapshot_archive(
         .map(|parent| parent.join(format!("archive-{}.tar.gz", uuid::Uuid::new_v4())))
         .ok_or_else(|| ApiError::internal("snapshot repository has no parent directory"))?;
     let args = snapshot_archive_args(git_ref, prefix);
-    let output = tokio::process::Command::new("git")
+    let mut command = git_command();
+    command
         .current_dir(repository)
         .args(args.iter().map(String::as_str))
         .arg("-o")
-        .arg(&archive_path)
-        .output()
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to run git archive: {error}")))?;
+        .arg(&archive_path);
+    // `git archive` writes a whole tree's tarball: whole-repository work.
+    let output = match git_output_within(command, "archive snapshot", GIT_WORK_TIMEOUT).await {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&archive_path).await;
+            return Err(error);
+        }
+    };
     if !output.status.success() {
         let _ = tokio::fs::remove_file(&archive_path).await;
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5233,17 +5591,16 @@ fn archive_commit_belongs_to_run(snapshot: &WorkspaceSnapshot, sha: &str) -> boo
 /// Resolve the archive's commit so the prefix carries a sha, and so an
 /// unprovable ref never reaches `git archive` as an argument.
 async fn resolve_archive_commit(repository: &FsPath, git_ref: &str) -> Result<String, ApiError> {
-    let output = tokio::process::Command::new("git")
-        .current_dir(repository)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{git_ref}^{{commit}}"),
-        ])
-        .output()
+    let mut command = git_command();
+    command.current_dir(repository).args([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{git_ref}^{{commit}}"),
+    ]);
+    let output = git_output_within(command, "resolve archive ref", GIT_CONTROL_TIMEOUT)
         .await
-        .map_err(|error| ApiError::internal(format!("failed to run git rev-parse: {error}")))?;
+        .map_err(|error| ApiError::internal(format!("failed to run git rev-parse: {error:?}")))?;
     if !output.status.success() {
         return Err(ApiError::not_found("snapshot archive ref not found"));
     }
@@ -7817,7 +8174,7 @@ mod git_stdin_tests {
         command.args(["-c", "cat"]);
         let input = vec![b'x'; 1024 * 1024];
 
-        let output = run_git_with_stdin(&mut command, &input, "echo large input")
+        let output = run_git_with_stdin(command, &input, "echo large input", GIT_WORK_TIMEOUT)
             .await
             .expect("a large stdin payload must not deadlock against its output");
 
@@ -8299,6 +8656,561 @@ mod lfs_accounting_tests {
             usage.bytes,
             (fixture.batch_body_len + fixture.blob.len()) as u64,
             "same-host blob bytes are GitHub bytes"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod bounded_git_tests {
+    use super::*;
+
+    /// A fake `git` that hangs: it records its pid and then sleeps far past any
+    /// deadline a test uses. Only a child that really does not exit on its own
+    /// can show that the deadline fires *and* that `kill_on_drop` kills it.
+    pub(crate) fn hanging_git(dir: &FsPath) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let pid_file = dir.join("fake-git.pid");
+        let program = dir.join("fake-git");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nsleep 3600\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (program, pid_file)
+    }
+
+    /// Whether the process is no longer running: reaped, or a zombie the
+    /// runtime has not reaped yet — a zombie is not running.
+    fn process_finished(pid: &str) -> bool {
+        match std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let stat = String::from_utf8_lossy(&output.stdout);
+                let stat = stat.trim();
+                stat.is_empty() || stat.starts_with('Z')
+            }
+            // `ps` could not ask (already gone, or unavailable): fall back to
+            // `kill -0`, which also fails once the pid is gone.
+            _ => !std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success()),
+        }
+    }
+
+    /// The pid the fake `git` recorded, waiting for the script to get there.
+    pub(crate) async fn wait_for_pid(pid_file: &FsPath) -> String {
+        for _ in 0..250 {
+            if let Ok(pid) = std::fs::read_to_string(pid_file) {
+                let pid = pid.trim().to_owned();
+                if !pid.is_empty() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "the fake git never recorded its pid at {}",
+            pid_file.display()
+        );
+    }
+
+    /// Wait until `pid` is no longer running, up to `within`.
+    pub(crate) async fn wait_until_finished(pid: &str, within: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < within {
+            if process_finished(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// A TCP listener that accepts connections and never answers: a stall, not
+    /// a refusal. That is the shape that froze the engine — the client is
+    /// connected and waits for a response that never comes.
+    fn stalled_forge() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+            }
+        });
+        address
+    }
+
+    /// A forge that answers every request with `401 Unauthorized`, which is
+    /// what sends Git to its credential subsystem (helper, then askpass).
+    fn unauthorized_forge() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let mut request = [0u8; 8192];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\n\
+                          WWW-Authenticate: Basic realm=\"preloop\"\r\n\
+                          Content-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    );
+                    let _ = stream.flush();
+                });
+            }
+        });
+        address
+    }
+
+    /// A bare repository created with the real Git.
+    async fn bare_repository(path: &FsPath, operation: &str) {
+        let mut init = git_command();
+        init.args(["init", "--bare", "--quiet", "--template="])
+            .arg(path);
+        run_git(init, operation).await.unwrap();
+    }
+
+    /// A fake `git` that records its argv and the credential environment, then
+    /// fails. Proves where each value is staged.
+    fn dumping_git(dir: &FsPath) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let argv_file = dir.join("argv");
+        let env_file = dir.join("env");
+        let program = dir.join("dumping-git");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n\
+                 for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > '{argv}'\n\
+                 {{ printf 'GIT_CONFIG_COUNT=%s\\n' \"$GIT_CONFIG_COUNT\"; \
+                 printf 'GIT_CONFIG_KEY_0=%s\\n' \"$GIT_CONFIG_KEY_0\"; \
+                 printf 'GIT_CONFIG_VALUE_0=%s\\n' \"$GIT_CONFIG_VALUE_0\"; \
+                 printf 'GIT_ASKPASS=%s\\n' \"$GIT_ASKPASS\"; \
+                 printf 'GIT_TERMINAL_PROMPT=%s\\n' \"$GIT_TERMINAL_PROMPT\"; }} > '{env}'\n\
+                 exit 1\n",
+                argv = argv_file.display(),
+                env = env_file.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (program, argv_file, env_file)
+    }
+
+    /// The forge token must travel in the child *environment*, never on the
+    /// command line: argv is world-readable through process listings, and the
+    /// value is a live GitHub bearer token. The credential-helper reset is the
+    /// opposite case — an empty, non-secret value — so it stays on argv, where
+    /// it cannot collide with the environment slot the token needs.
+    #[tokio::test]
+    async fn a_forge_token_never_reaches_the_git_command_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, argv_file, env_file) = dumping_git(temp.path());
+        let repository = temp.path().join("mirror.git");
+        std::fs::create_dir_all(&repository).unwrap();
+        let header = "Authorization: basic c2VjcmV0LXRva2Vu";
+        let error = fetch_checkout_cache_commit(
+            program,
+            std::time::Duration::from_secs(30),
+            &repository,
+            "https://github.com/owner/repo.git",
+            "0123456789012345678901234567890123456789",
+            Some(("http.https://github.com/.extraheader", header)),
+        )
+        .await
+        .expect_err("the dumping git exits non-zero");
+        assert!(
+            format!("{error:?}").contains("fetch remote checkout snapshot"),
+            "unexpected error: {error:?}"
+        );
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            !argv.contains("c2VjcmV0LXRva2Vu") && !argv.contains("Authorization"),
+            "the forge token must never be an argument: {argv}"
+        );
+        assert!(
+            argv.contains("credential.helper="),
+            "the helper reset is argv-safe and belongs on the command line: {argv}"
+        );
+
+        let env = std::fs::read_to_string(&env_file).unwrap();
+        assert!(
+            env.contains(&format!("GIT_CONFIG_VALUE_0={header}")),
+            "the token must be staged in the child environment: {env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_KEY_0=http.https://github.com/.extraheader"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_ASKPASS=false") && env.contains("GIT_TERMINAL_PROMPT=0"),
+            "prompting must stay disabled: {env}"
+        );
+    }
+
+    /// A hung Git child must be killed at the deadline, not waited on forever.
+    #[tokio::test]
+    async fn a_hung_git_is_killed_at_the_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, pid_file) = hanging_git(temp.path());
+        let command = Command::new(program);
+        let started = std::time::Instant::now();
+        let error = run_git_within(
+            command,
+            "refresh snapshot object cache",
+            std::time::Duration::from_millis(750),
+        )
+        .await
+        .expect_err("a git that never exits must hit the deadline");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the wait must end at the deadline, not never: {error:?}"
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("refresh snapshot object cache timed out after 750ms"),
+            "{message}"
+        );
+        assert!(
+            message.contains("killed the hung"),
+            "the error must name the process that hung: {message}"
+        );
+        let pid = wait_for_pid(&pid_file).await;
+        assert!(
+            wait_until_finished(&pid, std::time::Duration::from_secs(10)).await,
+            "the fake git child {pid} outlived the deadline; kill_on_drop did not fire"
+        );
+    }
+
+    /// The checkout-cache fetch runs under the per-repository cache lock, so a
+    /// stalled forge used to keep that lock — and every later submission for
+    /// the same repository — until the engine restarted. The deadline must end
+    /// the fetch, and the lock must be free when it does.
+    #[tokio::test]
+    async fn a_stalled_forge_fetch_ends_at_the_deadline_and_frees_the_cache_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout-cache/repositories");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository = root.join("namespace.git");
+        bare_repository(&repository, "initialize test cache repository").await;
+        let lock = root.join("namespace.lock");
+        let upstream = format!("http://{}/owner/repo.git", stalled_forge());
+
+        let held_lock = lock.clone();
+        let held_repository = repository.clone();
+        let held_upstream = upstream.clone();
+        let holder = tokio::spawn(async move {
+            let guard = acquire_cache_lock(&held_lock).await.unwrap();
+            let result = fetch_checkout_cache_commit(
+                GIT_PROGRAM,
+                std::time::Duration::from_millis(750),
+                &held_repository,
+                &held_upstream,
+                "0123456789012345678901234567890123456789",
+                None,
+            )
+            .await;
+            drop(guard);
+            result
+        });
+        let error = holder
+            .await
+            .unwrap()
+            .expect_err("a stalled forge must hit the deadline");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("fetch remote checkout snapshot timed out after 750ms"),
+            "{message}"
+        );
+        assert!(
+            message.contains("killed the hung git process"),
+            "the error must name the dependency that hung: {message}"
+        );
+        assert!(
+            !lock.exists(),
+            "the cache lock and its heartbeat must be released once the fetch ends"
+        );
+        let guard = acquire_cache_lock(&lock)
+            .await
+            .expect("the next submission must be able to take the lock");
+        drop(guard);
+        assert!(!lock.exists());
+    }
+
+    /// `GIT_TERMINAL_PROMPT=0` does not stop a credential helper: a configured
+    /// osxkeychain or GCM helper still runs and can block on a keychain dialog
+    /// forever. The engine policy has to keep it out of the child entirely.
+    /// The forge answers `401`, which is what makes Git ask for credentials.
+    #[tokio::test]
+    async fn a_configured_credential_helper_never_runs_for_engine_git() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn helper_script(dir: &FsPath, name: &str) -> (PathBuf, PathBuf) {
+            let log = dir.join(format!("{name}-ran"));
+            let helper = dir.join(name);
+            std::fs::write(
+                &helper,
+                format!("#!/bin/sh\necho ran >> '{}'\nsleep 5\n", log.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (helper, log)
+        }
+
+        async fn mirror_with_helper(
+            dir: &FsPath,
+            name: &str,
+            helper: &FsPath,
+            operation: &str,
+        ) -> PathBuf {
+            let repository = dir.join(format!("{name}.git"));
+            bare_repository(&repository, operation).await;
+            let config = std::fs::read_to_string(repository.join("config")).unwrap();
+            std::fs::write(
+                repository.join("config"),
+                format!("{config}[credential]\n\thelper = {}\n", helper.display()),
+            )
+            .unwrap();
+            repository
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let upstream = format!("http://{}/owner/repo.git", unauthorized_forge());
+        let sha = "0123456789012345678901234567890123456789";
+
+        // Control: plain Git does consult a configured helper. Without this the
+        // assertion below could pass for the wrong reason.
+        let (control_helper, control_log) = helper_script(temp.path(), "control-helper");
+        let control_repository = mirror_with_helper(
+            temp.path(),
+            "control-mirror",
+            &control_helper,
+            "initialize control mirror",
+        )
+        .await;
+        let mut control = Command::new(GIT_PROGRAM);
+        control
+            .arg("--git-dir")
+            .arg(&control_repository)
+            .args(["fetch", "--quiet", "--no-tags"])
+            .arg(&upstream)
+            .arg(sha);
+        control.kill_on_drop(true);
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(1500), control.output()).await;
+        assert!(
+            control_log.exists(),
+            "the fixture must make plain git consult a credential helper"
+        );
+
+        let (engine_helper, engine_log) = helper_script(temp.path(), "engine-helper");
+        let engine_repository = mirror_with_helper(
+            temp.path(),
+            "engine-mirror",
+            &engine_helper,
+            "initialize engine mirror",
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let error = fetch_checkout_cache_commit(
+            GIT_PROGRAM,
+            std::time::Duration::from_secs(10),
+            &engine_repository,
+            &upstream,
+            sha,
+            None,
+        )
+        .await
+        .expect_err("an unauthenticated forge must fail, not succeed");
+        let message = format!("{error:?}");
+        assert!(
+            !engine_log.exists(),
+            "the credential helper must never run for engine git: {message}"
+        );
+        assert!(
+            message.contains("terminal prompts disabled")
+                || message.contains("Authentication failed"),
+            "git must be refused at the credential step: {message}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the fetch must fail fast, not sit on the deadline: {message}"
+        );
+    }
+
+    /// A `git` killed at its deadline cannot unlink the lock files it held, and
+    /// Git then refuses every later operation in that repository with
+    /// "Unable to create '…lock': File exists". Under the engine's exclusive
+    /// cache lock every lock file is that corpse, so every one of them goes —
+    /// and nothing that is not a lock file is touched.
+    #[test]
+    fn stale_git_locks_are_removed_under_the_repository_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("cache.git");
+        std::fs::create_dir_all(repository.join("refs/heads/feature")).unwrap();
+        std::fs::create_dir_all(repository.join("logs/refs/heads")).unwrap();
+        std::fs::create_dir_all(repository.join("objects/pack")).unwrap();
+        let locks = [
+            "HEAD.lock",
+            "config.lock",
+            "packed-refs.lock",
+            "shallow.lock",
+            "refs/heads/main.lock",
+            "refs/heads/feature/topic.lock",
+            "logs/refs/heads/main.lock",
+        ];
+        for lock in locks {
+            std::fs::write(repository.join(lock), "").unwrap();
+        }
+        // Not locks: the ref itself, an ordinary object file, an unrelated
+        // config. The sweep must leave all three alone.
+        std::fs::write(repository.join("refs/heads/main"), "sha\n").unwrap();
+        std::fs::write(repository.join("objects/pack/pack-abc.pack"), "").unwrap();
+        std::fs::write(repository.join("config"), "[core]\n").unwrap();
+
+        remove_stale_git_locks(&repository, std::time::Duration::ZERO);
+
+        for lock in locks {
+            assert!(!repository.join(lock).exists(), "{lock} survived the sweep");
+        }
+        assert!(repository.join("refs/heads/main").is_file());
+        assert!(repository.join("objects/pack/pack-abc.pack").is_file());
+        assert_eq!(
+            std::fs::read_to_string(repository.join("config")).unwrap(),
+            "[core]\n"
+        );
+    }
+
+    /// A mirror has no engine lock, so a lock file there may belong to a
+    /// concurrent delivery that is still fetching. Only a lock that has
+    /// outlived the longest fetch any engine child may hold is provably dead.
+    #[test]
+    fn without_a_repository_lock_only_a_lock_older_than_any_fetch_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mirror = temp.path().join("mirror.git");
+        std::fs::create_dir_all(mirror.join("refs/preloop/merge/base")).unwrap();
+        std::fs::create_dir_all(mirror.join("refs/preloop/merge/head")).unwrap();
+        let dead = mirror.join("refs/preloop/merge/base/main.lock");
+        let live = mirror.join("refs/preloop/merge/head/main.lock");
+        std::fs::write(&dead, "").unwrap();
+        std::fs::write(&live, "").unwrap();
+        let age = GIT_TRANSFER_TIMEOUT + std::time::Duration::from_secs(60);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        filetime::set_file_mtime(
+            &dead,
+            filetime::FileTime::from_unix_time(now - (age.as_secs() as i64) - 60, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(&live, filetime::FileTime::from_unix_time(now, 0)).unwrap();
+
+        remove_stale_git_locks(&mirror, age);
+
+        assert!(
+            !dead.exists(),
+            "a lock older than any possible fetch must be removed"
+        );
+        assert!(
+            live.exists(),
+            "a young lock may belong to a live concurrent fetch"
+        );
+    }
+
+    /// The workspace's own remote is the operator's credential domain. When the
+    /// engine has no credential for it, the deepen fetch must still be able to
+    /// use a configured credential helper — otherwise a private GitLab or
+    /// enterprise workspace that used to deepen falls back to a history rewrite
+    /// and submits SHAs the forge never had.
+    #[tokio::test]
+    async fn a_workspace_origin_deepen_keeps_the_configured_credential_helper() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new(GIT_PROGRAM)
+                .args(["-c", "commit.gpgsign=false"])
+                .args(["-c", "user.email=preloop@example.invalid"])
+                .args(["-c", "user.name=preloop"])
+                .args(args)
+                .status()
+                .expect("git runs in tests");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        // A real shallow bare clone, so the deepen takes the `--unshallow` path
+        // a shallow workspace's own origin takes.
+        let work = temp.path().join("work");
+        run_git(&["init", "-q", "-b", "main", work.to_str().unwrap()]);
+        std::fs::write(work.join("file.txt"), "one\n").unwrap();
+        run_git(&["-C", work.to_str().unwrap(), "add", "-A"]);
+        run_git(&["-C", work.to_str().unwrap(), "commit", "-qm", "one"]);
+        let cache = temp.path().join("cache.git");
+        run_git(&[
+            "clone",
+            "-q",
+            "--bare",
+            "--depth=1",
+            &format!("file://{}", work.display()),
+            cache.to_str().unwrap(),
+        ]);
+        assert!(
+            cache.join("shallow").is_file(),
+            "the fixture must produce a shallow cache"
+        );
+
+        let log = temp.path().join("helper-ran");
+        let helper = temp.path().join("credential-helper");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The deepen fetch runs with `GIT_DIR` on the cache, so that is where
+        // the helper has to be configured to be read.
+        run_git(&[
+            "-C",
+            cache.to_str().unwrap(),
+            "config",
+            "credential.helper",
+            helper.to_str().unwrap(),
+        ]);
+
+        // The workspace origin is a private remote the engine has no token for;
+        // `401` is what sends Git to the credential subsystem.
+        let workspace = temp.path().join("workspace");
+        run_git(&["init", "-q", "-b", "main", workspace.to_str().unwrap()]);
+        run_git(&[
+            "-C",
+            workspace.to_str().unwrap(),
+            "config",
+            "remote.origin.url",
+            &format!("http://{}/owner/repo.git", unauthorized_forge()),
+        ]);
+
+        let deepened = deepen_object_cache_from_remote(&cache, &workspace, None).await;
+        assert!(
+            !deepened,
+            "an origin that rejects the credential leaves the cache shallow"
+        );
+        assert!(
+            log.exists(),
+            "the deepen fetch must consult the configured credential helper"
         );
     }
 }
