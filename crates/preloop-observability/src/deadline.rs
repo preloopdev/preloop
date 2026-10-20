@@ -32,7 +32,10 @@
 //!   the repository after the caller's lock has been released. Other platforms
 //!   signal the direct child only. The group is named by the id captured at
 //!   spawn, so a helper that outlives its parent is still reached when the
-//!   direct child has already been reaped.
+//!   direct child has already been reaped. [`run_command_status_in_group`]
+//!   exposes the same whole-group cancellation explicitly for shell wrappers;
+//!   dropping these futures is the same cancellation as expiry, so the group
+//!   guard kills with it.
 //! - Nothing here configures environment variables. Callers apply their own
 //!   non-interactive policy (`GIT_TERMINAL_PROMPT`, `GIT_ASKPASS`, …) to the
 //!   [`Command`] they pass in.
@@ -744,6 +747,99 @@ pub async fn run_command_status(
             kill_and_reap(&mut child, pgid).await;
             Err(timeout_error(what, &program, deadline))
         }
+    }
+}
+
+/// Run a command as the leader of its own process group, bounded by `deadline`.
+///
+/// The same contract as [`run_command_status`], with one addition: the child
+/// starts a fresh process group, and expiry — or dropping the returned future,
+/// which is what a caller's `select!` against a shutdown token does — SIGKILLs
+/// every member of that group instead of only the direct child.
+///
+/// A shell wrapper is why: `sh -c '… curl … tar …'` does its real work in a
+/// grandchild, so killing the shell alone leaves the transfer or the extraction
+/// running behind the failure the caller already reported, and a repeated start
+/// leaks another one. Use this wherever the command is a script that spawns
+/// children of its own. On targets without process groups this is
+/// [`run_command_status`].
+pub async fn run_command_status_in_group(
+    mut cmd: Command,
+    deadline: Duration,
+    what: &str,
+) -> Result<ExitStatus, CommandError> {
+    // `run_command_status` already isolates and kills the group on expiry.
+    // Keep this explicit variant for callers that also cancel by dropping the
+    // future: `ProcessGroup`'s guard closes that cancellation path.
+    let started = Instant::now();
+    let program = program_name(&cmd);
+    cmd.kill_on_drop(true);
+    cmd.stdin(Stdio::null());
+    isolate_process_group(&mut cmd);
+    let mut child = spawn_bounded(cmd, deadline, started, what, &program).await?;
+    let mut group = ProcessGroup::of(&child);
+    let remaining = deadline.saturating_sub(started.elapsed());
+    match tokio::time::timeout(remaining, child.wait()).await {
+        Ok(Ok(status)) if started.elapsed() < deadline => {
+            group.disarm();
+            Ok(status)
+        }
+        Ok(Ok(_)) => {
+            let pgid = group.take();
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, &program, deadline))
+        }
+        Ok(Err(source)) => {
+            group.kill();
+            Err(CommandError::io(what, &program, source))
+        }
+        Err(_) => {
+            let pgid = group.take();
+            kill_and_reap(&mut child, pgid).await;
+            Err(timeout_error(what, &program, deadline))
+        }
+    }
+}
+
+/// The process group of a child that started one, signalled on drop.
+///
+/// The guard is what makes a *dropped* bounded runner as clean as an expired
+/// one: without it, only the direct child dies and the group's other members
+/// are reparented and outlive the wait.
+struct ProcessGroup {
+    id: Option<u32>,
+}
+
+impl ProcessGroup {
+    /// The group of a freshly spawned leader, or an inert guard when none can
+    /// be addressed.
+    fn of(child: &Child) -> Self {
+        Self { id: child.id() }
+    }
+
+    /// Stop signalling on drop: the leader was collected, so the group is
+    /// drained and its id is free for the OS to hand to somebody else.
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+
+    /// Take the group id for an explicit kill-and-reap path.
+    fn take(&mut self) -> Option<u32> {
+        self.id.take()
+    }
+
+    /// SIGKILL every member now. An error means the group has already drained,
+    /// which is the outcome the caller wanted anyway.
+    fn kill(&mut self) {
+        if let Some(id) = self.id.take() {
+            kill_process_group(id);
+        }
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -1493,6 +1589,100 @@ mod tests {
             .unwrap_err();
         assert!(error.timed_out(), "expected a timeout: {error}");
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    /// A pid file for one group test: unique per test so the two of them can
+    /// run in parallel.
+    fn pid_file(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "preloop-deadline-{name}-{}.pid",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    /// The pid the script recorded, once it has written it.
+    async fn recorded_pid(path: &std::path::Path) -> String {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let pid = text.trim().to_owned();
+                if !pid.is_empty() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no pid was recorded at {}", path.display());
+    }
+
+    #[cfg(unix)]
+    /// Whether `pid` still exists. The null signal answers it without
+    /// delivering anything; a zombie is reaped by init, so it does not hold
+    /// this open.
+    fn process_alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    async fn assert_gone(pid: &str, what: &str) {
+        for _ in 0..100 {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{what} (pid {pid}) outlived its process group");
+    }
+
+    #[cfg(unix)]
+    /// A shell wrapper's real work is a grandchild, and killing only the shell
+    /// leaves it running: the group runner must take the grandchild with it.
+    #[tokio::test]
+    async fn group_runner_kills_a_hung_grandchild_at_the_deadline() {
+        let path = pid_file("group-deadline");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 600 & echo $! > '{}'; wait", path.display()),
+        ]);
+        let started = Instant::now();
+        let error = run_command_status_in_group(cmd, Duration::from_millis(300), "group sleep")
+            .await
+            .unwrap_err();
+        assert!(error.timed_out(), "expected a timeout: {error}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pid = recorded_pid(&path).await;
+        assert_gone(&pid, "the grandchild of a timed-out group runner").await;
+    }
+
+    #[cfg(unix)]
+    /// A caller that stops waiting drops the runner's future — a `select!`
+    /// losing to a shutdown token. That is a cancellation like any other, and
+    /// the group has to go with it.
+    #[tokio::test]
+    async fn group_runner_takes_the_group_with_a_dropped_future() {
+        let path = pid_file("group-dropped");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 600 & echo $! > '{}'; wait", path.display()),
+        ]);
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(300),
+            run_command_status_in_group(cmd, Duration::from_secs(30), "dropped group runner"),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the outer timeout must have dropped the runner"
+        );
+        let pid = recorded_pid(&path).await;
+        assert_gone(&pid, "the grandchild of a dropped group runner").await;
     }
 
     #[cfg(unix)]
