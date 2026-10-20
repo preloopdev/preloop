@@ -1214,12 +1214,7 @@ mod tests {
 
     /// A real mirror holding a two-parent merge of `owner/repo`, plus the
     /// state that serves it, so both attach paths run their git plumbing.
-    async fn merge_fixture() -> (
-        tempfile::TempDir,
-        Arc<SharedState>,
-        PathBuf,
-        MergedMerge,
-    ) {
+    async fn merge_fixture() -> (tempfile::TempDir, Arc<SharedState>, PathBuf, MergedMerge) {
         let temp = tempfile::tempdir().unwrap();
         let shared = Arc::new(SharedState {
             state: crate::AppState::new(temp.path().join("state"))
