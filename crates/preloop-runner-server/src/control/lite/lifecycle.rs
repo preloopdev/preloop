@@ -156,6 +156,7 @@ pub(super) fn retry_attempt(
     message.job_id = agent_job_id;
     message.request_id = retry;
     message.plan.plan_id = codec::plan_id(&agent_job_id);
+    logic::reprefix_orchestration_id(&mut message, agent_job_id);
     message.timeline.id = timeline_id;
     jobs::update_job_message(tx, run_id, job_id, &message)?;
     tx.prepare_cached("UPDATE github_token_requests SET request_id = ?2 WHERE request_id = ?1")

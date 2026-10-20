@@ -21,6 +21,15 @@ on:
         type: choice
         options:
           - x86_64
+      guest_gib:
+        description: Guest disk GiB for the bake, at least 200. The headroom gate below needs this plus ~2x the base image on the host; a smaller guest cannot hold the extracted layers, the merged layer, and the pack staging, so it fails inside pack on any host.
+        required: false
+        default: "200"
+      publish_ghcr:
+        description: Publish the baked pack to ghcr.io/<owner>/preloop-x86_64-smolvm-golden (dated tag, then latest). Only runs on a ref that passes the signing-identity check (main or a tag).
+        required: false
+        type: boolean
+        default: false
   pull_request:
     paths:
       - official-image.toml
@@ -96,6 +105,49 @@ jobs:
           git push -u origin "$BRANCH"
           gh pr create --base main --head "$BRANCH"             --title "chore(golden): update official image pins to upstream rebuild"             --body "Weekly drift check found the dump pipeline's floating tags ahead of the pins. Merging rebuilds the official goldens via push trigger."
 
+  golden-age:
+    name: Bake when the newest golden exceeds max age
+    # The weekly schedule is the freshness backstop: even when the upstream
+    # digest has not moved, refuse to keep serving an artifact past
+    # `golden_max_age_days`. The bake job below consumes this output; no
+    # workflow-dispatch token is needed.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      bake: ${{ steps.check.outputs.bake }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check newest golden artifact age
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          max_age="$(awk -F'"' '/^golden_max_age_days = / { print $2; exit }' official-image.toml)"
+          test -n "$max_age"
+          created="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=golden-x86_64&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .created_at // empty')"
+          if [ -z "$created" ]; then
+            echo "no unexpired golden artifact; scheduling a bake"
+            echo "bake=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          age=$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))
+          echo "newest golden artifact: ${created} (${age}d old, max ${max_age}d)"
+          if [ "$age" -ge "$max_age" ]; then
+            echo "bake=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bake=false" >> "$GITHUB_OUTPUT"
+          fi
+
   image-pins-changed:
     name: Do the image pins change?
     # official-image.toml carries two classes of keys: the
@@ -133,23 +185,28 @@ jobs:
 
   build-official-x86_64:
     name: Build official x86_64 golden
-    needs: image-pins-changed
+    needs: [image-pins-changed, golden-age]
     # `!cancelled()` keeps the job eligible when `image-pins-changed` was
     # skipped (it only runs for pull requests) — a bare `if` would inherit an
     # implicit `success()` and skip every manual bake. The pull-request branch
-    # then requires the gate to have run and found the pins moved.
-    if: ${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64')) || (github.event_name == 'pull_request' && needs.image-pins-changed.result == 'success' && needs.image-pins-changed.outputs.changed == 'true')) }}
+    # then requires the gate to have run and found the pins moved; the
+    # schedule branch bakes only when `golden-age` says the artifact is past
+    # its maximum age.
+    if: ${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64')) || (github.event_name == 'pull_request' && needs.image-pins-changed.result == 'success' && needs.image-pins-changed.outputs.changed == 'true') || (github.event_name == 'schedule' && needs.golden-age.outputs.bake == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "1"
       # Guest disk for the bake VM; the headroom gate below and
       # PRELOOP_RUNNER_STORAGE_GB both read it.
-      GOLDEN_GUEST_GIB: "200"
+      GOLDEN_GUEST_GIB: ${{ inputs.guest_gib || '200' }}
     permissions:
       contents: read
       id-token: write
       attestations: write
+      # Read only: this job runs pull-request code and must not be able to
+      # write packages. GHCR publication lives in the dispatch-only
+      # `publish-official-x86_64` job below, which holds `packages: write`.
       packages: read
     steps:
       # The bake needs nested KVM to boot the image it packs. Self-hosted
@@ -161,6 +218,27 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Validate guest disk input
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          # A guest below the proven 200G minimum cannot be baked on any host:
+          # the guest must hold the extracted layers, the merged layer, and the
+          # pack staging, and 120G already failed there with `pack binary: tar
+          # error: No space left on device` (see the install step below). Reject
+          # it here — the headroom gate cannot catch it, and the bake would
+          # otherwise burn its full runtime before dying.
+          case "$GOLDEN_GUEST_GIB" in
+            ''|*[!0-9]*)
+              echo "::error::guest_gib must be a whole number of GiB, got '$GOLDEN_GUEST_GIB'"
+              exit 1
+              ;;
+          esac
+          if [ "$GOLDEN_GUEST_GIB" -lt 200 ]; then
+            echo "::error::guest_gib=${GOLDEN_GUEST_GIB} is below the proven 200G minimum; a smaller guest fails inside pack on any host. Raise this runner's storage (PRELOOP_RUNNER_STORAGE_GB) instead of shrinking the guest."
+            exit 1
+          fi
 
       - name: Resolve golden identity and base
         if: runner.environment == 'github-hosted'
@@ -389,6 +467,30 @@ jobs:
           test -s "dist/$GOLDEN_NAME"
           sha256sum "dist/$GOLDEN_NAME" > "dist/$GOLDEN_NAME.sha256"
 
+      - name: Generate baked-package SBOM
+        if: runner.environment == 'github-hosted'
+        env:
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+        run: |
+          set -euo pipefail
+          test -s "dist/$GOLDEN_NAME.apt-manifest.txt"
+          python3 scripts/write-apt-sbom.py \
+            --manifest "dist/$GOLDEN_NAME.apt-manifest.txt" \
+            --output "dist/$GOLDEN_NAME.apt-sbom.cdx.json" \
+            --distro-version 24.04
+          test -s "dist/$GOLDEN_NAME.apt-sbom.cdx.json"
+
+      - name: Retain Golden SBOM
+        if: runner.environment == 'github-hosted'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: golden-sbom-${{ env.GOLDEN_ARCH }}
+          path: |
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-manifest.txt
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-sbom.cdx.json
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Write golden provenance manifest
         if: runner.environment == 'github-hosted'
         env:
@@ -414,7 +516,7 @@ jobs:
           cosign verify-blob \
             --bundle "dist/$GOLDEN_NAME.bundle" \
             --certificate-identity-regexp \
-              "^https://github.com/$GITHUB_REPOSITORY/.github/workflows/release-golden.yml@refs/(heads/main|tags/)" \
+              "^https://github.com/$GITHUB_REPOSITORY/.github/workflows/(release-golden|official-golden)\.yml@refs/(heads/main|tags/)" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "dist/$GOLDEN_NAME"
 
@@ -426,6 +528,8 @@ jobs:
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-manifest.txt
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-sbom.cdx.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
 
       - name: Retain Golden Artifact
@@ -441,6 +545,8 @@ jobs:
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.bundle
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-manifest.txt
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-sbom.cdx.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
           retention-days: 90
           if-no-files-found: error
@@ -454,6 +560,103 @@ jobs:
           rm -f "dist/$GOLDEN_NAME.part."*
           split -b 4G -d "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.part."
           sha256sum "dist/$GOLDEN_NAME.part."* > "dist/$GOLDEN_NAME.parts.sha256"
+
+  # GHCR publication is a separate, dispatch-only job on purpose:
+  # `packages: write` must never be held by the job that compiles and runs
+  # pull-request code, and a mutable tag must not move before the bake above
+  # has been signed, verified, and attested — `needs:` gives that ordering for
+  # free, so `latest` only moves for a pack whose own verification passed.
+  publish-official-x86_64:
+    name: Publish official x86_64 golden to GHCR
+    needs: build-official-x86_64
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_ghcr
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GOLDEN_ARCH: x86_64
+      GOLDEN_NAME: dist/preloop-ubuntu-24.04-x86_64
+      GOLDEN_REPOSITORY: ${{ github.repository_owner }}/preloop-x86_64-smolvm-golden
+    permissions:
+      contents: read
+      packages: write
+    # The workflow-level group is per-ref and manual runs are never cancelled,
+    # so two dispatches that select different refs would otherwise push at the
+    # same time and could move `latest` backwards (and two bakes on one UTC day
+    # collide on the dated tag). Serialize publication instead.
+    concurrency:
+      group: official-golden-publish-x86_64
+      cancel-in-progress: false
+    steps:
+      - name: Check out repository
+        if: runner.environment == 'github-hosted'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install configured smolvm
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          # `pack push` needs the CLI, not the bake's sized templates. The
+          # launcher resolves `smolvm-bin`, `lib/` and `agent-rootfs/` relative
+          # to itself, so keep the extracted distribution intact beside it.
+          SMOLVM_VERSION="$(grep -E '^[[:space:]]*smolvm_golden_version[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
+          [ -n "$SMOLVM_VERSION" ] || { echo "smolvm_golden_version missing from versions.toml" >&2; exit 1; }
+          ARCHIVE="smolvm-${SMOLVM_VERSION}-linux-x86_64.tar.gz"
+          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
+          curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"
+          curl -fsSL -o checksums.sha256 "$BASE/checksums.sha256"
+          grep -F "$ARCHIVE" checksums.sha256 | sha256sum -c -
+          mkdir -p "$HOME/.smolvm" "$HOME/.local/bin"
+          tar -xzf "$ARCHIVE" --strip-components=1 -C "$HOME/.smolvm"
+          echo "$SMOLVM_VERSION" > "$HOME/.smolvm/.version"
+          ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download the retained golden pack
+        if: runner.environment == 'github-hosted'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: golden-x86_64
+          path: dist
+
+      # The dated tag is the immutable record; `latest` is only promoted once
+      # that record has been verified to resolve without credentials.
+      - name: Push the dated tag
+        if: runner.environment == 'github-hosted'
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          test -s "$GOLDEN_NAME"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          DATED_TAG="$(date -u +%Y%m%d)-$GOLDEN_ARCH"
+          echo "DATED_TAG=$DATED_TAG" >> "$GITHUB_ENV"
+          # `pack push` writes `<tag>` (an index) and `<tag>-linux-amd64` (the
+          # platform manifest the engine pins its digest from).
+          smolvm pack push --file "$GOLDEN_NAME" "ghcr.io/$GOLDEN_REPOSITORY:$DATED_TAG"
+
+      - name: Verify the dated tag resolves anonymously
+        if: runner.environment == 'github-hosted'
+        run: |
+          python3 scripts/verify-published-golden.py \
+            --repository "$GOLDEN_REPOSITORY" \
+            --tag "$DATED_TAG" \
+            --payload "$GOLDEN_NAME"
+
+      - name: Promote latest
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          smolvm pack push --file "$GOLDEN_NAME" "ghcr.io/$GOLDEN_REPOSITORY:latest"
+
+      - name: Verify latest resolves anonymously
+        if: runner.environment == 'github-hosted'
+        run: |
+          python3 scripts/verify-published-golden.py \
+            --repository "$GOLDEN_REPOSITORY" \
+            --tag latest \
+            --payload "$GOLDEN_NAME"
 
   # aarch64 golden: built once on an Apple Silicon host (hosted macOS EINVAL
   # blocks the bake), published to
