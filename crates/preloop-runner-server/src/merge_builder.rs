@@ -1037,7 +1037,12 @@ pub async fn attach_merge(
                 storage_repository: None,
                 source: SnapshotSource::SelfBuiltMerge,
                 cache_namespace: None,
-                upstream_repository: None,
+                // A merge snapshot serves Git from the engine but still
+                // belongs to the forge repository. Without the upstream
+                // coordinate the snapshot's LFS batch endpoint cannot pull
+                // objects that were not already cached, so checkout steps
+                // with `lfs: true` fail on a miss.
+                upstream_repository: Some(merge.repository.clone()),
                 upstream_repository_id: None,
                 upstream_private: None,
                 merge: None,
@@ -1164,7 +1169,10 @@ pub async fn attach_prebuilt_merge(
         storage_repository: None,
         source: SnapshotSource::SelfBuiltMerge,
         cache_namespace: None,
-        upstream_repository: None,
+        // Keep the forge coordinate on the prebuilt-merge snapshot so its LFS
+        // batch endpoint can fetch missing objects on demand instead of
+        // answering 404 for every pointer the snapshot did not carry.
+        upstream_repository: Some(prebuilt.repository.clone()),
         upstream_repository_id: None,
         upstream_private: None,
         merge: Some(SnapshotMerge {
