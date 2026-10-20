@@ -708,7 +708,7 @@ pub async fn collect_runnerresolve_refs(
 
     let (run_id, mut declared) =
         declared_actions_for_runnerresolve(shared, orchestration_id, job_id).await?;
-    extend_with_local_composites(shared, run_id, &mut declared, &requests).await?;
+    extend_with_local_composites(shared, run_id, &mut declared.scopes, &requests).await?;
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
@@ -768,7 +768,7 @@ pub async fn collect_action_download_infos(
     requests.truncate(MAX_ACTION_BATCH_SIZE);
 
     let (run_id, mut declared) = declared_actions_for_plan(shared, plan_id).await?;
-    extend_with_local_composites(shared, run_id, &mut declared, &requests).await?;
+    extend_with_local_composites(shared, run_id, &mut declared.scopes, &requests).await?;
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
@@ -891,6 +891,28 @@ fn normalize_repo_slug(slug: &str) -> Option<String> {
 /// own limit, so the allowlist sees the same tree the expander did.
 const DECLARED_ACTION_REUSABLE_DEPTH: usize = preloop_gha_parser::MAX_REUSABLE_WORKFLOW_DEPTH;
 
+/// The run's directly declared action scopes plus the subdirectories that
+/// hold the manifests of subpath composite actions among them.
+///
+/// The download request names only `owner/repo`; the path after it lives in
+/// the workflow's `uses:` line. Keeping it here is what lets a later wave
+/// fetch `path/action.yml` for a declared composite such as
+/// `TanStack/config/.github/setup@ref`.
+#[derive(Debug, Default)]
+struct DeclaredActions {
+    scopes: BTreeSet<String>,
+    directories: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl From<BTreeSet<String>> for DeclaredActions {
+    fn from(scopes: BTreeSet<String>) -> Self {
+        Self {
+            scopes,
+            directories: BTreeMap::new(),
+        }
+    }
+}
+
 /// The actions a run may download, named directly by its workflow: every
 /// `owner/repo` in a step `uses:` or a job-level reusable `uses:`
 /// (transitively through local and already-fetched remote callee YAML),
@@ -904,8 +926,8 @@ fn direct_declared_actions(
     workflow_yaml: &str,
     reusable_workflows: &BTreeMap<String, String>,
     repository: &str,
-) -> BTreeSet<String> {
-    let mut declared = BTreeSet::new();
+) -> DeclaredActions {
+    let mut declared = DeclaredActions::default();
     let workflow = match preloop_gha_parser::parse_workflow(workflow_yaml) {
         Ok(workflow) => workflow,
         Err(error) => {
@@ -915,7 +937,7 @@ fn direct_declared_actions(
     };
     // `$/path` self-references resolve to the workflow's own repository.
     if let Some(slug) = normalize_repo_slug(repository) {
-        declared.insert(slug);
+        declared.scopes.insert(slug);
     }
     let mut visited = BTreeMap::new();
     collect_workflow_declared(
@@ -931,7 +953,7 @@ fn direct_declared_actions(
 fn collect_workflow_declared(
     workflow: &preloop_gha_parser::Workflow,
     reusable_workflows: &BTreeMap<String, String>,
-    declared: &mut BTreeSet<String>,
+    declared: &mut DeclaredActions,
     visited: &mut BTreeMap<String, usize>,
     depth: usize,
 ) {
@@ -941,10 +963,11 @@ fn collect_workflow_declared(
     for job in workflow.jobs.values() {
         // A job-level `uses:` is a reusable-workflow call: the callee repo
         // is declared, and the callee's own steps are too (recurse into the
-        // callee YAML stashed on the submission at submit time).
+        // callee YAML stashed on the submission at submit time). Its path is
+        // a workflow file, not a composite manifest directory.
         if let Some(uses) = job.uses.as_deref() {
             if let Some(owner_repo) = normalize_action_owner_repo(uses) {
-                declared.insert(owner_repo);
+                declared.scopes.insert(owner_repo);
             }
             if walk_callee_at(visited, uses, depth)
                 && let Some(yaml) = reusable_callee_yaml(uses, reusable_workflows)
@@ -963,7 +986,14 @@ fn collect_workflow_declared(
             if let Some(uses) = step.uses.as_deref()
                 && let Some(owner_repo) = normalize_action_owner_repo(uses)
             {
-                declared.insert(owner_repo);
+                if let Some(directory) = action_manifest_directory(uses) {
+                    declared
+                        .directories
+                        .entry(owner_repo.clone())
+                        .or_default()
+                        .insert(directory);
+                }
+                declared.scopes.insert(owner_repo);
             }
         }
     }
@@ -1001,7 +1031,7 @@ fn reusable_callee_yaml<'a>(
 async fn declared_actions_for_plan(
     shared: &SharedState,
     plan_id: &str,
-) -> Result<(RunId, BTreeSet<String>), ApiError> {
+) -> Result<(RunId, DeclaredActions), ApiError> {
     let state = &shared.state;
     use crate::control::backend::RequestKey;
     let run_id = match state
@@ -1029,7 +1059,7 @@ async fn declared_actions_for_runnerresolve(
     shared: &SharedState,
     orchestration_id: &str,
     job_id: &str,
-) -> Result<(RunId, BTreeSet<String>), ApiError> {
+) -> Result<(RunId, DeclaredActions), ApiError> {
     let state = &shared.state;
     use crate::control::backend::RequestKey;
     let mut run_id = None;
@@ -1069,7 +1099,7 @@ async fn declared_actions_for_runnerresolve(
 async fn declared_actions_for_run_id(
     shared: &SharedState,
     run_id: RunId,
-) -> Result<BTreeSet<String>, ApiError> {
+) -> Result<DeclaredActions, ApiError> {
     let state = &shared.state;
     let run = state
         .backend
@@ -2245,7 +2275,7 @@ fn manifest_nested_uses_from_yaml(decoded: &[u8]) -> (BTreeSet<String>, Vec<Stri
 async fn enforce_declared_actions(
     state: &AppState,
     run_id: RunId,
-    declared: &BTreeSet<String>,
+    declared: &DeclaredActions,
     requests: &[(String, Option<String>)],
 ) -> Result<(), ApiError> {
     // (batch index, owner/repo, ref, manifest directory) for requests
@@ -2267,10 +2297,26 @@ async fn enforce_declared_actions(
     // authorize nested uses: this batch's direct hits plus earlier batches'
     // ledger.
     let mut manifest_sources: Vec<(String, String, Option<String>)> = Vec::new();
-    for (index, owner_repo, git_ref, directory) in &remote {
-        if declared.contains(owner_repo) {
+    for (index, owner_repo, git_ref, request_directory) in &remote {
+        if declared.scopes.contains(owner_repo) {
             admitted.insert(*index);
-            manifest_sources.push((owner_repo.clone(), git_ref.clone(), directory.clone()));
+            // The download request names only `owner/repo`; the subpath of a
+            // composite action is in the workflow, so take it from there.
+            let mut directories: BTreeSet<String> = declared
+                .directories
+                .get(owner_repo)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(directory) = request_directory {
+                directories.insert(directory.clone());
+            }
+            if directories.is_empty() {
+                manifest_sources.push((owner_repo.clone(), git_ref.clone(), None));
+            } else {
+                for directory in directories {
+                    manifest_sources.push((owner_repo.clone(), git_ref.clone(), Some(directory)));
+                }
+            }
         }
     }
 
@@ -2357,13 +2403,12 @@ async fn enforce_declared_actions(
         )));
     }
 
-    // Ledger this batch's admitted triples for later waves' closures.
+    // Ledger this batch's admitted sources for later waves' closures.
     if let Ok(mut ledger) = state.action_resolved_uses.lock() {
         let entry = ledger.entry(run_id).or_default();
-        for (index, owner_repo, git_ref, directory) in &remote {
-            let resolved = (owner_repo.clone(), git_ref.clone(), directory.clone());
-            if admitted.contains(index) && !entry.contains(&resolved) {
-                entry.push(resolved);
+        for resolved in &manifest_sources {
+            if !entry.contains(resolved) {
+                entry.push(resolved.clone());
             }
         }
         if entry.len() > crate::state::MAX_RESOLVED_USES_PER_RUN {
@@ -3096,13 +3141,25 @@ jobs:
     uses: octo-org/octo-repo/.github/workflows/ci.yml@v1
 "#;
         let declared = direct_declared_actions(yaml, &BTreeMap::new(), "MyOrg/MyRepo");
-        assert!(declared.contains("actions/checkout"), "{declared:?}");
-        assert!(declared.contains("actions/setup-node"), "{declared:?}");
-        assert!(declared.contains("owner/repo"), "{declared:?}");
-        assert!(declared.contains("octo-org/octo-repo"), "{declared:?}");
+        assert!(declared.scopes.contains("actions/checkout"), "{declared:?}");
+        assert!(
+            declared.scopes.contains("actions/setup-node"),
+            "{declared:?}"
+        );
+        assert!(declared.scopes.contains("owner/repo"), "{declared:?}");
+        assert!(
+            declared.scopes.contains("octo-org/octo-repo"),
+            "{declared:?}"
+        );
         // The workflow's own repo: `$/path` self-references resolve to it.
-        assert!(declared.contains("myorg/myrepo"), "{declared:?}");
-        assert_eq!(declared.len(), 5, "{declared:?}");
+        assert!(declared.scopes.contains("myorg/myrepo"), "{declared:?}");
+        assert_eq!(declared.scopes.len(), 5, "{declared:?}");
+        // A subpath composite keeps the directory that holds its manifest.
+        assert_eq!(
+            declared.directories.get("owner/repo"),
+            Some(&BTreeSet::from(["sub/dir".to_owned()])),
+            "{declared:?}"
+        );
     }
 
     /// A corrupt stored workflow fails closed: nothing is declared, so no
@@ -3110,7 +3167,7 @@ jobs:
     #[test]
     fn direct_declared_actions_fails_closed_on_unparseable_yaml() {
         let declared = direct_declared_actions("not: [valid", &BTreeMap::new(), "o/r");
-        assert!(declared.is_empty(), "{declared:?}");
+        assert!(declared.scopes.is_empty(), "{declared:?}");
     }
 
     /// Reusable callees contribute their own steps' actions, transitively.
@@ -3134,11 +3191,11 @@ jobs:
         reusables.insert("reusable/ci.yml".to_string(), callee.to_string());
         let declared = direct_declared_actions(root, &reusables, "o/r");
         assert!(
-            declared.contains("docker/build-push-action"),
+            declared.scopes.contains("docker/build-push-action"),
             "{declared:?}"
         );
-        assert!(declared.contains("o/r"), "{declared:?}");
-        assert_eq!(declared.len(), 2, "{declared:?}");
+        assert!(declared.scopes.contains("o/r"), "{declared:?}");
+        assert_eq!(declared.scopes.len(), 2, "{declared:?}");
     }
 
     /// A caller `top` and five reusable workflows `l1` to `l5` below it, each
@@ -3165,7 +3222,7 @@ jobs:
     fn direct_declared_actions_follow_the_parser_depth() {
         let (top, reusable) = reusable_chain("      - uses: deep/action@v1\n");
         let declared = direct_declared_actions(&top, &reusable, "o/r");
-        assert!(declared.contains("deep/action"), "{declared:?}");
+        assert!(declared.scopes.contains("deep/action"), "{declared:?}");
     }
 
     /// `manifest_nested_uses` extracts nested `uses:` only from composite
@@ -3282,6 +3339,14 @@ jobs:
         format!("runs:\n  using: composite\n  steps:\n{steps}")
     }
 
+    /// A declared allowlist with no workflow-derived manifest directories.
+    fn scopes(declared: &BTreeSet<String>) -> DeclaredActions {
+        DeclaredActions {
+            scopes: declared.clone(),
+            directories: BTreeMap::new(),
+        }
+    }
+
     /// A local composite's remote dependency is read from the immutable
     /// checked-out tree and admitted, while an unrelated action remains
     /// forbidden. This exercises the same allowlist used by runnerresolve.
@@ -3316,15 +3381,24 @@ jobs:
             "dtolnay/rust-toolchain".to_owned(),
             Some("stable".to_owned()),
         )];
-        enforce_declared_actions(&state, RunId(uuid::Uuid::new_v4()), &declared, &allowed)
-            .await
-            .expect("local composite dependency should be authorized");
+        enforce_declared_actions(
+            &state,
+            RunId(uuid::Uuid::new_v4()),
+            &scopes(&declared),
+            &allowed,
+        )
+        .await
+        .expect("local composite dependency should be authorized");
 
         let denied = vec![("attacker/unlisted".to_owned(), Some("main".to_owned()))];
-        let error =
-            enforce_declared_actions(&state, RunId(uuid::Uuid::new_v4()), &declared, &denied)
-                .await
-                .expect_err("an action absent from workflow and manifests must be denied");
+        let error = enforce_declared_actions(
+            &state,
+            RunId(uuid::Uuid::new_v4()),
+            &scopes(&declared),
+            &denied,
+        )
+        .await
+        .expect_err("an action absent from workflow and manifests must be denied");
         assert_eq!(error.status(), StatusCode::FORBIDDEN);
     }
 
@@ -4020,7 +4094,7 @@ jobs:
         enforce_declared_actions(
             &shared.state,
             RunId(uuid::Uuid::new_v4()),
-            &declared,
+            &scopes(&declared),
             &allowed,
         )
         .await
@@ -4030,7 +4104,7 @@ jobs:
         let error = enforce_declared_actions(
             &shared.state,
             RunId(uuid::Uuid::new_v4()),
-            &declared,
+            &scopes(&declared),
             &denied,
         )
         .await
@@ -4141,7 +4215,9 @@ jobs:
     /// keeps that path when its manifest is fetched. The router's
     /// `TanStack/config/.github/setup@ref` names its pnpm and Node setup
     /// steps there; reading the repository root instead 404s and denied both
-    /// nested actions at download time.
+    /// nested actions at download time. The download request names only
+    /// `owner/repo`, so the directory must come from the workflow's declared
+    /// `uses:` line.
     #[tokio::test]
     async fn subpath_composite_dependency_is_admitted_from_its_directory() {
         let setup = composite_manifest(&[
@@ -4158,18 +4234,21 @@ jobs:
         )
         .await;
         let run_id = RunId(uuid::Uuid::new_v4());
-        let declared: BTreeSet<String> = ["tanstack/config".to_owned()].into();
+        let declared = DeclaredActions {
+            scopes: BTreeSet::from(["tanstack/config".to_owned()]),
+            directories: BTreeMap::from([(
+                "tanstack/config".to_owned(),
+                BTreeSet::from([".github/setup".to_owned()]),
+            )]),
+        };
 
-        // The parent downloads in one wave and is ledgered with its
-        // directory.
+        // The parent downloads in one wave. The request names the repository
+        // only; the workflow supplies the manifest directory.
         enforce_declared_actions(
             &fixture.shared.state,
             run_id,
             &declared,
-            &[(
-                "TanStack/config/.github/setup".to_owned(),
-                Some(SHA.to_owned()),
-            )],
+            &[("TanStack/config".to_owned(), Some(SHA.to_owned()))],
         )
         .await
         .expect("the subpath composite itself is directly declared");
@@ -4228,7 +4307,7 @@ jobs:
         let error = enforce_declared_actions(
             &fixture.shared.state,
             RunId(uuid::Uuid::new_v4()),
-            &declared,
+            &scopes(&declared),
             &requested,
         )
         .await
