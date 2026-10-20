@@ -10,6 +10,43 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A finished ephemeral runner releases its pool slot even when a descendant
+  holds the exec stream open.** The AgentENV `envd` exec channel reports
+  end-of-stream only after every writer of the command's stdout/stderr closes,
+  so a container shim or daemonizing helper that inherited those pipes kept
+  `aenv exec` alive after the runner exited and pinned the sole on-demand
+  permit on a healthy guest. `preloop-runner` now prints
+  `::preloop-runner::exit <code>` immediately before exiting, and the
+  orchestrator ends the stream wait on that line, drops the host-side exec
+  client, and deletes the VM (which also kills the descendant). A broker
+  completion releases the same slot even when no exit line arrives.
+
+- **A single-use runner slot is released when its job completes, and a spare
+  that never receives a job is bounded.** The co-hosted runner server now
+  publishes a committed claim to the VM pool before the guest is expected to
+  print anything, and publishes terminal completion after the attempt settles.
+  The pool marks the runner busy from that committed claim instead of relying
+  on guest stdout, so a long silent first step is not torn down at the
+  30-second idle grace — including when the claim event and the grace timer
+  become ready together. A genuinely unclaimed runner is still stopped after
+  the grace, and a requeued job restarts its ready-queue clock so it is not
+  failed for time spent on the runner that abandoned it.
+
+- **A job queued behind an occupied on-demand permit is not failed as
+  starving.** When a pool is already executing an earlier job, a ready job
+  that cannot match a registered runner is waiting for capacity, not for a
+  runner that will never appear. The starvation sweep resets its observation
+  clock while the permit is occupied, including past the absolute queue
+  ceiling, instead of failing the queued job. A job the pool's labels can
+  never satisfy still fails fast.
+
+- **A busy guest is no longer reaped just because `exec` probes time out.**
+  Under a heavy in-VM build the AgentENV gateway can fail `aenv exec` with
+  `502 client error (Connect)` while the job keeps writing output. The wedge
+  detector now requires both repeated failed probes and ten minutes without a
+  single chunk of guest output, so a live-output guest is left running while a
+  dead or silent one is still torn down.
+
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution

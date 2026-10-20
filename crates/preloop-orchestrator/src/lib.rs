@@ -6312,8 +6312,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // The grace expires only when the control store has no claim for this
     // machine. Re-read the authoritative set at the instant the timer fires:
     // an event that is queued but not yet polled must not lose to the timer.
+    //
+    // Warm mode (size > 0) is exempt: a warm spare is supposed to wait for
+    // the next job indefinitely, and recycling it every grace period would
+    // fork a new VM forever on an idle pool. The bounded spare this guard
+    // exists for is the on-demand slot created when a queue sample races a
+    // claim.
     let idle_claimed = claimed.clone();
     let idle_grace = async {
+        if config.size > 0 {
+            std::future::pending::<()>().await;
+        }
         tokio::time::sleep(UNCLAIMED_RUNNER_IDLE_GRACE).await;
         let claimed_now = config
             .pool_status
@@ -13631,6 +13640,77 @@ fi"#,
                 .any(|event| event == &format!("delete:{}", name.as_str())),
             "completion must still delete the machine"
         );
+        gate.notify_waiters();
+    }
+
+    /// Warm mode keeps a registered spare waiting past the on-demand idle
+    /// grace: recycling it would fork a fresh VM forever on an idle pool.
+    /// Completion still releases the single-use runner.
+    #[tokio::test(start_paused = true)]
+    async fn warm_spare_is_not_recycled_by_the_on_demand_idle_grace() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).with_run_gate(gate.clone()),
+        );
+        let mut config = test_config(false);
+        config.size = 1;
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        let runner = provision_slot(
+            &provider,
+            &config,
+            0,
+            1,
+            None,
+            &Arc::new(KeyPool::new()),
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                boot_from_pack: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("provisioning succeeds")
+        .expect("a runner is provisioned");
+        let name = runner.name.clone();
+        let idle = Arc::new(std::sync::Mutex::new(0));
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            let config = config.clone();
+            let name = name.clone();
+            async move {
+                run_one_runner(provider, &config, runner, CancellationToken::new(), idle)
+                    .await
+                    .inspect_err(|error| panic!("{name:?}: {error}"))
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "a warm spare must wait for the next job past the on-demand grace"
+        );
+        assert!(
+            !provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event == &format!("delete:{}", name.as_str())),
+            "the warm spare must not be deleted by the on-demand idle grace"
+        );
+
+        pool_status.notify_runner_completion(1, name.as_str().to_owned());
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("completion releases the runner")
+            .expect("runner task must not panic");
+        result.expect("the completed runner tears down cleanly");
         gate.notify_waiters();
     }
 
