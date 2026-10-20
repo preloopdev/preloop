@@ -5655,7 +5655,7 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
 ///
 /// `All` is the only scope that may kill a *live* hypervisor, so it is only
 /// ever used where nothing of ours can be running: pool startup and pool
-/// teardown ([`preloop_vm::purge_orphaned_vms`]). Those two moments differ in
+/// teardown ([`preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms`]). Those two moments differ in
 /// what an abandoned sweep costs, which is all this decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrphanPurgeDuty {

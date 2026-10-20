@@ -2910,7 +2910,7 @@ dependencies = [
 
 [[package]]
 name = "preloop-sandbox"
-version = "0.35.0"
+version = "0.35.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -2920,6 +2920,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "postgres_rustls",
+ "preloop-observability",
  "reqwest",
  "rusqlite",
  "rustls",
@@ -2948,7 +2949,6 @@ dependencies = [
 ]
 
 [[package]]
-
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -19,6 +19,7 @@ futures.workspace = true
 hex.workspace = true
 parking_lot.workspace = true
 postgres_rustls.workspace = true
+preloop-observability = { path = "../preloop-observability" }
 reqwest.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true

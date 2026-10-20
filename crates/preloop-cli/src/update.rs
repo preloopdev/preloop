@@ -432,10 +432,11 @@ fn resolved_smolvm_install() -> Option<SmolvmInstall> {
     // second `lib/` tree. The PATH-resolved prefix is tracked separately so a
     // rootfs refresh repairs the sibling the engine actually boots from.
     let prefix = home.join(".smolvm");
-    let resolved_prefix = preloop_vm::agent_rootfs::resolve_binary(Path::new("smolvm"))
-        .and_then(|binary| binary.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| prefix.clone());
-    let runtime = preloop_vm::agent_rootfs::Runtime::from_env();
+    let resolved_prefix =
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::resolve_binary(Path::new("smolvm"))
+            .and_then(|binary| binary.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| prefix.clone());
+    let runtime = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime::from_env();
     Some(SmolvmInstall {
         prefix,
         resolved_prefix,
@@ -447,7 +448,10 @@ fn resolved_smolvm_install() -> Option<SmolvmInstall> {
 
 /// The directory the engine exports the guest agent from, by the engine's own
 /// rule (`SMOLVM_DATA_DIR`, else the effective Preloop home's `smolvm`).
-fn engine_agent_dir(runtime: &preloop_vm::agent_rootfs::Runtime, fallback: &Path) -> PathBuf {
+fn engine_agent_dir(
+    runtime: &preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime,
+    fallback: &Path,
+) -> PathBuf {
     runtime
         .data_dir
         .clone()
@@ -650,7 +654,8 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
 /// restored or hand-copied tree cannot pass on its stamp alone — and it carries
 /// the shutdown handshake whenever the host is new enough to require one.
 fn agent_rootfs_serves(rootfs: &Path, host_version: &str) -> bool {
-    let inspected = preloop_vm::agent_rootfs::AgentRootfs::inspect(rootfs);
+    let inspected =
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::AgentRootfs::inspect(rootfs);
     if !inspected.agent_present() || inspected.version() != Some(host_version) {
         return false;
     }
@@ -666,15 +671,16 @@ fn agent_rootfs_serves(rootfs: &Path, host_version: &str) -> bool {
 
 /// Whether two rootfs trees hold the same agent bytes.
 fn agent_bytes_match(left: &Path, right: &Path) -> bool {
-    let left = preloop_vm::agent_rootfs::AgentRootfs::inspect(left);
-    let right = preloop_vm::agent_rootfs::AgentRootfs::inspect(right);
+    let left = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::AgentRootfs::inspect(left);
+    let right = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::AgentRootfs::inspect(right);
     left.digest().is_some() && left.digest() == right.digest()
 }
 
 /// Whether a host reporting `host_version` refuses to stop a guest whose agent
 /// lacks the `quiesced-shutdown-v1` handshake (the engine's own rule).
 fn host_requires_quiesced_shutdown(host_version: &str) -> bool {
-    let (major, minor, patch) = preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST;
+    let (major, minor, patch) =
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST;
     Version::parse(host_version)
         .ok()
         .is_some_and(|version| version >= Version::new(major, minor, patch))
@@ -710,7 +716,8 @@ async fn ensure_agent_rootfs(
     // An operator pin outranks every tree below, so a refresh of those trees
     // cannot change what the engine boots: say so instead of reporting a
     // repair that leaves the pin in place.
-    if let Some(pinned) = preloop_vm::agent_rootfs::Runtime::from_env().explicit_rootfs
+    if let Some(pinned) =
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime::from_env().explicit_rootfs
         && !agent_rootfs_serves(&pinned, host_version)
     {
         bail!(
@@ -833,7 +840,7 @@ async fn refresh_agent_rootfs_from_release(
 /// ships next to the binary in step.
 ///
 /// The stamp (`<rootfs>/.preloop-agent-version`) is what lets the guard in
-/// `preloop_vm::agent_rootfs` tell a stale pinned rootfs from a matching one
+/// `preloop_sandbox::drivers::smolvm::cli::agent_rootfs` tell a stale pinned rootfs from a matching one
 /// without hashing the agent binary on every engine start.
 fn install_agent_rootfs(
     source: &Path,
@@ -870,7 +877,8 @@ fn install_agent_rootfs(
         copy_dir_all(source, &destination)?;
         if destination == exported {
             fs::write(
-                destination.join(preloop_vm::agent_rootfs::VERSION_STAMP),
+                destination
+                    .join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP),
                 format!("{version}\n"),
             )?;
         }
@@ -2206,7 +2214,7 @@ mod tests {
                 install
                     .data_dir
                     .join("agent-rootfs")
-                    .join(preloop_vm::agent_rootfs::VERSION_STAMP)
+                    .join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP)
             )
             .unwrap(),
             "9.9.9\n",
@@ -2285,7 +2293,7 @@ mod tests {
         .unwrap();
         if let Some(stamp) = stamp {
             std::fs::write(
-                target.join(preloop_vm::agent_rootfs::VERSION_STAMP),
+                target.join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP),
                 format!("{stamp}\n"),
             )
             .unwrap();
@@ -2310,7 +2318,8 @@ mod tests {
         binary.extend_from_slice(version.as_bytes());
         if capability {
             binary.extend_from_slice(
-                preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_CAPABILITY.as_bytes(),
+                preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_CAPABILITY
+                    .as_bytes(),
             );
         }
         binary
@@ -2319,14 +2328,14 @@ mod tests {
     /// Version recorded beside a rootfs: the stamp Preloop wrote, else the
     /// version baked into the agent binary.
     fn agent_rootfs_version(rootfs: &Path) -> Option<String> {
-        preloop_vm::agent_rootfs::AgentRootfs::inspect(rootfs)
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::AgentRootfs::inspect(rootfs)
             .version()
             .map(str::to_owned)
     }
 
     #[test]
     fn the_agent_dir_follows_the_engines_own_rule() {
-        let pinned = preloop_vm::agent_rootfs::Runtime {
+        let pinned = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime {
             host_home: None,
             data_dir: Some(PathBuf::from("/tmp/preloop-home/smolvm")),
             explicit_rootfs: None,
@@ -2336,7 +2345,7 @@ mod tests {
             PathBuf::from("/tmp/preloop-home/smolvm"),
             "the engine exports the data dir it resolves, not smolvm's own"
         );
-        let unset = preloop_vm::agent_rootfs::Runtime::default();
+        let unset = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime::default();
         assert_eq!(
             engine_agent_dir(&unset, Path::new("/tmp/platform/smolvm")),
             PathBuf::from("/tmp/platform/smolvm"),
@@ -2383,7 +2392,7 @@ mod tests {
         // one: the recorded version is the host's, the bytes are not.
         let restored = agent_tree(root, "restored", "1.14.2", false);
         fs::write(
-            restored.join(preloop_vm::agent_rootfs::VERSION_STAMP),
+            restored.join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP),
             "1.30.1\n",
         )
         .unwrap();
@@ -2413,9 +2422,9 @@ mod tests {
         assert!(
             !agent_rootfs_serves(&incapable, "1.30.1"),
             "a {}.{}.{}+ host refuses to stop an agent without the capability",
-            preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.0,
-            preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.1,
-            preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.2,
+            preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.0,
+            preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.1,
+            preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.2,
         );
         assert!(
             !agent_rootfs_serves(&old, "1.30.1"),
@@ -2518,7 +2527,10 @@ mod tests {
             "the installed rootfs must be the host's agent"
         );
         assert_eq!(
-            std::fs::read_to_string(target.join(preloop_vm::agent_rootfs::VERSION_STAMP)).unwrap(),
+            std::fs::read_to_string(
+                target.join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP)
+            )
+            .unwrap(),
             "1.30.1\n",
             "the refresh must record the release it installed"
         );
