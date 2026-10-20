@@ -27,6 +27,31 @@ Override the OCI reference with `PRELOOP_GOLDEN_OCI_REF`. To use a release-asset
 
 The pool stores payloads below `<PRELOOP_HOME>/vms/`, keyed by the sanitized base-image name and environment fingerprint. `preloop golden-path --home PATH --base-image REF` prints the exact path.
 
+## Rotate an official golden
+
+For a mutable `PRELOOP_GOLDEN_OCI_REF` tag, the engine resolves its manifest
+digest periodically. A `PRELOOP_GOLDEN_URL` mirror is tracked using its SHA-256
+checksum. `PRELOOP_GOLDEN_POLL_SECS` defaults to 300; set it to 0 to disable
+automatic source polling. Digest-pinned sources do not move automatically.
+
+The replacement gets its own payload, machine and fingerprint record. It is
+prepared beside the serving golden, with a disk preflight before staging.
+Failure leaves the serving golden in place. Once ready, the engine switches
+new forks to the replacement, stops idle runners of the old generation and
+requeues jobs bound to them. Already-running jobs finish on their old generation.
+The old golden, record and payload are removed after its final clone exits;
+there is no retained rollback generation. Shared layers still referenced by
+surviving machines are kept.
+
+`PRELOOP_SHUTDOWN_JOB_GRACE_SECS` gives busy runners up to 600 seconds by default
+to finish during shutdown. Configure the service supervisor's stop timeout
+above that grace. A restart during staging can use the recorded predecessor
+while preparing the replacement.
+
+AgentENV bases named by a fixed `PRELOOP_RUNNER_BASE_IMAGE` snapshot do not have
+a mutable-source polling trigger. The shared rotation lifecycle does not by
+itself make AgentENV snapshot changes hot-swappable.
+
 ## Build a custom golden
 
 Build the Linux guest runner and bake an immutable base image on a host matching the guest architecture:

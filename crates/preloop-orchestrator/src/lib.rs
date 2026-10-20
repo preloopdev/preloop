@@ -2476,7 +2476,6 @@ fn guest_hostname_script_at(hosts: &str) -> String {
     )
 }
 
-
 /// The per-guest **hosted runtime init**: what the hosted image's own init
 /// applies to a job's environment, applied by preloop instead.
 ///
@@ -2514,77 +2513,6 @@ fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str) -> String {
         "set -e; ( {} ); ( {} )",
         guest_hostname_script_at(hosts),
         guest_sysctl_script_at(sysctl_root)
-    )
-}
-
-/// Re-apply the guest resolver step *inside the workload container* after the
-/// last container preparation that precedes a job.
-///
-/// The SmolVM agent (re)writes a persistent workload overlay's
-/// `/etc/resolv.conf` — to the guest's network resolver — whenever it
-/// (re)prepares that overlay (`storage::PersistentOverlay::execute_or_remount`
-/// → `refresh_overlay_resolver`), and the runner's own launch is one of those
-/// preparations. The runtime init's resolver half therefore runs *before* it
-/// and is overwritten: measured on smolvm 1.30.1 in one machine, preloop's
-/// write at 04:17:17.750 and the agent's rewrite at 04:17:18.305. What the
-/// container keeps is the guest's network gateway — the address the job's
-/// Dockerd hands its containers as the embedded DNS's `ExtServers`, which
-/// cannot answer for a compose network's `/etc/hosts` alias, so
-/// `postgres.localhost` came back NXDOMAIN and `db_migrate` failed on the
-/// template run.
-///
-/// Applied *after* the launch and re-checked bounded
-/// ([`CONTAINER_RESOLVER_STUB_ATTEMPTS`]): a refresh that lands while this
-/// step runs must not leave the machine with the gateway resolver silently.
-fn container_resolver_stub_script() -> String {
-    container_resolver_stub_script_at(
-        "/etc/resolv.conf",
-        "/run/systemd/resolve/stub-resolv.conf",
-        "/run/systemd/resolve/resolv.conf",
-        CONTAINER_RESOLVER_STUB_ATTEMPTS,
-        CONTAINER_RESOLVER_STUB_INTERVAL,
-    )
-}
-
-/// `resolv_conf`, `stub` and `upstream_file` are the scratch paths the shell
-/// tests substitute for `/etc/resolv.conf`, the stub's own file and resolved's
-/// upstream list; `attempts` and `interval` are the bounded re-check
-/// ([`CONTAINER_RESOLVER_STUB_ATTEMPTS`], [`CONTAINER_RESOLVER_STUB_INTERVAL`],
-/// shortened by the tests). Production passes the paths above and the
-/// constants' values.
-fn container_resolver_stub_script_at(
-    resolv_conf: &str,
-    stub: &str,
-    upstream_file: &str,
-    attempts: u32,
-    interval: &str,
-) -> String {
-    format!(
-        "prl_tries=0; \
-         while :; do \
-           ( {step} ); \
-           prl_first=$(awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2; exit }}' {conf} 2>/dev/null); \
-           if [ \"$prl_first\" = 127.0.0.53 ]; then \
-             echo \"preloop: the container resolver names the 127.0.0.53 stub first\"; \
-             break; \
-           fi; \
-           prl_tries=$((prl_tries + 1)); \
-           if [ \"$prl_tries\" -ge {attempts} ]; then \
-             echo \"preloop: warning: the container resolver still names '$prl_first' after {attempts} attempts; Docker's embedded DNS will not resolve /etc/hosts aliases\" >&2; \
-             exit 1; \
-           fi; \
-           sleep {interval} 2>/dev/null || true; \
-         done",
-        conf = shell_quote(resolv_conf),
-        step = guest_resolver_stub_script_at(
-            resolv_conf,
-            stub,
-            upstream_file,
-            RESOLVER_STUB_WAIT_ATTEMPTS,
-            RESOLVER_STUB_WAIT_INTERVAL,
-        ),
-        attempts = attempts,
-        interval = shell_quote(interval),
     )
 }
 
@@ -3467,25 +3395,7 @@ impl GoldenCache {
         self.released.notify_waiters();
     }
 
-    /// Mark every registered golden *except* `keep` as retiring: they were
-    /// superseded, or no pool environment resolves them any more. Returns the
-    /// names of those with no clone left to wait for, in retirement order.
-    pub async fn retire_all_but(&self, keep: &[MachineName]) -> Vec<(String, MachineName)> {
-        let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
-        let mut releasable = Vec::new();
-        for (fingerprint, entry) in entries.iter_mut() {
-            if keep.contains(&entry.name) || entry.retiring {
-                continue;
-            }
-            entry.retiring = true;
-            entry.superseded.cancel();
-            if entry.clones == 0 {
-                releasable.push((fingerprint.clone(), entry.name.clone()));
-            }
-        }
-        releasable
-    }
-
+    #[cfg(test)]
     /// Mark one golden retiring, returning it if nothing forks from it.
     pub async fn retire(&self, name: &MachineName) -> Option<(String, MachineName)> {
         let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
@@ -3524,11 +3434,6 @@ impl GoldenCache {
             .lock()
             .expect("golden ledger is not poisoned")
             .remove(fingerprint);
-    }
-
-    /// Wake the rotation task: a golden may now be deletable.
-    pub fn notify_released(&self) {
-        self.released.notify_waiters();
     }
 
     /// Adopt `name` as the golden for `fingerprint` and return the goldens it
@@ -3627,16 +3532,6 @@ impl GoldenCache {
             .len()
     }
 
-    /// The fingerprints the pool has registered, with their machine names.
-    pub async fn registered(&self) -> Vec<(String, MachineName)> {
-        self.entries
-            .lock()
-            .expect("golden ledger is not poisoned")
-            .iter()
-            .map(|(fingerprint, entry)| (fingerprint.clone(), entry.name.clone()))
-            .collect()
-    }
-
     /// Get the golden for `fingerprint`, or construct it via `build`.
     ///
     /// `build` returns the prepared machine name. It runs under a lock held
@@ -3717,13 +3612,6 @@ impl GoldenFork {
     /// runner forked from it is released instead of holding the golden.
     pub fn superseded(&self) -> CancellationToken {
         self.superseded.clone()
-    }
-}
-
-impl GoldenFork {
-    /// The golden this fork was taken from.
-    pub fn name(&self) -> &MachineName {
-        &self.name
     }
 }
 
@@ -4303,22 +4191,18 @@ async fn retire_golden<P: VmProvider + 'static>(
     fingerprint: &str,
     name: &MachineName,
 ) {
-    let survivors: Vec<MachineName> = provider
-        .list()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|other| {
-            other != name
-                && other
-                    .as_str()
-                    .starts_with(&format!("{}-", config.name_prefix))
-        })
-        .collect();
+    let survivors: Vec<MachineName> = match provider.list().await {
+        Ok(machines) => machines.into_iter().filter(|other| other != name).collect(),
+        Err(error) => {
+            warn!(machine = name.as_str(), %error, "cannot enumerate surviving machines; keeping the retired golden");
+            return;
+        }
+    };
     // Stop first: the golden's guest mounts its extracted layers from that
     // store, so the entry is only removed once nothing can be reading it.
     if let Err(error) = provider.stop(name).await {
-        debug!(machine = name.as_str(), %error, "stopping the retired golden failed");
+        warn!(machine = name.as_str(), %error, "cannot stop the retired golden; keeping its extracted layers");
+        return;
     }
     // Before the machine goes: the pointer to the extracted layer store lives
     // inside the machine's directory, and a machine's `delete` takes that
@@ -8378,21 +8262,6 @@ async fn remove_failed_fork<P: VmProvider + 'static>(provider: &Arc<P>, name: &M
     }
 }
 
-/// Log every non-empty line a guest script printed, under the caller's label.
-///
-/// The scripts provisioning runs report what they did (or why they skipped) on
-/// stdout and stderr and expect the engine to be the only reader; a step that
-/// exits 0 either way is a no-op only observable through these lines.
-fn log_script_output(name: &MachineName, label: &str, output: &preloop_vm::ExecOutput) {
-    for line in String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .chain(String::from_utf8_lossy(&output.stderr).lines())
-        .filter(|line| !line.trim().is_empty())
-    {
-        info!(machine = name.as_str(), "{label}: {line}");
-    }
-}
-
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
 ///
 /// The caller owns cleanup: on any error the machine may already exist.
@@ -8719,7 +8588,6 @@ async fn provision_runner<P: VmProvider + 'static>(
                     .join(", ")
             )));
         }
-
     }
 
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
@@ -8865,36 +8733,6 @@ async fn provision_runner<P: VmProvider + 'static>(
         let _ = std::fs::remove_file(path);
     }
     configure_result?;
-
-    // The workload container's `/etc/resolv.conf` is the file the job's Dockerd
-    // derives its embedded-DNS `ExtServers` from, and the SmolVM agent names the
-    // guest's network gateway in it whenever it (re)prepares the container's
-    // overlay — `configure` above is the last such preparation before a job, so
-    // the runtime init's resolver half has always been overwritten (measured on
-    // smolvm 1.30.1: preloop's write at 04:17:17.750, the agent's rewrite at
-    // 04:17:18.305 in one machine). A name that only exists in the job's
-    // `/etc/hosts` (`postgres.localhost`) then comes back NXDOMAIN through
-    // Docker, which is how `db_migrate` failed on the template run.
-    //
-    // Re-applied and confirmed here: the container is up and the runner has not
-    // been started yet (`run` below), so no job can read the file in between.
-    // See [`container_resolver_stub_script`].
-    {
-        let script = container_resolver_stub_script();
-        let output = provider
-            .exec(name, &["sh".to_owned(), "-c".to_owned(), script])
-            .await?;
-        log_script_output(name, "container resolver", &output);
-        if output.exit_code != 0 {
-            // The machine still runs jobs; only names Docker resolves through
-            // the host file break, so say that instead of failing the slot.
-            warn!(
-                machine = name.as_str(),
-                "container resolver stub was not confirmed after the runner launch; \
-                 jobs on this machine cannot resolve an /etc/hosts-only name through Docker"
-            );
-        }
-    }
 
     info!(machine = name.as_str(), "ephemeral runner ready");
     let mut run = guest_env_prefix(config, name);
@@ -9276,6 +9114,8 @@ mod lifecycle_tests {
         fail_configure: bool,
         fail_run: bool,
         fail_delete: bool,
+        fail_list: bool,
+        fail_stop: bool,
         /// Fail the next N deletes, then succeed. Mirrors a delete that loses
         /// a registry-lock race and lands on a retry, and lets a test watch
         /// what the pool does in the window where a finished VM is still
@@ -9344,6 +9184,8 @@ mod lifecycle_tests {
                 fail_configure,
                 fail_run,
                 fail_delete,
+                fail_list: false,
+                fail_stop: false,
                 fail_deletes_remaining: Mutex::new(0),
                 announce_busy: false,
                 configure_gate: None,
@@ -10993,7 +10835,6 @@ done
             "the hosted sysctl set changed — update official-image.toml and this test together"
         );
     }
-
 
     /// The composed init run end to end against scratch roots: the fork's own
     /// name resolves and the sysctls reach the hosted values in one exec, and
@@ -12869,6 +12710,9 @@ fi"#,
         }
 
         async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
+            if self.fail_stop {
+                return Err(test_error("stop-failure"));
+            }
             self.events
                 .lock()
                 .await
@@ -12912,6 +12756,9 @@ fi"#,
         }
 
         async fn list(&self) -> Result<Vec<MachineName>, VmError> {
+            if self.fail_list {
+                return Err(test_error("list-failure"));
+            }
             self.machines
                 .lock()
                 .await
@@ -15053,9 +14900,10 @@ fi"#,
         configure_gate.notify_waiters();
         wait_for_claimed_job("the second job", &pool_status, &provider, 2).await;
 
-        // A held job resumes on shutdown: the runner is stopped and deleted
-        // without stranding any count.
+        // Shutdown lets the claimed job finish before deleting the runner.
+        // Release the held job rather than waiting for the shutdown grace.
         shutdown.cancel();
+        run_gate.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(10), slot)
             .await
             .expect("the slot stops on shutdown")
@@ -15474,6 +15322,30 @@ fi"#,
             events.iter().any(|event| event.contains(&contract)),
             "the contract must be applied in the guest: {events:?}"
         );
+    }
+    #[tokio::test]
+    async fn retirement_keeps_the_golden_when_survivors_or_stop_are_unknown() {
+        for fail_list in [true, false] {
+            let mut backend = TestProvider::new(false, false, false, false, false);
+            backend.fail_list = fail_list;
+            backend.fail_stop = !fail_list;
+            let provider = Arc::new(backend);
+            let config = test_config(false);
+            let cache = GoldenCache::new(config.name_prefix.clone());
+            let golden = MachineName::new("lifecycle-test-retired").unwrap();
+            provider
+                .machines
+                .lock()
+                .await
+                .insert(golden.as_str().to_owned(), MachineState::Running);
+            cache.insert("old".into(), golden.clone()).await;
+            retire_golden(&provider, &config, &cache, "old", &golden).await;
+            assert_eq!(
+                provider.machines.lock().await.get(golden.as_str()),
+                Some(&MachineState::Running)
+            );
+            assert_eq!(cache.get("old").await, Some(golden));
+        }
     }
 }
 
@@ -16702,8 +16574,6 @@ mod golden_cache_tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
-            workload_init: None,
         }
     }
 }

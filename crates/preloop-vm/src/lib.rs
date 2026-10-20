@@ -699,6 +699,15 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
     ) -> Result<(), VmError> {
         (**self).fork_with_volumes(golden, clone, volumes).await
     }
+    async fn reclaim_retired_golden_layers(
+        &self,
+        retired: &MachineName,
+        survivors: &[MachineName],
+    ) -> Result<u64, VmError> {
+        (**self)
+            .reclaim_retired_golden_layers(retired, survivors)
+            .await
+    }
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
         (**self).stop(name).await
     }
