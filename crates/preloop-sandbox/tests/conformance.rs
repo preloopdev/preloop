@@ -414,6 +414,42 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
     wait_for(|| h.service.get(&lease.sandbox.id).is_err()).await;
 }
 
+/// Stats counts follow the lease: an expired lease destroys the machine and
+/// the provider's sandbox list drops back to empty.
+#[tokio::test]
+async fn stats_follow_lease_expiry() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "stats-ttl".into(),
+            template: "alpine".into(),
+            ttl_secs: 1,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let stats = h.service.stats();
+    let provider = stats
+        .providers
+        .iter()
+        .find(|provider| provider.provider_id == lease.sandbox.provider_id)
+        .expect("the acquiring provider is listed");
+    assert_eq!(provider.sandboxes.len(), 1);
+    assert_eq!(provider.sandboxes[0].sandbox.id, lease.sandbox.id);
+    assert_eq!(provider.sandboxes[0].sandbox.state, SandboxState::Leased);
+    wait_for(|| {
+        h.service
+            .stats()
+            .providers
+            .iter()
+            .all(|provider| provider.sandboxes.is_empty())
+    })
+    .await;
+    assert!(h.service.get(&lease.sandbox.id).is_err());
+}
+
 #[tokio::test]
 async fn reconcile_destroys_orphans_and_fails_lost_sandboxes() {
     let h = harness().await;
@@ -459,6 +495,51 @@ async fn reconcile_destroys_orphans_and_fails_lost_sandboxes() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("orphan was not destroyed");
+}
+
+/// Reconcile results are visible through Stats: a machine that disappeared
+/// behind the service's back becomes `Failed` instead of staying `Leased`.
+#[tokio::test]
+async fn stats_follow_reconcile_state_changes() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "stats-lost".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let state_of = |service: &Service, id: &str| {
+        service
+            .stats()
+            .providers
+            .into_iter()
+            .flat_map(|provider| provider.sandboxes)
+            .find(|sandbox| sandbox.sandbox.id == id)
+            .map(|sandbox| sandbox.sandbox.state)
+    };
+    assert_eq!(
+        state_of(&h.service, &lease.sandbox.id),
+        Some(SandboxState::Leased)
+    );
+    // The leased machine disappears behind the service's back.
+    h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
+    wait_for(|| state_of(&h.service, &lease.sandbox.id) == Some(SandboxState::Failed)).await;
+    // The count follows the state: the sandbox is still tracked, once, as
+    // failed.
+    let sandboxes: Vec<_> = h
+        .service
+        .stats()
+        .providers
+        .into_iter()
+        .flat_map(|provider| provider.sandboxes)
+        .filter(|sandbox| sandbox.sandbox.id == lease.sandbox.id)
+        .collect();
+    assert_eq!(sandboxes.len(), 1);
+    assert_eq!(sandboxes[0].sandbox.state, SandboxState::Failed);
 }
 
 #[tokio::test]
@@ -538,6 +619,101 @@ async fn state_survives_restart_from_sqlite() {
     assert_eq!(restored.list_pools().len(), 1);
     assert_eq!(restored.list_templates().len(), 1);
     assert_eq!(restored.list().len(), 1);
+}
+
+/// An old agent that only sends `provider_id`/`generation` is still
+/// accepted: absent fields never fabricate a host sample, and a report with
+/// no runtime facts replaces the previous report wholesale (never merges)
+/// while a host sample it did not carry survives.
+#[tokio::test]
+async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let sandbox;
+    {
+        let h = harness_with(
+            store::open(db.to_str().unwrap()).await.unwrap(),
+            tempfile::tempdir().unwrap(),
+            FakeDriver::full_capabilities(),
+        )
+        .await;
+        h.service.put_template(template("alpine")).await.unwrap();
+        sandbox = h
+            .service
+            .acquire(AcquireRequest {
+                idempotency_key: "old-agent".into(),
+                template: "alpine".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap()
+            .sandbox;
+    }
+    // Restart without an agent: the only heartbeats below are the ones this
+    // test sends, so their effect is deterministic.
+    let service = Service::open(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs2")),
+    )
+    .await
+    .unwrap();
+    let provider = service
+        .list_providers()
+        .into_iter()
+        .find(|provider| provider.id == sandbox.provider_id)
+        .expect("the provider row is restored");
+    let old_shape = || HeartbeatRequest {
+        provider_id: provider.id.clone(),
+        generation: provider.generation,
+        ..HeartbeatRequest::default()
+    };
+    let provider_stats = || {
+        service
+            .stats()
+            .providers
+            .into_iter()
+            .find(|entry| entry.provider_id == provider.id)
+            .expect("provider is listed")
+    };
+
+    // Never reported anything: succeeds and invents nothing.
+    Service::heartbeat(&service, old_shape()).unwrap();
+    let first = provider_stats();
+    assert_eq!(first.host, HostSample::default());
+    assert_eq!(first.host_sample_age_secs, 0);
+    assert_eq!(first.sandboxes.len(), 1);
+    assert_eq!(first.sandboxes[0].sandbox.id, sandbox.id);
+    assert_eq!(first.sandboxes[0].runtime, SandboxRuntimeStats::default());
+
+    // A new agent reports host + runtime facts...
+    let reported = SandboxRuntimeStats {
+        native_ref: sandbox.native_ref.clone(),
+        data_dir: "/host/sandboxes/reported".into(),
+        ..SandboxRuntimeStats::default()
+    };
+    Service::heartbeat(
+        &service,
+        HeartbeatRequest {
+            provider_id: provider.id.clone(),
+            generation: provider.generation,
+            host: Some(HostSample {
+                mem_total_bytes: Some(8 << 30),
+                ..HostSample::default()
+            }),
+            sandboxes: vec![reported.clone()],
+        },
+    )
+    .unwrap();
+    let second = provider_stats();
+    assert_eq!(second.host.mem_total_bytes, Some(8 << 30));
+    assert_eq!(second.sandboxes[0].runtime, reported);
+
+    // ...and a later old-shape heartbeat clears the runtime report (it is
+    // replaced wholesale) but cannot clear a host sample it did not send.
+    Service::heartbeat(&service, old_shape()).unwrap();
+    let third = provider_stats();
+    assert_eq!(third.host.mem_total_bytes, Some(8 << 30));
+    assert_eq!(third.sandboxes[0].runtime, SandboxRuntimeStats::default());
 }
 
 /// The same flows across a real HTTP server with a remote agent.
@@ -658,6 +834,108 @@ async fn remote_agent_and_client_over_connect() {
         .await
         .unwrap();
     wait_for(|| Service::list(&service).is_empty()).await;
+    shutdown.cancel();
+}
+
+/// Heartbeat stats travel from a remote agent to the Stats API: the host
+/// sample (where the platform measures one) and each sandbox's runtime
+/// facts, keyed by the driver-native ref the sandbox record carries.
+#[tokio::test]
+async fn remote_agent_heartbeat_feeds_the_stats_api() {
+    use preloop_sandbox::SandboxApi as _;
+    let dir = tempfile::tempdir().unwrap();
+    let service = Service::open(
+        store::open("memory:").await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let auth = Auth {
+        client_token: Some("client-secret".into()),
+        provider_token: Some("provider-secret".into()),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = router(service.clone(), auth);
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let shutdown = CancellationToken::new();
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    let fake = Arc::new(FakeDriver::new(
+        "fake",
+        dir.path().join("host"),
+        FakeDriver::full_capabilities(),
+    ));
+    let mut agent_config = AgentConfig::new("remote-host", dir.path().join("scratch"));
+    agent_config.heartbeat = Duration::from_millis(50);
+    let agent = Agent::new(
+        Arc::new(RemoteLink::new(&base, Some("provider-secret".into()))),
+        vec![fake as Arc<dyn Driver>],
+        agent_config,
+    );
+    tokio::spawn(agent.run(shutdown.clone()));
+
+    let client = SandboxClient::new(&base, Some("client-secret".into()));
+    wait_for(|| !Service::list_providers(&service).is_empty()).await;
+    let provider_id = Service::list_providers(&service)[0].id.clone();
+    client.put_template(template("alpine")).await.unwrap();
+    let lease = client
+        .acquire(AcquireRequest {
+            idempotency_key: "stats".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+
+    // Read Stats over the client transport, waiting for a heartbeat that
+    // has seen the acquired machine on disk.
+    let mut provider = None;
+    for _ in 0..200 {
+        let stats = client.stats().await.unwrap();
+        provider = stats
+            .providers
+            .into_iter()
+            .find(|entry| entry.provider_id == provider_id);
+        if provider.as_ref().is_some_and(|entry| {
+            entry
+                .sandboxes
+                .iter()
+                .any(|sandbox| sandbox.runtime.native_ref == lease.sandbox.native_ref)
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let provider = provider.expect("stats lists the registered provider");
+    assert_eq!(provider.sandboxes.len(), 1);
+    let reported = &provider.sandboxes[0];
+    assert_eq!(reported.sandbox.id, lease.sandbox.id);
+    assert_eq!(reported.sandbox.state, SandboxState::Leased);
+    assert_eq!(reported.runtime.native_ref, lease.sandbox.native_ref);
+    assert!(
+        reported
+            .runtime
+            .data_dir
+            .ends_with(&lease.sandbox.native_ref),
+        "{:?} does not belong to {}",
+        reported.runtime.data_dir,
+        lease.sandbox.native_ref
+    );
+    assert!(provider.host_sample_age_secs < 10);
+    // `sample_host` reads `/proc`; other platforms report "unmeasured"
+    // rather than a fabricated sample, and the service stores nothing.
+    if cfg!(target_os = "linux") {
+        assert_ne!(provider.host, HostSample::default());
+    }
+
+    client
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id,
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
     shutdown.cancel();
 }
 
