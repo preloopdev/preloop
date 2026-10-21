@@ -2618,16 +2618,13 @@ jobs:
             ".github/workflows/reusable.yml".to_owned(),
             REUSABLE_CALLEE_DEFERRED_MATRIX.to_owned(),
         )]);
-        let caller =
-            preloop_gha_parser::parse_workflow(REUSABLE_CALLER_NO_GRANT).unwrap();
-        let caller_node =
-            preloop_gha_parser::expand_jobs_with_reusables(&caller, &reusable)
-                .unwrap()
-                .jobs
-                .remove(0);
+        let caller = preloop_gha_parser::parse_workflow(REUSABLE_CALLER_NO_GRANT).unwrap();
+        let caller_node = preloop_gha_parser::expand_jobs_with_reusables(&caller, &reusable)
+            .unwrap()
+            .jobs
+            .remove(0);
         assert!(!caller_node.oidc_id_token_granted);
-        let called =
-            preloop_gha_parser::parse_workflow(REUSABLE_CALLEE_DEFERRED_MATRIX).unwrap();
+        let called = preloop_gha_parser::parse_workflow(REUSABLE_CALLEE_DEFERRED_MATRIX).unwrap();
         let base_plan = preloop_gha_parser::expand_reusable_call(
             &called,
             &caller_node,
@@ -2661,8 +2658,7 @@ jobs:
                     snapshot: None,
                     github_json: serde_json::json!({}),
                     workflow_path: ".github/workflows/ci.yml".to_owned(),
-                    workflow_ref: "owner/repo/.github/workflows/ci.yml@refs/heads/main"
-                        .to_owned(),
+                    workflow_ref: "owner/repo/.github/workflows/ci.yml@refs/heads/main".to_owned(),
                     head_sha: "0".repeat(40),
                 },
                 node_id: JobId("call/deploy".to_owned()),

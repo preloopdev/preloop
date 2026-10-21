@@ -104,5 +104,3 @@ fn deferred_matrix_legs_in_reusable_callee_keep_caller_oidc_cap() {
         );
     }
 }
-
-
