@@ -73,12 +73,17 @@ pub const RUNNER_BUSY_SENTINEL: &str = "::preloop-runner::job-acquired";
 
 /// Line a runner prints on stdout immediately before it exits.
 ///
-/// The exit code follows the sentinel, separated by one space. A runner's
-/// descendants can inherit the exec channel's stdout and outlive the runner
-/// (a container shim, a daemonizing helper), and a channel that only reports
-/// end-of-stream on every writer closing never reports this runner's exit.
-/// This line is what the orchestrator watches so a completed job releases its
-/// pool slot without waiting for those descendants.
+/// The line is `<sentinel> <token> <code>`: the attempt's per-runner token
+/// follows the sentinel, then the exit code, each separated by one space. A
+/// runner's descendants can inherit the exec channel's stdout and outlive the
+/// runner (a container shim, a daemonizing helper), and a channel that only
+/// reports end-of-stream on every writer closing never reports this runner's
+/// exit. This line is what the orchestrator watches so a completed job
+/// releases its pool slot without waiting for those descendants.
+///
+/// The token matters because the guest's stdout is shared with the job's
+/// steps: a line without the token the pool issued for this attempt is not an
+/// announcement, so workflow output cannot forge one.
 ///
 /// Like [`RUNNER_BUSY_SENTINEL`], this never crosses the GitHub wire protocol.
 pub const RUNNER_EXIT_SENTINEL: &str = "::preloop-runner::exit";

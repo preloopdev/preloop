@@ -105,8 +105,8 @@ pub(crate) struct StarvationCandidate<'a> {
     pub(crate) enqueued_at: SystemTime,
     pub(crate) first_seen: Option<SystemTime>,
     pub(crate) any_runner_matches: bool,
-    /// A runner is already executing another job, so the ready queue is
-    /// capacity-blocked: this job's turn cannot come until that job finishes.
+    /// An attempt that shares this job's runner class is already running, so
+    /// the job's turn cannot come until that attempt finishes.
     pub(crate) capacity_blocked: bool,
 }
 
@@ -153,6 +153,38 @@ pub(crate) fn pool_unsatisfiable_reason(
             runs_on.join(", "),
             pool_labels.join(", ")
         )
+    })
+}
+
+/// Whether two `runs-on` label sets name the same runner capacity.
+///
+/// A runner satisfies the superset of two comparable label sets. When one set
+/// contains the other, every runner that can serve the superset can also serve
+/// the subset, so an attempt on either set occupies capacity the other job
+/// could have used. Disjoint classes (a `self-hosted` job and a `gpu` job) can
+/// never be served by the same runner, so one running cannot be why the other
+/// waits — treating it as blocking would let continuous unrelated work keep
+/// an unschedulable job queued forever.
+pub(crate) fn runs_on_shares_capacity(active: &[String], queued: &[String]) -> bool {
+    let labels = |set: &[String]| -> std::collections::BTreeSet<String> {
+        set.iter()
+            .map(|label| label.trim().to_ascii_lowercase())
+            .filter(|label| !label.is_empty())
+            .collect()
+    };
+    let active = labels(active);
+    let queued = labels(queued);
+    active.is_subset(&queued) || queued.is_subset(&active)
+}
+
+/// Whether some started attempt is occupying a runner class `runs_on` could
+/// use (see [`runs_on_shares_capacity`]).
+pub(crate) fn capacity_blocked_by<'a>(
+    runs_on: &[String],
+    active: impl IntoIterator<Item = &'a crate::control::types::ActiveRequest>,
+) -> bool {
+    active.into_iter().any(|request| {
+        request.started_at.is_some() && runs_on_shares_capacity(&request.runs_on, runs_on)
     })
 }
 
@@ -1323,6 +1355,31 @@ mod decision_tests {
         };
         assert_eq!(grace, QUEUED_JOB_GRACE);
         assert!(reason.contains("within 120s"));
+    }
+
+    #[test]
+    fn capacity_blocking_is_scoped_to_the_runner_class() {
+        let self_hosted = labels(&["self-hosted"]);
+        let gpu = labels(&["gpu"]);
+        let ubuntu = labels(&["ubuntu-latest"]);
+        let ubuntu_arm = labels(&["ubuntu-latest", "arm64"]);
+        // The same class (or one whose superset covers the other) shares the
+        // runner that occupies the permit.
+        assert!(runs_on_shares_capacity(&self_hosted, &self_hosted));
+        assert!(runs_on_shares_capacity(&ubuntu, &ubuntu_arm));
+        assert!(runs_on_shares_capacity(&ubuntu_arm, &ubuntu));
+        assert!(runs_on_shares_capacity(
+            &labels(&["UBUNTU-latest"]),
+            &ubuntu
+        ));
+        // Disjoint classes can never be served by the same runner: unrelated
+        // work must not keep this job's starvation clock refreshed.
+        assert!(!runs_on_shares_capacity(&self_hosted, &gpu));
+        assert!(!runs_on_shares_capacity(&gpu, &ubuntu));
+        // An unlabelled job is served by any runner, so it shares every
+        // class.
+        assert!(runs_on_shares_capacity(&[], &gpu));
+        assert!(runs_on_shares_capacity(&gpu, &[]));
     }
 
     #[test]

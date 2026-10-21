@@ -936,6 +936,10 @@ pub(crate) struct ActiveRequest {
     pub(crate) session_live: bool,
     /// The job's `timeout-minutes` in seconds, when its message set one.
     pub(crate) job_timeout_s: Option<i64>,
+    /// The job's `runs-on` labels. A ready job is capacity-blocked only by an
+    /// attempt that shares this job's runner class, so the reaper needs the
+    /// running job's labels to scope the starvation clock.
+    pub(crate) runs_on: Vec<String>,
 }
 
 /// A ready-queue job, as the starvation sweep sees it.
@@ -1109,10 +1113,6 @@ pub(crate) struct ReapSweep {
     pub(crate) paused: std::collections::BTreeMap<i64, std::time::Duration>,
     /// A co-hosted pool is preparing/provisioning a runner.
     pub(crate) pool_preparing: bool,
-    /// A runner is already executing another job, so the ready queue is
-    /// capacity-blocked. Backends reset a queued job's observation clock
-    /// instead of failing it for waiting behind an occupied permit.
-    pub(crate) capacity_blocked: bool,
     /// When this node's process started: starvation clocks never start
     /// before it (`logic::starvation_verdict`).
     pub(crate) booted_at: std::time::SystemTime,

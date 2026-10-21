@@ -16,10 +16,30 @@ Releases before v0.27.0 predate the changelog.
   so a container shim or daemonizing helper that inherited those pipes kept
   `aenv exec` alive after the runner exited and pinned the sole on-demand
   permit on a healthy guest. `preloop-runner` now prints
-  `::preloop-runner::exit <code>` immediately before exiting, and the
+  `::preloop-runner::exit <token> <code>` immediately before exiting, and the
   orchestrator ends the stream wait on that line, drops the host-side exec
-  client, and deletes the VM (which also kills the descendant). A broker
-  completion releases the same slot even when no exit line arrives.
+  client, and deletes the VM (which also kills the descendant). The token is
+  minted per attempt and passed on the runner's command line, so workflow
+  output (which shares the guest's stdout) cannot forge the announcement and
+  force a teardown mid-job. A broker completion releases the same slot even
+  when no exit line arrives, and now only as a backstop: the pool waits for
+  the runner's own announcement first, so the worker still writes the
+  failure marker that debug-VM preservation reads.
+
+- **A claimed on-demand runner no longer serializes the pool.** The queue
+  sample counts ready jobs only, so a running slot must stop reserving a
+  queue entry once its job is claimed: otherwise one running job plus one
+  queued job compared `1 > 1` and the free permit went unused until the
+  running job finished. Reservations now cover only provisioning, unclaimed
+  slots, and the idle grace also honors a claim observed on guest stdout when
+  no claim set is published.
+
+- **Starvation protection is scoped to the runner class.** A ready job's
+  observation clock is reset only by an attempt whose `runs-on` shares its
+  runner capacity (one label set contains the other). Unrelated work — a
+  `self-hosted` job on a deployment with no co-hosted pool — no longer keeps
+  refreshing an unmatched `gpu` job's clock, which used to queue forever
+  instead of failing after the 120-second grace.
 
 - **A single-use runner slot is released when its job completes, and a spare
   that never receives a job is bounded.** The co-hosted runner server now

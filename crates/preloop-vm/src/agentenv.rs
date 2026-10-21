@@ -66,9 +66,9 @@
 //!   shim, a daemonizing helper) therefore keeps `aenv exec` alive long after the
 //!   command exited, and on a healthy guest no liveness probe can tell. The
 //!   orchestrator does not wait for that closure: the runner announces its own exit
-//!   on stdout (`preloop_gha_protocol::RUNNER_EXIT_SENTINEL`) and the stream future is
-//!   dropped there, which kills the `aenv exec` client; deleting the machine kills the
-//!   descendant.
+//!   on stdout (`preloop_gha_protocol::RUNNER_EXIT_SENTINEL`, tagged with the
+//!   per-attempt token it was started with) and the stream future is dropped there,
+//!   which kills the `aenv exec` client; deleting the machine kills the descendant.
 
 pub mod gc;
 pub mod volume;

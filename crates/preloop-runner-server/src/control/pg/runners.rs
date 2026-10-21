@@ -613,10 +613,11 @@ impl PgBackend {
                      EXISTS (SELECT 1 FROM runner_sessions s \
                              WHERE s.session_id = q.session_id AND ",
                     us!("s.last_seen_at"),
-                    " >= $1) \
+                    " >= $1), j.runs_on::text \
                      FROM job_requests q \
                      LEFT JOIN job_leases l ON l.request_id = q.request_id \
                      LEFT JOIN job_messages m ON m.run_id = q.run_id AND m.job_id = q.job_id \
+                     LEFT JOIN jobs j ON j.run_id = q.run_id AND j.job_id = q.job_id \
                      WHERE q.result IS NULL ORDER BY q.request_id"
                 ),
                 &[&cutoff],
@@ -633,6 +634,11 @@ impl PgBackend {
                 timeout_triggered: row.get(5),
                 session_live: row.get(7),
                 job_timeout_s: row.get(6),
+                runs_on: row
+                    .get::<_, Option<String>>(8)
+                    .map(|json| codec::from_json(&json))
+                    .transpose()?
+                    .unwrap_or_default(),
             });
         }
         for row in client

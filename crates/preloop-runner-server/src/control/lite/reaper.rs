@@ -111,10 +111,12 @@ impl LiteBackend {
                                 l.renewed_at, q.timeout_triggered, \
                                 CAST(json_extract(m.message_template, '$.jobTimeout') AS INTEGER), \
                                 EXISTS (SELECT 1 FROM runner_sessions s \
-                                        WHERE s.session_id = q.session_id AND s.last_seen_at >= ?1) \
+                                        WHERE s.session_id = q.session_id AND s.last_seen_at >= ?1), \
+                                j.runs_on \
                          FROM job_requests q \
                          LEFT JOIN job_leases l ON l.request_id = q.request_id \
                          LEFT JOIN job_messages m ON m.run_id = q.run_id AND m.job_id = q.job_id \
+                         LEFT JOIN jobs j ON j.run_id = q.run_id AND j.job_id = q.job_id \
                          WHERE q.result IS NULL ORDER BY q.request_id",
                     )
                     .map_err(db)?;
@@ -129,6 +131,10 @@ impl LiteBackend {
                             timeout_triggered: row.get::<_, i64>(5)? != 0,
                             session_live: row.get::<_, i64>(7)? != 0,
                             job_timeout_s: row.get(6)?,
+                            runs_on: row
+                                .get::<_, Option<String>>(8)?
+                                .and_then(|json| serde_json::from_str(&json).ok())
+                                .unwrap_or_default(),
                         })
                     })
                     .map_err(db)?;
@@ -218,7 +224,6 @@ impl LiteBackend {
                 active,
                 paused,
                 pool_preparing,
-                capacity_blocked,
                 booted_at,
                 pool_labels,
                 first_seen,
@@ -242,7 +247,7 @@ impl LiteBackend {
                     any_runner_matches: runner_labels.iter().any(|labels| {
                         crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                     }),
-                    capacity_blocked,
+                    capacity_blocked: logic::capacity_blocked_by(&job.runs_on, &active),
                 };
                 let verdict = logic::starvation_verdict(
                     &candidate,

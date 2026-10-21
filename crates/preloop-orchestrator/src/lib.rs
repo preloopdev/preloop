@@ -4704,20 +4704,27 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // Reserve a slot before provisioning starts. `queue_depth` is sampled
         // asynchronously; without this local reservation the same queued job
         // can be observed repeatedly while the first VM is still booting.
-        let in_flight = Arc::new(AtomicUsize::new(0));
+        // Only unclaimed slots count: a claimed runner's job has left the
+        // ready queue, so keeping it reserved would gate a newly queued job
+        // behind the running one even when a permit is free. A sample that
+        // still lists a just-claimed job can therefore start one spare; it
+        // picks up the next queued job, and the unclaimed-runner idle grace
+        // reclaims it if none arrives.
+        let reservations = Arc::new(AtomicUsize::new(0));
         let mut next_slot: usize = 0;
 
         loop {
-            // Wait until queued work exceeds locally reserved slots. The
-            // server's queue sample may remain stale while a claim is being
-            // provisioned, so checking only `queued > 0` over-provisions.
+            // Wait until queued work exceeds the slots that have not claimed
+            // a job yet. The server's queue sample may remain stale while a
+            // claim is being provisioned, so checking only `queued > 0`
+            // over-provisions.
             let pending = self.config.pending_jobs.as_deref();
             loop {
                 if shutdown.is_cancelled() {
                     break;
                 }
                 let queued = pending.map_or(0, |p| p.load(Ordering::Acquire));
-                let reserved = in_flight.load(Ordering::Acquire);
+                let reserved = reservations.load(Ordering::Acquire);
                 if queued > reserved {
                     break;
                 }
@@ -4739,8 +4746,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     permit.expect("semaphore is never closed")
                 }
             };
-            in_flight.fetch_add(1, Ordering::AcqRel);
-            let in_flight_slot = in_flight.clone();
+            let reservation = SlotReservation::reserve(reservations.clone());
 
             let slot = next_slot;
             next_slot = next_slot.wrapping_add(1);
@@ -4774,9 +4780,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_handles,
                     slot_semaphore,
                     permit_slot,
+                    reservation,
                 )
                 .await;
-                in_flight_slot.fetch_sub(1, Ordering::AcqRel);
                 if let Err(error) = &result {
                     warn!(slot, %error, "on-demand runner failed");
                 }
@@ -5145,12 +5151,63 @@ impl Drop for StagingLockGuard {
     }
 }
 
+/// One on-demand slot's claim on the server's queue sample.
+///
+/// The loop starts a slot only while queued work outnumbers the slots that
+/// have not claimed a job yet. A slot stops counting the moment its runner is
+/// claimed: the job it runs has left the ready queue, so the slot no longer
+/// reserves a queue entry and must not hold back the next job (a running job
+/// would otherwise compare against a queue that no longer contains it,
+/// serializing the pool whenever one job runs and one waits). Released
+/// exactly once, whether the slot claims, fails, or returns unclaimed.
+struct SlotReservation {
+    reservations: Arc<AtomicUsize>,
+    active: bool,
+}
+
+impl SlotReservation {
+    fn reserve(reservations: Arc<AtomicUsize>) -> Self {
+        reservations.fetch_add(1, Ordering::AcqRel);
+        Self {
+            reservations,
+            active: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        self.reservations.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for SlotReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// A provisioned, registered runner waiting to be handed a job.
 #[derive(Debug)]
 struct ReadyRunner {
     name: MachineName,
     run: Vec<String>,
+    /// Per-attempt secret the guest runner echoes in its exit announcement.
+    ///
+    /// Guest stdout is not a trusted channel: a workflow step shares the
+    /// exec user and can write into the runner's stdout, so a bare sentinel
+    /// would let job output forge an exit and tear the VM down mid-job. Only
+    /// a line carrying this attempt's token ends the wait (`run_until_exit`).
+    exit_token: String,
     environment: RunnerEnvironment,
+}
+
+/// One random per-attempt sentinel token, minted when the runner is
+/// provisioned and passed to the guest on its own command line.
+fn new_exit_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Tell the control plane a machine's runner is gone, BEFORE the VM goes
@@ -5729,6 +5786,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     handles: PoolHandles,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    reservation: SlotReservation,
 ) -> Result<(), OrchestratorError> {
     // Mirror `run_slot`: once the packed golden is known-unusable, on-demand
     // slots must not attempt another environment-golden bake either — fall
@@ -5823,6 +5881,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         runner,
         shutdown.clone(),
         idle.clone(),
+        Some(reservation),
     )
     .await;
     if let Some(watch) = pause_watch {
@@ -5978,6 +6037,7 @@ async fn run_slot<P: VmProvider + 'static>(
             runner,
             shutdown.clone(),
             idle.clone(),
+            None,
         )
         .await;
         if let Err(error) = &job {
@@ -6094,7 +6154,21 @@ async fn provision_slot<P: VmProvider + 'static>(
         fingerprint = environment.fingerprint.as_deref().unwrap_or("-"),
         "provisioning runner"
     );
-    match provision_runner(provider, config, &name, golden, keys, &environment).await {
+    // The exit announcement is a private channel, so it carries a per-attempt
+    // secret the guest runner echoes back. Minted once per runner, before the
+    // guest command line is built, and never written to job output.
+    let exit_token = new_exit_token();
+    match provision_runner(
+        provider,
+        config,
+        &name,
+        golden,
+        keys,
+        &environment,
+        &exit_token,
+    )
+    .await
+    {
         Ok(run) => {
             // A provision that made it (fork or direct create, configure,
             // registration) resets the consecutive-failure streak. The
@@ -6106,6 +6180,7 @@ async fn provision_slot<P: VmProvider + 'static>(
             Ok(Some(ReadyRunner {
                 name,
                 run,
+                exit_token,
                 environment,
             }))
         }
@@ -6207,10 +6282,12 @@ async fn run_one_runner<P: VmProvider + 'static>(
     runner: ReadyRunner,
     shutdown: CancellationToken,
     idle: Arc<std::sync::Mutex<usize>>,
+    mut reservation: Option<SlotReservation>,
 ) -> Result<(), OrchestratorError> {
     let ReadyRunner {
         name,
         run,
+        exit_token,
         environment,
     } = runner;
     let name = &name;
@@ -6253,12 +6330,16 @@ async fn run_one_runner<P: VmProvider + 'static>(
         );
         claimed.store(true, Ordering::Release);
         idle.release();
+        if let Some(reservation) = reservation.as_mut() {
+            reservation.release();
+        }
     }
     let run_task = tokio::spawn(async move {
         let result = run_until_exit(
             &run_provider,
             &run_name,
             &run,
+            &exit_token,
             busy_tx,
             completion,
             GUEST_LIVENESS,
@@ -6306,6 +6387,9 @@ async fn run_one_runner<P: VmProvider + 'static>(
         } {
             claim_claimed.store(true, Ordering::Release);
             idle.release();
+            if let Some(reservation) = reservation.as_mut() {
+                reservation.release();
+            }
         }
     };
 
@@ -6324,10 +6408,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
             std::future::pending::<()>().await;
         }
         tokio::time::sleep(UNCLAIMED_RUNNER_IDLE_GRACE).await;
-        let claimed_now = config
-            .pool_status
-            .as_ref()
-            .is_some_and(|status| status.runner_is_claimed(name.as_str()));
+        // The `select!` guard on this branch was evaluated once, when the
+        // select started, so a claim that lands later still leaves the timer
+        // armed. Re-read the local atomic — set by the stdout sentinel as
+        // well as by the server event — at the instant it fires: a legacy
+        // on-demand caller publishes no pool status, and a transient lookup
+        // failure must not tear down a runner that already announced a job.
+        let claimed_now = idle_claimed.load(Ordering::Acquire)
+            || config
+                .pool_status
+                .as_ref()
+                .is_some_and(|status| status.runner_is_claimed(name.as_str()));
         if claimed_now {
             idle_claimed.store(true, Ordering::Release);
             std::future::pending::<()>().await;
@@ -6610,13 +6701,52 @@ async fn guest_unresponsive<P: VmProvider + 'static>(
     }
 }
 
-/// Parse a runner's exit announcement: `<RUNNER_EXIT_SENTINEL> <code>`.
-fn runner_exit_code(line: &str) -> Option<i32> {
-    line.trim()
+/// Parse a runner's exit announcement: `<RUNNER_EXIT_SENTINEL> <token> <code>`.
+///
+/// The token is the per-attempt secret from the runner's command line. Guest
+/// stdout is shared with the job's steps, so anything that can write a line
+/// there could otherwise end the attempt and tear the VM down; only the
+/// runner knows which token this attempt was started with.
+fn runner_exit_code(line: &str, token: &str) -> Option<i32> {
+    let mut fields = line
+        .trim()
         .strip_prefix(RUNNER_EXIT_SENTINEL)?
-        .trim_start()
-        .parse()
-        .ok()
+        .split_whitespace();
+    if fields.next()? != token || token.is_empty() {
+        return None;
+    }
+    fields.next()?.parse().ok()
+}
+
+/// Append one chunk to its stream's line buffer and emit every complete line.
+///
+/// Each stream keeps its own buffer. The exit announcement is only valid on
+/// stdout, so completing a partial stdout line with a stderr chunk (and
+/// classifying the joined line by the chunk that happened to arrive second)
+/// could drain the announcement without recognising it.
+fn drain_stream_lines(
+    buffer: &mut String,
+    bytes: &[u8],
+    is_stdout: bool,
+    mut on_line: impl FnMut(&str, bool),
+) {
+    buffer.push_str(&String::from_utf8_lossy(bytes));
+    // Cap retained tail to prevent unbounded growth from a guest that never
+    // emits newlines (e.g. progress bar, binary output).
+    const LINE_BUFFER_CAP: usize = 64 * 1024;
+    if buffer.len() > LINE_BUFFER_CAP {
+        // Round forward to a char boundary: `String::drain` panics
+        // mid-codepoint, and a multi-byte char can straddle the cut.
+        let mut drain = buffer.len() - LINE_BUFFER_CAP;
+        while drain < buffer.len() && !buffer.is_char_boundary(drain) {
+            drain += 1;
+        }
+        buffer.drain(..drain);
+    }
+    while let Some(newline) = buffer.find('\n') {
+        let line: String = buffer.drain(..=newline).collect();
+        on_line(line.trim_end(), is_stdout);
+    }
 }
 
 /// Run the guest runner to completion, signalling the first job it accepts.
@@ -6631,13 +6761,15 @@ fn runner_exit_code(line: &str) -> Option<i32> {
 /// single job, but a descendant it spawned holds the exec channel's write end,
 /// and providers that report end-of-stream only when every writer closes (the
 /// AgentENV `envd` exec channel is one) never deliver it. The runner therefore
-/// announces its exit on stdout ([`RUNNER_EXIT_SENTINEL`]); that line ends the
-/// wait even while the stream stays open, and dropping the provider future
-/// kills the host-side exec client before the caller deletes the VM.
+/// announces its exit on stdout ([`RUNNER_EXIT_SENTINEL`], tagged with this
+/// attempt's `exit_token`); that line ends the wait even while the stream stays
+/// open, and dropping the provider future kills the host-side exec client
+/// before the caller deletes the VM.
 async fn run_until_exit<P: VmProvider + 'static>(
     provider: &Arc<P>,
     name: &MachineName,
     run: &[String],
+    exit_token: &str,
     busy: tokio::sync::oneshot::Sender<()>,
     completion: Option<
         tokio::sync::broadcast::Receiver<preloop_observability::status::RunnerJobCompleted>,
@@ -6647,6 +6779,7 @@ async fn run_until_exit<P: VmProvider + 'static>(
     let (chunks, mut receiver) = mpsc::channel(64);
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     let machine = name.as_str().to_owned();
+    let token = exit_token.to_owned();
     let activity = RunnerActivity::new();
     let stream_activity = activity.clone();
     let watcher = tokio::spawn(async move {
@@ -6658,7 +6791,17 @@ async fn run_until_exit<P: VmProvider + 'static>(
         // tracing is what makes an in-VM failure diagnosable from the host;
         // consuming it purely to sniff for the busy sentinel meant every
         // worker-side decision was invisible.
-        let mut line_buffer = String::new();
+        //
+        // stdout and stderr keep separate line buffers: the exit announcement
+        // is only valid on stdout, and a single buffer completed a partial
+        // stdout line with an interleaved stderr chunk — draining it as stderr
+        // without ever seeing the announcement.
+        let mut stdout_lines = String::new();
+        let mut stderr_lines = String::new();
+        // Set when the control plane records the job's terminal result. The
+        // guest's own announcement ends the wait sooner; this deadline only
+        // bounds a runner that died after reporting.
+        let mut completion_deadline: Option<tokio::time::Instant> = None;
         loop {
             let chunk = tokio::select! {
                 chunk = receiver.recv() => chunk,
@@ -6674,15 +6817,19 @@ async fn run_until_exit<P: VmProvider + 'static>(
                             if let Some(busy) = busy.take() {
                                 let _ = busy.send(());
                             }
-                            // The server has recorded the terminal result. Keep
-                            // the provider stream alive briefly for final log
-                            // fan-out, then the outer select drops the stream
-                            // future and the caller tears down the VM.
-                            tokio::time::sleep(RUNNER_COMPLETION_GRACE).await;
-                            if let Some(exit) = exit.take() {
-                                let _ = exit.send(0);
-                            }
-                            return;
+                            // The server has recorded the terminal result, but
+                            // the guest worker's cleanup is not finished: it
+                            // writes the failure marker that debug-VM
+                            // preservation reads only after `report_completion`
+                            // returns, and announces its exit after that. Stop
+                            // watching for events and keep forwarding output
+                            // until the announcement arrives; the deadline is
+                            // the backstop for a guest that never sends one.
+                            completion = None;
+                            completion_deadline = Some(
+                                tokio::time::Instant::now() + RUNNER_COMPLETION_GRACE,
+                            );
+                            continue;
                         }
                         Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             continue;
@@ -6692,6 +6839,26 @@ async fn run_until_exit<P: VmProvider + 'static>(
                             continue;
                         }
                     }
+                }
+                // `select!` builds every branch's future before checking its
+                // precondition, so the deadline must not be unwrapped here:
+                // `None` disables the branch and the placeholder future is
+                // dropped un-polled.
+                _ = tokio::time::sleep_until(
+                    completion_deadline.unwrap_or_else(tokio::time::Instant::now),
+                ), if completion_deadline.is_some() => {
+                    // The completion backstop expired without an exit
+                    // announcement: the runner died after reporting (or could
+                    // not print). Release the slot as a clean completion.
+                    debug!(
+                        machine = machine.as_str(),
+                        grace_ms = RUNNER_COMPLETION_GRACE.as_millis(),
+                        "no runner exit announcement after completion; closing the exec stream"
+                    );
+                    if let Some(exit) = exit.take() {
+                        let _ = exit.send(0);
+                    }
+                    return;
                 }
             };
             let Some(chunk) = chunk else {
@@ -6722,34 +6889,24 @@ async fn run_until_exit<P: VmProvider + 'static>(
                     pending.drain(..keep);
                 }
             }
-            line_buffer.push_str(&String::from_utf8_lossy(&bytes));
-            // Cap retained tail to prevent unbounded growth from a guest
-            // that never emits newlines (e.g. progress bar, binary output).
-            const LINE_BUFFER_CAP: usize = 64 * 1024;
-            if line_buffer.len() > LINE_BUFFER_CAP {
-                // Round forward to a char boundary: `String::drain` panics
-                // mid-codepoint, and a multi-byte char can straddle the cut.
-                let mut drain = line_buffer.len() - LINE_BUFFER_CAP;
-                while drain < line_buffer.len() && !line_buffer.is_char_boundary(drain) {
-                    drain += 1;
-                }
-                line_buffer.drain(..drain);
-            }
-            while let Some(newline) = line_buffer.find('\n') {
-                let line: String = line_buffer.drain(..=newline).collect();
-                let line = line.trim_end();
+            let buffer = if is_stdout {
+                &mut stdout_lines
+            } else {
+                &mut stderr_lines
+            };
+            drain_stream_lines(buffer, &bytes, is_stdout, |line, is_stdout| {
                 if !line.is_empty() {
                     debug!(machine = machine.as_str(), stdout = is_stdout, "{line}");
                 }
                 // The runner announces its own exit because the exec channel
                 // may stay open for as long as a descendant holds stdout.
                 if is_stdout
-                    && let Some(code) = runner_exit_code(line)
+                    && let Some(code) = runner_exit_code(line, &token)
                     && let Some(exit) = exit.take()
                 {
                     let _ = exit.send(code);
                 }
-            }
+            });
         }
     });
 
@@ -7014,6 +7171,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
     environment: &RunnerEnvironment,
+    exit_token: &str,
 ) -> Result<Vec<String>, OrchestratorError> {
     // Every runner is a fork of the pool's golden. There is no backup path that
     // boots a raw image: such a machine carries neither the published golden's
@@ -7481,6 +7639,12 @@ async fn provision_runner<P: VmProvider + 'static>(
         runner,
         "run".into(),
         "--once".into(),
+        // The exit announcement is a private channel, so it carries a
+        // per-attempt secret the guest echoes back. It must join the guest
+        // argv before the launcher wraps it, or the wrapper would swallow it
+        // as a positional parameter.
+        "--exit-token".into(),
+        exit_token.to_owned(),
         "--runner-root".into(),
         RUNNER_ROOT.into(),
     ]);
@@ -7797,6 +7961,45 @@ mod lifecycle_tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
     use tokio::sync::Mutex;
+
+    /// The per-attempt secret the lifecycle tests hand the guest runner.
+    const TEST_EXIT_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The guest command line the production pool builds for a runner: the
+    /// single-use `run` plus the attempt's exit token.
+    fn exit_argv() -> Vec<String> {
+        [
+            "run".to_owned(),
+            "--exit-token".to_owned(),
+            TEST_EXIT_TOKEN.to_owned(),
+        ]
+        .to_vec()
+    }
+
+    /// A claimed slot must stop reserving a queue entry, and the release must
+    /// be idempotent: the loop's admission (`queued > reservations`) only
+    /// frees a permit if each slot decrements exactly once.
+    #[test]
+    fn slot_reservation_counts_only_until_released() {
+        let reservations = Arc::new(AtomicUsize::new(0));
+        let mut claimed = SlotReservation::reserve(reservations.clone());
+        let unclaimed = SlotReservation::reserve(reservations.clone());
+        assert_eq!(reservations.load(Ordering::Acquire), 2);
+
+        // The claim wins: the running slot no longer counts against the
+        // ready queue, so a newly queued job may take the free permit.
+        claimed.release();
+        claimed.release();
+        assert_eq!(
+            reservations.load(Ordering::Acquire),
+            1,
+            "a claimed slot releases its reservation exactly once"
+        );
+
+        // A slot that ends without claiming still releases on drop.
+        drop(unclaimed);
+        assert_eq!(reservations.load(Ordering::Acquire), 0);
+    }
 
     /// The production scenario that OOMed: 22 GiB host, 8 GiB runners.
     /// Golden (8 GiB) + 2 GiB reserve leaves 12 GiB → at most 1 concurrent
@@ -11639,9 +11842,16 @@ fi"#,
                 return Ok(1);
             }
             if let Some(code) = self.exit_without_end {
+                // Echo the token the pool passed on the command line, exactly
+                // as the real runner does.
+                let token = argv
+                    .windows(2)
+                    .find(|window| window[0] == "--exit-token")
+                    .map(|window| window[1].as_str())
+                    .unwrap_or_default();
                 output
                     .send(OutputChunk::Stdout(
-                        format!("{RUNNER_EXIT_SENTINEL} {code}\n").into_bytes(),
+                        format!("{RUNNER_EXIT_SENTINEL} {token} {code}\n").into_bytes(),
                     ))
                     .await
                     .unwrap();
@@ -12153,6 +12363,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("an unrecoverable fork base must fail the provision");
@@ -12184,6 +12395,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect("a transient fork failure recovers by forking again");
@@ -12216,7 +12428,15 @@ fi"#,
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
         )
         .await
         .expect("a wedged guest must not pin the runner stream");
@@ -12252,7 +12472,16 @@ fi"#,
             let provider = provider.clone();
             let name = name.clone();
             async move {
-                run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness).await
+                run_until_exit(
+                    &provider,
+                    &name,
+                    &exit_argv(),
+                    TEST_EXIT_TOKEN,
+                    busy,
+                    None,
+                    liveness,
+                )
+                .await
             }
         });
 
@@ -12298,7 +12527,15 @@ fi"#,
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
         )
         .await
         .expect("a silent, unreachable guest must not pin the runner stream");
@@ -12332,7 +12569,15 @@ fi"#,
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
         )
         .await
         .expect("a runner exit line must not wait for its descendants to close stdout");
@@ -12361,7 +12606,15 @@ fi"#,
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
         )
         .await
         .expect("a runner exit line must not wait for its descendants to close stdout");
@@ -12408,7 +12661,8 @@ fi"#,
                 run_until_exit(
                     &provider,
                     &name,
-                    &["run".to_owned()],
+                    &exit_argv(),
+                    TEST_EXIT_TOKEN,
                     busy,
                     completion,
                     liveness,
@@ -12429,15 +12683,41 @@ fi"#,
     }
 
     /// Only the exact exit line is an announcement; runner output that
-    /// merely mentions it (or a truncated line) must not release the slot.
+    /// merely mentions it, a truncated line, or another attempt's token must
+    /// not release the slot.
     #[test]
     fn runner_exit_line_parsing_is_strict() {
-        assert_eq!(runner_exit_code("::preloop-runner::exit 0"), Some(0));
-        assert_eq!(runner_exit_code("::preloop-runner::exit 17\r"), Some(17));
-        assert_eq!(runner_exit_code("::preloop-runner::exiting 0"), None);
-        assert_eq!(runner_exit_code("echo ::preloop-runner::exit 0"), None);
-        assert_eq!(runner_exit_code("::preloop-runner::exit"), None);
-        assert_eq!(runner_exit_code("::preloop-runner::exit nope"), None);
+        let token = TEST_EXIT_TOKEN;
+        assert_eq!(
+            runner_exit_code(&format!("::preloop-runner::exit {token} 0"), token),
+            Some(0)
+        );
+        assert_eq!(
+            runner_exit_code(&format!("::preloop-runner::exit {token} 17\r"), token),
+            Some(17)
+        );
+        assert_eq!(
+            runner_exit_code(&format!("::preloop-runner::exiting {token} 0"), token),
+            None
+        );
+        assert_eq!(runner_exit_code("::preloop-runner::exit 0", token), None);
+        // A forged line without the attempt's secret is not an announcement.
+        assert_eq!(
+            runner_exit_code("::preloop-runner::exit deadbeef 0", token),
+            None
+        );
+        assert_eq!(
+            runner_exit_code("echo ::preloop-runner::exit 0", token),
+            None
+        );
+        assert_eq!(runner_exit_code("::preloop-runner::exit", token), None);
+        assert_eq!(
+            runner_exit_code(&format!("::preloop-runner::exit {token} nope"), token),
+            None
+        );
+        // An empty attempt token can never match: no runner is started
+        // without one, so a line that omits it must not end the attempt.
+        assert_eq!(runner_exit_code("::preloop-runner::exit  0", ""), None);
     }
 
     /// The AgentENV shape end to end: a fake `aenv` announces the runner's
@@ -12460,8 +12740,15 @@ fi"#,
                  start) echo s1 ;;\n\
                  exec)\n\
                    if [ \"$4\" = \"run\" ]; then\n\
-                     printf '%s\\n%s 0\\n' \
-                       '::preloop-runner::job-acquired' '::preloop-runner::exit'\n\
+                     token=\"\"\n\
+                     prev=\"\"\n\
+                     for arg in \"$@\"; do\n\
+                       if [ \"$prev\" = \"--exit-token\" ]; then token=\"$arg\"; fi\n\
+                       prev=\"$arg\"\n\
+                     done\n\
+                     printf '%s\\n%s %s 0\\n' \
+                       '::preloop-runner::job-acquired' \
+                       '::preloop-runner::exit' \"$token\"\n\
                      sleep 30 &\n\
                      echo $! > '{holder}';\n\
                    fi\n\
@@ -12509,7 +12796,15 @@ fi"#,
         };
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, None, liveness),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
         )
         .await;
         // The fake's descendant outlives the wait by design; never leave it
@@ -12857,6 +13152,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect("the re-armed golden serves the fork");
@@ -12907,6 +13203,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect("the re-armed fingerprint-suffixed golden serves the fork");
@@ -12954,6 +13251,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &env,
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("an unrecoverable fork failure must propagate");
@@ -12989,6 +13287,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("a base that cannot be re-armed within the drain budget fails the provision");
@@ -13027,6 +13326,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect("the re-armed golden serves the fork after the clone drains");
@@ -13075,6 +13375,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(environment_base),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("a busy plain-fork base fails the provision");
@@ -13110,6 +13411,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("a base that cannot even be cleaned up fails the provision");
@@ -13139,6 +13441,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment("mirror.gcr.io/library/ubuntu:22.04"),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("an environment-golden fork failure must propagate");
@@ -13596,9 +13899,16 @@ fi"#,
             let config = config.clone();
             let name = name.clone();
             async move {
-                run_one_runner(provider, &config, runner, CancellationToken::new(), idle)
-                    .await
-                    .inspect_err(|error| panic!("{name:?}: {error}"))
+                run_one_runner(
+                    provider,
+                    &config,
+                    runner,
+                    CancellationToken::new(),
+                    idle,
+                    None,
+                )
+                .await
+                .inspect_err(|error| panic!("{name:?}: {error}"))
             }
         });
 
@@ -13680,9 +13990,16 @@ fi"#,
             let config = config.clone();
             let name = name.clone();
             async move {
-                run_one_runner(provider, &config, runner, CancellationToken::new(), idle)
-                    .await
-                    .inspect_err(|error| panic!("{name:?}: {error}"))
+                run_one_runner(
+                    provider,
+                    &config,
+                    runner,
+                    CancellationToken::new(),
+                    idle,
+                    None,
+                )
+                .await
+                .inspect_err(|error| panic!("{name:?}: {error}"))
             }
         });
 
@@ -13749,6 +14066,7 @@ fi"#,
             runner,
             CancellationToken::new(),
             idle,
+            None,
         )
         .await
         .expect("the announced exit releases the slot");
@@ -13783,9 +14101,16 @@ fi"#,
         .expect("provisioning succeeds")
         .expect("a runner is provisioned");
         let idle = Arc::new(std::sync::Mutex::new(0));
-        let error = run_one_runner(provider, &config, runner, CancellationToken::new(), idle)
-            .await
-            .expect_err("runner failure must propagate");
+        let error = run_one_runner(
+            provider,
+            &config,
+            runner,
+            CancellationToken::new(),
+            idle,
+            None,
+        )
+        .await
+        .expect_err("runner failure must propagate");
         assert!(
             error
                 .to_string()
@@ -13817,6 +14142,7 @@ fi"#,
             handles,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
+            SlotReservation::reserve(Arc::new(AtomicUsize::new(0))),
         )
         .await
         .unwrap();
@@ -14221,6 +14547,7 @@ fi"#,
             handles,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
+            SlotReservation::reserve(Arc::new(AtomicUsize::new(0))),
         ));
 
         let booting = wait_for_pool_status("the on-demand boot", &pool_status, |snapshot| {
