@@ -505,6 +505,7 @@ impl Fixture {
             pending_registrations: None,
             preparing_signal: None,
             observability: None,
+            github: None,
         };
         Self {
             _hermetic_env: HermeticEnvGuard::new(&root),

@@ -3122,6 +3122,9 @@ async fn resolve_manifest(
         reference,
         MANIFEST_ACCEPT,
         Some(&platform_matches_host),
+        // A one-shot `preloop init` probe has no engine funnel to share; it
+        // sends plainly (the engine's golden downloader passes its own).
+        None,
     )
     .await
     .map_err(|error| manifest_error(reference, error))?;

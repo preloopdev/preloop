@@ -140,6 +140,9 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 pool_status: None,
                 observability: Some(observability.clone()),
+                // The standalone server has no runner pool to share with, so
+                // it keeps AppState's private funnel.
+                github: None,
                 systemd_socket_activation: false,
                 unix_socket,
                 state_dir,

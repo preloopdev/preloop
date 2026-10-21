@@ -1143,6 +1143,7 @@ async fn verdict_poll_releases_inner_before_the_backend_read() {
         temp.path().to_path_buf(),
         crate::config::config_path(),
         Some(&pg_url),
+        None,
     )
     .await
     .unwrap();

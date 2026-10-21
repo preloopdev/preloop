@@ -422,15 +422,66 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     })
 }
 
-/// Registry of per-credential breakers.
+/// The service origin of `url`: `host[:port]`, lowercased, with scheme, path,
+/// and a port that is only the scheme's default dropped.
+///
+/// This is the identity a breaker partition carries for the host an outbound
+/// call reaches. It is applied to the API base the engine resolved from
+/// configuration as well as to request URLs, so a value that is not a URL at
+/// all still names a stable partition of its own rather than collapsing every
+/// misconfigured caller into the same one.
+pub fn service_origin(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return url.trim().to_ascii_lowercase();
+    };
+    let Some(host) = parsed.host_str() else {
+        return url.trim().to_ascii_lowercase();
+    };
+    let host = host.to_ascii_lowercase();
+    // `Url` keeps no port that is only the scheme's default, so a port that
+    // arrives here is one that distinguishes the service.
+    match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
+/// The origin the engine's own GitHub calls resolve to: the
+/// `PRELOOP_GITHUB_API_URL` override every other origin-aware helper in the
+/// server reads, else github.com's API.
+fn default_github_origin() -> String {
+    std::env::var("PRELOOP_GITHUB_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| service_origin(&value))
+        .unwrap_or_else(|| "api.github.com".to_owned())
+}
+
+/// One breaker partition: a credential's budget *at* one service origin.
+///
+/// A credential alone cannot name a budget. GitHub's anonymous allowance is per
+/// address *per host*, and one process reaches several GitHub-family services —
+/// the engine's configured API origin, a GHES instance, GHCR, a release-asset
+/// host, a golden mirror an operator named with `PRELOOP_GOLDEN_URL`. Keying on
+/// the credential alone would park healthy traffic for an outage at another
+/// host, and let a success at the wrong host clear a real outage's streak.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GithubBreakerKey {
+    origin: String,
+    bucket: GithubCredentialBucket,
+}
+
+/// Registry of per-credential, per-origin breakers.
 ///
 /// Every outbound GitHub call resolves its credential's
-/// [`GithubCredentialBucket`] and uses that bucket's breaker, so unrelated
-/// rate-limit budgets never block each other while a genuine GitHub outage
-/// still parks every bucket that observes it.
+/// [`GithubCredentialBucket`] — and, when it reaches a service other than the
+/// engine's own GitHub origin, that origin — and uses that pair's breaker, so
+/// unrelated rate-limit budgets and unrelated hosts never block each other
+/// while a genuine GitHub outage still parks every bucket that observes it.
 #[derive(Debug)]
 pub struct GithubBreakerRegistry {
     config: BreakerConfig,
+    github_origin: String,
     inner: parking_lot::Mutex<BreakerRegistryInner>,
 }
 
@@ -448,15 +499,28 @@ const MAX_UNNAMED_INSTALLATION_BUCKETS: usize = 256;
 
 #[derive(Debug)]
 struct BreakerRegistryInner {
-    breakers: HashMap<GithubCredentialBucket, Arc<GithubBreaker>>,
-    /// Outstanding `InstallationToken` buckets, least recently used first.
-    unnamed: std::collections::VecDeque<GithubCredentialBucket>,
+    breakers: HashMap<GithubBreakerKey, Arc<GithubBreaker>>,
+    /// Outstanding `InstallationToken` partitions, least recently used first.
+    unnamed: std::collections::VecDeque<GithubBreakerKey>,
 }
 
 impl GithubBreakerRegistry {
     pub fn new(config: BreakerConfig) -> Self {
+        Self::for_origin(config, default_github_origin())
+    }
+
+    /// A registry whose bucket-keyed methods speak for `origin` — the GitHub
+    /// service the engine's own calls resolve to.
+    ///
+    /// [`GithubBreakerRegistry::new`] derives it from `PRELOOP_GITHUB_API_URL`
+    /// (else github.com's API); a caller that resolved the base from the config
+    /// file instead passes it here, so a GHES install never shares a partition
+    /// with the public API. Calls to any other host use
+    /// [`GithubBreakerRegistry::breaker_at`].
+    pub fn for_origin(config: BreakerConfig, origin: impl Into<String>) -> Self {
         Self {
             config,
+            github_origin: origin.into(),
             inner: parking_lot::Mutex::new(BreakerRegistryInner {
                 breakers: HashMap::new(),
                 unnamed: std::collections::VecDeque::new(),
@@ -464,20 +528,37 @@ impl GithubBreakerRegistry {
         }
     }
 
-    /// The breaker for `bucket`, creating it on first use. Breakers are never
-    /// removed except to bound the unnamed-installation set: the bucket set is
-    /// otherwise bounded (installations the server actually talks to), and
-    /// dropping one would lose its backoff streak.
+    /// The GitHub origin this registry's own calls speak for.
+    pub fn github_origin(&self) -> &str {
+        &self.github_origin
+    }
+
+    /// The breaker for `bucket` at the engine's own GitHub origin, creating it
+    /// on first use. Breakers are never removed except to bound the
+    /// unnamed-installation set: the key set is otherwise bounded
+    /// (installations and hosts the server actually talks to), and dropping one
+    /// would lose its backoff streak.
     pub fn breaker_for(&self, bucket: GithubCredentialBucket) -> Arc<GithubBreaker> {
+        let origin = self.github_origin.clone();
+        self.breaker_at(&origin, bucket)
+    }
+
+    /// The breaker for `bucket` at `origin` — for a call to a service that is
+    /// not the engine's GitHub origin (a mirror, a registry, a token realm).
+    pub fn breaker_at(&self, origin: &str, bucket: GithubCredentialBucket) -> Arc<GithubBreaker> {
+        let key = GithubBreakerKey {
+            origin: origin.to_owned(),
+            bucket,
+        };
         let mut inner = self.inner.lock();
-        if let Some(existing) = inner.breakers.get(&bucket).cloned() {
-            inner.touch_unnamed(bucket);
+        inner.touch_unnamed(&key);
+        if let Some(existing) = inner.breakers.get(&key).cloned() {
             return existing;
         }
         let breaker = Arc::new(GithubBreaker::new(self.config));
-        inner.breakers.insert(bucket, breaker.clone());
+        inner.breakers.insert(key.clone(), breaker.clone());
         if matches!(bucket, GithubCredentialBucket::InstallationToken(_)) {
-            inner.unnamed.push_back(bucket);
+            inner.unnamed.push_back(key);
             while inner.unnamed.len() > MAX_UNNAMED_INSTALLATION_BUCKETS {
                 if let Some(evicted) = inner.unnamed.pop_front() {
                     inner.breakers.remove(&evicted);
@@ -500,14 +581,29 @@ impl GithubBreakerRegistry {
     /// installation must not stop other installations' deliveries from being
     /// claimed, but a GitHub outage means every claim would burn an attempt.
     ///
+    /// Speaks for the engine's own GitHub origin
+    /// ([`GithubBreakerRegistry::github_origin`]) only: an outage at some other
+    /// host the process talks to — a GHES instance, a golden mirror — says
+    /// nothing about whether GitHub work is worth attempting.
+    ///
     /// A bucket whose window has elapsed but whose half-open probe is still
     /// running is still down. [`GithubBreaker::retry_after`] covers the probe;
     /// [`BreakerSnapshot::open`] covers only the window, so it cannot be used.
     pub fn unavailable_retry_after(&self) -> Option<Duration> {
+        let origin = self.github_origin.clone();
+        self.unavailable_retry_after_at(&origin)
+    }
+
+    /// [`GithubBreakerRegistry::unavailable_retry_after`] for `origin`:
+    /// GitHub-wide across the credentials that spend budget there, and only
+    /// there.
+    pub fn unavailable_retry_after_at(&self, origin: &str) -> Option<Duration> {
         self.inner
             .lock()
             .breakers
-            .values()
+            .iter()
+            .filter(|(key, _)| key.origin == origin)
+            .map(|(_, breaker)| breaker)
             .filter(|breaker| !breaker.snapshot().rate_limited)
             .filter_map(|breaker| breaker.retry_after())
             .min()
@@ -515,13 +611,22 @@ impl GithubBreakerRegistry {
 
     /// Per-bucket breaker state for the operational snapshot, in stable
     /// bucket-label order.
+    ///
+    /// Partitions at the engine's own origin keep the plain
+    /// [`GithubCredentialBucket::label`] the snapshots have always published;
+    /// a foreign origin is named after it, so an operator can tell which host a
+    /// parked bucket is parked for.
     pub fn snapshot(&self) -> Vec<GithubBucketSnapshot> {
         let inner = self.inner.lock();
         let mut snapshots: Vec<GithubBucketSnapshot> = inner
             .breakers
             .iter()
-            .map(|(bucket, breaker)| GithubBucketSnapshot {
-                bucket: bucket.label(),
+            .map(|(key, breaker)| GithubBucketSnapshot {
+                bucket: if key.origin == self.github_origin {
+                    key.bucket.label()
+                } else {
+                    format!("{}@{}", key.bucket.label(), key.origin)
+                },
                 breaker: breaker.snapshot(),
             })
             .collect();
@@ -531,18 +636,15 @@ impl GithubBreakerRegistry {
 }
 
 impl BreakerRegistryInner {
-    /// Move `bucket` to the most-recently-used end of the unnamed order.
-    fn touch_unnamed(&mut self, bucket: GithubCredentialBucket) {
-        if !matches!(bucket, GithubCredentialBucket::InstallationToken(_)) {
+    /// Move `key` to the most-recently-used end of the unnamed order.
+    fn touch_unnamed(&mut self, key: &GithubBreakerKey) {
+        if !matches!(key.bucket, GithubCredentialBucket::InstallationToken(_)) {
             return;
         }
-        if let Some(position) = self
-            .unnamed
-            .iter()
-            .position(|candidate| *candidate == bucket)
+        if let Some(position) = self.unnamed.iter().position(|candidate| candidate == key)
+            && let Some(key) = self.unnamed.remove(position)
         {
-            self.unnamed.remove(position);
-            self.unnamed.push_back(bucket);
+            self.unnamed.push_back(key);
         }
     }
 }
@@ -560,6 +662,34 @@ impl Default for GithubBreakerRegistry {
 pub struct GithubBucketSnapshot {
     pub bucket: String,
     pub breaker: BreakerSnapshot,
+}
+
+/// One process's outbound-GitHub funnel: the breaker registry every GitHub
+/// call is admitted through, together with the recorder its spend is
+/// attributed to.
+///
+/// The two travel as one value because a call admitted by one registry but
+/// accounted in another would report a budget it never spent. [`crate::state::AppState`]
+/// holds a funnel, and so does anything outside it that talks to GitHub on the
+/// engine's behalf — the runner pool downloads the packed golden over GitHub
+/// before a VM ever boots, and that traffic must resolve through the same
+/// breakers as the webhook path or a GitHub outage is discovered once per
+/// caller again. Cloning a funnel shares it; [`GithubFunnel::default`] builds a
+/// private one, which is what a caller with no engine to share with (the
+/// standalone one-shot CLI paths, tests) gets.
+#[derive(Debug, Clone)]
+pub struct GithubFunnel {
+    pub breakers: Arc<GithubBreakerRegistry>,
+    pub consumption: Arc<GithubConsumption>,
+}
+
+impl Default for GithubFunnel {
+    fn default() -> Self {
+        Self {
+            breakers: Arc::new(GithubBreakerRegistry::default()),
+            consumption: Arc::new(GithubConsumption::default()),
+        }
+    }
 }
 
 /// Classify a GitHub response status as a dependency failure.
@@ -702,6 +832,10 @@ pub enum GithubSubsystem {
     /// (`github_app.rs`), plus the one-time manifest code exchange that
     /// registers the App (`github.rs`).
     AppAuth,
+    /// Packed-golden provisioning in the orchestrator: the release listing,
+    /// the OCI manifest and token lookups, `.sha256` sidecars, and the golden
+    /// transfers themselves (`preloop-orchestrator/src/lib.rs`).
+    Golden,
     /// GitHub-compatible dispatch: auth validation and dispatch-target
     /// resolution (`dispatch_auth.rs`, `dispatch.rs`).
     Dispatch,
@@ -724,13 +858,14 @@ impl GithubSubsystem {
             GithubSubsystem::Workflows => "workflows",
             GithubSubsystem::Webhooks => "webhooks",
             GithubSubsystem::AppAuth => "app-auth",
+            GithubSubsystem::Golden => "golden",
             GithubSubsystem::Dispatch => "dispatch",
             GithubSubsystem::PushBack => "push-back",
             GithubSubsystem::Credentials => "credentials",
         }
     }
 
-    const ALL: [GithubSubsystem; 11] = [
+    const ALL: [GithubSubsystem; 12] = [
         GithubSubsystem::CheckRuns,
         GithubSubsystem::Actions,
         GithubSubsystem::RefResolve,
@@ -739,6 +874,7 @@ impl GithubSubsystem {
         GithubSubsystem::Workflows,
         GithubSubsystem::Webhooks,
         GithubSubsystem::AppAuth,
+        GithubSubsystem::Golden,
         GithubSubsystem::Dispatch,
         GithubSubsystem::PushBack,
         GithubSubsystem::Credentials,
@@ -886,11 +1022,13 @@ pub struct GithubSubsystemUsage {
 /// per-subsystem consumption accounting.
 ///
 /// This is the one funnel for outbound GitHub traffic: the breaker sees the
-/// whole dependency partitioned by credential (a 429 on installation A's
-/// action tarball parks installation A's check runs too, because the
-/// installation budget they share is what is actually exhausted — but
-/// installation B and the PAT keep flowing), and the accounting attributes
-/// every request, byte, and rate limit to the subsystem that caused it.
+/// whole dependency partitioned by credential *at the engine's own GitHub
+/// origin* (a 429 on installation A's action tarball parks installation A's
+/// check runs too, because the installation budget they share is what is
+/// actually exhausted — but installation B and the PAT keep flowing), and the
+/// accounting attributes every request, byte, and rate limit to the subsystem
+/// that caused it. Calls to any other host go through
+/// [`send_observed_labeled_at`], which adds that host to the partition.
 /// Response semantics are unchanged from [`send_observed`]: a 404 still
 /// means what it meant to the caller, it just also proves GitHub is up.
 ///
@@ -905,12 +1043,52 @@ pub async fn send_observed_labeled(
     subsystem: GithubSubsystem,
     request: reqwest::RequestBuilder,
 ) -> anyhow::Result<reqwest::Response> {
-    let breaker = registry.breaker_for(bucket);
+    let origin = registry.github_origin.clone();
+    send_observed_labeled_at(
+        registry,
+        &origin,
+        bucket,
+        consumption,
+        subsystem,
+        &[],
+        request,
+    )
+    .await
+}
+
+/// [`send_observed_labeled`] for a call to `origin`, with statuses the caller
+/// knows are protocol steps rather than verdicts.
+///
+/// `origin` is the service the request actually reaches
+/// ([`service_origin`]): the engine's own GitHub origin for a call to the
+/// configured API, or another host when the caller talks to one on GitHub's
+/// behalf — a golden mirror, a container registry, a token realm. Breaker state
+/// is per `(origin, bucket)`, so an outage or a rate limit at one host never
+/// parks traffic to another.
+///
+/// A status in `expect` is accounted and returned like any other, but it
+/// neither proves nor disproves reachability, so it leaves the breaker's
+/// failure streak alone. That is what keeps a multi-step protocol honest: the
+/// anonymous `Bearer` handshake answers the manifest request with `401` before
+/// it will hand out a token, and recording that expected challenge as a success
+/// would clear the streak the failing token endpoint accumulates, so the
+/// endpoint's outage would never trip the breaker.
+pub async fn send_observed_labeled_at(
+    registry: &GithubBreakerRegistry,
+    origin: &str,
+    bucket: GithubCredentialBucket,
+    consumption: &GithubConsumption,
+    subsystem: GithubSubsystem,
+    expect: &[axum::http::StatusCode],
+    request: reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    let breaker = registry.breaker_at(origin, bucket);
     if let Err(remaining) = breaker.acquire() {
         consumption.record_breaker_blocked(subsystem);
         tracing::debug!(
             subsystem = subsystem.as_str(),
             bucket = bucket.label(),
+            origin,
             retry_in_secs = remaining.as_secs(),
             "GitHub request refused without touching GitHub: circuit breaker open"
         );
@@ -922,6 +1100,15 @@ pub async fn send_observed_labeled(
         Ok(response) => {
             consumption.record_request(subsystem);
             let status = response.status();
+            if expect.contains(&status) {
+                // A protocol step, not a verdict about the dependency: the
+                // exchange still spent the host's budget, but it must not
+                // record a success — that would clear an accumulating failure
+                // streak (or close the breaker) on the strength of a challenge
+                // the caller expects to see before its real call is made.
+                breaker.observe_rate_budget(response.headers());
+                return Ok(response);
+            }
             let kind = breaker.observe_status(status, response.headers());
             if matches!(kind, Some(GithubFailureKind::RateLimited { .. })) {
                 consumption.record_rate_limited(subsystem);
@@ -1307,6 +1494,7 @@ mod tests {
                 "workflows",
                 "webhooks",
                 "app-auth",
+                "golden",
                 "dispatch",
                 "push-back",
                 "credentials"
@@ -1829,6 +2017,157 @@ mod tests {
         assert_eq!(
             refusal.to_string(),
             "GitHub circuit breaker is open (retry after 30s)"
+        );
+    }
+
+    #[test]
+    fn service_origin_names_the_host_and_only_a_real_port() {
+        assert_eq!(
+            service_origin("https://api.github.com/repos/preloopdev/preloop/releases"),
+            "api.github.com"
+        );
+        assert_eq!(
+            service_origin("https://API.GitHub.com:443/x"),
+            "api.github.com",
+            "a port that is only the scheme's default is the same service"
+        );
+        assert_eq!(
+            service_origin("http://127.0.0.1:8123/v2/x"),
+            "127.0.0.1:8123"
+        );
+        assert_eq!(
+            service_origin("https://ghcr.io/token?scope=x"),
+            "ghcr.io",
+            "the query names the token request, not the service"
+        );
+        // A configured base that is not a URL still names its own partition
+        // rather than collapsing into the default one.
+        assert_eq!(
+            service_origin("ghe.corp.example:8443"),
+            "ghe.corp.example:8443"
+        );
+        assert_eq!(service_origin(""), "");
+    }
+
+    /// Breaker state is per `(origin, bucket)`: an outage at one host must not
+    /// park another, and the GitHub-wide claim the webhook queue makes speaks
+    /// only for the engine's own GitHub origin.
+    #[test]
+    fn origins_do_not_share_a_partition() {
+        let registry = GithubBreakerRegistry::for_origin(test_config(), "api.github.com");
+        let anonymous = GithubCredentialBucket::Anonymous;
+        for _ in 0..3 {
+            registry
+                .breaker_at("ghcr.io", anonymous)
+                .record_failure(&GithubFailureKind::Unavailable, "503");
+        }
+        assert!(registry.breaker_at("ghcr.io", anonymous).is_open());
+        assert!(
+            registry.unavailable_retry_after_at("ghcr.io").is_some(),
+            "the host's own traffic is blocked"
+        );
+        assert!(
+            !registry.breaker_for(anonymous).is_open(),
+            "public GitHub is a different service and must keep flowing"
+        );
+        assert_eq!(
+            registry.unavailable_retry_after(),
+            None,
+            "a mirror outage says nothing about whether GitHub work is worth attempting"
+        );
+        let labels: Vec<String> = registry
+            .snapshot()
+            .into_iter()
+            .map(|snapshot| snapshot.bucket)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["anonymous", "anonymous@ghcr.io"],
+            "the engine's own partition keeps the published label; the foreign host is named"
+        );
+    }
+
+    /// A status the caller expects holds no verdict about reachability: it must
+    /// not clear the failure streak a real outage is building. This is the
+    /// anonymous `Bearer` handshake — a `401` challenge before the token
+    /// request that is the actual call.
+    #[tokio::test]
+    async fn expected_challenge_status_holds_no_verdict() {
+        let stub = StubGitHub::serve(
+            axum::http::StatusCode::UNAUTHORIZED,
+            vec![(
+                "www-authenticate".to_owned(),
+                "Bearer realm=\"x\"".to_owned(),
+            )],
+            "",
+        )
+        .await;
+        let origin = service_origin(&stub.base);
+        let registry = GithubBreakerRegistry::for_origin(test_config(), origin.clone());
+        let consumption = GithubConsumption::default();
+        let anonymous = GithubCredentialBucket::Anonymous;
+        let bucket = registry.breaker_for(anonymous);
+        for _ in 0..2 {
+            bucket.record_failure(&GithubFailureKind::Unavailable, "503");
+        }
+
+        let url = format!("{}/v2/x/y/manifests/latest", stub.base);
+        send_observed_labeled_at(
+            &registry,
+            &origin,
+            anonymous,
+            &consumption,
+            GithubSubsystem::Golden,
+            &[axum::http::StatusCode::UNAUTHORIZED],
+            crate::shared_http::CLIENT.get(&url),
+        )
+        .await
+        .expect("the challenge response itself is returned");
+
+        assert_eq!(
+            bucket.snapshot().consecutive_failures,
+            2,
+            "an expected challenge must not clear the streak the token endpoint is building"
+        );
+        // The third real failure is what trips it, exactly as it would have
+        // without the challenge in between.
+        bucket.record_failure(&GithubFailureKind::Unavailable, "503");
+        assert!(
+            bucket.is_open(),
+            "three failures with a challenge between them must still open the breaker"
+        );
+        assert_eq!(
+            consumption
+                .snapshot()
+                .into_iter()
+                .find(|usage| usage.subsystem == "golden")
+                .map(|usage| usage.requests),
+            Some(1),
+            "the challenge is still a completed exchange for accounting"
+        );
+
+        // The same 401 without the expectation is a success verdict, which is
+        // the behaviour that hid the token outage.
+        let cleared = GithubBreakerRegistry::for_origin(test_config(), origin.clone());
+        let cleared_bucket = cleared.breaker_for(anonymous);
+        for _ in 0..2 {
+            cleared_bucket.record_failure(&GithubFailureKind::Unavailable, "503");
+        }
+        send_observed_labeled_at(
+            &cleared,
+            &origin,
+            anonymous,
+            &GithubConsumption::default(),
+            GithubSubsystem::Golden,
+            &[],
+            crate::shared_http::CLIENT.get(&url),
+        )
+        .await
+        .expect("the 401 is returned");
+        assert_eq!(
+            cleared_bucket.snapshot().consecutive_failures,
+            0,
+            "an unannounced 401 is treated as reachability, as before"
         );
     }
 

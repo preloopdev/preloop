@@ -56,6 +56,14 @@ pub struct ServerConfig {
     /// Observability handle to clone into AppState (heartbeat, limits).
     /// `None` falls back to `Observability::noop()` (tests).
     pub observability: Option<preloop_observability::Observability>,
+    /// The engine's outbound-GitHub funnel (breaker registry + accounting).
+    ///
+    /// The embedding CLI supplies its own and hands the same one to the runner
+    /// pool, so the pool's golden downloads — which happen before any VM boots
+    /// — resolve through the breakers the webhook path already tripped;
+    /// `None` builds a private funnel (the standalone `preloop-server`
+    /// binary, tests).
+    pub github: Option<crate::github_breaker::GithubFunnel>,
     /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: refuse to dispatch any job without
     /// a recorded assignment, including to external runners.
     pub require_job_assignments: bool,
@@ -1488,6 +1496,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         config.state_dir.clone(),
         crate::config::config_path(),
         config.store_url.as_deref(),
+        config.github.clone(),
     )
     .await?;
     // Wire observability if supplied (CLI/server will pass its handle).

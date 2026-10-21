@@ -1353,7 +1353,7 @@ impl AppState {
     /// whole life, and lets tests point at a temp file without mutating
     /// process-wide environment state that other tests race against.
     pub async fn new_with_config(state_dir: PathBuf, config_path: PathBuf) -> anyhow::Result<Self> {
-        Self::new_with_store(state_dir, config_path, None).await
+        Self::new_with_store(state_dir, config_path, None, None).await
     }
 
     /// [`AppState::new_with_config`] against an explicit store URL.
@@ -1367,6 +1367,7 @@ impl AppState {
         state_dir: PathBuf,
         config_path: PathBuf,
         store_url: Option<&str>,
+        github: Option<crate::github_breaker::GithubFunnel>,
     ) -> anyhow::Result<Self> {
         // Test binaries share one process env: a sibling test mutating
         // `PRELOOP_STORE_URL` must not silently retarget a state built for a
@@ -1512,8 +1513,13 @@ impl AppState {
         let max_jobs_per_run = crate::config::max_jobs_per_run(&config)?;
         let diag_staging_max_age_seconds =
             crate::config::diag_staging_max_age_hours(&config)?.saturating_mul(3600);
-        let github_breakers = Arc::new(crate::github_breaker::GithubBreakerRegistry::default());
-        let github_consumption = Arc::new(crate::github_breaker::GithubConsumption::default());
+        // The process's outbound-GitHub funnel. The embedding engine supplies
+        // its own (`ServerConfig::github`) so the runner pool's golden
+        // downloads resolve through the same breakers and accounting as the
+        // webhook path; the standalone server and tests get a private one.
+        let github = github.unwrap_or_default();
+        let github_breakers = Arc::clone(&github.breakers);
+        let github_consumption = Arc::clone(&github.consumption);
         // Attached before `github_app` is cloned from the registry, so the
         // legacy field reports through the same breaker and accounting.
         let github_apps = crate::github_app::load_from(&config)?
