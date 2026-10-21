@@ -84,6 +84,22 @@ pub(crate) const GIT_WORK_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// hold that repository's cache lock against every other run.
 pub(crate) const GIT_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 
+/// Backstop for one run's whole snapshot capture: the merge attach, the local
+/// workspace capture, or the remote checkout fetch.
+///
+/// Every individual Git child is already bounded ([`GIT_CONTROL_TIMEOUT`],
+/// [`GIT_WORK_TIMEOUT`], [`GIT_TRANSFER_TIMEOUT`]), but a capture is a *chain*
+/// of them plus filesystem work, and a chain of bounded steps has no bound of
+/// its own. Ninety minutes sits far above the worst legitimate chain — a
+/// 30-minute transfer plus two 15-minute work commands plus headroom for
+/// pack/fsck and publishing — so a large repository never trips it, while a
+/// capture wedged on a filesystem or a lock held by a dead holder still ends
+/// and reports instead of pinning the submission forever. On expiry the run's
+/// staging trees are removed and the submission fails loudly; no jobs are
+/// queued against a snapshot that does not exist.
+pub(crate) const SNAPSHOT_CAPTURE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(90 * 60);
+
 /// Deadline for `du`, which the snapshot stats walk over a run-owned
 /// repository directory. A metadata walk of one repository, not of the state
 /// directory; a minute is generous and still finite.
@@ -456,6 +472,90 @@ fn snapshot_staging_root(snapshots_dir: &FsPath, run_id: RunId) -> PathBuf {
         .join(format!("{run_id}-{}", uuid::Uuid::new_v4()))
 }
 
+/// Boxed capture future.
+///
+/// The submit handler's own future is already one of the largest state
+/// machines in the crate; nesting a capture future inline inside it pushed
+/// debug-build tests over their stack limit. Boxing keeps the capture — and
+/// everything the merge, workspace, and remote paths allocate inline — on the
+/// heap instead of in the submit future.
+type CaptureFuture<'a, T> =
+    std::pin::Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
+
+/// Run one snapshot capture under a single overall deadline.
+///
+/// The outer `Err` is the deadline; the inner result is whatever the capture
+/// returned. Keeping them distinct matters for the remote checkout branch,
+/// which normally degrades to a direct forge checkout when its cache fetch
+/// fails: "the fetch errored" and "the capture never finished" are different
+/// answers, and queueing jobs against no snapshot silently changes what is
+/// tested.
+///
+/// Dropping the capture future is what stops its children: every Git command
+/// runs through the deadline runners, whose process-group guard SIGKILLs the
+/// whole group, so a hung fetch cannot keep writing into a cache after the
+/// submission is answered.
+///
+/// Cleanup is bounded by [`SNAPSHOT_CAPTURE_CLEANUP_GRACE`] so a wedged
+/// filesystem cannot extend the submission past the deadline. A filesystem
+/// operation already handed to the blocking pool cannot be cancelled; when
+/// cleanup does not finish in the grace period, the named leftovers are left
+/// for the startup sweep rather than awaited forever.
+pub(crate) async fn capture_snapshot_within<T>(
+    state_dir: &FsPath,
+    run_id: RunId,
+    deadline: std::time::Duration,
+    capture: CaptureFuture<'_, T>,
+) -> Result<Result<T, ApiError>, ApiError> {
+    capture_snapshot_within_with_cleanup(
+        state_dir,
+        run_id,
+        deadline,
+        SNAPSHOT_CAPTURE_CLEANUP_GRACE,
+        capture,
+    )
+    .await
+}
+
+async fn capture_snapshot_within_with_cleanup<T>(
+    state_dir: &FsPath,
+    run_id: RunId,
+    deadline: std::time::Duration,
+    cleanup_grace: std::time::Duration,
+    capture: CaptureFuture<'_, T>,
+) -> Result<Result<T, ApiError>, ApiError> {
+    match tokio::time::timeout(deadline, capture).await {
+        Ok(result) => Ok(result),
+        Err(_) => {
+            if tokio::time::timeout(
+                cleanup_grace,
+                discard_unaccepted_snapshot_run(state_dir, run_id),
+            )
+            .await
+            .is_err()
+            {
+                warn!(
+                    %run_id,
+                    grace_ms = cleanup_grace.as_millis() as u64,
+                    "Snapshot cleanup exceeded its grace period; leftover trees are left for the startup sweep"
+                );
+            }
+            let deadline_text = if deadline.as_secs() >= 60 && deadline.as_secs().is_multiple_of(60)
+            {
+                format!("{} minute", deadline.as_secs() / 60)
+            } else {
+                format!("{deadline:?}")
+            };
+            Err(ApiError::internal(format!(
+                "snapshot capture for run {run_id} exceeded the {deadline_text} engine deadline \
+                 and was aborted; no jobs were queued. A Git operation or filesystem publish is \
+                 stuck: check the engine log for the last snapshot warning, free space under \
+                 the state directory and verify the forge is reachable, then re-submit the run.",
+            )))
+        }
+    }
+}
+
 /// Capture `workspace` as an immutable cache-backed bare repository for `run_id`.
 ///
 /// A private index and a temporary bare object database keep the user's index,
@@ -534,6 +634,10 @@ pub async fn create_workspace_snapshot(
             }
         }
     });
+    // Blocking copies inside the capture cannot be cancelled once spawned.
+    // Register them against this staging tree so a timed-out capture waits
+    // for them to drain before removing the tree.
+    let blocking = register_capture_blocking(staging_root.clone());
 
     // Detect the workspace's GitHub upstream concurrently with snapshot
     // creation. Best-effort: a missing remote or unresolvable slug leaves
@@ -564,6 +668,7 @@ pub async fn create_workspace_snapshot(
             merge,
             origin_url.as_deref(),
             forge_host.as_deref(),
+            blocking.tracker(),
         ),
         detect_workspace_upstream(&workspace, shared, github_pat),
     );
@@ -610,6 +715,18 @@ pub async fn create_workspace_snapshot(
         repository = %final_repository.display(),
         "Created immutable workspace snapshot"
     );
+    // Best-effort ceiling enforcement after a successful capture: the cache
+    // lock was released when `ensure_object_cache` returned, and this run's
+    // published snapshot now pins the entries it alternates to. Single-flight
+    // per state directory, acquired before the spawn so an aborted task cannot
+    // wedge the guard; a burst of submissions coalesces into one sweep.
+    if let Some(shared) = shared {
+        crate::snapshots::spawn_snapshot_object_cache_sweep(
+            &shared.state.snapshot_object_cache_sweep,
+            state_dir.to_owned(),
+            shared.state.snapshot_object_cache_max_bytes,
+        );
+    }
     Ok(WorkspaceSnapshot {
         commit_sha,
         tree_sha,
@@ -1344,6 +1461,7 @@ async fn create_workspace_snapshot_inner(
     merge: Option<&crate::merge_builder::LocalPullRequestMerge>,
     origin_url: Option<&str>,
     forge_host: Option<&str>,
+    blocking: Arc<CaptureBlocking>,
 ) -> Result<SnapshotResult, ApiError> {
     // Creating the staging repository does not depend on anything we learn
     // from the workspace, so pay for both spawns at once. Every millisecond
@@ -1387,6 +1505,10 @@ async fn create_workspace_snapshot_inner(
         index: cache_index,
         refreshed: cache_refreshed,
         ancestry_complete,
+        // Named so it lives until this function returns — i.e. until after
+        // the alternates file below is written and the snapshot references
+        // the cache. `_` would drop it immediately.
+        pin: _cache_pin,
     } = cache;
 
     // A shallow workspace ends its history at the commits listed in its
@@ -2055,9 +2177,9 @@ async fn create_workspace_snapshot_inner(
 
     // Preserve any local Git LFS object store so `actions/checkout` with
     // `lfs: true` can download through the snapshot Git HTTP endpoint.
-    copy_lfs_objects_into_snapshot(&common_dir, staging_repository).await?;
+    copy_lfs_objects_into_snapshot(&common_dir, staging_repository, &blocking).await?;
 
-    publish_staged_repository(staging_repository, final_repository).await?;
+    publish_staged_repository(staging_repository, final_repository, &blocking).await?;
     Ok(SnapshotResult {
         commit_sha,
         // The snapshot commit's tree — the exact staged dirty tree CI tests,
@@ -2080,7 +2202,11 @@ async fn create_workspace_snapshot_inner(
 /// directory, a future caller) is copied into the destination directory and
 /// renamed from there, which keeps the atomicity while paying for a copy
 /// instead of failing every run.
-async fn publish_staged_repository(staging: &FsPath, destination: &FsPath) -> Result<(), ApiError> {
+async fn publish_staged_repository(
+    staging: &FsPath,
+    destination: &FsPath,
+    blocking: &Arc<CaptureBlocking>,
+) -> Result<(), ApiError> {
     match rename_staged(staging, destination).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
@@ -2103,11 +2229,15 @@ async fn publish_staged_repository(staging: &FsPath, destination: &FsPath) -> Re
                 .join(format!(".publish-{}", uuid::Uuid::new_v4()));
             let source = staging.to_path_buf();
             let staged = in_place.clone();
-            let copied = tokio::task::spawn_blocking(move || copy_dir_recursive(&source, &staged))
-                .await
-                .map_err(|error| {
-                    ApiError::internal(format!("snapshot publish copy task failed: {error}"))
-                })?;
+            let work = blocking.guard(staging.parent().unwrap_or(staging));
+            let copied = tokio::task::spawn_blocking(move || {
+                let _work = work;
+                copy_dir_recursive(&source, &staged)
+            })
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("snapshot publish copy task failed: {error}"))
+            })?;
             if let Err(error) = copied {
                 let _ = tokio::fs::remove_dir_all(&in_place).await;
                 return Err(publish_failure(
@@ -2369,6 +2499,7 @@ fn snapshot_git_command(
 async fn copy_lfs_objects_into_snapshot(
     source_common_dir: &FsPath,
     staging_repository: &FsPath,
+    blocking: &Arc<CaptureBlocking>,
 ) -> Result<(), ApiError> {
     let source = source_common_dir.join("lfs");
     if !source.is_dir() {
@@ -2377,16 +2508,20 @@ async fn copy_lfs_objects_into_snapshot(
     let destination = staging_repository.join("lfs");
     let source_owned = source.clone();
     let destination_owned = destination.clone();
-    tokio::task::spawn_blocking(move || copy_dir_recursive(&source_owned, &destination_owned))
-        .await
-        .map_err(|error| ApiError::internal(format!("Git LFS copy task failed: {error}")))?
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "failed to copy Git LFS objects from {} into {}: {error}",
-                source.display(),
-                destination.display()
-            ))
-        })
+    let work = blocking.guard(staging_repository.parent().unwrap_or(staging_repository));
+    tokio::task::spawn_blocking(move || {
+        let _work = work;
+        copy_dir_recursive(&source_owned, &destination_owned)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Git LFS copy task failed: {error}")))?
+    .map_err(|error| {
+        ApiError::internal(format!(
+            "failed to copy Git LFS objects from {} into {}: {error}",
+            source.display(),
+            destination.display()
+        ))
+    })
 }
 
 fn copy_dir_recursive(source: &FsPath, destination: &FsPath) -> std::io::Result<()> {
@@ -3105,6 +3240,12 @@ struct ObjectCache {
     /// shallow boundary. False means the snapshot must rewrite history to
     /// serve a complete graph, at the cost of changing every sha.
     ancestry_complete: bool,
+    /// Ownership pin held from the moment the cache lock is released until
+    /// the snapshot's alternates file is published. Eviction takes the same
+    /// cache lock and refuses to retire a pinned entry, which closes the
+    /// window where a just-refreshed cache has no alternates pointing at it
+    /// yet.
+    pin: CachePin,
 }
 
 /// Whether the snapshot object cache holds `sha` as a commit.
@@ -3326,11 +3467,17 @@ async fn ensure_object_cache(
     }
     let mut index = repository.as_os_str().to_owned();
     index.push(".index");
+    // Created while the cache lock is still held (the guard lives to the end
+    // of this function): from here until the snapshot's alternates file is
+    // written, the entry is protected by this pin rather than by a reference.
+    // Eviction takes the same lock, so it either sees the pin or the lock.
+    let pin = CachePin::create(&root, &key)?;
     Ok(ObjectCache {
         objects,
         index: PathBuf::from(index),
         refreshed,
         ancestry_complete,
+        pin,
     })
 }
 
@@ -3612,6 +3759,11 @@ struct CacheLock {
 /// age means "abandoned".
 const LOCK_HEARTBEAT: &str = "preloop-lock-heartbeat";
 
+/// How long a lock may go without a heartbeat before it is treated as
+/// abandoned: takeover in [`acquire_cache_lock`], and the size sweep's
+/// permission to evict in [`prune_snapshot_object_cache`].
+const CACHE_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Drop a finished run's snapshot repository.
 ///
 /// The repository exists so the run's checkouts can fetch the workspace; once
@@ -3838,6 +3990,293 @@ async fn sweep_abandoned_snapshot_staging(snapshots_dir: &FsPath) {
     }
 }
 
+/// In-flight blocking filesystem work for one capture's staging tree.
+///
+/// Two capture steps run on the blocking pool — copying Git LFS objects into
+/// the staging repository, and the cross-device publish fallback — and
+/// dropping the capture future does **not** stop an already-spawned blocking
+/// task. A timeout cleanup that removed the staging tree immediately could
+/// therefore race a copy that recreates files behind `remove_dir_all`. The
+/// tracker is registered when the staging tree is created and consulted by
+/// [`remove_snapshot_staging_for_run`], which waits (bounded) for it to
+/// drain first.
+struct CaptureBlocking {
+    in_flight: std::sync::atomic::AtomicUsize,
+    owner_alive: std::sync::atomic::AtomicBool,
+    idle: tokio::sync::Notify,
+}
+
+impl CaptureBlocking {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            owner_alive: std::sync::atomic::AtomicBool::new(true),
+            idle: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Mark one blocking task as running until the returned guard drops.
+    fn guard(self: &Arc<Self>, path: &FsPath) -> BlockingWorkGuard {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        BlockingWorkGuard {
+            path: path.to_owned(),
+            blocking: Arc::clone(self),
+        }
+    }
+
+    async fn wait_idle(&self) {
+        while self.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            self.idle.notified().await;
+        }
+    }
+}
+
+/// Live trackers keyed by staging root.
+static CAPTURE_BLOCKING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<CaptureBlocking>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Registration of one capture's tracker. Dropping it marks the owner gone;
+/// the entry survives while blocking work is still in flight so the timeout
+/// cleanup can find it.
+struct CaptureBlockingRegistration {
+    path: PathBuf,
+    blocking: Arc<CaptureBlocking>,
+}
+
+impl CaptureBlockingRegistration {
+    fn tracker(&self) -> Arc<CaptureBlocking> {
+        Arc::clone(&self.blocking)
+    }
+}
+
+impl Drop for CaptureBlockingRegistration {
+    fn drop(&mut self) {
+        self.blocking
+            .owner_alive
+            .store(false, std::sync::atomic::Ordering::Release);
+        if self
+            .blocking
+            .in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            unregister_capture_blocking(&self.path, &self.blocking);
+        }
+    }
+}
+
+/// Guard for one blocking task; decremented even if the task's join handle
+/// was dropped by a cancelled capture.
+struct BlockingWorkGuard {
+    path: PathBuf,
+    blocking: Arc<CaptureBlocking>,
+}
+
+impl Drop for BlockingWorkGuard {
+    fn drop(&mut self) {
+        if self
+            .blocking
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.blocking.idle.notify_one();
+            if !self
+                .blocking
+                .owner_alive
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                unregister_capture_blocking(&self.path, &self.blocking);
+            }
+        }
+    }
+}
+
+fn register_capture_blocking(path: PathBuf) -> CaptureBlockingRegistration {
+    let blocking = CaptureBlocking::new();
+    if let Ok(mut map) = CAPTURE_BLOCKING.lock() {
+        map.insert(path.clone(), Arc::clone(&blocking));
+    }
+    CaptureBlockingRegistration { path, blocking }
+}
+
+fn unregister_capture_blocking(path: &FsPath, blocking: &Arc<CaptureBlocking>) {
+    if let Ok(mut map) = CAPTURE_BLOCKING.lock()
+        && map
+            .get(path)
+            .is_some_and(|current| Arc::ptr_eq(current, blocking))
+    {
+        map.remove(path);
+    }
+}
+
+/// Whether this staging tree's blocking work has drained, waiting at most
+/// `wait`.
+async fn capture_blocking_drained(path: &FsPath, wait: std::time::Duration) -> bool {
+    let blocking = CAPTURE_BLOCKING
+        .lock()
+        .ok()
+        .and_then(|map| map.get(path).cloned());
+    let Some(blocking) = blocking else {
+        return true;
+    };
+    tokio::time::timeout(wait, blocking.wait_idle())
+        .await
+        .is_ok()
+}
+
+/// How long post-deadline cleanup may run in total: enumerating this run's
+/// staging trees, waiting for blocking copies, and removing the staging and
+/// unaccepted run-local repositories. A filesystem already wedged enough to
+/// trip the capture deadline must not extend the submission much past it.
+const SNAPSHOT_CAPTURE_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Portion of the cleanup grace spent waiting for an in-flight blocking copy
+/// (LFS staging copy, cross-device publish copy) to finish. A copy cannot be
+/// cancelled; if it outlives this, the tree is left for the startup sweep.
+const SNAPSHOT_CAPTURE_CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Test-only stall injected at the start of timeout cleanup, so the bounded
+/// cleanup path can be exercised deterministically on a healthy filesystem.
+#[cfg(test)]
+static CAPTURE_CLEANUP_STALL: std::sync::Mutex<Option<std::time::Duration>> =
+    std::sync::Mutex::new(None);
+
+/// Remove every staging tree this run owns.
+///
+/// Returns `false` when ownership is uncertain: an enumeration failure, a
+/// blocking copy that did not drain, or a removal that failed. The caller must
+/// then leave this run's final repository alone as well.
+///
+/// The startup sweep is age-gated on purpose: an unreadable or young tree may
+/// belong to a live capture. A timed-out capture knows better about its own
+/// trees, so it removes exactly the `<run_id>-*` entries and leaves other
+/// runs' in-flight staging alone. Naming matches [`snapshot_staging_root`].
+pub(crate) async fn remove_snapshot_staging_for_run(state_dir: &FsPath, run_id: RunId) -> bool {
+    #[cfg(test)]
+    if let Some(stall) = CAPTURE_CLEANUP_STALL.lock().ok().and_then(|stall| *stall) {
+        tokio::time::sleep(stall).await;
+    }
+    let root = state_dir.join("snapshots").join(SNAPSHOT_STAGING_DIR);
+    let prefix = format!("{run_id}-");
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(error) => {
+            warn!(
+                path = %root.display(),
+                %error,
+                "Failed to list snapshot staging directories for timed-out cleanup"
+            );
+            return false;
+        }
+    };
+    let mut removed = 0usize;
+    let mut uncertain = false;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(
+                    path = %root.display(),
+                    %error,
+                    "Failed to read entry during timed-out snapshot staging cleanup"
+                );
+                uncertain = true;
+                break;
+            }
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        // A blocking copy spawned by the capture cannot be cancelled; wait
+        // for it to drain before deleting the tree it may still be writing.
+        // If it does not drain, leave the tree to the startup sweep rather
+        // than racing `remove_dir_all` against it.
+        if !capture_blocking_drained(&path, SNAPSHOT_CAPTURE_CLEANUP_WAIT).await {
+            warn!(
+                path = %path.display(),
+                "Snapshot staging copy is still running after the capture deadline; leaving the tree for the startup sweep"
+            );
+            uncertain = true;
+            continue;
+        }
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    %error,
+                    "Failed to remove timed-out snapshot staging directory"
+                );
+                uncertain = true;
+            }
+        }
+    }
+    if removed > 0 {
+        info!(
+            %run_id,
+            removed,
+            "Removed timed-out snapshot staging directories"
+        );
+    }
+    !uncertain
+}
+
+/// Remove the run-local artifacts of a submission that was never accepted.
+///
+/// Called only from the capture deadline, before `backend.submit_run` creates
+/// a run row: the run id is unique to this submission and no accepted run can
+/// own `snapshots/<run_id>`. The staging trees are removed first and their
+/// ownership verdict gates the final repository, because a still-running
+/// blocking copy is the only writer that can target this run's tree. Shared
+/// `checkout-cache` repositories are never touched. Anything uncertain is
+/// left, named by `run_id`, for the startup sweep.
+pub(crate) async fn discard_unaccepted_snapshot_run(state_dir: &FsPath, run_id: RunId) {
+    if !remove_snapshot_staging_for_run(state_dir, run_id).await {
+        warn!(
+            %run_id,
+            "Leaving this run's published repository for the startup sweep: staging ownership is uncertain"
+        );
+        return;
+    }
+    let repository = state_dir.join("snapshots").join(run_id.to_string());
+    match tokio::fs::symlink_metadata(&repository).await {
+        Ok(metadata) if metadata.is_dir() => match tokio::fs::remove_dir_all(&repository).await {
+            Ok(()) => info!(
+                %run_id,
+                path = %repository.display(),
+                "Removed an unaccepted run's published snapshot repository"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                path = %repository.display(),
+                %error,
+                "Failed to remove an unaccepted run's published snapshot repository; leaving it for the startup sweep"
+            ),
+        },
+        // A symlink or unexpected file is not ours to chase.
+        Ok(_) => warn!(
+            path = %repository.display(),
+            "Unaccepted snapshot path is not a directory; leaving it for the operator"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            path = %repository.display(),
+            %error,
+            "Cannot inspect the unaccepted snapshot path; leaving it for the startup sweep"
+        ),
+    }
+}
+
 /// Marker file recording when a run-scoped cache became releasable.
 const RELEASED_MARKER: &str = "preloop-released-at";
 
@@ -4003,6 +4442,504 @@ pub async fn prune_checkout_cache(state_dir: &FsPath, config: &crate::config::Ch
     }
 }
 
+/// Single-flight ownership of the snapshot object cache sweep for one engine
+/// state directory.
+///
+/// Held by [`AppState::snapshot_object_cache_sweep`], so two engines (or two
+/// test states) never suppress each other: exclusion is scoped to this state
+/// directory, not the process.
+///
+/// The counter covers the sweep task *and* every detached blocking disk walk
+/// it starts. A cancelled sweep therefore cannot be replaced while one of its
+/// `spawn_blocking` walks is still running; the walk's own guard keeps the
+/// counter non-zero until the blocking closure returns. There is no queue: a
+/// request that arrives while any sweep or walk is active is simply skipped.
+#[derive(Default)]
+pub struct SnapshotObjectCacheSweep {
+    active: std::sync::atomic::AtomicUsize,
+}
+
+impl SnapshotObjectCacheSweep {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Take the sweep permit. Call this *before* spawning the sweep task so a
+    /// task aborted before its first poll cannot leave the flag stuck.
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<SnapshotObjectCacheSweepPermit> {
+        if self
+            .active
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            Some(SnapshotObjectCacheSweepPermit {
+                sweep: Arc::clone(self),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Extra ownership for one detached blocking walk.
+    fn walk(self: &Arc<Self>) -> SnapshotObjectCacheWalk {
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        SnapshotObjectCacheWalk {
+            sweep: Arc::clone(self),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+}
+
+/// Permit for the exclusive sweep itself.
+pub(crate) struct SnapshotObjectCacheSweepPermit {
+    sweep: Arc<SnapshotObjectCacheSweep>,
+}
+
+impl Drop for SnapshotObjectCacheSweepPermit {
+    fn drop(&mut self) {
+        self.sweep
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Ownership held inside a blocking walk, outliving the async sweep if it is
+/// cancelled and the `spawn_blocking` closure keeps running.
+struct SnapshotObjectCacheWalk {
+    sweep: Arc<SnapshotObjectCacheSweep>,
+}
+
+impl Drop for SnapshotObjectCacheWalk {
+    fn drop(&mut self) {
+        self.sweep
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Spawn a post-startup/post-capture sweep if none is active.
+///
+/// Returns whether a task was spawned. The permit is acquired before the
+/// spawn and moved into the task, so dropping the task (including before its
+/// first poll) releases it.
+pub(crate) fn spawn_snapshot_object_cache_sweep(
+    sweep: &Arc<SnapshotObjectCacheSweep>,
+    state_dir: PathBuf,
+    max_bytes: u64,
+) -> bool {
+    let Some(permit) = sweep.try_acquire() else {
+        return false;
+    };
+    let sweep = Arc::clone(sweep);
+    tokio::spawn(async move {
+        let _permit = permit;
+        prune_snapshot_object_cache(&state_dir, max_bytes, &sweep).await;
+    });
+    true
+}
+
+/// Enforce the shared snapshot object cache's size ceiling.
+///
+/// The cache is one bare repository per workspace identity:
+/// `<state>/snapshot-object-cache/<key>.git`, with `<key>.last-head` and
+/// `<key>.index` beside it. Auto-GC is disabled inside each entry on purpose,
+/// because a run's snapshot alternates to it and collection underneath a live
+/// checkout breaks that checkout; this sweep is the only thing that reclaims
+/// space.
+///
+/// Eviction is not a bare check-then-delete. Every candidate is retired under
+/// the *same* per-entry cache lock [`ensure_object_cache`] refreshes under,
+/// and only after re-checking, while that lock is held:
+///
+/// - no capture pin exists (`<key>.pin-*`). A capture creates its pin before
+///   releasing the refresh lock and drops it only after its snapshot's
+///   alternates file is written, so "no pin" means no capture is in the
+///   refresh-to-publication window;
+/// - no `objects/info/alternates` pointer under `snapshots/<run>/` or
+///   `snapshots/.staging/<run>-*/` references the entry. Real paths are
+///   compared, so a symlinked state directory still matches. The scan is
+///   repeated under the lock because the pre-scan may predate a publication
+///   whose pin has since been dropped.
+///
+/// A capture in progress holds the lock or a pin, so a busy entry is simply
+/// skipped rather than waited for. Entries are evicted whole (repository plus
+/// its persisted `.last-head`/`.index` sidecars), oldest mtime first, until
+/// the counted total is under `max_bytes`; the total includes those sidecars,
+/// and a partial removal subtracts only what was actually removed.
+/// `max_bytes == 0` disables the sweep.
+///
+/// `sweep` carries the per-state-directory single-flight ownership and keeps
+/// the exclusive claim alive across detached blocking size walks.
+///
+/// Caveat: [`ensure_object_cache`] seeds an entry with `git clone --local`,
+/// which hardlinks objects when workspace and state share a filesystem.
+/// [`directory_bytes`] counts each link at its apparent size, so both the
+/// counted total and the bytes an eviction appears to reclaim are a soft
+/// ceiling while the workspace's own object store still holds the same inodes.
+pub async fn prune_snapshot_object_cache(
+    state_dir: &FsPath,
+    max_bytes: u64,
+    sweep: &Arc<SnapshotObjectCacheSweep>,
+) {
+    if max_bytes == 0 {
+        return;
+    }
+    let root = state_dir.join("snapshot-object-cache");
+    let snapshots_dir = state_dir.join("snapshots");
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warn!(
+                path = %root.display(),
+                %error,
+                "Failed to scan snapshot object cache"
+            );
+            return;
+        }
+    };
+    // A conservative snapshot for the cheap "definitely referenced" skip. A
+    // candidate not in this set is re-checked under its lock below. An
+    // unknowable set aborts the sweep: deleting from a partial view is how a
+    // live run's cache disappears.
+    let Some(referenced) = snapshot_object_cache_references(&snapshots_dir).await else {
+        warn!(
+            path = %snapshots_dir.display(),
+            "Cannot enumerate snapshot alternates; skipping snapshot object cache eviction"
+        );
+        return;
+    };
+    let mut sized: Vec<SnapshotObjectCacheEntry> = Vec::new();
+    let mut total: u64 = 0;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(
+                    path = %root.display(),
+                    %error,
+                    "Failed to read snapshot object cache entry"
+                );
+                break;
+            }
+        };
+        let path = entry.path();
+        let Some(key) = cache_entry_key(&path).map(str::to_owned) else {
+            continue;
+        };
+        // The walk runs in the blocking pool and outlives a cancelled sweep;
+        // its guard keeps a replacement sweep out until it finishes.
+        let (repository_bytes, sidecars) = {
+            let path = path.clone();
+            let walk = sweep.walk();
+            tokio::task::spawn_blocking(move || {
+                let _walk = walk;
+                (
+                    directory_bytes(&path),
+                    snapshot_object_cache_sidecars(&path, &key),
+                )
+            })
+            .await
+            .unwrap_or_default()
+        };
+        let sidecar_bytes: u64 = sidecars.iter().map(|(_, bytes)| *bytes).sum();
+        total = total
+            .saturating_add(repository_bytes)
+            .saturating_add(sidecar_bytes);
+        let age = entry_age(&path).await.unwrap_or_default();
+        sized.push(SnapshotObjectCacheEntry {
+            path,
+            repository_bytes,
+            sidecars,
+            age,
+        });
+    }
+    if total <= max_bytes {
+        return;
+    }
+    // Oldest first: a cache nobody has touched recently is the cheapest one
+    // to lose, and every eviction only costs the next snapshot of that
+    // workspace one local clone.
+    sized.sort_by_key(|entry| std::cmp::Reverse(entry.age));
+    let mut evicted = 0usize;
+    for entry in sized {
+        if total <= max_bytes {
+            break;
+        }
+        let path = entry.path;
+        let Some(key) = cache_entry_key(&path) else {
+            continue;
+        };
+        // Same exclusion as a refresh. A capture that already released it
+        // holds a pin, checked next; one that still holds it makes this try
+        // fail and the entry is left for a later sweep.
+        let Some(_guard) = try_acquire_cache_lock(&root.join(format!("{key}.lock"))) else {
+            continue;
+        };
+        if snapshot_object_cache_entry_is_pinned(&root, key).await {
+            continue;
+        }
+        let entry_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if snapshot_object_cache_references_contain(&referenced, &entry_path) {
+            continue;
+        }
+        // The pre-scan may predate a capture that published its alternates
+        // and dropped its pin just before this lock was acquired. A fresh view
+        // that cannot be established must not be treated as empty.
+        let Some(fresh) = snapshot_object_cache_references(&snapshots_dir).await else {
+            warn!(
+                path = %snapshots_dir.display(),
+                "Cannot re-check snapshot alternates; leaving the object cache intact"
+            );
+            break;
+        };
+        if snapshot_object_cache_references_contain(&fresh, &entry_path) {
+            continue;
+        }
+        let removed =
+            remove_snapshot_object_cache_entry(&path, entry.repository_bytes, &entry.sidecars)
+                .await;
+        if removed > 0 {
+            total = total.saturating_sub(removed);
+            evicted += 1;
+        }
+    }
+    if evicted > 0 {
+        info!(
+            evicted,
+            remaining_bytes = total,
+            max_bytes,
+            "Evicted snapshot object cache entries"
+        );
+    }
+}
+
+/// One measured cache entry: repository bytes, owned sidecar bytes, and age.
+struct SnapshotObjectCacheEntry {
+    path: PathBuf,
+    repository_bytes: u64,
+    sidecars: Vec<(PathBuf, u64)>,
+    age: std::time::Duration,
+}
+
+/// Persisted files an entry owns beside `<key>.git`, with their byte sizes.
+///
+/// These count against the ceiling: an index scales with the tracked file
+/// count and path lengths, and leaving it out made the sweep report a total
+/// well below what the cache directory actually held. Pins and locks are
+/// deliberately absent — they protect entries and are not part of one.
+fn snapshot_object_cache_sidecars(path: &FsPath, key: &str) -> Vec<(PathBuf, u64)> {
+    [".last-head", ".index"]
+        .into_iter()
+        .map(|suffix| path.with_file_name(format!("{key}{suffix}")))
+        .map(|path| {
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            (path, bytes)
+        })
+        .collect()
+}
+
+/// Cache key of an entry path named `<key>.git`.
+fn cache_entry_key(path: &FsPath) -> Option<&str> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".git"))
+}
+
+/// Real paths referenced as Git alternates by a snapshot repository, live or
+/// staging.
+///
+/// A published snapshot keeps its alternates at
+/// `snapshots/<run>/objects/info/alternates`; a capture in progress keeps its
+/// repository one level down, at `snapshots/.staging/<run>-<uuid>/repository.git/`.
+/// Both layouts are read so the sweep sees the reference as soon as it exists.
+///
+/// `None` means the reference set could not be established. Eviction is
+/// destructive, so an unreadable directory or alternates file (anything but a
+/// proven "this layout is absent") must skip the sweep rather than be treated
+/// as "no references": a partial set would delete a cache a live run needs.
+async fn snapshot_object_cache_references(snapshots_dir: &FsPath) -> Option<Vec<PathBuf>> {
+    let mut referenced = Vec::new();
+    let mut alternate_files = Vec::new();
+    // Published snapshots.
+    match tokio::fs::read_dir(snapshots_dir).await {
+        Ok(mut entries) => loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    alternate_files.push(entry.path().join("objects/info/alternates"))
+                }
+                Ok(None) => break,
+                Err(_) => return None,
+            }
+        },
+        // No snapshots at all: nothing can reference the cache.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    // Captures in progress. Accept both the nested staging repository and a
+    // directly staged one so a future layout change cannot silently unprotect
+    // the entry.
+    match tokio::fs::read_dir(snapshots_dir.join(SNAPSHOT_STAGING_DIR)).await {
+        Ok(mut entries) => loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let root = entry.path();
+                    alternate_files.push(root.join("repository.git/objects/info/alternates"));
+                    alternate_files.push(root.join("objects/info/alternates"));
+                }
+                Ok(None) => break,
+                Err(_) => return None,
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    for file in alternate_files {
+        let contents = match tokio::fs::read_to_string(&file).await {
+            Ok(contents) => contents,
+            // This layout has no alternates file: no reference from it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // The file exists but cannot be read: the reference set is
+            // unknown, not empty.
+            Err(_) => return None,
+        };
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match std::fs::canonicalize(line) {
+                Ok(real) => referenced.push(real),
+                // A dangling alternate points at nothing live.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                // Cannot prove what this line names.
+                Err(_) => return None,
+            }
+        }
+    }
+    Some(referenced)
+}
+
+/// Whether any collected alternate points inside `entry`.
+fn snapshot_object_cache_references_contain(referenced: &[PathBuf], entry: &FsPath) -> bool {
+    referenced
+        .iter()
+        .any(|alternate| alternate.starts_with(entry))
+}
+
+/// Whether a capture pin protects `key`.
+///
+/// Called with the entry's cache lock held, so a new pin cannot appear while
+/// this runs. A pin older than the aggregate capture deadline plus the lock
+/// staleness bound cannot belong to a live capture (the whole capture is
+/// bounded) and is removed as a crash leftover; it only ever delayed eviction.
+async fn snapshot_object_cache_entry_is_pinned(root: &FsPath, key: &str) -> bool {
+    let prefix = cache_pin_prefix(key);
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        // Unreadable pin evidence is not permission to delete.
+        Err(_) => return true,
+    };
+    // A pin younger than the aggregate capture deadline plus the staging
+    // grace cannot be a crash leftover: the whole capture is bounded by that
+    // deadline on the submit path, and the grace covers scheduling and clock
+    // skew. Anything older only ever delayed eviction.
+    let stale_after = SNAPSHOT_CAPTURE_TIMEOUT + SNAPSHOT_STAGING_GRACE;
+    let mut pinned = false;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            // A partial pin listing is not permission to delete either.
+            Err(_) => return true,
+        };
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        let age = entry_age(&path).await;
+        // Unreadable metadata is uncertainty, not a crash leftover: protect.
+        if age.is_some_and(|age| age > stale_after) {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!(
+                    path = %path.display(),
+                    %error,
+                    "Failed to remove a stale snapshot object cache pin"
+                ),
+            }
+            continue;
+        }
+        pinned = true;
+    }
+    pinned
+}
+
+/// Remove one object-cache entry and return the bytes actually removed.
+///
+/// The repository and each sidecar are attempted independently; a failed
+/// removal leaves its bytes in the returned remainder's favour (i.e. they are
+/// not subtracted from the sweep's total), so a partial eviction is reported
+/// honestly instead of pretending the full entry is gone.
+async fn remove_snapshot_object_cache_entry(
+    path: &FsPath,
+    repository_bytes: u64,
+    sidecars: &[(PathBuf, u64)],
+) -> u64 {
+    let mut removed = 0u64;
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => removed = removed.saturating_add(repository_bytes),
+        // Already gone: the bytes were counted once and are no longer there.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            removed = removed.saturating_add(repository_bytes);
+        }
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                %error,
+                "Failed to evict snapshot object cache entry"
+            );
+        }
+    }
+    for (sidecar, bytes) in sidecars {
+        match tokio::fs::remove_file(sidecar).await {
+            Ok(()) => removed = removed.saturating_add(*bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                removed = removed.saturating_add(*bytes);
+            }
+            Err(error) => warn!(
+                path = %sidecar.display(),
+                %error,
+                "Failed to remove snapshot object cache sidecar"
+            ),
+        }
+    }
+    if removed > 0 {
+        debug!(
+            path = %path.display(),
+            removed,
+            "Evicted snapshot object cache entry bytes"
+        );
+    }
+    removed
+}
+
 /// Whether a cache entry may still serve a live run. Run-scoped entries are
 /// live until the release marker lands; shared repositories are live while
 /// any run ref is published. Anything else is retry-window weight the size
@@ -4104,6 +5041,38 @@ impl Drop for CacheLock {
     }
 }
 
+/// Ownership marker for one cache entry, held by a capture from the moment
+/// the cache lock is released until its snapshot's alternates file exists.
+///
+/// Eviction takes the same per-entry cache lock and refuses to retire a pinned
+/// entry. Without the pin, a cache refreshed milliseconds ago could be deleted
+/// before the staging repository points at it, and the capture would publish a
+/// snapshot whose alternate no longer exists.
+struct CachePin {
+    path: PathBuf,
+}
+
+/// Filename prefix shared by every pin for `key`.
+fn cache_pin_prefix(key: &str) -> String {
+    format!("{key}.pin-")
+}
+
+impl CachePin {
+    fn create(root: &FsPath, key: &str) -> Result<Self, ApiError> {
+        let path = root.join(format!("{}{}", cache_pin_prefix(key), uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"").map_err(|error| {
+            ApiError::internal(format!("failed to pin snapshot object cache: {error}"))
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for CachePin {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Freshness of a lock directory: the holder's heartbeat when present, the
 /// directory itself for locks that predate heartbeats or died mid-create.
 fn lock_age(path: &FsPath) -> Option<std::time::Duration> {
@@ -4123,8 +5092,7 @@ async fn acquire_cache_lock(path: &FsPath) -> Result<CacheLock, ApiError> {
                 // Freshness comes from the holder's heartbeat, so a slow
                 // fetch is never mistaken for an abandoned lock. Only a
                 // holder that died without cleanup goes stale.
-                let stale =
-                    lock_age(path).is_some_and(|age| age > std::time::Duration::from_secs(60));
+                let stale = lock_age(path).is_some_and(|age| age > CACHE_LOCK_STALE_AFTER);
                 if stale {
                     let _ = std::fs::remove_file(path.join(LOCK_HEARTBEAT));
                     let _ = std::fs::remove_dir(path);
@@ -4144,6 +5112,27 @@ async fn acquire_cache_lock(path: &FsPath) -> Result<CacheLock, ApiError> {
             }
         }
     }
+}
+
+/// Take a cache lock only if it is free, without waiting.
+///
+/// The eviction sweep runs beside submissions, so a held lock means "this
+/// entry is busy right now" and the sweep moves on. A stale lock is taken
+/// over exactly like [`acquire_cache_lock`] does.
+fn try_acquire_cache_lock(path: &FsPath) -> Option<CacheLock> {
+    match std::fs::create_dir(path) {
+        Ok(()) => return Some(CacheLock::held(path.to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    if !lock_age(path).is_some_and(|age| age > CACHE_LOCK_STALE_AFTER) {
+        return None;
+    }
+    let _ = std::fs::remove_file(path.join(LOCK_HEARTBEAT));
+    let _ = std::fs::remove_dir(path);
+    std::fs::create_dir(path)
+        .ok()
+        .map(|()| CacheLock::held(path.to_owned()))
 }
 
 /// Split a git ident header (`Name <email> 1234567890 +0000`) into the
@@ -7738,7 +8727,7 @@ mod snapshot_staging_tests {
         };
         let publishes_before = cross_device_publishes();
 
-        publish_staged_repository(&staging, &destination)
+        publish_staged_repository(&staging, &destination, &CaptureBlocking::new())
             .await
             .expect("a staging tree on another filesystem must still publish");
 
@@ -7969,6 +8958,571 @@ mod github_remote_slug_selection_tests {
                         backup\thttps://bitbucket.org/owner/repo.git (fetch)\n";
         assert_eq!(github_remote_slug(remote_v, "github.com"), None);
         assert_eq!(github_remote_slug("", "github.com"), None);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_limit_tests {
+    use super::*;
+
+    async fn prune(state_dir: &FsPath, max_bytes: u64) {
+        prune_snapshot_object_cache(state_dir, max_bytes, &SnapshotObjectCacheSweep::new()).await;
+    }
+
+    /// Serializes tests that drive timeout cleanup, because the stall hook is
+    /// process-global.
+    static CLEANUP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Simulate a filesystem that stalls only inside cleanup.
+    struct CleanupStallGuard;
+
+    impl CleanupStallGuard {
+        fn set(stall: std::time::Duration) -> Self {
+            *CAPTURE_CLEANUP_STALL.lock().unwrap() = Some(stall);
+            Self
+        }
+    }
+
+    impl Drop for CleanupStallGuard {
+        fn drop(&mut self) {
+            *CAPTURE_CLEANUP_STALL.lock().unwrap() = None;
+        }
+    }
+
+    fn cache_entry(state_dir: &FsPath, key: &str, age: std::time::Duration) -> PathBuf {
+        let root = state_dir.join("snapshot-object-cache");
+        let repository = root.join(format!("{key}.git"));
+        std::fs::create_dir_all(repository.join("objects")).unwrap();
+        // 100 bytes per entry: small enough for an exact ceiling.
+        std::fs::write(repository.join("objects/pack.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(root.join(format!("{key}.last-head")), "head\n").unwrap();
+        std::fs::write(root.join(format!("{key}.index")), "index\n").unwrap();
+        let modified = filetime::FileTime::from_system_time(std::time::SystemTime::now() - age);
+        filetime::set_file_times(&repository, modified, modified).unwrap();
+        repository
+    }
+
+    fn alternate(repository: &FsPath) -> String {
+        format!("{}\n", repository.join("objects").display())
+    }
+
+    fn published_snapshot_referencing(state_dir: &FsPath, run: &str, repository: &FsPath) {
+        let info = state_dir.join("snapshots").join(run).join("objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("alternates"), alternate(repository)).unwrap();
+    }
+
+    /// The oldest unreferenced entry goes first, and the sweep stops as soon
+    /// as the total is under the ceiling.
+    #[tokio::test]
+    async fn size_sweep_evicts_unreferenced_entries_oldest_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let older = cache_entry(&state, &"a".repeat(64), std::time::Duration::from_secs(600));
+        let newer = cache_entry(&state, &"b".repeat(64), std::time::Duration::from_secs(60));
+
+        prune(&state, 150).await;
+
+        assert!(!older.exists(), "the oldest entry must be evicted first");
+        assert!(newer.exists(), "one eviction is enough to meet the ceiling");
+    }
+
+    /// A published snapshot alternates to the entry, so removing it would
+    /// break checkouts for a live run.
+    #[tokio::test]
+    async fn size_sweep_spares_a_referenced_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let referenced = cache_entry(&state, &"a".repeat(64), std::time::Duration::from_secs(600));
+        let unreferenced = cache_entry(&state, &"b".repeat(64), std::time::Duration::from_secs(60));
+        published_snapshot_referencing(&state, "run-1", &referenced);
+
+        prune(&state, 1).await;
+
+        assert!(referenced.exists(), "a referenced cache must survive");
+        assert!(!unreferenced.exists(), "the unreferenced cache must yield");
+    }
+
+    /// A capture in progress keeps its repository one level down in staging;
+    /// its alternates must protect the entry before the capture publishes.
+    #[tokio::test]
+    async fn size_sweep_spares_a_capture_in_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let entry = cache_entry(&state, &"c".repeat(64), std::time::Duration::from_secs(600));
+        let info = state
+            .join("snapshots")
+            .join(SNAPSHOT_STAGING_DIR)
+            .join("run-1-uuid")
+            .join("repository.git")
+            .join("objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("alternates"), alternate(&entry)).unwrap();
+
+        prune(&state, 1).await;
+
+        assert!(
+            entry.exists(),
+            "a capture in progress must keep its object cache"
+        );
+    }
+
+    /// The lock heartbeat is the only evidence that a capture holds the entry
+    /// before staging exists; a fresh one outranks the ceiling.
+    #[tokio::test]
+    async fn size_sweep_spares_a_fresh_cache_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let key = "d".repeat(64);
+        let entry = cache_entry(&state, &key, std::time::Duration::from_secs(600));
+        let lock = state
+            .join("snapshot-object-cache")
+            .join(format!("{key}.lock"));
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join(LOCK_HEARTBEAT), "held").unwrap();
+
+        prune(&state, 1).await;
+
+        assert!(entry.exists(), "a fresh lock must block eviction");
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// The outer capture deadline drops a `git_output_within` future. The
+    /// direct child dies via `kill_on_drop`, but a wrapper's background
+    /// descendant must die with its process group before the capture's cache
+    /// lock is released and reusable — otherwise a transport left running
+    /// keeps writing into the shared object cache.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_timeout_kills_wrapped_git_descendants_and_releases_the_cache_lock() {
+        let _serial = CLEANUP_TEST_LOCK.lock().await;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let run_id: RunId = "33333333-3333-4333-8333-333333333333".parse().unwrap();
+        let staging = state
+            .join("snapshots")
+            .join(SNAPSHOT_STAGING_DIR)
+            .join(format!("{run_id}-aaaa"));
+        std::fs::create_dir_all(staging.join("repository.git/objects")).unwrap();
+
+        let pid_file = temp.path().join("descendant.pid");
+        let fake_git = temp.path().join("fake-git");
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\n( sleep 600 ) &\necho $! > '{}'\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cache_root = state.join("snapshot-object-cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let lock_path = cache_root.join(format!("{}.lock", "k".repeat(64)));
+
+        let result = capture_snapshot_within(
+            &state,
+            run_id,
+            // Long enough for the fake wrapper to spawn and record its child
+            // even on a loaded debug-build test machine; the assertion is
+            // cancellation, not speed.
+            std::time::Duration::from_secs(2),
+            Box::pin(async {
+                // Held while the fake Git runs, exactly like
+                // `ensure_object_cache`.
+                let _guard = acquire_cache_lock(&lock_path).await?;
+                let mut command = git_command_for(&fake_git);
+                command.arg("--version");
+                git_output_within(command, "fake hung git", std::time::Duration::from_secs(60))
+                    .await?;
+                Ok::<(), ApiError>(())
+            }),
+        )
+        .await;
+
+        let error = result.expect_err("the outer capture deadline must fire");
+        assert!(error.message().contains("deadline"), "{}", error.message());
+        assert!(
+            !staging.exists(),
+            "the timed-out capture's staging tree must be removed"
+        );
+
+        let mut pid = String::new();
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                pid = text.trim().to_owned();
+                if !pid.is_empty() {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!pid.is_empty(), "the fake git recorded no descendant pid");
+        let mut gone = false;
+        for _ in 0..100 {
+            if !process_alive(&pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            gone,
+            "the wrapper's background descendant ({pid}) outlived the dropped capture"
+        );
+
+        // The future drop released the per-cache lock, so the next capture can
+        // take it immediately.
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            acquire_cache_lock(&lock_path),
+        )
+        .await
+        .expect("the cache lock must be free after cancellation")
+        .expect("acquiring the released cache lock");
+        drop(guard);
+    }
+
+    /// A capture pin spans the window between the cache lock being released
+    /// and the snapshot publishing its alternates. Eviction must honour it.
+    #[tokio::test]
+    async fn size_sweep_spares_a_pinned_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let key = "e".repeat(64);
+        let entry = cache_entry(&state, &key, std::time::Duration::from_secs(600));
+        let pin = state
+            .join("snapshot-object-cache")
+            .join(format!("{}0000", cache_pin_prefix(&key)));
+        std::fs::write(&pin, b"").unwrap();
+
+        prune(&state, 1).await;
+
+        assert!(entry.exists(), "a pinned cache must survive");
+        assert!(pin.exists(), "a fresh pin is not a crash leftover");
+    }
+
+    #[tokio::test]
+    async fn zero_cap_disables_the_sweep() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let entry = cache_entry(&state, &"f".repeat(64), std::time::Duration::from_secs(600));
+
+        prune(&state, 0).await;
+
+        assert!(entry.exists(), "0 means the operator opted out");
+    }
+
+    #[tokio::test]
+    async fn total_under_the_cap_is_a_no_op() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let entry = cache_entry(&state, &"g".repeat(64), std::time::Duration::from_secs(600));
+
+        prune(&state, 10_000).await;
+
+        assert!(entry.exists(), "nothing may be evicted under the ceiling");
+    }
+
+    /// An alternates file that exists but cannot be read leaves the reference
+    /// set unknown. Eviction must abort rather than treat it as empty.
+    #[tokio::test]
+    async fn unreadable_alternates_abort_eviction() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let referenced = cache_entry(&state, &"h".repeat(64), std::time::Duration::from_secs(600));
+        let other = cache_entry(&state, &"i".repeat(64), std::time::Duration::from_secs(60));
+        published_snapshot_referencing(&state, "run-1", &referenced);
+        // A directory where the alternates file should be: it exists, so this
+        // is not a proven "layout absent", and reading it fails.
+        std::fs::create_dir_all(state.join("snapshots/run-2/objects/info/alternates")).unwrap();
+
+        prune(&state, 1).await;
+
+        assert!(referenced.exists(), "a referenced cache must survive");
+        assert!(
+            other.exists(),
+            "an unknowable reference set must abort the whole sweep"
+        );
+    }
+
+    /// If `snapshots/` itself cannot be enumerated, no candidate is provably
+    /// unreferenced.
+    #[tokio::test]
+    async fn unreadable_snapshot_enumeration_aborts_eviction() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let entry = cache_entry(&state, &"j".repeat(64), std::time::Duration::from_secs(600));
+        std::fs::create_dir_all(&state).unwrap();
+        // A regular file where the snapshots directory should be.
+        std::fs::write(state.join("snapshots"), b"not a directory").unwrap();
+
+        prune(&state, 1).await;
+
+        assert!(
+            entry.exists(),
+            "an unreadable snapshot root must not authorize eviction"
+        );
+    }
+
+    /// Timeout cleanup must not remove a staging tree while a blocking copy
+    /// that the dropped capture future left behind may still be writing.
+    #[tokio::test]
+    async fn staging_cleanup_waits_for_blocking_copy_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let registration = register_capture_blocking(staging.clone());
+        let guard = registration.tracker().guard(&staging);
+
+        assert!(
+            !capture_blocking_drained(&staging, std::time::Duration::from_millis(20)).await,
+            "in-flight blocking work must keep the tree in place"
+        );
+        drop(guard);
+        assert!(
+            capture_blocking_drained(&staging, std::time::Duration::from_millis(200)).await,
+            "drained work must let cleanup proceed"
+        );
+        drop(registration);
+    }
+
+    /// A wedged filesystem inside cleanup must not extend the submission: the
+    /// timeout error returns within its own cleanup grace, and the run-scoped
+    /// leftover is identifiable for the startup sweep.
+    #[tokio::test]
+    async fn cleanup_after_timeout_is_bounded() {
+        let _serial = CLEANUP_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let run_id: RunId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        let staging = state
+            .join("snapshots")
+            .join(SNAPSHOT_STAGING_DIR)
+            .join(format!("{run_id}-aaaa"));
+        std::fs::create_dir_all(&staging).unwrap();
+        let _stall = CleanupStallGuard::set(std::time::Duration::from_secs(30));
+
+        let started = std::time::Instant::now();
+        let result = capture_snapshot_within_with_cleanup(
+            &state,
+            run_id,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(100),
+            Box::pin(std::future::pending::<Result<(), ApiError>>()),
+        )
+        .await;
+
+        assert!(result.is_err(), "the capture deadline must win");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cleanup must be bounded, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            staging.exists(),
+            "a stalled cleanup leaves the run-scoped tree for the startup sweep"
+        );
+    }
+
+    /// Timeout after the final repository was published: remove only this
+    /// unaccepted run's repository, leave another run's snapshot and the
+    /// shared checkout cache alone, and let the now-unreferenced cache entry
+    /// be reclaimed.
+    #[tokio::test]
+    async fn timeout_after_publication_removes_only_the_unaccepted_run_repository() {
+        let _serial = CLEANUP_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let run_id: RunId = "66666666-6666-4666-8666-666666666666".parse().unwrap();
+        let other: RunId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
+        let key = "m".repeat(64);
+        let backing = cache_entry(&state, &key, std::time::Duration::from_secs(60));
+        published_snapshot_referencing(&state, &run_id.to_string(), &backing);
+        let other_snapshot = state.join("snapshots").join(other.to_string());
+        std::fs::create_dir_all(&other_snapshot).unwrap();
+        let checkout_cache = state.join("checkout-cache/runs/shared.git");
+        std::fs::create_dir_all(&checkout_cache).unwrap();
+
+        let result = capture_snapshot_within_with_cleanup(
+            &state,
+            run_id,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(2),
+            Box::pin(std::future::pending::<Result<(), ApiError>>()),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            !state.join("snapshots").join(run_id.to_string()).exists(),
+            "the unaccepted run's published repository must be removed"
+        );
+        assert!(
+            other_snapshot.exists(),
+            "another run's snapshot must survive"
+        );
+        assert!(
+            checkout_cache.exists(),
+            "the shared checkout cache must survive"
+        );
+
+        // The removed snapshot no longer references the entry, so the sweep
+        // may reclaim it.
+        prune(&state, 1).await;
+        assert!(
+            !backing.exists(),
+            "removing the unaccepted snapshot must unpin its backing cache entry"
+        );
+    }
+
+    /// A still-running blocking copy makes staging ownership uncertain; the
+    /// published repository must not be deleted eagerly in that case.
+    #[tokio::test]
+    async fn uncertain_staging_ownership_keeps_the_published_repository() {
+        let _serial = CLEANUP_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let run_id: RunId = "88888888-8888-4888-8888-888888888888".parse().unwrap();
+        let staging = state
+            .join("snapshots")
+            .join(SNAPSHOT_STAGING_DIR)
+            .join(format!("{run_id}-aaaa"));
+        std::fs::create_dir_all(&staging).unwrap();
+        let published = state.join("snapshots").join(run_id.to_string());
+        std::fs::create_dir_all(published.join("objects")).unwrap();
+        let registration = register_capture_blocking(staging.clone());
+        let guard = registration.tracker().guard(&staging);
+
+        let result = capture_snapshot_within_with_cleanup(
+            &state,
+            run_id,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(50),
+            Box::pin(std::future::pending::<Result<(), ApiError>>()),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(staging.exists(), "in-flight copy keeps the staging tree");
+        assert!(
+            published.exists(),
+            "uncertain staging ownership must keep the published repository"
+        );
+        drop(guard);
+        drop(registration);
+    }
+
+    /// The persisted index counts against the ceiling even when the
+    /// repository itself is small.
+    #[tokio::test]
+    async fn sidecar_index_counts_toward_the_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let key = "n".repeat(64);
+        let entry = cache_entry(&state, &key, std::time::Duration::from_secs(60));
+        let index = state
+            .join("snapshot-object-cache")
+            .join(format!("{key}.index"));
+        std::fs::write(&index, vec![0u8; 4_000]).unwrap();
+
+        // 100-byte repository + 4000-byte index, cap 1000: the repository
+        // alone would fit, the entry as a whole does not.
+        prune(&state, 1_000).await;
+
+        assert!(!entry.exists(), "the oversized entry must be evicted");
+        assert!(!index.exists(), "its sidecar must go with it");
+    }
+
+    /// Concurrent requests coalesce, and a later request runs once the active
+    /// sweep (or a detached blocking walk) releases ownership.
+    #[tokio::test]
+    async fn object_cache_sweeps_coalesce_and_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let sweep = SnapshotObjectCacheSweep::new();
+
+        let permit = sweep.try_acquire().expect("first sweep takes the permit");
+        assert!(
+            !spawn_snapshot_object_cache_sweep(&sweep, state.clone(), 1),
+            "a second request while one is active must coalesce"
+        );
+        drop(permit);
+        assert!(
+            spawn_snapshot_object_cache_sweep(&sweep, state.clone(), 1),
+            "a later request may sweep"
+        );
+        for _ in 0..200 {
+            if sweep.is_idle() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(sweep.is_idle(), "the spawned sweep must release ownership");
+
+        // A detached blocking walk also blocks replacement until it returns.
+        let walk = sweep.walk();
+        assert!(
+            sweep.try_acquire().is_none(),
+            "a detached walk must keep replacement sweeps out"
+        );
+        drop(walk);
+        assert!(
+            sweep.try_acquire().is_some(),
+            "ownership is released when the walk finishes"
+        );
+
+        // A second state directory has its own guard.
+        let other = SnapshotObjectCacheSweep::new();
+        assert!(other.try_acquire().is_some());
+    }
+
+    /// On expiry the aggregate capture deadline removes exactly this run's
+    /// staging trees, leaves another run's capture alone, and returns the
+    /// operator-facing error instead of queueing jobs.
+    #[tokio::test]
+    async fn capture_timeout_removes_only_this_runs_staging() {
+        let _serial = CLEANUP_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let run_id: RunId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let other: RunId = "22222222-2222-4222-8222-222222222222".parse().unwrap();
+        let staging = state.join("snapshots").join(SNAPSHOT_STAGING_DIR);
+        let ours = staging.join(format!("{run_id}-aaaa"));
+        let theirs = staging.join(format!("{other}-bbbb"));
+        std::fs::create_dir_all(ours.join("repository.git/objects")).unwrap();
+        std::fs::create_dir_all(theirs.join("repository.git/objects")).unwrap();
+
+        let result = capture_snapshot_within(
+            &state,
+            run_id,
+            std::time::Duration::from_millis(20),
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok::<(), ApiError>(())
+            }),
+        )
+        .await;
+
+        let error = result.expect_err("a capture past its deadline must fail");
+        assert!(error.message().contains("deadline"));
+        assert!(!ours.exists(), "the timed-out staging tree must be removed");
+        assert!(
+            theirs.exists(),
+            "another run's staging tree must survive the cleanup"
+        );
     }
 }
 
