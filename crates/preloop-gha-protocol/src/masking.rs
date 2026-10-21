@@ -32,12 +32,36 @@
 //! run (bounded by the longest encoded secret span) so an alignment-shifted
 //! encoding split across chunks is decided before any of its bytes are
 //! emitted.
+//!
+//! Pattern matching ([`PatternMasker`]) covers job `MaskHint`s of type
+//! `MaskType::Regex`: a compiled pattern's matches are redacted in the same
+//! scan as the value matches through the `*_with_patterns` entry points, so a
+//! secret-shaped span (`user:[^@\s]+@host`) is masked even when no exact
+//! value was registered for it.
 
 use base64::engine::DecodePaddingMode;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 
 /// The redaction marker used across all masking paths.
 pub const MASK_MARKER: &str = "***";
+
+/// A compiled pattern whose matches are redacted wherever they appear.
+///
+/// Covers job `MaskHint`s of `MaskType::Regex` (see the official worker's
+/// `Worker.cs` `InitializeSecretMasker`): the hint's pattern is compiled once
+/// per job and every span it matches becomes [`MASK_MARKER`], catching
+/// secret-shaped text (`user:[^@\s]+@host`) that no registered value would.
+/// The regex engine lives with the caller (the runner), so this crate only
+/// defines the matching contract.
+///
+/// Implementations append the byte span `(start, end)` of every non-empty,
+/// non-overlapping match in `haystack` to `spans`, like `Regex::find_iter`.
+/// Order does not matter: the scan sorts the spans and merges overlapping or
+/// touching ones, so replacement is one [`MASK_MARKER`] per merged region.
+pub trait PatternMasker: Send + Sync {
+    /// Append the byte span `(start, end)` of every match in `haystack`.
+    fn find_spans(&self, haystack: &str, spans: &mut Vec<(usize, usize)>);
+}
 
 /// Mask secret values in `input`, replacing each occurrence with [`MASK_MARKER`].
 ///
@@ -54,7 +78,31 @@ pub fn mask_secrets<'a, I>(input: &str, secrets: I, exclude: &[&str]) -> String
 where
     I: IntoIterator<Item = &'a str>,
 {
-    mask_secrets_inner(input, secrets, exclude, false, false)
+    mask_secrets_inner(
+        input,
+        secrets,
+        std::iter::empty::<&dyn PatternMasker>(),
+        exclude,
+        false,
+        false,
+    )
+}
+
+/// [`mask_secrets`] plus pattern maskers in one scan pass: every span a
+/// pattern reports is replaced with [`MASK_MARKER`] alongside the value
+/// matches. Longest match at each position wins; overlapping pattern spans
+/// are merged so one span can never be partially redacted.
+pub fn mask_secrets_with_patterns<'a, 'p, I, P>(
+    input: &str,
+    secrets: I,
+    patterns: P,
+    exclude: &[&str],
+) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+    P: IntoIterator<Item = &'p dyn PatternMasker>,
+{
+    mask_secrets_inner(input, secrets, patterns, exclude, false, false)
 }
 
 /// Transform-aware masking for log output.
@@ -69,7 +117,29 @@ pub fn mask_secrets_transform_aware<'a, I>(input: &str, secrets: I, exclude: &[&
 where
     I: IntoIterator<Item = &'a str>,
 {
-    mask_secrets_inner(input, secrets, exclude, false, true)
+    mask_secrets_inner(
+        input,
+        secrets,
+        std::iter::empty::<&dyn PatternMasker>(),
+        exclude,
+        false,
+        true,
+    )
+}
+
+/// [`mask_secrets_transform_aware`] plus pattern maskers in one scan pass:
+/// the log-masking strength for jobs that carry `MaskType::Regex` hints.
+pub fn mask_secrets_transform_aware_with_patterns<'a, 'p, I, P>(
+    input: &str,
+    secrets: I,
+    patterns: P,
+    exclude: &[&str],
+) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+    P: IntoIterator<Item = &'p dyn PatternMasker>,
+{
+    mask_secrets_inner(input, secrets, patterns, exclude, false, true)
 }
 
 /// Mask secret values like [`mask_secrets`], but preserve the newline
@@ -85,7 +155,30 @@ pub fn mask_secrets_preserving_lines<'a, I>(input: &str, secrets: I, exclude: &[
 where
     I: IntoIterator<Item = &'a str>,
 {
-    mask_secrets_inner(input, secrets, exclude, true, false)
+    mask_secrets_inner(
+        input,
+        secrets,
+        std::iter::empty::<&dyn PatternMasker>(),
+        exclude,
+        true,
+        false,
+    )
+}
+
+/// [`mask_secrets_preserving_lines`] plus pattern maskers in one scan pass.
+/// A multi-line pattern match emits one [`MASK_MARKER`] per physical line,
+/// exactly like a multi-line secret value.
+pub fn mask_secrets_preserving_lines_with_patterns<'a, 'p, I, P>(
+    input: &str,
+    secrets: I,
+    patterns: P,
+    exclude: &[&str],
+) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+    P: IntoIterator<Item = &'p dyn PatternMasker>,
+{
+    mask_secrets_inner(input, secrets, patterns, exclude, true, false)
 }
 
 /// Transform-aware variant of [`mask_secrets_preserving_lines`]: variant
@@ -99,7 +192,30 @@ pub fn mask_secrets_preserving_lines_transform_aware<'a, I>(
 where
     I: IntoIterator<Item = &'a str>,
 {
-    mask_secrets_inner(input, secrets, exclude, true, true)
+    mask_secrets_inner(
+        input,
+        secrets,
+        std::iter::empty::<&dyn PatternMasker>(),
+        exclude,
+        true,
+        true,
+    )
+}
+
+/// [`mask_secrets_preserving_lines_transform_aware`] plus pattern maskers in
+/// one scan pass: the retroactive log-masking strength for jobs that carry
+/// `MaskType::Regex` hints.
+pub fn mask_secrets_preserving_lines_transform_aware_with_patterns<'a, 'p, I, P>(
+    input: &str,
+    secrets: I,
+    patterns: P,
+    exclude: &[&str],
+) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+    P: IntoIterator<Item = &'p dyn PatternMasker>,
+{
+    mask_secrets_inner(input, secrets, patterns, exclude, true, true)
 }
 
 /// Byte-safety guard for slicing `haystack` at a secret's byte length.
@@ -132,15 +248,17 @@ fn match_secret_at<'s>(
     })
 }
 
-fn mask_secrets_inner<'a, I>(
+fn mask_secrets_inner<'a, 'p, I, P>(
     input: &str,
     secrets: I,
+    patterns: P,
     exclude: &[&str],
     preserve_lines: bool,
     transform_aware: bool,
 ) -> String
 where
     I: IntoIterator<Item = &'a str>,
+    P: IntoIterator<Item = &'p dyn PatternMasker>,
 {
     let mut sorted: Vec<String> = Vec::new();
     let mut raw_secrets: Vec<String> = Vec::new();
@@ -176,12 +294,31 @@ where
         Vec::new()
     };
 
+    // Pattern hint matches, collected once per pattern over the whole input
+    // and merged into disjoint spans. Without pattern maskers the list stays
+    // empty and the scan below is the value-only pass, byte for byte.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for pattern in patterns {
+        pattern.find_spans(input, &mut spans);
+    }
+    // Defensive: a faulty pattern implementation must not panic the scan on
+    // a mid-character or out-of-bounds span, and a zero-length match would
+    // never advance the cursor.
+    spans.retain(|&(start, end)| {
+        start < end
+            && end <= input.len()
+            && input.is_char_boundary(start)
+            && input.is_char_boundary(end)
+    });
+    merge_pattern_spans(&mut spans);
+
     // Scan the original input once. A marker run that overlaps a short
     // marker-valued secret is canonicalized to one replacement marker, rather
     // than being mistaken for unmasked input or expanded on every pass.
     let mut result = String::with_capacity(input.len());
     let mut offset = 0;
     let mut span_index = 0;
+    let mut span_idx = 0;
     while offset < input.len() {
         while span_index < alignment_spans.len() && alignment_spans[span_index].1 <= offset {
             span_index += 1;
@@ -196,9 +333,26 @@ where
         }
         let remaining = &input[offset..];
         let case_insensitive = transform_aware;
-        let matching_secret = match_secret_at(remaining, &sorted, case_insensitive);
-        if let Some(secret) = matching_secret {
-            if remaining.starts_with(MASK_MARKER) && secret.len() <= MASK_MARKER.len() {
+        let value_len = match_secret_at(remaining, &sorted, case_insensitive).map(str::len);
+        // Spans ending at or behind the cursor are consumed; the next span
+        // may still cover the cursor — a value match can end inside one —
+        // and masking its tail keeps the span fully redacted.
+        while spans.get(span_idx).is_some_and(|(_, end)| *end <= offset) {
+            span_idx += 1;
+        }
+        let pattern_len = spans
+            .get(span_idx)
+            .filter(|(start, _)| *start <= offset)
+            .map(|(_, end)| end - offset);
+        // Longest match at the cursor wins. A value tying a pattern span
+        // masks the same region, so the marker handling below covers both.
+        let matched_len = match (value_len, pattern_len) {
+            (Some(value), Some(pattern)) => Some(value.max(pattern)),
+            (Some(len), None) | (None, Some(len)) => Some(len),
+            (None, None) => None,
+        };
+        if let Some(matched_len) = matched_len {
+            if remaining.starts_with(MASK_MARKER) && matched_len <= MASK_MARKER.len() {
                 // `***`, `**`, and `*` are all represented by the canonical
                 // marker. Consume the complete marker span so re-masking stays
                 // idempotent while the secret is still treated as matched.
@@ -206,19 +360,19 @@ where
                 offset += MASK_MARKER.len();
             } else if preserve_lines {
                 // Keep the physical record count stable: re-emit every
-                // newline inside the matched secret so line checkpoints
+                // newline inside the matched span so line checkpoints
                 // captured before this retroactive pass stay valid.
                 result.push_str(MASK_MARKER);
-                for ch in secret.chars() {
+                for ch in remaining[..matched_len].chars() {
                     if ch == '\n' || ch == '\r' {
                         result.push(ch);
                         result.push_str(MASK_MARKER);
                     }
                 }
-                offset += secret.len();
+                offset += matched_len;
             } else {
                 result.push_str(MASK_MARKER);
-                offset += secret.len();
+                offset += matched_len;
             }
         } else if remaining.starts_with(MASK_MARKER) {
             // Existing redaction output is opaque when no registered secret
@@ -784,6 +938,30 @@ fn tainted_segment_ranges(
         }
     }
     merged
+}
+
+/// Sort pattern spans and merge overlapping or touching ones, in place, so
+/// the scan consumes them in order. Merged regions replace with a single
+/// [`MASK_MARKER`]; touching matches stay one marker so re-masking is
+/// idempotent even for patterns that match marker text.
+///
+/// Sorts and merges in place, over the sorted input itself: a dense hint set
+/// (a pattern matching most characters of a multi-megabyte line reports spans
+/// of the same order) pays no second buffer for the merged list.
+fn merge_pattern_spans(spans: &mut Vec<(usize, usize)>) {
+    spans.sort_unstable();
+    let mut merged = 0;
+    for index in 0..spans.len() {
+        let span = spans[index];
+        if merged > 0 && span.0 <= spans[merged - 1].1 {
+            let last = &mut spans[merged - 1];
+            last.1 = last.1.max(span.1);
+            continue;
+        }
+        spans[merged] = span;
+        merged += 1;
+    }
+    spans.truncate(merged);
 }
 
 /// Transformed variants of a secret value that must all be masked.
@@ -1583,6 +1761,47 @@ mod tests {
         }
     }
 
+    // ── Pattern maskers ─────────────────────────────────────────────
+
+    /// Test pattern: masks from each `prefix` through the end of the
+    /// following `suffix`, like a `prefix.*suffix` regex hint.
+    struct PrefixSuffixMasker {
+        prefix: &'static str,
+        suffix: &'static str,
+    }
+
+    impl PatternMasker for PrefixSuffixMasker {
+        fn find_spans(&self, haystack: &str, spans: &mut Vec<(usize, usize)>) {
+            let mut search = 0;
+            while let Some(rel_start) = haystack[search..].find(self.prefix) {
+                let start = search + rel_start;
+                let after_prefix = start + self.prefix.len();
+                let Some(rel_end) = haystack[after_prefix..].find(self.suffix) else {
+                    return;
+                };
+                let end = after_prefix + rel_end + self.suffix.len();
+                spans.push((start, end));
+                search = end;
+            }
+        }
+    }
+
+    /// Test pattern: masks every run of `*`, like a `\*+` regex hint.
+    struct StarRunMasker;
+
+    impl PatternMasker for StarRunMasker {
+        fn find_spans(&self, haystack: &str, spans: &mut Vec<(usize, usize)>) {
+            let mut search = 0;
+            while let Some(rel_start) = haystack[search..].find('*') {
+                let start = search + rel_start;
+                let rest = &haystack[start..];
+                let run_len = rest.len() - rest.trim_start_matches('*').len();
+                spans.push((start, start + run_len));
+                search = start + run_len;
+            }
+        }
+    }
+
     #[test]
     fn unshifted_base64_is_still_masked() {
         let secret = "pentest-mask-9f3k2";
@@ -1883,5 +2102,111 @@ mod tests {
             "leaked wrapped token: {text}"
         );
         assert_eq!(text, "***\n***");
+    }
+
+    #[test]
+    fn pattern_masks_span_beyond_registered_values() {
+        let masker = PrefixSuffixMasker {
+            prefix: "user:",
+            suffix: "@host",
+        };
+        let patterns: [&dyn PatternMasker; 1] = [&masker];
+        let input = "login user:hunter2@host ok";
+        // Value-only masking leaves the span alone even with the interior
+        // word registered — the hint is what catches the whole span.
+        assert_eq!(
+            mask_secrets(input, ["hunter2"].iter().copied(), &[]),
+            "login user:***@host ok"
+        );
+        assert_eq!(
+            mask_secrets_with_patterns(input, std::iter::empty(), patterns, &[]),
+            "login *** ok"
+        );
+        // Values and patterns combine in the same scan.
+        assert_eq!(
+            mask_secrets_with_patterns(input, ["hunter2"].iter().copied(), patterns, &[]),
+            "login *** ok"
+        );
+    }
+
+    #[test]
+    fn pattern_and_value_matches_both_mask() {
+        let masker = PrefixSuffixMasker {
+            prefix: "beta:",
+            suffix: ":omega",
+        };
+        let patterns: [&dyn PatternMasker; 1] = [&masker];
+        assert_eq!(
+            mask_secrets_with_patterns(
+                "alpha beta:xx:omega alpha",
+                ["alpha"].iter().copied(),
+                patterns,
+                &[],
+            ),
+            "*** *** ***"
+        );
+    }
+
+    #[test]
+    fn overlapping_and_touching_pattern_spans_merge_to_one_marker() {
+        let left = PrefixSuffixMasker {
+            prefix: "ab",
+            suffix: "de",
+        };
+        let right = PrefixSuffixMasker {
+            prefix: "cd",
+            suffix: "fg",
+        };
+        // "ab..de" (0..5) and "cd..fg" (2..7) overlap over "abcdefg".
+        let patterns: [&dyn PatternMasker; 2] = [&left, &right];
+        assert_eq!(
+            mask_secrets_with_patterns("x abcdefg y", std::iter::empty(), patterns, &[]),
+            "x *** y"
+        );
+    }
+
+    #[test]
+    fn pattern_masks_preserve_line_count() {
+        let masker = PrefixSuffixMasker {
+            prefix: "BEGIN",
+            suffix: "END",
+        };
+        let patterns: [&dyn PatternMasker; 1] = [&masker];
+        assert_eq!(
+            mask_secrets_preserving_lines_transform_aware_with_patterns(
+                "l1\nBEGIN\nsecret\nEND\nl2",
+                std::iter::empty(),
+                patterns,
+                &[],
+            ),
+            "l1\n***\n***\n***\nl2"
+        );
+    }
+
+    #[test]
+    fn pattern_matching_marker_runs_stays_idempotent() {
+        let patterns: [&dyn PatternMasker; 1] = [&StarRunMasker];
+        let input = "a****b";
+        let once = mask_secrets_with_patterns(input, std::iter::empty(), patterns, &[]);
+        assert_eq!(once, "a***b");
+        let twice = mask_secrets_with_patterns(&once, std::iter::empty(), patterns, &[]);
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn zero_length_pattern_matches_are_ignored() {
+        struct EmptyMasker;
+        impl PatternMasker for EmptyMasker {
+            fn find_spans(&self, haystack: &str, spans: &mut Vec<(usize, usize)>) {
+                for i in 0..=haystack.len() {
+                    spans.push((i, i));
+                }
+            }
+        }
+        let patterns: [&dyn PatternMasker; 1] = [&EmptyMasker];
+        assert_eq!(
+            mask_secrets_with_patterns("unchanged", std::iter::empty(), patterns, &[]),
+            "unchanged"
+        );
     }
 }

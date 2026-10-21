@@ -99,6 +99,8 @@ On shutdown the pool lets every slot stop its runner, stops the golden fork base
 
 Crash recovery is deliberate about the two things that look like a missing VM when they are not: hypervisors that outlive a detached boot, and macOS layer images still attached to a data directory. Startup — and a periodic reconcile while serving — kills orphaned hypervisor processes, detaches orphaned layer mounts, removes data directories the provider registry no longer knows about, and prunes pack intermediates. Machines this pool owns without a current golden record are treated as stale and deleted.
 
+A stop can also be refused *by smolvm* rather than fail: `machine stop` requires the guest agent to advertise `quiesced-shutdown-v1`, and a guest agent older than the installed smolvm (≥ 1.16) cannot. The engine therefore refuses to boot from a guest-agent rootfs it can prove does not match the resolved binary, and prefers the rootfs that ships next to it over a stale copy in the data directory; the surfaced error names both rootfs paths, both agent hashes, the agent version the guest logged at boot, and the remedy (`preloop update --ensure-runtime`). See [Stale guest-agent rootfs](/control-plane/operate/vm-images#stale-guest-agent-rootfs).
+
 A failed job that requested preservation is the one exception to immediate deletion: the VM is held for a debug session and reaped after 600 seconds idle. See [Debugging](/control-plane/guides/debugging).
 
 ## Disk sizing

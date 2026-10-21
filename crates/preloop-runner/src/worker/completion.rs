@@ -268,7 +268,7 @@ pub(crate) fn evaluate_environment_url(
     if value.is_empty() {
         return Ok(None);
     }
-    if job_ctx.masks.iter().any(|mask| {
+    let matches_value_mask = job_ctx.masks.iter().any(|mask| {
         if mask.is_empty() {
             return false;
         }
@@ -278,7 +278,8 @@ pub(crate) fn evaluate_environment_url(
             || preloop_gha_protocol::masking::secret_variants(mask)
                 .iter()
                 .any(|variant| value.contains(variant.as_str()))
-    }) {
+    });
+    if matches_value_mask || job_ctx.matches_pattern_mask(&value) {
         // Official `JobExtension.FinalizeJob`: a URL that would disclose a
         // secret is skipped, never reported.
         warn!("Skip setting environment url as it may contain secret");
@@ -804,6 +805,40 @@ mod tests {
         assert!(
             evaluate_environment_url(&message, &job).unwrap().is_none(),
             "a secret-bearing url must not be reported"
+        );
+    }
+
+    /// The same guard covers a span only a `MaskType::Regex` hint declares
+    /// secret: the engine's `scheme://user:password@host` hint redacts URL
+    /// credentials from the logs, so a URL carrying them must not be published
+    /// either.
+    #[test]
+    fn environment_url_skips_values_matching_a_pattern_hint() {
+        let mut job = environment_job();
+        job.apply_mask_hints(&[preloop_gha_protocol::azdo::MaskHint {
+            hint_type: preloop_gha_protocol::azdo::MaskType::Regex,
+            value: r"user:[^@\s]+@host".to_owned(),
+        }]);
+        let message = serde_json::json!({
+            "actionsEnvironment": {
+                "name": "prod",
+                "url": {"type": 0, "lit": "https://user:hunter2@host/deploy"},
+            }
+        });
+        assert!(
+            evaluate_environment_url(&message, &job).unwrap().is_none(),
+            "a url matching a hint pattern must not be reported"
+        );
+        // A URL the hints do not match is still reported.
+        let plain = serde_json::json!({
+            "actionsEnvironment": {
+                "name": "prod",
+                "url": {"type": 0, "lit": "https://example.test/deploy"},
+            }
+        });
+        assert_eq!(
+            evaluate_environment_url(&plain, &job).unwrap().as_deref(),
+            Some("https://example.test/deploy")
         );
     }
 }

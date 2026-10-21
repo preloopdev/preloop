@@ -1037,7 +1037,10 @@ pub async fn attach_merge(
                 storage_repository: None,
                 source: SnapshotSource::SelfBuiltMerge,
                 cache_namespace: None,
-                upstream_repository: None,
+                // The merge commit exists only in the engine, but the LFS
+                // objects it references still live upstream. Record the
+                // repository so a missing blob can be fetched on demand.
+                upstream_repository: Some(merge.repository.clone()),
                 upstream_repository_id: None,
                 upstream_private: None,
                 merge: None,
@@ -1164,7 +1167,9 @@ pub async fn attach_prebuilt_merge(
         storage_repository: None,
         source: SnapshotSource::SelfBuiltMerge,
         cache_namespace: None,
-        upstream_repository: None,
+        // A prebuilt merge is still a merge of two upstream commits; keep the
+        // repository so its LFS objects remain fetchable on demand.
+        upstream_repository: Some(prebuilt.repository.clone()),
         upstream_repository_id: None,
         upstream_private: None,
         merge: Some(SnapshotMerge {
@@ -1205,6 +1210,103 @@ mod tests {
 
     fn parse(bytes: &[u8]) -> Option<(String, Vec<String>)> {
         parse_merge_tree_output(bytes)
+    }
+
+    /// A real mirror holding a two-parent merge of `owner/repo`, plus the
+    /// state that serves it, so both attach paths run their git plumbing.
+    async fn merge_fixture() -> (tempfile::TempDir, Arc<SharedState>, PathBuf, MergedMerge) {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = Arc::new(SharedState {
+            state: crate::AppState::new(temp.path().join("state"))
+                .await
+                .unwrap(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let mirror = shared
+            .state
+            .state_dir
+            .join(repository_mirror_relative(&shared, "owner/repo"));
+        ensure_mirror(&mirror).await.unwrap();
+
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "preloop-test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(work.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "topic"]);
+        std::fs::write(work.join("head.txt"), "head\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "head"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(work.join("main.txt"), "main\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "main"]);
+        git(&["merge", "-q", "--no-ff", "topic", "-m", "merge"]);
+        let merge_sha = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        let parents = git(&["rev-list", "--parents", "-n", "1", "HEAD"]);
+        let parents: Vec<&str> = parents.split_whitespace().skip(1).collect();
+        assert_eq!(parents.len(), 2, "fixture merge must have two parents");
+        git(&[
+            "push",
+            "-q",
+            mirror.to_str().unwrap(),
+            "main:refs/heads/main",
+            "topic:refs/heads/topic",
+        ]);
+        let merge = MergedMerge {
+            repository: "owner/repo".to_owned(),
+            sha: merge_sha,
+            tree,
+            base_sha: parents[0].to_owned(),
+            head_sha: parents[1].to_owned(),
+        };
+        (temp, shared, mirror, merge)
+    }
+
+    /// A self-built merge's commit lives only in the engine, but its LFS
+    /// objects are still upstream. Both attach paths must record the upstream
+    /// repository, or an LFS miss is served as a 404 instead of being fetched.
+    #[tokio::test]
+    async fn self_built_merge_snapshots_record_the_upstream_repository() {
+        let (_temp, shared, mirror, merge) = merge_fixture().await;
+
+        let attached = attach_merge(&shared, RunId::new(), &mirror, &merge, None)
+            .await
+            .expect("attach_merge serves the built merge");
+        assert_eq!(attached.source, SnapshotSource::SelfBuiltMerge);
+        assert_eq!(attached.upstream_repository.as_deref(), Some("owner/repo"));
+        assert_eq!(attached.upstream_repository_id, None);
+        assert_eq!(
+            attached.upstream_private, None,
+            "visibility stays unknown; the LFS route treats that as public"
+        );
+
+        let prebuilt = prebuilt_merge_record(&shared, &mirror, &merge, Some(7))
+            .expect("the mirror is under the state directory");
+        let attached = attach_prebuilt_merge(&shared, RunId::new(), &prebuilt)
+            .await
+            .expect("attach_prebuilt_merge serves the prebuilt merge");
+        assert_eq!(attached.source, SnapshotSource::SelfBuiltMerge);
+        assert_eq!(attached.upstream_repository.as_deref(), Some("owner/repo"));
+        assert_eq!(attached.upstream_repository_id, None);
+        assert_eq!(attached.upstream_private, None);
     }
 
     #[test]
