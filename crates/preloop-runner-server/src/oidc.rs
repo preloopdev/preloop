@@ -356,45 +356,6 @@ pub fn build_claims(
     claims
 }
 
-/// Parse whether a workflow/job grants `id-token: write`.
-///
-/// Job-level permissions replace workflow-level permissions. `write-all` grants
-/// the permission; boolean permission values are not treated as write grants.
-pub fn parse_id_token_grant(workflow_yaml: &str, job_id: Option<&str>) -> bool {
-    let Ok(parsed) = serde_yaml::from_str::<serde_yaml::Value>(workflow_yaml) else {
-        return false;
-    };
-    let Some(jobs) = parsed.get("jobs") else {
-        return false;
-    };
-
-    fn permission_is_write(value: &serde_yaml::Value) -> bool {
-        match value {
-            serde_yaml::Value::String(value) => value == "write",
-            serde_yaml::Value::Mapping(value) => value
-                .get(serde_yaml::Value::String("id-token".to_owned()))
-                .is_some_and(permission_is_write),
-            _ => false,
-        }
-    }
-
-    fn permissions_grant(value: &serde_yaml::Value) -> bool {
-        match value {
-            serde_yaml::Value::String(value) => value == "write-all",
-            serde_yaml::Value::Mapping(_) => permission_is_write(value),
-            _ => false,
-        }
-    }
-
-    if let Some(job_id) = job_id
-        && let Some(job_permissions) = jobs.get(job_id).and_then(|job| job.get("permissions"))
-    {
-        return permissions_grant(job_permissions);
-    }
-
-    parsed.get("permissions").is_some_and(permissions_grant)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -686,82 +647,6 @@ mod tests {
                 .verify_signature_rs256(signing_input.as_bytes(), &sig_bytes)
                 .is_ok()
         );
-    }
-
-    // -- permission parsing --------------------------------------------------
-
-    #[test]
-    fn parse_workflow_level_id_token_write() {
-        let yaml = r#"
-name: test
-on: push
-permissions:
-  id-token: write
-  contents: read
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        assert!(parse_id_token_grant(yaml, Some("build")));
-        assert!(parse_id_token_grant(yaml, None));
-    }
-
-    #[test]
-    fn parse_job_level_id_token_write() {
-        let yaml = r#"
-name: test
-on: push
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    steps:
-      - run: echo hi
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        assert!(parse_id_token_grant(yaml, Some("deploy")));
-        assert!(!parse_id_token_grant(yaml, Some("build")));
-    }
-
-    #[test]
-    fn parse_no_id_token_grant() {
-        let yaml = r#"
-name: test
-on: push
-permissions:
-  contents: read
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"#;
-        assert!(!parse_id_token_grant(yaml, Some("build")));
-    }
-
-    #[test]
-    fn parse_workflow_level_grant_applies_to_all_jobs() {
-        let yaml = r#"
-name: test
-on: push
-permissions:
-  id-token: write
-jobs:
-  job-a:
-    runs-on: ubuntu-latest
-    steps: [{ run: "echo a" }]
-  job-b:
-    runs-on: ubuntu-latest
-    steps: [{ run: "echo b" }]
-"#;
-        assert!(parse_id_token_grant(yaml, Some("job-a")));
-        assert!(parse_id_token_grant(yaml, Some("job-b")));
     }
 
     // -- property tests ------------------------------------------------------
