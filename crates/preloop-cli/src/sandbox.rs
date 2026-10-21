@@ -20,7 +20,9 @@ use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
 use preloop_sandbox::server::{Auth, router};
-use preloop_sandbox::{Driver, SandboxApi, SandboxClient, Service, ServiceConfig, store};
+use preloop_sandbox::{
+    Driver, LeastLoaded, Placement, SandboxApi, SandboxClient, Service, ServiceConfig, store,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Default loopback address of the engine's sandbox API.
@@ -34,6 +36,19 @@ fn smolvm_slots() -> u32 {
     env_nonempty("PRELOOP_SANDBOX_SMOLVM_SLOTS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
+}
+
+/// Placement strategy for this process's service:
+/// `PRELOOP_SANDBOX_PLACEMENT` (default `least-loaded`).
+fn placement_from_env() -> anyhow::Result<Arc<dyn Placement>> {
+    let name =
+        env_nonempty("PRELOOP_SANDBOX_PLACEMENT").unwrap_or_else(|| LeastLoaded::NAME.to_owned());
+    preloop_sandbox::placement::by_name(&name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown sandbox placement `{name}` in PRELOOP_SANDBOX_PLACEMENT (valid: {})",
+            preloop_sandbox::placement::NAMES.join(", ")
+        )
+    })
 }
 
 /// Drivers attached to this host: `PRELOOP_SANDBOX_DRIVERS`, comma-separated
@@ -84,10 +99,12 @@ impl LocalSandboxes {
         let state = home.join("state");
         let store_url = env_nonempty("PRELOOP_SANDBOX_STORE_URL")
             .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
+        let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
+        config.placement = placement_from_env()?;
         let store = store::open(&store_url)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
-        let service = Service::open(store, ServiceConfig::new(state.join("sandbox-blobs"))).await?;
+        let service = Service::open(store, config).await?;
         let shutdown = CancellationToken::new();
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
 
@@ -653,8 +670,10 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     let store_url = args
         .store
         .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
+    let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
+    config.placement = placement_from_env()?;
     let store = store::open(&store_url).await?;
-    let service = Service::open(store, ServiceConfig::new(state.join("sandbox-blobs"))).await?;
+    let service = Service::open(store, config).await?;
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {
