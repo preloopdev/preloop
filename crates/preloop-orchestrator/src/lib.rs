@@ -10,7 +10,7 @@ pub mod oci;
 use crate::environment::{EnvironmentSpec, is_official_golden};
 use crate::keys::{KeyPool, StagedKey};
 use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
-use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
+use preloop_gha_protocol::{RUNNER_BUSY_SENTINEL, SecretString};
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
 /// `VmProvider` implementation can model the handshake this pool relies on.
@@ -72,6 +72,26 @@ const GOLDEN_RETRY_MAX: Duration = Duration::from_secs(60);
 const TEARDOWN_RETRY_MIN: Duration = Duration::from_secs(1);
 const TEARDOWN_RETRY_MAX: Duration = Duration::from_secs(30);
 const TEARDOWN_RETRY_ATTEMPTS: u32 = 3;
+
+/// Ceiling on the external control plane's runner-teardown callback.
+///
+/// The callback resolves a runner name to an ID and DELETEs it through an
+/// admin API. `notify_runner_gone` runs on every path before the machine
+/// delete, so an unbounded await would keep the VM — and the slot that owns
+/// it — occupied for as long as the remote connection stalls, and would stop
+/// pool shutdown behind it. The engine purge request in the same function is
+/// bounded for the same reason; the callback gets more room only because it
+/// makes more than one round trip before the machine comes down regardless.
+const RUNNER_GONE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceiling on the external control plane's per-VM credential mint.
+///
+/// The mint is a caller-supplied admin API call, awaited while a slot is
+/// between machines. An unbounded await would leave that slot without a runner
+/// for as long as the remote connection stalls — and only a restart clears it,
+/// because shutdown is not the failure mode. Expiry is reported as a provision
+/// failure, which the slot already retries.
+const REGISTRATION_MINT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Debug marker contents written by the orchestrator when it parks a failed VM.
 pub const DEBUG_MARKER_IDLE: &str = "preserved";
@@ -3024,11 +3044,113 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
     argv
 }
 
+/// Callback that mints a short-lived registration credential for one VM.
+///
+/// The callback is invoked once per provisioning attempt. Callers can adapt a
+/// GitHub admin client (or another control-plane client) to this boundary
+/// without making the VM pool depend on that client's crate. The credential
+/// is returned as a [`SecretString`]: the pool copies it into a private file
+/// for the guest's `configure` invocation and never formats or logs it.
+#[derive(Clone)]
+pub struct RegistrationTokenMint(
+    Arc<dyn Fn() -> BoxFuture<'static, Result<SecretString, String>> + Send + Sync>,
+);
+
+impl RegistrationTokenMint {
+    /// Adapt an async credential provider to the pool's callback boundary.
+    pub fn new<F, Fut>(mint: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<SecretString, String>> + Send + 'static,
+    {
+        Self(Arc::new(move || Box::pin(mint())))
+    }
+
+    async fn mint(&self) -> Result<SecretString, String> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for RegistrationTokenMint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RegistrationTokenMint(..)")
+    }
+}
+
+/// How a runner receives the credential used by `configure`.
+#[derive(Debug, Clone)]
+pub enum RegistrationSource {
+    /// The engine's existing static host credential. The value is resolved
+    /// only for the configure invocation and is never persisted in a VM.
+    Engine { token_env: String },
+    /// Mint a fresh credential for each VM and inject it through a temporary
+    /// secret file. This is the GitHub/GHES control-plane path.
+    PerVm(RegistrationTokenMint),
+}
+
+/// What control plane supplies runner demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Demand {
+    /// The engine queue supplies demand. `size == 0` retains on-demand mode;
+    /// `size > 0` provisions a fixed warm pool.
+    Engine,
+    /// A queue-free external control plane keeps this many ephemeral runners
+    /// registered and replenishes each slot after it disappears.
+    GitHub { warm: usize },
+}
+
+/// Optional callbacks for control-plane-specific runner teardown.
+#[derive(Clone, Default)]
+pub struct ControlPlaneHooks {
+    /// Called before deleting a VM. The callback receives the runner name;
+    /// GitHub adapters resolve that name to an ID before DELETE.
+    pub runner_gone: Option<RunnerGoneHook>,
+}
+
+impl std::fmt::Debug for ControlPlaneHooks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneHooks")
+            .field("runner_gone", &self.runner_gone)
+            .finish()
+    }
+}
+
+/// Adapter for deleting or purging a runner in an external control plane.
+#[derive(Clone)]
+pub struct RunnerGoneHook(
+    Arc<dyn Fn(MachineName) -> BoxFuture<'static, Result<(), String>> + Send + Sync>,
+);
+
+impl RunnerGoneHook {
+    /// Adapt an async name-to-delete callback to the pool boundary.
+    pub fn new<F, Fut>(runner_gone: F) -> Self
+    where
+        F: Fn(MachineName) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        Self(Arc::new(move |name| Box::pin(runner_gone(name))))
+    }
+
+    async fn call(&self, name: MachineName) -> Result<(), String> {
+        (self.0)(name).await
+    }
+}
+
+impl std::fmt::Debug for RunnerGoneHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RunnerGoneHook(..)")
+    }
+}
+
 /// Local ephemeral-runner pool configuration.
 #[derive(Debug, Clone)]
 pub struct RunnerPoolConfig {
     /// Number of runners polling concurrently.
     pub size: usize,
+    /// Control-plane demand source. Engine mode retains the existing queue
+    /// semantics; GitHub mode keeps a fixed warm count without a local queue.
+    pub demand: Demand,
     /// Use a forkable golden VM as a fork base for instant runner creation.
     /// When enabled, a single "golden" VM boots once and each runner slot
     /// clones from it with CoW memory and disks.
@@ -3073,8 +3195,12 @@ pub struct RunnerPoolConfig {
     /// Guest DNS resolver override (smolvm `--dns`), for networks that
     /// filter smolvm's default public resolvers.
     pub dns: Option<String>,
-    /// Host environment variable containing the registration credential.
-    pub registration_token_env: String,
+    /// Source for the credential passed to each guest's configure command.
+    /// `PerVm` is required for an external GitHub/GHES control plane.
+    pub registration: RegistrationSource,
+    /// Control-plane-specific teardown actions. Engine mode still performs its
+    /// built-in purge; GitHub adapters use this hook to DELETE by runner ID.
+    pub control_plane_hooks: ControlPlaneHooks,
     /// Runner labels advertised to the scheduler.
     pub labels: Vec<String>,
     /// vCPUs per runner.
@@ -3392,11 +3518,60 @@ impl RunnerPoolConfig {
                 )));
             }
         }
-        if std::env::var_os(&self.registration_token_env).is_none() {
+        if let RegistrationSource::Engine { token_env } = &self.registration
+            && (token_env.is_empty() || std::env::var_os(token_env).is_none())
+        {
             return Err(OrchestratorError::Config(format!(
-                "registration token environment variable `{}` is not set",
-                self.registration_token_env
+                "registration token environment variable `{token_env}` is not set"
             )));
+        }
+        if matches!(self.demand, Demand::GitHub { warm: 0 }) {
+            return Err(OrchestratorError::Config(
+                "GitHub control-plane demand requires at least one warm runner".into(),
+            ));
+        }
+        // `warm` is the desired slot count in GitHub mode, exactly as `size`
+        // is in engine mode, so it carries the same ceiling: `run` only trims
+        // it to what the host's memory can hold, which is no bound on a large
+        // host.
+        if let Demand::GitHub { warm } = self.demand
+            && warm > 64
+        {
+            return Err(OrchestratorError::Config(
+                "GitHub control-plane demand must be between 0 and 64 warm runners".into(),
+            ));
+        }
+        if matches!(self.demand, Demand::GitHub { .. })
+            && matches!(&self.registration, RegistrationSource::Engine { .. })
+        {
+            return Err(OrchestratorError::Config(
+                "GitHub control-plane demand requires a per-VM registration source".into(),
+            ));
+        }
+        // GitHub demand never sends the engine purge request, so the teardown
+        // callback is the only thing that removes the runner identity GitHub
+        // keeps for a VM that died mid-job or at shutdown. Without it the
+        // identity lingers until GitHub's own offline cleanup.
+        if matches!(self.demand, Demand::GitHub { .. })
+            && self.control_plane_hooks.runner_gone.is_none()
+        {
+            return Err(OrchestratorError::Config(
+                "GitHub control-plane demand requires control_plane_hooks.runner_gone so a \
+                 runner identity cannot outlive its VM"
+                    .into(),
+            ));
+        }
+        // The engine purge path reads its bearer credential from the static
+        // registration env var, so a per-VM registration source would leave a
+        // VM lost mid-job unpurged until the lease reaper notices.
+        if matches!(self.demand, Demand::Engine)
+            && matches!(&self.registration, RegistrationSource::PerVm(_))
+        {
+            return Err(OrchestratorError::Config(
+                "engine demand requires a static registration source: the runner purge path \
+                 needs the engine credential"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -4604,30 +4779,31 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         keys.spawn_refill();
         let building = Arc::new(std::sync::Mutex::new(0));
 
-        // On-demand mode: size=0 means no warm pool. Fork runners only when
-        // jobs arrive, capped by the host's CPU and memory budget.
-        if self.config.size == 0 {
+        // Engine mode retains the existing size-zero queue gate. An external
+        // GitHub control plane never enters this path: it has no local queue
+        // and uses its explicit warm count below.
+        if matches!(self.config.demand, Demand::Engine) && self.config.size == 0 {
             return self
                 .run_on_demand(shutdown, golden_cache, idle, keys, building)
                 .await;
         }
 
-        // Warm mode: cap the configured pool size by host memory as well as
+        // Warm mode: cap the requested pool size by host memory as well as
         // CPU. Each slot holds exactly one VM at a time — the VM is deleted
         // when its job finishes and the slot forks a fresh runner from the
-        // golden — so the host must fit one runner ceiling per slot. Sizing
-        // down at startup is safer than OOMing mid-run;
-        // `PRELOOP_RUNNER_POOL_SIZE` remains an explicit override that wins.
-        let warm_size = match host_memory_mib() {
-            Some(total) => self
-                .config
-                .size
-                .min(on_demand_memory_cap(total, u64::from(self.config.memory_mib)).max(1)),
-            None => self.config.size,
+        // golden — so the host must fit one runner ceiling per slot.
+        let desired_warm = match self.config.demand {
+            Demand::Engine => self.config.size,
+            Demand::GitHub { warm } => warm,
         };
-        if warm_size < self.config.size {
+        let warm_size = match host_memory_mib() {
+            Some(total) => desired_warm
+                .min(on_demand_memory_cap(total, u64::from(self.config.memory_mib)).max(1)),
+            None => desired_warm,
+        };
+        if warm_size < desired_warm {
             warn!(
-                configured = self.config.size,
+                configured = desired_warm,
                 warm_size,
                 memory_mib = self.config.memory_mib,
                 "reduced warm pool size to fit host memory"
@@ -5243,15 +5419,41 @@ struct ReadyRunner {
     environment: RunnerEnvironment,
 }
 
-/// Tell the control plane a machine's runner is gone, BEFORE the VM goes
-/// away: the server purges the identity AND requeues any job the runner
-/// claimed but never finished. Without this, a machine torn down mid-job
-/// hangs that job until the 45-minute lease reaper marks it failed.
+/// Notify the configured control plane before a runner VM disappears.
 ///
-/// Fire-and-forget: machine deletion must not stall on control-plane
-/// availability, and a missed purge only reverts to the old reaper path.
+/// Engine mode keeps the existing `/api/v1/runners/purge` request. External
+/// GitHub/GHES mode never sends that request (and therefore never presents an
+/// engine bearer credential to `github.com`); its adapter uses
+/// `control_plane_hooks.runner_gone` to resolve the runner name to an ID and
+/// DELETE it through the admin API.
 async fn notify_runner_gone(config: &RunnerPoolConfig, name: &MachineName) {
-    let Some(token) = std::env::var(&config.registration_token_env)
+    if let Some(hook) = &config.control_plane_hooks.runner_gone {
+        // Bounded: the machine delete below is what reclaims the slot, so a
+        // stalled admin API must not hold it. A teardown that does not
+        // complete is logged and left to reconciliation rather than retried
+        // here — the runner identity outliving its VM is exactly what
+        // `ControlPlaneHooks::runner_gone`'s adapter reconciles.
+        match tokio::time::timeout(RUNNER_GONE_TIMEOUT, hook.call(name.clone())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(machine = name.as_str(), %error, "control-plane runner teardown failed");
+            }
+            Err(_) => {
+                warn!(
+                    machine = name.as_str(),
+                    timeout_ms = RUNNER_GONE_TIMEOUT.as_millis(),
+                    "control-plane runner teardown timed out; deleting the machine anyway"
+                );
+            }
+        }
+    }
+    if !matches!(config.demand, Demand::Engine) {
+        return;
+    }
+    let RegistrationSource::Engine { token_env } = &config.registration else {
+        return;
+    };
+    let Some(token) = std::env::var(token_env)
         .ok()
         .filter(|value| !value.is_empty())
     else {
@@ -7159,10 +7361,52 @@ async fn provision_runner<P: VmProvider + 'static>(
         "--ephemeral".into(),
         "--no-externals".into(),
     ]);
-    let mut secrets = vec![(
-        "PRELOOP_RUNNER_TOKEN".to_owned(),
-        SecretSource::HostEnv(config.registration_token_env.clone()),
-    )];
+    let (registration_secret, registration_token_file) = match &config.registration {
+        RegistrationSource::Engine { token_env } => {
+            (SecretSource::HostEnv(token_env.clone()), None)
+        }
+        RegistrationSource::PerVm(mint) => {
+            // Bounded like every other external control-plane call on this
+            // path: the adapter reaches an admin API, and a connection that
+            // stalls must surface as a provision failure the slot retries
+            // rather than a slot that never registers a runner.
+            let token = match tokio::time::timeout(REGISTRATION_MINT_TIMEOUT, mint.mint()).await {
+                Ok(Ok(token)) => token,
+                Ok(Err(error)) => {
+                    return Err(OrchestratorError::Pool(format!(
+                        "minting registration credential for {} failed: {error}",
+                        name.as_str()
+                    )));
+                }
+                Err(_) => {
+                    return Err(OrchestratorError::Pool(format!(
+                        "minting registration credential for {} timed out after {}s",
+                        name.as_str(),
+                        REGISTRATION_MINT_TIMEOUT.as_secs()
+                    )));
+                }
+            };
+            let directory = config
+                .runner_key_dir
+                .clone()
+                .or_else(|| {
+                    config
+                        .artifact_stem
+                        .parent()
+                        .map(|parent| parent.join(".registration-tokens"))
+                })
+                .unwrap_or_else(|| std::env::temp_dir().join(".preloop-registration-tokens"));
+            let staged = StagedKey::write_named(
+                &directory,
+                &format!(".{}-{}", name.as_str(), uuid::Uuid::new_v4()),
+                token.expose(),
+            )
+            .map_err(OrchestratorError::Io)?;
+            let path = staged.path().map_err(OrchestratorError::Io)?;
+            (SecretSource::HostFile(path), Some(staged))
+        }
+    };
+    let mut secrets = vec![("PRELOOP_RUNNER_TOKEN".to_owned(), registration_secret)];
     // One-time provision token: the control plane pairs this machine's
     // registration with the queued job the machine was provisioned for. The
     // guest cannot fabricate a pairing because only this exact configure
@@ -7250,6 +7494,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         .exec_with_secret_env(name, &as_runner_user(config, &configure), &secrets)
         .await;
     drop(staged);
+    drop(registration_token_file);
     if configure_result.is_err()
         && let Some(token) = provision_token_value.as_deref()
     {
@@ -7623,6 +7868,11 @@ mod lifecycle_tests {
     struct TestProvider {
         machines: Mutex<HashMap<String, MachineState>>,
         events: Mutex<Vec<String>>,
+        /// Secret values resolved by the mock at configure time. Real
+        /// providers resolve HostEnv/HostFile inside the VM launch path; this
+        /// lets tests assert per-VM credential isolation without retaining
+        /// the staged file after configure returns.
+        configure_secrets: Mutex<Vec<Vec<(String, String)>>>,
         created_images: Mutex<Vec<(String, String)>>,
         fail_fork: bool,
         fork_base_busy: bool,
@@ -7701,6 +7951,7 @@ mod lifecycle_tests {
             Self {
                 machines: Mutex::new(HashMap::new()),
                 events: Mutex::new(Vec::new()),
+                configure_secrets: Mutex::new(Vec::new()),
                 created_images: Mutex::new(Vec::new()),
                 fail_fork: false,
                 fork_base_busy: false,
@@ -7831,6 +8082,9 @@ mod lifecycle_tests {
 
         async fn events(&self) -> Vec<String> {
             self.events.lock().await.clone()
+        }
+        async fn configure_secret_values(&self) -> Vec<Vec<(String, String)>> {
+            self.configure_secrets.lock().await.clone()
         }
 
         async fn created_image(&self, name: &MachineName) -> Option<String> {
@@ -10913,6 +11167,81 @@ fi"#,
         let _ = slot.await;
     }
 
+    /// A queue-free GitHub-demand slot mints a fresh credential for every
+    /// ephemeral generation and never invokes the engine purge path.
+    #[tokio::test]
+    async fn github_demand_replenishes_with_per_vm_credentials() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let mut config = test_config(false);
+        config.demand = Demand::GitHub { warm: 1 };
+        let minted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mint_counter = minted.clone();
+        config.registration = RegistrationSource::PerVm(RegistrationTokenMint::new(move || {
+            let sequence = mint_counter.fetch_add(1, Ordering::AcqRel);
+            async move {
+                Ok::<_, String>(SecretString::new(format!(
+                    "github-registration-token-{sequence}"
+                )))
+            }
+        }));
+        // GitHub demand never sends the engine purge request, so `validate`
+        // requires the teardown adapter that replaces it.
+        config.control_plane_hooks.runner_gone = Some(RunnerGoneHook::new(|_| async { Ok(()) }));
+        config.server_url = "https://github.example".to_owned();
+        let shutdown = CancellationToken::new();
+        let slot = tokio::spawn(run_slot(
+            provider.clone(),
+            config.clone(),
+            0,
+            shutdown.clone(),
+            Arc::new(GoldenCache::new(config.name_prefix.clone())),
+            GoldenBudget::unbounded(),
+            pool_handles(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if provider.configure_secret_values().await.len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("GitHub demand must replenish a disappeared runner");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), slot)
+            .await
+            .expect("GitHub slot should stop")
+            .expect("GitHub slot task should join")
+            .expect("GitHub slot should stop cleanly");
+
+        let values = provider
+            .configure_secret_values()
+            .await
+            .into_iter()
+            .filter_map(|secrets| {
+                secrets
+                    .into_iter()
+                    .find(|(guest, _)| guest == "PRELOOP_RUNNER_TOKEN")
+                    .map(|(_, value)| value)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            values.len() >= 2,
+            "expected at least two generations: {values:?}"
+        );
+        assert_ne!(values[0], values[1], "every VM needs a fresh credential");
+        assert!(
+            values.iter().all(|value| !value.contains("test")),
+            "engine credential must not be sent to GitHub guests: {values:?}"
+        );
+        assert!(
+            minted.load(Ordering::Acquire) >= 2,
+            "credential provider should run once per VM"
+        );
+    }
+
     /// Materialize a valid externals tree for every expected runtime.
     fn write_valid_externals(externals_root: &std::path::Path) {
         for (runtime, version) in crate::node_externals::expected_runtimes() {
@@ -11079,6 +11408,7 @@ fi"#,
             .clone();
         RunnerPoolConfig {
             size: 1,
+            demand: Demand::Engine,
             use_fork: false,
             name_prefix: "lifecycle-test".to_owned(),
             base_image: "base-image".to_owned(),
@@ -11092,7 +11422,10 @@ fi"#,
             control_socket: control_socket.then(|| PathBuf::from("/tmp/engine.sock")),
             control_upstream: None,
             dns: None,
-            registration_token_env: "LIFECYCLE_TEST_TOKEN".to_owned(),
+            registration: RegistrationSource::Engine {
+                token_env: "LIFECYCLE_TEST_TOKEN".to_owned(),
+            },
+            control_plane_hooks: ControlPlaneHooks::default(),
             labels: vec!["test".to_owned()],
             cpus: 1,
             memory_mib: 128,
@@ -11127,6 +11460,79 @@ fi"#,
                 .contains("storage must be greater than zero"),
             "{error}"
         );
+    }
+
+    /// `warm` is the desired slot count in GitHub mode, so it carries the same
+    /// ceiling `size` does; `run` only trims it to fit host memory.
+    #[test]
+    fn github_demand_caps_the_warm_count() {
+        let mut config = test_config(false);
+        let mint = RegistrationTokenMint::new(|| async { Ok(SecretString::new("token")) });
+        config.registration = RegistrationSource::PerVm(mint);
+        config.control_plane_hooks.runner_gone = Some(RunnerGoneHook::new(|_| async { Ok(()) }));
+        config.demand = Demand::GitHub { warm: 65 };
+
+        let error = config
+            .validate()
+            .expect_err("65 warm runners must exceed the pool ceiling");
+        assert!(error.to_string().contains("between 0 and 64"), "{error}");
+
+        config.demand = Demand::GitHub { warm: 64 };
+        config.validate().expect("64 warm runners must validate");
+    }
+
+    /// GitHub demand never sends the engine purge request, so without the
+    /// teardown callback nothing removes the runner identity GitHub keeps for
+    /// a VM that disappears mid-job.
+    #[test]
+    fn github_demand_requires_a_teardown_hook() {
+        let mut config = test_config(false);
+        let mint = RegistrationTokenMint::new(|| async { Ok(SecretString::new("token")) });
+        config.registration = RegistrationSource::PerVm(mint);
+        config.demand = Demand::GitHub { warm: 1 };
+
+        let error = config
+            .validate()
+            .expect_err("GitHub demand without a teardown hook must be invalid");
+        assert!(error.to_string().contains("runner_gone"), "{error}");
+    }
+
+    /// The engine purge path reads its bearer credential from the static
+    /// registration env var, so a per-VM source would leave a VM lost mid-job
+    /// unpurged until the lease reaper notices.
+    #[test]
+    fn engine_demand_rejects_a_per_vm_registration_source() {
+        let mut config = test_config(false);
+        config.registration = RegistrationSource::PerVm(RegistrationTokenMint::new(|| async {
+            Ok(SecretString::new("token"))
+        }));
+
+        let error = config
+            .validate()
+            .expect_err("engine demand with per-VM registration must be invalid");
+        assert!(
+            error.to_string().contains("static registration source"),
+            "{error}"
+        );
+    }
+
+    /// A teardown callback that never completes must not hold the machine, or
+    /// the slot that owns it, past the bounded wait.
+    #[tokio::test]
+    async fn stalled_runner_gone_hook_does_not_block_teardown() {
+        let mut config = test_config(false);
+        config.demand = Demand::GitHub { warm: 1 };
+        config.control_plane_hooks.runner_gone = Some(RunnerGoneHook::new(|_| {
+            std::future::pending::<Result<(), String>>()
+        }));
+        let name = MachineName::new(format!("{}-0", config.name_prefix)).unwrap();
+
+        tokio::time::timeout(
+            RUNNER_GONE_TIMEOUT + Duration::from_secs(1),
+            notify_runner_gone(&config, &name),
+        )
+        .await
+        .expect("a stalled teardown hook must not outlive its timeout");
     }
 
     #[async_trait]
@@ -11386,12 +11792,27 @@ fi"#,
             &self,
             name: &MachineName,
             _argv: &[String],
-            _secrets: &[(String, SecretSource)],
+            secrets: &[(String, SecretSource)],
         ) -> Result<ExecOutput, VmError> {
             self.events
                 .lock()
                 .await
                 .push(format!("configure:{}", name.as_str()));
+            let resolved = secrets
+                .iter()
+                .map(|(guest, source)| {
+                    let value = match source {
+                        SecretSource::HostEnv(host) => {
+                            std::env::var(host).unwrap_or_else(|_| "<missing>".to_owned())
+                        }
+                        SecretSource::HostFile(path) => {
+                            std::fs::read_to_string(path).unwrap_or_else(|_| "<missing>".to_owned())
+                        }
+                    };
+                    (guest.clone(), value)
+                })
+                .collect();
+            self.configure_secrets.lock().await.push(resolved);
             if let Some(gate) = &self.configure_gate {
                 gate.notified().await;
             }

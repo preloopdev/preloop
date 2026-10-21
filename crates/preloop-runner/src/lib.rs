@@ -3,9 +3,10 @@
 //! Rust reimplementation of the GitHub Actions runner.
 //!
 //! This crate implements the runner protocol client (Runner.Listener + Runner.Worker)
-//! faithful to the official `actions/runner` v2.335.1. It speaks the same wire protocol
-//! as the C# runner so it can register with GitHub, poll for jobs, execute workflow
-//! steps, and report results.
+//! faithful to the official `actions/runner` release pinned by `runner_version` in
+//! the workspace `versions.toml` (advertised as [`PROTOCOL_COMPAT_VERSION`]). It
+//! speaks the same wire protocol as the C# runner so it can register with GitHub,
+//! poll for jobs, execute workflow steps, and report results.
 //!
 //! # Architecture
 //!
@@ -33,8 +34,17 @@ pub mod process;
 pub mod settings;
 pub mod worker;
 
-/// Protocol compatibility version (matches actions/runner release we target).
-pub const PROTOCOL_COMPAT_VERSION: &str = "2.335.1";
+/// Protocol compatibility version: the `actions/runner` release this build
+/// advertises everywhere the wire protocol exposes a version (agent body,
+/// session body, `runnerVersion=` poll/ack params, User-Agent).
+///
+/// Sourced from `runner_version` in the workspace `versions.toml` via the
+/// build script's `pins.rs` (`RUNNER_VERSION`); bumping that pin is the only
+/// edit an advertised-version change needs. GitHub stops queuing jobs to a
+/// runner 30 days after a newer release, so the pin must stay current —
+/// `configure` warns when the deprecations endpoint reports a near
+/// `runtime_deprecates_at` for this version.
+pub const PROTOCOL_COMPAT_VERSION: &str = RUNNER_VERSION;
 
 /// Crate version for display.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

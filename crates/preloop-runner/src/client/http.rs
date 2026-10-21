@@ -223,6 +223,35 @@ impl HttpClient {
             .with_context(|| format!("parsing GET {url}"))
     }
 
+    /// GET request returning JSON, with an optional bearer credential, that
+    /// reports the status without the response body on failure.
+    ///
+    /// For advisory lookups against a third-party endpoint: the caller logs
+    /// the reason it could not verify something, and an unauthenticated
+    /// endpoint's error body is text this process never asked for and must
+    /// not copy into runner logs.
+    pub async fn get_json_optional_auth<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        auth: Option<&str>,
+    ) -> Result<T> {
+        let mut request = self
+            .client_for(url)
+            .get(url)
+            .header(ACCEPT, "application/json");
+        if let Some(auth) = auth {
+            request = request.header(AUTHORIZATION, auth);
+        }
+        let resp = request.send().await.with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("GET {url} returned {status}");
+        }
+        resp.json()
+            .await
+            .with_context(|| format!("parsing GET {url}"))
+    }
+
     /// GET request with bearer auth returning JSON.
     pub async fn get_json_with_auth<T: serde::de::DeserializeOwned>(
         &self,
