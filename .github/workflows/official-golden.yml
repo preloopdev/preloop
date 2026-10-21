@@ -105,6 +105,49 @@ jobs:
           git push -u origin "$BRANCH"
           gh pr create --base main --head "$BRANCH"             --title "chore(golden): update official image pins to upstream rebuild"             --body "Weekly drift check found the dump pipeline's floating tags ahead of the pins. Merging rebuilds the official goldens via push trigger."
 
+  golden-age:
+    name: Bake when the newest golden exceeds max age
+    # The weekly schedule is the freshness backstop: even when the upstream
+    # digest has not moved, refuse to keep serving an artifact past
+    # `golden_max_age_days`. The bake job below consumes this output; no
+    # workflow-dispatch token is needed.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      bake: ${{ steps.check.outputs.bake }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check newest golden artifact age
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          max_age="$(awk -F'"' '/^golden_max_age_days = / { print $2; exit }' official-image.toml)"
+          test -n "$max_age"
+          created="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=golden-x86_64&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .created_at // empty')"
+          if [ -z "$created" ]; then
+            echo "no unexpired golden artifact; scheduling a bake"
+            echo "bake=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          age=$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))
+          echo "newest golden artifact: ${created} (${age}d old, max ${max_age}d)"
+          if [ "$age" -ge "$max_age" ]; then
+            echo "bake=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bake=false" >> "$GITHUB_OUTPUT"
+          fi
+
   image-pins-changed:
     name: Do the image pins change?
     # official-image.toml carries two classes of keys: the
@@ -142,12 +185,14 @@ jobs:
 
   build-official-x86_64:
     name: Build official x86_64 golden
-    needs: image-pins-changed
+    needs: [image-pins-changed, golden-age]
     # `!cancelled()` keeps the job eligible when `image-pins-changed` was
     # skipped (it only runs for pull requests) — a bare `if` would inherit an
     # implicit `success()` and skip every manual bake. The pull-request branch
-    # then requires the gate to have run and found the pins moved.
-    if: ${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64')) || (github.event_name == 'pull_request' && needs.image-pins-changed.result == 'success' && needs.image-pins-changed.outputs.changed == 'true')) }}
+    # then requires the gate to have run and found the pins moved; the
+    # schedule branch bakes only when `golden-age` says the artifact is past
+    # its maximum age.
+    if: ${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64')) || (github.event_name == 'pull_request' && needs.image-pins-changed.result == 'success' && needs.image-pins-changed.outputs.changed == 'true') || (github.event_name == 'schedule' && needs.golden-age.outputs.bake == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -422,6 +467,30 @@ jobs:
           test -s "dist/$GOLDEN_NAME"
           sha256sum "dist/$GOLDEN_NAME" > "dist/$GOLDEN_NAME.sha256"
 
+      - name: Generate baked-package SBOM
+        if: runner.environment == 'github-hosted'
+        env:
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+        run: |
+          set -euo pipefail
+          test -s "dist/$GOLDEN_NAME.apt-manifest.txt"
+          python3 scripts/write-apt-sbom.py \
+            --manifest "dist/$GOLDEN_NAME.apt-manifest.txt" \
+            --output "dist/$GOLDEN_NAME.apt-sbom.cdx.json" \
+            --distro-version 24.04
+          test -s "dist/$GOLDEN_NAME.apt-sbom.cdx.json"
+
+      - name: Retain Golden SBOM
+        if: runner.environment == 'github-hosted'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: golden-sbom-${{ env.GOLDEN_ARCH }}
+          path: |
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-manifest.txt
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-sbom.cdx.json
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Write golden provenance manifest
         if: runner.environment == 'github-hosted'
         env:
@@ -459,6 +528,8 @@ jobs:
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-manifest.txt
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-sbom.cdx.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
 
       - name: Retain Golden Artifact
@@ -474,6 +545,8 @@ jobs:
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.bundle
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-manifest.txt
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.apt-sbom.cdx.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
           retention-days: 90
           if-no-files-found: error

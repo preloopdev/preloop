@@ -29,7 +29,7 @@ fn snapshot_rewrite_appends_to_workflow_supplied_git_config() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     // Workflow entry survives, snapshot entries land after it.
     assert_eq!(
@@ -71,7 +71,7 @@ fn snapshot_origin_rewrite_routes_hardcoded_forge_urls_to_the_snapshot() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
@@ -127,7 +127,7 @@ fn snapshot_rewrite_installs_its_own_extraheader_only() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     // The rewrite installs only its own snapshot header. github.com auth is
     // the checkout's own job (the broker patches the minted token into the
@@ -161,7 +161,7 @@ fn snapshot_auth_header_is_registered_as_a_mask() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("GIT_CONFIG_VALUE_2").map(String::as_str),
@@ -197,7 +197,7 @@ fn snapshot_origin_rewrite_routes_git_scheme_repository_url_to_the_snapshot() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
@@ -402,7 +402,7 @@ fn inject_github_env_sets_core_vars() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(job.env.get("CI").unwrap(), "true");
     assert_eq!(job.env.get("GITHUB_ACTIONS").unwrap(), "true");
@@ -430,7 +430,7 @@ fn inject_github_env_stringifies_boolean_ref_protected() {
             "github": { "ref": "refs/heads/main", "ref_protected": true }
         }
     });
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
     assert_eq!(job.env.get("GITHUB_REF_PROTECTED").unwrap(), "true");
 
     let mut job = JobContext::new(
@@ -444,7 +444,7 @@ fn inject_github_env_stringifies_boolean_ref_protected() {
             "github": { "ref": "refs/heads/main", "ref_protected": false }
         }
     });
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
     assert_eq!(job.env.get("GITHUB_REF_PROTECTED").unwrap(), "false");
 }
 
@@ -637,7 +637,7 @@ fn inject_actions_env_from_system_vss_endpoint_data() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("ACTIONS_RUNTIME_URL").map(String::as_str),
@@ -703,7 +703,7 @@ fn injects_job_environment_variables_from_acquire_payload() {
         }]
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("MEGA_GLOBAL_ENV").map(String::as_str),
@@ -740,7 +740,7 @@ fn job_message_variables_do_not_leak_into_step_env() {
         },
         "environmentVariables": []
     });
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     for leaked in [
         "system.orchestrationId",
@@ -773,6 +773,7 @@ fn github_job_falls_back_to_context_when_variable_absent() {
             "contextData": {"github": {"job": "legacy-build"}},
             "environmentVariables": []
         }),
+        crate::settings::ControlPlane::Engine,
     );
     assert_eq!(
         job.env.get("GITHUB_JOB").map(String::as_str),
@@ -1493,11 +1494,11 @@ fn test_golden_acquirejob_payloads_parsing() {
         let mut job = JobContext::new(
             "job1".into(),
             "test-job".into(),
-            serde_json::json!({}),
-            serde_json::json!({}),
+            msg.get("variables").cloned().unwrap_or_default(),
+            msg.get("contextData").cloned().unwrap_or_default(),
         );
         job.workspace = Some("_work/repo/repo".into());
-        inject_github_env(&mut job, &msg);
+        inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
         // GITHUB_REPOSITORY must be set and not empty (from contextData.github.repository)
         let repo = job.env.get("GITHUB_REPOSITORY").map(|s| s.as_str());
@@ -1507,14 +1508,71 @@ fn test_golden_acquirejob_payloads_parsing() {
             "mismatched GITHUB_REPOSITORY in {scenario}"
         );
 
-        // GITHUB_TOKEN mirrors `github.token` only — never the engine's
-        // runtime JWT. The golden captures carry no `github.token` context,
-        // so the env is empty here (anonymous mode): exporting the JWT sent a
-        // dead credential to api.github.com on engines without an App/PAT.
+        // Token resolution is control-plane dependent (#626). On a preloop
+        // engine `system.github.token` can carry the job's runtime credential,
+        // so it must never surface as `github.token`/`GITHUB_TOKEN`. On
+        // github.com the same variable IS the job's GitHub credential — the
+        // official runner builds `github.token` from exactly this variable
+        // (`ExecutionContext.cs` `InitializeJob`).
+        let wire_token = msg
+            .get("variables")
+            .and_then(|v| v.get("system.github.token"))
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        // Engine registration: keep the fence. This branch is also the
+        // before/after control for #626 — the variable is exactly what the
+        // pre-fix runner never read, so `GITHUB_TOKEN` stayed unset and
+        // `github.token` resolved empty from this same golden message.
         let token = job.env.get("GITHUB_TOKEN").map(|s| s.as_str());
         assert_eq!(
             token, None,
-            "GITHUB_TOKEN must not export when github.token is empty ({scenario}) — the old fallback leaked the engine's runtime JWT to api.github.com"
+            "GITHUB_TOKEN must not export when registered against an engine ({scenario}) — the old fallback leaked the job's runtime credential to api.github.com"
+        );
+        let engine_ctx = job.build_expression_context();
+        assert_eq!(
+            preloop_gha_expressions::eval_expression("github.token", &engine_ctx)
+                .unwrap()
+                .as_str(),
+            Some(""),
+            "github.token must stay empty in engine mode ({scenario})"
+        );
+
+        // github.com registration: the variable the server sent is the job's
+        // real credential. Golden captures redact it, so assert it reaches
+        // the step surface byte-for-byte rather than comparing literals.
+        let mut github_job = JobContext::new(
+            "job1".into(),
+            "test-job".into(),
+            msg.get("variables").cloned().unwrap_or_default(),
+            msg.get("contextData").cloned().unwrap_or_default(),
+        );
+        github_job.workspace = job.workspace.clone();
+        inject_github_env(&mut github_job, &msg, crate::settings::ControlPlane::GitHub);
+        assert_eq!(
+            github_job.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some(wire_token.as_str()),
+            "github.com mode must export system.github.token as GITHUB_TOKEN ({scenario})"
+        );
+        let github_ctx = github_job.build_expression_context();
+        assert_eq!(
+            preloop_gha_expressions::eval_expression("github.token", &github_ctx)
+                .unwrap()
+                .as_str(),
+            Some(wire_token.as_str()),
+            "github.token must resolve from system.github.token in github.com mode ({scenario})"
+        );
+        assert_eq!(
+            preloop_gha_expressions::eval_expression("secrets.GITHUB_TOKEN", &github_ctx)
+                .unwrap()
+                .as_str(),
+            msg.get("variables")
+                .and_then(|v| v.get("github_token"))
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str()),
+            "secrets.GITHUB_TOKEN resolves from github_token in both modes ({scenario})"
         );
 
         // 3. Scenario-specific checks
@@ -1922,7 +1980,7 @@ fn unresolved_job_env_token_evaluates_to_the_minted_token_at_step_time() {
     }]);
     let mut job = claimed_job(&message);
     job.workspace = Some("_work/repo/repo".into());
-    inject_github_env(&mut job, &message);
+    inject_github_env(&mut job, &message, crate::settings::ControlPlane::Engine);
     assert_eq!(
         job.env.get("GITHUB_TOKEN").map(String::as_str),
         Some(CLAIM_MINTED_TOKEN),
@@ -1940,6 +1998,93 @@ fn unresolved_job_env_token_evaluates_to_the_minted_token_at_step_time() {
                 .expect("job env value evaluates"),
             CLAIM_MINTED_TOKEN,
             "job env `{name}` must evaluate to the claim-minted token"
+        );
+    }
+}
+
+/// A workflow- or job-level `env: GITHUB_TOKEN` reaches the step process as
+/// that override, but never becomes `${{ github.token }}`: the context comes
+/// from `system.github.token` (or the `github_token` alias) alone, exactly as
+/// `ExecutionContext.InitializeJob` builds it.
+#[test]
+fn job_env_github_token_override_does_not_replace_the_github_token_context() {
+    let mut message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    message["environmentVariables"] = serde_json::json!([{
+        "type": 2,
+        "map": [{
+            "Key": {"type": 0, "lit": "GITHUB_TOKEN"},
+            "Value": {"type": 0, "lit": "ghp_job_env"}
+        }]
+    }]);
+    let mut job = claimed_job(&message);
+    job.workspace = Some("_work/repo/repo".into());
+    inject_github_env(&mut job, &message, crate::settings::ControlPlane::GitHub);
+
+    assert_eq!(
+        job.env.get("GITHUB_TOKEN").map(String::as_str),
+        Some("ghp_job_env"),
+        "the workflow's `env:` override is what the step process reads"
+    );
+    let ctx = job.build_expression_context();
+    for expression in ["github.token", "secrets.GITHUB_TOKEN"] {
+        assert_eq!(
+            preloop_gha_expressions::eval_expression(expression, &ctx)
+                .expect("expression evaluates")
+                .as_str(),
+            Some(CLAIM_MINTED_TOKEN),
+            "`{expression}` must stay the job credential, not the env override"
+        );
+    }
+}
+
+/// The builder writes empty `isSecret` slots for both token aliases before the
+/// claim fills them; an empty `system.github.token` must not shadow the
+/// populated `github_token` it is paired with (nor the other way round).
+#[test]
+fn empty_system_token_slot_falls_back_to_the_github_token_alias() {
+    let token_variables = |system: &str, alias: &str| {
+        serde_json::json!({
+            "system.github.token": {"value": system, "isSecret": true},
+            "github_token": {"value": alias, "isSecret": true}
+        })
+    };
+    for (system, alias) in [("", CLAIM_MINTED_TOKEN), (CLAIM_MINTED_TOKEN, "")] {
+        // The claim patches the context token too; build the message with no
+        // context token at all so only the variable aliases can supply one.
+        let mut message = golden_claimed_message("13-composite-action", "");
+        message["variables"] = token_variables(system, alias);
+
+        let mut job = claimed_job(&message);
+        job.workspace = Some("_work/repo/repo".into());
+        inject_github_env(&mut job, &message, crate::settings::ControlPlane::GitHub);
+        assert_eq!(
+            job.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some(CLAIM_MINTED_TOKEN),
+            "the populated alias must be exported (system={system:?})"
+        );
+        assert_eq!(
+            preloop_gha_expressions::eval_expression(
+                "github.token",
+                &job.build_expression_context()
+            )
+            .expect("expression evaluates")
+            .as_str(),
+            Some(CLAIM_MINTED_TOKEN),
+            "`github.token` must read the populated alias (system={system:?})"
+        );
+
+        // Engine registration: the same variables stay off the step surface.
+        let mut engine_job = claimed_job(&message);
+        engine_job.workspace = Some("_work/repo/repo".into());
+        inject_github_env(
+            &mut engine_job,
+            &message,
+            crate::settings::ControlPlane::Engine,
+        );
+        assert_eq!(
+            engine_job.env.get("GITHUB_TOKEN").map(String::as_str),
+            None,
+            "an engine registration must not export the token variable"
         );
     }
 }

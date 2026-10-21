@@ -280,7 +280,9 @@ pub(crate) fn fill_template(
 
     // Mask breadth stays wider than the injected set: unreferenced secrets
     // are off the wire but can still reach a log through literals, so the
-    // node masker gets the whole resolved scope.
+    // node masker gets the whole resolved scope. The scope stays extensible
+    // after the fill: values minted while the job runs (the OIDC id_token)
+    // join it at mint time via `timeline_logs::register_runtime_mask_value`.
     let mut masked: Vec<String> = scoped.values().cloned().collect();
     masked.extend(resolved.values().cloned());
 

@@ -16,6 +16,12 @@ The runtime JWT uses the key at `<state-dir>/hmac-key.bin` by default. `PRELOOP_
 
 At claim time, Preloop writes the same GitHub credential to `github_token` and `contextData.github.token`. Therefore `${{ secrets.GITHUB_TOKEN }}` and `${{ github.token }}` agree in runner-time `env:`, `with:`, and `run:` values, local composite-action inputs, job environment expressions, and container or service credentials. Acquire-time job `env:` values and reusable-workflow `secrets:` maps are filled after that claim patch as well.
 
+## github.com registrations
+
+A runner can register directly against github.com (`preloop-runner configure --url https://github.com/...`) instead of a Preloop engine. `configure` records the plane in `.runner` as `controlPlane` (`engine` or `github`). A `.runner` written before that field existed is classified from the `gitHubUrl` it already carries, so an upgraded github.com runner keeps its token surface without re-registering. An unknown `controlPlane` value or a registration URL that cannot be parsed is an error: the runner refuses to start rather than silently treating corrupt metadata as an engine registration.
+
+On a github.com registration the job message carries the credential in the `system.github.token` variable and never patches the context, so the runner resolves `github.token` and `GITHUB_TOKEN` from that variable — or its `github_token` alias — exactly as the official runner's `ExecutionContext.InitializeJob` does. On a Preloop engine registration the runner reads the `github.token` context the claim patched and keeps `system.github.token` off the step surface: that slot holds the GitHub credential the claim minted, or nothing. The job-scoped runtime JWT is separate — it is delivered through the job's `SystemVssConnection` endpoint, is never written to `system.github.token`, and is never exported as `GITHUB_TOKEN`. On both planes a workflow's own `env: GITHUB_TOKEN` reaches the step process but never replaces `${{ github.token }}`.
+
 `ACTIONS_ID_TOKEN_REQUEST_URL` is present only when the job has `id-token: write`. OIDC tokens are signed by Preloop and use the configured issuer, not GitHub's token service.
 
 ## What works with no GitHub token

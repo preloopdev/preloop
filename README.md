@@ -44,7 +44,7 @@ mise use -g github:preloopdev/preloop
 **Installer script**
 
 ```sh
-ver=v0.35.0   # https://github.com/preloopdev/preloop/releases
+ver=v0.35.5   # https://github.com/preloopdev/preloop/releases
 curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
 less install.sh
 sh install.sh
@@ -60,7 +60,7 @@ Setup, credentials, golden images, `preloop init`, and first run are in the docs
 `preloop-runner` is a drop-in Rust replacement for `actions/runner`. It registers against GitHub or a preloop server the same way.
 
 ```sh
-ver=v0.35.0
+ver=v0.35.5
 curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
 less install.sh
 sh install.sh --runner

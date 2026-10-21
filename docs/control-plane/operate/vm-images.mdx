@@ -123,3 +123,24 @@ A microVM's device count is capped by libkrun's MMIO IRQ allocation: one line pe
 | Disk waits indefinitely | Check `PRELOOP_RUNNER_MIN_FREE_DISK_GB`, `PRELOOP_SKIP_DISK_PREFLIGHT`, and `PRELOOP_GOLDEN_UNPACK_FACTOR`. |
 | Every pool start fails with `krun_start_enter returned: -22 (EINVAL)` plus `no more IRQs are available` | The host ran out of MMIO IRQ lines for the machine's virtio devices (`VmError::IrqExhausted` — see [The virtio device budget](#the-virtio-device-budget-irq-lines)). Restarting the pool cannot help: upgrade the host runtime to the compiled floor (`preloop update --ensure-runtime`) or start the machine with fewer mounts. |
 | Wrong OS or labels | Check the custom base, `PRELOOP_RUNNER_LABELS`, and the workflow's `runs-on` labels. |
+| `running guest agent does not support safe shutdown` | The guest-agent rootfs does not match the resolved smolvm; see [Stale guest-agent rootfs](#stale-guest-agent-rootfs). |
+
+### Stale guest-agent rootfs
+
+The engine exports `SMOLVM_AGENT_ROOTFS` on every smolvm child (the child's `HOME`/data directory is isolated, so the rootfs must be named explicitly), and an inherited variable wins over the rootfs beside the binary — so a stale copy in the data directory used to outrank a version-matched one. SmolVM ≥ 1.16 requires the `quiesced-shutdown-v1` capability from the agent before it will stop a machine, so a stale agent makes every machine unstoppable and the pool retries the same stop forever.
+
+Preloop now prefers the rootfs shipped next to the resolved binary and refuses (with both rootfs paths, both agent hashes, and the host version) before booting from one it can prove cannot serve that binary — including when both trees hold the same stale agent, which is what a smolvm upgraded without its rootfs looks like. Repair the install with `preloop update --ensure-runtime`, which refreshes the rootfs the engine exports (`<data dir>/agent-rootfs`, where `<data dir>` is `$SMOLVM_DATA_DIR` or the effective Preloop home's `smolvm`), keeps the rootfs beside the resolved binary in step with it, and records the version in `<data dir>/agent-rootfs/.preloop-agent-version`. By hand, the equivalent is `cp -a <smolvm prefix>/agent-rootfs <data dir>/agent-rootfs`; if `SMOLVM_AGENT_ROOTFS` names the stale tree, unset it. `<smolvm prefix>` is the directory of the `smolvm` that `PATH` resolves (following symlinks), the official installer's `~/.smolvm` by default; with no `PRELOOP_HOME` the effective Preloop home is `~/.preloop`, so `<data dir>` is `~/.preloop/smolvm` and smolvm's own platform data directory is not what the engine exports. The agent version that actually booted is in the machine's console log (`smolvm machine data-dir --name <machine>` + `agent-console.log`), which the engine now appends to the stop error along with the rootfs it exported.
+
+The failure reproduces on any host that upgrades smolvm without replacing the rootfs the engine already points at, and the two copies are easy to tell apart — this is a real macOS host, before the fix:
+
+```console
+$ smolvm --version
+smolvm 1.18.1
+$ strings ~/.smolvm/agent-rootfs/usr/local/bin/smolvm-agent | grep -c quiesced-shutdown-v1
+1
+$ strings "$HOME/Library/Application Support/smolvm/agent-rootfs/usr/local/bin/smolvm-agent" \
+    | grep -c quiesced-shutdown-v1
+0
+```
+
+The data-directory agent is 1.14.2 and reports no capability while the host requires it, so every `machine stop` is refused. `cargo nextest run -p preloop-vm` covers the same pair with fixtures (the shipped tree, a stale data-directory copy, and a host that answers `smolvm --version`), which is what keeps it from coming back.
