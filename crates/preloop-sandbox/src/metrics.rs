@@ -10,6 +10,9 @@
 //! standalone `preloop sandbox serve` with no caller at all still reports
 //! accurate gauges and counters.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 
@@ -27,6 +30,14 @@ pub struct SandboxMetrics {
     exec_duration: Histogram<f64>,
     exec_exit: Counter<u64>,
     create_failures: Counter<u64>,
+    heartbeat_truncated: Counter<u64>,
+    /// `(state, provider, template)` combinations the last
+    /// [`Self::record_sandbox_counts`] tick recorded. Shared across clones so
+    /// a config clone cannot forget which series are live. A plain gauge keeps
+    /// its last value until something records over it, so the next tick must
+    /// write zero for every combination that disappeared instead of omitting
+    /// it.
+    live_counts: Arc<parking_lot::Mutex<HashSet<(String, String, String)>>>,
 }
 
 impl std::fmt::Debug for SandboxMetrics {
@@ -112,17 +123,44 @@ impl SandboxMetrics {
                 .with_description("Sandbox creations that failed, by reason (timeout, reported)")
                 .with_unit("{failure}")
                 .build(),
+            heartbeat_truncated: meter
+                .u64_counter("preloop.sandbox.heartbeat.truncated")
+                .with_description(
+                    "Per-sandbox runtime entries dropped from a heartbeat because one report \
+                     exceeded the per-heartbeat cap",
+                )
+                .with_unit("{sandbox}")
+                .build(),
+            live_counts: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         }
     }
 
+    /// Record the live sandboxes for one maintenance tick, keyed by
+    /// `(state, provider, template)`.
+    ///
+    /// Every combination recorded by the previous tick but absent from this
+    /// one is recorded as zero first: the OTel last-value gauge would
+    /// otherwise keep the drained combination's old count forever, so a
+    /// scrape after the last sandbox of a pool is destroyed would show it
+    /// still live.
+    pub fn record_sandbox_counts<I>(&self, counts: I)
+    where
+        I: IntoIterator<Item = (String, String, String, u64)>,
+    {
+        let mut current = HashSet::new();
+        for (state, provider, template, count) in counts {
+            self.record_sandbox_count(&state, &provider, &template, count);
+            current.insert((state, provider, template));
+        }
+        let mut seen = self.live_counts.lock();
+        for (state, provider, template) in seen.difference(&current) {
+            self.record_sandbox_count(state, provider, template, 0);
+        }
+        *seen = current;
+    }
+
     /// Record one `(state, provider, template)` combination's live count.
-    /// Called every maintenance tick with every combination currently
-    /// present; a combination that drops to zero live sandboxes simply
-    /// stops being recorded; the OTel SDK reader keeps its own meter has
-    /// no way to see stale low-cardinality combinations — this is the same
-    /// convention as other gauges in the workspace, which skip rather than
-    /// fabricate stale zeros.
-    pub fn record_sandbox_count(&self, state: &str, provider: &str, template: &str, count: u64) {
+    fn record_sandbox_count(&self, state: &str, provider: &str, template: &str, count: u64) {
         self.sandboxes.record(
             count,
             &[
@@ -131,6 +169,14 @@ impl SandboxMetrics {
                 KeyValue::new("template", template.to_owned()),
             ],
         );
+    }
+
+    /// Record per-sandbox runtime entries a heartbeat had to drop because
+    /// the host runs more measured sandboxes than one report carries.
+    pub fn record_heartbeat_truncation(&self, dropped: u64) {
+        if dropped > 0 {
+            self.heartbeat_truncated.add(dropped, &[]);
+        }
     }
 
     /// Record one acquire's outcome. `reason` is `None` on success.
@@ -198,10 +244,35 @@ impl SandboxMetrics {
 mod tests {
     use super::*;
 
+    /// Build a meter the test can scrape synchronously. `PrometheusHandle`
+    /// deduplicates series, so each render sees the latest value for every
+    /// label set.
+    fn test_meter() -> (
+        SandboxMetrics,
+        preloop_observability::prometheus::PrometheusHandle,
+        opentelemetry_sdk::metrics::SdkMeterProvider,
+    ) {
+        use opentelemetry::metrics::MeterProvider as _;
+
+        let handle = preloop_observability::prometheus::PrometheusHandle::new(
+            opentelemetry_sdk::metrics::ManualReader::default(),
+        );
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_reader(handle.clone())
+            .build();
+        let metrics = SandboxMetrics::from_meter(&provider.meter("test"));
+        (metrics, handle, provider)
+    }
+
     #[test]
     fn default_registry_is_noop() {
         let metrics = SandboxMetrics::default();
-        metrics.record_sandbox_count("ready", "prov-1", "alpine", 2);
+        metrics.record_sandbox_counts(vec![(
+            "ready".to_owned(),
+            "prov-1".to_owned(),
+            "alpine".to_owned(),
+            2,
+        )]);
         metrics.record_acquire(std::time::Duration::from_millis(5), None);
         metrics.record_acquire(
             std::time::Duration::from_millis(5),
@@ -214,5 +285,76 @@ mod tests {
         metrics.record_reconcile_orphans(1);
         metrics.record_exec(std::time::Duration::from_millis(5), "success");
         metrics.record_create_failure("timeout");
+        metrics.record_heartbeat_truncation(3);
+    }
+
+    #[test]
+    fn drained_combinations_record_zero() {
+        let (metrics, handle, provider) = test_meter();
+        let series = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("preloop_sandbox_sandboxes{"))
+                .map(str::to_owned)
+                .unwrap_or_default()
+        };
+
+        metrics.record_sandbox_counts(vec![
+            (
+                "ready".to_owned(),
+                "prov-1".to_owned(),
+                "alpine".to_owned(),
+                3,
+            ),
+            (
+                "leased".to_owned(),
+                "prov-1".to_owned(),
+                "alpine".to_owned(),
+                1,
+            ),
+        ]);
+        let text = handle.render();
+        assert!(
+            text.contains(
+                "preloop_sandbox_sandboxes{provider=\"prov-1\",state=\"ready\",template=\"alpine\"} 3"
+            ),
+            "missing the live ready series in: {text}"
+        );
+
+        // One pool drains, the other stays: the gone combination must be
+        // written back as zero, not left at its last value.
+        metrics.record_sandbox_counts(vec![(
+            "leased".to_owned(),
+            "prov-1".to_owned(),
+            "alpine".to_owned(),
+            1,
+        )]);
+        let text = handle.render();
+        assert!(
+            text.contains(
+                "preloop_sandbox_sandboxes{provider=\"prov-1\",state=\"ready\",template=\"alpine\"} 0"
+            ),
+            "drained combination kept its last value in: {text}"
+        );
+        assert!(
+            text.contains(
+                "preloop_sandbox_sandboxes{provider=\"prov-1\",state=\"leased\",template=\"alpine\"} 1"
+            ),
+            "live combination lost in: {text}"
+        );
+
+        // An empty tick zeroes everything currently known.
+        metrics.record_sandbox_counts(Vec::new());
+        let text = handle.render();
+        assert!(
+            text.contains(
+                "preloop_sandbox_sandboxes{provider=\"prov-1\",state=\"leased\",template=\"alpine\"} 0"
+            ),
+            "empty tick did not zero the last combination in: {text}"
+        );
+        assert!(
+            series(&text).contains(" 0"),
+            "expected zeroed series: {text}"
+        );
+        drop(provider);
     }
 }

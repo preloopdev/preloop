@@ -302,9 +302,7 @@ impl Driver for FakeDriver {
                 .map(|duration| duration.as_secs() as i64);
             sandboxes.push(SandboxRuntimeStats {
                 native_ref,
-                pid: None,
                 memory_bytes: None,
-                data_dir: entry.path().display().to_string(),
                 start_time,
             });
         }

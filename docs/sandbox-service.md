@@ -20,7 +20,7 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
   pool or template, identity to inject), `Renew`, `Release` (destroy or
   preserve), `Exec` (server-streaming), `OpenStream` (data-plane ticket),
   `Snapshot`, `Pause`/`Resume`, `Get`/`List`, `Stats` (read-only per-provider
-  host and sandbox inventory).
+  host and sandbox aggregates).
 * **Providers** (capacity owners): `Register` (drivers + capabilities →
   provider id and fencing generation), `Heartbeat`, `Poll` (long-poll for
   work), `Report` / `ReportExec` (fenced by generation), `Reconcile` (full
@@ -112,9 +112,14 @@ gauges.
 
 * `preloop.sandbox.sandboxes` (gauge, `state`/`provider`/`template`) — live
   sandboxes per combination, recorded from the service's own inventory on
-  every maintenance tick.
+  every maintenance tick. A combination that disappears is recorded as zero
+  on the next tick instead of keeping its last value, so a drained pool
+  reads as `0`.
 * `preloop.sandbox.pool.warm_depth` (gauge, `pool`) — idle, unleased
   sandboxes currently held for a pool.
+* `preloop.sandbox.heartbeat.truncated` (counter) — per-sandbox runtime
+  entries a heartbeat dropped because the host runs more than the
+  per-heartbeat cap.
 
 **Acquire, creation, and leases**
 
@@ -150,18 +155,28 @@ pool, template, sandbox, or lease being touched.
 
 Host and per-sandbox facts only the owning driver can measure travel on the
 provider's `Heartbeat`: a `HostReport` with a `HostSample` (RAM, swap, engine
-and summed guest RSS, top processes) plus one `SandboxRuntimeStats` per
-sandbox (native ref, pid, memory, data directory, start time). Every field is
-optional and best-effort — a backend that cannot measure something omits it
-instead of reporting a fabricated zero, and an empty report never fails or
-delays the heartbeat. A report replaces that provider's previous sandbox set
-rather than merging into it.
+and summed guest RSS) plus one `SandboxRuntimeStats` per sandbox (native ref,
+memory, start time). Every field is optional and best-effort — a backend that
+cannot measure something omits it instead of reporting a fabricated zero, and
+an empty report never fails or delays the heartbeat. A report replaces that
+provider's previous sandbox set rather than merging into it.
+
+One heartbeat carries at most 512 per-sandbox entries, most recently active
+first: "active" is work the agent handled for that native ref, falling back
+to newest start time. A host running more sandboxes drops the tail; the agent
+logs it and increments `preloop.sandbox.heartbeat.truncated` by the number of
+dropped entries. The cap bounds both the wire payload and the stored
+per-provider report.
 
 `Stats` exposes the stored inventory read-only, per registered provider:
 `ProviderStats` carries the provider's id, name and drivers, its latest
 `HostSample` with `host_sample_age_secs` (0 when never sampled), and its
 `SandboxStats` — each `Sandbox` record with the runtime facts the provider
-last reported (default/empty when never reported).
+last reported (default/empty when never reported). Every client-token holder
+can read `Stats`, so it carries aggregates only: host process names, PIDs and
+data-directory paths stay on the provider that measured them. An unavailable
+`Stats` read is reported as an unknown fleet (source `unavailable` plus a
+`vm_sample_unavailable` condition), never as an empty one.
 
 ## How preloop uses it
 

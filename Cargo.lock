@@ -2920,6 +2920,7 @@ dependencies = [
  "futures",
  "hex",
  "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "postgres_rustls",
  "preloop-observability",

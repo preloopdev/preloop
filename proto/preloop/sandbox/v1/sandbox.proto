@@ -269,11 +269,10 @@ message ListProvidersResponse { repeated Provider providers = 1; }
 // on `Heartbeat` and surfaced read-only by `Stats`. Every field is itself
 // optional or empty-means-unmeasured: a driver that cannot measure
 // something omits it rather than fabricating a zero.
-message HostTopProcess {
-  uint32 pid = 1;
-  string name = 2;
-  uint64 rss_bytes = 3;
-}
+//
+// Only aggregates travel on this message: host process names, PIDs and
+// host paths stay on the provider that measured them. `Stats` is readable
+// by every client-token holder, so it must not become a host inventory.
 message HostSample {
   optional uint64 mem_total_bytes = 1;
   optional uint64 mem_available_bytes = 2;
@@ -281,13 +280,14 @@ message HostSample {
   optional uint64 swap_free_bytes = 4;
   optional uint64 engine_rss_bytes = 5;      // the host agent's own RSS
   optional uint64 vm_rss_bytes = 6;          // summed guest-VM RSS
-  repeated HostTopProcess top_processes = 7;
+  reserved 7;
+  reserved "top_processes";
 }
 message SandboxRuntimeStats {
-  string native_ref = 1;
-  optional uint32 pid = 2;
+  string native_ref = 1;                     // heartbeat key; matches Sandbox.native_ref
+  reserved 2, 4;
+  reserved "pid", "data_dir";
   optional uint64 memory_bytes = 3;          // RSS or cgroup memory.current
-  string data_dir = 4;
   optional int64 start_time = 5;             // unix seconds
 }
 // What a provider reports at `Heartbeat`, batched so a 10s heartbeat and a
@@ -338,7 +338,7 @@ message HeartbeatRequest {
   string provider_id = 1;
   uint64 generation = 2;
   HostSample host = 3;
-  repeated SandboxRuntimeStats sandboxes = 4; // this provider's full current set
+  repeated SandboxRuntimeStats sandboxes = 4; // most recently active first; at most 512
 }
 message PollRequest { string provider_id = 1; uint64 generation = 2; uint64 wait_secs = 3; }
 

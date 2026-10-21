@@ -20,9 +20,11 @@ Releases before v0.27.0 predate the changelog.
   warm-pool depth and refill failures, lease transitions, reconcile
   lost/orphans, exec duration and exit class, and creation failures. Acquire,
   Release, Exec, and Reconcile emit tracing spans. Drivers report best-effort
-  host and per-sandbox runtime facts on `Heartbeat` (`HostReport`), and the
-  read-only `Stats` RPC — with `preloop sandbox stats` in the CLI — exposes
-  them per registered provider.
+  host and per-sandbox runtime facts on `Heartbeat` (`HostReport`, capped at
+  512 sandboxes per heartbeat, most recently active first), and the read-only
+  `Stats` RPC — with `preloop sandbox stats` in the CLI — exposes their
+  aggregates per registered provider (never host PIDs, process names or
+  paths).
 
 ### Changed
 
@@ -35,6 +37,14 @@ Releases before v0.27.0 predate the changelog.
   removed; the runner pool no longer pushes VM identities into telemetry.
 
 ### Fixed
+
+- **Sandbox telemetry is shareable and bounded.** `Stats` carries aggregates
+  only — host process names, PIDs and data-directory paths stay on the
+  provider that measured them — the live-sandbox gauge records zero when a
+  `(state, provider, template)` combination drains, a `Heartbeat` caps its
+  per-sandbox runtime report at 512 entries (most recently active first) and
+  counts what it drops, and an unavailable `Stats` read reports the engine
+  fleet as unknown instead of empty.
 
 - **The runner pool's golden-release GitHub calls now go through the engine's
   circuit breaker.** `resolve_latest_golden_tag` (the `/releases` listing), the

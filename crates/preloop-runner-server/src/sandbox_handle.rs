@@ -6,6 +6,11 @@
 //! its host and heartbeats it in, and `Stats` exposes it. Handing this handle
 //! to the server keeps that data flow one-directional — the runner server
 //! never reaches into the pool.
+//!
+//! `Stats` is aggregates-only (another client-token holder must not learn
+//! host PIDs, process names or paths), and an unset handle or a failed call
+//! is *unknown*, never an empty fleet; the status builder turns the `None`
+//! into a `vm_sample_unavailable` condition.
 
 use std::sync::Arc;
 

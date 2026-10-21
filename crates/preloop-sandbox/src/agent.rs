@@ -4,12 +4,14 @@
 //! The same agent runs in-process (local `preloop serve`) and on remote
 //! hosts (a Mac Studio behind NAT dials out; the service never connects in).
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -18,6 +20,12 @@ use crate::api::*;
 use crate::connect::{self, Code, Error, Result};
 use crate::driver::Driver;
 use crate::service::Service;
+
+/// Most per-sandbox runtime entries one `Heartbeat` carries. A host can run
+/// more sandboxes than this; the report is ordered most-recently-active
+/// first and the tail is dropped, so the heartbeat stays bounded while the
+/// sandboxes that matter keep their stats.
+pub const MAX_HEARTBEAT_SANDBOX_STATS: usize = 512;
 
 /// How an agent reaches the service's `Providers` API.
 #[async_trait]
@@ -220,6 +228,9 @@ pub struct AgentConfig {
     pub heartbeat: Duration,
     /// Full inventory reconcile period.
     pub reconcile: Duration,
+    /// `preloop.sandbox.*` instruments for facts only the agent sees (a
+    /// heartbeat trimmed to its cap). Defaults to a no-op registry.
+    pub metrics: crate::metrics::SandboxMetrics,
 }
 
 impl AgentConfig {
@@ -230,6 +241,7 @@ impl AgentConfig {
             scratch,
             heartbeat: Duration::from_secs(10),
             reconcile: Duration::from_secs(60),
+            metrics: crate::metrics::SandboxMetrics::default(),
         }
     }
 }
@@ -239,6 +251,10 @@ pub struct Agent {
     link: Arc<dyn ProviderLink>,
     drivers: HashMap<String, Arc<dyn Driver>>,
     config: AgentConfig,
+    /// Last time this agent handled work for a driver-native sandbox, keyed
+    /// by native ref. Orders the capped heartbeat report so the sandboxes
+    /// being used are the ones that keep their stats.
+    active: Mutex<HashMap<String, Instant>>,
 }
 
 impl Agent {
@@ -255,6 +271,7 @@ impl Agent {
                 .map(|driver| (driver.name().to_owned(), driver))
                 .collect(),
             config,
+            active: Mutex::new(HashMap::new()),
         })
     }
 
@@ -423,8 +440,13 @@ impl Agent {
 
     /// Fan out `host_report` over every driver on this host: one host
     /// sample (the first driver to measure one wins; they describe the
-    /// same host) plus every driver's current sandboxes, merged. Never
-    /// fails — a driver without the hook contributes nothing.
+    /// same host) plus every driver's current sandboxes, merged and capped.
+    /// Never fails — a driver without the hook contributes nothing.
+    ///
+    /// The merged report is ordered most-recently-active first and trimmed
+    /// to [`MAX_HEARTBEAT_SANDBOX_STATS`], so one heartbeat stays bounded no
+    /// matter how many sandboxes the host runs. Dropped entries are counted
+    /// on `preloop.sandbox.heartbeat.truncated` and logged.
     pub async fn collect_host_report(&self) -> (Option<HostSample>, Vec<SandboxRuntimeStats>) {
         let mut host = None;
         let mut sandboxes = Vec::new();
@@ -435,7 +457,31 @@ impl Agent {
             }
             sandboxes.extend(report.sandboxes);
         }
+        let dropped = {
+            let mut active = self.active.lock();
+            cap_heartbeat_sandboxes(&mut sandboxes, &mut active)
+        };
+        if dropped > 0 {
+            self.config
+                .metrics
+                .record_heartbeat_truncation(dropped as u64);
+            warn!(
+                dropped,
+                kept = MAX_HEARTBEAT_SANDBOX_STATS,
+                "heartbeat sandbox stats truncated"
+            );
+        }
         (host, sandboxes)
+    }
+
+    /// Remember that this agent just handled work for `native_ref`.
+    fn touch(&self, native_ref: &str) {
+        if native_ref.is_empty() {
+            return;
+        }
+        self.active
+            .lock()
+            .insert(native_ref.to_owned(), Instant::now());
     }
 
     fn driver(&self, name: &str) -> Result<Arc<dyn Driver>> {
@@ -468,6 +514,11 @@ impl Agent {
         if !ok {
             warn!(%work_id, %error, "work failed");
         }
+        // A successful create or snapshot returns the native ref that did
+        // not exist when the work was dispatched.
+        if ok {
+            self.touch(&native_ref);
+        }
         if let Err(report_error) = self
             .link
             .report(ReportRequest {
@@ -485,6 +536,11 @@ impl Agent {
     }
 
     async fn run_work(&self, session: &Session, item: WorkItem) -> Result<String> {
+        // Record activity before running: a slow exec is exactly the
+        // sandbox whose stats a capped heartbeat must keep.
+        if let Some(native_ref) = item_native_ref(&item) {
+            self.touch(native_ref);
+        }
         if let Some(create) = item.create {
             return self.driver(&create.driver)?.create(&create).await;
         }
@@ -621,5 +677,152 @@ impl Agent {
                 error.code != Code::NotFound
             }
         }
+    }
+}
+
+/// The driver-native sandbox a work item addresses, when it names one. A
+/// `CreateWork` does not: the driver picks the native ref and returns it in
+/// the report.
+fn item_native_ref(item: &WorkItem) -> Option<&str> {
+    if item.create.is_some() {
+        return None;
+    }
+    if let Some(target) = &item.destroy {
+        return Some(target.native_ref.as_str());
+    }
+    if let Some(exec) = &item.exec {
+        return Some(exec.target.native_ref.as_str());
+    }
+    if let Some(copy) = &item.copy {
+        return Some(copy.target.native_ref.as_str());
+    }
+    if let Some(snapshot) = &item.snapshot {
+        return Some(snapshot.target.native_ref.as_str());
+    }
+    if let Some(target) = &item.pause {
+        return Some(target.native_ref.as_str());
+    }
+    if let Some(target) = &item.resume {
+        return Some(target.native_ref.as_str());
+    }
+    if let Some(target) = &item.stop {
+        return Some(target.native_ref.as_str());
+    }
+    if let Some(start) = &item.start {
+        return Some(start.target.native_ref.as_str());
+    }
+    None
+}
+
+/// Order a heartbeat's runtime report most-recently-active first and trim it
+/// to [`MAX_HEARTBEAT_SANDBOX_STATS`], returning the number of entries
+/// dropped. Activity comes from the work this agent has handled; sandboxes it
+/// has never touched fall back to newest start time. Activity for sandboxes
+/// that no longer report is forgotten, so the map stays bounded by the host's
+/// live set rather than every native ref ever seen.
+fn cap_heartbeat_sandboxes(
+    sandboxes: &mut Vec<SandboxRuntimeStats>,
+    active: &mut HashMap<String, Instant>,
+) -> usize {
+    let reported: HashSet<&str> = sandboxes
+        .iter()
+        .map(|stats| stats.native_ref.as_str())
+        .collect();
+    active.retain(|native_ref, _| reported.contains(native_ref.as_str()));
+    drop(reported);
+    let active = &*active;
+    sandboxes.sort_by(|a, b| {
+        match (active.get(&a.native_ref), active.get(&b.native_ref)) {
+            (Some(a_at), Some(b_at)) => b_at.cmp(a_at),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => b.start_time.cmp(&a.start_time),
+        }
+        .then_with(|| a.native_ref.cmp(&b.native_ref))
+    });
+    let dropped = sandboxes.len().saturating_sub(MAX_HEARTBEAT_SANDBOX_STATS);
+    sandboxes.truncate(MAX_HEARTBEAT_SANDBOX_STATS);
+    dropped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(native_ref: impl Into<String>, start_time: i64) -> SandboxRuntimeStats {
+        SandboxRuntimeStats {
+            native_ref: native_ref.into(),
+            start_time: Some(start_time),
+            ..SandboxRuntimeStats::default()
+        }
+    }
+
+    #[test]
+    fn heartbeat_report_is_capped_and_orders_activity_first() {
+        let now = Instant::now();
+        let mut active = HashMap::new();
+        // 600 sandboxes, all created in the same second, so start time alone
+        // cannot separate them; the ten most recently used must survive.
+        let mut sandboxes: Vec<SandboxRuntimeStats> = (0..600)
+            .map(|i| stats(format!("sbx-{i:03}"), 1_000))
+            .collect();
+        for (offset, i) in (590..600).enumerate() {
+            active.insert(
+                format!("sbx-{i:03}"),
+                now - Duration::from_secs(60 - offset as u64),
+            );
+        }
+        // A sandbox that is gone must not keep its activity entry.
+        active.insert("sbx-gone".to_owned(), now);
+
+        let dropped = cap_heartbeat_sandboxes(&mut sandboxes, &mut active);
+
+        assert_eq!(dropped, 600 - MAX_HEARTBEAT_SANDBOX_STATS);
+        assert_eq!(sandboxes.len(), MAX_HEARTBEAT_SANDBOX_STATS);
+        // Newest activity first: offset 9 (sbx-599) was touched last.
+        assert_eq!(sandboxes[0].native_ref, "sbx-599");
+        assert_eq!(sandboxes[9].native_ref, "sbx-590");
+        // Never-touched sandboxes follow, newest start time first, then by
+        // native ref for a stable report.
+        assert_eq!(sandboxes[10].native_ref, "sbx-000");
+        assert!(!active.contains_key("sbx-gone"));
+        assert!(!active.contains_key("sbx-000"));
+        assert_eq!(active.len(), 10);
+    }
+
+    #[test]
+    fn heartbeat_report_keeps_everything_under_the_cap() {
+        let mut active = HashMap::new();
+        let mut sandboxes: Vec<SandboxRuntimeStats> = (0..MAX_HEARTBEAT_SANDBOX_STATS)
+            .map(|i| stats(format!("sbx-{i:03}"), 1_000))
+            .collect();
+        assert_eq!(cap_heartbeat_sandboxes(&mut sandboxes, &mut active), 0);
+        assert_eq!(sandboxes.len(), MAX_HEARTBEAT_SANDBOX_STATS);
+    }
+
+    #[test]
+    fn work_items_name_their_native_sandbox() {
+        let target = SandboxWork {
+            sandbox_id: "sbx-1".into(),
+            driver: "fake".into(),
+            native_ref: "native-1".into(),
+        };
+        let exec = WorkItem {
+            id: "w1".into(),
+            exec: Some(ExecWork {
+                exec_id: "e1".into(),
+                target: target.clone(),
+                request: ExecRequest::default(),
+            }),
+            ..WorkItem::default()
+        };
+        assert_eq!(item_native_ref(&exec), Some("native-1"));
+        assert_eq!(item_native_ref(&WorkItem::default()), None);
+        let create = WorkItem {
+            id: "w2".into(),
+            create: Some(CreateWork::default()),
+            ..WorkItem::default()
+        };
+        assert_eq!(item_native_ref(&create), None);
     }
 }

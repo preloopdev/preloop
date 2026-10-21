@@ -1171,6 +1171,7 @@ fn build_operational_snapshot_sync(
     // Live fleet view from the sandbox service; the chosen provider's host
     // sample also feeds the host-memory conditions below and the sampler's
     // host metrics.
+    let fleet_unknown = sandbox_stats.is_none();
     let (vms, host_sample) = vm_fleet_snapshot(sandbox_stats, &pool_provider_id);
 
     OperationalSnapshot {
@@ -1290,6 +1291,19 @@ fn build_operational_snapshot_sync(
                     });
                 }
             }
+            // No statistics means the fleet is unknown, not empty. The zero
+            // counts in `vms` must never read as an idle fleet, so name the
+            // gap the same way the sampler conditions do.
+            if fleet_unknown {
+                conditions.push(Condition {
+                    code: "vm_sample_unavailable".to_owned(),
+                    severity: "warning".to_owned(),
+                    message:
+                        "sandbox service statistics unavailable; VM fleet state is unknown, not empty"
+                            .to_owned(),
+                    exemplars: Vec::new(),
+                });
+            }
             conditions
         },
     }
@@ -1321,15 +1335,17 @@ fn host_sample_measured(host: &preloop_sandbox::api::HostSample) -> bool {
         || host.swap_free_bytes.is_some()
         || host.engine_rss_bytes.is_some()
         || host.vm_rss_bytes.is_some()
-        || !host.top_processes.is_empty()
 }
 
 /// Build the `/api/v1/status` `vms` section (and return the chosen provider's
 /// host sample) from the sandbox service's live statistics.
 ///
-/// No statistics (no co-hosted service, or the `Stats` RPC failed) yields the
-/// default snapshot — the same "nothing registered yet" shape the pool-fed
-/// registry produced before its first registration.
+/// No statistics (no co-hosted service, or the `Stats` RPC failed) is an
+/// *unknown* fleet, not an empty one: `source: Unavailable` says so, counts
+/// stay zero because there is nothing to count, and the caller adds a
+/// `vm_sample_unavailable` condition. Nothing here is sourced from the
+/// client-token-readable `Stats` beyond aggregates; host process identity is
+/// sampled in-process by [`vm_host_top_processes`].
 fn vm_fleet_snapshot(
     sandbox_stats: Option<preloop_sandbox::api::StatsResponse>,
     pool_provider_id: &str,
@@ -1344,7 +1360,15 @@ fn vm_fleet_snapshot(
     const GIB: u64 = 1024 * 1024 * 1024;
 
     let Some(stats) = sandbox_stats else {
-        return (VmFleetSnapshot::default(), None);
+        return (
+            VmFleetSnapshot {
+                // Explicit, not the enum's incidental default: the fleet is
+                // unknown, and `Process`/`CgroupV2` would claim a live view.
+                source: VmSource::Unavailable,
+                ..Default::default()
+            },
+            None,
+        );
     };
     let host = chosen_provider(&stats, pool_provider_id).map(|provider| provider.host.clone());
 
@@ -1384,7 +1408,9 @@ fn vm_fleet_snapshot(
         configured,
         host_usage: host.as_ref().map(vm_host_usage).unwrap_or_default(),
         top_consumers: Vec::new(),
-        host_top_processes: host.as_ref().map(vm_host_top_processes).unwrap_or_default(),
+        // Host process identity is engine-local telemetry, not service data;
+        // the caller fills it from this process's own sampler.
+        host_top_processes: Vec::new(),
         ..Default::default()
     };
     (snapshot, host)
@@ -1409,14 +1435,20 @@ fn vm_host_usage(
     }
 }
 
-fn vm_host_top_processes(
-    host: &preloop_sandbox::api::HostSample,
-) -> Vec<preloop_observability::status::HostTopProcess> {
-    host.top_processes
-        .iter()
+/// The engine host's top RSS processes, sampled in this process.
+///
+/// Host process identity (PID and command name) never crosses the sandbox
+/// service's client API, which every client-token holder can read; the engine
+/// status page is served to operators instead, so it samples its own host.
+/// Non-Linux platforms measure nothing and report an empty list rather than a
+/// fabricated zero.
+fn vm_host_top_processes() -> Vec<preloop_observability::status::HostTopProcess> {
+    preloop_observability::vm_telemetry::sample_host()
+        .top_processes
+        .into_iter()
         .map(|process| preloop_observability::status::HostTopProcess {
             pid: process.pid,
-            name: process.name.clone(),
+            name: process.name,
             rss_bytes: process.rss_bytes,
         })
         .collect()
@@ -1445,17 +1477,9 @@ fn observability_host_sample(
         swap_free_bytes: host.swap_free_bytes,
         engine_rss_bytes: host.engine_rss_bytes,
         vm_rss_bytes: host.vm_rss_bytes,
-        top_processes: host
-            .top_processes
-            .iter()
-            .map(
-                |process| preloop_observability::vm_telemetry::HostTopProcess {
-                    pid: process.pid,
-                    rss_bytes: process.rss_bytes,
-                    name: process.name.clone(),
-                },
-            )
-            .collect(),
+        // Process identity is not service data; the status page samples it
+        // in-process (`vm_host_top_processes`) and host metrics do not use it.
+        top_processes: Vec::new(),
     }
 }
 
@@ -1514,7 +1538,7 @@ async fn publish_snapshot(
             .await
             .unwrap_or_default();
     let webhook = collect_webhook_condition_inputs(&shared.state);
-    let snap = build_operational_snapshot_sync(
+    let mut snap = build_operational_snapshot_sync(
         inputs,
         debug,
         pool_snapshot,
@@ -1530,6 +1554,10 @@ async fn publish_snapshot(
         sandbox_stats,
         pool_provider_id,
     );
+    // The sandbox service's client API is aggregates-only, so host process
+    // identity for the operator status page comes from this process's own
+    // sampler — the same host the co-hosted pool reports on.
+    snap.vms.host_top_processes = vm_host_top_processes();
     *shared.state.status_snapshot.write() = snap;
     host_sample
 }
@@ -1853,7 +1881,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             debug_session_scalars(&inner)
         };
         let inputs = read_snapshot_inputs(&state).await;
-        let init = build_operational_snapshot_sync(
+        let mut init = build_operational_snapshot_sync(
             inputs,
             debug,
             state.pool_status.snapshot(),
@@ -1875,6 +1903,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             None,
             String::new(),
         );
+        // Host process identity is engine-local telemetry; sample it here
+        // like every later tick, so the seed matches the steady-state shape.
+        init.vms.host_top_processes = vm_host_top_processes();
         *state.status_snapshot.write() = init;
     }
     if !config.listen.ip().is_loopback()
@@ -2870,7 +2901,7 @@ mod tests {
 
     #[test]
     fn vms_track_live_sandboxes_and_the_pool_providers_host_sample() {
-        use preloop_sandbox::api::{HostSample, HostTopProcess as SandboxHostTopProcess};
+        use preloop_sandbox::api::HostSample;
 
         let sample = HostSample {
             mem_total_bytes: Some(1000),
@@ -2879,11 +2910,6 @@ mod tests {
             swap_free_bytes: Some(80),
             engine_rss_bytes: Some(11),
             vm_rss_bytes: Some(22),
-            top_processes: vec![SandboxHostTopProcess {
-                pid: 7,
-                name: "qemu".to_owned(),
-                rss_bytes: 33,
-            }],
         };
         let (vms, host) = vm_fleet_snapshot(Some(sandbox_stats_fixture(sample)), "pool");
         assert_eq!(
@@ -2903,12 +2929,79 @@ mod tests {
         assert_eq!(vms.host_usage.swap_total_bytes, Some(100));
         assert_eq!(vms.host_usage.engine_rss_bytes, Some(11));
         assert_eq!(vms.host_usage.vm_rss_bytes, Some(22));
-        assert_eq!(vms.host_top_processes.len(), 1);
-        assert_eq!(vms.host_top_processes[0].name, "qemu");
+        // Fleet statistics never carry host process identity; the status
+        // page fills it in-process.
+        assert!(vms.host_top_processes.is_empty());
         let host = host.expect("the pool provider's sample must be returned");
         assert_eq!(host.mem_total_bytes, Some(1000));
         assert!((host.ram_used_fraction().unwrap() - 0.93).abs() < 1e-9);
         assert!((host.swap_used_fraction().unwrap() - 0.2).abs() < 1e-9);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_top_processes_come_from_the_in_process_sample() {
+        let processes = vm_host_top_processes();
+        assert!(
+            !processes.is_empty(),
+            "the Linux host sampler must report its top processes"
+        );
+        assert!(
+            processes
+                .iter()
+                .all(|process| !process.name.is_empty() && process.pid > 0)
+        );
+    }
+
+    #[test]
+    fn status_reports_the_fleet_as_unknown_without_stats() {
+        let temp = tempfile::tempdir().unwrap();
+        let build = |stats: Option<preloop_sandbox::api::StatsResponse>| {
+            build_operational_snapshot_sync(
+                Default::default(),
+                (0, None),
+                Default::default(),
+                &preloop_observability::Observability::noop(),
+                std::time::Instant::now(),
+                false,
+                true,
+                temp.path(),
+                Vec::new(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                stats,
+                "pool".to_owned(),
+            )
+        };
+
+        // No statistics at all: the section names the fleet unknown instead
+        // of looking like an idle (empty) one, and a condition explains it.
+        let unknown = build(None);
+        assert!(matches!(
+            unknown.vms.source,
+            preloop_observability::status::VmSource::Unavailable
+        ));
+        assert_eq!(unknown.vms.count.runner, 0);
+        assert!(
+            unknown
+                .conditions
+                .iter()
+                .any(|condition| condition.code == "vm_sample_unavailable"),
+            "missing vm_sample_unavailable in {:?}",
+            unknown.conditions
+        );
+
+        // Live statistics clear the condition.
+        let known = build(Some(sandbox_stats_fixture(Default::default())));
+        assert!(
+            known
+                .conditions
+                .iter()
+                .all(|condition| condition.code != "vm_sample_unavailable"),
+            "unexpected vm_sample_unavailable in {:?}",
+            known.conditions
+        );
     }
 
     #[test]

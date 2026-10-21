@@ -4311,10 +4311,11 @@ pub struct RunnerPoolConfig {
     /// Retain the legacy fields for now for backwards compatibility; new code
     /// should read/write `pool_status`.
     pub pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
-    /// Observability handle whose VM registry tracks this pool's live
-    /// machines. When `Some`, the pool registers created/forked VMs and
-    /// deregisters them at teardown; `None` (tests, legacy callers) skips
-    /// the wiring.
+    /// Observability handle for pool-owned metrics (slot failures). When
+    /// `Some`, the pool records its own instruments there; `None` (tests,
+    /// one-shot CLI runs) skips the wiring. Live VM telemetry no longer
+    /// flows through here: the sandbox service's drivers measure it and the
+    /// engine status reads the service's `Stats`.
     pub observability: Option<preloop_observability::Observability>,
     /// The engine's outbound-GitHub funnel (breaker registry + accounting).
     ///

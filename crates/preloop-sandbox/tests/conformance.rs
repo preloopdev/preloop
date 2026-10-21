@@ -688,7 +688,7 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
     // A new agent reports host + runtime facts...
     let reported = SandboxRuntimeStats {
         native_ref: sandbox.native_ref.clone(),
-        data_dir: "/host/sandboxes/reported".into(),
+        memory_bytes: Some(64 << 20),
         ..SandboxRuntimeStats::default()
     };
     Service::heartbeat(
@@ -912,21 +912,26 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
     assert_eq!(reported.sandbox.id, lease.sandbox.id);
     assert_eq!(reported.sandbox.state, SandboxState::Leased);
     assert_eq!(reported.runtime.native_ref, lease.sandbox.native_ref);
-    assert!(
-        reported
-            .runtime
-            .data_dir
-            .ends_with(&lease.sandbox.native_ref),
-        "{:?} does not belong to {}",
-        reported.runtime.data_dir,
-        lease.sandbox.native_ref
-    );
     assert!(provider.host_sample_age_secs < 10);
     // `sample_host` reads `/proc`; other platforms report "unmeasured"
     // rather than a fabricated sample, and the service stores nothing.
     if cfg!(target_os = "linux") {
         assert_ne!(provider.host, HostSample::default());
     }
+    // The wire carries aggregates only: no host PIDs, process names or
+    // data-directory paths, which the provider measured for itself.
+    let wire = serde_json::to_value(client.stats().await.unwrap())
+        .unwrap()
+        .to_string();
+    assert!(!wire.contains("\"pid\""), "Stats leaked a host PID: {wire}");
+    assert!(
+        !wire.contains("\"dataDir\""),
+        "Stats leaked a host path: {wire}"
+    );
+    assert!(
+        !wire.contains("\"topProcesses\""),
+        "Stats leaked host process names: {wire}"
+    );
 
     client
         .release(ReleaseRequest {

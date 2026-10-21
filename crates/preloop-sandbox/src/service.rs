@@ -507,7 +507,9 @@ impl Service {
                 self.fill_pool_locked(&mut state, &pool, &mut ops);
             }
             // Live sandboxes by state/provider/template: every combination
-            // present this tick, so a scrape always sees the current shape.
+            // present this tick, and a zero for every combination that was
+            // live last tick but is gone now, so a drained pool falls to 0
+            // instead of keeping its last value.
             let mut counts: HashMap<(&'static str, String, String), u64> = HashMap::new();
             for sandbox in state.sandboxes.values() {
                 *counts
@@ -518,14 +520,13 @@ impl Service {
                     ))
                     .or_insert(0) += 1;
             }
-            for ((sandbox_state, provider, template), count) in counts {
-                self.config.metrics.record_sandbox_count(
-                    sandbox_state,
-                    &provider,
-                    &template,
-                    count,
-                );
-            }
+            self.config
+                .metrics
+                .record_sandbox_counts(counts.into_iter().map(
+                    |((sandbox_state, provider, template), count)| {
+                        (sandbox_state.to_owned(), provider, template, count)
+                    },
+                ));
             ops
         };
         if !ops.is_empty() {
@@ -1414,7 +1415,9 @@ impl Service {
     }
 
     /// `Stats`: per-provider host sample + capacity and sandboxes by state
-    /// with their latest reported runtime facts.
+    /// with their latest reported runtime facts. Aggregates only — the
+    /// stored report never carries host PIDs, process names or data-dir
+    /// paths, because every client-token holder can read this.
     pub fn stats(&self) -> StatsResponse {
         let state = self.state.lock();
         let providers = state

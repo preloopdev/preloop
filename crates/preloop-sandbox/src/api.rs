@@ -791,20 +791,11 @@ pub struct ListProvidersResponse {
     pub providers: Vec<Provider>,
 }
 
-/// One host process by measured RSS, for [`HostSample::top_processes`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct HostTopProcess {
-    /// PID.
-    pub pid: u32,
-    /// Command name (no args).
-    pub name: String,
-    /// RSS in bytes.
-    pub rss_bytes: u64,
-}
-
 /// Host facts only the owning driver can measure, reported on `Heartbeat`.
-/// Every field is `None`/empty when unmeasured — never a fabricated zero.
+/// Every field is `None` when unmeasured — never a fabricated zero.
+///
+/// Aggregates only: host process names, PIDs and paths never reach the wire,
+/// because every client-token holder can read `Stats`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HostSample {
@@ -826,9 +817,6 @@ pub struct HostSample {
     /// Summed guest-VM RSS.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_rss_bytes: Option<u64>,
-    /// Top RSS processes host-wide, descending.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub top_processes: Vec<HostTopProcess>,
 }
 
 impl From<preloop_observability::vm_telemetry::HostSample> for HostSample {
@@ -840,15 +828,6 @@ impl From<preloop_observability::vm_telemetry::HostSample> for HostSample {
             swap_free_bytes: sample.swap_free_bytes,
             engine_rss_bytes: sample.engine_rss_bytes,
             vm_rss_bytes: sample.vm_rss_bytes,
-            top_processes: sample
-                .top_processes
-                .into_iter()
-                .map(|process| HostTopProcess {
-                    pid: process.pid,
-                    name: process.name,
-                    rss_bytes: process.rss_bytes,
-                })
-                .collect(),
         }
     }
 }
@@ -875,21 +854,19 @@ impl HostSample {
     }
 }
 
-/// Per-sandbox runtime facts only the owning driver can measure.
+/// Per-sandbox runtime facts only the owning driver can measure. Aggregates
+/// only: the hypervisor PID and host data-directory path stay on the
+/// provider that measured them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SandboxRuntimeStats {
-    /// Driver-native reference (matches [`Sandbox::native_ref`]).
+    /// Driver-native reference (matches [`Sandbox::native_ref`]). This is the
+    /// heartbeat's key; a `Stats` response already nests the stats under the
+    /// sandbox record.
     pub native_ref: String,
-    /// `_boot-vm`-style hypervisor pid, when discoverable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u32>,
     /// RSS or cgroup `memory.current`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
-    /// Host-side data directory.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub data_dir: String,
     /// Unix seconds, best-effort (a data-directory timestamp when no
     /// process start time is recoverable).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -977,8 +954,9 @@ pub struct HeartbeatRequest {
     /// Host sample (every field `None` when unmeasured).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<HostSample>,
-    /// This provider's full current set of measurable sandboxes (replaces
-    /// the prior report — not a merge).
+    /// This provider's measurable sandboxes, most recently active first and
+    /// capped at 512 entries so one heartbeat stays bounded. Replaces the
+    /// prior report — not a merge.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sandboxes: Vec<SandboxRuntimeStats>,
 }

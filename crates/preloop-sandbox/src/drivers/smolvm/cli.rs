@@ -1872,12 +1872,14 @@ impl SmolVmProvider {
 
     /// Best-effort host + per-sandbox facts for `Heartbeat`: this host's
     /// memory reality ([`preloop_observability::vm_telemetry::sample_host`])
-    /// plus, per live machine, its `_boot-vm` pid (from one `ps` scan,
-    /// attributed by boot-config path — the same evidence
-    /// [`kill_vm_processes_in`] kills by) and data directory. Configured
+    /// plus, per live machine, its memory from the `_boot-vm` pid (from one
+    /// `ps` scan, attributed by boot-config path — the same evidence
+    /// [`kill_vm_processes_in`] kills by) and its start time. Configured
     /// shape and a real process start time are not retained by this driver
     /// after create/boot, so they are absent rather than fabricated; start
     /// time falls back to the data directory's filesystem creation time.
+    /// The pid and data directory stay here: only aggregates leave the
+    /// service's client API.
     pub async fn host_report(&self) -> HostReport {
         let host = preloop_observability::vm_telemetry::sample_host().into();
         let names = match self.list().await {
@@ -1927,11 +1929,7 @@ impl SmolVmProvider {
                 .map(|duration| duration.as_secs() as i64);
             sandboxes.push(SandboxRuntimeStats {
                 native_ref: name.as_str().to_owned(),
-                pid,
                 memory_bytes,
-                data_dir: data_dir
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_default(),
                 start_time,
             });
         }

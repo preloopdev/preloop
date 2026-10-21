@@ -93,8 +93,8 @@ impl LocalSandboxes {
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
         let mut service_config = ServiceConfig::new(state.join("sandbox-blobs"));
-        service_config.metrics =
-            preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+        let metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+        service_config.metrics = metrics.clone();
         let service = Service::open(store, service_config).await?;
         let shutdown = CancellationToken::new();
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -113,10 +113,12 @@ impl LocalSandboxes {
             .iter()
             .find(|driver| driver.name() == pool_driver)
             .map(|driver| driver.capabilities());
+        let mut agent_config = AgentConfig::new(local_provider_name(), state.join("sandbox-agent"));
+        agent_config.metrics = metrics;
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             drivers,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            agent_config,
         );
         let session = agent.register().await.ok();
         let provider_id = session
@@ -487,7 +489,7 @@ pub(crate) async fn run(
     let client = SandboxClient::new(&args.service, args.token.clone());
     match args.command {
         SandboxCommand::Serve(serve) => serve_standalone(serve, observability).await,
-        SandboxCommand::Agent(agent) => run_agent(&args.service, agent).await,
+        SandboxCommand::Agent(agent) => run_agent(&args.service, agent, observability).await,
         SandboxCommand::Template(TemplateCommand::Put {
             name,
             os,
@@ -682,16 +684,18 @@ async fn serve_standalone(
         .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
     let store = store::open(&store_url).await?;
     let mut service_config = ServiceConfig::new(state.join("sandbox-blobs"));
-    service_config.metrics =
-        preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+    let metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+    service_config.metrics = metrics.clone();
     let service = Service::open(store, service_config).await?;
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {
+        let mut agent_config = AgentConfig::new(local_provider_name(), state.join("sandbox-agent"));
+        agent_config.metrics = metrics;
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             host_drivers(None, smolvm_slots())?,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            agent_config,
         );
         tokio::spawn(agent.run(shutdown.clone()));
     }
@@ -707,13 +711,20 @@ async fn serve_standalone(
     Ok(())
 }
 
-async fn run_agent(service: &str, args: AgentArgs) -> anyhow::Result<()> {
+async fn run_agent(
+    service: &str,
+    args: AgentArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let name = args.name.unwrap_or_else(local_provider_name);
     let scratch = crate::preloop_home().join("state").join("sandbox-agent");
+    let mut agent_config = AgentConfig::new(name, scratch);
+    agent_config.metrics =
+        preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     let agent = Agent::new(
         Arc::new(RemoteLink::new(service, args.provider_token)),
         host_drivers(None, args.slots)?,
-        AgentConfig::new(name, scratch),
+        agent_config,
     );
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
