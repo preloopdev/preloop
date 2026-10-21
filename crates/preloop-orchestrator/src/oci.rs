@@ -12,6 +12,7 @@
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Manifest media types both consumers accept.
 ///
@@ -353,6 +354,14 @@ pub struct ResolvedManifest {
     pub image: Value,
     /// Digest of the index entry that was followed, when one was.
     pub selected_digest: Option<String>,
+    /// Digest of the manifest served at the requested reference: the
+    /// registry's `Docker-Content-Digest` when it sends a usable one, else the
+    /// SHA-256 of the bytes that were parsed.
+    ///
+    /// A tag that resolves straight to a single-image manifest names no index
+    /// entry, so [`selected_digest`](Self::selected_digest) is `None` for it;
+    /// this is the digest that still moves when the tag is republished.
+    pub top_digest: String,
     /// Set when an index entry was selected but its manifest could not be
     /// fetched; `image` then falls back to `top` so a best-effort caller can
     /// still report what the index held.
@@ -372,7 +381,7 @@ pub async fn get_manifest(
     accept: &str,
     select: Option<&(dyn Fn(&str) -> bool + Sync)>,
 ) -> Result<ResolvedManifest, OciError> {
-    let top = fetch_json(
+    let (top, top_digest) = fetch_json(
         client,
         &reference.manifest_url(&reference.reference),
         reference,
@@ -394,20 +403,23 @@ pub async fn get_manifest(
             image: top.clone(),
             top,
             selected_digest: None,
+            top_digest,
             follow_error: None,
         });
     };
     match fetch_json(client, &reference.manifest_url(&digest), reference, accept).await {
-        Ok(image) => Ok(ResolvedManifest {
+        Ok((image, _)) => Ok(ResolvedManifest {
             top,
             image,
             selected_digest: Some(digest),
+            top_digest,
             follow_error: None,
         }),
         Err(error) => Ok(ResolvedManifest {
             image: top.clone(),
             top,
             selected_digest: Some(digest),
+            top_digest,
             follow_error: Some(error),
         }),
     }
@@ -436,19 +448,38 @@ fn entry_platform(entry: &Value) -> Option<String> {
     Some(format!("{os}/{arch}"))
 }
 
+/// The digest of a manifest body: `sha256:<hex>`, the form registries use.
+fn manifest_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
 /// GET and parse a JSON body, with the transport errors already phrased for a
-/// caller that wants to log or wrap them.
+/// caller that wants to log or wrap them. Returns the parsed value together
+/// with the digest of the manifest bytes.
 async fn fetch_json(
     client: &reqwest::Client,
     url: &str,
     reference: &OciReference,
     accept: &str,
-) -> Result<Value, OciError> {
+) -> Result<(Value, String), OciError> {
     let response = registry_get(client, url, &reference.repository, accept, None, None).await?;
+    // The registry's own digest identifies exactly what the tag names, so it
+    // wins over hashing the body; a registry or proxy that omits it gets the
+    // content hash of the bytes this client parsed.
+    let advertised = response
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| value.starts_with("sha256:") && value.len() == 71)
+        .map(str::to_owned);
     let body = response.bytes().await.map_err(|error| {
         OciError::Message(format!("cannot read the response from {url}: {error}"))
     })?;
-    serde_json::from_slice(&body).map_err(|error| OciError::ManifestUnreadable(error.to_string()))
+    let digest = advertised.unwrap_or_else(|| manifest_digest(&body));
+    serde_json::from_slice(&body)
+        .map(|value| (value, digest))
+        .map_err(|error| OciError::ManifestUnreadable(error.to_string()))
 }
 
 /// Registries and Docker report GOARCH (`arm64`, `amd64`) while

@@ -3201,6 +3201,14 @@ impl GoldenBudget {
     fn free(&self) -> usize {
         self.free.load(Ordering::Acquire)
     }
+
+    /// Hand one retained-golden slot back after the golden that held it is
+    /// gone. Retirement is the normal path: a rotation that evicts an
+    /// environment's golden must not spend the host's spare slot forever,
+    /// or every later job for that environment falls back to a direct create.
+    fn release(&self) {
+        self.free.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// A reserved golden slot. Dropping it hands the slot back — a bake that
@@ -3262,6 +3270,27 @@ struct GoldenEntry {
     substitutes: Option<String>,
     /// Cancelled once a newer golden supersedes this one: idle forks of it are released.
     superseded: CancellationToken,
+    /// The pool-memory slot this golden keeps, when it took one. It is handed
+    /// back when the entry is forgotten, so a rotation that evicts another
+    /// environment's golden releases the room to bake it again later.
+    slot: Option<GoldenBudget>,
+}
+
+impl GoldenEntry {
+    /// An entry registered under its fingerprint: the golden serving it, or —
+    /// with `substitutes` — the previous generation standing in for it. Only
+    /// [`GoldenCache::get_or_prepare`] records a slot; that is the one path
+    /// that reserves one.
+    fn new(name: MachineName, substitutes: Option<String>, slot: Option<GoldenBudget>) -> Self {
+        Self {
+            name,
+            clones: 0,
+            retiring: false,
+            superseded: CancellationToken::new(),
+            substitutes,
+            slot,
+        }
+    }
 }
 
 /// The pool's prepared fork bases, keyed by environment fingerprint, with the
@@ -3340,22 +3369,23 @@ impl GoldenCache {
     /// for it. An entry that was standing in for this fingerprint stops doing
     /// so: the real golden is here.
     pub async fn register(&self, fingerprint: String, name: MachineName) {
+        self.register_with_slot(fingerprint, name, None).await;
+    }
+
+    /// [`GoldenCache::register`], recording the budget slot the golden keeps.
+    async fn register_with_slot(
+        &self,
+        fingerprint: String,
+        name: MachineName,
+        slot: Option<GoldenBudget>,
+    ) {
         let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
         for entry in entries.values_mut() {
             if entry.substitutes.as_deref() == Some(fingerprint.as_str()) {
                 entry.substitutes = None;
             }
         }
-        entries.insert(
-            fingerprint,
-            GoldenEntry {
-                name,
-                clones: 0,
-                retiring: false,
-                superseded: CancellationToken::new(),
-                substitutes: None,
-            },
-        );
+        entries.insert(fingerprint, GoldenEntry::new(name, None, slot));
     }
 
     /// Register `name` as the golden new forks use *until* the golden for
@@ -3368,16 +3398,7 @@ impl GoldenCache {
         desired: String,
     ) {
         let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
-        entries.insert(
-            fingerprint,
-            GoldenEntry {
-                name,
-                clones: 0,
-                retiring: false,
-                superseded: CancellationToken::new(),
-                substitutes: Some(desired),
-            },
-        );
+        entries.insert(fingerprint, GoldenEntry::new(name, Some(desired), None));
     }
 
     /// The golden serving `fingerprint` as a stand-in for it, if any.
@@ -3480,28 +3501,44 @@ impl GoldenCache {
             .collect()
     }
 
-    /// Drop an entry after its machine and artifacts are gone.
+    /// Drop an entry after its machine and artifacts are gone, returning the
+    /// memory slot it held to the pool's budget.
     pub async fn forget(&self, fingerprint: &str) {
-        self.entries
+        let removed = self
+            .entries
             .lock()
             .expect("golden ledger is not poisoned")
             .remove(fingerprint);
+        if let Some(slot) = removed.and_then(|entry| entry.slot) {
+            slot.release();
+        }
     }
 
-    /// Adopt `name` as the golden for `fingerprint` and return the goldens it
-    /// replaced, already marked retiring.
+    /// Adopt `name` as the golden for `desired`'s fingerprint, publish that
+    /// identity, and return the goldens it replaced, already marked retiring.
     ///
-    /// Two entries can be replaced: the one that stood in for `fingerprint`
+    /// Two entries can be replaced: the one that stood in for the fingerprint
     /// while its successor was staged, and the entry registered under the
     /// previously desired fingerprint. Both stop being fork sources the moment
     /// the switch lands — new forks resolve to the new fingerprint — and are
     /// deleted once the clones they already have exit.
+    ///
+    /// Publication is part of the switch, not a caller's follow-up: retirement
+    /// can wait on a machine's last fork, so a caller that published
+    /// afterwards would leave a window in which a slot resolves the *old*
+    /// fingerprint, finds the retiring entry through [`GoldenCache::get`], and
+    /// forks a machine that is being stopped and deleted.
     pub async fn switch_to(
         &self,
-        fingerprint: String,
+        desired: EnvironmentSpec,
         name: MachineName,
-        _previous: Option<&str>,
     ) -> Vec<(String, MachineName)> {
+        let fingerprint = desired.fingerprint.clone();
+        // Lock order matches `current_spec` (desired, then entries): publish
+        // while the entry mutation is in the same critical section, so a
+        // reader never sees the new identity without its golden, or the old
+        // identity pointing at an entry the switch has already superseded.
+        let mut published = self.desired.write().await;
         let mut entries = self.entries.lock().expect("golden ledger is not poisoned");
         let mut replaced = Vec::new();
         // Every other golden this pool holds is a predecessor of the one now
@@ -3546,16 +3583,16 @@ impl GoldenCache {
                 }
             }
         }
-        entries.insert(
-            fingerprint,
-            GoldenEntry {
-                name,
-                clones: 0,
-                retiring: false,
-                superseded: CancellationToken::new(),
-                substitutes: None,
-            },
-        );
+        // The staged golden was registered by `get_or_prepare`, which is the
+        // only place a budget slot is taken: carry it onto the entry the
+        // switch publishes. Dropping it here would leak the slot the moment
+        // the golden is adopted.
+        let slot = entries
+            .get(&fingerprint)
+            .filter(|entry| entry.name == name)
+            .and_then(|entry| entry.slot.clone());
+        entries.insert(fingerprint, GoldenEntry::new(name, None, slot));
+        *published = Some(desired);
         replaced
     }
 
@@ -3631,7 +3668,8 @@ impl GoldenCache {
             "building golden for environment; other environments proceed concurrently"
         );
         let name = build.await?;
-        self.insert(fingerprint.to_owned(), name.clone()).await;
+        self.register_with_slot(fingerprint.to_owned(), name.clone(), Some(budget.clone()))
+            .await;
         reservation.keep();
         Ok(Some(name))
     }
@@ -3689,7 +3727,13 @@ const SHUTDOWN_JOB_GRACE: Duration = Duration::from_secs(600);
 /// (the pre-drain behavior), a larger value waits longer.
 const SHUTDOWN_JOB_GRACE_ENV: &str = "PRELOOP_SHUTDOWN_JOB_GRACE_SECS";
 
-fn shutdown_job_grace() -> Duration {
+/// How long the engine's own shutdown must wait for the pool to finish its
+/// drain, from the configured grace.
+///
+/// Public because the pool is not the last thing the process waits for: the
+/// CLI's `settle_pool` bounds the pool task from outside, and a window shorter
+/// than this grace would abort the drain the pool just promised.
+pub fn shutdown_job_grace() -> Duration {
     std::env::var(SHUTDOWN_JOB_GRACE_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -3796,6 +3840,25 @@ fn remove_golden_payload(config: &RunnerPoolConfig, fingerprint: &str) {
     }
 }
 
+/// An environment identity resolved from the configured golden source.
+struct ResolvedGoldenSource {
+    spec: EnvironmentSpec,
+    /// The revision `spec` was folded from, when the source names one; the
+    /// paths that can reuse an already-downloaded payload verify it.
+    revision: Option<String>,
+}
+
+impl ResolvedGoldenSource {
+    /// The plain configured base with no revision folded in: the identity a
+    /// pool that does not track a mutable source serves.
+    fn unresolved(config: &RunnerPoolConfig) -> Self {
+        Self {
+            spec: EnvironmentSpec::for_base(config.base_image.clone()),
+            revision: None,
+        }
+    }
+}
+
 /// The environment this pool must serve: the configured base with its golden
 /// source resolved to whatever revision it currently names.
 ///
@@ -3810,49 +3873,76 @@ fn remove_golden_payload(config: &RunnerPoolConfig, fingerprint: &str) {
 /// which is exactly the previous behavior, and the golden already prepared for
 /// it keeps serving.
 async fn resolve_configured_environment(config: &RunnerPoolConfig) -> EnvironmentSpec {
-    resolve_configured_source(config).await.0
+    resolve_configured_source(config)
+        .await
+        .unwrap_or_else(|| ResolvedGoldenSource::unresolved(config))
+        .spec
 }
 
 /// [`resolve_configured_environment`] with the revision that identity came
-/// from, for the paths that can reuse an already-downloaded payload.
-async fn resolve_configured_source(config: &RunnerPoolConfig) -> (EnvironmentSpec, Option<String>) {
+/// from.
+///
+/// `None` means a mutable source could not be read this pass, and the caller
+/// must keep the identity it already published. Synthesizing the *unresolved*
+/// identity instead would read as a new generation to the rotation loop, which
+/// would then stage the retained legacy payload under it and retire the
+/// generation that resolved a moment earlier — the opposite of keep-serving.
+async fn resolve_configured_source(config: &RunnerPoolConfig) -> Option<ResolvedGoldenSource> {
     let base = config.base_image.clone();
     if !is_official_golden(&base) {
         // A configured image is baked locally: its identity is the bake
         // contract, which only a binary upgrade changes.
-        return (EnvironmentSpec::for_base(base), None);
+        return Some(ResolvedGoldenSource::unresolved(config));
     }
-    match golden_source_revision().await {
-        Some(source) => (
-            EnvironmentSpec::for_base_with_source(base, source.clone()),
-            Some(source),
-        ),
-        None => (EnvironmentSpec::for_base(base), None),
-    }
+    let revision = match golden_source_revision().await {
+        GoldenSourceRevision::Resolved(revision) => revision,
+        GoldenSourceRevision::Complete => {
+            return Some(ResolvedGoldenSource::unresolved(config));
+        }
+        GoldenSourceRevision::Unavailable => return None,
+    };
+    Some(ResolvedGoldenSource {
+        spec: EnvironmentSpec::for_base_with_source(base, revision.clone()),
+        revision: Some(revision),
+    })
 }
 
-/// The revision the configured official golden source names, or `None` when
-/// the source is immutable (or cannot be resolved).
-async fn golden_source_revision() -> Option<String> {
+/// What the configured official golden source answered this pass.
+enum GoldenSourceRevision {
+    /// A mutable source named this revision.
+    Resolved(String),
+    /// Nothing to resolve — a digest-pinned reference, or no source at all:
+    /// the plain base is the complete identity.
+    Complete,
+    /// A mutable source could not be read; whatever is published stays.
+    Unavailable,
+}
+
+/// The revision the configured official golden source names.
+async fn golden_source_revision() -> GoldenSourceRevision {
     if let Some(url) = golden_url_override() {
         // A mirror's bytes are what its `.sha256` companion describes, and the
         // downloader refuses an unverified mirror payload anyway (see
         // `download_release_asset`), so the checksum is the identity.
         return mirror_revision(&url).await;
     }
-    let reference = std::env::var("PRELOOP_GOLDEN_OCI_REF")
+    let Some(reference) = std::env::var("PRELOOP_GOLDEN_OCI_REF")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| default_golden_oci_ref().map(str::to_owned))?;
+        .or_else(|| default_golden_oci_ref().map(str::to_owned))
+    else {
+        return GoldenSourceRevision::Complete;
+    };
     if oci_reference_is_pinned(&reference) {
         // Already immutable: keep the identity string the engine has always
         // hashed for it, so an upgrade never re-downloads a golden whose
         // content cannot have changed.
-        return None;
+        return GoldenSourceRevision::Complete;
     }
-    oci_manifest_digest(&reference)
-        .await
-        .map(|digest| format!("oci:{reference}@{digest}"))
+    match oci_manifest_digest(&reference).await {
+        Some(digest) => GoldenSourceRevision::Resolved(format!("oci:{reference}@{digest}")),
+        None => GoldenSourceRevision::Unavailable,
+    }
 }
 
 /// Whether an OCI reference pins a digest instead of naming a mutable tag.
@@ -3871,11 +3961,14 @@ async fn oci_manifest_digest(reference: &str) -> Option<String> {
         .ok()?;
     match get_manifest(&client, &oci, MANIFEST_ACCEPT, None).await {
         Ok(resolved) => {
-            // The digest of the platform manifest the pool downloads. A tag that
-            // resolves to a single image names no index entry, and this client does
-            // not expose the registry's content digest for it, so that tag is not
-            // tracked: the pool keeps the golden it already has.
-            let digest = resolved.selected_digest?;
+            // The digest of the manifest the pool downloads: the platform entry
+            // an index names, or the manifest the tag served directly. Both are
+            // tracked, so a tag that starts publishing new bytes under a
+            // single-image manifest still triggers a rotation.
+            let digest = match resolved.selected_digest {
+                Some(digest) => digest,
+                None => resolved.top_digest,
+            };
             info!(reference, digest = %digest, "resolved the mutable golden reference");
             Some(digest)
         }
@@ -3889,27 +3982,43 @@ async fn oci_manifest_digest(reference: &str) -> Option<String> {
 }
 
 /// The revision a mirror URL publishes, from its companion checksum.
-async fn mirror_revision(url: &str) -> Option<String> {
-    if let Ok(pinned) = std::env::var("PRELOOP_GOLDEN_SHA256") {
-        if let Some(digest) = parse_sha256_checksum(&pinned) {
-            return Some(format!("{url}@sha256:{digest}"));
-        }
+async fn mirror_revision(url: &str) -> GoldenSourceRevision {
+    if let Ok(pinned) = std::env::var("PRELOOP_GOLDEN_SHA256")
+        && let Some(digest) = parse_sha256_checksum(&pinned)
+    {
+        return GoldenSourceRevision::Resolved(format!("{url}@sha256:{digest}"));
     }
-    let client = reqwest::Client::builder()
+    let Some(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
-        .ok()?;
-    let response = client.get(format!("{url}.sha256")).send().await.ok()?;
+        .ok()
+    else {
+        return GoldenSourceRevision::Unavailable;
+    };
+    let Some(response) = client.get(format!("{url}.sha256")).send().await.ok() else {
+        warn!(url = %url, "mirror checksum unreachable; keeping the current golden");
+        return GoldenSourceRevision::Unavailable;
+    };
     if !response.status().is_success() {
         warn!(
             url = %format!("{url}.sha256"),
             status = %response.status(),
             "mirror publishes no checksum; keeping the current golden"
         );
-        return None;
+        return GoldenSourceRevision::Unavailable;
     }
-    let digest = parse_sha256_checksum(&response.text().await.ok()?)?;
-    Some(format!("{url}@sha256:{digest}"))
+    match response
+        .text()
+        .await
+        .ok()
+        .and_then(|body| parse_sha256_checksum(&body))
+    {
+        Some(digest) => GoldenSourceRevision::Resolved(format!("{url}@sha256:{digest}")),
+        None => {
+            warn!(url = %format!("{url}.sha256"), "mirror checksum unreadable; keeping the current golden");
+            GoldenSourceRevision::Unavailable
+        }
+    }
 }
 
 /// Whether a recorded fingerprint belongs to an environment this pool can
@@ -4051,18 +4160,16 @@ async fn plan_goldens<P: VmProvider>(
 /// Bytes the volume must have free before a second golden is staged beside the
 /// one already serving.
 ///
-/// Two full unpack trees at once: the serving golden keeps its own storage for
-/// as long as it serves (the whole point of staging beside it), and the new
-/// pack needs its download plus its extraction on top. A host that cannot
-/// afford both refuses to stage and keeps serving the old golden, which is a
-/// working pool instead of an ENOSPC part-way through a 50 GB write.
-fn rotation_staging_required_bytes(new_pack: Option<u64>, resident_pack: Option<u64>) -> u64 {
-    let estimate = |bytes: Option<u64>| match bytes {
-        Some(bytes) => bytes,
-        None => GOLDEN_UNKNOWN_SIZE_ESTIMATE,
-    };
-    golden_unpack_required_bytes(estimate(new_pack))
-        .saturating_add(golden_unpack_required_bytes(estimate(resident_pack)))
+/// Only what the *new* golden adds is counted. `available` is free space, so
+/// the serving golden's storage is already excluded from it; adding that
+/// golden's unpack estimate here would double-count it, and a host that fits
+/// the replacement but not a third copy would refuse every rotation forever.
+/// The estimate itself already bounds the download and the extraction SmolVM
+/// writes for the new pack. A host that cannot afford that refusal keeps
+/// serving the old golden, which is a working pool instead of an ENOSPC
+/// part-way through a 50 GB write.
+fn rotation_staging_required_bytes(new_pack: Option<u64>) -> u64 {
+    golden_unpack_required_bytes(new_pack.unwrap_or(GOLDEN_UNKNOWN_SIZE_ESTIMATE))
 }
 
 /// Whether `available` bytes can hold the staging of a second golden.
@@ -4070,8 +4177,8 @@ fn rotation_staging_fits(required: u64, available: u64) -> bool {
     available >= required
 }
 
-/// Payload size of the golden currently serving, when its file is readable.
-fn serving_payload_bytes(config: &RunnerPoolConfig, fingerprint: &str) -> Option<u64> {
+/// Size of the packed payload for `fingerprint`, when its file is readable.
+fn payload_bytes(config: &RunnerPoolConfig, fingerprint: &str) -> Option<u64> {
     let payload = payload_for_fingerprint(config, fingerprint);
     std::fs::metadata(packed_golden_path(&payload))
         .ok()
@@ -4088,16 +4195,13 @@ fn serving_payload_bytes(config: &RunnerPoolConfig, fingerprint: &str) -> Option
 fn rotation_staging_room(
     config: &RunnerPoolConfig,
     spec_fingerprint: &str,
-    serving_fingerprint: Option<&str>,
     available: AvailableSpace,
 ) -> Result<(), String> {
     if disk_preflight_overridden() {
         return Ok(());
     }
     let root = golden_disk_root(config);
-    let new_pack = serving_payload_bytes(config, spec_fingerprint);
-    let resident_pack = serving_fingerprint.and_then(|fp| serving_payload_bytes(config, fp));
-    let required = rotation_staging_required_bytes(new_pack, resident_pack);
+    let required = rotation_staging_required_bytes(payload_bytes(config, spec_fingerprint));
     let free = available(&root).map_err(|error| {
         format!(
             "free space on {} is unreadable ({error}); refusing to stage a second golden",
@@ -4180,12 +4284,9 @@ async fn stage_and_switch_golden<P: VmProvider + 'static>(
     ))?;
     let previous = cache.desired().await;
     let previous_fingerprint = previous.as_ref().map(|spec| spec.fingerprint.as_str());
-    if let Err(reason) = rotation_staging_room(
-        config,
-        &spec.fingerprint,
-        previous_fingerprint,
-        filesystem_available_space,
-    ) {
+    if let Err(reason) =
+        rotation_staging_room(config, &spec.fingerprint, filesystem_available_space)
+    {
         return Err(OrchestratorError::Config(reason));
     }
     adopt_legacy_payload(config, spec, revision).await;
@@ -4220,10 +4321,11 @@ async fn stage_and_switch_golden<P: VmProvider + 'static>(
             "the host cannot retain another golden; keeping the one that is serving".into(),
         ));
     };
-    for (fingerprint, retired) in cache
-        .switch_to(spec.fingerprint.clone(), name.clone(), previous_fingerprint)
-        .await
-    {
+    // The switch publishes the new identity itself, so from here on every
+    // slot resolves the new fingerprint. Only then do the goldens it replaced
+    // start retiring — retirement can wait on a machine's last fork.
+    let replaced = cache.switch_to(spec.clone(), name.clone()).await;
+    for (fingerprint, retired) in replaced {
         retire_golden(provider, config, cache, &fingerprint, &retired).await;
     }
     write_configured_golden_marker(config, &spec.fingerprint);
@@ -4319,16 +4421,19 @@ async fn golden_rotation_task<P: VmProvider + 'static>(
     // lands between the reap and the wait must not strand a retired golden
     // until shutdown.
     let tick = poll.unwrap_or(Duration::from_secs(30));
-    // The first pass runs at once: a restart that changed the configuration
-    // stages its golden now, not one poll interval later.
-    let mut first_pass = true;
+    // When the golden source is next due for re-resolution. A release wakes
+    // the reap pass alone: re-resolving on that wake would hit the registry (or
+    // mirror) once per finished job instead of once per interval, which
+    // rate-limits a busy pool and retries a failed staging on every slot exit.
+    // The first pass is due at once, so a restart that changed the
+    // configuration stages its golden now, not one interval later.
+    let mut next_poll = poll.map(|_| tokio::time::Instant::now());
     loop {
-        if !std::mem::replace(&mut first_pass, false) {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = cache.released() => {}
-                _ = tokio::time::sleep(tick) => {}
-            }
+        let wake_at = next_poll.unwrap_or_else(|| tokio::time::Instant::now() + tick);
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = cache.released() => {}
+            _ = tokio::time::sleep_until(wake_at) => {}
         }
         if shutdown.is_cancelled() {
             break;
@@ -4336,10 +4441,24 @@ async fn golden_rotation_task<P: VmProvider + 'static>(
         for (fingerprint, name) in cache.releasable().await {
             retire_golden(&provider, &config, &cache, &fingerprint, &name).await;
         }
-        if poll.is_none() {
+        let Some(interval) = poll else { continue };
+        let now = tokio::time::Instant::now();
+        if next_poll.is_some_and(|due| now < due) {
+            // A release woke the loop; reaping was the whole point of it.
             continue;
         }
-        let (desired, revision) = resolve_configured_source(&config).await;
+        // Reschedule before resolving: a slow or failed staging must not turn
+        // into a retry on the next release.
+        next_poll = Some(now + interval);
+        let Some(resolved) = resolve_configured_source(&config).await else {
+            // A mutable source that cannot be read this pass leaves the
+            // published identity alone. Treating the unresolved identity as a
+            // new revision here would stage the retained legacy payload under
+            // it and retire the generation that is serving.
+            debug!("golden source unresolved this pass; keeping the current golden");
+            continue;
+        };
+        let desired = resolved.spec;
         let current = match cache.desired().await {
             Some(current) => current,
             None => {
@@ -4366,14 +4485,13 @@ async fn golden_rotation_task<P: VmProvider + 'static>(
             &config,
             &cache,
             &desired,
-            revision.as_deref(),
+            resolved.revision.as_deref(),
             &budget,
             &shutdown,
         )
         .await
         {
             Ok(name) => {
-                cache.set_desired(desired).await;
                 info!(
                     machine = name.as_str(),
                     "golden rotation complete; new runners fork from the new golden"
@@ -6216,16 +6334,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // and record the rotation path will use for the same spec. A pool that
         // never forks has no golden and no rotation — it boots the artifact
         // directly — so it keeps the unresolved identity its runners ask for.
-        let (env_spec, revision) = if self.config.use_fork {
-            resolve_configured_source(&self.config).await
+        let resolved = if self.config.use_fork {
+            resolve_configured_source(&self.config)
+                .await
+                .unwrap_or_else(|| ResolvedGoldenSource::unresolved(&self.config))
         } else {
-            (
-                EnvironmentSpec::for_base(self.config.base_image.clone()),
-                None,
-            )
+            ResolvedGoldenSource::unresolved(&self.config)
         };
+        let env_spec = resolved.spec;
         let payload = payload_for_fingerprint(&self.config, &env_spec.fingerprint);
-        adopt_legacy_payload(&self.config, &env_spec, revision.as_deref()).await;
+        adopt_legacy_payload(&self.config, &env_spec, resolved.revision.as_deref()).await;
         ensure_golden_payload(&self.provider, &self.config, &env_spec, &payload, shutdown).await
     }
 
@@ -6307,11 +6425,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // smolvm DB no longer knows the machines, so the deletes above
         // cannot reach them and they keep the storage fds open — the
         // unlinked blocks leak until the process dies. Kill by config path.
-        // `All` is only sound here: every Preloop machine is stale by now, so
-        // nothing of ours can be running. The periodic reconcile the pool
-        // runs while serving uses `RemovedDataDir`, which spares any process
-        // whose boot config still exists.
-        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
+        //
+        // `All` is only sound when nothing of ours can be running. A restart
+        // during staging spares the golden it is about to serve (`spare`
+        // above): that machine is alive, and `All` would SIGKILL it even
+        // though its data directory exists. With a spare, the sweep therefore
+        // takes the live-safe scope, which matches exactly the hypervisors
+        // whose machine directory the deletes above just removed.
+        let scope = if spare.is_empty() {
+            preloop_vm::OrphanPurge::All
+        } else {
+            preloop_vm::OrphanPurge::RemovedDataDir
+        };
+        match preloop_vm::purge_orphaned_vms(scope) {
             Ok(killed) if killed > 0 => {
                 info!(killed, "purged orphaned SmolVM hypervisor processes")
             }
@@ -6636,32 +6762,68 @@ struct RunnerEnvironment {
 /// after the sample and before the next one, so the old depth still includes
 /// that job while the runner has already left `idle`. Keep one local claim
 /// credit until a later sample drops the depth by the same amount.
+///
+/// A drop is not the only way a sample accounts for a claim, though: a job
+/// claimed by one runner and another job enqueued before the next sample leave
+/// the depth unchanged (`1 -> 1`). A credit that only a numeric decrease could
+/// retire would keep hiding the new job for as long as the pool runs, so a
+/// credit also expires after [`CLAIM_CREDIT_TTL`] — long enough to outlast a
+/// sampler publication, short enough that the queue is never permanently
+/// under-counted.
 #[derive(Default)]
 struct QueueAccounting {
     state: std::sync::Mutex<QueueAccountingState>,
 }
 
+/// How long a local claim credit survives without a sample accounting for it.
+///
+/// The server's state sampler republishes the ready depth every five seconds,
+/// and also wakes early (with a one-second floor) on the submit/claim/complete
+/// events, so one sampler interval is the longest a claim can stay in the
+/// published depth. An unconsumed credit older than that is a depth that stayed
+/// equal — a claim and an enqueue in the same window — not a stale sample, and
+/// keeping it would hide a job no runner covers.
+const CLAIM_CREDIT_TTL: Duration = Duration::from_secs(5);
+
 #[derive(Default)]
 struct QueueAccountingState {
     observed_depth: Option<usize>,
-    claimed_since_sample: usize,
+    /// One timestamp per unconsumed claim, oldest first.
+    credits: std::collections::VecDeque<std::time::Instant>,
 }
 
 impl QueueAccounting {
     fn observe(&self, depth: usize) -> usize {
+        self.observe_at(depth, std::time::Instant::now())
+    }
+
+    fn observe_at(&self, depth: usize, now: std::time::Instant) -> usize {
         let mut state = self.state.lock().unwrap();
-        if let Some(previous) = state.observed_depth
-            && depth < previous
+        // A sample that dropped by N already accounts for N of the jobs this
+        // pool's runners took: those credits are spent, not expired.
+        if let Some(previous) = state.observed_depth {
+            let accounted = previous.saturating_sub(depth);
+            for _ in 0..accounted.min(state.credits.len()) {
+                state.credits.pop_front();
+            }
+        }
+        while state
+            .credits
+            .front()
+            .is_some_and(|claimed| now.duration_since(*claimed) >= CLAIM_CREDIT_TTL)
         {
-            state.claimed_since_sample =
-                state.claimed_since_sample.saturating_sub(previous - depth);
+            state.credits.pop_front();
         }
         state.observed_depth = Some(depth);
-        depth.saturating_sub(state.claimed_since_sample)
+        depth.saturating_sub(state.credits.len())
     }
 
     fn record_claim(&self) {
-        self.state.lock().unwrap().claimed_since_sample += 1;
+        self.record_claim_at(std::time::Instant::now());
+    }
+
+    fn record_claim_at(&self, now: std::time::Instant) {
+        self.state.lock().unwrap().credits.push_back(now);
     }
 }
 
@@ -15281,6 +15443,41 @@ fi"#,
         assert_eq!(accounting.observe(1), 1, "a later job is forkable");
     }
 
+    /// A claim followed by an enqueue keeps the published depth equal
+    /// (`1 -> 1`), so no drop ever retires the credit. Without an expiry the
+    /// credit would hide the new job forever and its runner would never be
+    /// forked; after one sampler window it must stop counting.
+    #[test]
+    fn a_claim_credit_expires_when_the_depth_never_drops() {
+        let accounting = QueueAccounting::default();
+        let start = std::time::Instant::now();
+        assert_eq!(accounting.observe_at(1, start), 1);
+        accounting.record_claim_at(start);
+        assert_eq!(
+            accounting.observe_at(1, start + Duration::from_secs(1)),
+            0,
+            "inside the sampler window the claim is still credited"
+        );
+        assert_eq!(
+            accounting.observe_at(1, start + CLAIM_CREDIT_TTL),
+            1,
+            "the expired credit no longer hides the job enqueued in the same window"
+        );
+        // A drop still spends the credit immediately: expiry is the fallback,
+        // not the only way a credit can end.
+        accounting.record_claim_at(start + CLAIM_CREDIT_TTL);
+        assert_eq!(
+            accounting.observe_at(0, start + CLAIM_CREDIT_TTL),
+            0,
+            "the sample that dropped by one accounts for the claim"
+        );
+        assert_eq!(
+            accounting.observe_at(1, start + CLAIM_CREDIT_TTL),
+            1,
+            "the spent credit cannot suppress a later job"
+        );
+    }
+
     /// One queued job forks one runner, even with the whole concurrency budget
     /// free.
     ///
@@ -16087,7 +16284,86 @@ mod golden_cache_tests {
         assert_eq!(budget.free(), 0, "a registered golden keeps its slot");
     }
 
+    /// A rotation supersedes every other golden the pool holds. The slot an
+    /// evicted environment golden took must come back when its entry is
+    /// forgotten, or the host's spare slot stays spent and every later job for
+    /// that environment is forced down the direct-create fallback.
+    #[tokio::test]
+    async fn rotation_returns_the_slot_of_an_evicted_environment_golden() {
+        let cache = Arc::new(GoldenCache::new("pool".to_owned()));
+        let budget = GoldenBudget::new(2);
+        let evicted = MachineName::new(fingerprint_golden_name("pool", &"aa".repeat(32))).unwrap();
+        let next = MachineName::new(fingerprint_golden_name("pool", &"bb".repeat(32))).unwrap();
+        for (fingerprint, name) in [("fp-env", &evicted), ("fp-next", &next)] {
+            let built = name.clone();
+            let golden = cache
+                .get_or_prepare(fingerprint, &budget, async move { Ok(built) })
+                .await
+                .unwrap()
+                .expect("the host has room for both");
+            assert_eq!(&golden, name);
+        }
+        assert_eq!(budget.free(), 0, "both goldens hold their slots");
+
+        let replaced = cache.switch_to(test_spec("fp-next"), next.clone()).await;
+        assert_eq!(
+            replaced,
+            vec![("fp-env".to_owned(), evicted.clone())],
+            "the evicted golden has no forks to wait for"
+        );
+        cache.forget("fp-env").await;
+        assert_eq!(
+            budget.free(),
+            1,
+            "the evicted golden's slot returns to the host"
+        );
+        // The adopted golden keeps the slot it took, and returns it too.
+        assert_eq!(cache.get("fp-next").await, Some(next.clone()));
+        cache.forget("fp-next").await;
+        assert_eq!(
+            budget.free(),
+            2,
+            "the adopted golden's slot is not lost by the switch"
+        );
+    }
+
     // ---- golden rotation --------------------------------------------------
+
+    /// A cache-test environment identity: the fingerprint is what the ledger
+    /// keys on, and the base only has to be stable.
+    fn test_spec(fingerprint: &str) -> EnvironmentSpec {
+        EnvironmentSpec {
+            base: "test-base".to_owned(),
+            fingerprint: fingerprint.to_owned(),
+        }
+    }
+
+    /// The switch publishes the identity it hands over to in the same step: a
+    /// slot that resolves this environment after the switch sees the new
+    /// fingerprint, never the one whose entry is already retiring.
+    #[tokio::test]
+    async fn a_switch_publishes_the_identity_with_the_new_golden() {
+        let cache = Arc::new(GoldenCache::new("pool".to_owned()));
+        let previous = MachineName::new(fingerprint_golden_name("pool", &"aa".repeat(32))).unwrap();
+        cache.insert("fp-old".to_owned(), previous.clone()).await;
+        cache.set_desired(test_spec("fp-old")).await;
+
+        let next = MachineName::new(fingerprint_golden_name("pool", &"bb".repeat(32))).unwrap();
+        let replaced = cache.switch_to(test_spec("fp-new"), next.clone()).await;
+        assert_eq!(replaced, vec![("fp-old".to_owned(), previous)]);
+        assert_eq!(
+            cache
+                .current_spec(test_spec("unresolved"))
+                .await
+                .fingerprint,
+            "fp-new",
+            "a new slot resolves the published identity, not the retiring one"
+        );
+        assert_eq!(
+            cache.desired().await.map(|spec| spec.fingerprint),
+            Some("fp-new".to_owned())
+        );
+    }
 
     /// A golden's name is its fingerprint, so the golden for a new release can
     /// exist beside the one still serving.
@@ -16151,9 +16427,7 @@ mod golden_cache_tests {
             .fork_started(&previous)
             .expect("the served golden is tracked");
         assert!(!old_fork.superseded().is_cancelled());
-        cache
-            .switch_to("fp-new".to_owned(), next.clone(), Some("fp-old"))
-            .await;
+        cache.switch_to(test_spec("fp-new"), next.clone()).await;
         assert!(
             old_fork.superseded().is_cancelled(),
             "the replaced generation's forks are released"
@@ -16205,7 +16479,7 @@ mod golden_cache_tests {
         let fork = cache.fork_started(&previous).expect("the stand-in serves");
         assert!(
             cache
-                .switch_to("fp-new".to_owned(), next.clone(), None)
+                .switch_to(test_spec("fp-new"), next.clone())
                 .await
                 .is_empty(),
             "a live fork keeps the old golden until it exits"
@@ -16238,7 +16512,7 @@ mod golden_cache_tests {
             .expect("the served golden is tracked");
         assert!(
             cache
-                .switch_to("fp-new".to_owned(), next.clone(), Some("fp-old"))
+                .switch_to(test_spec("fp-new"), next.clone())
                 .await
                 .is_empty(),
             "a live fork keeps the previous golden until it exits"
@@ -16268,13 +16542,13 @@ mod golden_cache_tests {
         cache
             .register_substitute(previous.clone(), "fp-old".to_owned(), fp.clone())
             .await;
-        cache.set_desired(desired).await;
+        cache.set_desired(desired.clone()).await;
         assert!(
             cache.staging_owed(&fp).await,
             "a stand-in is not the switched golden"
         );
         assert_eq!(
-            cache.switch_to(fp.clone(), next, Some(fp.as_str())).await,
+            cache.switch_to(desired, next).await,
             vec![("fp-old".to_owned(), previous)],
             "the switch retires the stand-in"
         );
@@ -16293,29 +16567,26 @@ mod golden_cache_tests {
         assert!(filesystem_available_space(&missing).unwrap() > 0);
     }
 
-    /// Staging a second golden needs room for *both*: the one serving keeps
-    /// its storage for as long as it serves.
+    /// Staging counts only what the new golden adds: the serving golden's
+    /// storage is already spent, and `available` is free space.
     #[test]
-    fn rotation_staging_requires_room_for_two_goldens() {
+    fn rotation_staging_counts_only_the_new_golden() {
         const GIB: u64 = 1024 * 1024 * 1024;
         assert_eq!(
-            rotation_staging_required_bytes(Some(GIB), Some(2 * GIB)),
-            golden_unpack_required_bytes(GIB) + golden_unpack_required_bytes(2 * GIB)
+            rotation_staging_required_bytes(Some(GIB)),
+            golden_unpack_required_bytes(GIB)
         );
         // An unreadable pack size falls back to the conservative estimate
         // rather than skipping the gate.
         assert_eq!(
-            rotation_staging_required_bytes(None, None),
-            2 * golden_unpack_required_bytes(GOLDEN_UNKNOWN_SIZE_ESTIMATE)
+            rotation_staging_required_bytes(None),
+            golden_unpack_required_bytes(GOLDEN_UNKNOWN_SIZE_ESTIMATE)
         );
-        let required = rotation_staging_required_bytes(Some(GIB), Some(GIB));
+        let required = rotation_staging_required_bytes(Some(GIB));
         assert!(rotation_staging_fits(required, required));
         assert!(!rotation_staging_fits(required, required - 1));
         // Saturates instead of wrapping for a maliciously sized payload.
-        assert_eq!(
-            rotation_staging_required_bytes(Some(u64::MAX), Some(u64::MAX)),
-            u64::MAX
-        );
+        assert_eq!(rotation_staging_required_bytes(Some(u64::MAX)), u64::MAX);
     }
 
     /// A volume that cannot hold the second golden refuses to stage and keeps
@@ -16330,27 +16601,21 @@ mod golden_cache_tests {
         std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
         std::fs::write(&payload, b"packed-golden").unwrap();
 
-        let refused =
-            rotation_staging_room(&config, &spec.fingerprint, Some(&spec.fingerprint), |_| {
-                Ok(0)
-            })
+        let refused = rotation_staging_room(&config, &spec.fingerprint, |_| Ok(0))
             .expect_err("a full volume must refuse staging");
         assert!(
             refused.contains("keeping the golden that is already serving"),
             "the refusal says what the pool does instead: {refused}"
         );
         assert!(
-            rotation_staging_room(&config, &spec.fingerprint, Some(&spec.fingerprint), |_| Ok(
-                u64::MAX / 2
-            ))
-            .is_ok(),
+            rotation_staging_room(&config, &spec.fingerprint, |_| Ok(u64::MAX / 2)).is_ok(),
             "a volume with room stages"
         );
         // An unreadable measurement is not a licence to write: it refuses too.
         assert!(
-            rotation_staging_room(&config, &spec.fingerprint, None, |_| Err(
-                std::io::Error::other("df failed")
-            ))
+            rotation_staging_room(&config, &spec.fingerprint, |_| Err(std::io::Error::other(
+                "df failed"
+            )))
             .is_err()
         );
     }
@@ -16672,8 +16937,8 @@ mod golden_cache_tests {
         let payload = payload_for_fingerprint(&config, &desired.fingerprint);
         std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
         std::fs::write(&payload, b"packed-golden").unwrap();
-        // The staging preflight measures the pool's own payload too; keep both
-        // small so the gate is about the code path, not the test host's disk.
+        // Keep the payload small so the staging preflight is about the code
+        // path, not the test host's disk.
         let existing = payload_for_fingerprint(&config, &serving_spec.fingerprint);
         std::fs::write(&existing, b"packed-golden").unwrap();
 

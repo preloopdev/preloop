@@ -1459,6 +1459,7 @@ fn prune_pack_dir_in(data_dir: &Path) -> Result<bool, VmError> {
         return Ok(false);
     }
     let bytes = dir_size_bytes(&canonical_pack);
+    preserve_shared_pack_pointer(&canonical_dir, &canonical_pack);
     std::fs::remove_dir_all(&canonical_pack).map_err(|source| VmError::RuntimeIo { source })?;
     info!(
         machine_dir = %canonical_dir.display(),
@@ -1485,7 +1486,8 @@ fn parse_reclaimed_bytes(stdout: &str) -> u64 {
 }
 
 /// Filename SmolVM uses for a machine's pointer to the node-shared extraction
-/// it was created from (`<machine data dir>/pack/.pack-shared`).
+/// it was created from. SmolVM writes it inside `pack/`; pruning that directory
+/// carries it beside the machine's disk so retirement can still find the entry.
 const SHARED_PACK_POINTER_FILE: &str = ".pack-shared";
 
 /// The shared store entry a machine's `pack/.pack-shared` pointer names.
@@ -1530,6 +1532,40 @@ fn shared_store_entry_path(root: &Path, pointer: &str) -> Option<PathBuf> {
         return None;
     }
     Some(entry)
+}
+
+/// Carry a machine's shared-store pointer out of `pack/` before it is removed.
+///
+/// Retirement finds the store entry a golden was extracted into through this
+/// pointer, and `pack/` is exactly what [`prune_pack_dir_in`] deletes once the
+/// disk exists. A pointer left inside would make every retired golden's
+/// extracted layers unreachable: the layers-only sweep still sees the entry
+/// naming them and keeps them. The pointer therefore moves beside the machine's
+/// disk. Best effort — a machine without one has no store entry of its own.
+fn preserve_shared_pack_pointer(data_dir: &Path, pack: &Path) {
+    let Ok(pointer) = std::fs::read_to_string(pack.join(SHARED_PACK_POINTER_FILE)) else {
+        return;
+    };
+    if let Err(error) = std::fs::write(data_dir.join(SHARED_PACK_POINTER_FILE), &pointer) {
+        warn!(
+            machine_dir = %data_dir.display(),
+            %error,
+            "could not preserve the shared layer-store pointer"
+        );
+    }
+}
+
+/// The store entry a machine's data directory names: the durable pointer
+/// [`preserve_shared_pack_pointer`] leaves beside the disk, or the original one
+/// inside a `pack/` that has not been pruned yet.
+fn shared_entry_in_data_dir(data_dir: &Path, root: &Path) -> Option<PathBuf> {
+    let pointer = [
+        data_dir.join(SHARED_PACK_POINTER_FILE),
+        data_dir.join("pack").join(SHARED_PACK_POINTER_FILE),
+    ]
+    .into_iter()
+    .find_map(|path| std::fs::read_to_string(path).ok())?;
+    shared_store_entry_path(root, &pointer)
 }
 
 /// Remove `pack/` intermediates inside machine data dirs no registry row
@@ -1619,10 +1655,8 @@ impl SmolVmProvider {
     /// caller reclaims what it can and leaves the rest.
     async fn shared_store_entry(&self, name: &MachineName) -> Option<PathBuf> {
         let data_dir = self.machine_data_dir(name).await.ok()?;
-        let pointer =
-            std::fs::read_to_string(data_dir.join("pack").join(SHARED_PACK_POINTER_FILE)).ok()?;
         let root = machine_data_root()?;
-        shared_store_entry_path(&root, &pointer)
+        shared_entry_in_data_dir(&data_dir, &root)
     }
 }
 
@@ -4705,6 +4739,43 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// Pruning `pack/` must not take the pointer to the extracted layer store
+    /// with it: retirement reclaims the entry through that pointer, and the
+    /// layers-only sweep keeps every layer a surviving entry still names.
+    #[test]
+    fn pruning_pack_intermediates_preserves_the_shared_store_pointer() {
+        let temp = tempfile::tempdir().expect("scratch dir");
+        let root = temp.path().join("vms");
+        let data_dir = root.join("pool-golden-aaaaaaaaaaaa");
+        let entry = root.join("_shared").join("ea92da8f");
+        std::fs::create_dir_all(&entry).expect("store entry");
+        std::fs::create_dir_all(data_dir.join("pack")).expect("pack dir");
+        // Both files a finished create leaves behind: the disk, and the pack
+        // the pruning reclaims.
+        std::fs::write(data_dir.join("storage.raw"), b"disk").expect("disk");
+        std::fs::write(data_dir.join("pack").join("storage.ext4"), b"ext4").expect("intermediate");
+        std::fs::write(
+            data_dir.join("pack").join(SHARED_PACK_POINTER_FILE),
+            entry.display().to_string(),
+        )
+        .expect("pointer");
+
+        // Before pruning, the original location answers for the machine.
+        let canonical = entry.canonicalize().expect("entry path");
+        assert_eq!(
+            shared_entry_in_data_dir(&data_dir, &root),
+            Some(canonical.clone())
+        );
+        assert!(prune_pack_dir(&data_dir).expect("prune"));
+        assert!(!data_dir.join("pack").exists(), "pack/ is gone");
+
+        assert_eq!(
+            shared_entry_in_data_dir(&data_dir, &root),
+            Some(canonical),
+            "the durable pointer still names the entry retirement must reclaim"
+        );
     }
 
     #[test]
