@@ -321,6 +321,7 @@ fn push_challenge_param(params: &mut Vec<(String, String)>, raw: &mut String) {
 /// let a stalled token service hold a 9.6 GB pull — and therefore pool start —
 /// for the transfer's whole budget. Callers whose `client` already carries the
 /// metadata deadline pass it for both.
+#[allow(clippy::too_many_arguments)]
 pub async fn registry_get(
     client: &reqwest::Client,
     token_client: &reqwest::Client,
