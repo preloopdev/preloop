@@ -698,6 +698,12 @@ pub enum VmError {
     /// Invalid VM configuration.
     #[error("invalid VM configuration: {0}")]
     InvalidSpec(String),
+    /// A fork request asks for settings this backend cannot change on a clone.
+    #[error("fork cannot apply {fields}: a clone inherits them from its fork base")]
+    UnsupportedForkOptions {
+        /// Requested settings the backend cannot express, comma separated.
+        fields: String,
+    },
     /// Failed to launch SmolVM.
     #[error("failed to launch `{program}`: {source}")]
     Launch {
@@ -843,6 +849,162 @@ pub enum VmError {
     },
 }
 
+/// Launch settings a fork applies while the clone boots.
+///
+/// Everything else a caller asks for is either inherited unchanged or applied
+/// afterwards through [`MachineUpdate`]: SmolVM's `machine branch` accepts no
+/// mount, socket, DNS or resource flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForkLaunch {
+    /// Make the clone itself a fork base (`machine branch --branchable`).
+    pub branchable: bool,
+    /// Launch under this egress policy. `PublicOnly` starts the clone under
+    /// the strict egress floor; `None` inherits the base's launch policy.
+    pub network: Option<NetworkPolicy>,
+}
+
+impl ForkLaunch {
+    /// Whether the fork should inherit the base unchanged.
+    pub fn is_default(&self) -> bool {
+        !self.branchable && self.network.is_none()
+    }
+
+    /// Settings this launch requests, comma separated.
+    pub fn non_default_fields(&self) -> String {
+        let mut fields = Vec::new();
+        if self.branchable {
+            fields.push("forkable");
+        }
+        if self.network.is_some() {
+            fields.push("network");
+        }
+        fields.join(", ")
+    }
+}
+
+/// Changes applied to a clone after it booted, through `machine update`.
+///
+/// `machine update` only runs on a stopped machine, so a non-default update
+/// costs one stop and one start. Values equal to what the clone already has
+/// are accepted as no-ops by smolvm.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineUpdate {
+    /// vCPU count.
+    pub cpus: Option<u16>,
+    /// Guest memory in MiB.
+    pub memory_mib: Option<u32>,
+    /// Persistent storage in GiB (expand only).
+    pub storage_gib: Option<u32>,
+    /// Root overlay size in GiB (expand only).
+    pub overlay_gib: Option<u32>,
+    /// Egress policy that replaces the cloned machine's current one.
+    pub network: Option<NetworkPolicy>,
+    /// Host mounts to add (`--volume`).
+    pub volumes: Vec<VolumeMount>,
+    /// Enable Rosetta 2 x86_64 translation.
+    pub rosetta: bool,
+}
+
+impl MachineUpdate {
+    /// Whether the clone should be handed back exactly as forked.
+    pub fn is_default(&self) -> bool {
+        self.cpus.is_none()
+            && self.memory_mib.is_none()
+            && self.storage_gib.is_none()
+            && self.overlay_gib.is_none()
+            && self.network.is_none()
+            && self.volumes.is_empty()
+            && !self.rosetta
+    }
+
+    /// Settings this update requests, comma separated.
+    pub fn non_default_fields(&self) -> String {
+        let mut fields = Vec::new();
+        if self.cpus.is_some() {
+            fields.push("shape.cpus");
+        }
+        if self.memory_mib.is_some() {
+            fields.push("shape.memory_mib");
+        }
+        if self.storage_gib.is_some() {
+            fields.push("shape.disk_gib");
+        }
+        if self.overlay_gib.is_some() {
+            fields.push("overlay_gib");
+        }
+        if self.network.is_some() {
+            fields.push("network");
+        }
+        if !self.volumes.is_empty() {
+            fields.push("mounts");
+        }
+        if self.rosetta {
+            fields.push("rosetta");
+        }
+        fields.join(", ")
+    }
+
+    /// The `machine update` argv applying this update.
+    fn args(&self, name: &MachineName) -> Vec<String> {
+        let mut args = vec![
+            "machine".into(),
+            "update".into(),
+            "--name".into(),
+            name.as_str().into(),
+        ];
+        if let Some(cpus) = self.cpus {
+            args.extend(["--cpus".into(), cpus.to_string()]);
+        }
+        if let Some(memory_mib) = self.memory_mib {
+            args.extend(["--mem".into(), memory_mib.to_string()]);
+        }
+        if let Some(storage_gib) = self.storage_gib {
+            args.extend(["--storage".into(), storage_gib.to_string()]);
+        }
+        if let Some(overlay_gib) = self.overlay_gib {
+            args.extend(["--overlay".into(), overlay_gib.to_string()]);
+        }
+        if let Some(network) = &self.network {
+            match network {
+                NetworkPolicy::Disabled => args.push("--no-net".into()),
+                // An empty allow list means deny-all, which `machine update`
+                // cannot spell; no networking is the closest expressible
+                // policy and is what a cold boot of that spec gets too.
+                NetworkPolicy::Restricted { hosts, cidrs }
+                    if hosts.is_empty() && cidrs.is_empty() =>
+                {
+                    args.push("--no-net".into());
+                }
+                NetworkPolicy::Unrestricted | NetworkPolicy::PublicOnly => {
+                    args.push("--net".into());
+                    args.push("--reset-allow-list".into());
+                }
+                NetworkPolicy::Restricted { hosts, cidrs } => {
+                    args.push("--net".into());
+                    args.push("--reset-allow-list".into());
+                    for host in hosts {
+                        args.extend(["--allow-host".into(), host.clone()]);
+                    }
+                    for cidr in cidrs {
+                        args.extend(["--allow-cidr".into(), cidr.clone()]);
+                    }
+                }
+            }
+        }
+        for mount in &self.volumes {
+            let mut value = format!("{}:{}", mount.host.display(), mount.guest.display());
+            if mount.read_only {
+                value.push_str(":ro");
+            }
+            args.extend(["--volume".into(), value]);
+        }
+        if self.rosetta {
+            args.push("--rosetta".into());
+        }
+        args
+    }
+}
+
 /// What a backend can express, so the orchestrator can pick a strategy
 /// instead of assuming SmolVM's.
 ///
@@ -938,6 +1100,46 @@ pub trait VmProvider: Send + Sync {
         _volumes: &[VolumeMount],
     ) -> Result<(), VmError> {
         self.fork(golden, clone).await
+    }
+    /// Fork `golden` into `clone` with `launch` settings.
+    ///
+    /// A backend that cannot express a non-default launch refuses it rather
+    /// than silently forking a machine that does not match the request. The
+    /// default implementation delegates the "inherit unchanged" case to
+    /// [`VmProvider::fork`].
+    async fn fork_with(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        launch: &ForkLaunch,
+    ) -> Result<(), VmError> {
+        if launch.is_default() {
+            self.fork(golden, clone).await
+        } else {
+            Err(VmError::UnsupportedForkOptions {
+                fields: launch.non_default_fields(),
+            })
+        }
+    }
+    /// Apply a fork request's changes to a clone that just booted.
+    ///
+    /// `branchable` is the clone's launch setting, so a backend that stops
+    /// and restarts it keeps that property. The default implementation
+    /// refuses any non-default update: returning the unchanged clone would
+    /// silently drop the request.
+    async fn apply_fork_update(
+        &self,
+        _name: &MachineName,
+        update: &MachineUpdate,
+        _branchable: bool,
+    ) -> Result<(), VmError> {
+        if update.is_default() {
+            Ok(())
+        } else {
+            Err(VmError::UnsupportedForkOptions {
+                fields: update.non_default_fields(),
+            })
+        }
     }
     /// Remove `pack/` build intermediates from a machine's data directory once
     /// its finished disk exists (issue #295).
@@ -1064,6 +1266,22 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
         volumes: &[VolumeMount],
     ) -> Result<(), VmError> {
         (**self).fork_with_volumes(golden, clone, volumes).await
+    }
+    async fn fork_with(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        launch: &ForkLaunch,
+    ) -> Result<(), VmError> {
+        (**self).fork_with(golden, clone, launch).await
+    }
+    async fn apply_fork_update(
+        &self,
+        name: &MachineName,
+        update: &MachineUpdate,
+        branchable: bool,
+    ) -> Result<(), VmError> {
+        (**self).apply_fork_update(name, update, branchable).await
     }
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
         (**self).stop(name).await
@@ -1780,11 +1998,11 @@ impl SmolVmProvider {
         &self,
         operation: &'static str,
         args: &[String],
-        network: &NetworkPolicy,
+        network: Option<&NetworkPolicy>,
         deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.write().await;
-        self.checked_with_network(operation, args, Some(network), None, deadline)
+        self.checked_with_network(operation, args, network, None, deadline)
             .await
     }
 
@@ -1810,6 +2028,21 @@ impl SmolVmProvider {
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.read().await;
         self.checked(operation, args, deadline).await
+    }
+
+    /// [`Self::concurrent`] with an explicit launch policy for commands that
+    /// boot a machine (fork, start): `PublicOnly` turns on the strict egress
+    /// floor, and every other policy drops a floor inherited from the parent.
+    async fn concurrent_with_network(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        network: Option<&NetworkPolicy>,
+        deadline: Duration,
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.read().await;
+        self.checked_with_network(operation, args, network, None, deadline)
+            .await
     }
 
     /// The mutex guarding forks from one golden, created on first use.
@@ -2023,6 +2256,90 @@ fn prune_unregistered_pack_dirs(
     Ok(pruned)
 }
 
+impl SmolVmProvider {
+    /// Fork one clone, applying the launch settings `machine branch` accepts.
+    ///
+    /// Serialized per golden: see [`VmProvider::fork`] for the checkpoint
+    /// invariant that requires it. `--branchable` makes the child a fork base
+    /// itself; `launch.network` reaches the booted child through the command's
+    /// egress-floor environment, exactly like `machine create`.
+    async fn fork_launch(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        launch: &ForkLaunch,
+    ) -> Result<(), VmError> {
+        let fork_lock = self.fork_lock(golden).await;
+        let _fork_guard = fork_lock.lock().await;
+        let mut args = vec![
+            "machine".into(),
+            "fork".into(),
+            "--golden".into(),
+            golden.as_str().into(),
+            "--name".into(),
+            clone.as_str().into(),
+            "--freeze-source".into(),
+        ];
+        if launch.branchable {
+            args.push("--branchable".into());
+        }
+        let result = self
+            .concurrent_with_network("fork", &args, launch.network.as_ref(), self.deadlines.boot)
+            .await;
+        if result.is_ok() {
+            self.forked_machines
+                .lock()
+                .await
+                .insert(clone.as_str().to_owned(), golden.as_str().to_owned());
+            // Issue #295: smolvm's fork copies the golden's whole data dir,
+            // pack/ build intermediates included. Prune the clone's copy;
+            // never fail provisioning over best-effort disk hygiene.
+            if let Err(error) = self.prune_pack_intermediates(clone).await {
+                warn!(
+                    clone = clone.as_str(),
+                    %error,
+                    "failed to prune pack/ intermediates from forked machine"
+                );
+            }
+        }
+        result.map(|_| ())
+    }
+
+    /// Start a machine, optionally re-claiming its fork-base status, under
+    /// `network`'s launch policy (`PublicOnly` turns on the strict egress
+    /// floor; other policies explicitly drop an inherited floor).
+    async fn start_with_network(
+        &self,
+        name: &MachineName,
+        forkable: bool,
+        network: Option<&NetworkPolicy>,
+    ) -> Result<(), VmError> {
+        let mut args = vec![
+            "machine".into(),
+            "start".into(),
+            "--name".into(),
+            name.as_str().into(),
+        ];
+        if forkable {
+            args.push("--forkable".into());
+        }
+        let result = if forkable {
+            self.exclusive_with_network("start_forkable", &args, network, self.deadlines.boot)
+                .await
+        } else {
+            self.concurrent_with_network("start", &args, network, self.deadlines.boot)
+                .await
+        };
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let operation = if forkable { "start_forkable" } else { "start" };
+                Err(self.explain_boot_failure(name, operation, error).await)
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl VmProvider for SmolVmProvider {
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
@@ -2152,7 +2469,7 @@ impl VmProvider for SmolVmProvider {
             args.push("--".into());
             args.extend(workload.iter().cloned());
         }
-        self.exclusive_with_network("create", &args, &spec.network, self.deadlines.boot)
+        self.exclusive_with_network("create", &args, Some(&spec.network), self.deadlines.boot)
             .await?;
         // Recorded after a successful create: the spec is the only place the
         // device inventory a `start` failure has to explain is still known.
@@ -2198,44 +2515,11 @@ impl VmProvider for SmolVmProvider {
     /// [`VmError::IrqExhausted`] instead of the bare `EINVAL` smolvm prints:
     /// see [`SmolVmProvider::explain_boot_failure`].
     async fn start(&self, name: &MachineName) -> Result<(), VmError> {
-        match self
-            .concurrent(
-                "start",
-                &[
-                    "machine".into(),
-                    "start".into(),
-                    "--name".into(),
-                    name.as_str().into(),
-                ],
-                self.deadlines.boot,
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) => Err(self.explain_boot_failure(name, "start", error).await),
-        }
+        self.start_with_network(name, false, None).await
     }
 
     async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
-        match self
-            .exclusive(
-                "start_forkable",
-                &[
-                    "machine".into(),
-                    "start".into(),
-                    "--name".into(),
-                    name.as_str().into(),
-                    "--forkable".into(),
-                ],
-                self.deadlines.boot,
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) => Err(self
-                .explain_boot_failure(name, "start_forkable", error)
-                .await),
-        }
+        self.start_with_network(name, true, None).await
     }
 
     /// Fork one clone from a golden, one fork per golden at a time.
@@ -2260,40 +2544,51 @@ impl VmProvider for SmolVmProvider {
     /// Different goldens still fork concurrently, and forks remain excluded
     /// from base construction, so a golden cannot be replaced underneath one.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
-        let fork_lock = self.fork_lock(golden).await;
-        let _fork_guard = fork_lock.lock().await;
-        let result = self
-            .concurrent(
-                "fork",
-                &[
-                    "machine".into(),
-                    "fork".into(),
-                    "--golden".into(),
-                    golden.as_str().into(),
-                    "--name".into(),
-                    clone.as_str().into(),
-                    "--freeze-source".into(),
-                ],
-                self.deadlines.boot,
-            )
-            .await;
-        if result.is_ok() {
-            self.forked_machines
-                .lock()
-                .await
-                .insert(clone.as_str().to_owned(), golden.as_str().to_owned());
-            // Issue #295: smolvm's fork copies the golden's whole data dir,
-            // pack/ build intermediates included. Prune the clone's copy;
-            // never fail provisioning over best-effort disk hygiene.
-            if let Err(error) = self.prune_pack_intermediates(clone).await {
-                warn!(
-                    clone = clone.as_str(),
-                    %error,
-                    "failed to prune pack/ intermediates from forked machine"
-                );
-            }
+        self.fork_launch(golden, clone, &ForkLaunch::default())
+            .await
+    }
+
+    /// Fork with the request's launch settings.
+    ///
+    /// `--branchable` is the only creation-time setting `machine branch`
+    /// accepts besides the egress floor, which reaches the child through the
+    /// command's environment. Everything else is applied afterwards by
+    /// [`VmProvider::apply_fork_update`].
+    async fn fork_with(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        launch: &ForkLaunch,
+    ) -> Result<(), VmError> {
+        self.fork_launch(golden, clone, launch).await
+    }
+
+    /// Apply a fork request's changes, stopping the clone while `machine
+    /// update` rewrites its record and starting it again afterwards.
+    ///
+    /// A clone inherits the base's running state, so the stop/start pair only
+    /// runs when the request actually changes something. On failure the
+    /// caller deletes the half-configured clone.
+    async fn apply_fork_update(
+        &self,
+        name: &MachineName,
+        update: &MachineUpdate,
+        branchable: bool,
+    ) -> Result<(), VmError> {
+        if update.is_default() {
+            return Ok(());
         }
-        result.map(|_| ())
+        self.stop(name).await?;
+        let result = self
+            .concurrent("update", &update.args(name), self.deadlines.control)
+            .await;
+        match result {
+            Ok(_) => {
+                self.start_with_network(name, branchable, update.network.as_ref())
+                    .await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn prune_pack_intermediates(&self, name: &MachineName) -> Result<bool, VmError> {

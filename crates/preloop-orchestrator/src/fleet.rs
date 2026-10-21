@@ -187,31 +187,71 @@ impl SandboxMachines {
         template: String,
         spec: &MachineSpec,
         purpose: Purpose,
+        inherit: bool,
     ) -> Result<Entry, VmError> {
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let mut options = std::collections::BTreeMap::new();
-        if let Some(dns) = &spec.dns {
-            options.insert("dns".to_owned(), dns.clone());
-        }
-        if spec.rosetta {
-            options.insert("rosetta".to_owned(), "true".to_owned());
-        }
-        if let Some(overlay) = spec.overlay_gib {
-            options.insert("overlay_gib".to_owned(), overlay.to_string());
-        }
-        // The pool states each machine's role, and an explicit guest-volume or
-        // workload override; the SmolVM driver decodes these the same way.
-        if spec.role != MachineRole::default() {
-            options.insert("role".to_owned(), json_option(&spec.role)?);
-        }
-        if let Some(volumes) = &spec.guest_volumes {
-            options.insert("guest_volumes".to_owned(), json_option(volumes)?);
-        }
-        if let Some(init) = &spec.workload_init {
-            options.insert("workload_init".to_owned(), json_option(init)?);
-        }
+        // A clone already carries the golden's shape, network, mounts,
+        // sockets and launch options: restating them would either duplicate
+        // the base's settings or ask the fork for a change it cannot make
+        // (sockets, DNS, role). Send only the request itself; the driver
+        // inherits everything from the snapshot base.
+        let (shape, network, mounts, sockets, options) = if inherit {
+            (
+                Shape::default(),
+                SbxNetwork::default(),
+                Vec::new(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+            )
+        } else {
+            let mut options = std::collections::BTreeMap::new();
+            if let Some(dns) = &spec.dns {
+                options.insert("dns".to_owned(), dns.clone());
+            }
+            if spec.rosetta {
+                options.insert("rosetta".to_owned(), "true".to_owned());
+            }
+            if let Some(overlay) = spec.overlay_gib {
+                options.insert("overlay_gib".to_owned(), overlay.to_string());
+            }
+            // The pool states each machine's role, and an explicit guest-volume
+            // or workload override; the SmolVM driver decodes these the same way.
+            if spec.role != MachineRole::default() {
+                options.insert("role".to_owned(), json_option(&spec.role)?);
+            }
+            if let Some(volumes) = &spec.guest_volumes {
+                options.insert("guest_volumes".to_owned(), json_option(volumes)?);
+            }
+            if let Some(init) = &spec.workload_init {
+                options.insert("workload_init".to_owned(), json_option(init)?);
+            }
+            (
+                Shape {
+                    cpus: u32::from(spec.cpus),
+                    memory_mib: spec.memory_mib,
+                    disk_gib: spec.storage_gib,
+                },
+                network(&spec.network),
+                spec.volumes
+                    .iter()
+                    .map(|v| Mount {
+                        host: v.host.display().to_string(),
+                        guest: v.guest.display().to_string(),
+                        readonly: v.read_only,
+                    })
+                    .collect(),
+                spec.sockets
+                    .iter()
+                    .map(|s| SocketMount {
+                        host: s.host.display().to_string(),
+                        guest: s.guest.display().to_string(),
+                    })
+                    .collect(),
+                options,
+            )
+        };
         let response = self
             .api
             .acquire(AcquireRequest {
@@ -222,32 +262,13 @@ impl SandboxMachines {
                 ),
                 name: name.as_str().to_owned(),
                 template,
-                shape: Shape {
-                    cpus: u32::from(spec.cpus),
-                    memory_mib: spec.memory_mib,
-                    disk_gib: spec.storage_gib,
-                },
+                shape,
                 purpose,
                 requires: self.requires.clone(),
                 ttl_secs: LEASE_TTL.as_secs(),
-                network: network(&spec.network),
-                mounts: spec
-                    .volumes
-                    .iter()
-                    .map(|v| Mount {
-                        host: v.host.display().to_string(),
-                        guest: v.guest.display().to_string(),
-                        readonly: v.read_only,
-                    })
-                    .collect(),
-                sockets: spec
-                    .sockets
-                    .iter()
-                    .map(|s| SocketMount {
-                        host: s.host.display().to_string(),
-                        guest: s.guest.display().to_string(),
-                    })
-                    .collect(),
+                network,
+                mounts,
+                sockets,
                 options,
                 ..AcquireRequest::default()
             })
@@ -336,7 +357,7 @@ impl SandboxMachines {
             }
         };
         let template = self.ensure_image_template(&spec.image).await?;
-        let entry = self.acquire(name, template, &spec, purpose).await?;
+        let entry = self.acquire(name, template, &spec, purpose, false).await?;
         self.entries
             .lock()
             .await
@@ -714,7 +735,7 @@ impl VmProvider for SandboxMachines {
         let mut clone_spec = spec;
         clone_spec.name = clone.clone();
         let entry = self
-            .acquire(clone, template, &clone_spec, Purpose::Runner)
+            .acquire(clone, template, &clone_spec, Purpose::Runner, true)
             .await?;
         self.entries
             .lock()

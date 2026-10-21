@@ -105,6 +105,15 @@ pub struct Capabilities {
     /// require `multi_exec`.
     #[serde(skip_serializing_if = "is_false")]
     pub one_shot: bool,
+    /// Largest vCPU count one sandbox can be given (0 = unreported).
+    ///
+    /// Placement rejects a [`Shape`] above this instead of handing the driver
+    /// a machine it cannot boot.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub max_vcpus: u32,
+    /// Largest memory one sandbox can be given, in MiB (0 = unreported).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub max_memory_mib: u32,
 }
 
 impl Capabilities {

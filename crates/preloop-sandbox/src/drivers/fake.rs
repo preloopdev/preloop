@@ -55,6 +55,8 @@ impl FakeDriver {
             slots: 0,
             native_pool: false,
             one_shot: false,
+            max_vcpus: 0,
+            max_memory_mib: 0,
         }
     }
 

@@ -886,6 +886,19 @@ impl Service {
         }
     }
 
+    /// Whether a provider's declared per-sandbox capacity can host `shape`.
+    ///
+    /// Zero on either side means "not reported" (or "driver default"), never
+    /// zero capacity: a driver that publishes no ceiling still accepts the
+    /// request rather than being rejected by placement.
+    fn fits_shape(caps: &Capabilities, shape: &Shape) -> bool {
+        let cpus_fit = caps.max_vcpus == 0 || shape.cpus == 0 || shape.cpus <= caps.max_vcpus;
+        let memory_fit = caps.max_memory_mib == 0
+            || shape.memory_mib == 0
+            || shape.memory_mib <= caps.max_memory_mib;
+        cpus_fit && memory_fit
+    }
+
     /// Pick `(provider_id, driver)`: filter on capabilities and capacity,
     /// then let the configured [`Placement`] rank the survivors.
     ///
@@ -973,6 +986,18 @@ impl Service {
                         rec.provider.name,
                         driver.driver,
                         reasons.join(", ")
+                    ));
+                    continue;
+                }
+                if !Self::fits_shape(caps, &spec.shape) {
+                    unmet.push(format!(
+                        "{}/{}: shape={}cpus/{}mib (max {}cpus/{}mib)",
+                        rec.provider.name,
+                        driver.driver,
+                        spec.shape.cpus,
+                        spec.shape.memory_mib,
+                        caps.max_vcpus,
+                        caps.max_memory_mib
                     ));
                     continue;
                 }
