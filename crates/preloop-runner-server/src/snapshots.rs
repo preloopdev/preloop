@@ -3030,11 +3030,11 @@ pub(crate) fn stage_git_auth_header(command: &mut Command, key: &str, value: &st
 ///
 /// Unlike [`git_command_for`] this does not reset Git's credential-helper
 /// list. The engine holds no credential for a GitLab, enterprise, or PAT-less
-/// GitHub origin — `deepen_remote` scopes its token to the configured forge and
-/// nothing else — so for a private workspace whose only credential is a
-/// configured helper, the helper *is* the credential. Resetting it fails the
-/// deepen, and the caller then rewrites history and submits SHAs the forge has
-/// never seen, which breaks every workflow that fetches those SHAs back.
+/// GitHub origin — [`deepen_remote`] covers the configured forge and nothing
+/// else — so for a private workspace whose only credential is a configured
+/// helper, the helper *is* the credential. Resetting it fails the deepen,
+/// and the caller then rewrites history and submits SHAs the forge has never
+/// seen, which breaks every workflow that fetches those SHAs back.
 ///
 /// The helper stays bounded, not unprompted-forever: the askpass programs are
 /// still pointed at `false` and `GIT_TERMINAL_PROMPT=0`/`GCM_INTERACTIVE=never`
@@ -3632,6 +3632,9 @@ async fn deepen_object_cache_from_remote(
     };
     fetch.env("GIT_DIR", repository);
     if let Some((key, value)) = auth {
+        // Scoped by `deepen_remote`, so the token is never sent to a host the
+        // operator did not configure it for.
+        //
         // Staged in the environment: the value is a live token, and command
         // lines are world-readable.
         stage_git_auth_header(&mut fetch, &key, &value);

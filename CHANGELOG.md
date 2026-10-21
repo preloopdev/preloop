@@ -605,7 +605,7 @@ Releases before v0.27.0 predate the changelog.
   process-wide roots as the engine (bundled Mozilla, the OS store read with a
   5 s deadline, and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`) instead of
   reqwest's platform verifier, so a hung `trustd`/`securityd` can no longer
-  stall them. `preloop runner lint` also gains a 30 s request / 10 s connect
+  stall them. `preloop-runner lint` also gains a 30 s request / 10 s connect
   deadline. A bundle certificate the anchor parser cannot read is dropped
   instead of failing the set, so one malformed entry in
   `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE` no longer takes Postgres TLS
