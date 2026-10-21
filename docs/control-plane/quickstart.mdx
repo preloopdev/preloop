@@ -3,7 +3,7 @@ title: Quickstart
 description: Install the Preloop CLI, configure the engine, and run a workflow from your working tree.
 ---
 
-This page takes you from a clean machine to one workflow running locally. Local runs use your working tree, including uncommitted and untracked files, and they need no GitHub credential.
+This page takes you from a clean machine to one workflow running locally. Local runs use your working tree, including uncommitted and untracked files.
 
 Before you start, confirm the host can run microVMs and has room for the default image. [Install](/control-plane/install) lists the requirements. The short version:
 
@@ -25,22 +25,12 @@ The [installer script](/control-plane/install#installer-script) works too, and i
 ## 2. Configure the engine
 
 ```sh
-preloop init --auth none --golden official --mode none
+preloop init
 ```
 
-Each flag answers one step of `init`:
+Follow the wizard. It asks for a GitHub credential (App or fine-grained PAT), which golden image to use, and how to run the engine, then writes `~/.preloop/config.toml`. Most existing workflows need a credential so job tokens, private actions, and check runs keep working — choose App or PAT unless you know the workflow is fully offline.
 
-| Flag | Meaning |
-|---|---|
-| `--auth none` | Write no GitHub credential. Local runs do not need one. Add a GitHub App later to publish check runs. |
-| `--golden official` | Use the official packed GitHub runner image, which Preloop downloads on first use. |
-| `--mode none` | Write the configuration and start nothing. |
-
-`init` writes `~/.preloop/config.toml` and checks the host's disk, architecture, and hypervisor. If a check fails, it stops with exit code `3` and names what is short.
-
-<Tip>
-Run `preloop init` with no flags in a terminal to answer each step interactively. To see the host report without changing anything, run `preloop init --probe --json`.
-</Tip>
+`init` also checks the host's disk, architecture, and hypervisor. If a check fails, it stops with exit code `3` and names what is short. To see that report without changing anything, run `preloop init --probe --json`.
 
 ## 3. Start the engine
 
@@ -50,7 +40,7 @@ preloop serve
 
 The engine listens on `127.0.0.1:9090`. Leave it running in this terminal and stop it with `Ctrl-C`.
 
-If `serve` asks whether to run `init` first, answer `n` to continue with the official image. You can re-run `init` at any time to change the image or the credential.
+If you already told `init` to start the engine for you, you can skip this step. You can re-run `init` at any time to change the image or the credential.
 
 ## 4. Run a workflow
 

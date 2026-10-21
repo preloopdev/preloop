@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
 use base64::Engine;
@@ -68,6 +68,25 @@ const INSTALLATION_MISS_TTL: std::time::Duration = std::time::Duration::from_sec
 /// Bound on remembered installation misses, so requests naming many owners
 /// cannot grow the map without limit. Clearing it only costs a fresh lookup.
 const MAX_CACHED_INSTALLATION_MISSES: usize = 1024;
+
+/// How long a positive exact-repository coverage answer is reused.
+///
+/// The webhook receiver asks for coverage on every signed delivery, and the
+/// answer costs one App-JWT round trip (`GET /repos/{owner}/{repo}/installation`).
+/// Coverage changes when the App is installed, suspended, uninstalled, or has
+/// repositories added/removed. A signed lifecycle delivery invalidates the
+/// affected answers before ordinary gating ([`invalidate_repository_coverage`]);
+/// this TTL is the fallback for a lifecycle delivery that is delayed, missed by
+/// this process, or never arrives. Cache state is process-local, so in a
+/// multi-process deployment another process can keep a stale positive for up
+/// to this bound.
+const REPOSITORY_COVERAGE_TTL: Duration = Duration::from_secs(600);
+
+/// Bound on cached positive coverage answers, so deliveries naming many
+/// repositories cannot grow the map without limit. At capacity the oldest
+/// checked entry is evicted after expired entries are discarded; one eviction
+/// preserves the rest of the working set.
+const MAX_CACHED_REPOSITORY_COVERAGE: usize = 1024;
 
 /// Workflow permission scopes with no GitHub App counterpart. `id-token`
 /// controls Actions OIDC issuance and `models` controls GitHub Models access;
@@ -238,6 +257,224 @@ pub fn fallback_token(
     }
 }
 
+/// Exact-repository installation coverage, cached per App.
+///
+/// The webhook receiver asks [`app_covers_repository`] once per signed
+/// delivery, and the answer costs an App-JWT round trip
+/// (`GET /repos/{owner}/{repo}/installation`). Only positives are retained:
+/// a definitive 404 is returned for that delivery but not stored, so the next
+/// delivery can discover a repository that was just added. Transport errors,
+/// rate limits, 5xx/invalid responses, and app-id mismatches are unknowns and
+/// are never stored either.
+///
+/// Concurrent misses for one `owner/repo` coalesce onto one lookup; independent
+/// keys run concurrently. Invalidation bumps the cache generation, so a lookup
+/// that began before it can neither record its answer nor authorize a delivery
+/// waiting on it. The in-flight map is removed as lookups finish (including on
+/// cancellation), so synchronization state is bounded by concurrency rather
+/// than by the set of repositories ever seen.
+#[derive(Clone)]
+struct RepositoryCoverageCache {
+    state: Arc<parking_lot::Mutex<CoverageState>>,
+    positive_ttl: Duration,
+    capacity: usize,
+}
+
+#[derive(Default)]
+struct CoverageState {
+    /// `owner/repo` (lowercased) -> when a positive answer was recorded.
+    positives: HashMap<String, Instant>,
+    /// One in-flight lookup per key; removed when the lookup ends.
+    flights: HashMap<String, Arc<CoverageFlight>>,
+    /// Incremented by every invalidation. A lookup records the generation it
+    /// began under and refuses to publish or authorize a positive after a
+    /// bump.
+    generation: u64,
+}
+
+struct CoverageFlight {
+    generation: u64,
+    /// `None` while the lookup runs, then the answer shared with every waiter.
+    /// `false` is a denial for this delivery only and is never cached.
+    answer: tokio::sync::watch::Sender<Option<bool>>,
+}
+
+impl RepositoryCoverageCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Arc::new(parking_lot::Mutex::new(CoverageState::default())),
+            positive_ttl: REPOSITORY_COVERAGE_TTL,
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Whether a fresh positive answer is held for `key`.
+    fn positive(&self, state: &mut CoverageState, key: &str) -> bool {
+        match state.positives.get(key).copied() {
+            Some(checked_at) if checked_at.elapsed() < self.positive_ttl => true,
+            Some(_) => {
+                state.positives.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Forget the answer for one repository and fence lookups already in
+    /// flight under the previous generation.
+    fn invalidate(&self, repository: &str) {
+        let key = repository.to_ascii_lowercase();
+        let mut state = self.state.lock();
+        state.positives.remove(&key);
+        // Drop the flight too, so deliveries arriving after the revocation do
+        // not wait for a lookup whose answer is already fenced. The old leader
+        // may still finish; its generation check prevents publication.
+        state.flights.remove(&key);
+        state.generation = state.generation.wrapping_add(1);
+    }
+
+    /// Forget every answer. Conservative for installation-wide events that
+    /// can change any repository's coverage.
+    fn invalidate_all(&self) {
+        let mut state = self.state.lock();
+        state.positives.clear();
+        state.flights.clear();
+        state.generation = state.generation.wrapping_add(1);
+    }
+
+    /// Store a confirmed positive under the cache lock, discarding expired
+    /// entries first and then evicting the single oldest entry at capacity.
+    fn record_positive(&self, state: &mut CoverageState, key: &str) {
+        let now = Instant::now();
+        state
+            .positives
+            .retain(|_, checked_at| now.saturating_duration_since(*checked_at) < self.positive_ttl);
+        if state.positives.len() >= self.capacity
+            && let Some(oldest) = state
+                .positives
+                .iter()
+                .min_by_key(|(_, checked_at)| **checked_at)
+                .map(|(key, _)| key.clone())
+        {
+            state.positives.remove(&oldest);
+        }
+        state.positives.insert(key.to_owned(), now);
+    }
+
+    /// Number of deliveries waiting on the in-flight lookup for `repository`.
+    /// Test-only observability for single-flight assertions.
+    #[cfg(test)]
+    pub(crate) fn flight_waiters(&self, repository: &str) -> usize {
+        self.state
+            .lock()
+            .flights
+            .get(&repository.to_ascii_lowercase())
+            .map(|flight| flight.answer.receiver_count())
+            .unwrap_or(0)
+    }
+
+    async fn covers(&self, api_base: &str, app: &GitHubAppCredentials, repository: &str) -> bool {
+        let key = repository.to_ascii_lowercase();
+        loop {
+            let (flight, leader) = {
+                let mut state = self.state.lock();
+                if self.positive(&mut state, &key) {
+                    return true;
+                }
+                match state.flights.get(&key).cloned() {
+                    Some(flight) => (flight, false),
+                    None => {
+                        let flight = Arc::new(CoverageFlight {
+                            generation: state.generation,
+                            answer: tokio::sync::watch::channel(None).0,
+                        });
+                        state.flights.insert(key.clone(), Arc::clone(&flight));
+                        (flight, true)
+                    }
+                }
+            };
+            if leader {
+                return self.lead(api_base, app, repository, &key, flight).await;
+            }
+            // Share the leader's answer. An error or a 404 denies this
+            // delivery; a positive is re-checked against the cache because an
+            // invalidation or capacity eviction may have removed it between
+            // the leader's publish and this waiter running.
+            let mut answer = flight.answer.subscribe();
+            match answer.wait_for(|answer| answer.is_some()).await {
+                Ok(answer) if *answer == Some(false) => return false,
+                Ok(_) | Err(_) => continue,
+            }
+        }
+    }
+
+    async fn lead(
+        &self,
+        api_base: &str,
+        app: &GitHubAppCredentials,
+        repository: &str,
+        key: &str,
+        flight: Arc<CoverageFlight>,
+    ) -> bool {
+        let mut guard = FlightGuard {
+            cache: self,
+            key: key.to_owned(),
+            flight: Arc::clone(&flight),
+            published: false,
+        };
+        let lookup = app_covers_repository_on(api_base, app, repository).await;
+        // Unknown answers are denials for this delivery, never cache entries.
+        let covers = matches!(lookup, Ok(true));
+        let mut state = self.state.lock();
+        // A lookup that began before an invalidation cannot publish a stale
+        // positive, nor authorize its own delivery.
+        let accepted = covers && state.generation == flight.generation;
+        if accepted {
+            self.record_positive(&mut state, key);
+        }
+        if state
+            .flights
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, &flight))
+        {
+            state.flights.remove(key);
+        }
+        drop(state);
+        flight.answer.send_replace(Some(accepted));
+        guard.published = true;
+        accepted
+    }
+}
+
+/// Remove a cancelled lookup's flight and deny its waiters. A lookup that
+/// never answered must not leave a flight that new deliveries wait on forever,
+/// and must never authorize anyone.
+struct FlightGuard<'a> {
+    cache: &'a RepositoryCoverageCache,
+    key: String,
+    flight: Arc<CoverageFlight>,
+    published: bool,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        {
+            let mut state = self.cache.state.lock();
+            if state
+                .flights
+                .get(&self.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+            {
+                state.flights.remove(&self.key);
+            }
+        }
+        self.flight.answer.send_replace(Some(false));
+    }
+}
+
 /// GitHub App credentials for minting installation tokens.
 #[derive(Clone)]
 pub struct GitHubAppCredentials {
@@ -266,6 +503,13 @@ pub struct GitHubAppCredentials {
     /// installation added later must still be noticed, which is why a miss is
     /// never treated as permanent.
     installation_misses: Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    /// Exact-repository installation coverage, keyed by lowercased
+    /// `owner/repo`.
+    ///
+    /// The webhook signer binding asks this per signed delivery, and the
+    /// lookup is an App-JWT round trip whose answer only changes on
+    /// install/uninstall. See [`RepositoryCoverageCache`].
+    repository_coverage: RepositoryCoverageCache,
     /// Every installation token this App has minted, keyed by token hash.
     /// The GitHub-compatible dispatch API consults it to validate a token
     /// offline — without a github.com round-trip — when github.com is
@@ -462,6 +706,7 @@ impl GitHubAppCredentials {
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             installation_misses: Arc::new(RwLock::new(HashMap::new())),
+            repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
@@ -485,6 +730,13 @@ impl GitHubAppCredentials {
             self.github_accounting(),
         )
         .await
+    }
+
+    /// Number of deliveries waiting on this App's in-flight coverage lookup
+    /// for `repository`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn coverage_flight_waiters(&self, repository: &str) -> usize {
+        self.repository_coverage.flight_waiters(repository)
     }
 
     /// Breaker and consumption handles for this App's JWT calls, present when
@@ -570,6 +822,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
                 pat_fallback: pat_fallback.clone(),
                 installation_cache: Arc::new(RwLock::new(HashMap::new())),
                 installation_misses: Arc::new(RwLock::new(HashMap::new())),
+                repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
                 mint_ledger: Arc::new(MintLedger::default()),
                 // The primary slot's webhook secret belongs to this App — it
                 // is the default App's secret — so a payload it signs is bound
@@ -659,6 +912,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
             pat_fallback: pat_fallback.clone(),
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             installation_misses: Arc::new(RwLock::new(HashMap::new())),
+            repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret,
             installation_id: app.installation_id,
@@ -823,12 +1077,75 @@ pub async fn candidate_apps_for_repo_inner(
 /// `acme/repo2`, letting a payload signed by that App's secret claim a
 /// repository outside its installation.
 ///
-/// Fail-closed: any transport error, unexpected status, or app-id mismatch
-/// returns false (the caller rejects with 403). Webhook deliveries are
-/// low-volume relative to App rate limits, so this lookup is not cached; the
-/// owner-granularity installation id it complements stays cached per App.
+/// Fail-closed: any transport error, unexpected status, unparseable body, or
+/// app-id mismatch denies the delivery. Only a validated positive is cached
+/// (for [`REPOSITORY_COVERAGE_TTL`]); a definitive 404 denies this delivery but
+/// is not retained, so the next delivery can discover a newly added
+/// repository. See [`RepositoryCoverageCache`].
 pub async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str) -> bool {
-    app_covers_repository_on(&api_base(), app, repository).await
+    app_covers_repository_cached(&api_base(), app, repository).await
+}
+
+/// Apply a signature-verified installation lifecycle event to the signer
+/// App's cached coverage, returning whether the event was handled.
+///
+/// The caller MUST pass the credentials resolved from the *verified* signer
+/// (never a payload `app_id` or `installation.app_id`), so a delivery can only
+/// change the cache of the App whose secret signed it. Handled events skip the
+/// ordinary exact-repository gate because a removal/uninstall may already make
+/// that lookup fail; they only invalidate, they never grant.
+///
+/// `installation` events conservatively drop every answer: any action can
+/// change coverage, and legitimate payload shapes are not required to carry a
+/// repository list. `installation_repositories` names the affected
+/// repositories; a payload without a usable list clears the App's answers
+/// rather than risk keeping an answer the event invalidated.
+pub fn invalidate_repository_coverage(
+    app: &GitHubAppCredentials,
+    event: &str,
+    payload: &[u8],
+) -> bool {
+    if event != "installation" && event != "installation_repositories" {
+        return false;
+    }
+    let payload = serde_json::from_slice::<serde_json::Value>(payload).ok();
+    if event == "installation" {
+        app.repository_coverage.invalidate_all();
+        return true;
+    }
+    let mut named = 0usize;
+    if let Some(payload) = payload.as_ref() {
+        for field in ["repositories_added", "repositories_removed"] {
+            if let Some(repositories) = payload.get(field).and_then(serde_json::Value::as_array) {
+                for repository in repositories {
+                    if let Some(full_name) = repository
+                        .get("full_name")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        app.repository_coverage.invalidate(full_name);
+                        named += 1;
+                    }
+                }
+            }
+        }
+    }
+    if named == 0 {
+        // No usable repository list: the event may have changed anything.
+        app.repository_coverage.invalidate_all();
+    }
+    true
+}
+
+/// [`app_covers_repository`] against an explicit API base, consulting the
+/// App's coverage cache first.
+async fn app_covers_repository_cached(
+    api_base: &str,
+    app: &GitHubAppCredentials,
+    repository: &str,
+) -> bool {
+    app.repository_coverage
+        .covers(api_base, app, repository)
+        .await
 }
 
 /// Whether the App built from raw `app_id`/`pem` is installed on
@@ -856,23 +1173,24 @@ pub async fn app_covers_repository_at(
             return false;
         }
     };
-    app_covers_repository_on(api_base, &app, repository).await
+    app_covers_repository_on(api_base, &app, repository)
+        .await
+        .unwrap_or(false)
 }
 
 /// [`app_covers_repository`] against an explicit API base.
+///
+/// `Ok(true)` means the App's installation covers the repository,
+/// `Ok(false)` a definitive "not installed", and `Err` that the lookup did
+/// not answer (transport, rate limit, unexpected status). Callers fail closed
+/// on `Err`; only the two `Ok` answers are cacheable.
 async fn app_covers_repository_on(
     api_base: &str,
     app: &GitHubAppCredentials,
     repository: &str,
-) -> bool {
-    let (owner, repo) = match split_repository(repository) {
-        Ok(parts) => parts,
-        Err(_) => return false,
-    };
-    let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
-        Ok(jwt) => jwt,
-        Err(_) => return false,
-    };
+) -> anyhow::Result<bool> {
+    let (owner, repo) = split_repository(repository)?;
+    let app_jwt = sign_app_jwt(&app.app_id, &app.private_key)?;
     let url = format!("{api_base}/repos/{owner}/{repo}/installation");
     let request = CLIENT
         .get(&url)
@@ -890,34 +1208,62 @@ async fn app_covers_repository_on(
         Ok(response) => response,
         Err(error) => {
             warn!(app_id = %app.app_id, repository = %repository, ?error, "repository installation lookup failed");
-            return false;
+            return Err(anyhow!("repository installation lookup failed: {error}"));
         }
     };
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return false;
+        return Ok(false);
     }
     if !response.status().is_success() {
         warn!(app_id = %app.app_id, repository = %repository, status = %response.status(), "repository installation lookup returned unexpected status");
-        return false;
+        return Err(anyhow!(
+            "repository installation lookup returned {}",
+            response.status()
+        ));
     }
     let body: serde_json::Value = match response.json().await {
         Ok(body) => body,
         Err(error) => {
             warn!(app_id = %app.app_id, repository = %repository, ?error, "cannot parse repository installation response");
-            return false;
+            return Err(anyhow!(
+                "cannot parse repository installation response: {error}"
+            ));
         }
     };
-    // Defense in depth: App-JWT auth already scopes GitHub's response to
-    // the calling App, but verify the app id matches anyway.
-    let covers = body
-        .get("app_id")
-        .and_then(serde_json::Value::as_u64)
-        .map(|id| id.to_string() == app.app_id)
-        .unwrap_or(false);
-    if !covers {
-        warn!(app_id = %app.app_id, repository = %repository, "repository installation belongs to a different App");
+    // Defense in depth: App-JWT auth already scopes GitHub's response to the
+    // calling App, but verify the app id matches anyway. A missing or
+    // mismatched id is not a denial we may cache: it is a malformed/foreign
+    // answer, and the next delivery must retry.
+    let Some(returned_app_id) = body.get("app_id").and_then(serde_json::Value::as_u64) else {
+        warn!(app_id = %app.app_id, repository = %repository, "repository installation response has no app_id");
+        return Err(anyhow!("repository installation response has no app_id"));
+    };
+    if returned_app_id.to_string() != app.app_id {
+        warn!(app_id = %app.app_id, repository = %repository, returned_app_id, "repository installation belongs to a different App");
+        return Err(anyhow!(
+            "repository installation app_id {returned_app_id} does not match {}",
+            app.app_id
+        ));
     }
-    covers
+    // A 200 for a suspended installation is not active coverage: GitHub keeps
+    // the installation object and clears access. Deny without caching.
+    if body
+        .get("suspended_at")
+        .is_some_and(|suspended| !suspended.is_null())
+    {
+        info!(app_id = %app.app_id, repository = %repository, "repository installation is suspended");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+tokio::task_local! {
+    /// App id of the verified webhook signer for the delivery this task is
+    /// processing. [`select_app_for_repo`] consults it so a delivery signed by
+    /// App B is never processed with App A's installation credentials just
+    /// because A comes first in the registry. Set only around a delivery's
+    /// processing task and its check-run reporting; unset everywhere else.
+    pub(crate) static VERIFIED_WEBHOOK_APP: String;
 }
 
 /// Select the App whose installation covers `repository`'s owner.
@@ -927,14 +1273,26 @@ async fn app_covers_repository_on(
 /// returned directly. For multi-App setups, returns `None` when no registered
 /// App covers the target repository's owner, avoiding silent mis-attribution
 /// or minting from the wrong App.
+///
+/// While a webhook delivery is being processed, the verified signer App is the
+/// only eligible answer: the exact-repository gate at ingress bound the
+/// sender to that App, and selecting a sibling App would authorize the
+/// delivery with credentials that did not send it.
 pub async fn select_app_for_repo(
     shared: &crate::state::SharedState,
     repository: &str,
 ) -> Option<GitHubAppCredentials> {
-    candidate_apps_for_repo(shared, repository)
-        .await
-        .into_iter()
-        .next()
+    let candidates = candidate_apps_for_repo(shared, repository).await;
+    // A webhook delivery is processed under the App whose secret verified it.
+    // The registry's first covering App is not necessarily that App (two Apps
+    // can be installed on one owner), and silently minting with another App's
+    // installation would mismatch the sender's credentials. Pin selection to
+    // the verified signer; if it no longer covers the repository, fail closed
+    // rather than fall through to a sibling App.
+    if let Ok(verified) = VERIFIED_WEBHOOK_APP.try_with(Clone::clone) {
+        return candidates.into_iter().find(|app| app.app_id == verified);
+    }
+    candidates.into_iter().next()
 }
 
 /// The installation id `app` mints tokens for on `repository`'s owner.
@@ -2115,6 +2473,7 @@ fn credentials_for(app_id: &str, pem: &str) -> anyhow::Result<GitHubAppCredentia
         pat_fallback: None,
         installation_cache: Arc::new(RwLock::new(HashMap::new())),
         installation_misses: Arc::new(RwLock::new(HashMap::new())),
+        repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
         mint_ledger: Arc::new(MintLedger::default()),
         webhook_secret: None,
         installation_id: None,
@@ -2556,6 +2915,7 @@ mod tests {
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             installation_misses: Arc::new(RwLock::new(HashMap::new())),
+            repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
@@ -2681,6 +3041,7 @@ mod tests {
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             installation_misses: Arc::new(RwLock::new(HashMap::new())),
+            repository_coverage: RepositoryCoverageCache::new(MAX_CACHED_REPOSITORY_COVERAGE),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
@@ -3515,6 +3876,541 @@ mod tests {
             candidate_apps_for_repo(&shared, "owner/repo").await.len(),
             1,
             "the non-fail-closed adapter retains the sole App for minting"
+        );
+    }
+
+    /// Loopback GitHub API for `GET /repos/{owner}/{repo}/installation`.
+    ///
+    /// Each call snapshots the configured response, so a test can change it
+    /// between calls. The first call can be held at a barrier to exercise
+    /// single-flight and invalidation fencing without sleeping.
+    struct CoverageStub {
+        api_base: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        response: Arc<parking_lot::Mutex<(u16, serde_json::Value)>>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl CoverageStub {
+        async fn start(status: u16, body: serde_json::Value, block_first: bool) -> Self {
+            use axum::routing::get;
+            use axum::{Json, Router};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let response = Arc::new(parking_lot::Mutex::new((status, body)));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let served = Arc::clone(&calls);
+            let current = Arc::clone(&response);
+            let started = Arc::clone(&entered);
+            let resume = Arc::clone(&release);
+            let stub = Router::new().route(
+                "/repos/{owner}/{repo}/installation",
+                get(move || {
+                    let served = Arc::clone(&served);
+                    let current = Arc::clone(&current);
+                    let started = Arc::clone(&started);
+                    let resume = Arc::clone(&resume);
+                    async move {
+                        let call = served.fetch_add(1, Ordering::SeqCst);
+                        let (status, body) = current.lock().clone();
+                        if block_first && call == 0 {
+                            started.notify_one();
+                            resume.notified().await;
+                        }
+                        let status =
+                            axum::http::StatusCode::from_u16(status).expect("stub status code");
+                        (status, Json(body))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind stub API");
+            let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+            tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+            Self {
+                api_base,
+                calls,
+                response,
+                entered,
+                release,
+            }
+        }
+
+        fn set(&self, status: u16, body: serde_json::Value) {
+            *self.response.lock() = (status, body);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn wait_entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    fn covering_installation() -> serde_json::Value {
+        json!({ "id": 77, "app_id": 424 })
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if condition() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "condition was not reached"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Coverage is one App-JWT round trip per delivery, so a positive answer is
+    /// reused (case-insensitively, as GitHub repository names are). The TTL is
+    /// the fallback for a missed lifecycle invalidation; lowering it in-place
+    /// expires the entry without sleeping.
+    #[tokio::test]
+    async fn repository_coverage_positive_is_cached_and_ttl_expires_it() {
+        let stub = CoverageStub::start(200, covering_installation(), false).await;
+        let mut creds =
+            GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
+
+        assert!(
+            app_covers_repository_cached(&stub.api_base, &creds, "Preloop/preloop").await,
+            "the stub App covers the repository"
+        );
+        assert!(
+            app_covers_repository_cached(&stub.api_base, &creds, "preloop/PRELOOP").await,
+            "a cached positive is reused regardless of case"
+        );
+        assert_eq!(
+            stub.calls(),
+            1,
+            "a fresh positive must not be looked up twice"
+        );
+
+        creds.repository_coverage.positive_ttl = Duration::ZERO;
+        assert!(app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await);
+        assert_eq!(
+            stub.calls(),
+            2,
+            "the fallback TTL expires the positive and forces a new lookup"
+        );
+    }
+
+    /// A 404 denies that delivery but is not retained: the next delivery must
+    /// be able to discover a repository just added to the installation.
+    #[tokio::test]
+    async fn repository_coverage_miss_is_denied_but_not_cached() {
+        let stub = CoverageStub::start(404, json!({ "message": "Not Found" }), false).await;
+        let creds = GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
+
+        assert!(!app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await);
+        assert!(!app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await);
+        assert_eq!(
+            stub.calls(),
+            2,
+            "a definitive 404 must not suppress the next delivery's lookup"
+        );
+
+        stub.set(200, covering_installation());
+        assert!(
+            app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await,
+            "the first delivery after a grant must observe it immediately"
+        );
+        assert_eq!(stub.calls(), 3);
+    }
+
+    /// Malformed, foreign-App, and suspended 200 answers are not coverage.
+    /// None may be cached, so a later healthy answer is observed immediately.
+    #[tokio::test]
+    async fn repository_coverage_unusable_200_answers_are_not_cached() {
+        let stub = CoverageStub::start(200, json!({ "id": 77, "app_id": 999 }), false).await;
+        let creds = GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
+
+        assert!(
+            !app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await,
+            "a response for another App is not this App's coverage"
+        );
+        stub.set(200, json!({ "id": 77 }));
+        assert!(
+            !app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await,
+            "a response with no app_id is unclassified, not a denial we may keep"
+        );
+        stub.set(
+            200,
+            json!({ "id": 77, "app_id": 424, "suspended_at": "2026-01-01T00:00:00Z" }),
+        );
+        assert!(
+            !app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await,
+            "a suspended installation is not active coverage"
+        );
+        assert_eq!(stub.calls(), 3, "every unusable answer was looked up again");
+
+        stub.set(200, covering_installation());
+        assert!(app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await);
+        assert_eq!(stub.calls(), 4);
+    }
+
+    /// Transport/status failures are unknowns: fail closed for the delivery but
+    /// never teach the cache a denial.
+    #[tokio::test]
+    async fn repository_coverage_transient_failures_are_not_cached() {
+        let stub = CoverageStub::start(500, json!({ "message": "outage" }), false).await;
+        let creds = GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
+
+        for status in [500u16, 429, 403] {
+            stub.set(status, json!({ "message": "not an answer" }));
+            assert!(
+                !app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await,
+                "{status} must fail closed"
+            );
+        }
+        assert_eq!(stub.calls(), 3);
+        stub.set(200, covering_installation());
+        assert!(
+            app_covers_repository_cached(&stub.api_base, &creds, "preloop/preloop").await,
+            "the next delivery retries rather than reusing the failure"
+        );
+        assert_eq!(stub.calls(), 4, "no failed lookup was cached");
+    }
+
+    /// Concurrent misses for one repository share one lookup; an unrelated
+    /// repository does not queue behind it, and the flight state is removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_misses_for_one_repository_share_a_lookup() {
+        let stub = CoverageStub::start(200, covering_installation(), true).await;
+        let creds = Arc::new(GitHubAppCredentials::for_tests(
+            "424",
+            test_key(),
+            MintFailurePolicy::LocalJwt,
+        ));
+        let base = stub.api_base.clone();
+
+        let first = tokio::spawn({
+            let creds = Arc::clone(&creds);
+            let base = base.clone();
+            async move { app_covers_repository_cached(&base, &creds, "owner/repo").await }
+        });
+        stub.wait_entered().await;
+        let second = tokio::spawn({
+            let creds = Arc::clone(&creds);
+            let base = base.clone();
+            async move { app_covers_repository_cached(&base, &creds, "owner/repo").await }
+        });
+        wait_until(|| {
+            creds
+                .repository_coverage
+                .state
+                .lock()
+                .flights
+                .get("owner/repo")
+                .is_some_and(|flight| flight.answer.receiver_count() > 0)
+        })
+        .await;
+
+        let other = tokio::spawn({
+            let creds = Arc::clone(&creds);
+            let base = base.clone();
+            async move { app_covers_repository_cached(&base, &creds, "owner/other").await }
+        });
+        assert!(
+            other.await.unwrap(),
+            "an independent repository must not serialize behind the blocked lookup"
+        );
+        assert_eq!(stub.calls(), 2, "the independent key made its own lookup");
+
+        stub.release();
+        assert!(first.await.unwrap());
+        assert!(second.await.unwrap());
+        assert_eq!(
+            stub.calls(),
+            2,
+            "the same-key waiter shared the leader's lookup"
+        );
+        assert!(
+            creds.repository_coverage.state.lock().flights.is_empty(),
+            "finished flights leave no per-key synchronization state"
+        );
+    }
+
+    /// An invalidation fences the lookup and every waiter that began before it:
+    /// neither may authorize a delivery, and no positive may be stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invalidation_fences_in_flight_lookups_and_waiters() {
+        let stub = CoverageStub::start(200, covering_installation(), true).await;
+        let creds = Arc::new(GitHubAppCredentials::for_tests(
+            "424",
+            test_key(),
+            MintFailurePolicy::LocalJwt,
+        ));
+        let base = stub.api_base.clone();
+
+        let leader = tokio::spawn({
+            let creds = Arc::clone(&creds);
+            let base = base.clone();
+            async move { app_covers_repository_cached(&base, &creds, "owner/repo").await }
+        });
+        stub.wait_entered().await;
+        let waiter = tokio::spawn({
+            let creds = Arc::clone(&creds);
+            let base = base.clone();
+            async move { app_covers_repository_cached(&base, &creds, "owner/repo").await }
+        });
+        wait_until(|| {
+            creds
+                .repository_coverage
+                .state
+                .lock()
+                .flights
+                .get("owner/repo")
+                .is_some_and(|flight| flight.answer.receiver_count() > 0)
+        })
+        .await;
+
+        creds.repository_coverage.invalidate("owner/repo");
+        stub.release();
+        assert!(
+            !leader.await.unwrap(),
+            "a lookup begun before invalidation must not authorize its delivery"
+        );
+        assert!(
+            !waiter.await.unwrap(),
+            "a delivery waiting on that lookup must not be authorized after invalidation"
+        );
+        assert!(
+            creds.repository_coverage.state.lock().positives.is_empty(),
+            "the fenced lookup must not repopulate the cache"
+        );
+
+        stub.set(200, covering_installation());
+        assert!(
+            app_covers_repository_cached(&stub.api_base, &creds, "owner/repo").await,
+            "a fresh lookup after invalidation can confirm current coverage"
+        );
+        assert_eq!(stub.calls(), 2);
+    }
+
+    /// A slow pre-invalidation lookup cannot overwrite the newer state
+    /// confirmed after invalidation (here: a definitive 404).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_lookup_cannot_overwrite_newer_state() {
+        let stub = CoverageStub::start(200, covering_installation(), true).await;
+        let creds = Arc::new(GitHubAppCredentials::for_tests(
+            "424",
+            test_key(),
+            MintFailurePolicy::LocalJwt,
+        ));
+        let base = stub.api_base.clone();
+
+        let stale = tokio::spawn({
+            let creds = Arc::clone(&creds);
+            let base = base.clone();
+            async move { app_covers_repository_cached(&base, &creds, "owner/repo").await }
+        });
+        stub.wait_entered().await;
+
+        creds.repository_coverage.invalidate("owner/repo");
+        stub.set(404, json!({ "message": "Not Found" }));
+        assert!(
+            !app_covers_repository_cached(&stub.api_base, &creds, "owner/repo").await,
+            "the post-invalidation lookup observes the 404"
+        );
+        stub.release();
+        assert!(
+            !stale.await.unwrap(),
+            "the pre-invalidation lookup is denied"
+        );
+
+        stub.set(200, covering_installation());
+        assert!(app_covers_repository_cached(&stub.api_base, &creds, "owner/repo").await);
+        assert_eq!(
+            stub.calls(),
+            3,
+            "the stale 200 must not have been inserted after the newer 404"
+        );
+    }
+
+    #[test]
+    fn lifecycle_invalidation_targets_named_repositories_and_clears_on_installation_events() {
+        let creds = GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
+        {
+            let mut state = creds.repository_coverage.state.lock();
+            state
+                .positives
+                .insert("owner/kept".to_owned(), Instant::now());
+            state
+                .positives
+                .insert("owner/removed".to_owned(), Instant::now());
+        }
+        let removed = json!({
+            "action": "removed",
+            "repositories_removed": [{ "full_name": "owner/removed" }],
+        });
+        assert!(invalidate_repository_coverage(
+            &creds,
+            "installation_repositories",
+            removed.to_string().as_bytes(),
+        ));
+        {
+            let state = creds.repository_coverage.state.lock();
+            assert!(state.positives.contains_key("owner/kept"));
+            assert!(!state.positives.contains_key("owner/removed"));
+        }
+
+        // A lifecycle shape without a repository list is still authenticated;
+        // it clears every answer rather than guessing which repository moved.
+        assert!(invalidate_repository_coverage(
+            &creds,
+            "installation_repositories",
+            br#"{"action":"removed"}"#,
+        ));
+        assert!(creds.repository_coverage.state.lock().positives.is_empty());
+
+        creds
+            .repository_coverage
+            .state
+            .lock()
+            .positives
+            .insert("owner/repo".to_owned(), Instant::now());
+        assert!(invalidate_repository_coverage(
+            &creds,
+            "installation",
+            br#"{"action":"deleted"}"#,
+        ));
+        assert!(creds.repository_coverage.state.lock().positives.is_empty());
+
+        // Ordinary events must not clear anything.
+        creds
+            .repository_coverage
+            .state
+            .lock()
+            .positives
+            .insert("owner/repo".to_owned(), Instant::now());
+        assert!(!invalidate_repository_coverage(
+            &creds,
+            "push",
+            br#"{"repository":{"full_name":"owner/repo"}}"#,
+        ));
+        assert!(
+            creds
+                .repository_coverage
+                .state
+                .lock()
+                .positives
+                .contains_key("owner/repo")
+        );
+    }
+
+    #[test]
+    fn capacity_discards_expired_entries_then_evicts_only_the_oldest() {
+        let cache = RepositoryCoverageCache::new(2);
+        let now = Instant::now();
+        let expired = now
+            .checked_sub(cache.positive_ttl + Duration::from_secs(1))
+            .expect("monotonic clock is older than the fallback TTL");
+        let mut state = cache.state.lock();
+        state.positives.insert("expired/repo".to_owned(), expired);
+        state.positives.insert("kept/repo".to_owned(), now);
+
+        cache.record_positive(&mut state, "new/repo");
+        assert!(
+            !state.positives.contains_key("expired/repo"),
+            "expired entries are discarded before eviction"
+        );
+        assert!(state.positives.contains_key("kept/repo"));
+        assert!(state.positives.contains_key("new/repo"));
+        assert_eq!(state.positives.len(), 2);
+
+        cache.record_positive(&mut state, "newer/repo");
+        assert_eq!(
+            state.positives.len(),
+            2,
+            "the map stays at capacity instead of being cleared"
+        );
+        assert!(
+            state.positives.contains_key("new/repo"),
+            "an unrelated recent entry survives the eviction"
+        );
+        assert!(state.positives.contains_key("newer/repo"));
+        assert!(
+            !state.positives.contains_key("kept/repo"),
+            "only the oldest checked entry is evicted"
+        );
+    }
+
+    /// A webhook delivery's verified signer is the only App downstream
+    /// selection may choose, even when another App sorts first and also covers
+    /// the owner. Outside a delivery task, selection is unchanged.
+    #[tokio::test]
+    async fn verified_signer_pins_app_selection() {
+        let owner = "owner";
+        let first = GitHubAppCredentials::for_tests("424", test_key(), MintFailurePolicy::LocalJwt);
+        first
+            .installation_cache
+            .write()
+            .await
+            .insert(owner.to_owned(), 1);
+        let second =
+            GitHubAppCredentials::for_tests("525", test_key(), MintFailurePolicy::LocalJwt);
+        second
+            .installation_cache
+            .write()
+            .await
+            .insert(owner.to_owned(), 2);
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().join("state"))
+            .await
+            .unwrap();
+        state.github_apps = Some(GitHubApps {
+            apps: vec![first, second],
+            default_index: 0,
+        });
+        let shared = Arc::new(crate::state::SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+
+        assert_eq!(
+            select_app_for_repo(&shared, "owner/repo")
+                .await
+                .expect("the first covering App")
+                .app_id,
+            "424",
+            "without delivery context, registry order selects"
+        );
+        let pinned = VERIFIED_WEBHOOK_APP
+            .scope("525".to_owned(), select_app_for_repo(&shared, "owner/repo"))
+            .await
+            .expect("the verified signer covers the owner");
+        assert_eq!(
+            pinned.app_id, "525",
+            "the delivery's signer must win over registry order"
+        );
+        assert!(
+            VERIFIED_WEBHOOK_APP
+                .scope("999".to_owned(), select_app_for_repo(&shared, "owner/repo"),)
+                .await
+                .is_none(),
+            "a signer that no longer covers the owner fails closed"
+        );
+        assert_eq!(
+            select_app_for_repo(&shared, "owner/repo")
+                .await
+                .expect("selection after the scope")
+                .app_id,
+            "424",
+            "the task-local must not leak out of the delivery scope"
         );
     }
 }

@@ -11,17 +11,17 @@ Use the right template. Each one collects exactly the evidence a maintainer need
 | **Bug report** | Something misbehaves, or preloop diverges from the official runner | [`.github/ISSUE_TEMPLATE/bug_report.yml`](.github/ISSUE_TEMPLATE/bug_report.yml) |
 | **Feature request** | Something preloop should do that it doesn't yet | [`.github/ISSUE_TEMPLATE/feature_request.yml`](.github/ISSUE_TEMPLATE/feature_request.yml) |
 
-**For divergence bugs, the fastest path to a fix is a reproduction showing what the official runner does.** preloop's compatibility target is `actions/runner` v2.336.0 (pinned in `versions.toml`). Two ways to record it:
+**For divergence bugs, the fastest path to a fix is a reproduction showing what the official runner does.** preloop's compatibility target is `actions/runner` v2.337.0 (pinned in `versions.toml`). Two ways to record it:
 
 - **Easy:** run the same workflow on GitHub (or with the official runner binary) and paste `gh run view --log <run-id>` — job/step names, order, and conclusions.
 - **Wire-accurate (protocol issues):** the repo ships `runner-watch`, which records the official runner's exact request/response exchange and replays it against preloop:
 
   ```sh
   runner-watch record-golden --runner /path/to/actions-runner --scenario <name>
-  runner-watch conform --runner 2.336.0 --preloop-url http://127.0.0.1:9090
+  runner-watch conform --runner 2.337.0 --preloop-url http://127.0.0.1:9090
   ```
 
-  Attach the generated `.runner-watch/golden/v2.336.0/<scenario>/flows.jsonl` and the `conform` output.
+  Attach the generated `.runner-watch/golden/v2.337.0/<scenario>/flows.jsonl` and the `conform` output.
 
 ## Before you open a PR
 
@@ -81,10 +81,13 @@ workflow warning when the tap token is missing.
 `dist-workspace.toml` is the source of truth for what gets built and
 `cargo-dist-version` pins the dist that runs in CI, but `release.yml` is
 hand-maintained (`allow-dirty = ["ci"]`) and carries the publish jobs — change
-both together. The `preloop` name on crates.io is reserved by a documentation-only
-crate under `packaging/crates-io/preloop/`; no workflow publishes it, so it is
-released by hand (`cargo publish` from that directory, which needs a crates.io
-token with `publish-new` and a verified account email).
+both together. The `preloop` name on crates.io is held by a documentation-only
+crate under `packaging/crates-io/preloop/`. Its first version is released by hand
+(a crates.io token scoped to that crate name, with a verified account email);
+after that `publish-crates-io` publishes it on every stable tag through a trusted
+publisher, so no crates.io token is stored here. The job skips with a workflow
+warning until that first publish has happened — `packaging/crates-io/README.md`
+has the steps.
 
 ## Project structure
 

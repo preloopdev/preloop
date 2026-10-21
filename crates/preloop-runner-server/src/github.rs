@@ -3397,33 +3397,49 @@ pub async fn handle_github_webhook(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    // Bind the claimed repository to the signer's installation
-    // coverage BEFORE any event processing (adapters and check_run
-    // rerequests alike). The signature only proves *some* registered
-    // credential sent the payload — without binding, a payload signed by
-    // App B's secret could claim App A's repository and trigger runs
-    // there under App A's credentials. Coverage is verified at exact
-    // repository granularity: an owner-granularity check would pass a
-    // selected-repository installation for a sibling repo under the same
-    // owner that the installation does not cover.
-    if let crate::github_app::WebhookSigner::App(app_id) = &signer
-        && let Some(claimed) = claimed_repository(&body)
-    {
+    let event_name = headers
+        .get("x-github-event")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Bind the claimed repository to the signer's installation coverage
+    // BEFORE any event processing (adapters and check_run rerequests alike).
+    // The signature only proves *some* registered credential sent the payload
+    // — without binding, a payload signed by App B's secret could claim App
+    // A's repository and trigger runs there under App A's credentials.
+    // Coverage is verified at exact repository granularity: an
+    // owner-granularity check would pass a selected-repository installation
+    // for a sibling repo under the same owner that the installation does not
+    // cover.
+    //
+    // Installation lifecycle events are handled before that gate: a removal
+    // or uninstall can already make the lookup fail, so the verifier's App
+    // first invalidates its own cached answers (derived from the verified
+    // signer, never from payload app ids). The event then skips the ordinary
+    // gate — it only invalidates cache state and never grants access.
+    if let crate::github_app::WebhookSigner::App(app_id) = &signer {
         // Resolve the App's credentials here rather than in the signer:
         // the signer carries only the id, so a delivery never clones App
         // key material.
-        let covers = match shared
+        let app = shared
             .state
             .github_apps
             .as_ref()
-            .and_then(|apps| apps.app_by_id(app_id))
-        {
-            Some(app) => crate::github_app::app_covers_repository(app, &claimed).await,
-            // The payload's secret matched a registered App's secret, so
-            // its id must resolve. Fail closed rather than skip binding.
-            None => false,
+            .and_then(|apps| apps.app_by_id(app_id));
+        let Some(app) = app else {
+            // The payload's secret matched a registered App's secret, so its
+            // id must resolve. Fail closed rather than skip binding.
+            return Err(StatusCode::FORBIDDEN);
         };
-        if !covers {
+        if crate::github_app::invalidate_repository_coverage(app, event_name, &body) {
+            info!(
+                app_id = %app_id,
+                event = event_name,
+                "installation lifecycle event invalidated cached repository coverage"
+            );
+        } else if let Some(claimed) = claimed_repository(&body)
+            && !crate::github_app::app_covers_repository(app, &claimed).await
+        {
             warn!(
                 app_id = %app_id,
                 repository = %claimed,
@@ -3435,11 +3451,6 @@ pub async fn handle_github_webhook(
     // `WebhookSigner::Legacy`: the single shared secret is the only trust
     // anchor — with no registry there is no cross-App confusion to bind
     // against.
-
-    let event_name = headers
-        .get("x-github-event")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(StatusCode::BAD_REQUEST)?;
 
     let delivery_id = headers
         .get("x-github-delivery")
@@ -3456,6 +3467,13 @@ pub async fn handle_github_webhook(
         attempts: 0,
         lease_until_us: None,
         lease_token: None,
+        // Persist the verified signer: durable processing pins credential
+        // selection to the App that sent the delivery, not whichever App the
+        // registry happens to return first.
+        signer_app_id: match &signer {
+            crate::github_app::WebhookSigner::App(app_id) => Some(app_id.clone()),
+            crate::github_app::WebhookSigner::Legacy => None,
+        },
         last_error: None,
     };
 
@@ -4152,6 +4170,21 @@ async fn webhook_delivery_bucket(
 
 /// Process one claimed delivery and update its state according to the failure taxonomy.
 pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookDeliveryRecord) {
+    // Pin every credential selection in this delivery's task to the App whose
+    // webhook secret verified it. Rows from the legacy shared secret (and rows
+    // written before signer ids were persisted) keep the existing selection.
+    let Some(app_id) = delivery.signer_app_id.as_deref() else {
+        return process_one_delivery_inner(shared, delivery).await;
+    };
+    crate::github_app::VERIFIED_WEBHOOK_APP
+        .scope(
+            app_id.to_owned(),
+            process_one_delivery_inner(shared, delivery),
+        )
+        .await
+}
+
+async fn process_one_delivery_inner(shared: &Arc<SharedState>, delivery: &WebhookDeliveryRecord) {
     let Some(lease_token) = delivery.lease_token.as_deref() else {
         error!(
             delivery_id = %delivery.delivery_id,
@@ -4181,12 +4214,31 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
     let processing_delivery = delivery.clone();
     let processing_lease_lost = lease_lost.clone();
     let mut processing = tokio::spawn(async move {
-        process_delivery_payload_with_lease(
-            &processing_shared,
-            &processing_delivery,
-            &processing_lease_lost,
-        )
-        .await
+        // `tokio::spawn` does not inherit task-locals; re-scope the signer for
+        // the processing task so its GitHub calls use the verified App too.
+        let signer = processing_delivery.signer_app_id.clone();
+        match signer {
+            Some(app_id) => {
+                crate::github_app::VERIFIED_WEBHOOK_APP
+                    .scope(
+                        app_id,
+                        process_delivery_payload_with_lease(
+                            &processing_shared,
+                            &processing_delivery,
+                            &processing_lease_lost,
+                        ),
+                    )
+                    .await
+            }
+            None => {
+                process_delivery_payload_with_lease(
+                    &processing_shared,
+                    &processing_delivery,
+                    &processing_lease_lost,
+                )
+                .await
+            }
+        }
     });
     let outcome = tokio::select! {
         _ = lease_lost.cancelled() => {
@@ -6313,7 +6365,13 @@ mod tests {
             Self::with_workspace(temp, ws_dir).await
         }
 
+        /// Build the fixture's engine.
+        ///
+        /// Completes the process-wide outbound client first, so its one-time
+        /// TLS root build cannot land inside a poll budget one of these tests
+        /// asserts on (same reasoning as [`poll_only_shared`]).
         async fn with_workspace(temp: &tempfile::TempDir, ws_dir: std::path::PathBuf) -> Self {
+            std::sync::LazyLock::force(&crate::shared_http::CLIENT);
             let event_sha = if ws_dir.join(".github/workflows").is_dir() {
                 commit_workspace(&ws_dir)
             } else {
@@ -7874,7 +7932,20 @@ mod tests {
 
     /// Engine state for driving [`poll_fresh_merge`] directly: a poll schedule
     /// and the environment's stubbed API, with no repository or merge needed.
+    ///
+    /// Also builds the process-wide outbound client before any caller starts a
+    /// poll budget. [`crate::shared_http::CLIENT`] is a `LazyLock` whose first
+    /// use pays for the TLS root set — the bundled Mozilla anchors, the OS
+    /// certificate store ([`crate::shared_http::tls_roots`] reads it through a
+    /// daemon with a deadline of its own), and any `PRELOOP_GITHUB_CA_FILE` /
+    /// `SSL_CERT_FILE` bundle. On a host with a slow trust store the *first*
+    /// probe spends the budget inside that build, no second poll happens, and
+    /// "the probe is retried within the budget" fails on the certificate store
+    /// instead of on the poll schedule. Warming here is test-only and keeps
+    /// every assertion in this family measuring the schedule the poll code is
+    /// written to honour; the engine's own client build is untouched.
     async fn poll_only_shared(temp: &tempfile::TempDir, budget: Duration) -> Arc<SharedState> {
+        std::sync::LazyLock::force(&crate::shared_http::CLIENT);
         let mut state = AppState::new(temp.path().join("state")).await.unwrap();
         state.fresh_merge_poll = FreshMergePoll {
             budget,
@@ -8496,6 +8567,7 @@ mod tests {
                 attempts: WEBHOOK_MAX_ATTEMPTS,
                 lease_until_us: None,
                 lease_token: None,
+                signer_app_id: None,
                 last_error: None,
             })
             .await
@@ -8775,6 +8847,7 @@ mod tests {
                 attempts: 0,
                 lease_until_us: None,
                 lease_token: None,
+                signer_app_id: None,
                 last_error: None,
             };
             async move { webhook_delivery_bucket(&shared, &delivery).await }
@@ -9110,6 +9183,7 @@ jobs:
             attempts: 1,
             lease_until_us: Some(crate::store::now_us() + 60_000_000),
             lease_token: Some("test-lease".to_owned()),
+            signer_app_id: None,
             last_error: None,
         };
 
@@ -9219,6 +9293,7 @@ jobs:
             attempts: 1,
             lease_until_us: Some(crate::store::now_us() - 1_000_000), // expired lease
             lease_token: Some("expired-token".to_owned()),
+            signer_app_id: None,
             last_error: None,
         };
         fixture
@@ -9330,6 +9405,7 @@ jobs:
             attempts: 0,
             lease_until_us: None,
             lease_token: None,
+            signer_app_id: None,
             last_error: None,
         };
         assert!(
@@ -9417,6 +9493,7 @@ jobs:
             attempts: 0,
             lease_until_us: None,
             lease_token: None,
+            signer_app_id: None,
             last_error: None,
         };
         let valid = WebhookDeliveryRecord {
@@ -9505,6 +9582,7 @@ jobs:
             attempts: 0,
             lease_until_us: None,
             lease_token: None,
+            signer_app_id: None,
             last_error: None,
         };
         fixture
@@ -9573,6 +9651,7 @@ jobs:
             attempts: 0,
             lease_until_us: None,
             lease_token: None,
+            signer_app_id: None,
             last_error: None,
         };
         fixture
@@ -9654,6 +9733,7 @@ jobs:
                     attempts: 1,
                     lease_until_us: None,
                     lease_token: None,
+                    signer_app_id: None,
                     last_error: None,
                 })
                 .await

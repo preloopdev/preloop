@@ -2597,6 +2597,13 @@ fn parse_tailscale_json(stdout: &str) -> Option<Value> {
 /// status` talks to a daemon, and an unresponsive one must not hang the
 /// wizard. `None` when the program cannot be run, exits non-zero, or does not
 /// finish in time — all of which read as "no answer".
+///
+/// `timeout` bounds the whole call, not just the wait on the child. A kill
+/// reaches the direct child alone, so the write end of its stdout can outlive
+/// it in *its* children — some hosts' `/bin/sh` forks the command it was given
+/// rather than replacing itself with it — and a query that read until that
+/// pipe closed would then wait out whatever the child left behind. Past the
+/// deadline the answer is abandoned rather than awaited.
 fn bounded_stdout(command: &mut std::process::Command, timeout: Duration) -> Option<String> {
     use std::process::Stdio;
     command
@@ -2607,12 +2614,15 @@ fn bounded_stdout(command: &mut std::process::Command, timeout: Duration) -> Opt
     let mut stdout = child.stdout.take()?;
     // Drained on its own thread: a chatty answer fills the pipe buffer while
     // this thread watches the clock, and a full buffer would otherwise block
-    // the child until the deadline killed it.
-    let reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
+    // the child until the deadline killed it. The answer comes back over a
+    // channel, never a join: the drain returns only once the pipe reaches EOF,
+    // which is exactly what the deadline is not allowed to wait for.
+    let (sender, answer) = std::sync::mpsc::channel();
+    let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain_abandoned = std::sync::Arc::clone(&abandoned);
+    std::thread::spawn(move || {
+        let bytes = drain_bounded_answer(&mut stdout, &drain_abandoned, TAILSCALE_ANSWER_LIMIT);
+        let _ = sender.send(bytes);
     });
     let deadline = std::time::Instant::now() + timeout;
     let mut succeeded = false;
@@ -2631,11 +2641,61 @@ fn bounded_stdout(command: &mut std::process::Command, timeout: Duration) -> Opt
     }
     if !succeeded {
         let _ = child.kill();
-        // Reaped either way, so the reader thread sees EOF.
+        // Reaped, so a killed child does not linger as a zombie. Children of
+        // its own are not ours to reap; the read below simply does not wait on
+        // them.
         let _ = child.wait();
     }
-    let bytes = reader.join().ok()?;
+    // Whatever the child left of the deadline, and no more: one that answered
+    // closed its own stdout and sends at once, and one that did not has
+    // nothing worth waiting for. The drain is told to stop here either way, so
+    // a chatty descendant is not read past this call; one that has stopped
+    // talking but holds the pipe keeps only its fixed read buffer, never the
+    // answer growing behind it.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let answer = answer.recv_timeout(remaining);
+    abandoned.store(true, std::sync::atomic::Ordering::Relaxed);
+    let bytes = answer.ok()?;
     succeeded.then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Largest `tailscale status` answer kept, in bytes. The JSON runs to
+/// kilobytes on even a large tailnet, so a longer answer is already one the
+/// caller cannot use — and the cap is what keeps a wrapper's chatty descendant
+/// from growing this buffer without bound after the wizard has moved on.
+const TAILSCALE_ANSWER_LIMIT: usize = 4 << 20;
+
+/// Drain `reader` until it ends, the query is abandoned, or the answer reaches
+/// `limit` bytes — then hand back what was kept.
+///
+/// Chunked rather than `read_to_end` for two reasons: the loop checks
+/// `abandoned` between reads, so a chatty writer is not read past the call
+/// that abandoned it, and the answer cannot grow past `limit` however much a
+/// survivor writes. Past the limit the pipe is still drained, so a writer that
+/// is still producing is not left blocked on a full buffer. A read already
+/// blocked in the kernel when a descendant goes quiet returns when that pipe
+/// closes; until then it holds only the fixed `chunk` buffer above, never the
+/// answer.
+fn drain_bounded_answer(
+    reader: &mut impl std::io::Read,
+    abandoned: &std::sync::atomic::AtomicBool,
+    limit: usize,
+) -> Vec<u8> {
+    use std::sync::atomic::Ordering;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while !abandoned.load(Ordering::Relaxed) {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if bytes.len() < limit {
+                    let room = limit - bytes.len();
+                    bytes.extend_from_slice(&chunk[..read.min(room)]);
+                }
+            }
+        }
+    }
+    bytes
 }
 
 /// `tailscale status --json`'s name for this machine as a URL
@@ -4150,6 +4210,50 @@ mod tests {
         );
     }
 
+    /// A descendant that keeps writing must not keep this thread reading:
+    /// abandonment is checked between reads, so the drain ends at the first
+    /// boundary after the deadline or the answer's end, whichever comes first.
+    #[test]
+    fn an_abandoned_drain_stops_at_the_next_read() {
+        use std::io::Read;
+        use std::sync::atomic::Ordering;
+        struct Chatty<'a> {
+            abandoned: &'a std::sync::atomic::AtomicBool,
+            reads: usize,
+        }
+        impl Read for Chatty<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 2 {
+                    self.abandoned.store(true, Ordering::Relaxed);
+                }
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+        let abandoned = std::sync::atomic::AtomicBool::new(false);
+        let mut source = Chatty {
+            abandoned: &abandoned,
+            reads: 0,
+        };
+        // The read that flips the flag still counts; the one after it does not
+        // happen, however much the writer has left to say.
+        assert_eq!(drain_bounded_answer(&mut source, &abandoned, 4096).len(), 2);
+    }
+
+    /// The answer is capped, however much a survivor writes down the pipe: an
+    /// unbounded read is what a chatty descendant would grow without end.
+    #[test]
+    fn a_drain_keeps_no_more_than_its_limit() {
+        let limit = 4096;
+        let abandoned = std::sync::atomic::AtomicBool::new(false);
+        let mut source = std::io::Cursor::new(vec![b'x'; limit * 3]);
+        assert_eq!(
+            drain_bounded_answer(&mut source, &abandoned, limit).len(),
+            limit
+        );
+    }
+
     /// A bounded query still returns a healthy answer, and a program that
     /// cannot answer is `None` rather than a wizard failure.
     #[test]
@@ -4243,7 +4347,10 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("docs/control-plane/operate/deploy.mdx"), "{text}");
+        assert!(
+            text.contains("docs/control-plane/operate/deploy.mdx"),
+            "{text}"
+        );
         assert!(text.contains("builder.tail1234.ts.net"), "{text}");
         assert!(text.to_lowercase().contains("cloudflare"), "{text}");
         // F7: the path mount does not keep the other mounts private.

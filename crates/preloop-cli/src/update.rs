@@ -341,16 +341,37 @@ async fn update_linux_runner_bundle(client: &Client, release: &Release) -> anyho
 /// Tests point these at tempdirs.
 #[derive(Debug, Clone)]
 struct SmolvmInstall {
-    /// `~/.smolvm`: the wrapper, binary, `lib/`, and disk templates.
+    /// `~/.smolvm`: the wrapper, binary, `lib/`, and disk templates. The
+    /// archive installer always writes here.
     prefix: PathBuf,
+    /// Directory of the `smolvm` that `PATH` resolves (symlinks followed).
+    /// Its `agent-rootfs` is the tree the engine prefers, so refreshes repair
+    /// this sibling; it is never an install destination.
+    resolved_prefix: PathBuf,
     /// macOS: `~/Library/Application Support/smolvm`; Linux:
-    /// `$XDG_DATA_HOME/smolvm` or `~/.local/share/smolvm`.
+    /// `$XDG_DATA_HOME/smolvm` or `~/.local/share/smolvm`. SmolVM's own
+    /// registry and `init.krun` live here.
     data_dir: PathBuf,
     /// `~/.local/bin`: where the `smolvm` symlink lives.
     bin_dir: PathBuf,
+    /// Where the *engine* exports the guest agent from: the effective Preloop
+    /// home's `smolvm` (`SMOLVM_DATA_DIR` when the operator set one). SmolVM's
+    /// own data directory is not it — the engine isolates the child's HOME and
+    /// hands it an explicit `SMOLVM_AGENT_ROOTFS`, so this is the copy
+    /// `preloop update --ensure-runtime` has to refresh.
+    agent_dir: PathBuf,
 }
 
-fn default_smolvm_install() -> Option<SmolvmInstall> {
+/// The smolvm installation this host actually runs.
+///
+/// `PATH` decides which binary the engine launches, and the engine exports the
+/// rootfs that ships next to *that* binary, so the prefix is resolved the same
+/// way (following symlinks, since the official `~/.local/bin/smolvm` is a shim
+/// into `~/.smolvm`). A binary installed in another prefix — a system or
+/// package-manager install — would otherwise be tested against one
+/// installation while the updater rewrote another, leaving the sibling the
+/// engine boots from untouched.
+fn resolved_smolvm_install() -> Option<SmolvmInstall> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
     #[cfg(target_os = "macos")]
     let data_dir = home
@@ -362,11 +383,31 @@ fn default_smolvm_install() -> Option<SmolvmInstall> {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local").join("share"))
         .join("smolvm");
+    // The managed prefix is fixed: the archive installer owns its layout, and
+    // a system or package-manager binary must not turn `/usr/local/bin` into a
+    // second `lib/` tree. The PATH-resolved prefix is tracked separately so a
+    // rootfs refresh repairs the sibling the engine actually boots from.
+    let prefix = home.join(".smolvm");
+    let resolved_prefix = preloop_vm::agent_rootfs::resolve_binary(Path::new("smolvm"))
+        .and_then(|binary| binary.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| prefix.clone());
+    let runtime = preloop_vm::agent_rootfs::Runtime::from_env();
     Some(SmolvmInstall {
-        prefix: home.join(".smolvm"),
+        prefix,
+        resolved_prefix,
+        agent_dir: engine_agent_dir(&runtime, &data_dir),
         data_dir,
         bin_dir: home.join(".local").join("bin"),
     })
+}
+
+/// The directory the engine exports the guest agent from, by the engine's own
+/// rule (`SMOLVM_DATA_DIR`, else the effective Preloop home's `smolvm`).
+fn engine_agent_dir(runtime: &preloop_vm::agent_rootfs::Runtime, fallback: &Path) -> PathBuf {
+    runtime
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| fallback.to_path_buf())
 }
 
 /// Host triple naming used by the smolvm release assets.
@@ -449,14 +490,22 @@ fn configured_smolvm_version() -> Option<String> {
 
 /// Probe the resolved smolvm and install the latest stable release when its
 /// version is below the minimum or it lacks the required socket capability.
+///
+/// A *compatible* binary is not the end of the story: the guest agent it boots
+/// lives in a separate rootfs (see `ensure_agent_rootfs`), and smolvm refuses
+/// to stop a guest whose agent predates the host's shutdown handshake. So the
+/// agent is checked against the installed binary on every update, not only
+/// when the binary itself is (re)installed.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
-    let install = default_smolvm_install().context("HOME is not set")?;
+    let install = resolved_smolvm_install().context("HOME is not set")?;
     // Clear stale templates from older layouts even when the compatible runtime
     // is already installed: a compatible binary skips the install below, so
     // this is the only chance to drop leftover variants that would otherwise
     // keep being selected by SmolVM.
     remove_stale_smolvm_templates(&install.prefix)?;
     if smolvm_is_compatible(Path::new("smolvm")).await {
+        let host_version = probe_smolvm_version(Path::new("smolvm")).await;
+        ensure_agent_rootfs(client, &install, host_version.as_deref()).await?;
         return Ok(());
     }
     let platform = smolvm_platform().ok_or_else(|| {
@@ -511,6 +560,243 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
             install.prefix.display(),
             install.bin_dir.display()
         );
+    }
+    Ok(())
+}
+
+/// Whether `rootfs` holds the guest agent the smolvm reporting `host_version`
+/// needs.
+///
+/// The same two conditions the engine's guard applies before it exports a
+/// tree: the agent binary is readable and is the host's — by the version
+/// recorded beside the tree *and* by the version baked into the binary, so a
+/// restored or hand-copied tree cannot pass on its stamp alone — and it carries
+/// the shutdown handshake whenever the host is new enough to require one.
+fn agent_rootfs_serves(rootfs: &Path, host_version: &str) -> bool {
+    let inspected = preloop_vm::agent_rootfs::AgentRootfs::inspect(rootfs);
+    if !inspected.agent_present() || inspected.version() != Some(host_version) {
+        return false;
+    }
+    // A binary whose banner cannot be read is not evidence either way.
+    if inspected
+        .binary_version()
+        .is_some_and(|banner| banner != host_version)
+    {
+        return false;
+    }
+    !host_requires_quiesced_shutdown(host_version) || inspected.supports_quiesced_shutdown()
+}
+
+/// Whether two rootfs trees hold the same agent bytes.
+fn agent_bytes_match(left: &Path, right: &Path) -> bool {
+    let left = preloop_vm::agent_rootfs::AgentRootfs::inspect(left);
+    let right = preloop_vm::agent_rootfs::AgentRootfs::inspect(right);
+    left.digest().is_some() && left.digest() == right.digest()
+}
+
+/// Whether a host reporting `host_version` refuses to stop a guest whose agent
+/// lacks the `quiesced-shutdown-v1` handshake (the engine's own rule).
+fn host_requires_quiesced_shutdown(host_version: &str) -> bool {
+    let (major, minor, patch) = preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST;
+    Version::parse(host_version)
+        .ok()
+        .is_some_and(|version| version >= Version::new(major, minor, patch))
+}
+
+/// Keep every guest-agent rootfs the engine can boot from in step with the
+/// installed smolvm binary.
+///
+/// The engine exports the rootfs that ships next to the resolved binary, or a
+/// data-dir copy whose agent is byte-identical to it — and an agent without the
+/// `quiesced-shutdown-v1` handshake makes every machine unstoppable on a smolvm
+/// new enough to require it ("running guest agent does not support safe
+/// shutdown; VM left unchanged; update the guest agent before retrying"). Both
+/// trees are therefore refreshed here, with a tree that already holds this
+/// host's agent as the source: repairing only the data-dir copy would report
+/// success while the stale sibling the engine prefers kept booting guests,
+/// which is the bug this mechanism exists to close.
+///
+/// When neither tree is the host's agent, the matching release is the only
+/// trustworthy source. A sibling whose version does *not* match is never copied
+/// into place — stamping it as the current release is exactly how a stale agent
+/// becomes permanent, because every later run would read the stamp and skip the
+/// refresh.
+async fn ensure_agent_rootfs(
+    client: &Client,
+    install: &SmolvmInstall,
+    host_version: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(host_version) = host_version else {
+        return Ok(());
+    };
+    let target = install.agent_dir.join("agent-rootfs");
+    // An operator pin outranks every tree below, so a refresh of those trees
+    // cannot change what the engine boots: say so instead of reporting a
+    // repair that leaves the pin in place.
+    if let Some(pinned) = preloop_vm::agent_rootfs::Runtime::from_env().explicit_rootfs
+        && !agent_rootfs_serves(&pinned, host_version)
+    {
+        bail!(
+            "SMOLVM_AGENT_ROOTFS pins {}, which does not hold the guest agent for smolvm \
+             {host_version}; the engine refuses to boot from it. Unset the variable to use the \
+             rootfs Preloop manages at {}, or put the agent from the smolvm {host_version} release \
+             there",
+            pinned.display(),
+            target.display(),
+        );
+    }
+    let shipped = install.resolved_prefix.join("agent-rootfs");
+    // smolvm's own data directory is a candidate too — the tree an install
+    // with no sibling rootfs boots from — so a stale copy there is a stale
+    // boot as well.
+    let platform = install.data_dir.join("agent-rootfs");
+    let shipped_serves = shipped.is_dir() && agent_rootfs_serves(&shipped, host_version);
+    // The data-dir copy only has to agree with the tree the engine prefers.
+    let target_serves = agent_rootfs_serves(&target, host_version)
+        && (!shipped_serves || agent_bytes_match(&target, &shipped));
+    let platform_serves = !platform.is_dir() || agent_rootfs_serves(&platform, host_version);
+    if target_serves && (!shipped.is_dir() || shipped_serves) && platform_serves {
+        return Ok(());
+    }
+    match refresh_source(&[&shipped, &target, &platform], host_version) {
+        // A tree that already holds this host's agent needs no download, and
+        // no verification beyond the version it reports.
+        Some(source) => {
+            install_agent_rootfs(&source, host_version, install)?;
+            println!(
+                "refreshed the smolvm {host_version} guest agent at {} from {}",
+                target.display(),
+                source.display()
+            );
+            Ok(())
+        }
+        None => match refresh_agent_rootfs_from_release(client, host_version, install).await {
+            Ok(()) => {
+                println!(
+                    "refreshed the smolvm {host_version} guest agent at {}",
+                    target.display()
+                );
+                Ok(())
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "the installed agent rootfs at {} is not the one for smolvm {host_version}; \
+                     refresh it with the matching release",
+                    target.display()
+                )
+            }),
+        },
+    }
+}
+
+/// The tree a refresh copies from: a rootfs that already holds this host's
+/// agent, so the repair needs no download and no unverified bytes.
+///
+/// Callers pass the candidates in preference order — the rootfs beside the
+/// binary (the one the engine exports), the engine's data-dir copy, then
+/// smolvm's own data directory. `None` means none of them is the host's agent:
+/// the matching release is then the only trustworthy source. Copying any of
+/// them anyway — and stamping it as the current release — is what would make a
+/// stale agent permanent, because every later run reads that stamp and skips
+/// the refresh.
+fn refresh_source(candidates: &[&PathBuf], host_version: &str) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|tree| tree.is_dir() && agent_rootfs_serves(tree, host_version))
+        .map(|tree| (*tree).clone())
+}
+
+/// Download the release that matches the installed smolvm binary and copy its
+/// guest agent into the data directory.
+async fn refresh_agent_rootfs_from_release(
+    client: &Client,
+    version: &str,
+    install: &SmolvmInstall,
+) -> anyhow::Result<()> {
+    let platform = smolvm_platform().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no smolvm release asset for {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let release = fetch_release(
+        client,
+        &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
+        Some(version),
+    )
+    .await?;
+    let archive_name = format!("smolvm-{version}-{platform}.tar.gz");
+    let archive_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == archive_name)
+        .with_context(|| format!("release {} has no {archive_name} asset", release.tag_name))?;
+    let checksum_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == "checksums.sha256");
+    let staging = tempfile::tempdir().context("create smolvm download directory")?;
+    let archive_path = staging.path().join(&archive_name);
+    download(client, &archive_asset.browser_download_url, &archive_path).await?;
+    verify_checksum(client, archive_asset, checksum_asset, &archive_path).await?;
+    let extracted = staging.path().join("extracted");
+    extract_tar_gz(&archive_path, &extracted)?;
+    // The archive carries a single top-level `smolvm-<version>-<platform>/`.
+    let top = fs::read_dir(&extracted)?
+        .next()
+        .context("smolvm archive is empty")?
+        .context("read smolvm archive entry")?
+        .path();
+    install_agent_rootfs(&top.join("agent-rootfs"), version, install)
+}
+
+/// Copy one agent rootfs over the trees the engine can boot from, record the
+/// release it came from beside the data-dir copy, and keep the rootfs that
+/// ships next to the binary in step.
+///
+/// The stamp (`<rootfs>/.preloop-agent-version`) is what lets the guard in
+/// `preloop_vm::agent_rootfs` tell a stale pinned rootfs from a matching one
+/// without hashing the agent binary on every engine start.
+fn install_agent_rootfs(
+    source: &Path,
+    version: &str,
+    install: &SmolvmInstall,
+) -> anyhow::Result<()> {
+    if !source.is_dir() {
+        bail!("smolvm agent rootfs source {} is missing", source.display());
+    }
+    fs::create_dir_all(&install.agent_dir)?;
+    let exported = install.agent_dir.join("agent-rootfs");
+    let mut destinations = vec![exported.clone()];
+    // The engine prefers a rootfs that ships next to the resolved binary, and
+    // smolvm's own data directory is a candidate when there is no sibling:
+    // every copy the resolver can select has to hold the same agent. Only trees
+    // that already exist are filled — laying one down is the smolvm
+    // installer's job, not ours.
+    for other in [
+        install.resolved_prefix.join("agent-rootfs"),
+        install.prefix.join("agent-rootfs"),
+        install.data_dir.join("agent-rootfs"),
+    ] {
+        if other != exported && other.is_dir() && !destinations.contains(&other) {
+            destinations.push(other);
+        }
+    }
+    for destination in destinations {
+        // The source may be one of the destinations — repairing the others
+        // from the copy the engine already trusts must not delete it.
+        if destination == source {
+            continue;
+        }
+        let _ = fs::remove_dir_all(&destination);
+        copy_dir_all(source, &destination)?;
+        if destination == exported {
+            fs::write(
+                destination.join(preloop_vm::agent_rootfs::VERSION_STAMP),
+                format!("{version}\n"),
+            )?;
+        }
     }
     Ok(())
 }
@@ -590,10 +876,7 @@ fn install_smolvm_from_archive(
 
     let agent_rootfs = top.join("agent-rootfs");
     if agent_rootfs.is_dir() {
-        fs::create_dir_all(&install.data_dir)?;
-        let target = install.data_dir.join("agent-rootfs");
-        let _ = fs::remove_dir_all(&target);
-        copy_dir_all(&agent_rootfs, &target)?;
+        install_agent_rootfs(&agent_rootfs, version, install)?;
     }
     #[cfg(target_os = "linux")]
     {
@@ -1709,8 +1992,10 @@ mod tests {
 
         let install = SmolvmInstall {
             prefix: directory.path().join("prefix"),
+            resolved_prefix: directory.path().join("path-bin"),
             data_dir: directory.path().join("data"),
             bin_dir: directory.path().join("bin"),
+            agent_dir: directory.path().join("data"),
         };
         std::fs::create_dir_all(&install.prefix).unwrap();
         std::fs::write(install.prefix.join("storage-template.ext4"), b"stale").unwrap();
@@ -1725,6 +2010,10 @@ mod tests {
             b"stale-compressed",
         )
         .unwrap();
+        // An older rootfs left beside the binary by a previous install (the
+        // official installer and hand-upgrades both lay one down there).
+        std::fs::create_dir_all(install.prefix.join("agent-rootfs")).unwrap();
+        std::fs::write(install.prefix.join("agent-rootfs/rootfs.txt"), b"stale").unwrap();
         if let Err(error) = install_smolvm_from_archive(&archive_path, "9.9.9", &install) {
             eprintln!("install error: {error:?}");
             panic!("install failed: {error}");
@@ -1753,6 +2042,22 @@ mod tests {
         assert_eq!(
             std::fs::read(install.data_dir.join("agent-rootfs/rootfs.txt")).unwrap(),
             b"rootfs"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                install
+                    .data_dir
+                    .join("agent-rootfs")
+                    .join(preloop_vm::agent_rootfs::VERSION_STAMP)
+            )
+            .unwrap(),
+            "9.9.9\n",
+            "the installed agent must record the release it came from"
+        );
+        assert_eq!(
+            std::fs::read(install.prefix.join("agent-rootfs/rootfs.txt")).unwrap(),
+            b"rootfs",
+            "a rootfs shipped next to the binary must be refreshed, not left stale"
         );
         #[cfg(unix)]
         {
@@ -1792,6 +2097,294 @@ mod tests {
             std::fs::read_link(install.bin_dir.join("smolvm")).unwrap(),
             install.prefix.join("smolvm")
         );
+        assert!(
+            !install.resolved_prefix.exists(),
+            "the archive install must never write into the PATH-resolved prefix"
+        );
+    }
+
+    /// Fixture for the agent-rootfs refresh tests: a data-dir rootfs holding
+    /// `agent`, an optional sibling rootfs in the prefix, and a stamp.
+    fn agent_rootfs_fixture(
+        directory: &tempfile::TempDir,
+        agent: &str,
+        stamp: Option<&str>,
+        sibling: Option<&str>,
+    ) -> (SmolvmInstall, std::path::PathBuf) {
+        let install = SmolvmInstall {
+            prefix: directory.path().join("prefix"),
+            resolved_prefix: directory.path().join("prefix"),
+            data_dir: directory.path().join("data"),
+            bin_dir: directory.path().join("bin"),
+            agent_dir: directory.path().join("data"),
+        };
+        let target = install.data_dir.join("agent-rootfs");
+        std::fs::create_dir_all(target.join("usr/local/bin")).unwrap();
+        std::fs::write(
+            target.join("usr/local/bin/smolvm-agent"),
+            agent_bytes(agent, true),
+        )
+        .unwrap();
+        if let Some(stamp) = stamp {
+            std::fs::write(
+                target.join(preloop_vm::agent_rootfs::VERSION_STAMP),
+                format!("{stamp}\n"),
+            )
+            .unwrap();
+        }
+        if let Some(sibling) = sibling {
+            let shipped = install.prefix.join("agent-rootfs");
+            std::fs::create_dir_all(shipped.join("usr/local/bin")).unwrap();
+            std::fs::write(
+                shipped.join("usr/local/bin/smolvm-agent"),
+                agent_bytes(sibling, true),
+            )
+            .unwrap();
+        }
+        (install, target)
+    }
+
+    /// The bytes of a guest agent that reports `version`: the boot banner, the
+    /// version, and — for a release new enough to carry it — the shutdown
+    /// handshake, which is how a real agent binary reads.
+    fn agent_bytes(version: &str, capability: bool) -> Vec<u8> {
+        let mut binary = Vec::from(&b"smolvm-agent started, deferred boot work in progress"[..]);
+        binary.extend_from_slice(version.as_bytes());
+        if capability {
+            binary.extend_from_slice(
+                preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_CAPABILITY.as_bytes(),
+            );
+        }
+        binary
+    }
+
+    /// Version recorded beside a rootfs: the stamp Preloop wrote, else the
+    /// version baked into the agent binary.
+    fn agent_rootfs_version(rootfs: &Path) -> Option<String> {
+        preloop_vm::agent_rootfs::AgentRootfs::inspect(rootfs)
+            .version()
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn the_agent_dir_follows_the_engines_own_rule() {
+        let pinned = preloop_vm::agent_rootfs::Runtime {
+            host_home: None,
+            data_dir: Some(PathBuf::from("/tmp/preloop-home/smolvm")),
+            explicit_rootfs: None,
+        };
+        assert_eq!(
+            engine_agent_dir(&pinned, Path::new("/tmp/platform/smolvm")),
+            PathBuf::from("/tmp/preloop-home/smolvm"),
+            "the engine exports the data dir it resolves, not smolvm's own"
+        );
+        let unset = preloop_vm::agent_rootfs::Runtime::default();
+        assert_eq!(
+            engine_agent_dir(&unset, Path::new("/tmp/platform/smolvm")),
+            PathBuf::from("/tmp/platform/smolvm"),
+            "with nothing set the platform layout is what is left"
+        );
+    }
+
+    #[test]
+    fn the_refresh_source_is_only_a_tree_that_holds_the_hosts_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root).unwrap();
+        let stale = agent_tree(root, "stale", "1.14.2", false);
+        let current = agent_tree(root, "current", "1.30.1", true);
+        let missing = root.join("missing");
+
+        assert_eq!(
+            refresh_source(&[&current, &stale], "1.30.1").as_deref(),
+            Some(current.as_path()),
+            "the rootfs beside the binary is the engine's own tree"
+        );
+        assert_eq!(
+            refresh_source(&[&missing, &current], "1.30.1").as_deref(),
+            Some(current.as_path()),
+            "a data-dir copy that is the host's agent repairs a missing sibling"
+        );
+        assert_eq!(
+            refresh_source(&[&stale, &current], "1.30.1").as_deref(),
+            Some(current.as_path()),
+            "a stale sibling is repaired from the copy that is the host's agent"
+        );
+        // Neither tree is the host's agent: only the release may be installed,
+        // because stamping either one as current would hide it from every
+        // later refresh.
+        assert_eq!(refresh_source(&[&stale, &stale], "1.30.1"), None);
+        assert_eq!(refresh_source(&[&missing, &missing], "1.30.1"), None);
+    }
+
+    #[test]
+    fn a_stale_stamp_does_not_hide_a_replaced_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        // A tree stamped 1.30.1 whose agent binary was replaced by the 1.14.2
+        // one: the recorded version is the host's, the bytes are not.
+        let restored = agent_tree(root, "restored", "1.14.2", false);
+        fs::write(
+            restored.join(preloop_vm::agent_rootfs::VERSION_STAMP),
+            "1.30.1\n",
+        )
+        .unwrap();
+
+        assert_eq!(agent_rootfs_version(&restored).as_deref(), Some("1.30.1"));
+        assert!(
+            !agent_rootfs_serves(&restored, "1.30.1"),
+            "the version baked into the binary is what the guest will report"
+        );
+    }
+
+    #[test]
+    fn the_shutdown_handshake_is_required_only_from_hosts_that_use_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        // A pre-1.16 agent: it carries no handshake, and such a host never
+        // performs one.
+        let old = agent_tree(root, "old", "1.15.1", false);
+        // A modern agent without the handshake: only a host that requires it
+        // can be broken by that pair.
+        let incapable = agent_tree(root, "incapable", "1.30.1", false);
+
+        assert!(
+            agent_rootfs_serves(&old, "1.15.1"),
+            "a host that never performs the handshake cannot be broken by it"
+        );
+        assert!(
+            !agent_rootfs_serves(&incapable, "1.30.1"),
+            "a {}.{}.{}+ host refuses to stop an agent without the capability",
+            preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.0,
+            preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.1,
+            preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.2,
+        );
+        assert!(
+            !agent_rootfs_serves(&old, "1.30.1"),
+            "a pre-1.16 agent is not the modern host's agent"
+        );
+    }
+
+    /// A rootfs tree holding an agent that reports `version`, with the shutdown
+    /// handshake only when `capability` says so, and no stamp.
+    fn agent_tree(root: &Path, name: &str, version: &str, capability: bool) -> std::path::PathBuf {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("usr/local/bin")).unwrap();
+        fs::write(
+            path.join("usr/local/bin/smolvm-agent"),
+            agent_bytes(version, capability),
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_stale_sibling_is_repaired_from_the_data_dir_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        // The data-dir copy is the host's agent while the sibling the engine
+        // prefers is not: the refresh must repair the sibling, offline.
+        let (install, target) =
+            agent_rootfs_fixture(&directory, "1.30.1", Some("1.30.1"), Some("1.14.2"));
+        let client = Client::builder().build().unwrap();
+
+        ensure_agent_rootfs(&client, &install, Some("1.30.1"))
+            .await
+            .expect("a matching data-dir copy needs no download");
+
+        assert_eq!(
+            agent_rootfs_version(&install.prefix.join("agent-rootfs")).as_deref(),
+            Some("1.30.1"),
+            "the rootfs beside the binary outranks the data-dir copy, so it must not stay stale"
+        );
+        assert_eq!(
+            agent_rootfs_version(&target).as_deref(),
+            Some("1.30.1"),
+            "the installed agent is untouched"
+        );
+    }
+
+    /// The rootfs the engine prefers is the one beside the `PATH`-resolved
+    /// binary, which can live outside the managed `~/.smolvm` prefix (a
+    /// system or package-manager install). Refresh that sibling, and do not
+    /// create a rootfs in the managed prefix that was not there before.
+    #[tokio::test]
+    async fn the_refresh_repairs_the_resolved_sibling_not_the_managed_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut install, target) =
+            agent_rootfs_fixture(&directory, "1.30.1", Some("1.30.1"), None);
+        install.resolved_prefix = directory.path().join("usr/local/bin");
+        let shipped = install.resolved_prefix.join("agent-rootfs");
+        std::fs::create_dir_all(shipped.join("usr/local/bin")).unwrap();
+        std::fs::write(
+            shipped.join("usr/local/bin/smolvm-agent"),
+            agent_bytes("1.14.2", true),
+        )
+        .unwrap();
+
+        let client = Client::builder().build().unwrap();
+        ensure_agent_rootfs(&client, &install, Some("1.30.1"))
+            .await
+            .expect("the matching data-dir copy repairs the resolved sibling");
+
+        assert_eq!(
+            agent_rootfs_version(&shipped).as_deref(),
+            Some("1.30.1"),
+            "the tree beside the resolved binary is the one the engine boots from"
+        );
+        assert!(
+            !install.prefix.join("agent-rootfs").exists(),
+            "only trees that already exist are refreshed"
+        );
+        assert_eq!(agent_rootfs_version(&target).as_deref(), Some("1.30.1"));
+    }
+
+    #[tokio::test]
+    async fn an_agent_rootfs_from_another_release_is_refreshed_from_the_binarys_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        // The data-dir copy is from an older release (its stamp says so), while
+        // the prefix ships the agent that belongs to the installed binary.
+        let (install, target) =
+            agent_rootfs_fixture(&directory, "1.14.2", Some("1.14.2"), Some("1.30.1"));
+        let host_version = agent_rootfs_version(&install.prefix.join("agent-rootfs"));
+        assert_eq!(host_version.as_deref(), Some("1.30.1"));
+
+        // A client that can never reach the network: this path must stay local.
+        let client = Client::builder().build().unwrap();
+        ensure_agent_rootfs(&client, &install, Some("1.30.1"))
+            .await
+            .expect("a matching sibling rootfs needs no download");
+
+        assert_eq!(
+            agent_rootfs_version(&target).as_deref(),
+            Some("1.30.1"),
+            "the installed rootfs must be the host's agent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join(preloop_vm::agent_rootfs::VERSION_STAMP)).unwrap(),
+            "1.30.1\n",
+            "the refresh must record the release it installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matching_agent_rootfs_is_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let (install, target) = agent_rootfs_fixture(&directory, "1.30.1", Some("1.30.1"), None);
+        let client = Client::builder().build().unwrap();
+
+        ensure_agent_rootfs(&client, &install, Some("1.30.1"))
+            .await
+            .expect("a matching rootfs is a no-op");
+
+        assert_eq!(
+            agent_rootfs_version(&target).as_deref(),
+            Some("1.30.1"),
+            "the installed agent is untouched"
+        );
+        assert_eq!(
+            agent_rootfs_version(&target),
+            agent_rootfs_version(&install.data_dir.join("agent-rootfs"))
+        );
     }
 
     #[test]
@@ -1826,8 +2419,10 @@ mod tests {
 
         let install = SmolvmInstall {
             prefix: directory.path().join("prefix"),
+            resolved_prefix: directory.path().join("prefix"),
             data_dir: directory.path().join("data"),
             bin_dir: directory.path().join("bin"),
+            agent_dir: directory.path().join("data"),
         };
         // A pre-1.7.7 installation left uncompressed templates behind; the
         // upgrade must not keep serving them.
