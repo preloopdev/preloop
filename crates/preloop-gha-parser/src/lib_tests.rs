@@ -5173,3 +5173,49 @@ jobs:
         );
     }
 }
+
+/// A deployment environment is only resolved at parse time from contexts that
+/// actually exist there (`matrix`, `shard`). Anything else would stringify a
+/// missing value to `""` (`deploy-`) and select the wrong secret scope, so it
+/// must stay unresolved for the job-context path.
+#[test]
+fn environment_names_reading_unpopulated_contexts_stay_unresolved() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  github_ref:
+    runs-on: ubuntu-latest
+    environment: deploy-${{ github.ref_name }}
+    steps:
+      - run: echo hi
+  inputs_ctx:
+    runs-on: ubuntu-latest
+    environment: deploy-${{ inputs.target }}
+    steps:
+      - run: echo hi
+  matrix_ctx:
+    runs-on: ubuntu-latest
+    environment: deploy-${{ matrix.env }}
+    strategy:
+      matrix:
+        env: [staging]
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    let by_base = |base: &str| {
+        jobs.iter()
+            .find(|job| job.base_id == base)
+            .unwrap()
+            .oidc_environment
+            .clone()
+    };
+    assert_eq!(by_base("github_ref"), None);
+    assert_eq!(by_base("inputs_ctx"), None);
+    assert_eq!(by_base("matrix_ctx").as_deref(), Some("deploy-staging"));
+}

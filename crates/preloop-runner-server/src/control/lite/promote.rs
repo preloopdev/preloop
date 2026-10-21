@@ -24,6 +24,7 @@ pub(super) fn dependency_decision(
     graph: &RunGraph,
     needs: &[JobId],
     if_condition: Option<&str>,
+    deferred_matrix: bool,
     condition_context: &preloop_gha_expressions::Context,
 ) -> Result<DependencyDecision, ControlError> {
     if needs.is_empty() {
@@ -39,6 +40,15 @@ pub(super) fn dependency_decision(
     let aggregate =
         crate::runtime_scheduling::aggregate_need_status(&graph.ancestor_statuses(needs))
             .unwrap_or(ExecutionStatus::Skipped);
+    // A deferred-matrix placeholder has no shard identity: judge its
+    // `shard.*` condition on the cells, but keep the dependency gate (a
+    // failed/cancelled need skips it unless explicitly overridden).
+    if deferred_matrix && crate::runtime_scheduling::condition_defers_to_shards(if_condition) {
+        return Ok(crate::runtime_scheduling::shard_deferred_decision(
+            if_condition,
+            aggregate,
+        ));
+    }
     let mut context = condition_context.clone().with_status(
         aggregate == ExecutionStatus::Success,
         aggregate == ExecutionStatus::Failure,
@@ -871,18 +881,13 @@ pub(super) fn promote_run(
             };
             let condition_context: preloop_gha_expressions::Context =
                 serde_json::from_str(&ctx_json).unwrap_or_default();
-            // A deferred-matrix node is a placeholder: a condition that reads
-            // `shard.*` cannot be judged before the fan-out (there is no
-            // shard identity yet, so it would evaluate false and skip every
-            // shard). Approve the expansion and let each materialized shard
-            // evaluate the condition against its own context.
-            let decision = if deferred.is_some()
-                && crate::runtime_scheduling::condition_defers_to_shards(if_condition.as_deref())
-            {
-                DependencyDecision::Run
-            } else {
-                dependency_decision(&graph, &needs, if_condition.as_deref(), &condition_context)?
-            };
+            let decision = dependency_decision(
+                &graph,
+                &needs,
+                if_condition.as_deref(),
+                deferred.is_some(),
+                &condition_context,
+            )?;
             if decision == DependencyDecision::Run {
                 tx.prepare_cached(
                     "UPDATE jobs SET deps_ready_at = COALESCE(deps_ready_at, ?3) \

@@ -450,17 +450,33 @@ pub(crate) fn condition_defers_to_shards(if_condition: Option<&str>) -> bool {
     }
 }
 
+/// Verdict for a deferred-matrix node whose `if:` reads `shard.*`, once its
+/// needs are terminal.
+///
+/// The placeholder has no shard identity to test, so the condition is judged
+/// on each materialized shard. Expansion must still respect the dependency
+/// gate: a failed or cancelled need skips the node, exactly as the implicit
+/// `success()` would, unless the condition explicitly overrides it with
+/// `always()`, `failure()` or `cancelled()`.
+pub(crate) fn shard_deferred_decision(
+    if_condition: Option<&str>,
+    aggregate: ExecutionStatus,
+) -> DependencyDecision {
+    let explicit_status = if_condition.is_some_and(|condition| {
+        let condition = condition.to_ascii_lowercase();
+        condition.contains("always(")
+            || condition.contains("failure(")
+            || condition.contains("cancelled(")
+    });
+    if aggregate == ExecutionStatus::Success || explicit_status {
+        DependencyDecision::Run
+    } else {
+        DependencyDecision::Skip
+    }
+}
+
 pub fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecision {
     if job.needs.is_empty() {
-        return DependencyDecision::Run;
-    }
-    // A deferred-matrix node is a placeholder, not a job: the matrix — and
-    // with `parallelism:`, the shard identity — only exists once the runtime
-    // fan-out materializes its cells. A condition reading `shard.*` would
-    // evaluate against a missing context here and skip every cell (the
-    // placeholder has no shard to test), so approve the expansion and let
-    // each materialized shard evaluate its own condition.
-    if job.deferred_matrix.is_some() && condition_defers_to_shards(job.if_condition.as_deref()) {
         return DependencyDecision::Run;
     }
     let direct_statuses = job
@@ -473,6 +489,13 @@ pub fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecisi
     }
     let statuses = ancestor_statuses(run, job);
     let aggregate = aggregate_need_status(&statuses).unwrap_or(ExecutionStatus::Skipped);
+    // A deferred-matrix node is a placeholder: a condition reading `shard.*`
+    // cannot be judged here (no shard identity), but the dependency gate still
+    // applies — a failed or cancelled need skips the node unless the
+    // condition explicitly overrides it. The cells evaluate the shard part.
+    if job.deferred_matrix.is_some() && condition_defers_to_shards(job.if_condition.as_deref()) {
+        return shard_deferred_decision(job.if_condition.as_deref(), aggregate);
+    }
     let context = job.condition_context.clone().with_status(
         aggregate == ExecutionStatus::Success,
         aggregate == ExecutionStatus::Failure,
@@ -1814,7 +1837,9 @@ bogus_field = true
 
 #[cfg(test)]
 mod deferred_shard_condition_tests {
-    use super::condition_defers_to_shards;
+    use super::{
+        DependencyDecision, ExecutionStatus, condition_defers_to_shards, shard_deferred_decision,
+    };
 
     /// A condition that reads the preloop `shard` context cannot be judged on
     /// the pre-expansion placeholder: it has no shard identity, so the
@@ -1833,5 +1858,39 @@ mod deferred_shard_condition_tests {
             "${{ needs.build.result == 'success' }}"
         )));
         assert!(!condition_defers_to_shards(None));
+    }
+
+    /// The shard-condition bypass must not outrun the dependency gate: a
+    /// failed or cancelled need skips the node unless the condition
+    /// explicitly overrides the implicit `success()`.
+    #[test]
+    fn shard_deferred_decision_keeps_the_dependency_gate() {
+        let condition = Some("${{ shard.index == 2 }}");
+        assert_eq!(
+            shard_deferred_decision(condition, ExecutionStatus::Success),
+            DependencyDecision::Run
+        );
+        assert_eq!(
+            shard_deferred_decision(condition, ExecutionStatus::Failure),
+            DependencyDecision::Skip
+        );
+        assert_eq!(
+            shard_deferred_decision(condition, ExecutionStatus::Cancelled),
+            DependencyDecision::Skip
+        );
+        assert_eq!(
+            shard_deferred_decision(
+                Some("shard.index == 2 && always()"),
+                ExecutionStatus::Failure
+            ),
+            DependencyDecision::Run
+        );
+        assert_eq!(
+            shard_deferred_decision(
+                Some("shard.index == 2 && failure()"),
+                ExecutionStatus::Failure
+            ),
+            DependencyDecision::Run
+        );
     }
 }

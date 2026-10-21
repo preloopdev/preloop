@@ -66,7 +66,7 @@ fn remaining_job_budget_applies_the_namespace_run_limit() {
 
     let backend = LiteBackend::in_memory().unwrap();
     let run_id = RunId::new();
-    let (unlimited, remaining, exhausted) = backend
+    let (unlimited, remaining, exhausted, webhook) = backend
         .write(|tx| {
             let namespace: String = tx
                 .query_row("SELECT namespace_id FROM namespaces", [], |row| row.get(0))
@@ -95,20 +95,29 @@ fn remaining_job_budget_applies_the_namespace_run_limit() {
             insert_job("build", 1)?;
 
             // No limits row: unlimited.
-            let unlimited = super::expansion::remaining_job_budget(tx, run_id, &namespace)?;
+            let unlimited = super::expansion::remaining_job_budget(tx, run_id)?;
 
             tx.execute(
                 "INSERT INTO namespace_limits (namespace_id, max_jobs_per_run) VALUES (?1, 3)",
                 [&namespace],
             )
             .map_err(super::db)?;
-            let remaining = super::expansion::remaining_job_budget(tx, run_id, &namespace)?;
+            let remaining = super::expansion::remaining_job_budget(tx, run_id)?;
 
             // The run is already past the limit: nothing more may be added.
             insert_job("test", 2)?;
             insert_job("lint", 3)?;
-            let exhausted = super::expansion::remaining_job_budget(tx, run_id, &namespace)?;
-            Ok((unlimited, remaining, exhausted))
+            let exhausted = super::expansion::remaining_job_budget(tx, run_id)?;
+
+            // Webhook deliveries are never refused at submit, so their
+            // deferred expansions stay exempt from the per-run cap.
+            tx.execute(
+                "UPDATE runs SET webhook_delivery_id = 'delivery-1' WHERE run_id = ?1",
+                [run_id.0.to_string()],
+            )
+            .map_err(super::db)?;
+            let webhook = super::expansion::remaining_job_budget(tx, run_id)?;
+            Ok((unlimited, remaining, exhausted, webhook))
         })
         .unwrap();
 
@@ -119,4 +128,8 @@ fn remaining_job_budget_applies_the_namespace_run_limit() {
         "3 per run minus the row already admitted"
     );
     assert_eq!(exhausted, Some(0));
+    assert_eq!(
+        webhook, None,
+        "webhook runs stay exempt from the per-run cap"
+    );
 }

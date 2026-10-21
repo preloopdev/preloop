@@ -597,11 +597,40 @@ fn resolved_environment(
     shard_index: Option<usize>,
     shard_total: Option<usize>,
 ) -> Option<String> {
-    if crate::eval::resolves_after_job_build(raw) {
+    if crate::eval::resolves_after_job_build(raw) || !environment_is_parse_time(raw) {
         return None;
     }
     let context = expression_context(matrix, None, None, shard_index, shard_total);
     crate::eval::resolve_string(raw, &context).ok()
+}
+
+/// Whether every expression in an environment name reads a context that is
+/// populated at parse time.
+///
+/// Only `matrix` and `shard` are known here. Any other context (`github`,
+/// `inputs`, `vars`, `secrets`, `env`, …) resolves to a missing value, which
+/// stringifies to `""` — so `deploy-${{ github.ref_name }}` would silently
+/// become `deploy-` and select the wrong secret scope. Leave such a name
+/// unresolved instead; the server finishes it once the job context exists.
+fn environment_is_parse_time(raw: &str) -> bool {
+    let mut rest = raw;
+    while let Some(start) = rest.find("${{") {
+        let after = &rest[start + 3..];
+        let Some(end) = preloop_gha_protocol::expr_scan::find_expression_end(after) else {
+            return false;
+        };
+        let Ok(references) = preloop_gha_expressions::collect_expression_references(&after[..end])
+        else {
+            return false;
+        };
+        if references.contexts.iter().any(|context| {
+            !context.eq_ignore_ascii_case("matrix") && !context.eq_ignore_ascii_case("shard")
+        }) {
+            return false;
+        }
+        rest = &after[end + 2..];
+    }
+    true
 }
 
 fn oidc_environment(

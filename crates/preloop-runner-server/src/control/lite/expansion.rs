@@ -117,23 +117,33 @@ fn node_parent(plan: &preloop_gha_protocol::JobPlan, placeholder: &JobId) -> Opt
 pub(super) fn remaining_job_budget(
     tx: &Transaction<'_>,
     run_id: RunId,
-    namespace: &str,
 ) -> Result<Option<u64>, ControlError> {
-    let limit: Option<Option<i64>> = tx
-        .prepare_cached("SELECT max_jobs_per_run FROM namespace_limits WHERE namespace_id = ?1")
+    let row: Option<(Option<String>, Option<i64>, i64)> = tx
+        .prepare_cached(
+            "SELECT r.webhook_delivery_id, l.max_jobs_per_run, \
+                    (SELECT count(*) FROM jobs j WHERE j.run_id = r.run_id) \
+             FROM runs r LEFT JOIN namespace_limits l ON l.namespace_id = r.namespace_id \
+             WHERE r.run_id = ?1",
+        )
         .map_err(db)?
-        .query_row([namespace], |row| row.get(0))
+        .query_row([codec::run_key(run_id)], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
         .optional()
         .map_err(db)?;
-    let Some(Some(limit)) = limit else {
+    let Some((webhook_delivery_id, limit, existing)) = row else {
+        return Ok(None);
+    };
+    // Webhook deliveries are never refused at submit (a push must not be
+    // lost) and wait at claim instead, so their deferred expansions stay
+    // exempt from the per-run cap too.
+    if webhook_delivery_id.is_some() {
+        return Ok(None);
+    }
+    let Some(limit) = limit else {
         return Ok(None);
     };
     let limit = u64::try_from(limit).unwrap_or(0);
-    let existing: i64 = tx
-        .prepare_cached("SELECT count(*) FROM jobs WHERE run_id = ?1")
-        .map_err(db)?
-        .query_row([codec::run_key(run_id)], |row| row.get(0))
-        .map_err(db)?;
     Ok(Some(
         limit.saturating_sub(u64::try_from(existing).unwrap_or(0)),
     ))
@@ -626,7 +636,7 @@ impl LiteBackend {
                     jobs.len()
                 }
             };
-            if let Some(remaining) = remaining_job_budget(tx, run_id, &namespace)?
+            if let Some(remaining) = remaining_job_budget(tx, run_id)?
                 && adding as u64 > remaining
             {
                 tracing::warn!(

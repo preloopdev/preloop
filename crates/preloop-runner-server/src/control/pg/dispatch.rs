@@ -7604,9 +7604,9 @@ async fn remaining_job_budget(
 ) -> Result<Option<u64>, ControlError> {
     let row = tx
         .query_opt(
-            "SELECT l.max_jobs_per_run, \
+            "SELECT r.webhook_delivery_id, l.max_jobs_per_run, \
                     (SELECT count(*) FROM jobs j WHERE j.run_id = r.run_id) \
-             FROM runs r JOIN namespace_limits l ON l.namespace_id = r.namespace_id \
+             FROM runs r LEFT JOIN namespace_limits l ON l.namespace_id = r.namespace_id \
              WHERE r.run_id = $1::text::uuid",
             &[&run_id.0.to_string()],
         )
@@ -7615,11 +7615,18 @@ async fn remaining_job_budget(
     let Some(row) = row else {
         return Ok(None);
     };
-    let limit: Option<i32> = row.get(0);
+    // Webhook deliveries are never refused at submit (a push must not be
+    // lost) and wait at claim instead, so their deferred expansions stay
+    // exempt from the per-run cap too.
+    let webhook_delivery_id: Option<String> = row.get(0);
+    if webhook_delivery_id.is_some() {
+        return Ok(None);
+    }
+    let limit: Option<i32> = row.get(1);
     let Some(limit) = limit else {
         return Ok(None);
     };
-    let existing: i64 = row.get(1);
+    let existing: i64 = row.get(2);
     Ok(Some(
         u64::try_from(limit.max(0))
             .unwrap_or(0)
