@@ -5,6 +5,8 @@
 //! gets its machines from it. The same service is reachable over HTTP
 //! (Connect) so other hosts can join as providers (`preloop sandbox agent`)
 //! and other callers can acquire sandboxes (`preloop sandbox acquire`).
+//! `preloop sandbox stats` prints each provider's host sample, capacity and
+//! sandboxes with their runtime facts.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -283,6 +285,8 @@ enum SandboxCommand {
     Ls,
     /// List providers and their capabilities.
     Providers,
+    /// Per-provider host sample, capacity and sandboxes with their runtime facts.
+    Stats,
 }
 
 #[derive(Debug, Args)]
@@ -603,6 +607,7 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
         ),
         SandboxCommand::Ls => print_json(&client.list().await?),
         SandboxCommand::Providers => print_json(&client.list_providers().await?),
+        SandboxCommand::Stats => print_json(&client.stats().await?),
     }
 }
 
