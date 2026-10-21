@@ -2030,7 +2030,15 @@ pub fn load_or_generate_oidc_keypair(
 ) -> anyhow::Result<oidc::OidcKeypair> {
     let key_path = state_dir.join("oidc-key.json");
     let certificate_path = state_dir.join("oidc-cert.der");
+    // The key files below are forced to 0600, but a state dir created with
+    // the process umask (typically 0755) still lets any local user
+    // enumerate it. When the server creates the dir, make it owner-only; a
+    // pre-existing dir keeps the operator's chosen permissions.
+    let dir_preexisting = state_dir.exists();
     std::fs::create_dir_all(state_dir)?;
+    if !dir_preexisting {
+        set_private_dir_permissions(state_dir)?;
+    }
 
     if key_path.exists() {
         set_private_file_permissions(&key_path)?;
@@ -2088,6 +2096,15 @@ fn store_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()
         let _ = std::fs::remove_file(&temp_path);
     }
     result
+}
+
+fn set_private_dir_permissions(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn set_private_file_permissions(path: &std::path::Path) -> anyhow::Result<()> {
@@ -2478,6 +2495,27 @@ mod tests {
         let exp = claims["exp"].as_u64().expect("exp is minted");
         let iat = claims["iat"].as_u64().expect("iat is minted");
         assert_eq!(exp - iat, ceiling.as_secs());
+    }
+
+    /// The OIDC private key files are forced to 0600, but the state dir
+    /// itself was created with the process umask (typically 0755): any
+    /// local user could enumerate it, and the 0600 files are the only
+    /// barrier. A state dir the server creates must be owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn oidc_keypair_state_dir_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("nested").join("state");
+        let keypair = load_or_generate_oidc_keypair(&state_dir).unwrap();
+        let mode = std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "a state dir the server creates must be owner-only"
+        );
+        // The key material landed and reloads as the same key.
+        let reloaded = load_or_generate_oidc_keypair(&state_dir).unwrap();
+        assert_eq!(keypair.kid(), reloaded.kid());
     }
 }
 
