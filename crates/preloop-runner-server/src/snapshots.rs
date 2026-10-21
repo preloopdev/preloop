@@ -1462,7 +1462,12 @@ async fn missing_objects_reachable_from(repository: &FsPath, rev: &str) -> Resul
     verify
         .env("GIT_DIR", repository)
         .args(["rev-list", "--objects", "--missing=print", rev]);
-    let output = run_git(verify, "verify snapshot object cache HEAD history").await?;
+    let output = run_git_within(
+        verify,
+        "verify snapshot object cache HEAD history",
+        GIT_WORK_TIMEOUT,
+    )
+    .await?;
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| line.starts_with('?'))
