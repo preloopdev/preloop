@@ -604,11 +604,9 @@ mod tests {
     fn decode_claims(jwt: &str) -> serde_json::Value {
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3, "a JWS compact token has three parts");
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            parts[1],
-        )
-        .unwrap();
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[1])
+                .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
