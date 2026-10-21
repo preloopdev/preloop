@@ -354,7 +354,10 @@ pub(super) fn hydrate_message(
     // claim, indistinguishable from a plain branch job to a cloud trust
     // policy. Only a missing or unexpanded-template value is filled: a name
     // the parser resolved is already correct and stays untouched.
-    if let Some(name) = environment_name.as_deref().filter(|name| !name.contains("${{")) {
+    if let Some(name) = environment_name
+        .as_deref()
+        .filter(|name| !name.contains("${{"))
+    {
         tx.prepare_cached(
             "UPDATE job_specs SET oidc_environment = ?3 \
              WHERE run_id = ?1 AND job_id = ?2 \

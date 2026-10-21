@@ -2932,13 +2932,10 @@ pub(crate) mod suite {
     /// built from this context, so a stale `None` mints a ref-shaped `sub`
     /// with no `environment` claim for a job that *is* environment-scoped —
     /// indistinguishable from a plain branch job to a cloud trust policy.
-    pub(crate) async fn deferred_environment_name_reaches_oidc_grant(
-        backend: &dyn ControlBackend,
-    ) {
-        backend
-            .set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
-                EnvironmentRulesMap::new(),
-            ));
+    pub(crate) async fn deferred_environment_name_reaches_oidc_grant(backend: &dyn ControlBackend) {
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            EnvironmentRulesMap::new(),
+        ));
         let run_id = RunId::new();
         let mut submit = submit_run(
             run_id,
@@ -2964,11 +2961,10 @@ pub(crate) mod suite {
             environment_name: Some("${{ needs.build.outputs.env }}".to_owned()),
             ..Default::default()
         });
-        deploy.message.actions_environment =
-            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
-                name: "${{ needs.build.outputs.env }}".to_owned(),
-                url: None,
-            });
+        deploy.message.actions_environment = Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+            name: "${{ needs.build.outputs.env }}".to_owned(),
+            url: None,
+        });
         backend.submit_run(submit).await.unwrap();
 
         let (runner, session) = live_runner(backend, "env-oidc-runner").await;
