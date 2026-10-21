@@ -158,6 +158,8 @@ message Sandbox {
   uint64 incarnation = 7;
   SandboxState state = 8;
   Purpose purpose = 9;
+  // Active lease. Redacted in `List`; `Get` returns it only to the caller
+  // presenting that lease.
   string lease_id = 10;
   string error = 11;
   int64 created_at = 12;
@@ -244,7 +246,11 @@ enum ReleaseMode {
   PRESERVE = 2;                     // keep for debugging until ttl
 }
 message ReleaseRequest { string lease_id = 1; ReleaseMode mode = 2; uint64 preserve_ttl_secs = 3; }
-message GetRequest { string sandbox_id = 1; }
+// `lease_id` on any sandbox-scoped request is the capability `Acquire`
+// returned: the service rejects the call unless it is that sandbox's
+// active lease (`PERMISSION_DENIED`). `List` is not scoped to a sandbox and
+// returns every sandbox with its lease id redacted.
+message GetRequest { string sandbox_id = 1; string lease_id = 100; }
 message ListSandboxesResponse {
   repeated Sandbox sandboxes = 1;
   string next_page_token = 180;
@@ -258,6 +264,7 @@ message ExecRequest {
   string user = 5;
   uint64 timeout_secs = 6;
   bytes stdin = 7;
+  string lease_id = 100;
 }
 message ExecEvent {
   oneof event {
@@ -272,10 +279,10 @@ enum StreamKind {
   UPLOAD = 1;                       // client PUTs a tar, extracted at path
   DOWNLOAD = 2;                     // client GETs a tar of path
 }
-message OpenStreamRequest { string sandbox_id = 1; StreamKind kind = 2; string path = 3; }
+message OpenStreamRequest { string sandbox_id = 1; StreamKind kind = 2; string path = 3; string lease_id = 100; }
 message Ticket { string url = 1; string token = 2; int64 expires_at = 3; }
-message SnapshotRequest { string sandbox_id = 1; string name = 2; }
-message StartRequest { string sandbox_id = 1; bool forkable = 2; }
+message SnapshotRequest { string sandbox_id = 1; string name = 2; string lease_id = 100; }
+message StartRequest { string sandbox_id = 1; bool forkable = 2; string lease_id = 100; }
 message ListProvidersResponse {
   repeated Provider providers = 1;
   string next_page_token = 180;

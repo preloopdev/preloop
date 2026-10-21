@@ -4511,6 +4511,27 @@ impl GoldenCache {
 }
 
 impl RunnerPoolConfig {
+    /// Host directory prefixes the pool mounts into its machines: the runner
+    /// bundle, the shared Node externals, and the per-machine control-bridge
+    /// trees. The embedded host agent allows exactly these (plus whatever
+    /// `PRELOOP_SANDBOX_MOUNT_ALLOW` names); anything else is refused.
+    pub fn sandbox_mount_prefixes(&self) -> Vec<PathBuf> {
+        let mut prefixes = vec![
+            effective_runner_bundle(self).unwrap_or_else(|_| self.runner_bundle.clone()),
+            self.externals_dir.clone(),
+        ];
+        if let Some(bridge) = control_bridge_dir(self) {
+            prefixes.push(bridge);
+        }
+        prefixes
+    }
+
+    /// Host Unix socket prefixes the pool mounts into its machines: the
+    /// control-plane socket handed to the guest bridge.
+    pub fn sandbox_socket_prefixes(&self) -> Vec<PathBuf> {
+        self.control_socket.iter().cloned().collect()
+    }
+
     /// Validate configuration before changing machine state.
     pub fn validate(&self) -> Result<(), OrchestratorError> {
         if self.size > 64 {
@@ -14275,6 +14296,29 @@ fi"#,
         assert!(
             format!("{error}").contains("no runner bundle with complete node externals"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// The embedded host agent's allowlist is derived from the exact host
+    /// paths the pool mounts, so CI keeps working under the default
+    /// deny-everything mount policy.
+    #[test]
+    fn sandbox_allowlist_covers_the_pool_volumes_and_socket() {
+        let config = test_config(true);
+        let machine = MachineName::new("preloop-runner-1-1").unwrap();
+        let volumes = runner_volumes(&config, &machine, true).unwrap();
+        assert!(!volumes.is_empty());
+        let mounts = config.sandbox_mount_prefixes();
+        for volume in &volumes {
+            assert!(
+                mounts.iter().any(|prefix| volume.host.starts_with(prefix)),
+                "mount {} is not covered by {mounts:?}",
+                volume.host.display()
+            );
+        }
+        assert_eq!(
+            config.sandbox_socket_prefixes(),
+            vec![PathBuf::from("/tmp/engine.sock")]
         );
     }
 

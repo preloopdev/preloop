@@ -211,6 +211,9 @@ impl Driver for SmolvmDriver {
             },
             overlay_gib: option("overlay_gib").and_then(|v| v.parse().ok()),
             network: network(&work.network),
+            // The host agent admitted these paths against its allowlist
+            // before this work item reached the driver; never resolve or
+            // widen them here.
             volumes: work
                 .mounts
                 .iter()

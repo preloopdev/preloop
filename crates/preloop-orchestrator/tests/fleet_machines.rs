@@ -355,25 +355,22 @@ async fn a_restarted_adapter_adopts_a_snapshot_golden_and_forks() {
 }
 
 #[tokio::test]
-async fn a_restart_adopts_machines_this_process_never_created() {
+async fn a_restart_sees_but_cannot_drive_a_machine_it_did_not_lease() {
     let dir = tempfile::tempdir().unwrap();
     let f = fixture(&dir).await;
     let name = MachineName::new("pool-runner-9-1").unwrap();
     f.machines.create(&spec(name.as_str())).await.unwrap();
     f.machines.start(&name).await.unwrap();
-    // The service is authoritative for machines this process never created.
+    // The service is authoritative for machines this process never created,
+    // so status and list still see the machine...
     let restarted = stranger(&f.service);
     assert_eq!(
         restarted.status(&name).await.unwrap(),
         MachineState::Running
     );
-    assert_eq!(
-        restarted
-            .exec(&name, &["true".into()])
-            .await
-            .unwrap()
-            .exit_code,
-        0
-    );
     assert!(restarted.list().await.unwrap().contains(&name));
+    // ...but driving it needs the lease `Acquire` returned, and the list
+    // projection redacts lease ids: a restarted adapter cannot take over a
+    // sandbox it never leased.
+    assert!(restarted.exec(&name, &["true".into()]).await.is_err());
 }

@@ -209,6 +209,94 @@ impl ProviderLink for RemoteLink {
     }
 }
 
+/// Host paths an agent may expose inside its guests.
+///
+/// The agent is the authority for this, not the service or the driver: a
+/// `Create` asking for a host mount or socket outside these prefixes is
+/// rejected with `FAILED_PRECONDITION` before the driver runs. Paths are
+/// resolved through symlinks when checked, so `..` traversal and symlinks
+/// cannot step outside an allowed tree. An empty list denies every mount of
+/// that kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostAccess {
+    /// Host directory prefixes allowed for `Mount.host`.
+    pub mounts: Vec<PathBuf>,
+    /// Host socket path prefixes allowed for `SocketMount.host`.
+    pub sockets: Vec<PathBuf>,
+}
+
+impl HostAccess {
+    /// Prefixes from `PRELOOP_SANDBOX_MOUNT_ALLOW` and
+    /// `PRELOOP_SANDBOX_SOCKET_ALLOW` (comma-separated host paths; unset or
+    /// empty denies every mount of that kind).
+    pub fn from_env() -> Self {
+        fn list(variable: &str) -> Vec<PathBuf> {
+            std::env::var(variable)
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        Self {
+            mounts: list("PRELOOP_SANDBOX_MOUNT_ALLOW"),
+            sockets: list("PRELOOP_SANDBOX_SOCKET_ALLOW"),
+        }
+    }
+
+    /// Allow more host directory prefixes.
+    pub fn allow_mounts(&mut self, prefixes: impl IntoIterator<Item = PathBuf>) {
+        self.mounts.extend(prefixes);
+    }
+
+    /// Allow more host socket prefixes.
+    pub fn allow_sockets(&mut self, prefixes: impl IntoIterator<Item = PathBuf>) {
+        self.sockets.extend(prefixes);
+    }
+
+    /// Reject a create whose host mounts or sockets this agent does not
+    /// export. Forks arrive as `Create` work and take the same check.
+    pub fn check_create(&self, work: &CreateWork) -> Result<()> {
+        for mount in &work.mounts {
+            check_host_path("mount", &mount.host, &self.mounts)?;
+        }
+        for socket in &work.sockets {
+            check_host_path("socket", &socket.host, &self.sockets)?;
+        }
+        Ok(())
+    }
+}
+
+/// Canonicalize `host` and require it under one of `allowed`.
+fn check_host_path(kind: &str, host: &str, allowed: &[PathBuf]) -> Result<()> {
+    if host.is_empty() {
+        return Err(Error::precondition(format!("host {kind} path is empty")));
+    }
+    if allowed.is_empty() {
+        return Err(Error::precondition(format!(
+            "host {kind} `{host}` is not allowed: this agent exports no {kind} paths"
+        )));
+    }
+    let resolved = std::fs::canonicalize(host).map_err(|error| {
+        Error::precondition(format!("host {kind} `{host}` cannot be resolved: {error}"))
+    })?;
+    let permitted = allowed.iter().any(|prefix| {
+        std::fs::canonicalize(prefix).is_ok_and(|prefix| resolved.starts_with(prefix))
+    });
+    if permitted {
+        Ok(())
+    } else {
+        Err(Error::precondition(format!(
+            "host {kind} `{host}` is outside this agent's allowlist"
+        )))
+    }
+}
+
 /// Agent settings.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -220,6 +308,8 @@ pub struct AgentConfig {
     pub heartbeat: Duration,
     /// Full inventory reconcile period.
     pub reconcile: Duration,
+    /// Host mounts and sockets this agent may expose to guests.
+    pub access: HostAccess,
 }
 
 impl AgentConfig {
@@ -230,7 +320,14 @@ impl AgentConfig {
             scratch,
             heartbeat: Duration::from_secs(10),
             reconcile: Duration::from_secs(60),
+            access: HostAccess::default(),
         }
+    }
+
+    /// Set the host access allowlist.
+    pub fn with_access(mut self, access: HostAccess) -> Self {
+        self.access = access;
+        self
     }
 }
 
@@ -466,6 +563,10 @@ impl Agent {
 
     async fn run_work(&self, session: &Session, item: WorkItem) -> Result<String> {
         if let Some(create) = item.create {
+            // Admission before the driver: no backend sees a host path this
+            // agent does not export. Fork acquires carry their mounts here
+            // too, so they are checked the same way.
+            self.config.access.check_create(&create)?;
             return self.driver(&create.driver)?.create(&create).await;
         }
         if let Some(target) = item.destroy {
@@ -517,6 +618,8 @@ impl Agent {
             return Ok(String::new());
         }
         if let Some(start) = item.start {
+            // `Start` boots an existing machine and carries no host mounts;
+            // a fork is a `Create` and took the allowlist check above.
             self.driver(&start.target.driver)?
                 .start(&start.target.native_ref, start.forkable)
                 .await?;
@@ -601,5 +704,126 @@ impl Agent {
                 error.code != Code::NotFound
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create(mounts: Vec<Mount>, sockets: Vec<SocketMount>) -> CreateWork {
+        CreateWork {
+            sandbox_id: "sbx-test".into(),
+            incarnation: 1,
+            driver: "fake".into(),
+            mounts,
+            sockets,
+            ..CreateWork::default()
+        }
+    }
+
+    fn mount(host: &Path) -> Mount {
+        Mount {
+            host: host.display().to_string(),
+            guest: "/mnt".into(),
+            readonly: true,
+        }
+    }
+
+    fn socket(host: &Path) -> SocketMount {
+        SocketMount {
+            host: host.display().to_string(),
+            guest: "/run/socket".into(),
+        }
+    }
+
+    #[test]
+    fn empty_allowlist_denies_every_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = HostAccess::default();
+        let error = access
+            .check_create(&create(vec![mount(dir.path())], vec![]))
+            .unwrap_err();
+        assert_eq!(error.code, Code::FailedPrecondition);
+        assert!(
+            error.message.contains("exports no mount paths"),
+            "{}",
+            error.message
+        );
+        let error = access
+            .check_create(&create(vec![], vec![socket(dir.path())]))
+            .unwrap_err();
+        assert!(
+            error.message.contains("exports no socket paths"),
+            "{}",
+            error.message
+        );
+        // No mounts means nothing to check.
+        access.check_create(&create(vec![], vec![])).unwrap();
+    }
+
+    #[test]
+    fn prefixes_allow_the_tree_and_nothing_outside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let child = allowed.join("child");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let access = HostAccess {
+            mounts: vec![allowed.clone()],
+            sockets: vec![allowed.clone()],
+        };
+        access
+            .check_create(&create(vec![mount(&allowed)], vec![]))
+            .unwrap();
+        access
+            .check_create(&create(vec![mount(&child)], vec![]))
+            .unwrap();
+        access
+            .check_create(&create(vec![], vec![socket(&allowed)]))
+            .unwrap();
+        let error = access
+            .check_create(&create(vec![mount(&outside)], vec![]))
+            .unwrap_err();
+        assert_eq!(error.code, Code::FailedPrecondition);
+        assert!(
+            error.message.contains("outside this agent's allowlist"),
+            "{}",
+            error.message
+        );
+        // `..` resolves before the prefix check, so it cannot escape.
+        let escape = allowed.join("..").join("outside");
+        let error = access
+            .check_create(&create(vec![mount(&escape)], vec![]))
+            .unwrap_err();
+        assert!(
+            error.message.contains("outside this agent's allowlist"),
+            "{}",
+            error.message
+        );
+        // A symlink inside the tree that points out of it is denied too.
+        #[cfg(unix)]
+        {
+            let link = allowed.join("link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let error = access
+                .check_create(&create(vec![mount(&link)], vec![]))
+                .unwrap_err();
+            assert!(
+                error.message.contains("outside this agent's allowlist"),
+                "{}",
+                error.message
+            );
+        }
+        // A path that does not exist cannot be resolved, so it is denied.
+        let error = access
+            .check_create(&create(vec![mount(&allowed.join("missing"))], vec![]))
+            .unwrap_err();
+        assert!(
+            error.message.contains("cannot be resolved"),
+            "{}",
+            error.message
+        );
     }
 }

@@ -8,17 +8,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink};
+use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
 use preloop_sandbox::{Driver, Service, ServiceConfig, store};
 use tokio_util::sync::CancellationToken;
 
-async fn run(service: &Arc<Service>, sandbox: &str, script: &str) -> (i32, String) {
+async fn run(service: &Arc<Service>, sandbox: &str, lease_id: &str, script: &str) -> (i32, String) {
     let (code, stdout, stderr) = service
         .exec_collect(ExecRequest {
             sandbox_id: sandbox.into(),
+            lease_id: lease_id.into(),
             argv: vec!["sh".into(), "-c".into(), script.into()],
             ..ExecRequest::default()
         })
@@ -47,7 +48,11 @@ async fn smolvm_golden_fork_pool_end_to_end() {
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![driver.clone() as Arc<dyn Driver>],
-        AgentConfig::new("e2e-smolvm", dir.path().join("scratch")),
+        AgentConfig::new("e2e-smolvm", dir.path().join("scratch")).with_access(HostAccess {
+            mounts: Vec::new(),
+            // The build sandbox mounts a host socket from the temp dir.
+            sockets: vec![dir.path().to_path_buf()],
+        }),
     );
     tokio::spawn(agent.run(shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -94,6 +99,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
     let (code, out) = run(
         &service,
         &build.sandbox.id,
+        &build.lease.id,
         "echo baked > /etc/golden-marker && uname -m",
     )
     .await;
@@ -101,6 +107,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
     let golden = service
         .snapshot(SnapshotRequest {
             sandbox_id: build.sandbox.id.clone(),
+            lease_id: build.lease.id.clone(),
             name: "alpine-golden".into(),
         })
         .await
@@ -140,6 +147,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
         let (code, out) = run(
             &service,
             &lease.sandbox.id,
+            &lease.lease.id,
             "cat /etc/golden-marker; echo $JOB; cat /run/preloop/token; echo; test -S /run/engine.sock && echo socket",
         )
         .await;
@@ -162,12 +170,16 @@ async fn smolvm_golden_fork_pool_end_to_end() {
         builder.finish().unwrap();
     }
     let sandbox = leases[0].sandbox.id.clone();
-    service.upload_path(&sandbox, "/work", &src).await.unwrap();
-    let (code, out) = run(&service, &sandbox, "cat /work/w/hello.txt").await;
+    let lease_id = leases[0].lease.id.clone();
+    service
+        .upload_path(&sandbox, &lease_id, "/work", &src)
+        .await
+        .unwrap();
+    let (code, out) = run(&service, &sandbox, &lease_id, "cat /work/w/hello.txt").await;
     assert_eq!((code, out.as_str()), (0, "hello"));
     let out_tar = dir.path().join("out.tar");
     service
-        .download_path(&sandbox, "/work/w", &out_tar)
+        .download_path(&sandbox, &lease_id, "/work/w", &out_tar)
         .await
         .unwrap();
     assert!(std::fs::metadata(&out_tar).unwrap().len() > 0);
@@ -176,6 +188,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
     let (code, out) = run(
         &service,
         &sandbox,
+        &lease_id,
         "for i in 1 2 3; do echo line$i; sleep 0.2; done; exit 7",
     )
     .await;
