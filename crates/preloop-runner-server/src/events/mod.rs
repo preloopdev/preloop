@@ -163,7 +163,56 @@ pub(crate) const SKIP_CI_LABELS: &[&str] = &[
 
 /// Whether a single commit message carries any skip-CI label.
 pub(crate) fn has_skip_label(message: &str) -> bool {
-    SKIP_CI_LABELS.iter().any(|label| message.contains(label))
+    SKIP_CI_LABELS.iter().any(|label| message.contains(label)) || has_skip_checks_trailer(message)
+}
+
+/// Whether `line` is GitHub's `skip-checks: true` trailer.
+///
+/// Both `skip-checks:true` and `skip-checks: true` are accepted; the key and
+/// value are matched case-insensitively, as Git treats trailer keys.
+fn is_skip_checks_trailer(line: &str) -> bool {
+    let Some((key, value)) = line.split_once(':') else {
+        return false;
+    };
+    key.trim().eq_ignore_ascii_case("skip-checks") && value.trim().eq_ignore_ascii_case("true")
+}
+
+/// Whether `line` looks like a Git trailer (`Key: value`), so the walk can
+/// cross trailers that precede `skip-checks`.
+fn looks_like_trailer(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else {
+        return false;
+    };
+    let key = key.trim();
+    !key.is_empty() && !key.chars().any(char::is_whitespace)
+}
+
+/// GitHub's `skip-checks: true` trailer, which suppresses a run the same way
+/// the bracketed labels do.
+///
+/// A trailer section is the message's last paragraph: consecutive `Key: value`
+/// lines separated from the body by a blank line. `skip-checks` must be the
+/// last trailer, so only the final non-empty line is considered; a message
+/// whose trailer section is not separated from the body does not match.
+fn has_skip_checks_trailer(message: &str) -> bool {
+    let lines: Vec<&str> = message.lines().collect();
+    let Some(last) = lines.iter().rposition(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    if !is_skip_checks_trailer(lines[last]) {
+        return false;
+    }
+    // Walk back over the trailer block; it must start after a blank line.
+    for line in lines[..last].iter().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            return true;
+        }
+        if !looks_like_trailer(line) {
+            return false;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
