@@ -642,8 +642,9 @@ impl BreakerRegistryInner {
             return;
         }
         if let Some(position) = self.unnamed.iter().position(|candidate| candidate == key) {
-            let key = self.unnamed.remove(position);
-            self.unnamed.push_back(key);
+            if let Some(key) = self.unnamed.remove(position) {
+                self.unnamed.push_back(key);
+            }
         }
     }
 }
