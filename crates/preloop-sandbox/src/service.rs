@@ -22,6 +22,7 @@ use tracing::{info, warn};
 
 use crate::api::*;
 use crate::connect::{Code, Error, Result};
+use crate::placement::{Candidate, CandidateId, LeastLoaded, Placement, PlacementRequest};
 use crate::store::{Kind, Store};
 
 /// Tunables.
@@ -47,6 +48,10 @@ pub struct ServiceConfig {
     /// A provider silent this many times `provider_timeout` is treated as
     /// lost: its sandboxes fail, which frees leases and closes exec streams.
     pub provider_lost_factor: u32,
+    /// Strategy that ranks the candidates the capability filter admits.
+    /// `PRELOOP_SANDBOX_PLACEMENT` selects a built-in one in the CLI and the
+    /// engine; the default is [`LeastLoaded`].
+    pub placement: Arc<dyn Placement>,
 }
 
 impl ServiceConfig {
@@ -62,6 +67,7 @@ impl ServiceConfig {
             ticket_ttl: Duration::from_secs(300),
             work_timeout: Duration::from_secs(900),
             provider_lost_factor: 3,
+            placement: Arc::new(LeastLoaded),
         }
     }
 }
@@ -166,7 +172,7 @@ struct Blob {
 
 /// Per-sandbox creation parameters kept for (re)provisioning and audit.
 #[derive(Clone)]
-struct Placement {
+struct PlacementSpec {
     template: Template,
     shape: Shape,
     network: NetworkPolicy,
@@ -175,6 +181,37 @@ struct Placement {
     options: BTreeMap<String, String>,
     requires: Requirements,
     snapshot_capable: bool,
+}
+
+impl PlacementSpec {
+    /// What the configured [`Placement`] ranks on: the request as resolved
+    /// against the template, in capability terms.
+    fn request(&self) -> PlacementRequest {
+        let template = &self.template;
+        let requires = &self.requires;
+        let os = if requires.os.is_empty() {
+            template.spec.os.clone()
+        } else {
+            requires.os.clone()
+        };
+        let driver = if requires.driver.is_empty() {
+            template.driver.clone()
+        } else {
+            requires.driver.clone()
+        };
+        PlacementRequest {
+            template: template.spec.name.clone(),
+            driver,
+            os,
+            arch: requires.arch.clone(),
+            features: requires.features.clone(),
+            capabilities: requires.capabilities.clone(),
+            snapshot_capable: self.snapshot_capable,
+            network: self.network.mode,
+            host_mounts: !self.mounts.is_empty(),
+            socket_mounts: !self.sockets.is_empty(),
+        }
+    }
 }
 
 /// Close every open exec stream of a sandbox, so a destroyed or failed
@@ -660,13 +697,13 @@ impl Service {
         state: &State,
         pool: &PoolSpec,
         extra: &Requirements,
-    ) -> Result<(Placement, String, String)> {
+    ) -> Result<(PlacementSpec, String, String)> {
         let template = state
             .templates
             .get(&pool.template)
             .cloned()
             .ok_or_else(|| Error::not_found(format!("template `{}` not found", pool.template)))?;
-        let placement = Placement {
+        let placement = PlacementSpec {
             requires: template.spec.requires.merged(&pool.requires).merged(extra),
             template,
             shape: pool.shape,
@@ -687,7 +724,7 @@ impl Service {
             // registered provider could ever serve is rejected.
             Err(error) if error.code == Code::FailedPrecondition => {
                 let template = &state.templates[&pool.template];
-                let placement = Placement {
+                let placement = PlacementSpec {
                     requires: template.spec.requires.merged(&pool.requires),
                     template: template.clone(),
                     shape: pool.shape,
@@ -707,15 +744,20 @@ impl Service {
     }
 
     /// Pick `(provider_id, driver)`: filter on capabilities and capacity,
-    /// then prefer the least-loaded owner.
+    /// then let the configured [`Placement`] rank the survivors.
+    ///
+    /// The filter is the service's: offline providers (and, for snapshot
+    /// templates, providers that do not hold the snapshot), providers whose
+    /// drivers miss a required capability, and pairs at their slot cap never
+    /// reach the placement.
     fn place(
         &self,
         state: &State,
-        placement: &Placement,
+        spec: &PlacementSpec,
         require_online: bool,
     ) -> Result<(String, String)> {
-        let template = &placement.template;
-        let requires = &placement.requires;
+        let template = &spec.template;
+        let requires = &spec.requires;
         let os = if requires.os.is_empty() {
             template.spec.os.as_str()
         } else {
@@ -723,7 +765,7 @@ impl Service {
         };
         let mut unmet = Vec::new();
         let mut full = false;
-        let mut best: Option<(usize, String, String)> = None;
+        let mut candidates: Vec<Candidate> = Vec::new();
         for (provider_id, rec) in &state.providers {
             if require_online && rec.seen.elapsed() > self.config.provider_timeout {
                 continue;
@@ -757,16 +799,16 @@ impl Service {
                         reasons.push(format!("capability={capability}"));
                     }
                 }
-                if placement.snapshot_capable && !caps.snapshot {
+                if spec.snapshot_capable && !caps.snapshot {
                     reasons.push("capability=snapshot".into());
                 }
-                if !placement.sockets.is_empty() && !caps.socket_mounts {
+                if !spec.sockets.is_empty() && !caps.socket_mounts {
                     reasons.push("capability=socket_mounts".into());
                 }
-                if placement.mounts.iter().any(|_| !caps.host_mounts) {
+                if spec.mounts.iter().any(|_| !caps.host_mounts) {
                     reasons.push("capability=host_mounts".into());
                 }
-                let mode = placement.network.mode;
+                let mode = spec.network.mode;
                 if mode != NetworkMode::NetworkModeUnspecified
                     && !caps.network_modes.contains(&mode)
                 {
@@ -801,32 +843,53 @@ impl Service {
                     full = true;
                     continue;
                 }
-                if best.as_ref().is_none_or(|(load, _, _)| live < *load) {
-                    best = Some((live, provider_id.clone(), driver.driver.clone()));
-                }
+                candidates.push(Candidate {
+                    id: CandidateId(candidates.len()),
+                    provider_id: provider_id.clone(),
+                    provider_name: rec.provider.name.clone(),
+                    driver: driver.driver.clone(),
+                    live,
+                    slots: caps.slots,
+                });
             }
         }
-        match best {
-            Some((_, provider, driver)) => Ok((provider, driver)),
-            None if full => Err(Error::new(
-                Code::ResourceExhausted,
-                "every matching provider is at capacity",
-            )),
-            None if unmet.is_empty() => Err(Error::unavailable(
-                "no provider is online for this template",
-            )),
-            None => Err(Error::precondition(format!(
+        if candidates.is_empty() {
+            if full {
+                return Err(Error::new(
+                    Code::ResourceExhausted,
+                    "every matching provider is at capacity",
+                ));
+            }
+            if unmet.is_empty() {
+                return Err(Error::unavailable(
+                    "no provider is online for this template",
+                ));
+            }
+            return Err(Error::precondition(format!(
                 "no provider satisfies template `{}`: {}",
                 template.spec.name,
                 unmet.join("; ")
-            ))),
+            )));
         }
+        let request = spec.request();
+        let ranked = self.config.placement.rank(&request, &candidates);
+        ranked
+            .iter()
+            .find_map(|id| candidates.get(id.0))
+            .map(|candidate| (candidate.provider_id.clone(), candidate.driver.clone()))
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "placement `{}` ranked no candidate out of {}",
+                    self.config.placement.name(),
+                    candidates.len()
+                ))
+            })
     }
 
     fn create_locked(
         &self,
         state: &mut State,
-        (placement, provider_id, driver): (Placement, String, String),
+        (placement, provider_id, driver): (PlacementSpec, String, String),
         pool: &str,
         purpose: Purpose,
         name: &str,
@@ -1177,7 +1240,7 @@ impl Service {
                 .ok_or_else(|| {
                     Error::not_found(format!("template `{}` not found", request.template))
                 })?;
-            let placement = Placement {
+            let placement = PlacementSpec {
                 requires: template.spec.requires.merged(&request.requires),
                 template,
                 shape: request.shape,

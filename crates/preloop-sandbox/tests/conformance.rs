@@ -7,6 +7,7 @@ use std::time::Duration;
 use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::fake::FakeDriver;
+use preloop_sandbox::placement::{Candidate, CandidateId, Placement, PlacementRequest};
 use preloop_sandbox::server::{Auth, router};
 use preloop_sandbox::store::{self, Kind, Store};
 use preloop_sandbox::{Code, Driver, SandboxClient, Service, ServiceConfig};
@@ -230,6 +231,75 @@ async fn placement_rejects_unsatisfiable_requirements_by_name() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::NotFound);
+}
+
+/// A `Placement` from `ServiceConfig` overrides the default ranking: this one
+/// prefers the busiest candidate, so it must beat `least-loaded`.
+#[tokio::test]
+async fn a_configured_placement_ranks_the_candidates() {
+    struct Busiest;
+
+    impl Placement for Busiest {
+        fn name(&self) -> &'static str {
+            "busiest"
+        }
+
+        fn rank(&self, _request: &PlacementRequest, candidates: &[Candidate]) -> Vec<CandidateId> {
+            let mut ranked: Vec<CandidateId> =
+                candidates.iter().map(|candidate| candidate.id).collect();
+            ranked.sort_by_key(|id| std::cmp::Reverse(candidates[id.0].live));
+            ranked
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    config.acquire_wait = Duration::from_secs(10);
+    config.placement = Arc::new(Busiest);
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    let add_host = |name: &str| {
+        let fake = Arc::new(FakeDriver::new(
+            "fake",
+            dir.path().join(name),
+            FakeDriver::full_capabilities(),
+        ));
+        let agent = Agent::new(
+            Arc::new(service.clone()) as Arc<dyn ProviderLink>,
+            vec![fake as Arc<dyn Driver>],
+            AgentConfig::new(name, dir.path().join(format!("{name}-scratch"))),
+        );
+        tokio::spawn(agent.run(shutdown.clone()));
+    };
+    add_host("host-a");
+    wait_for(|| service.list_providers().len() == 1).await;
+    service.put_template(template("alpine")).await.unwrap();
+    // The only host, so the first lease lands there and loads it.
+    let first = service
+        .acquire(AcquireRequest {
+            idempotency_key: "k1".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .expect("first acquire");
+    add_host("host-b");
+    wait_for(|| service.list_providers().len() == 2).await;
+    let second = service
+        .acquire(AcquireRequest {
+            idempotency_key: "k2".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .expect("second acquire");
+    // `least-loaded` would have taken the empty host; the configured placement
+    // wins, and the service still admits the loaded candidate.
+    assert_eq!(second.sandbox.provider_id, first.sandbox.provider_id);
+    assert_ne!(second.sandbox.id, first.sandbox.id);
 }
 
 #[tokio::test]

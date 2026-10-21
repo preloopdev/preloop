@@ -60,6 +60,23 @@ operation a backend does not declare (`Pause`, `Snapshot`) fails with
 `failed_precondition` instead of being emulated. `one_shot` backends run one
 command per sandbox; callers needing several execs require `multi_exec`.
 
+## Placement
+
+Placement is split in two. The service filters: it drops offline providers
+(and, for a snapshot template, every provider that does not hold the snapshot)
+and every provider/driver pair that misses a required capability or is at its
+slot cap, leaving a candidate list. A `Placement`
+(`crates/preloop-sandbox/src/placement.rs`) then ranks those candidates by
+preference, and the service takes the first one. A placement therefore orders
+the candidates the service proved eligible; it can neither admit a pair the
+filter rejected nor widen a request.
+
+`LeastLoaded` is the default: fewest live sandboxes first, ties in candidate
+order (provider id, then the provider's driver order). `ServiceConfig::placement`
+takes any `Placement` implementation; `PRELOOP_SANDBOX_PLACEMENT` selects a
+built-in one by name (default `least-loaded`) for `preloop sandbox serve` and
+the engine, and an unknown name is a startup error naming the valid values.
+
 ## Drivers
 
 A driver is the host-side, in-process interface a host agent drives
@@ -114,6 +131,7 @@ and debug-hold strategy; the machines under it are sandboxes.
 | `PRELOOP_SANDBOX_STORE_URL` | store URL |
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
 | `PRELOOP_SANDBOX_POOL_DRIVER` | driver the CI pool places on (default: first) |
+| `PRELOOP_SANDBOX_PLACEMENT` | placement strategy (default `least-loaded`) |
 | `PRELOOP_SANDBOX_SMOLVM_SLOTS` | concurrent SmolVM sandboxes (0 = no cap) |
 
 ## CLI
@@ -137,11 +155,11 @@ preloop sandbox ls | providers
 
 * `cargo test -p preloop-sandbox` — service/agent conformance over the fake
   driver, in-process and across a real HTTP server with a remote agent
-  (idempotency, warm pools, placement errors, unsupported operations,
-  snapshot → template → fork, create failure, lease expiry and preservation,
-  orphan/lost reconcile, generation fencing, SQLite restart, streaming exec,
-  ticketed upload/download). Set `PRELOOP_SANDBOX_TEST_PG` to also run the
-  Postgres store test.
+  (idempotency, warm pools, placement errors and configured ranking,
+  unsupported operations, snapshot → template → fork, create failure, lease
+  expiry and preservation, orphan/lost reconcile, generation fencing, SQLite
+  restart, streaming exec, ticketed upload/download). Set
+  `PRELOOP_SANDBOX_TEST_PG` to also run the Postgres store test.
 * `PRELOOP_SANDBOX_E2E_SMOLVM=1 cargo test -p preloop-sandbox --test smolvm_e2e`
   — real SmolVM: bake, snapshot, warm pool of branches, socket mount, files,
   streaming, cleanup.
