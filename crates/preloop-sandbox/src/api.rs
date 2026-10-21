@@ -241,6 +241,124 @@ pub struct SocketMount {
     pub guest: String,
 }
 
+/// One immutable artifact a backend can materialize for a template.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Artifact {
+    /// `oci-image` or `smolmachine`.
+    pub format: String,
+    /// Guest architecture (`aarch64`/`x86_64`, or `arm64`/`amd64`).
+    pub arch: String,
+    /// Image reference or `file://` pack path. Proto field: `ref`.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// sha256 of the artifact content (`sha256:<hex>`).
+    pub digest: String,
+    /// Size in bytes when known.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub size_bytes: u64,
+}
+
+impl Artifact {
+    /// A registry image the backend pulls itself.
+    pub const OCI_IMAGE: &'static str = "oci-image";
+    /// A monolithic packed machine (an OCI artifact or a `file://` pack).
+    pub const SMOLMACHINE: &'static str = "smolmachine";
+
+    /// Validate the artifact's shape and digest pinning.
+    ///
+    /// Returns a message phrased for the caller (`PutTemplate` turns it into
+    /// `INVALID_ARGUMENT`), or `Ok(())`.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.format.is_empty() {
+            return Err("artifact format is required".into());
+        }
+        if self.arch.is_empty() {
+            return Err("artifact arch is required".into());
+        }
+        if !is_sha256_digest(&self.digest) {
+            return Err(format!(
+                "artifact digest `{}` is not a `sha256:<64 hex>` digest",
+                self.digest
+            ));
+        }
+        if self.reference.is_empty() {
+            return Err("artifact ref is required".into());
+        }
+        match self.format.as_str() {
+            Self::OCI_IMAGE => {
+                let pinned = self.reference.rsplit_once('@').map(|(_, digest)| digest);
+                match pinned {
+                    Some(digest) if is_sha256_digest(digest) => {}
+                    _ => {
+                        return Err(format!(
+                            "artifact ref `{}` is not digest-pinned; use `{}@sha256:…`",
+                            self.reference, self.reference
+                        ));
+                    }
+                }
+                if !pinned.is_some_and(|digest| digest.eq_ignore_ascii_case(&self.digest)) {
+                    return Err(format!(
+                        "artifact digest `{}` does not match its pinned ref `{}`",
+                        self.digest, self.reference
+                    ));
+                }
+            }
+            Self::SMOLMACHINE => match self.reference.strip_prefix("file://") {
+                Some("") => return Err("artifact ref `file://` has no path".into()),
+                Some(_) => {}
+                None => {
+                    let pinned = self.reference.rsplit_once('@').map(|(_, digest)| digest);
+                    if !pinned.is_some_and(is_sha256_digest) {
+                        return Err(format!(
+                            "artifact ref `{}` must be a `file://` pack or a digest-pinned \
+                             OCI artifact reference",
+                            self.reference
+                        ));
+                    }
+                }
+            },
+            other => {
+                return Err(format!(
+                    "unsupported artifact format `{other}`; use `{}` or `{}`",
+                    Self::OCI_IMAGE,
+                    Self::SMOLMACHINE
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this artifact serves `host_arch`, accepting the OCI spelling.
+    pub fn matches_arch(&self, host_arch: &str) -> bool {
+        self.arch == host_arch
+            || matches!(
+                (host_arch, self.arch.as_str()),
+                ("aarch64", "arm64") | ("x86_64", "amd64")
+            )
+            || matches!(
+                (host_arch, self.arch.as_str()),
+                ("arm64", "aarch64") | ("amd64", "x86_64")
+            )
+    }
+}
+
+/// Whether `value` is `sha256:` followed by 64 hex characters.
+pub fn is_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// This host's guest architecture, in the spelling artifacts and drivers use
+/// (`aarch64`, `x86_64`).
+pub fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" | "arm64" => "aarch64",
+        other => other,
+    }
+}
+
 /// A logical image.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -250,33 +368,20 @@ pub struct TemplateSpec {
     /// Guest OS.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub os: String,
-    /// OCI image (oneof source).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
     /// Driver-specific recipe (oneof source).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipe: Option<String>,
     /// Sandbox captured by `Snapshot` (oneof source).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_of: Option<String>,
-    /// Per-architecture OCI references.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub images_by_arch: BTreeMap<String, String>,
+    /// Formats and architectures this template can be materialized in.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Artifact>,
     /// Placement requirements every sandbox from this template carries.
     pub requires: Requirements,
     /// Labels.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
-}
-
-impl TemplateSpec {
-    /// Image for an architecture: the per-arch entry, else the plain image.
-    pub fn image_for(&self, arch: &str) -> Option<&str> {
-        self.images_by_arch
-            .get(arch)
-            .or(self.image.as_ref())
-            .map(String::as_str)
-    }
 }
 
 /// A registered template.

@@ -167,9 +167,16 @@ fn stranger(service: &Arc<Service>) -> Arc<SandboxMachines> {
 }
 
 fn spec(name: &str) -> MachineSpec {
+    // The fake driver boots nothing, but the adapter registers an image by
+    // content: a real local pack keeps that path off the network.
+    let pack = std::env::temp_dir().join(format!(
+        "preloop-fleet-test-{}.smolmachine",
+        std::process::id()
+    ));
+    std::fs::write(&pack, b"fleet test pack").unwrap();
     MachineSpec {
         name: MachineName::new(name).unwrap(),
-        image: "alpine:3.20".into(),
+        image: pack.display().to_string(),
         cpus: 1,
         memory_mib: 512,
         storage_gib: 1,

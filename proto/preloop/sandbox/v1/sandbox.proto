@@ -81,18 +81,40 @@ message SocketMount {
   string guest = 2;
 }
 
-// A logical image. Backends materialize it in their own format.
+// One immutable artifact a backend can materialize for a template.
+message Artifact {
+  // `oci-image` (a registry image the backend pulls itself) or
+  // `smolmachine` (a monolithic packed machine: an OCI artifact on GHCR,
+  // or a local pack behind `file://`).
+  string format = 1;
+  // Guest architecture: `aarch64`/`x86_64`, or the OCI spellings
+  // `arm64`/`amd64`.
+  string arch = 2;
+  // For `oci-image`, a digest-pinned registry reference. For
+  // `smolmachine`, `file://<path>` or a digest-pinned OCI artifact
+  // reference. Backends fetch by content digest.
+  string ref = 3;
+  // sha256 of the artifact content (`sha256:<hex>`).
+  string digest = 4;
+  // Size in bytes when known; 0 otherwise.
+  uint64 size_bytes = 5;
+}
+
+// A logical image: per-format, per-arch artifacts, a driver-specific
+// recipe, or a snapshot. Backends materialize the first artifact whose
+// format and architecture they support.
 message TemplateSpec {
   string name = 1;
   string os = 2;
+  reserved 3, 6;
+  reserved "image", "images_by_arch";
   oneof source {
-    string image = 3;               // OCI reference (digest-pinned)
     string recipe = 4;              // opaque recipe interpreted by the driver
     string snapshot_of = 5;         // sandbox id captured by Snapshot
   }
-  map<string, string> images_by_arch = 6; // per-arch OCI digests
   Requirements requires = 7;
   map<string, string> labels = 8;
+  repeated Artifact artifacts = 150;
 }
 
 message Template {

@@ -7,10 +7,14 @@
 //! only in `smolvm serve`, whose clones lose `--mount-socket` relays).
 
 pub mod cli;
+pub mod pack;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -18,6 +22,7 @@ use self::cli::{
     ForkLaunch, MachineName, MachineRole, MachineSpec, MachineUpdate, NetworkPolicy as VmNetwork,
     OutputChunk, SmolVmProvider, SocketMount as VmSocket, VmError, VmProvider, VolumeMount,
 };
+use self::pack::{ArtifactCache, ArtifactPin, LocalImage, PackFormat, select_artifact};
 use crate::api::*;
 use crate::connect::{Code, Error, Result};
 use crate::driver::{Driver, NATIVE_PREFIX, native_name, parse_native_name, shell_quote};
@@ -28,11 +33,21 @@ pub const NAME: &str = "smolvm";
 /// Template recipe prefix for a packed `.smolmachine` artifact on this host.
 pub const SMOLMACHINE_RECIPE: &str = "smolmachine:";
 
+/// Template recipe prefix for a host path the CLI boots with `--image`: a
+/// Docker-save `.tar` archive or a bare rootfs directory.
+pub const IMAGE_RECIPE: &str = "image:";
+
 /// SmolVM driver.
 pub struct SmolvmDriver {
     provider: SmolVmProvider,
     slots: u32,
     named_prefix: Option<String>,
+    /// Formats this host's SmolVM can materialize.
+    formats: Vec<Arc<dyn PackFormat>>,
+    /// Content-addressed cache of packed artifacts.
+    cache: ArtifactCache,
+    /// Artifact each live machine keeps resident, by native name.
+    pins: Mutex<HashMap<String, ArtifactPin>>,
 }
 
 impl SmolvmDriver {
@@ -42,7 +57,16 @@ impl SmolvmDriver {
             provider,
             slots,
             named_prefix: None,
+            formats: pack::default_formats(),
+            cache: ArtifactCache::from_env(std::env::temp_dir().join("preloop-sandbox-artifacts")),
+            pins: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Use `cache` for packed artifacts instead of the default one.
+    pub fn with_cache(mut self, cache: ArtifactCache) -> Self {
+        self.cache = cache;
+        self
     }
 
     /// Also report machines with this name prefix (caller-named sandboxes,
@@ -62,13 +86,54 @@ impl SmolvmDriver {
     pub fn provider(&self) -> &SmolVmProvider {
         &self.provider
     }
+
+    /// The artifact cache this driver materializes packs into.
+    pub fn cache(&self) -> &ArtifactCache {
+        &self.cache
+    }
+
+    /// Evict least-recently-used cached artifacts, sparing those in use.
+    pub fn collect_garbage(&self) -> Result<u64> {
+        self.cache.collect_garbage()
+    }
+
+    /// Materialize the first artifact this host can boot for `template`.
+    ///
+    /// Returns the image string for SmolVM and, when the bytes live in the
+    /// cache, the pin that keeps them resident for the machine's lifetime.
+    async fn image_for(&self, template: &Template) -> Result<(String, Option<ArtifactPin>)> {
+        if template.spec.artifacts.is_empty() {
+            if let Some(recipe) = &template.spec.recipe {
+                let path = recipe
+                    .strip_prefix(SMOLMACHINE_RECIPE)
+                    .or_else(|| recipe.strip_prefix(IMAGE_RECIPE))
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::invalid(format!("smolvm: unknown recipe `{recipe}`")))?;
+                return Ok((path, None));
+            }
+            return Err(Error::invalid(format!(
+                "template `{}` has no artifacts",
+                template.spec.name
+            )));
+        }
+        let (artifact, format) =
+            select_artifact(&template.spec.artifacts, &self.formats, guest_arch())?;
+        // Pin before fetching: a concurrent GC must not delete bytes that are
+        // about to be handed to a machine.
+        let pin = self.cache.pin(&artifact.digest);
+        let materialized = format.materialize(artifact, &self.cache).await?;
+        // The backend pulls a registry image itself; only cached bytes need
+        // to stay resident.
+        let pin = match &materialized {
+            LocalImage::File(_) => Some(pin),
+            LocalImage::Reference(_) => None,
+        };
+        Ok((materialized.into_image(), pin))
+    }
 }
 
 fn guest_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "aarch64" | "arm64" => "aarch64",
-        other => other,
-    }
+    crate::api::host_arch()
 }
 
 fn vm_error(error: VmError) -> Error {
@@ -304,6 +369,9 @@ impl Driver for SmolvmDriver {
             work.name.clone()
         };
         let clone = machine(&name)?;
+        // One native name is one machine: a pin from an earlier incarnation
+        // must not outlive it.
+        self.pins.lock().remove(&name);
         if !work.template.native_ref.is_empty() {
             let golden = machine(&work.template.native_ref)?;
             let (launch, update) = fork_request(work)?;
@@ -342,23 +410,7 @@ impl Driver for SmolvmDriver {
             }
             return Ok(name);
         }
-        let image = match (
-            &work.template.spec.recipe,
-            work.template.spec.image_for(guest_arch()),
-        ) {
-            (Some(recipe), _) => recipe
-                .strip_prefix(SMOLMACHINE_RECIPE)
-                .map(str::to_owned)
-                .ok_or_else(|| Error::invalid(format!("smolvm: unknown recipe `{recipe}`")))?,
-            (None, Some(image)) => image.to_owned(),
-            (None, None) => {
-                return Err(Error::invalid(format!(
-                    "template `{}` has no image for {}",
-                    work.template.spec.name,
-                    guest_arch()
-                )));
-            }
-        };
+        let (image, pin) = self.image_for(&work.template).await?;
         let option = |key: &str| work.options.get(key).map(String::as_str);
         let spec = MachineSpec {
             name: clone.clone(),
@@ -416,16 +468,24 @@ impl Driver for SmolvmDriver {
             let _ = self.provider.delete(&clone).await;
             return Err(vm_error(error));
         }
+        if let Some(pin) = pin {
+            self.pins.lock().insert(name.clone(), pin);
+        }
         Ok(name)
     }
 
     async fn destroy(&self, native_ref: &str) -> Result<()> {
         let name = machine(native_ref)?;
-        match self.provider.delete(&name).await {
+        let destroyed = match self.provider.delete(&name).await {
             Ok(()) => Ok(()),
             Err(error) if error.to_string().contains("not found") => Ok(()),
             Err(error) => Err(vm_error(error)),
+        };
+        // The pack is still needed if the machine survived a failed delete.
+        if destroyed.is_ok() {
+            self.pins.lock().remove(native_ref);
         }
+        destroyed
     }
 
     async fn exec(

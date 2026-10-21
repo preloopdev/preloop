@@ -25,9 +25,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use preloop_sandbox::api::{
-    AcquireRequest, ExecRequest, Mount, NetworkMode, NetworkPolicy as SbxNetwork, Purpose,
-    ReleaseMode, ReleaseRequest, RenewRequest, Requirements, SandboxState, Shape, SnapshotRequest,
-    SocketMount, TemplateSpec,
+    AcquireRequest, Artifact, ExecRequest, Mount, NetworkMode, NetworkPolicy as SbxNetwork,
+    Purpose, ReleaseMode, ReleaseRequest, RenewRequest, Requirements, SandboxState, Shape,
+    SnapshotRequest, SocketMount, TemplateSpec, host_arch,
 };
 use preloop_sandbox::drivers::smolvm::cli::{
     ExecOutput, MachineName, MachineRole, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
@@ -74,10 +74,297 @@ pub struct SandboxMachines {
     requires: Requirements,
     capabilities: ProviderCapabilities,
     entries: Mutex<HashMap<String, Entry>>,
+    /// Templates registered per image string, keyed by the content identity
+    /// that produced them. A rebuilt local pack keeps its path but changes
+    /// length or mtime, so it is hashed again and gets a new template.
+    images: Mutex<HashMap<String, CachedImage>>,
     /// Serializes turning a golden into a snapshot template: concurrent
     /// first forks must snapshot once, not race two captures of one base.
     snapshot_lock: Mutex<()>,
     generation: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedImage {
+    /// What the image looked like when the template was registered.
+    fingerprint: String,
+    template: TemplateSpec,
+}
+
+/// Cheap identity of an image string, used to skip re-hashing or re-resolving.
+///
+/// A local file is identified by path, length and mtime; a digest-pinned
+/// registry reference never changes; a tag is mutable and always resolved.
+fn image_fingerprint(image: &str) -> Option<String> {
+    let raw = image.strip_prefix("file://").unwrap_or(image);
+    let path = Path::new(raw);
+    if path.is_file() {
+        let metadata = std::fs::metadata(path).ok()?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|age| age.as_nanos())
+            .unwrap_or(0);
+        return Some(format!(
+            "file:{}:{}:{modified}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    image
+        .contains("@sha256:")
+        .then(|| format!("pinned:{image}"))
+}
+
+/// The template a machine image string describes.
+async fn image_template(image: &str) -> Result<TemplateSpec, VmError> {
+    let artifacts = image_artifacts(image).await?;
+    Ok(TemplateSpec {
+        name: image_template_name(&artifacts),
+        os: "linux".into(),
+        artifacts,
+        ..TemplateSpec::default()
+    })
+}
+
+/// Artifacts for `image`: a local pack, or a registry image resolved to a
+/// digest.
+async fn image_artifacts(image: &str) -> Result<Vec<Artifact>, VmError> {
+    if let Some(path) = image.strip_prefix("file://") {
+        let path = Path::new(path);
+        if !path.is_file() {
+            return Err(VmError::InvalidSpec(format!(
+                "pack {} does not exist",
+                path.display()
+            )));
+        }
+        return Ok(vec![local_pack_artifact(path).await?]);
+    }
+    let path = Path::new(image);
+    if path.is_file() {
+        return Ok(vec![local_pack_artifact(path).await?]);
+    }
+    oci_artifacts(image).await
+}
+
+/// A host-local image input the SmolVM CLI boots with `--image`: a Docker-save
+/// `.tar` archive or a bare rootfs directory.
+///
+/// These are not content-addressed packs, so they stay a driver recipe (as
+/// they always were) rather than an artifact; a registry image or a
+/// `.smolmachine` pack is the artifact path.
+fn local_image_recipe(image: &str, driver: &str) -> Option<TemplateSpec> {
+    let raw = image.strip_prefix("file://").unwrap_or(image);
+    let path = Path::new(raw);
+    let archive = path.is_file() && raw.ends_with(".tar");
+    if !(path.is_dir() || archive) {
+        return None;
+    }
+    let path = std::fs::canonicalize(path).ok()?;
+    let digest = hex::encode(Sha256::digest(path.display().to_string().as_bytes()));
+    Some(TemplateSpec {
+        name: format!("image-{}", &digest[..16]),
+        os: "linux".into(),
+        recipe: Some(format!(
+            "{}{}",
+            preloop_sandbox::drivers::smolvm::IMAGE_RECIPE,
+            path.display()
+        )),
+        requires: Requirements {
+            driver: driver.to_owned(),
+            ..Requirements::default()
+        },
+        ..TemplateSpec::default()
+    })
+}
+
+/// A host-local `.smolmachine` pack, identified by its content.
+async fn local_pack_artifact(path: &Path) -> Result<Artifact, VmError> {
+    let path = std::fs::canonicalize(path).map_err(|error| {
+        VmError::InvalidSpec(format!("resolving pack {}: {error}", path.display()))
+    })?;
+    let digest = crate::sha256_file(&path)
+        .await
+        .map_err(VmError::InvalidSpec)?;
+    let size_bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    Ok(Artifact {
+        format: Artifact::SMOLMACHINE.into(),
+        arch: host_arch().into(),
+        reference: format!("file://{}", path.display()),
+        digest: format!("sha256:{digest}"),
+        size_bytes,
+    })
+}
+
+/// A registry image (or packed OCI artifact) resolved to the digest the
+/// registry serves right now.
+///
+/// `smolvm pack push` publishes a packed machine as an OCI index whose single
+/// image manifest carries the packed layer; a bootable image has none. Either
+/// way the artifact records the layer content digest (`smolmachine`) or the
+/// pinned image digest (`oci-image`).
+async fn oci_artifacts(image: &str) -> Result<Vec<Artifact>, VmError> {
+    let reference = crate::oci::OciReference::parse(image)
+        .map_err(|error| VmError::InvalidSpec(format!("image `{image}`: {error}")))?;
+    let client = registry_client()?;
+    let (mut manifest_digest, mut manifest) =
+        fetch_manifest(&client, &reference, &reference.reference, image).await?;
+    let layers_empty = manifest
+        .get("layers")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|layers| layers.is_empty());
+    let selected = layers_empty
+        .then(|| {
+            manifest
+                .get("manifests")
+                .and_then(serde_json::Value::as_array)
+        })
+        .flatten()
+        .and_then(|entries| {
+            // One index level: our packs publish one platform entry, and a
+            // multi-platform image names an image manifest per platform.
+            entries
+                .iter()
+                .find(|entry| {
+                    entry
+                        .get("digest")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+                        && entry_platform_matches_host(entry)
+                })
+                .or_else(|| {
+                    entries.iter().find(|entry| {
+                        entry
+                            .get("digest")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                    })
+                })
+                .and_then(|entry| entry.get("digest").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+        });
+    if let Some(digest) = selected {
+        (manifest_digest, manifest) = fetch_manifest(&client, &reference, &digest, image).await?;
+    }
+    let pinned = format!(
+        "{}/{}@{}",
+        reference.registry, reference.repository, manifest_digest
+    );
+    if let Some(layer) = manifest
+        .get("layers")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|layers| {
+            layers.iter().find(|layer| {
+                layer
+                    .get("mediaType")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(crate::oci::is_packed_vm_layer)
+            })
+        })
+    {
+        let digest = layer
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                VmError::InvalidSpec(format!("image `{image}` packed layer has no digest"))
+            })?;
+        return Ok(vec![Artifact {
+            format: Artifact::SMOLMACHINE.into(),
+            arch: host_arch().into(),
+            reference: pinned,
+            digest: digest.to_owned(),
+            size_bytes: layer
+                .get("size")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        }]);
+    }
+    Ok(vec![Artifact {
+        format: Artifact::OCI_IMAGE.into(),
+        arch: host_arch().into(),
+        reference: pinned,
+        digest: manifest_digest,
+        size_bytes: 0,
+    }])
+}
+
+/// Fetch a manifest by tag or digest, returning the digest the registry
+/// served and the parsed body.
+async fn fetch_manifest(
+    client: &reqwest::Client,
+    reference: &crate::oci::OciReference,
+    at: &str,
+    image: &str,
+) -> Result<(String, serde_json::Value), VmError> {
+    let url = reference.manifest_url(at);
+    let response = crate::oci::registry_get(
+        client,
+        client,
+        &url,
+        &reference.repository,
+        crate::oci::MANIFEST_ACCEPT,
+        None,
+        None,
+        None,
+    )
+    .await
+    .map_err(|error| VmError::InvalidSpec(format!("resolving image `{image}`: {error}")))?;
+    let served = response
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.bytes().await.map_err(|error| {
+        VmError::InvalidSpec(format!("reading image `{image}` manifest: {error}"))
+    })?;
+    let digest = served.unwrap_or_else(|| format!("sha256:{}", hex::encode(Sha256::digest(&body))));
+    if !digest.starts_with("sha256:") {
+        return Err(VmError::InvalidSpec(format!(
+            "image `{image}` manifest digest `{digest}` is not sha256"
+        )));
+    }
+    let manifest = serde_json::from_slice(&body).map_err(|error| {
+        VmError::InvalidSpec(format!("image `{image}` manifest is not JSON: {error}"))
+    })?;
+    Ok((digest, manifest))
+}
+
+fn entry_platform_matches_host(entry: &serde_json::Value) -> bool {
+    let platform = entry.get("platform");
+    let os = platform
+        .and_then(|platform| platform.get("os"))
+        .and_then(serde_json::Value::as_str);
+    let arch = platform
+        .and_then(|platform| platform.get("architecture"))
+        .and_then(serde_json::Value::as_str);
+    os == Some("linux") && arch.is_some_and(|arch| crate::oci::host_arch_aliases().contains(&arch))
+}
+
+fn registry_client() -> Result<reqwest::Client, VmError> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent(concat!("preloop-orchestrator/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| VmError::InvalidSpec(format!("building the registry client: {error}")))
+}
+
+/// Template name derived from the artifact content: a rebuilt pack yields a
+/// new digest, and therefore a new template.
+fn image_template_name(artifacts: &[Artifact]) -> String {
+    let mut canonical = String::new();
+    for artifact in artifacts {
+        canonical.push_str(&artifact.format);
+        canonical.push('\u{0}');
+        canonical.push_str(&artifact.arch);
+        canonical.push('\u{0}');
+        canonical.push_str(&artifact.digest);
+        canonical.push('\u{0}');
+        canonical.push_str(&artifact.reference);
+        canonical.push('\n');
+    }
+    let digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+    format!("image-{}", &digest[..16])
 }
 
 impl SandboxMachines {
@@ -102,6 +389,7 @@ impl SandboxMachines {
             requires,
             capabilities,
             entries: Mutex::new(HashMap::new()),
+            images: Mutex::new(HashMap::new()),
             snapshot_lock: Mutex::new(()),
             generation: std::sync::atomic::AtomicU64::new(0),
         });
@@ -166,19 +454,41 @@ impl SandboxMachines {
         }
     }
 
+    /// The template for `image`, registered by content digest.
+    ///
+    /// A local pack is hashed, so rebuilding it registers a new template whose
+    /// name derives from the new digest; a registry tag is resolved to the
+    /// digest the registry actually serves before it is registered.
     async fn ensure_image_template(&self, image: &str) -> Result<String, VmError> {
-        let digest = hex::encode(Sha256::digest(image.as_bytes()));
-        let name = format!("image-{}", &digest[..16]);
+        let fingerprint = image_fingerprint(image);
+        if let Some(fingerprint) = &fingerprint {
+            let cached = self.images.lock().await.get(image).cloned();
+            if let Some(cached) = cached.filter(|cached| &cached.fingerprint == fingerprint) {
+                self.api
+                    .put_template(cached.template.clone())
+                    .await
+                    .map_err(|error| sandbox_error("template", error))?;
+                return Ok(cached.template.name);
+            }
+        }
+        let template = match local_image_recipe(image, &self.requires.driver) {
+            Some(template) => template,
+            None => image_template(image).await?,
+        };
         self.api
-            .put_template(TemplateSpec {
-                name: name.clone(),
-                os: "linux".into(),
-                image: Some(image.to_owned()),
-                ..TemplateSpec::default()
-            })
+            .put_template(template.clone())
             .await
-            .map_err(|e| sandbox_error("template", e))?;
-        Ok(name)
+            .map_err(|error| sandbox_error("template", error))?;
+        if let Some(fingerprint) = fingerprint {
+            self.images.lock().await.insert(
+                image.to_owned(),
+                CachedImage {
+                    fingerprint,
+                    template: template.clone(),
+                },
+            );
+        }
+        Ok(template.name)
     }
 
     async fn acquire(
@@ -1070,5 +1380,74 @@ impl VmProvider for SandboxMachines {
                 "pack needs the sandbox on this host's SmolVM".into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_local_pack_registers_by_content_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("base.smolmachine");
+        std::fs::write(&pack, b"first pack").unwrap();
+
+        let template = image_template(pack.to_str().unwrap()).await.unwrap();
+        assert_eq!(template.artifacts.len(), 1);
+        let artifact = &template.artifacts[0];
+        assert_eq!(artifact.format, Artifact::SMOLMACHINE);
+        assert_eq!(artifact.arch, host_arch());
+        assert_eq!(
+            artifact.digest,
+            format!("sha256:{}", hex::encode(Sha256::digest(b"first pack")))
+        );
+        assert_eq!(
+            artifact.reference,
+            format!("file://{}", std::fs::canonicalize(&pack).unwrap().display())
+        );
+        assert_eq!(artifact.size_bytes, b"first pack".len() as u64);
+        assert_eq!(template.name, image_template_name(&template.artifacts));
+        assert!(template.name.starts_with("image-"));
+
+        // The same path with new content is a new template: a rebuilt pack
+        // must never be mistaken for the one it replaced.
+        std::fs::write(&pack, b"second pack").unwrap();
+        let rebuilt = image_template(pack.to_str().unwrap()).await.unwrap();
+        assert_ne!(rebuilt.artifacts[0].digest, artifact.digest);
+        assert_ne!(rebuilt.name, template.name);
+    }
+
+    #[test]
+    fn a_digest_pinned_image_is_its_own_fingerprint_and_a_tag_is_not() {
+        let pinned = format!("ghcr.io/preloop/base@sha256:{}", "a".repeat(64));
+        assert_eq!(image_fingerprint(&pinned), Some(format!("pinned:{pinned}")));
+        assert_eq!(image_fingerprint("ghcr.io/preloop/base:latest"), None);
+    }
+
+    #[test]
+    fn local_image_archives_and_rootfs_directories_stay_recipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        std::fs::write(&archive, b"image archive").unwrap();
+        let template = local_image_recipe(archive.to_str().unwrap(), "smolvm").unwrap();
+        assert!(template.artifacts.is_empty());
+        assert!(
+            template
+                .recipe
+                .as_deref()
+                .is_some_and(|recipe| recipe.starts_with("image:")),
+            "{:?}",
+            template.recipe
+        );
+        assert_eq!(template.requires.driver, "smolvm");
+
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let template = local_image_recipe(rootfs.to_str().unwrap(), "smolvm").unwrap();
+        assert!(template.artifacts.is_empty());
+        assert!(template.recipe.is_some());
+
+        assert!(local_image_recipe("alpine:3.20", "smolvm").is_none());
     }
 }
