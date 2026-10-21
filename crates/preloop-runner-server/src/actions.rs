@@ -693,10 +693,11 @@ pub const MAX_ACTION_CONCURRENCY: usize = 16;
 /// A manifest past the budget is not read, so whatever only it would authorize
 /// stays denied for this wave and is retried on the next one.
 const MAX_MANIFEST_FETCHES_PER_ADJUDICATION: usize = 256;
-/// Most manifest directories one adjudication reads for one repository at one
-/// ref, the repository root included. A workflow naming a repository at many
-/// subpaths cannot multiply reads past this.
-const MAX_MANIFEST_DIRECTORIES_PER_REF: usize = 16;
+/// Most subdirectories one adjudication fans out to for one repository at one
+/// ref: those the workflow declares or a manifest names, for a request that
+/// names no directory. A request's own directory, the root manifest and ledger
+/// seeds are not counted, and the fetch budget bounds the reads either way.
+const MAX_MANIFEST_DIRECTORIES_PER_REF: usize = 64;
 
 type ResolvedActionParts = (String, String, String, Option<String>, String);
 
@@ -2593,50 +2594,68 @@ fn push_working_sources(
             RequestedDirectory::Unspecified => {
                 sources.push(scope, git_ref, None);
                 for directory in declared.directories_for(scope).into_iter().flatten() {
-                    sources.push(scope, git_ref, directory.clone());
+                    sources.push_fanout(scope, git_ref, directory.clone());
                 }
             }
         }
         for directory in named.get(scope).into_iter().flatten() {
-            sources.push(scope, git_ref, directory.clone());
+            sources.push_fanout(scope, git_ref, directory.clone());
         }
     }
     for (scope, git_ref, _) in seeds {
         for directory in named.get(scope).into_iter().flatten() {
-            sources.push(scope, git_ref, directory.clone());
+            sources.push_fanout(scope, git_ref, directory.clone());
         }
     }
 }
 
-/// The manifests one adjudication reads: deduplicated, with at most
-/// [`MAX_MANIFEST_DIRECTORIES_PER_REF`] directories per repository and ref, and
-/// at most as many entries as the run's ledger holds.
+/// The manifests one adjudication reads: deduplicated, and bounded by the
+/// run's ledger. Fan-out subdirectories are also capped per repository and ref
+/// (see [`MAX_MANIFEST_DIRECTORIES_PER_REF`]). A request's own directory, the
+/// root and ledger seeds are not, so a batch naming more subdirectories of one
+/// repository than the fan-out limit still reads each of them.
 #[derive(Default)]
 struct ManifestSources {
     seen: BTreeSet<ManifestSource>,
     entries: Vec<ManifestSource>,
-    per_ref: BTreeMap<(String, String), usize>,
+    /// Fan-out subdirectories queued, per repository and ref.
+    fanout_per_ref: BTreeMap<(String, String), usize>,
     /// A source was dropped by a limit.
     truncated: bool,
 }
 
 impl ManifestSources {
+    /// Queue a manifest a request, the root, or the ledger names.
     fn push(&mut self, scope: &str, git_ref: &str, directory: Option<String>) {
+        self.insert(scope, git_ref, directory, false);
+    }
+
+    /// Queue a subdirectory a workflow declares or a manifest names for a
+    /// repository a request admits.
+    fn push_fanout(&mut self, scope: &str, git_ref: &str, directory: Option<String>) {
+        self.insert(scope, git_ref, directory, true);
+    }
+
+    fn insert(&mut self, scope: &str, git_ref: &str, directory: Option<String>, fanout: bool) {
         let source: ManifestSource = (scope.to_owned(), git_ref.to_owned(), directory);
         if self.seen.contains(&source) {
             return;
         }
-        let directories = self
-            .per_ref
-            .entry((scope.to_owned(), git_ref.to_owned()))
-            .or_default();
-        if *directories >= MAX_MANIFEST_DIRECTORIES_PER_REF
-            || self.entries.len() >= crate::state::MAX_RESOLVED_USES_PER_RUN
-        {
+        if self.entries.len() >= crate::state::MAX_RESOLVED_USES_PER_RUN {
             self.truncated = true;
             return;
         }
-        *directories += 1;
+        if fanout && source.2.is_some() {
+            let queued = self
+                .fanout_per_ref
+                .entry((scope.to_owned(), git_ref.to_owned()))
+                .or_default();
+            if *queued >= MAX_MANIFEST_DIRECTORIES_PER_REF {
+                self.truncated = true;
+                return;
+            }
+            *queued += 1;
+        }
         self.seen.insert(source.clone());
         self.entries.push(source);
     }
@@ -4758,10 +4777,11 @@ jobs:
         }
     }
 
-    /// One adjudication reads at most [`MAX_MANIFEST_DIRECTORIES_PER_REF`]
-    /// directories for a repository at one ref, however many subpaths the
-    /// workflow declares for it. The unlisted request in the same batch is what
-    /// runs the closure; it stays denied.
+    /// One adjudication fans out to at most [`MAX_MANIFEST_DIRECTORIES_PER_REF`]
+    /// subdirectories of a repository at one ref, however many subpaths the
+    /// workflow declares for it, and always reads the root as well. The
+    /// unlisted request in the same batch is what runs the closure; it stays
+    /// denied.
     #[tokio::test]
     async fn declared_subpath_directories_are_bounded_per_adjudication() {
         let fixture = forge_fixture(
@@ -4806,7 +4826,7 @@ jobs:
             .collect();
         assert_eq!(
             directories.len(),
-            MAX_MANIFEST_DIRECTORIES_PER_REF,
+            MAX_MANIFEST_DIRECTORIES_PER_REF + 1,
             "{directories:?}"
         );
     }
@@ -4861,6 +4881,62 @@ jobs:
                 .iter()
                 .any(|(path, git_ref, _)| path == "setup/action.yml" && git_ref == "v1"),
             "the subdirectory manifest must be read: {contents:?}"
+        );
+    }
+
+    /// A batch may name more subdirectories of one repository and ref than the
+    /// fan-out limit. Each request names its own directory, so every one is
+    /// read, and the nested action of the last is admitted in a later wave.
+    #[tokio::test]
+    async fn requested_subdirectories_are_not_capped_by_the_fan_out_limit() {
+        let count = MAX_MANIFEST_DIRECTORIES_PER_REF + 4;
+        let last = format!("sub{}", count - 1);
+        let mut files = BTreeMap::new();
+        let mut declared = DeclaredActions::default();
+        let mut batch = Vec::new();
+        for index in 0..count {
+            let directory = format!("sub{index}");
+            let manifest = if directory == last {
+                composite_manifest(&["pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0"])
+            } else {
+                composite_manifest(&[])
+            };
+            files.insert(format!("{directory}/action.yml"), manifest);
+            declared.insert("acme/actions".to_owned(), Some(directory.clone()));
+            batch.push(ActionRequest::new(
+                format!("acme/actions/{directory}"),
+                Some("v1".to_owned()),
+            ));
+        }
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        enforce_declared_actions(&fixture.shared.state, run_id, &declared, &batch)
+            .await
+            .expect("every requested subdirectory is declared");
+
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("pnpm/action-setup", Some(NESTED_REF))]),
+        )
+        .await
+        .expect("the last subdirectory's nested action must be admitted");
+
+        let contents = fixture.stub.contents.lock().clone();
+        assert!(
+            contents
+                .iter()
+                .any(|(path, git_ref, _)| path == &format!("{last}/action.yml") && git_ref == "v1"),
+            "the last requested subdirectory must be read"
         );
     }
 
