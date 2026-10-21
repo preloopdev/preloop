@@ -2139,3 +2139,560 @@ async fn cancel_shim_409s_an_archived_run() {
         "the 409 must be GitHub-shaped: {body}"
     );
 }
+
+// ─── webhook coverage cache and lifecycle invalidation ─────────────────
+
+/// Loopback GitHub API for `GET /repos/{owner}/{repo}/installation`, with
+/// per-repository answers and a barrier on the first request. Counts lookups
+/// per repository so cache hits, invalidation, and single-flight are observable
+/// without sleeping.
+struct WebhookCoverageStub {
+    base: String,
+    lookups: Arc<std::sync::atomic::AtomicUsize>,
+    by_repo: Arc<parking_lot::Mutex<std::collections::HashMap<String, usize>>>,
+    answers: Arc<parking_lot::Mutex<std::collections::HashMap<String, (u16, Value)>>>,
+    raw_answers: Arc<parking_lot::Mutex<std::collections::HashMap<String, (u16, String)>>>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl WebhookCoverageStub {
+    async fn start(block_first: bool) -> Self {
+        use axum::extract::Path;
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let by_repo: Arc<parking_lot::Mutex<std::collections::HashMap<String, usize>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let answers: Arc<parking_lot::Mutex<std::collections::HashMap<String, (u16, Value)>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let raw_answers: Arc<parking_lot::Mutex<std::collections::HashMap<String, (u16, String)>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let served = Arc::clone(&lookups);
+        let repo_counts = Arc::clone(&by_repo);
+        let configured = Arc::clone(&answers);
+        let raw_configured = Arc::clone(&raw_answers);
+        let started = Arc::clone(&entered);
+        let resume = Arc::clone(&release);
+        let stub = Router::new().route(
+            "/repos/{owner}/{repo}/installation",
+            get(
+                move |Path((owner, repo)): Path<(String, String)>, _headers: HeaderMap| {
+                    let served = Arc::clone(&served);
+                    let repo_counts = Arc::clone(&repo_counts);
+                    let configured = Arc::clone(&configured);
+                    let raw_configured = Arc::clone(&raw_configured);
+                    let started = Arc::clone(&started);
+                    let resume = Arc::clone(&resume);
+                    async move {
+                        let key = format!("{owner}/{repo}").to_ascii_lowercase();
+                        let call = served.fetch_add(1, Ordering::SeqCst);
+                        *repo_counts.lock().entry(key.clone()).or_insert(0) += 1;
+                        let answer = configured
+                            .lock()
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| (404, json!({ "message": "Not Found" })));
+                        let raw = raw_configured.lock().get(&key).cloned();
+                        if block_first && call == 0 {
+                            started.notify_one();
+                            resume.notified().await;
+                        }
+                        match raw {
+                            Some((status, body)) => (
+                                axum::http::StatusCode::from_u16(status).expect("stub status code"),
+                                body,
+                            )
+                                .into_response(),
+                            None => {
+                                let status = axum::http::StatusCode::from_u16(answer.0)
+                                    .expect("stub status code");
+                                (status, Json(answer.1)).into_response()
+                            }
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+        Self {
+            base,
+            lookups,
+            by_repo,
+            answers,
+            raw_answers,
+            entered,
+            release,
+        }
+    }
+
+    fn set(&self, repository: &str, status: u16, body: Value) {
+        let key = repository.to_ascii_lowercase();
+        self.answers.lock().insert(key.clone(), (status, body));
+        self.raw_answers.lock().remove(&key);
+    }
+
+    fn set_raw(&self, repository: &str, status: u16, body: &str) {
+        let key = repository.to_ascii_lowercase();
+        self.raw_answers
+            .lock()
+            .insert(key.clone(), (status, body.to_owned()));
+        self.answers.lock().remove(&key);
+    }
+
+    fn lookups_for(&self, repository: &str) -> usize {
+        self.by_repo
+            .lock()
+            .get(&repository.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn total_lookups(&self) -> usize {
+        self.lookups.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if condition() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition was not reached"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Two registered Apps with distinct webhook secrets and exact-repository
+/// installation answers served by the loopback stub.
+async fn webhook_coverage_fixture() -> (tempfile::TempDir, AppState, Router) {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+    let (mut registry, _) = two_app_registry();
+    registry.apps[0].webhook_secret = Some("default-secret".to_owned());
+    state.webhook_secret = Some("legacy-secret".to_owned());
+    state.github_apps = Some(registry);
+    let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
+    (temp, state, app)
+}
+
+fn coverage_ping(repository: &str) -> Value {
+    json!({ "repository": { "full_name": repository } })
+}
+
+fn coverage_installation(app_id: u64) -> Value {
+    json!({ "id": 77, "app_id": app_id })
+}
+
+/// Only the App whose secret verifies a lifecycle payload may change its cached
+/// answers. Unsigned payloads and payloads claiming another `app_id` affect
+/// nothing; a valid removal invalidates the signer's answer immediately.
+#[tokio::test]
+async fn signed_lifecycle_events_invalidate_only_their_own_app_coverage() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 1);
+
+    let removal = json!({
+        "action": "removed",
+        "repositories_removed": [{ "full_name": "org-a/repo" }],
+    });
+    assert_eq!(
+        deliver_webhook(&app, "installation_repositories", &removal, "wrong-secret").await,
+        StatusCode::UNAUTHORIZED,
+        "an invalid signature must be rejected before any cache mutation"
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        1,
+        "an unsigned lifecycle payload must not invalidate the cache"
+    );
+
+    // App 525 is a different verified signer. Its lifecycle payload cannot
+    // invalidate App 424's answer, even when it claims app_id 424.
+    let foreign = json!({
+        "action": "deleted",
+        "installation": { "id": 9, "app_id": 424 },
+        "repositories_removed": [{ "full_name": "org-a/repo" }],
+    });
+    assert_eq!(
+        deliver_webhook(&app, "installation", &foreign, "second-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        1,
+        "another App's lifecycle event must not invalidate App 424's cache"
+    );
+
+    // The signer's own verified removal invalidates its answer.
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &removal,
+            "default-secret"
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        2,
+        "the next ordinary delivery re-confirms after invalidation"
+    );
+    // The signer reports the repository revoked; the next delivery must see
+    // the 404 immediately rather than reuse the re-confirmed positive.
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &removal,
+            "default-secret"
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    stub.set("org-a/repo", 404, json!({ "message": "Not Found" }));
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN,
+        "a revoked repository is denied immediately, not after the TTL"
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 3);
+}
+
+/// Suspension and deletion clear the signer's answers before the ordinary gate,
+/// so the next delivery checks GitHub again. A 200 with `suspended_at` is not
+/// active coverage.
+#[tokio::test]
+async fn lifecycle_suspension_and_deletion_deny_the_next_delivery() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation",
+            &json!({ "action": "suspend", "installation": { "id": 7, "app_id": 424 } }),
+            "default-secret",
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    stub.set(
+        "org-a/repo",
+        200,
+        json!({
+            "id": 77,
+            "app_id": 424,
+            "suspended_at": "2026-10-20T00:00:00Z",
+        }),
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN,
+        "a suspended installation is not coverage"
+    );
+
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation",
+            &json!({ "action": "deleted", "installation": { "id": 7, "app_id": 424 } }),
+            "default-secret",
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    stub.set("org-a/repo", 404, json!({ "message": "Not Found" }));
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        3,
+        "each lifecycle event forced a fresh lookup"
+    );
+}
+
+/// A signed `installation_repositories` addition invalidates the affected
+/// answer, so the next ordinary delivery confirms current access.
+#[tokio::test]
+async fn adding_a_repository_invalidates_its_previous_answer() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+
+    // First delivery sees a definitive 404 and is denied; the 404 is not
+    // retained, so a later grant works without waiting for a TTL.
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 1);
+    stub.set("org-a/repo", 200, coverage_installation(424));
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 2);
+
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &json!({
+                "action": "added",
+                "repositories_added": [{ "full_name": "org-a/repo" }],
+            }),
+            "default-secret",
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        3,
+        "the addition invalidated the cached positive for the next ordinary delivery"
+    );
+}
+
+/// A positive lookup that began before a signed removal completes afterwards:
+/// it must neither repopulate the cache nor authorize its own delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_positive_after_invalidation_neither_repopulates_nor_authorizes() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(true).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+
+    let app_for_slow = app.clone();
+    let slow = tokio::spawn(async move {
+        deliver_webhook(
+            &app_for_slow,
+            "ping",
+            &coverage_ping("org-a/repo"),
+            "default-secret",
+        )
+        .await
+    });
+    stub.wait_entered().await;
+
+    let removal = json!({
+        "action": "removed",
+        "repositories_removed": [{ "full_name": "org-a/repo" }],
+    });
+    let lifecycle = tokio::time::timeout(
+        Duration::from_secs(2),
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &removal,
+            "default-secret",
+        ),
+    )
+    .await
+    .expect("the lifecycle request must not wait behind the blocked lookup");
+    assert_eq!(lifecycle, StatusCode::ACCEPTED);
+
+    stub.set("org-a/repo", 404, json!({ "message": "Not Found" }));
+    stub.release();
+    assert_eq!(
+        slow.await.unwrap(),
+        StatusCode::FORBIDDEN,
+        "a lookup begun before invalidation must not authorize its delivery"
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        2,
+        "the stale positive was not cached; the next delivery looked again"
+    );
+}
+
+/// Same-repository deliveries arriving together share one coverage lookup;
+/// an independent repository does not wait behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_webhook_deliveries_coalesce_by_repository() {
+    let (_temp, state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(true).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+    stub.set("org-a/other", 200, coverage_installation(424));
+    let app_creds = state
+        .github_apps
+        .as_ref()
+        .expect("registry")
+        .app_by_id("424")
+        .expect("default App")
+        .clone();
+
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move {
+            deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await
+        }
+    });
+    stub.wait_entered().await;
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move {
+            deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await
+        }
+    });
+    wait_until(|| app_creds.coverage_flight_waiters("org-a/repo") >= 1).await;
+
+    let other = tokio::spawn({
+        let app = app.clone();
+        async move {
+            deliver_webhook(
+                &app,
+                "ping",
+                &coverage_ping("org-a/other"),
+                "default-secret",
+            )
+            .await
+        }
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), other)
+            .await
+            .expect("an independent repository must not wait behind the blocked lookup")
+            .unwrap(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(stub.lookups_for("org-a/other"), 1);
+
+    stub.release();
+    assert_eq!(first.await.unwrap(), StatusCode::ACCEPTED);
+    assert_eq!(second.await.unwrap(), StatusCode::ACCEPTED);
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        1,
+        "the same-repository delivery shared the in-flight lookup"
+    );
+    assert_eq!(stub.total_lookups(), 2);
+}
+
+/// Malformed, foreign-App, and transient answers deny the delivery without
+/// teaching the cache; a healthy answer immediately after is accepted.
+#[tokio::test]
+async fn unusable_coverage_answers_are_retried_not_cached() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+
+    for (status, body) in [
+        (200, json!({ "id": 77, "app_id": 999 })),
+        (200, json!({ "id": 77 })),
+        (500, json!({ "message": "outage" })),
+        (429, json!({ "message": "rate limited" })),
+    ] {
+        stub.set("org-a/repo", status, body);
+        assert_eq!(
+            deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+            StatusCode::FORBIDDEN,
+            "{status} was not a valid positive, so the delivery fails closed"
+        );
+    }
+    stub.set_raw("org-a/repo", 200, r#"{"id": 77, "app_id": "#);
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN,
+        "invalid JSON is not a positive"
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 5);
+    stub.set("org-a/repo", 200, coverage_installation(424));
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        6,
+        "none of the unusable answers was retained"
+    );
+}
+
+/// The verified signer is persisted with the delivery, and a legacy delivery
+/// records no App identity.
+#[tokio::test]
+async fn verified_signer_is_persisted_for_durable_processing() {
+    let (_temp, state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    let claimed = state.backend.claim_webhook_deliveries(1, 60).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].signer_app_id.as_deref(), Some("424"));
+
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "legacy-secret").await,
+        StatusCode::ACCEPTED
+    );
+    let claimed = state.backend.claim_webhook_deliveries(1, 60).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(
+        claimed[0].signer_app_id, None,
+        "the legacy shared secret has no App identity"
+    );
+}

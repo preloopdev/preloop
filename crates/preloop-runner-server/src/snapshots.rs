@@ -481,6 +481,7 @@ pub async fn create_workspace_snapshot(
             &staging_repository,
             &staging_index,
             &final_repository,
+            shared,
             github_pat,
             merge,
             origin_url.as_deref(),
@@ -1178,12 +1179,30 @@ async fn missing_snapshot_objects(repository: &FsPath) -> Result<u64, ApiError> 
         .count() as u64)
 }
 
+/// Count the objects that `rev` reaches and the cache lacks.
+///
+/// Unlike [`missing_snapshot_objects`], which walks every ref, this sees only
+/// what one commit needs. A hole that only a dangling or unfetched ref reaches
+/// does not count against the snapshot built on `rev`.
+async fn missing_objects_reachable_from(repository: &FsPath, rev: &str) -> Result<u64, ApiError> {
+    let mut verify = Command::new("git");
+    verify
+        .env("GIT_DIR", repository)
+        .args(["rev-list", "--objects", "--missing=print", rev]);
+    let output = run_git(&mut verify, "verify snapshot object cache HEAD history").await?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with('?'))
+        .count() as u64)
+}
+
 async fn create_workspace_snapshot_inner(
     state_dir: &FsPath,
     workspace: &FsPath,
     staging_repository: &FsPath,
     staging_index: &FsPath,
     final_repository: &FsPath,
+    shared: Option<&SharedState>,
     github_pat: Option<&str>,
     merge: Option<&crate::merge_builder::LocalPullRequestMerge>,
     origin_url: Option<&str>,
@@ -1223,6 +1242,7 @@ async fn create_workspace_snapshot_inner(
         workspace,
         &common_dir,
         source_head.as_deref(),
+        shared,
         github_pat,
     )
     .await?;
@@ -2804,6 +2824,7 @@ async fn ensure_object_cache(
     workspace: &FsPath,
     common_dir: &FsPath,
     source_head: Option<&str>,
+    shared: Option<&SharedState>,
     github_pat: Option<&str>,
 ) -> Result<ObjectCache, ApiError> {
     use sha2::Digest;
@@ -2921,6 +2942,9 @@ async fn ensure_object_cache(
     // remote while the lock is held; once complete it stays complete and
     // later runs skip the fetch entirely.
     let mut ancestry_complete = !repository.join("shallow").is_file();
+    // Set only when a partial clone left holes. A shallow cache has a boundary
+    // the snapshot can rewrite around, so it never takes the refusal below.
+    let mut holes = false;
     if ancestry_complete {
         // A cache cloned from a `--filter=blob:none` workspace inherits the
         // promisor pack contents (commits and trees but no blobs) without
@@ -2941,15 +2965,33 @@ async fn ensure_object_cache(
                 "snapshot object cache is missing objects (partial-clone workspace?); deepening from the remote"
             );
             ancestry_complete = false;
+            holes = true;
         }
     }
     if !ancestry_complete {
         ancestry_complete =
-            deepen_object_cache_from_remote(&repository, workspace, github_pat).await;
+            deepen_object_cache_from_remote(&repository, workspace, shared, github_pat).await;
         if ancestry_complete {
             ancestry_complete = missing_snapshot_objects(&repository).await? == 0;
         }
         refreshed = refreshed || ancestry_complete;
+    }
+    // The snapshot is served from its HEAD commit: the staged tree is checked
+    // out, and the parent chain is what fetches and diffs walk. So HEAD's own
+    // history must be complete. Holes that only other refs reach (a branch a
+    // partial clone never fetched, a dangling tag) are tolerated: publish
+    // advertises only refs whose targets exist, and deep history a job cannot
+    // read is rerouted to the forge. A reused cache skips fsck, so this check
+    // is what keeps an incomplete HEAD history out of the snapshot.
+    if let Some(head) = source_head.filter(|_| holes && !ancestry_complete)
+        && missing_objects_reachable_from(&repository, head).await? > 0
+    {
+        return Err(ApiError::internal(format!(
+            "snapshot object cache {} is missing objects that HEAD {head} reaches; the \
+             workspace remote could not supply them, so the workspace is likely a partial \
+             clone. Fetch the missing objects (or clone without `--filter`), then resubmit",
+            repository.display()
+        )));
     }
     let mut index = repository.as_os_str().to_owned();
     index.push(".index");
@@ -3021,11 +3063,17 @@ async fn present_objects(
 /// plus a promisor remote it can reach); until then, correctness first.
 ///
 /// Best effort by design. No remote, no network, or a private repository
-/// without credentials simply leaves the cache shallow and the caller falls
-/// back to rewriting.
+/// without credentials simply leaves the cache incomplete. A shallow cache
+/// then falls back to rewriting its history; a partial clone has no boundary
+/// to rewrite around, so `ensure_object_cache` refuses it when HEAD's own
+/// history is still incomplete.
+///
+/// Heads and tags are both fetched: an object reachable only from a tag is
+/// absent from every head. The credential is chosen by `deepen_remote`.
 async fn deepen_object_cache_from_remote(
     repository: &FsPath,
     workspace: &FsPath,
+    shared: Option<&SharedState>,
     github_pat: Option<&str>,
 ) -> bool {
     let remote = Command::new("git")
@@ -3056,20 +3104,22 @@ async fn deepen_object_cache_from_remote(
         // Refetch asks Git to transfer those promisor objects too.
         fetch.arg("--refetch");
     }
-    if let Some((key, value)) = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat))
-    {
-        // A private remote rejects the anonymous unshallow; the engine's own
-        // GitHub credential (already used for action downloads) closes it.
-        // Scoped by `github_auth_header_for_remote` so the PAT is never sent
-        // to a host the operator did not configure it for.
+    // A private remote rejects the anonymous unshallow. The engine's read
+    // credential (App installation token first, then the PAT) closes it; see
+    // `deepen_remote` for where that credential may be sent.
+    let (fetch_url, auth) = deepen_remote(shared, &url, github_pat).await;
+    if let Some((key, value)) = auth {
         fetch
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", key)
             .env("GIT_CONFIG_VALUE_0", value);
     }
+    // Tags are fetched into their own namespace: an object reachable only from
+    // a tag (a release tag on a deleted branch) is absent from every head.
     fetch
-        .arg(&url)
-        .arg("+refs/heads/*:refs/remotes/preloop-upstream/*");
+        .arg(&fetch_url)
+        .arg("+refs/heads/*:refs/remotes/preloop-upstream/*")
+        .arg("+refs/tags/*:refs/remotes/preloop-upstream-tags/*");
     match run_git(&mut fetch, "deepen snapshot object cache").await {
         Ok(_) => !shallow_marker.is_file(),
         Err(error) => {
@@ -3147,35 +3197,40 @@ pub(crate) async fn forge_read_token(shared: &SharedState, repository: &str) -> 
     shared.state.static_github_pat()
 }
 
-/// Extra-header config that authenticates a deepen fetch against the engine's
-/// GitHub credential, or `None` when the remote is not GitHub.
+/// Where a deepen fetch goes, and the credential it carries.
 ///
-/// The static PAT is a GitHub credential; attaching it to any other host would
-/// leak it to a remote the operator never vouched for. Scope strictly: only
-/// `https://github.com/...` remotes get the header, matching what
-/// `actions/checkout` configures for its own auth.
-fn github_auth_header_for_remote(remote_url: &str, pat: &str) -> Option<(&'static str, String)> {
-    // The credential rides only over https to github.com: never over a
-    // plaintext remote, and never over an SSH remote (no scheme at all —
-    // SSH has its own key auth).
-    let (scheme, rest) = remote_url.split_once("://")?;
-    if scheme != "https" {
-        return None;
+/// A GitHub remote gets the engine's read credential: the App installation
+/// token when one covers the repository, otherwise the static PAT. The token
+/// rides only over HTTPS and only to the configured forge. An SSH origin is
+/// fetched over HTTPS to the same repository so the token can reach it; a
+/// plaintext `http://` origin never carries one. Every other remote keeps its
+/// URL and transport (SSH keys, or anonymous).
+async fn deepen_remote(
+    shared: Option<&SharedState>,
+    remote_url: &str,
+    github_pat: Option<&str>,
+) -> (String, Option<(String, String)>) {
+    let host = configured_github_host(shared);
+    let slug = parse_github_remote_slug(remote_url, &host)
+        .or_else(|| parse_github_remote_slug(&sanitize_remote_url(remote_url), &host));
+    let Some(slug) = slug.filter(|_| !remote_url.starts_with("http://")) else {
+        return (remote_url.to_owned(), None);
+    };
+    let token = match shared {
+        Some(shared) => forge_read_token(shared, &slug).await,
+        None => None,
     }
-    // Strip userinfo (`https://user:pass@github.com/...`) before extracting
-    // the host; the port separator `:` must not truncate a host either.
-    let authority = rest.rsplit('@').next().unwrap_or(rest);
-    let host = authority.split(['/', ':']).next().unwrap_or("");
-    if host != "github.com" {
-        return None;
-    }
-    use base64::Engine as _;
-    let encoded = base64::engine::general_purpose::STANDARD
-        .encode(format!("x-access-token:{pat}").as_bytes());
-    Some((
-        "http.https://github.com/.extraheader",
-        format!("AUTHORIZATION: basic {encoded}"),
-    ))
+    .or_else(|| github_pat.map(str::to_owned));
+    let Some(token) = token else {
+        return (remote_url.to_owned(), None);
+    };
+    let fetch_url = if remote_url.starts_with("https://") {
+        remote_url.to_owned()
+    } else {
+        format!("https://{host}/{slug}.git")
+    };
+    let header = scoped_fetch_auth_header(&fetch_url, &token);
+    (fetch_url, header)
 }
 /// Persist the workspace HEAD the cache was last synced to.
 ///
@@ -5282,18 +5337,24 @@ mod auth_scoping_tests {
         assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    #[test]
-    fn github_remote_gets_scoped_basic_header() {
-        let (key, value) = github_auth_header_for_remote(
+    #[tokio::test]
+    async fn deepen_remote_scopes_the_token_to_the_github_origin() {
+        let (url, auth) = deepen_remote(
+            None,
             "https://github.com/preloopdev/preloop-trigger-e2e-20260715.git",
-            "gho_secret",
+            Some("gho_secret"),
         )
-        .expect("github.com remote should get the header");
-        assert_eq!(key, "http.https://github.com/.extraheader");
+        .await;
+        assert_eq!(
+            url,
+            "https://github.com/preloopdev/preloop-trigger-e2e-20260715.git"
+        );
+        let (key, value) = auth.expect("github.com remote should get the token");
+        assert_eq!(key, "http.https://github.com/.extraHeader");
         // base64("x-access-token:gho_secret")
         assert_eq!(
             value,
-            "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hvX3NlY3JldA=="
+            "Authorization: basic eC1hY2Nlc3MtdG9rZW46Z2hvX3NlY3JldA=="
         );
     }
 
@@ -5336,30 +5397,48 @@ mod auth_scoping_tests {
         }
     }
 
-    #[test]
-    fn userinfo_in_remote_url_is_stripped_before_host_matching() {
-        let header = github_auth_header_for_remote(
-            "https://x-access-token:gho_secret@github.com/owner/repo.git",
-            "gho_secret",
-        );
-        assert!(header.is_some(), "userinfo must not defeat host matching");
-    }
-
-    #[test]
-    fn non_github_remote_never_receives_the_pat() {
+    #[tokio::test]
+    async fn deepen_remote_moves_a_github_ssh_origin_onto_https() {
         for url in [
-            "https://git.example.com/owner/repo.git",
-            "https://github.example.net/owner/repo.git",
-            "git@github.com:owner/repo.git", // SSH remotes have no scheme
-            "http://github.com/owner/repo.git", // https-only credential
+            "git@github.com:owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
         ] {
-            assert_eq!(
-                github_auth_header_for_remote(url, "gho_secret"),
-                None,
-                "PAT must not be attached to {url}"
-            );
+            let (fetch_url, auth) = deepen_remote(None, url, Some("gho_secret")).await;
+            assert_eq!(fetch_url, "https://github.com/owner/repo.git", "from {url}");
+            let (key, _) = auth.expect("the token rides over the HTTPS form");
+            assert_eq!(key, "http.https://github.com/.extraHeader");
         }
     }
+
+    #[tokio::test]
+    async fn deepen_remote_never_sends_a_token_elsewhere() {
+        for url in [
+            "http://github.com/owner/repo.git",
+            "https://git.example.com/owner/repo.git",
+            "https://github.example.net/owner/repo.git",
+        ] {
+            let (fetch_url, auth) = deepen_remote(None, url, Some("gho_secret")).await;
+            assert_eq!(fetch_url, url, "the origin is fetched unchanged");
+            assert!(auth.is_none(), "credential must not be attached to {url}");
+        }
+        // No credential configured: an SSH origin keeps its SSH transport.
+        let (fetch_url, auth) = deepen_remote(None, "git@github.com:owner/repo.git", None).await;
+        assert_eq!(fetch_url, "git@github.com:owner/repo.git");
+        assert!(auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn deepen_remote_keeps_userinfo_out_of_the_header_key() {
+        let (_, auth) = deepen_remote(
+            None,
+            "https://x-access-token:gho_secret@github.com/owner/repo.git",
+            Some("gho_secret"),
+        )
+        .await;
+        let (key, _) = auth.expect("userinfo must not defeat host matching");
+        assert_eq!(key, "http.https://github.com/.extraHeader");
+    }
+
     #[test]
     fn fetch_credential_is_scoped_to_the_upstream_origin() {
         let (key, value) =
@@ -5462,7 +5541,7 @@ mod deepen_and_redirect_tests {
             .unwrap();
         assert!(status.success());
 
-        let deepened = deepen_object_cache_from_remote(&repository, &workspace, None).await;
+        let deepened = deepen_object_cache_from_remote(&repository, &workspace, None, None).await;
         assert!(
             !deepened,
             "the deepen must fail against a refused connection"
@@ -7605,7 +7684,7 @@ mod object_cache_tests {
         let (work, common_dir, _, detached) = detached_workspace(temp.path());
         let state = temp.path().join("state");
 
-        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None)
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
             .await
             .unwrap();
 
@@ -7622,13 +7701,13 @@ mod object_cache_tests {
         let (work, common_dir, on_branch, _) = detached_workspace(temp.path());
         let state = temp.path().join("state");
         git(&work, &["checkout", "main"]);
-        ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+        ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None, None)
             .await
             .unwrap();
 
         git(&work, &["checkout", "--detach"]);
         let later = commit(&work, "later.txt");
-        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&later), None)
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&later), None, None)
             .await
             .unwrap();
 
@@ -7647,7 +7726,7 @@ mod object_cache_tests {
         let on_branch = commit(&work, "a.txt");
         let common_dir = std::fs::canonicalize(work.join(".git")).unwrap();
         let state = temp.path().join("state");
-        let seeded = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+        let seeded = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None, None)
             .await
             .unwrap();
 
@@ -7661,11 +7740,112 @@ mod object_cache_tests {
         marker.push(".last-head");
         std::fs::write(PathBuf::from(marker), format!("{detached}\n")).unwrap();
 
-        let healed = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None)
+        let healed = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
             .await
             .unwrap();
 
         assert!(cache_has(&healed, &detached));
+    }
+
+    /// A remote whose only route to a blob is the `v1` tag: the `side` branch
+    /// that carried `tagged.txt` is deleted before anyone clones. Returns the
+    /// remote and the `main` tip.
+    fn tag_only_history(root: &FsPath) -> (PathBuf, String) {
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["config", "uploadpack.allowFilter", "true"]);
+        commit(&source, "m1.txt");
+        let head = commit(&source, "m2.txt");
+        git(&source, &["checkout", "-b", "side"]);
+        commit(&source, "tagged.txt");
+        git(&source, &["tag", "v1"]);
+        git(&source, &["checkout", "main"]);
+        git(&source, &["branch", "-D", "side"]);
+        (source, head)
+    }
+
+    /// A reused cache whose HEAD history lost a blob must be refused. The
+    /// reused path skips fsck, so nothing else would catch it, and the staged
+    /// tree would name objects no job can read.
+    #[tokio::test]
+    async fn reused_cache_with_holes_under_head_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let (work, common_dir, _, detached) = detached_workspace(temp.path());
+        let state = temp.path().join("state");
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
+            .await
+            .unwrap();
+        let blob = git(&work, &["rev-parse", "HEAD:a.txt"]);
+        let object = loose_object(&cache.objects, &blob);
+        assert!(object.is_file(), "the fixture blob must be loose");
+        std::fs::remove_file(&object).unwrap();
+
+        let error = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
+            .await
+            .err()
+            .expect("a hole HEAD reaches, with no remote to repair it, must be refused");
+        assert!(
+            error.message().contains("missing objects"),
+            "unexpected error: {}",
+            error.message()
+        );
+    }
+
+    /// A hole only another branch reaches must not refuse the snapshot: HEAD is
+    /// complete, and publish leaves out refs whose targets are absent.
+    #[tokio::test]
+    async fn holes_off_head_do_not_refuse_the_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let (work, common_dir, _, detached) = detached_workspace(temp.path());
+        git(&work, &["checkout", "-b", "side"]);
+        let side = commit(&work, "side.txt");
+        git(&work, &["checkout", "--detach", detached.as_str()]);
+        let state = temp.path().join("state");
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
+            .await
+            .unwrap();
+        assert!(cache_has(&cache, &side));
+        let spec = format!("{side}:side.txt");
+        let side_blob = git(&work, &["rev-parse", spec.as_str()]);
+        std::fs::remove_file(loose_object(&cache.objects, &side_blob)).unwrap();
+
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
+            .await
+            .expect("a hole only the side branch reaches must not refuse HEAD");
+        assert!(!cache.ancestry_complete, "the hole is still there");
+    }
+
+    /// A partial clone whose origin is reachable must recover objects that only
+    /// a tag reaches, not just those on the branches.
+    #[tokio::test]
+    async fn deepen_fetches_objects_reachable_only_from_tags() {
+        let temp = tempfile::tempdir().unwrap();
+        let (source, head) = tag_only_history(temp.path());
+        let partial = temp.path().join("partial");
+        let origin = format!("file://{}", source.display());
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--filter=blob:none",
+                origin.as_str(),
+                "partial",
+            ],
+        );
+        let common_dir = std::fs::canonicalize(partial.join(".git")).unwrap();
+        let state = temp.path().join("state");
+
+        let cache = ensure_object_cache(&state, &partial, &common_dir, Some(&head), None, None)
+            .await
+            .expect("a partial clone with a reachable origin must build the cache");
+
+        assert!(
+            cache.ancestry_complete,
+            "the tag-only blob must be fetched too"
+        );
     }
 
     /// Path of a loose object inside an object directory.
@@ -7690,7 +7870,7 @@ mod object_cache_tests {
         std::fs::create_dir_all(&state).unwrap();
         assert!(!local_clone_can_hardlink(&common_dir, &state));
 
-        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None, None)
             .await
             .expect("a workspace on another filesystem must still build the cache");
 
@@ -7712,7 +7892,7 @@ mod object_cache_tests {
         let (work, common_dir, on_branch, _) = detached_workspace(temp.path());
         let state = temp.path().join("state");
 
-        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None, None)
             .await
             .unwrap();
 
