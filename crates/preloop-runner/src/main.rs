@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
         // Pin OTLP export TLS to the shared in-process roots when an operator
         // enables export: reqwest's default platform verifier can block on a
         // hung macOS trust daemon with no deadline.
-        .with_otel_client_builder(preloop_runner::client::tls::with_shared_roots_blocking);
+        .with_otel_client_builder(preloop_observability::tls::with_client_config_blocking);
     let (_observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     // first client build would otherwise read the OS certificate store on
     // whichever async worker needs a client first; the read is bounded (5 s)
     // but a hung store must not park a worker at all.
-    let _ = tokio::task::spawn_blocking(preloop_runner::client::tls::preload_roots).await;
+    let _ = tokio::task::spawn_blocking(preloop_observability::tls::preload_roots).await;
 
     let result = match cli.command {
         Commands::Configure(args) => {
@@ -155,7 +155,7 @@ async fn resolve_remote_workflows(
         .timeout(REMOTE_WORKFLOW_REQUEST_TIMEOUT)
         .connect_timeout(REMOTE_WORKFLOW_CONNECT_TIMEOUT)
         .user_agent("preloop-runner")
-        .use_preconfigured_tls(preloop_runner::client::tls::client_config(None)?)
+        .use_preconfigured_tls(preloop_observability::tls::client_config(None)?)
         .build()?;
     let token = env_or_test("PRELOOP_GITHUB_TOKEN");
     // Honour the engine's `PRELOOP_GITHUB_API_URL` override so `lint` against a

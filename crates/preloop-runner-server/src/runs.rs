@@ -1317,9 +1317,22 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // submission is validated against the mirror before anything is
         // served, and a failure is fatal — falling back to a forge checkout
         // would run the wrong tree.
-        match crate::merge_builder::attach_prebuilt_merge(shared, run_id, prebuilt).await {
-            Ok(snapshot) => Some(snapshot),
-            Err(error) => return Err(error.into_api_error()),
+        match capture_snapshot_within(
+            &shared.state.state_dir,
+            run_id,
+            SNAPSHOT_CAPTURE_TIMEOUT,
+            Box::pin(async {
+                crate::merge_builder::attach_prebuilt_merge(shared, run_id, prebuilt)
+                    .await
+                    .map_err(|error| error.into_api_error())
+            }),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            // A timeout and a capture failure are both fatal here: the commit
+            // exists only in the engine, so there is nothing to fall back to.
+            Ok(Err(error)) | Err(error) => return Err(error),
         }
     } else if let Some(workspace) = local_workspace {
         // The snapshot is a local submission's only copy of the tested tree:
@@ -1327,18 +1340,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // checkout to fall back to. Failing here reports the real reason (a
         // full disk, a publish that could not be completed) to the person who
         // submitted, instead of queueing jobs that can only die in setup.
-        match create_workspace_snapshot(
+        match capture_snapshot_within(
             &shared.state.state_dir,
-            workspace,
             run_id,
-            Some(shared),
-            shared.state.static_github_pat().as_deref(),
-            local_pull_request_merge.as_ref(),
+            SNAPSHOT_CAPTURE_TIMEOUT,
+            Box::pin(create_workspace_snapshot(
+                &shared.state.state_dir,
+                workspace,
+                run_id,
+                Some(shared),
+                shared.state.static_github_pat().as_deref(),
+                local_pull_request_merge.as_ref(),
+            )),
         )
         .await
         {
-            Ok(snapshot) => Some(snapshot),
-            Err(error) => {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            Ok(Err(error)) => {
                 error!(
                     %run_id,
                     workspace = %workspace.display(),
@@ -1347,17 +1365,36 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 );
                 return Err(error);
             }
+            // A timed-out capture has already removed this run's staging
+            // trees and carries its own operator-facing explanation.
+            Err(error) => return Err(error),
         }
     } else {
-        match create_remote_checkout_snapshot(shared, &submission, run_id, &sha).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
+        match capture_snapshot_within(
+            &shared.state.state_dir,
+            run_id,
+            SNAPSHOT_CAPTURE_TIMEOUT,
+            Box::pin(create_remote_checkout_snapshot(
+                shared,
+                &submission,
+                run_id,
+                &sha,
+            )),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => {
                 // The commit exists upstream, so jobs can still check out
                 // directly — degraded, never broken. Reported at error level
                 // because it is a full forge fetch per job, not a cache hit.
                 error!(%run_id, error = ?error, "Failed to populate remote checkout cache — jobs will fetch from the forge");
                 None
             }
+            // A capture that never finished is not a degraded cache hit: the
+            // engine cannot vouch for what the run would test, and queueing
+            // jobs silently would hide the hang. Fail the submission.
+            Err(error) => return Err(error),
         }
     };
 
