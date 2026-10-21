@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
+use super::contexts::JobContext;
 use crate::process;
 
 /// Registry credentials for pulling images from private registries.
@@ -286,11 +287,11 @@ fn parse_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
 // ── Docker CLI operations ────────────────────────────────────────────
 
 /// Check if Docker is available and return the server API version.
-pub async fn check_docker(log: &mut Vec<String>) -> Result<bool> {
+pub async fn check_docker(job: &JobContext, log: &mut Vec<String>) -> Result<bool> {
     log.push("##[group]Checking docker version".to_string());
 
-    let server = docker_cmd(&["version", "--format", "{{.Server.APIVersion}}"], log).await;
-    let client = docker_cmd(&["version", "--format", "{{.Client.APIVersion}}"], log).await;
+    let server = docker_cmd(&["version", "--format", "{{.Server.APIVersion}}"], job, log).await;
+    let client = docker_cmd(&["version", "--format", "{{.Client.APIVersion}}"], job, log).await;
 
     log.push("##[endgroup]".to_string());
 
@@ -298,7 +299,7 @@ pub async fn check_docker(log: &mut Vec<String>) -> Result<bool> {
 }
 
 /// Clean up stale containers/networks from previous jobs with this label.
-pub async fn cleanup_stale(label: &str, log: &mut Vec<String>) -> Result<()> {
+pub async fn cleanup_stale(label: &str, job: &JobContext, log: &mut Vec<String>) -> Result<()> {
     log.push("##[group]Clean up resources from previous jobs".to_string());
 
     // Find stale containers
@@ -310,6 +311,7 @@ pub async fn cleanup_stale(label: &str, log: &mut Vec<String>) -> Result<()> {
             "--no-trunc",
             &format!("--filter=label={label}"),
         ],
+        job,
         log,
     )
     .await?;
@@ -317,7 +319,7 @@ pub async fn cleanup_stale(label: &str, log: &mut Vec<String>) -> Result<()> {
     // Remove any found containers
     for line in &result {
         if !line.is_empty() {
-            let _ = docker_cmd(&["rm", "--force", line], log).await;
+            let _ = docker_cmd(&["rm", "--force", line], job, log).await;
         }
     }
 
@@ -329,6 +331,7 @@ pub async fn cleanup_stale(label: &str, log: &mut Vec<String>) -> Result<()> {
             "--force",
             &format!("--filter=label={label}"),
         ],
+        job,
         log,
     )
     .await?;
@@ -338,9 +341,14 @@ pub async fn cleanup_stale(label: &str, log: &mut Vec<String>) -> Result<()> {
 }
 
 /// Create the job Docker network.
-pub async fn create_network(network: &str, label: &str, log: &mut Vec<String>) -> Result<()> {
+pub async fn create_network(
+    network: &str,
+    label: &str,
+    job: &JobContext,
+    log: &mut Vec<String>,
+) -> Result<()> {
     log.push("##[group]Create local container network".to_string());
-    docker_cmd(&["network", "create", "--label", label, network], log).await?;
+    docker_cmd(&["network", "create", "--label", label, network], job, log).await?;
     log.push("##[endgroup]".to_string());
     Ok(())
 }
@@ -354,25 +362,30 @@ pub async fn create_network(network: &str, label: &str, log: &mut Vec<String>) -
 pub async fn pull_image(
     image: &str,
     credentials: Option<&RegistryCredentials>,
+    job: &JobContext,
     log: &mut Vec<String>,
 ) -> Result<()> {
     if let Some(creds) = credentials {
-        let config_dir = docker_registry_login(image, creds, log).await?;
+        let config_dir = docker_registry_login(image, creds, job, log).await?;
         let config_path = config_dir.path().to_string_lossy().to_string();
-        let result = docker_cmd(&["--config", &config_path, "pull", image], log).await;
+        let result = docker_cmd(&["--config", &config_path, "pull", image], job, log).await;
         drop(config_dir); // deletes temp credentials dir
         result?;
     } else {
-        docker_cmd(&["pull", image], log).await?;
+        docker_cmd(&["pull", image], job, log).await?;
     }
     Ok(())
 }
 
-/// Start the job container (long-running with `tail -f /dev/null` entrypoint).
+/// Prepare the job container's `docker create` invocation: build its argv and
+/// register every credential-shaped `-e NAME=VALUE` value as a job mask (see
+/// [`register_credential_env_masks`]).
 ///
-/// Returns the full container ID.
+/// The entry point plans before recording any `##[command]`/`debug!` line, so
+/// registration beats every sink that can mention the values: the recorded
+/// command line, service `docker logs` output, and `docker inspect` env dumps.
 #[allow(clippy::too_many_arguments)]
-pub async fn start_job_container(
+fn plan_job_container_create(
     spec: &ContainerSpec,
     container_name: &str,
     label: &str,
@@ -383,13 +396,12 @@ pub async fn start_job_container(
     runner_externals: &str,
     runner_actions: &str,
     toolcache: &str,
-    engine: Option<&ContainerEngineAccess>,
-    log: &mut Vec<String>,
-) -> Result<String> {
-    log.push("##[group]Starting job container".to_string());
-
-    // Pull image
-    pull_image(&spec.image, spec.credentials.as_ref(), log).await?;
+    job: &mut JobContext,
+) -> Vec<String> {
+    // The engine handle lives on the job; clone it so registering masks below
+    // can still borrow the job mutably.
+    let engine_access = job.container_engine.clone();
+    let engine = engine_access.as_deref();
 
     let container_workdir = translate_to_container_path(work_dir, runner_work);
 
@@ -467,12 +479,64 @@ pub async fn start_job_container(
     args.push("-f".into());
     args.push("/dev/null".into());
 
+    register_credential_env_masks(&args, job);
+    args
+}
+
+/// Start the job container (long-running with `tail -f /dev/null` entrypoint).
+///
+/// Registers the container's credential-shaped `env:` values as job masks
+/// before any recorded line can mention them (see
+/// [`plan_job_container_create`]).
+///
+/// Returns the full container ID.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_job_container(
+    spec: &ContainerSpec,
+    container_name: &str,
+    label: &str,
+    network: &str,
+    work_dir: &str,
+    runner_work: &str,
+    runner_temp: &str,
+    runner_externals: &str,
+    runner_actions: &str,
+    toolcache: &str,
+    job: &mut JobContext,
+    log: &mut Vec<String>,
+) -> Result<String> {
+    log.push("##[group]Starting job container".to_string());
+
+    // Plan (register credential-shaped env masks + build the create argv)
+    // before any `##[command]`/`debug!` push can mention a `-e NAME=VALUE`
+    // value.
+    let args = plan_job_container_create(
+        spec,
+        container_name,
+        label,
+        network,
+        work_dir,
+        runner_work,
+        runner_temp,
+        runner_externals,
+        runner_actions,
+        toolcache,
+        job,
+    );
+
+    // Pull image
+    pull_image(&spec.image, spec.credentials.as_ref(), job, log).await?;
+
     // The official runner takes the first stdout line as the container ID
     // (`outputStrings.FirstOrDefault()` where the list is stdout-only). Parse
     // stdout separately — docker's platform warning lands on stderr and the
     // merged stream can surface it first.
-    let result =
-        docker_cmd_stdout(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
+    let result = docker_cmd_stdout(
+        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        job,
+        log,
+    )
+    .await?;
     let container_id = result
         .first()
         .cloned()
@@ -481,14 +545,17 @@ pub async fn start_job_container(
         .to_owned();
 
     if container_id.is_empty() {
+        // This error text leaves the runner through the caller's `##[error]`
+        // line, which no later mask pass rewrites: mask the captured output at
+        // the message.
         anyhow::bail!(
             "Failed to create job container — no ID returned (output: {})",
-            result.join(" | ")
+            job.mask_secrets(&result.join(" | "))
         );
     }
 
     // Start the container
-    docker_cmd(&["start", &container_id], log).await?;
+    docker_cmd(&["start", &container_id], job, log).await?;
 
     // Verify it's running
     docker_cmd(
@@ -501,11 +568,13 @@ pub async fn start_job_container(
             "--format",
             "{{.ID}} {{.Status}}",
         ],
+        job,
         log,
     )
     .await?;
 
-    // Inspect env (for PATH extraction)
+    // Inspect env (for PATH extraction). The dump echoes every env value, so
+    // it is masked at the record site like all docker output.
     docker_cmd(
         &[
             "inspect",
@@ -513,6 +582,7 @@ pub async fn start_job_container(
             "{{range .Config.Env}}{{println .}}{{end}}",
             &container_id,
         ],
+        job,
         log,
     )
     .await?;
@@ -521,24 +591,24 @@ pub async fn start_job_container(
     Ok(container_id)
 }
 
-/// Start a service container.
+/// Prepare a service container's `docker create` invocation: build its argv
+/// and register every credential-shaped `-e NAME=VALUE` value as a job mask
+/// (see [`register_credential_env_masks`]).
 ///
-/// Returns the full container ID.
-pub async fn start_service_container(
+/// Runs before the entry point records any `##[command]`/`debug!` line, so a
+/// `services: db: env: POSTGRES_PASSWORD: …` value is masked at every sink
+/// (the create command line, the debug trace, `docker logs` output).
+fn plan_service_container_create(
     service: &ServiceSpec,
     container_name: &str,
     label: &str,
     network: &str,
-    engine: Option<&ContainerEngineAccess>,
-    log: &mut Vec<String>,
-) -> Result<String> {
-    log.push(format!(
-        "##[group]Starting {} service container",
-        service.alias
-    ));
-
-    // Pull image
-    pull_image(&service.image, service.credentials.as_ref(), log).await?;
+    job: &mut JobContext,
+) -> Vec<String> {
+    // The engine handle lives on the job; clone it so registering masks below
+    // can still borrow the job mutably.
+    let engine_access = job.container_engine.clone();
+    let engine = engine_access.as_deref();
 
     let mut args: Vec<String> = vec![
         "create".into(),
@@ -585,8 +655,44 @@ pub async fn start_service_container(
 
     args.push(service.image.clone());
 
-    let result =
-        docker_cmd_stdout(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
+    register_credential_env_masks(&args, job);
+    args
+}
+
+/// Start a service container.
+///
+/// Registers the service's credential-shaped `env:` values as job masks
+/// before any recorded line can mention them (see
+/// [`plan_service_container_create`]).
+///
+/// Returns the full container ID.
+pub async fn start_service_container(
+    service: &ServiceSpec,
+    container_name: &str,
+    label: &str,
+    network: &str,
+    job: &mut JobContext,
+    log: &mut Vec<String>,
+) -> Result<String> {
+    log.push(format!(
+        "##[group]Starting {} service container",
+        service.alias
+    ));
+
+    // Plan (register credential-shaped env masks + build the create argv)
+    // before any `##[command]`/`debug!` push can mention a `-e NAME=VALUE`
+    // value.
+    let args = plan_service_container_create(service, container_name, label, network, job);
+
+    // Pull image
+    pull_image(&service.image, service.credentials.as_ref(), job, log).await?;
+
+    let result = docker_cmd_stdout(
+        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        job,
+        log,
+    )
+    .await?;
     let container_id = result
         .first()
         .cloned()
@@ -595,15 +701,17 @@ pub async fn start_service_container(
         .to_owned();
 
     if container_id.is_empty() {
+        // See `start_job_container`: the error text is the one docker-output
+        // surface no later mask pass rewrites.
         anyhow::bail!(
             "Failed to create service container '{}' — no ID returned (output: {})",
             service.alias,
-            result.join(" | ")
+            job.mask_secrets(&result.join(" | "))
         );
     }
 
     // Start the container
-    docker_cmd(&["start", &container_id], log).await?;
+    docker_cmd(&["start", &container_id], job, log).await?;
 
     // Verify running
     docker_cmd(
@@ -616,12 +724,13 @@ pub async fn start_service_container(
             "--format",
             "{{.ID}} {{.Status}}",
         ],
+        job,
         log,
     )
     .await?;
 
     // Get port mappings
-    docker_cmd(&["port", &container_id], log).await.ok();
+    docker_cmd(&["port", &container_id], job, log).await.ok();
 
     log.push("##[endgroup]".to_string());
     Ok(container_id)
@@ -637,6 +746,7 @@ pub async fn start_service_container(
 /// terminates a stuck wait.
 pub async fn wait_for_services_healthy(
     services: &[(String, String, String)],
+    job: &JobContext,
     log: &mut Vec<String>,
 ) -> Result<()> {
     log.push("##[group]Waiting for all services to be ready".to_string());
@@ -650,6 +760,7 @@ pub async fn wait_for_services_healthy(
                     "--format={{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}",
                     container_id,
                 ],
+                job,
                 log,
             )
             .await?;
@@ -748,30 +859,41 @@ pub async fn get_port_mappings(container_id: &str) -> Vec<(String, String)> {
 /// Stop and clean up all containers and the network.
 ///
 /// Golden cleanup order: job container → per-service (logs then rm) → network.
-pub async fn cleanup_containers(state: &ContainerState, log: &mut Vec<String>) -> Result<()> {
+pub async fn cleanup_containers(
+    state: &ContainerState,
+    job: &JobContext,
+    log: &mut Vec<String>,
+) -> Result<()> {
     // 1. Stop and remove job container
     if let Some(name) = &state.job_container_name
         && let Some(id) = &state.job_container_id
     {
         log.push(format!("Stop and remove container: {name}"));
-        let _ = docker_cmd(&["rm", "--force", id], log).await;
+        let _ = docker_cmd(&["rm", "--force", id], job, log).await;
     }
 
-    // Per-service: print logs, then remove
+    // Per-service: print logs, then remove. The `docker logs` output echoes
+    // the service's env, so it is masked at the record site by docker_cmd —
+    // this sink feeds the uploaded step log without a later mask pass.
     for (alias, container_id, container_name) in &state.service_containers {
         log.push(format!("Print service container logs: {container_name}"));
         // Bound the logs pulled into memory at teardown; a chatty
         // service would otherwise have its whole log buffered by the runner.
-        let _ = docker_cmd(&["logs", "--details", "--tail", "5000", container_id], log).await;
+        let _ = docker_cmd(
+            &["logs", "--details", "--tail", "5000", container_id],
+            job,
+            log,
+        )
+        .await;
 
         log.push(format!("Stop and remove container: {container_name}"));
-        let _ = docker_cmd(&["rm", "--force", container_id], log).await;
+        let _ = docker_cmd(&["rm", "--force", container_id], job, log).await;
         debug!("Removed service container {alias} ({container_id})");
     }
 
     // Remove network
     log.push(format!("Remove container network: {}", state.network));
-    let _ = docker_cmd(&["network", "rm", &state.network], log).await;
+    let _ = docker_cmd(&["network", "rm", &state.network], job, log).await;
 
     Ok(())
 }
@@ -1104,6 +1226,7 @@ fn parse_registry_from_image(image: &str) -> &str {
 async fn docker_registry_login(
     image: &str,
     creds: &RegistryCredentials,
+    job: &JobContext,
     log: &mut Vec<String>,
 ) -> Result<tempfile::TempDir> {
     use tokio::io::AsyncWriteExt;
@@ -1117,14 +1240,19 @@ async fn docker_registry_login(
     } else {
         registry.to_string()
     };
+    // Mask at the record site: the log Vec is uploaded with no later mask
+    // pass (the `--password-stdin` value itself never reaches argv).
     log.push(format!(
-        "##[command]docker --config <tmpdir> login{} -u {} --password-stdin",
-        if registry.is_empty() {
-            String::new()
-        } else {
-            format!(" {registry}")
-        },
-        creds.username
+        "##[command]{}",
+        job.mask_secrets(&format!(
+            "docker --config <tmpdir> login{} -u {} --password-stdin",
+            if registry.is_empty() {
+                String::new()
+            } else {
+                format!(" {registry}")
+            },
+            creds.username
+        ))
     ));
 
     let mut last_err: Option<anyhow::Error> = None;
@@ -1132,8 +1260,11 @@ async fn docker_registry_login(
         if attempt > 0 {
             let secs = 5u64 * (1 << (attempt - 1));
             log.push(format!(
-                "##[warning]docker login for '{registry_display}' failed (attempt {attempt}), \
-                 retrying in {secs}s"
+                "##[warning]{}",
+                job.mask_secrets(&format!(
+                    "docker login for '{registry_display}' failed (attempt {attempt}), \
+                     retrying in {secs}s"
+                ))
             ));
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         }
@@ -1158,10 +1289,10 @@ async fn docker_registry_login(
         let output = child.wait_with_output().await.context("docker login")?;
 
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            log.push(line.to_string());
+            log.push(job.mask_secrets(line));
         }
         for line in String::from_utf8_lossy(&output.stderr).lines() {
-            log.push(line.to_string());
+            log.push(job.mask_secrets(line));
         }
 
         if output.status.success() {
@@ -1240,11 +1371,34 @@ fn mask_proxy_passwords(args: &[&str]) -> String {
     )
 }
 
+/// Record a docker command at every sink that would otherwise see it raw —
+/// the `##[command]` step-log line and the `debug!` trace — masking with the
+/// job's registered secrets and, first, the proxy passwords the argv may
+/// inline. `docker create` inlines workflow env as `-e NAME=VALUE`, so the
+/// argv itself can carry a credential (see [`register_credential_env_masks`]);
+/// a container's own proxy `env:` arrives the same way (see
+/// [`mask_proxy_passwords`]). Proxy masks are applied first: they consume the
+/// URL's userinfo, and the job-value pass then cannot see a password that the
+/// URL's own encoding moved.
+fn record_docker_command(args: &[&str], job: &JobContext, log: &mut Vec<String>) {
+    let masked_args = job.mask_secrets(&mask_proxy_passwords(args));
+    log.push(format!("##[command]/usr/bin/docker {masked_args}"));
+    debug!("docker {masked_args}");
+}
+
+/// Record docker command output to the step log, masked at the record site.
+/// This sink is joined and uploaded as the step log with no later mask pass,
+/// and output can echo the container's env values (service `docker logs`
+/// output, `docker inspect` env dumps).
+fn record_docker_output(lines: &[String], job: &JobContext, log: &mut Vec<String>) {
+    for line in lines {
+        log.push(job.mask_secrets(line));
+    }
+}
+
 /// Run a docker command, logging the command line, and return stdout lines.
-async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
-    let cmd_line = format!("/usr/bin/docker {}", args.join(" "));
-    log.push(format!("##[command]{cmd_line}"));
-    debug!("docker {}", mask_proxy_passwords(args));
+async fn docker_cmd(args: &[&str], job: &JobContext, log: &mut Vec<String>) -> Result<Vec<String>> {
+    record_docker_command(args, job, log);
 
     let result = process::invoke(
         "docker",
@@ -1259,9 +1413,7 @@ async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>>
     .with_context(|| format!("docker {}", args.first().unwrap_or(&"")))?;
 
     // Log output lines
-    for line in &result.lines {
-        log.push(line.clone());
-    }
+    record_docker_output(&result.lines, job, log);
 
     if result.exit_code != 0 {
         anyhow::bail!(
@@ -1282,10 +1434,12 @@ async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>>
 /// ID as the single stdout line, and docker's platform warning lands on
 /// stderr — the merged stream can surface the warning first, so parsing the
 /// merged stream is how the ID gets lost.
-async fn docker_cmd_stdout(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
-    let cmd_line = format!("/usr/bin/docker {}", args.join(" "));
-    log.push(format!("##[command]{cmd_line}"));
-    debug!("docker {}", mask_proxy_passwords(args));
+async fn docker_cmd_stdout(
+    args: &[&str],
+    job: &JobContext,
+    log: &mut Vec<String>,
+) -> Result<Vec<String>> {
+    record_docker_command(args, job, log);
 
     let result = process::invoke(
         "docker",
@@ -1301,9 +1455,7 @@ async fn docker_cmd_stdout(args: &[&str], log: &mut Vec<String>) -> Result<Vec<S
 
     // Log every line (both streams), matching the official runner echoing
     // stdout and stderr to the console.
-    for line in &result.lines {
-        log.push(line.clone());
-    }
+    record_docker_output(&result.lines, job, log);
 
     if result.exit_code != 0 {
         anyhow::bail!(
@@ -1322,6 +1474,81 @@ fn push_docker_create_env(args: &mut Vec<String>, key: &str, value: &str) {
         args.push(key.to_string());
     } else {
         args.push(format!("{key}={value}"));
+    }
+}
+
+/// Does this `docker create` env name look like it holds a credential?
+///
+/// Case-insensitive substring match on the name. See
+/// [`register_credential_env_masks`] for why this deliberately over-masks.
+fn is_credential_env_name(name: &str) -> bool {
+    const CREDENTIAL_MARKERS: [&str; 9] = [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "private_key",
+        "credential",
+        "access_key",
+    ];
+    let name = name.to_ascii_lowercase();
+    CREDENTIAL_MARKERS
+        .iter()
+        .any(|marker| name.contains(marker))
+}
+
+/// Register every credential-shaped env value in a `docker create` argv as a
+/// job mask via [`JobContext::add_mask`], so every log sink shows `***`
+/// instead of the value: the recorded `##[command]docker create … -e
+/// NAME=VALUE` step-log line, its `debug!` trace, service `docker logs`
+/// output, and `docker inspect` env dumps.
+///
+/// Two forms carry a value. The explicit `-e NAME=VALUE` form passes the
+/// workflow-authored job-container `env:` and each service's `env:`. The
+/// `-e KEY` form (a workflow value that is empty, inlined as a bare key, as
+/// `push_docker_create_env` does for the proxy vars) makes Docker copy `KEY`
+/// out of the runner process's own environment: whatever the host has for a
+/// credential-shaped name then reaches the container — and the `docker
+/// inspect` env dump immediately after `docker create` — so the host value is
+/// registered too.
+///
+/// The name heuristic (PASSWORD, PASSWD, SECRET, TOKEN, API_KEY, APIKEY,
+/// PRIVATE_KEY, CREDENTIAL, ACCESS_KEY) deliberately over-masks: a false
+/// positive like `TOKEN_BUDGET=5` becomes `***` in logs too. That trade-off
+/// is accepted — a false positive costs a redacted log line, while a false
+/// negative leaks a credential.
+fn register_credential_env_masks(args: &[String], job: &mut JobContext) {
+    register_credential_env_masks_lookup(args, job, |name| std::env::var(name).ok());
+}
+
+/// [`register_credential_env_masks`] with the runner's environment behind a
+/// `lookup` closure, so tests can supply an inherited value without writing
+/// the process environment (`set_var` is unsafe under edition 2024 and this
+/// crate forbids `unsafe`).
+fn register_credential_env_masks_lookup(
+    args: &[String],
+    job: &mut JobContext,
+    lookup: impl Fn(&str) -> Option<String>,
+) {
+    for pair in args.windows(2).filter(|pair| pair[0] == "-e") {
+        match pair[1].split_once('=') {
+            Some((name, value)) => {
+                if value.is_empty() || !is_credential_env_name(name) {
+                    continue;
+                }
+                job.add_mask(value);
+            }
+            None => {
+                if !is_credential_env_name(&pair[1]) {
+                    continue;
+                }
+                if let Some(value) = lookup(&pair[1]).filter(|value| !value.is_empty()) {
+                    job.add_mask(&value);
+                }
+            }
+        }
     }
 }
 
@@ -2176,5 +2403,290 @@ mod tests {
         let mut args = Vec::new();
         append_container_env(&mut args, &env, None);
         assert!(args.contains(&"ENGINE_URL=http://127.0.0.1:9198".to_string()));
+    }
+
+    // ── Container env credential masking ─────────────────────────────
+
+    /// The env-name heuristic over-masks on purpose: `TOKEN_BUDGET` matches
+    /// because of `TOKEN`, while non-credential names pass through.
+    #[test]
+    fn credential_env_name_heuristic() {
+        for name in [
+            "POSTGRES_PASSWORD",
+            "MYSQL_ROOT_PASSWD",
+            "MY_SECRET",
+            "GITHUB_TOKEN",
+            "STRIPE_API_KEY",
+            "STRIPE_APIKEY",
+            "GPG_PRIVATE_KEY",
+            "DB_CREDENTIAL",
+            "AWS_ACCESS_KEY",
+            "token_budget",
+        ] {
+            assert!(is_credential_env_name(name), "{name} must be masked");
+        }
+        for name in ["PATH", "NODE_ENV", "HOME", "KEY", "API", "PORT"] {
+            assert!(!is_credential_env_name(name), "{name} must pass through");
+        }
+    }
+
+    fn mask_test_job() -> JobContext {
+        JobContext::new(
+            "job1".into(),
+            "Test job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+    }
+
+    fn credential_service(env: HashMap<String, String>) -> ServiceSpec {
+        ServiceSpec {
+            alias: "db".into(),
+            image: "postgres:16".into(),
+            env,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            options: String::new(),
+            credentials: None,
+        }
+    }
+
+    fn arg_refs(args: &[String]) -> Vec<&str> {
+        args.iter().map(String::as_str).collect()
+    }
+
+    /// Run `f` with a fmt subscriber recording every event (DEBUG included)
+    /// into a string — the tracing counterpart of the log-Vec assertions,
+    /// mirroring the `RecordingWriter` pattern used by the server crate tests.
+    fn capture_trace(f: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || RecordingWriter(sink.clone()))
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            f();
+        }
+        String::from_utf8(captured.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Regression: `services: db: env: POSTGRES_PASSWORD: hunter2` is inlined
+    /// into `docker create` as `-e NAME=VALUE`, and the recorded
+    /// `##[command]` line is uploaded with the step log with no later mask
+    /// pass. It must already show `***` — while non-credential names (PATH,
+    /// NODE_ENV) stay untouched.
+    #[test]
+    fn credential_service_env_is_masked_in_the_recorded_docker_create_line() {
+        let service = credential_service(HashMap::from([
+            ("POSTGRES_PASSWORD".to_string(), "hunter2".to_string()),
+            ("PATH".to_string(), "/usr/local/bin".to_string()),
+            ("NODE_ENV".to_string(), "test".to_string()),
+        ]));
+        let mut job = mask_test_job();
+        let mut log = Vec::new();
+
+        let args = plan_service_container_create(&service, "name", "abc123", "net", &mut job);
+        let refs = arg_refs(&args);
+        record_docker_command(&refs, &job, &mut log);
+
+        assert_eq!(log.len(), 1);
+        let line = &log[0];
+        assert!(
+            line.starts_with("##[command]/usr/bin/docker create"),
+            "{line}"
+        );
+        assert!(line.contains("-e POSTGRES_PASSWORD=***"), "{line}");
+        assert!(!line.contains("hunter2"), "credential leaked: {line}");
+        assert!(line.contains("-e PATH=/usr/local/bin"), "{line}");
+        assert!(line.contains("-e NODE_ENV=test"), "{line}");
+        assert!(job.masks.contains("hunter2"));
+        assert!(!job.masks.contains("/usr/local/bin"));
+        assert!(!job.masks.contains("test"));
+    }
+
+    /// The `debug!("docker …")` trace is the second sink for the same argv;
+    /// it must mask with the job masks before formatting too.
+    #[test]
+    fn credential_service_env_is_masked_in_the_docker_debug_line() {
+        let service = credential_service(HashMap::from([(
+            "POSTGRES_PASSWORD".to_string(),
+            "hunter2".to_string(),
+        )]));
+        let mut job = mask_test_job();
+        let mut log = Vec::new();
+        let args = plan_service_container_create(&service, "name", "abc123", "net", &mut job);
+        let refs = arg_refs(&args);
+
+        let trace = capture_trace(|| record_docker_command(&refs, &job, &mut log));
+
+        assert!(trace.contains("docker create"), "{trace}");
+        assert!(trace.contains("POSTGRES_PASSWORD=***"), "{trace}");
+        assert!(
+            !trace.contains("hunter2"),
+            "credential leaked into the trace: {trace}"
+        );
+    }
+
+    /// Service `docker logs` output echoes the container's env. It is
+    /// recorded into the teardown step log — queued, uploaded, and traced
+    /// without a later mask pass — so every sink must show `***`, and the
+    /// recorded lines must stay masked under any further mask pass.
+    #[test]
+    fn service_docker_logs_output_is_masked_at_every_sink() {
+        let service = credential_service(HashMap::from([(
+            "POSTGRES_PASSWORD".to_string(),
+            "hunter2".to_string(),
+        )]));
+        let mut job = mask_test_job();
+        let mut log = Vec::new();
+        let args = plan_service_container_create(&service, "name", "abc123", "net", &mut job);
+        let refs = arg_refs(&args);
+        let logs_cmd = ["logs", "--details", "--tail", "5000", "container-id"];
+        let echoed = vec![
+            "PostgreSQL init process complete; ready for start up.".to_string(),
+            "POSTGRES_PASSWORD=hunter2 accepted".to_string(),
+        ];
+
+        let trace = capture_trace(|| {
+            record_docker_command(&refs, &job, &mut log);
+            record_docker_command(&logs_cmd, &job, &mut log);
+            record_docker_output(&echoed, &job, &mut log);
+        });
+
+        assert!(!log.join("\n").contains("hunter2"), "{log:?}");
+        assert!(!trace.contains("hunter2"), "{trace}");
+        assert!(
+            log.iter()
+                .any(|line| line.contains("POSTGRES_PASSWORD=***")),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|line| line.contains("*** accepted")),
+            "{log:?}"
+        );
+        // Downstream sinks consume these records verbatim; a second mask pass
+        // must leave them unchanged.
+        assert_eq!(job.mask_secrets(&log.join("\n")), log.join("\n"));
+    }
+
+    /// The job container's own `container.env` gets the same treatment.
+    #[test]
+    fn credential_job_container_env_is_masked_in_the_recorded_docker_create_line() {
+        let spec = ContainerSpec {
+            image: "alpine:3.22".into(),
+            env: HashMap::from([("API_KEY".to_string(), "k-123".to_string())]),
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            options: String::new(),
+            credentials: None,
+        };
+        let mut job = mask_test_job();
+        let mut log = Vec::new();
+
+        let args = plan_job_container_create(
+            &spec,
+            "name",
+            "abc123",
+            "net",
+            "/w/repo/repo",
+            "/w",
+            "/w/_temp",
+            "/w/../externals",
+            "/w/_actions",
+            "/w/_tool",
+            &mut job,
+        );
+        let refs = arg_refs(&args);
+        record_docker_command(&refs, &job, &mut log);
+
+        assert!(log[0].contains("-e API_KEY=***"), "{}", log[0]);
+        assert!(!log[0].contains("k-123"), "credential leaked: {}", log[0]);
+    }
+
+    /// A credential value holding the engine's advertised origin is rewritten
+    /// (`translate_engine_origin`) before `docker create` carries it.
+    /// Registration reads the finished argv, so the form that is actually
+    /// recorded — the translated one — is the form that gets masked.
+    #[test]
+    fn engine_translated_credential_env_is_masked_in_the_create_line() {
+        let service = credential_service(HashMap::from([(
+            "SERVICE_TOKEN".to_string(),
+            "http://127.0.0.1:9198/token".to_string(),
+        )]));
+        let mut job = mask_test_job();
+        job.container_engine = Some(std::sync::Arc::new(ContainerEngineAccess::for_tests(
+            "http://127.0.0.1:9198",
+            "http://172.18.0.1:9198",
+        )));
+        let mut log = Vec::new();
+
+        let args = plan_service_container_create(&service, "name", "abc123", "net", &mut job);
+        let refs = arg_refs(&args);
+        record_docker_command(&refs, &job, &mut log);
+
+        assert!(log[0].contains("-e SERVICE_TOKEN=***"), "{}", log[0]);
+        assert!(
+            !log[0].contains("172.18.0.1:9198"),
+            "translated credential leaked: {}",
+            log[0]
+        );
+        assert!(job.masks.contains("http://172.18.0.1:9198/token"));
+    }
+
+    /// The `-e KEY` inherit form carries no workflow value: Docker copies `KEY`
+    /// out of the runner's own environment, and the `docker inspect` dump right
+    /// after `docker create` records it, so the host value is registered when
+    /// the name is credential-shaped — and only then.
+    #[test]
+    fn inherited_credential_env_values_are_masked() {
+        let service = credential_service(HashMap::from([
+            ("DB_PASSWORD".to_string(), String::new()),
+            ("PATH".to_string(), "/bin".to_string()),
+        ]));
+        let mut job = mask_test_job();
+        let mut log = Vec::new();
+
+        let args = plan_service_container_create(&service, "name", "abc123", "net", &mut job);
+        let refs = arg_refs(&args);
+        record_docker_command(&refs, &job, &mut log);
+
+        // Neither name is set in the runner's environment here: nothing to
+        // register, and the argv keeps the bare-key form.
+        assert!(job.masks.is_empty(), "{:?}", job.masks);
+        assert!(log[0].contains("-e DB_PASSWORD"), "{}", log[0]);
+        assert!(!log[0].contains("DB_PASSWORD="), "{}", log[0]);
+
+        // With the host value present it joins the mask set, so the value the
+        // container inherits and `docker inspect` echoes shows as `***`.
+        let mut job = mask_test_job();
+        let args = vec![
+            "create".to_owned(),
+            "-e".to_owned(),
+            "DB_PASSWORD".to_owned(),
+            "-e".to_owned(),
+            "PATH".to_owned(),
+        ];
+        register_credential_env_masks_lookup(&args, &mut job, |name| {
+            (name == "DB_PASSWORD").then(|| "host-hunter2".to_owned())
+        });
+        assert_eq!(job.masks.len(), 1, "{:?}", job.masks);
+        assert_eq!(job.mask_secrets("password=host-hunter2"), "password=***");
     }
 }

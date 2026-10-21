@@ -666,6 +666,13 @@ pub struct WebhookDeliveryRecord {
     /// renew or finalize a lease that another worker has reclaimed.
     #[serde(default)]
     pub lease_token: Option<String>,
+    /// App id of the webhook signer whose HMAC verified this delivery.
+    ///
+    /// `None` for the legacy shared secret and for rows written before this
+    /// column existed. Processing pins credential selection to this App, so a
+    /// delivery signed by App B cannot run with App A's installation.
+    #[serde(default)]
+    pub signer_app_id: Option<String>,
     pub last_error: Option<String>,
 }
 
