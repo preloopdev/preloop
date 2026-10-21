@@ -82,14 +82,20 @@ impl LocalSandboxes {
     /// Open the service (state under `<home>/state`), attach this host's
     /// SmolVM driver, and serve the API when `PRELOOP_SANDBOX_LISTEN`
     /// (default `127.0.0.1:9191`) can be bound.
-    pub(crate) async fn start(home: &Path) -> anyhow::Result<Self> {
+    pub(crate) async fn start(
+        home: &Path,
+        observability: preloop_observability::Observability,
+    ) -> anyhow::Result<Self> {
         let state = home.join("state");
         let store_url = env_nonempty("PRELOOP_SANDBOX_STORE_URL")
             .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
         let store = store::open(&store_url)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
-        let service = Service::open(store, ServiceConfig::new(state.join("sandbox-blobs"))).await?;
+        let mut service_config = ServiceConfig::new(state.join("sandbox-blobs"));
+        service_config.metrics =
+            preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+        let service = Service::open(store, service_config).await?;
         let shutdown = CancellationToken::new();
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
 
@@ -157,6 +163,16 @@ impl LocalSandboxes {
             pool_capabilities,
             shutdown,
         })
+    }
+
+    /// The service API plus the provider id this process's agent registered
+    /// under — the pool provider whose host sample describes this engine's
+    /// host. Used to publish live sandbox telemetry to the runner server.
+    pub(crate) fn api_and_provider_id(&self) -> (Arc<dyn SandboxApi>, String) {
+        (
+            Arc::new(preloop_sandbox::InProcess(self.service.clone())),
+            self.provider_id.clone(),
+        )
     }
 
     /// The runner pool's machine provider, pinned to the pool driver
@@ -464,10 +480,13 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 }
 
 /// Entry point for `preloop sandbox`.
-pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(
+    args: SandboxArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let client = SandboxClient::new(&args.service, args.token.clone());
     match args.command {
-        SandboxCommand::Serve(serve) => serve_standalone(serve).await,
+        SandboxCommand::Serve(serve) => serve_standalone(serve, observability).await,
         SandboxCommand::Agent(agent) => run_agent(&args.service, agent).await,
         SandboxCommand::Template(TemplateCommand::Put {
             name,
@@ -652,14 +671,20 @@ async fn copy(client: &SandboxClient, source: &str, destination: &str) -> anyhow
     }
 }
 
-async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
+async fn serve_standalone(
+    args: ServeSandboxArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let home = crate::preloop_home();
     let state = home.join("state");
     let store_url = args
         .store
         .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
     let store = store::open(&store_url).await?;
-    let service = Service::open(store, ServiceConfig::new(state.join("sandbox-blobs"))).await?;
+    let mut service_config = ServiceConfig::new(state.join("sandbox-blobs"));
+    service_config.metrics =
+        preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+    let service = Service::open(store, service_config).await?;
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {

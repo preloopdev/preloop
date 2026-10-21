@@ -5042,7 +5042,6 @@ async fn prepare_fork_base<P: VmProvider + 'static>(
     remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
-        vm_telemetry_deregister(config, golden);
     }
     // Give up before the expensive part when a shutdown is already pending.
     // The caller checks `is_cancelled` afterwards and reports a clean stop
@@ -5058,7 +5057,6 @@ async fn prepare_fork_base<P: VmProvider + 'static>(
         bake_golden_in_guest(provider, config, golden, env_spec).await
     };
     if let Err(error) = prepared {
-        vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error);
     }
@@ -5159,7 +5157,6 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
             provider.create(&spec).await?;
         }
         provider.start(golden).await?;
-        vm_telemetry_register(config, golden, "golden", Some(&spec));
         await_guest_ready(provider.as_ref(), golden).await?;
         // Fatal for a packed golden: its jobs expect the multiarch shim, and a
         // failed install leaves a reusable base that is adoptable on later
@@ -5311,7 +5308,6 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
     };
     provider.create(&spec).await?;
     provider.start(golden).await?;
-    vm_telemetry_register(config, golden, "golden", Some(&spec));
     await_guest_ready(provider.as_ref(), golden).await?;
     prepare_rosetta_multiarch(provider.as_ref(), golden, false).await?;
     apply_golden_contract(provider.as_ref(), config, golden, &env_spec.base).await?;
@@ -5985,7 +5981,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // start can adopt it instead of rebaking. `remove_stale_machines`
         // spares recorded goldens; the fingerprint record gates adoption.
         for golden in golden_cache.all_names().await {
-            vm_telemetry_deregister(&self.config, &golden);
             if let Err(error) = self.provider.stop(&golden).await {
                 warn!(
                     machine = golden.as_str(),
@@ -6246,7 +6241,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             if !retired {
                 notify_runner_gone(&self.config, &name).await;
             }
-            vm_telemetry_deregister(&self.config, &name);
             match self.provider.delete(&name).await {
                 // The record goes only with the machine: a failed delete keeps
                 // it, so the next start retries instead of forgetting a golden
@@ -7555,7 +7549,6 @@ async fn provision_slot<P: VmProvider + 'static>(
             if let Some(ps) = &config.pool_status {
                 ps.record_provision_failure();
             }
-            vm_telemetry_deregister(config, &name);
             if let Err(cleanup) = provider.delete(&name).await {
                 warn!(
                     machine = name.as_str(),
@@ -7753,7 +7746,6 @@ async fn run_one_runner<P: VmProvider + 'static>(
     if let Some(debug_dir) = preserved {
         hold_for_debugging(&provider, name, &debug_dir, &shutdown).await;
         notify_runner_gone(config, name).await;
-        vm_telemetry_deregister(config, name);
         if let Err(error) = delete_machine(provider.as_ref(), name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
@@ -7762,7 +7754,6 @@ async fn run_one_runner<P: VmProvider + 'static>(
 
     // Report the runner's own failure in preference to a teardown failure.
     notify_runner_gone(config, name).await;
-    vm_telemetry_deregister(config, name);
     let delete_result = delete_machine(provider.as_ref(), name)
         .await
         .map_err(OrchestratorError::from);
@@ -8063,59 +8054,6 @@ fn is_retired_stock_payload(name: &str) -> bool {
     matches!(arch, "x86_64" | "aarch64")
 }
 
-/// Best-effort VM telemetry: register a just-created or forked machine.
-///
-/// Fills what the pool knows about the machine; unknown fields stay unset.
-/// No-op without a wired observability handle.
-fn vm_telemetry_register(
-    config: &RunnerPoolConfig,
-    name: &MachineName,
-    role: &str,
-    spec: Option<&MachineSpec>,
-) {
-    let Some(observability) = &config.observability else {
-        return;
-    };
-    let (cpus, memory_mib, storage_gb, overlay_gb) = match spec {
-        Some(spec) => (
-            spec.cpus,
-            spec.memory_mib,
-            spec.storage_gib,
-            spec.overlay_gib,
-        ),
-        // A fork inherits the golden's resources, which match the pool's
-        // configured values.
-        None => (
-            config.cpus,
-            config.memory_mib,
-            config.storage_gib,
-            config.overlay_gib,
-        ),
-    };
-    observability
-        .vm_registry()
-        .register(preloop_observability::vm_telemetry::VmRuntimeInfo {
-            name: name.as_str().to_owned(),
-            role: role.to_owned(),
-            activity: "running".to_owned(),
-            pid: None,
-            start_time: None,
-            cpus,
-            memory_mib,
-            storage_gb,
-            overlay_gb,
-            data_dir: None,
-            created_at: None,
-        });
-}
-
-/// Best-effort VM telemetry: drop a machine from the registry at teardown.
-fn vm_telemetry_deregister(config: &RunnerPoolConfig, name: &MachineName) {
-    if let Some(observability) = &config.observability {
-        observability.vm_registry().deregister(name.as_str());
-    }
-}
-
 /// Emit a runner-slot failure metric so guest crashes, provisioning errors,
 /// and un-recyclable fork bases are alertable — not just WARN log lines. A
 /// guest-internal OOM/`-1` exit has no host cgroup signal, so the WARN was the
@@ -8371,16 +8309,13 @@ async fn provision_runner<P: VmProvider + 'static>(
         None => None,
     };
 
-    if forked_golden.is_some() {
-        // The fork succeeded, so the clone exists as a live machine — and it
-        // carries the whole golden: a pack has its rootfs flattened into the
-        // artifact, a snapshot backend carries the guest writes that built it.
-        // Nothing is installed here. The runner contract (account, ownership,
-        // tool cache, `/etc/environment`) was applied once, when the golden was
-        // built, which is also why no per-VM `chown` walk exists: on overlayfs
-        // a recursive one copies the tree into the per-VM upper layer.
-        vm_telemetry_register(config, name, "runner", None);
-    } else {
+    // A fork inherits the whole golden: a pack has its rootfs flattened into
+    // the artifact, a snapshot backend carries the guest writes that built it.
+    // Nothing is installed here. The runner contract (account, ownership,
+    // tool cache, `/etc/environment`) was applied once, when the golden was
+    // built, which is also why no per-VM `chown` walk exists: on overlayfs
+    // a recursive one copies the tree into the per-VM upper layer.
+    if forked_golden.is_none() {
         // No golden at all: `use_fork` is off, so the machine is created from
         // the golden's payload instead of forked from it. A file-pack backend
         // boots the packed artifact — the same rootfs a fork would have
@@ -8437,7 +8372,6 @@ async fn provision_runner<P: VmProvider + 'static>(
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
-        vm_telemetry_register(config, name, "runner", Some(&spec));
         if !from_packed {
             await_guest_ready(provider.as_ref(), name).await?;
             apply_golden_contract(provider.as_ref(), config, name, &environment.base).await?;

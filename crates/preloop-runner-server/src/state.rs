@@ -921,6 +921,10 @@ pub struct AppState {
     pub fresh_merge_probe_permits: Arc<tokio::sync::Semaphore>,
     /// Observability handle (cloneable, holds heartbeat & limit registries).
     pub observability: preloop_observability::Observability,
+    /// The co-hosted sandbox service, when this engine runs a runner pool.
+    /// Unset for the standalone server and tests: status and host metrics
+    /// then report "not measured" instead of fabricated zeroes.
+    pub sandbox: crate::SandboxHandle,
     /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
     pub status_snapshot:
         Arc<parking_lot::RwLock<preloop_observability::status::OperationalSnapshot>>,
@@ -1730,6 +1734,7 @@ impl AppState {
                 crate::github::fresh_merge_poll_capacity(),
             )),
             observability: preloop_observability::Observability::noop(),
+            sandbox: crate::SandboxHandle::new(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(
                 preloop_observability::status::OperationalSnapshot::default(),
             )),

@@ -56,6 +56,10 @@ pub struct ServerConfig {
     /// Observability handle to clone into AppState (heartbeat, limits).
     /// `None` falls back to `Observability::noop()` (tests).
     pub observability: Option<preloop_observability::Observability>,
+    /// Live sandbox service of the co-hosted runner pool, when one exists.
+    /// `None` (standalone server, tests) leaves the status snapshot's `vms`
+    /// and host metrics at their "not measured" defaults.
+    pub sandbox: Option<SandboxHandle>,
     /// The engine's outbound-GitHub funnel (breaker registry + accounting).
     ///
     /// The embedding CLI supplies its own and hands the same one to the runner
@@ -94,6 +98,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("enable_scheduler", &self.enable_scheduler)
             .field("pending_registrations", &self.pending_registrations)
             .field("pool_status", &self.pool_status)
+            .field("sandbox", &self.sandbox.is_some())
             .field("require_job_assignments", &self.require_job_assignments)
             .finish()
     }
@@ -1064,6 +1069,8 @@ fn build_operational_snapshot_sync(
     github_snapshot: preloop_observability::status::GithubSnapshot,
     store_backend: preloop_observability::status::StoreBackend,
     webhook: WebhookConditionInputs,
+    sandbox_stats: Option<preloop_sandbox::api::StatsResponse>,
+    pool_provider_id: String,
 ) -> preloop_observability::status::OperationalSnapshot {
     use chrono::Utc;
     use preloop_observability::status::*;
@@ -1161,6 +1168,11 @@ fn build_operational_snapshot_sync(
     pool_snapshot.released_bindings = inputs.released_bindings;
     pool_snapshot.busy = inputs.pool_busy;
 
+    // Live fleet view from the sandbox service; the chosen provider's host
+    // sample also feeds the host-memory conditions below and the sampler's
+    // host metrics.
+    let (vms, host_sample) = vm_fleet_snapshot(sandbox_stats, &pool_provider_id);
+
     OperationalSnapshot {
         schema_version: 2,
         observed_at: now,
@@ -1216,17 +1228,7 @@ fn build_operational_snapshot_sync(
             assignments: inputs.runner_assignments,
         },
         pool: pool_snapshot,
-        vms: {
-            // Host sampler is stubbed until the cgroup parser lands;
-            // the registry is the source of truth for configured counts
-            // and will be populated by RunnerPool on create/fork.
-            let caps = std::collections::HashMap::new();
-            preloop_observability::vm_telemetry::build_fleet_snapshot(
-                observability.vm_registry(),
-                None,
-                caps,
-            )
-        },
+        vms,
         store: StoreSnapshot {
             backend: store_backend,
             ..Default::default()
@@ -1256,37 +1258,204 @@ fn build_operational_snapshot_sync(
                 &webhook,
                 crate::webhook_status::now_us(),
             ));
-            // Host memory pressure from a fresh sample (microseconds of
-            // /proc reads on a path that already blocks for worse).
-            // Thresholds are RAM fractions; swap counts as pressure via its
-            // own warning, never as headroom against the critical line.
-            let host = preloop_observability::vm_telemetry::sample_host();
-            let ram_used = host.ram_used_fraction().unwrap_or(0.0);
-            let swap_used = host.swap_used_fraction().unwrap_or(0.0);
-            if ram_used >= 0.93 {
-                conditions.push(Condition {
-                    code: "host_memory_critical".to_owned(),
-                    severity: "error".to_owned(),
-                    message: format!(
-                        "host RAM {:.0}% consumed; OOM kills are imminent, shed load",
-                        ram_used * 100.0
-                    ),
-                    exemplars: Vec::new(),
-                });
-            } else if ram_used >= 0.85 || swap_used >= 0.25 {
-                conditions.push(Condition {
-                    code: "host_memory_pressure".to_owned(),
-                    severity: "warning".to_owned(),
-                    message: format!(
-                        "host memory pressure: RAM {:.0}% consumed, swap {:.0}% consumed",
-                        ram_used * 100.0,
-                        swap_used * 100.0
-                    ),
-                    exemplars: Vec::new(),
-                });
+            // Host memory pressure from the pool's heartbeat sample. The
+            // pool measures its host on the same service; using its report
+            // (rather than a fresh local /proc scan) keeps one authority for
+            // host memory. Thresholds are RAM fractions; swap counts as
+            // pressure via its own warning, never as headroom against the
+            // critical line. No sample means no condition: never fabricate.
+            if let Some(host) = &host_sample {
+                let ram_used = host.ram_used_fraction().unwrap_or(0.0);
+                let swap_used = host.swap_used_fraction().unwrap_or(0.0);
+                if ram_used >= 0.93 {
+                    conditions.push(Condition {
+                        code: "host_memory_critical".to_owned(),
+                        severity: "error".to_owned(),
+                        message: format!(
+                            "host RAM {:.0}% consumed; OOM kills are imminent, shed load",
+                            ram_used * 100.0
+                        ),
+                        exemplars: Vec::new(),
+                    });
+                } else if ram_used >= 0.85 || swap_used >= 0.25 {
+                    conditions.push(Condition {
+                        code: "host_memory_pressure".to_owned(),
+                        severity: "warning".to_owned(),
+                        message: format!(
+                            "host memory pressure: RAM {:.0}% consumed, swap {:.0}% consumed",
+                            ram_used * 100.0,
+                            swap_used * 100.0
+                        ),
+                        exemplars: Vec::new(),
+                    });
+                }
             }
             conditions
         },
+    }
+}
+
+/// The `ProviderStats` whose host sample describes this engine's host.
+///
+/// The co-hosted pool runs exactly one provider, so the pool's own provider
+/// id is the right answer; its `find` guards a future multi-provider engine.
+/// A stale id (the pool restarted under a new generation) falls back to the
+/// first provider rather than reporting nothing.
+fn chosen_provider<'a>(
+    stats: &'a preloop_sandbox::api::StatsResponse,
+    pool_provider_id: &str,
+) -> Option<&'a preloop_sandbox::api::ProviderStats> {
+    stats
+        .providers
+        .iter()
+        .find(|provider| provider.provider_id == pool_provider_id)
+        .or_else(|| stats.providers.first())
+}
+
+/// Whether a driver actually measured anything. An all-`None` sample is an
+/// unmeasured host, not an idle one.
+fn host_sample_measured(host: &preloop_sandbox::api::HostSample) -> bool {
+    host.mem_total_bytes.is_some()
+        || host.mem_available_bytes.is_some()
+        || host.swap_total_bytes.is_some()
+        || host.swap_free_bytes.is_some()
+        || host.engine_rss_bytes.is_some()
+        || host.vm_rss_bytes.is_some()
+        || !host.top_processes.is_empty()
+}
+
+/// Build the `/api/v1/status` `vms` section (and return the chosen provider's
+/// host sample) from the sandbox service's live statistics.
+///
+/// No statistics (no co-hosted service, or the `Stats` RPC failed) yields the
+/// default snapshot — the same "nothing registered yet" shape the pool-fed
+/// registry produced before its first registration.
+fn vm_fleet_snapshot(
+    sandbox_stats: Option<preloop_sandbox::api::StatsResponse>,
+    pool_provider_id: &str,
+) -> (
+    preloop_observability::status::VmFleetSnapshot,
+    Option<preloop_sandbox::api::HostSample>,
+) {
+    use preloop_observability::status::{VmConfigured, VmCount, VmFleetSnapshot, VmSource};
+    use preloop_sandbox::api::Purpose;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    let Some(stats) = sandbox_stats else {
+        return (VmFleetSnapshot::default(), None);
+    };
+    let host = chosen_provider(&stats, pool_provider_id).map(|provider| provider.host.clone());
+
+    let mut count = VmCount::default();
+    let mut configured = VmConfigured::default();
+    // Terminal sandboxes hold no capacity; they are not part of the fleet.
+    for entry in stats
+        .providers
+        .iter()
+        .flat_map(|provider| provider.sandboxes.iter())
+        .filter(|entry| !entry.sandbox.state.is_terminal())
+    {
+        let sandbox = &entry.sandbox;
+        match sandbox.purpose {
+            Purpose::Build => count.golden += 1,
+            Purpose::Runner => count.runner += 1,
+            // Exec/session/unspecified sandboxes hold capacity but are not
+            // one of the two fleet roles the snapshot reports.
+            _ => {}
+        }
+        configured.vcpus += sandbox.shape.cpus;
+        configured.memory_bytes += u64::from(sandbox.shape.memory_mib) * MIB;
+        configured.storage_bytes += u64::from(sandbox.shape.disk_gib) * GIB;
+    }
+
+    let measured = host.as_ref().is_some_and(host_sample_measured);
+    let snapshot = VmFleetSnapshot {
+        // Only the driver's own process/host measurements feed this now;
+        // there is no cgroup-detection path, so a sample is `Process` or
+        // nothing.
+        source: if measured {
+            VmSource::Process
+        } else {
+            VmSource::Unavailable
+        },
+        count,
+        configured,
+        host_usage: host.as_ref().map(vm_host_usage).unwrap_or_default(),
+        top_consumers: Vec::new(),
+        host_top_processes: host.as_ref().map(vm_host_top_processes).unwrap_or_default(),
+        ..Default::default()
+    };
+    (snapshot, host)
+}
+
+/// Map the sandbox service's host sample onto the status snapshot's host
+/// usage. Per-cgroup and shared-disk figures have no source here; they stay
+/// unset rather than reporting a fabricated zero.
+fn vm_host_usage(
+    host: &preloop_sandbox::api::HostSample,
+) -> preloop_observability::status::VmHostUsage {
+    preloop_observability::status::VmHostUsage {
+        cpu_cores: None,
+        memory_bytes: None,
+        sparse_disk_allocated_bytes: None,
+        mem_total_bytes: host.mem_total_bytes,
+        mem_available_bytes: host.mem_available_bytes,
+        swap_total_bytes: host.swap_total_bytes,
+        swap_free_bytes: host.swap_free_bytes,
+        engine_rss_bytes: host.engine_rss_bytes,
+        vm_rss_bytes: host.vm_rss_bytes,
+    }
+}
+
+fn vm_host_top_processes(
+    host: &preloop_sandbox::api::HostSample,
+) -> Vec<preloop_observability::status::HostTopProcess> {
+    host.top_processes
+        .iter()
+        .map(|process| preloop_observability::status::HostTopProcess {
+            pid: process.pid,
+            name: process.name.clone(),
+            rss_bytes: process.rss_bytes,
+        })
+        .collect()
+}
+
+/// Convert the sandbox service's host sample to the form the host-metrics
+/// recorder takes.
+///
+/// A plain function rather than `impl From`: both types live in other crates,
+/// so the orphan rule rejects the impl here, and `preloop-observability` must
+/// not depend on `preloop-sandbox` (the dependency runs the other way).
+fn observability_host_sample(
+    host: &preloop_sandbox::api::HostSample,
+) -> preloop_observability::vm_telemetry::HostSample {
+    preloop_observability::vm_telemetry::HostSample {
+        cpu_time_secs: None,
+        throttled_secs: None,
+        memory_bytes: None,
+        memory_limit_bytes: None,
+        pids_current: None,
+        sparse_allocated_bytes: None,
+        pid_valid: false,
+        mem_total_bytes: host.mem_total_bytes,
+        mem_available_bytes: host.mem_available_bytes,
+        swap_total_bytes: host.swap_total_bytes,
+        swap_free_bytes: host.swap_free_bytes,
+        engine_rss_bytes: host.engine_rss_bytes,
+        vm_rss_bytes: host.vm_rss_bytes,
+        top_processes: host
+            .top_processes
+            .iter()
+            .map(
+                |process| preloop_observability::vm_telemetry::HostTopProcess {
+                    pid: process.pid,
+                    rss_bytes: process.rss_bytes,
+                    name: process.name.clone(),
+                },
+            )
+            .collect(),
     }
 }
 
@@ -1317,7 +1486,7 @@ async fn publish_snapshot(
     shared: &SharedState,
     store_backend: &preloop_observability::status::StoreBackend,
     shutdown_requested: bool,
-) {
+) -> Option<preloop_observability::vm_telemetry::HostSample> {
     let debug = {
         let inner = shared.state.inner.lock().await;
         debug_session_scalars(&inner)
@@ -1325,6 +1494,16 @@ async fn publish_snapshot(
     let inputs = read_snapshot_inputs(&shared.state).await;
     let pool_snapshot = shared.state.pool_status.snapshot();
     let github_snapshot = shared.state.status_snapshot.read().github.clone();
+    // Live sandbox/host facts. Best-effort: an unset handle or a failing RPC
+    // degrades the status section instead of failing the tick.
+    let sandbox_stats = shared.state.sandbox.stats().await;
+    let pool_provider_id = shared.state.sandbox.pool_provider_id();
+    let host_sample = sandbox_stats
+        .as_ref()
+        .and_then(|stats| chosen_provider(stats, &pool_provider_id))
+        .map(|provider| &provider.host)
+        .filter(|host| host_sample_measured(host))
+        .map(observability_host_sample);
     // The storage bytes are a synchronous filesystem read; run it on the
     // blocking pool so a stalled state filesystem cannot stall request
     // handling or shutdown on the executor.
@@ -1348,8 +1527,11 @@ async fn publish_snapshot(
         github_snapshot,
         store_backend.clone(),
         webhook,
+        sandbox_stats,
+        pool_provider_id,
     );
     *shared.state.status_snapshot.write() = snap;
+    host_sample
 }
 
 /// Read the repair layers' published state plus the queue counters.
@@ -1406,7 +1588,7 @@ async fn run_state_sampler(
             // 503 — without this the flag would only land on the next 5s
             // tick that never comes.
             heartbeat.beat("state_sampler");
-            publish_snapshot(&shared, &store_backend, true).await;
+            let _ = publish_snapshot(&shared, &store_backend, true).await;
             break;
         }
         if early
@@ -1422,7 +1604,7 @@ async fn run_state_sampler(
                 _ = tokio::time::sleep(nap) => {}
                 _ = shared.shutdown.cancelled() => {
                     heartbeat.beat("state_sampler");
-                    publish_snapshot(&shared, &store_backend, true).await;
+                    let _ = publish_snapshot(&shared, &store_backend, true).await;
                     break;
                 }
             }
@@ -1441,7 +1623,7 @@ pub(crate) async fn sample_state_once(
     shared: &Arc<SharedState>,
     store_backend: &preloop_observability::status::StoreBackend,
 ) {
-    publish_snapshot(shared, store_backend, false).await;
+    let host_sample = publish_snapshot(shared, store_backend, false).await;
     // Record pool/queue gauges into OTel instruments so `/metrics` has a
     // single exposition source (the SDK renderer).
     let s = shared.state.status_snapshot.read();
@@ -1465,15 +1647,17 @@ pub(crate) async fn sample_state_once(
         s.jobs.unclaimable as u64,
         s.jobs.dependency_blocked as u64,
     );
-    // Host memory reality on the same cadence: a /proc scan is microseconds
-    // next to everything else on this tick. Recorded even when nothing else
-    // changed so OOM proximity is a continuous signal, not a sampled one.
-    shared
-        .state
-        .observability
-        .metrics()
-        .host
-        .record(&preloop_observability::vm_telemetry::sample_host());
+    // Host memory reality on the same cadence, from the pool's heartbeat
+    // sample — the same sample that fed this tick's snapshot. No sample means
+    // no recording: an unmeasured host must not look like an idle one.
+    if let Some(host_sample) = &host_sample {
+        shared
+            .state
+            .observability
+            .metrics()
+            .host
+            .record(host_sample);
+    }
 }
 
 fn is_routine_unix_disconnect(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -1506,6 +1690,11 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // standalone `preloop-server` binary, which passes no handle.
     if let Some(obs) = config.observability.clone() {
         state.observability = obs;
+    }
+    // The co-hosted pool publishes its sandbox service through this handle;
+    // unset (standalone server, tests) keeps the no-op default from `new`.
+    if let Some(sandbox) = config.sandbox.clone() {
+        state.sandbox = sandbox;
     }
     // Warm the static-PAT OAuth scope cache once at startup. Job expansion
     // is synchronous and cannot introspect the PAT itself, so without this the
@@ -1682,6 +1871,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             },
             store_backend.clone(),
             collect_webhook_condition_inputs(&state),
+            // The pool starts after this seed; the first 5s tick fills it.
+            None,
+            String::new(),
         );
         *state.status_snapshot.write() = init;
     }
@@ -2550,6 +2742,8 @@ mod tests {
             Default::default(),
             Default::default(),
             Default::default(),
+            None,
+            String::new(),
         );
         assert_eq!(
             snapshot.overall,
@@ -2583,6 +2777,8 @@ mod tests {
             Default::default(),
             Default::default(),
             Default::default(),
+            None,
+            String::new(),
         );
         assert_eq!(
             snapshot.overall,
@@ -2618,12 +2814,172 @@ mod tests {
             github,
             Default::default(),
             Default::default(),
+            None,
+            String::new(),
         );
         assert_eq!(
             snapshot.overall,
             preloop_observability::status::Overall::Degraded
         );
         assert_eq!(snapshot.conditions[0].code, "github_check_update_failure");
+    }
+
+    /// A live `Stats` response: two providers, one matching the pool's own
+    /// id. The other provider's sandboxes still count toward the fleet.
+    fn sandbox_stats_fixture(
+        host: preloop_sandbox::api::HostSample,
+    ) -> preloop_sandbox::api::StatsResponse {
+        use preloop_sandbox::api::{
+            ProviderStats, Purpose, Sandbox, SandboxState, SandboxStats, Shape, StatsResponse,
+        };
+
+        let entry = |purpose, state, cpus, memory_mib, disk_gib| SandboxStats {
+            sandbox: Sandbox {
+                purpose,
+                state,
+                shape: Shape {
+                    cpus,
+                    memory_mib,
+                    disk_gib,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        StatsResponse {
+            providers: vec![
+                ProviderStats {
+                    provider_id: "other".to_owned(),
+                    sandboxes: vec![entry(Purpose::Build, SandboxState::Ready, 1, 1024, 5)],
+                    ..Default::default()
+                },
+                ProviderStats {
+                    provider_id: "pool".to_owned(),
+                    host,
+                    sandboxes: vec![
+                        entry(Purpose::Build, SandboxState::Ready, 2, 2048, 10),
+                        entry(Purpose::Runner, SandboxState::Leased, 4, 4096, 20),
+                        // Terminal sandboxes hold no capacity and do not count.
+                        entry(Purpose::Runner, SandboxState::Gone, 8, 8192, 40),
+                    ],
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn vms_track_live_sandboxes_and_the_pool_providers_host_sample() {
+        use preloop_sandbox::api::{HostSample, HostTopProcess as SandboxHostTopProcess};
+
+        let sample = HostSample {
+            mem_total_bytes: Some(1000),
+            mem_available_bytes: Some(70),
+            swap_total_bytes: Some(100),
+            swap_free_bytes: Some(80),
+            engine_rss_bytes: Some(11),
+            vm_rss_bytes: Some(22),
+            top_processes: vec![SandboxHostTopProcess {
+                pid: 7,
+                name: "qemu".to_owned(),
+                rss_bytes: 33,
+            }],
+        };
+        let (vms, host) = vm_fleet_snapshot(Some(sandbox_stats_fixture(sample)), "pool");
+        assert_eq!(
+            (vms.count.golden, vms.count.runner, vms.count.unavailable),
+            (2, 1, 0)
+        );
+        assert_eq!(vms.configured.vcpus, 7);
+        assert_eq!(vms.configured.memory_bytes, 7 * 1024 * 1024 * 1024);
+        assert_eq!(vms.configured.storage_bytes, 35 * 1024 * 1024 * 1024);
+        assert_eq!(vms.configured.overlay_bytes, 0);
+        assert!(matches!(
+            vms.source,
+            preloop_observability::status::VmSource::Process
+        ));
+        assert_eq!(vms.host_usage.mem_total_bytes, Some(1000));
+        assert_eq!(vms.host_usage.mem_available_bytes, Some(70));
+        assert_eq!(vms.host_usage.swap_total_bytes, Some(100));
+        assert_eq!(vms.host_usage.engine_rss_bytes, Some(11));
+        assert_eq!(vms.host_usage.vm_rss_bytes, Some(22));
+        assert_eq!(vms.host_top_processes.len(), 1);
+        assert_eq!(vms.host_top_processes[0].name, "qemu");
+        let host = host.expect("the pool provider's sample must be returned");
+        assert_eq!(host.mem_total_bytes, Some(1000));
+        assert!((host.ram_used_fraction().unwrap() - 0.93).abs() < 1e-9);
+        assert!((host.swap_used_fraction().unwrap() - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vms_degrade_to_defaults_without_sandbox_stats() {
+        let (vms, host) = vm_fleet_snapshot(None, "pool");
+        assert_eq!((vms.count.golden, vms.count.runner), (0, 0));
+        assert_eq!(vms.configured.vcpus, 0);
+        assert!(matches!(
+            vms.source,
+            preloop_observability::status::VmSource::Unavailable
+        ));
+        assert!(vms.host_usage.mem_total_bytes.is_none());
+        assert!(vms.host_top_processes.is_empty());
+        assert!(host.is_none());
+    }
+
+    #[test]
+    fn host_memory_conditions_come_from_the_sandbox_host_sample() {
+        // 95% RAM used trips the critical line; 1/1.0 RAM+swap default must
+        // not produce a condition when no sample exists.
+        let hot = preloop_sandbox::api::HostSample {
+            mem_total_bytes: Some(100),
+            mem_available_bytes: Some(5),
+            ..Default::default()
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = build_operational_snapshot_sync(
+            Default::default(),
+            (0, None),
+            Default::default(),
+            &preloop_observability::Observability::noop(),
+            std::time::Instant::now(),
+            false,
+            true,
+            temp.path(),
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Some(sandbox_stats_fixture(hot)),
+            "pool".to_owned(),
+        );
+        assert!(
+            snapshot
+                .conditions
+                .iter()
+                .any(|condition| condition.code == "host_memory_critical")
+        );
+
+        let snapshot = build_operational_snapshot_sync(
+            Default::default(),
+            (0, None),
+            Default::default(),
+            &preloop_observability::Observability::noop(),
+            std::time::Instant::now(),
+            false,
+            true,
+            temp.path(),
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            None,
+            String::new(),
+        );
+        assert!(
+            snapshot
+                .conditions
+                .iter()
+                .all(|condition| !condition.code.starts_with("host_memory_"))
+        );
     }
 
     #[test]

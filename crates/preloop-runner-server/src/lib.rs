@@ -104,6 +104,8 @@ use snapshots::*;
 pub mod state;
 use state::*;
 pub use state::{AppState, SharedState};
+mod sandbox_handle;
+pub use sandbox_handle::SandboxHandle;
 pub mod models;
 use models::*;
 pub mod bootstrap;
