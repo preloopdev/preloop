@@ -149,13 +149,13 @@ enum SandboxState {
 }
 
 message Sandbox {
+  reserved 7;                       // was incarnation: ids are never re-provisioned
   string id = 1;
   string template = 2;
   string pool = 3;
   string provider_id = 4;
   string driver = 5;
   string native_ref = 6;
-  uint64 incarnation = 7;
   SandboxState state = 8;
   Purpose purpose = 9;
   string lease_id = 10;
@@ -172,6 +172,10 @@ message Lease {
   string idempotency_key = 4;
   int64 expires_at = 5;
   map<string, string> env = 6;      // merged into every Exec on this lease
+  // sha256 of the Acquire payload that owns `idempotency_key`; a reuse with a
+  // different payload is rejected. 130-139 is the reserved range for new
+  // fields on existing messages.
+  string request_hash = 130;
 }
 
 // ─── Sandboxes (callers) ──────────────────────────────────────────────
@@ -290,8 +294,8 @@ message HeartbeatRequest { string provider_id = 1; uint64 generation = 2; }
 message PollRequest { string provider_id = 1; uint64 generation = 2; uint64 wait_secs = 3; }
 
 message CreateWork {
+  reserved 2;                       // was incarnation
   string sandbox_id = 1;
-  uint64 incarnation = 2;
   string driver = 3;
   Template template = 4;
   Shape shape = 5;
@@ -339,6 +343,11 @@ message ReportExecRequest {
   repeated ExecEvent events = 4;
 }
 
-message Observed { string driver = 1; string native_ref = 2; string sandbox_id = 3; uint64 incarnation = 4; }
+message Observed {
+  reserved 4;                       // was incarnation
+  string driver = 1;
+  string native_ref = 2;
+  string sandbox_id = 3;            // when the driver can recover it from the native name
+}
 message ReconcileRequest { string provider_id = 1; uint64 generation = 2; repeated Observed sandboxes = 3; }
 message ReconcileResponse { repeated SandboxWork destroy = 1; }

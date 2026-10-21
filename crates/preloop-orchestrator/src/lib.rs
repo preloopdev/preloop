@@ -5654,9 +5654,13 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
 /// caller.
 ///
 /// `All` is the only scope that may kill a *live* hypervisor, so it is only
-/// ever used where nothing of ours can be running: pool startup and pool
-/// teardown ([`preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms`]). Those two moments differ in
-/// what an abandoned sweep costs, which is all this decides.
+/// ever used where nothing *of the pool's* can be running: pool startup and
+/// pool teardown
+/// ([`preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms`]). Sandboxes
+/// the Sandbox Service serves for other callers are marked in their machine
+/// data directory and spared by that sweep, so a leased sandbox survives an
+/// engine restart. Those two moments differ in what an abandoned sweep costs,
+/// which is all this decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrphanPurgeDuty {
     /// The pool is about to boot machines. The sweep is bounded per child now,
@@ -6283,10 +6287,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // smolvm DB no longer knows the machines, so the deletes above
         // cannot reach them and they keep the storage fds open — the
         // unlinked blocks leak until the process dies. Kill by config path.
-        // `All` is only sound here: every Preloop machine is stale by now, so
-        // nothing of ours can be running. The periodic reconcile the pool
-        // runs while serving uses `RemovedDataDir`, which spares any process
-        // whose boot config still exists.
+        // `All` is only sound here: every machine the pool owns is stale by
+        // now. It still spares machines the Sandbox Service marked as owned by
+        // a sandbox the pool does not hold — another caller's lease outlives
+        // this engine — and the periodic reconcile the pool runs while serving
+        // uses `RemovedDataDir`, which spares any process whose boot config
+        // still exists.
         match deadline::run_blocking(HOST_CLEANUP_TIMEOUT, "orphaned hypervisor purge", || {
             preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms(
                 preloop_sandbox::drivers::smolvm::cli::OrphanPurge::All,

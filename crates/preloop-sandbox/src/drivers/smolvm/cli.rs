@@ -1829,7 +1829,7 @@ impl SmolVmProvider {
     ///
     /// The directory is hash-derived, not name-derived, so it must be asked
     /// of smolvm rather than reconstructed from the platform cache layout.
-    async fn machine_data_dir(&self, name: &MachineName) -> Result<PathBuf, VmError> {
+    pub(crate) async fn machine_data_dir(&self, name: &MachineName) -> Result<PathBuf, VmError> {
         let _guard = self.lifecycle_lock.read().await;
         self.machine_data_dir_direct(name).await
     }
@@ -3331,12 +3331,11 @@ fn boot_config_dirs(line: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Classify a `ps` line by the machine state its argv names.
+/// Classify one `ps` line by the machine data directories its argv names.
 ///
 /// The boot config itself is gone once the machine booted, so the directory
 /// is what proves the machine exists.
-fn machine_data_state(line: &str, roots: &[PathBuf]) -> MachineDataState {
-    let dirs = boot_config_dirs(line, roots);
+fn machine_data_state(dirs: &[PathBuf]) -> MachineDataState {
     if dirs.iter().any(|dir| dir.exists()) {
         return MachineDataState::Present;
     }
@@ -3499,13 +3498,47 @@ fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Resu
     Ok(detached)
 }
 
+/// Marker file the Sandbox Service's SmolVM driver writes into a machine's
+/// data directory for a sandbox the CI pool does not own (see
+/// [`SmolvmDriver`](super::SmolvmDriver)).
+///
+/// The purge sees only the boot-config path of a hypervisor, never the
+/// machine name, and smolvm derives that path from a hash of the name — so a
+/// file in the data directory is the one ownership fact available at kill
+/// time. A marked machine is one the service keeps a record of and destroys
+/// through the driver, which escalates to a targeted
+/// [`kill_vm_processes_in`] when `machine delete` refuses.
+pub const SANDBOX_OWNER_MARKER: &str = ".preloop-sandbox";
+
+/// Writes [`SANDBOX_OWNER_MARKER`] for a machine the service owns.
+///
+/// `data_dir` is the machine's resolved data directory (smolvm's
+/// `machine data-dir`); `native` is recorded in the file for operators
+/// reading a host by hand.
+pub fn mark_sandbox_owned(data_dir: &Path, native: &str) -> Result<(), VmError> {
+    std::fs::write(data_dir.join(SANDBOX_OWNER_MARKER), format!("{native}\n")).map_err(|error| {
+        VmError::Protocol(format!(
+            "writing the sandbox owner marker in {}: {error}",
+            data_dir.display()
+        ))
+    })
+}
+
+/// Whether a machine data directory carries [`SANDBOX_OWNER_MARKER`].
+fn is_sandbox_owned(dir: &Path) -> bool {
+    dir.join(SANDBOX_OWNER_MARKER).is_file()
+}
+
 /// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanPurge {
-    /// Every hypervisor whose argv names this Preloop home's data root.
+    /// Every hypervisor whose argv names this Preloop home's data root,
+    /// except machines the Sandbox Service owns.
     ///
-    /// Only safe where nothing of ours can be running: pool startup, after
-    /// the stale machines have been deleted, and shutdown.
+    /// Only safe where nothing *of the pool's* can be running: pool startup,
+    /// after the stale machines have been deleted, and shutdown. A Sandbox
+    /// Service sandbox the CI pool does not own may still be leased to
+    /// another caller at those moments — its machine is marked and spared.
     All,
     /// Only hypervisors whose machine data directory is already gone — the
     /// directory the `boot-config.json` in their argv names no longer exists.
@@ -3537,9 +3570,11 @@ pub enum OrphanPurge {
 /// path merely shares a prefix is never matched.
 ///
 /// `scope` decides which of those processes may be killed; see
-/// [`OrphanPurge`]. Called at pool startup (crash recovery, `All`) and on an
-/// interval while the pool serves (`RemovedDataDir`). Returns the number of
-/// processes killed.
+/// [`OrphanPurge`]. A machine whose data directory carries
+/// [`SANDBOX_OWNER_MARKER`] belongs to a Sandbox Service sandbox the CI pool
+/// does not own and is never killed, whatever the scope. Called at pool
+/// startup (crash recovery, `All`) and on an interval while the pool serves
+/// (`RemovedDataDir`). Returns the number of processes killed.
 ///
 /// Both host tools it runs (`ps`, `kill`) are bounded by [`PROBE_DEADLINE`]:
 /// this is called from the pool's reconcile loop, where a wedged `ps` on a
@@ -3559,10 +3594,18 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
         if !line.contains(BOOT_VM_PROCESS) {
             continue;
         }
+        let dirs = boot_config_dirs(line, &roots);
+        // A Sandbox Service sandbox the CI pool does not own is not this
+        // purge's to kill, even under `All`: it may be leased to another
+        // caller right now, and the service's own delete path escalates to a
+        // targeted kill when smolvm refuses.
+        if dirs.iter().any(|dir| is_sandbox_owned(dir)) {
+            continue;
+        }
         // Anything whose machine data directory still exists may be live:
         // spare it rather than kill a machine that is registered, running a
         // job, or still being created. See `OrphanPurge::RemovedDataDir`.
-        match machine_data_state(line, &roots) {
+        match machine_data_state(&dirs) {
             MachineDataState::Unknown => continue,
             MachineDataState::Present if scope == OrphanPurge::RemovedDataDir => continue,
             MachineDataState::Present | MachineDataState::Removed => {}
@@ -4866,6 +4909,45 @@ mod tests {
         );
         let _ = unknown_child.kill();
         let _ = unknown_child.wait();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A machine the Sandbox Service marked as its own is never killed, even
+    /// under `All`: it may be a sandbox leased to a caller the CI pool knows
+    /// nothing about, and the service destroys it through the driver.
+    #[test]
+    fn all_purge_spares_a_marked_sandbox_service_machine() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home =
+            std::env::temp_dir().join(format!("preloop-purge-owned-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let vms = super::machine_data_root().expect("this home resolves to a data root");
+        let data_dir = vms.join("0123456789abcdef");
+        std::fs::create_dir_all(&data_dir).expect("create machine dir");
+        super::mark_sandbox_owned(&data_dir, "psbx-3f2a9c").expect("mark");
+        let mut child = spawn_fake_boot_vm(&[data_dir.join("boot-config.json").to_str().unwrap()]);
+        let pid = child.id() as i32;
+
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            0,
+            "a marked sandbox is not the pool's to kill"
+        );
+        assert!(
+            process_alive(pid),
+            "a sandbox leased to another caller must survive the engine's sweep"
+        );
+
+        // Without the marker the same machine is the crash-recovery case the
+        // startup sweep exists for.
+        std::fs::remove_file(data_dir.join(super::SANDBOX_OWNER_MARKER)).unwrap();
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            1,
+            "an unmarked machine is still reaped"
+        );
+        let _ = child.wait();
+        assert!(!process_alive(pid), "the unmarked hypervisor must be dead");
         std::fs::remove_dir_all(&home).ok();
     }
 

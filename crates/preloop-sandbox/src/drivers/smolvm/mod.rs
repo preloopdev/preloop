@@ -16,7 +16,7 @@ use tracing::warn;
 
 use self::cli::{
     MachineName, MachineSpec, NetworkPolicy as VmNetwork, OutputChunk, SmolVmProvider,
-    SocketMount as VmSocket, VmError, VmProvider, VolumeMount,
+    SocketMount as VmSocket, VmError, VmProvider, VolumeMount, mark_sandbox_owned,
 };
 use crate::api::*;
 use crate::connect::{Code, Error, Result};
@@ -56,6 +56,42 @@ impl SmolvmDriver {
         self.named_prefix
             .as_deref()
             .is_some_and(|prefix| name.starts_with(prefix))
+    }
+
+    /// Mark a machine the CI pool does not own as a Sandbox Service sandbox.
+    ///
+    /// The engine's start/teardown sweep (`OrphanPurge::All`) kills every
+    /// hypervisor under this home it cannot attribute, which used to include
+    /// sandboxes leased to other callers. The sweep sees only a machine's
+    /// data directory, so that is where the ownership marker goes. Pool
+    /// machines (`named_prefix`) stay unmarked: the pool deletes them itself
+    /// on teardown and the sweep is its crash backstop.
+    ///
+    /// A marker that cannot be written fails the create: an unmarked sandbox
+    /// could be killed under a live lease at the next engine start or stop.
+    async fn mark_owned(&self, name: &MachineName) -> Result<()> {
+        if self.adopts(name.as_str()) {
+            return Ok(());
+        }
+        let data_dir = self
+            .provider
+            .machine_data_dir(name)
+            .await
+            .map_err(vm_error)?;
+        mark_sandbox_owned(&data_dir, name.as_str()).map_err(vm_error)?;
+        Ok(())
+    }
+
+    /// [`SmolvmDriver::mark_owned`] for a machine already created: a machine
+    /// that cannot be marked must not be handed out, so it is destroyed.
+    async fn mark_owned_or_destroy(&self, name: &MachineName) -> Result<()> {
+        match self.mark_owned(name).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self.provider.delete(name).await;
+                Err(error)
+            }
+        }
     }
 
     /// The underlying CLI provider.
@@ -144,7 +180,7 @@ impl Driver for SmolvmDriver {
         // A caller-chosen name doubles as the native name, so host tools
         // (`preloop shell`, `smolvm machine exec`) address the same machine.
         let name = if work.name.is_empty() {
-            native_name(&work.sandbox_id, work.incarnation)
+            native_name(&work.sandbox_id)
         } else {
             work.name.clone()
         };
@@ -152,7 +188,10 @@ impl Driver for SmolvmDriver {
         if !work.template.native_ref.is_empty() {
             let golden = machine(&work.template.native_ref)?;
             match self.provider.fork(&golden, &clone).await {
-                Ok(()) => return Ok(name),
+                Ok(()) => {
+                    self.mark_owned_or_destroy(&clone).await?;
+                    return Ok(name);
+                }
                 Err(error) => {
                     // Older SmolVM fork bases serve one live clone; re-arm
                     // once when nothing depends on the base any more.
@@ -167,6 +206,7 @@ impl Driver for SmolvmDriver {
                             .fork(&golden, &clone)
                             .await
                             .map_err(vm_error)?;
+                        self.mark_owned_or_destroy(&clone).await?;
                         return Ok(name);
                     }
                     return Err(vm_error(error));
@@ -235,6 +275,10 @@ impl Driver for SmolvmDriver {
             workload_init: json_option(option("workload_init"), "workload_init")?,
         };
         self.provider.create(&spec).await.map_err(vm_error)?;
+        // Mark before boot: the engine's sweep can only kill a running
+        // hypervisor, so doing it here leaves no window in which a live
+        // sandbox is unmarked.
+        self.mark_owned_or_destroy(&clone).await?;
         let started = if work.snapshot_capable {
             self.provider.start_forkable(&clone).await
         } else {
@@ -422,13 +466,11 @@ impl Driver for SmolvmDriver {
             .into_iter()
             .filter(|name| name.as_str().starts_with(NATIVE_PREFIX) || self.adopts(name.as_str()))
             .map(|name| {
-                let (sandbox_id, incarnation) =
-                    parse_native_name(name.as_str()).unwrap_or_default();
+                let sandbox_id = parse_native_name(name.as_str()).unwrap_or_default();
                 Observed {
                     driver: NAME.into(),
                     native_ref: name.as_str().to_owned(),
                     sandbox_id,
-                    incarnation,
                 }
             })
             .collect())

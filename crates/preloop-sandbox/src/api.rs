@@ -423,8 +423,6 @@ pub struct Sandbox {
     /// Driver-native reference.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub native_ref: String,
-    /// Bumped whenever the id is re-provisioned.
-    pub incarnation: u64,
     /// State.
     pub state: SandboxState,
     /// Purpose.
@@ -464,6 +462,9 @@ pub struct Lease {
     /// Environment merged into every exec on this lease.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// sha256 of the [`AcquireRequest`] that owns the idempotency key.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub request_hash: String,
 }
 
 /// Empty message.
@@ -824,8 +825,6 @@ pub struct CreateWork {
     /// Caller-chosen name; drivers use it as the native name when set.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// Incarnation.
-    pub incarnation: u64,
     /// Driver.
     pub driver: String,
     /// Template (with native_ref when it is a snapshot).
@@ -1006,9 +1005,6 @@ pub struct Observed {
     /// Sandbox id, when the driver can recover it from the native name.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub sandbox_id: String,
-    /// Incarnation, when recoverable.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub incarnation: u64,
 }
 
 /// `Reconcile`.
@@ -1027,6 +1023,6 @@ pub struct ReconcileRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ReconcileResponse {
-    /// Orphans and stale incarnations.
+    /// Orphans: machines no live record owns.
     pub destroy: Vec<SandboxWork>,
 }
