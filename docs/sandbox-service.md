@@ -20,12 +20,14 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
   pool or template, identity to inject), `Renew`, `Release` (destroy or
   preserve), `Exec` (server-streaming), `OpenStream` (data-plane ticket),
   `Snapshot`, `Pause`/`Resume`, `Get`/`List`.
-* **Providers** (capacity owners): `Register` (drivers + capabilities →
-  provider id and fencing generation), `Heartbeat`, `Poll` (long-poll for
-  work), `Report` / `ReportExec` (fenced by generation), `Reconcile` (full
-  inventory: lost sandboxes fail, orphans and stale incarnations are destroyed).
+* **Providers** (capacity owners): `Enroll` (single-use join token → 24h
+  client certificate), `Register` (drivers + capabilities → provider id and
+  fencing generation), `Heartbeat`, `Poll` (long-poll for work), `Report` /
+  `ReportExec` (fenced by generation), `Reconcile` (full inventory: lost
+  sandboxes fail, orphans and stale incarnations are destroyed),
+  `RenewCertificate`.
 
-Both are served with the Connect protocol, JSON codec, over one HTTP port:
+Both are served with the Connect protocol, JSON codec, over one HTTPS port:
 `POST /preloop.sandbox.v1.<Service>/<Method>`. Every RPC is unary or
 server-streaming, so it works over HTTP/1.1 — proxies, and hosts behind NAT that
 dial out. Bulk bytes never ride inside RPCs: `OpenStream` returns a short-lived
@@ -76,19 +78,50 @@ parties integrate by implementing the Providers protocol.
 relays (the CLI's branches keep them), so the driver stays on the CLI and pools
 are the service's.
 
-## Security model
+## Security
 
-* Data-plane tickets are single-use, scoped to one sandbox and direction, and
-  short-lived; the URL carries its own token.
-* `Report`/`ReportExec`/`Reconcile` are fenced by the provider's registration
-  generation, and a provider may not report output for another provider's
-  exec, nor destroy another provider's machine.
-* **The provider token authenticates a role, not an identity.** Any holder can
-  register any provider *name*, which bumps that name's generation and fails
-  its in-flight work, poll its queue, or report its work items. Deployments
-  that hand the provider token to more than one trusted operator need
-  per-provider identities (a follow-up); on a single-operator tailnet the
-  shared token is the trust boundary, exactly like the engine token.
+Every listener speaks TLS. On first start the service creates a CA in
+`<state>/sandbox-ca/` (`ca.pem`, `ca.key`, mode 0600) and reuses it, issuing its
+own server certificate with SANs from `PRELOOP_SANDBOX_TLS_SANS` (default: the
+hostname, `localhost`, `127.0.0.1`, `::1`).
+`PRELOOP_SANDBOX_TLS_CERT` / `PRELOOP_SANDBOX_TLS_KEY` replace the server
+certificate. There is no plaintext mode and no loopback exemption.
+
+* **Callers** (`Sandboxes`) present one bearer token. When
+  `PRELOOP_SANDBOX_TOKEN` is unset the service generates one on first start at
+  `<state>/sandbox-client-token` (0600). The CLI resolves `--token` /
+  `PRELOOP_SANDBOX_TOKEN`, then that file, and the CA through `--ca` /
+  `PRELOOP_SANDBOX_CA`, then `<home>/state/sandbox-ca/ca.pem`. The in-process
+  path (`InProcess`) needs no credentials: it is the same process.
+* **Providers** authenticate with a client certificate issued by the service
+  CA. Every `Providers` RPC except `Enroll` requires one; the service maps the
+  leaf's SHA-256 fingerprint to a provider record, so no X.509 parsing happens
+  past the handshake. A certificate only acts as the provider it was enrolled
+  for: `Register`'s `name` must equal the enrolled name and every other RPC may
+  only name its own provider id. Removed providers and expired certificates are
+  rejected with `permission_denied`. `PRELOOP_SANDBOX_PROVIDER_TOKEN` is gone.
+* **Enrollment** is a single-use token:
+  `preloop sandbox token create --ttl 1h` prints
+  `plj1.<id>.<secret>.<ca_sha256>` and the store keeps only a hash of the
+  secret. `preloop sandbox agent --join https://hub:9191 --token plj1.…`
+  exchanges it for a 24h certificate and records the leaf's fingerprint on the
+  provider. The agent fetches the service CA first and refuses to send its CSR
+  unless that CA hashes to the token's pin. The identity (`key.pem`, `cert.pem`,
+  `ca.pem`, `identity.json`, all 0600) lives under
+  `<home>/state/sandbox-identity/`; later starts reuse it with no token.
+  Re-enrolling an existing name with a new token replaces its fingerprints.
+* **Renewal** is automatic: the agent asks for a new certificate once two
+  thirds of the lifetime have passed and hot-reloads its client identity. The
+  previous fingerprint stays valid until it expires, so a failure between the
+  service signing and the agent persisting the new key does not lock it out.
+* **Revocation** is `preloop sandbox provider rm <name>`, which deletes the
+  provider record and its fingerprints. Its machine records are dropped too:
+  once the host cannot authenticate, nothing will ever reconcile them.
+* **Data-plane tickets** are single-use, scoped to one sandbox and direction,
+  and short-lived; their URLs are relative, so they inherit the `https` base.
+* `Report`/`ReportExec`/`Reconcile` are additionally fenced by the provider's
+  registration generation, and a provider may not report output for another
+  provider's exec, nor destroy another provider's machine.
 
 ## State
 
@@ -100,9 +133,9 @@ never references control tables.
 ## How preloop uses it
 
 `preloop engine` runs the service in-process with this host's drivers attached
-through an in-process agent, and serves the API on `PRELOOP_SANDBOX_LISTEN`
-(default `127.0.0.1:9191`; `off` disables). The runner pool
-(`preloop_orchestrator::fleet::SandboxMachines`) acquires every VM from it:
+through an in-process agent, and serves the API over HTTPS on
+`PRELOOP_SANDBOX_LISTEN` (default `127.0.0.1:9191`; `off` disables). The runner
+pool (`preloop_orchestrator::fleet::SandboxMachines`) acquires every VM from it:
 goldens are build sandboxes, forks are acquires from the golden's snapshot
 template, and deletes are releases. The pool keeps its golden, packed-artifact
 and debug-hold strategy; the machines under it are sandboxes.
@@ -110,7 +143,11 @@ and debug-hold strategy; the machines under it are sandboxes.
 | Variable | Effect |
 |---|---|
 | `PRELOOP_SANDBOX_LISTEN` | API address, or `off` |
-| `PRELOOP_SANDBOX_TOKEN` / `PRELOOP_SANDBOX_PROVIDER_TOKEN` | bearer tokens; required off loopback |
+| `PRELOOP_SANDBOX_TOKEN` | caller bearer token; generated into `<state>/sandbox-client-token` when unset |
+| `PRELOOP_SANDBOX_CA` | CA bundle the CLI verifies the service with |
+| `PRELOOP_SANDBOX_JOIN_TOKEN` | join token for `sandbox agent` on its first run |
+| `PRELOOP_SANDBOX_TLS_SANS` | server certificate SANs (comma list) |
+| `PRELOOP_SANDBOX_TLS_CERT` / `PRELOOP_SANDBOX_TLS_KEY` | replace the generated server certificate |
 | `PRELOOP_SANDBOX_STORE_URL` | store URL |
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
 | `PRELOOP_SANDBOX_POOL_DRIVER` | driver the CI pool places on (default: first) |
@@ -120,7 +157,8 @@ and debug-hold strategy; the machines under it are sandboxes.
 
 ```sh
 preloop sandbox serve --listen 0.0.0.0:9191            # standalone service (+ local SmolVM)
-preloop sandbox agent --service http://hub:9191        # join as a provider
+preloop sandbox token create --ttl 1h                  # join token for a provider
+preloop sandbox agent --join https://hub:9191 --token plj1.…  # enroll, then reuse the identity
 preloop sandbox template put --name alpine --image alpine:3.20
 preloop sandbox pool put --name alpine --template alpine --warm 2
 preloop sandbox acquire --pool alpine --env JOB=1      # → lease + sandbox JSON
@@ -130,17 +168,21 @@ preloop sandbox stop sbx-…                            # power off, keep the di
 preloop sandbox start sbx-… [--forkable]               # boot it again (bakes)
 preloop sandbox snapshot sbx-… --name golden
 preloop sandbox release lse-… [--preserve 600]
-preloop sandbox ls | providers
+preloop sandbox ls
+preloop sandbox provider ls
+preloop sandbox provider rm host-a                     # revoke its certificates
 ```
 
 ## Verification
 
 * `cargo test -p preloop-sandbox` — service/agent conformance over the fake
-  driver, in-process and across a real HTTP server with a remote agent
+  driver, in-process and across a real TLS server with a remote enrolled agent
   (idempotency, warm pools, placement errors, unsupported operations,
   snapshot → template → fork, create failure, lease expiry and preservation,
   orphan/lost reconcile, generation fencing, SQLite restart, streaming exec,
-  ticketed upload/download). Set `PRELOOP_SANDBOX_TEST_PG` to also run the
+  ticketed upload/download), plus enrollment: single-use and expired join
+  tokens, CA pinning, name binding, mTLS denial without a certificate,
+  renewal, and revocation. Set `PRELOOP_SANDBOX_TEST_PG` to also run the
   Postgres store test.
 * `PRELOOP_SANDBOX_E2E_SMOLVM=1 cargo test -p preloop-sandbox --test smolvm_e2e`
   — real SmolVM: bake, snapshot, warm pool of branches, socket mount, files,

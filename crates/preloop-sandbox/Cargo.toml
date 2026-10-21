@@ -17,9 +17,12 @@ base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
+hostname.workspace = true
 parking_lot.workspace = true
 postgres_rustls.workspace = true
 preloop-observability = { path = "../preloop-observability" }
+rand.workspace = true
+rcgen = { workspace = true, features = ["x509-parser"] }
 reqwest.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true
@@ -29,6 +32,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+time = "0.3"
 tokio = { workspace = true, features = ["process"] }
 tokio-postgres.workspace = true
 tokio-rustls.workspace = true

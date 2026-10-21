@@ -1,13 +1,14 @@
 //! Service/agent conformance over the process-backed fake driver, driven
-//! both in-process and across a real HTTP server with a remote agent.
+//! both in-process and across a real TLS server with a remote agent.
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink, RemoteLink};
+use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::fake::FakeDriver;
-use preloop_sandbox::server::{Auth, router};
 use preloop_sandbox::store::{self, Kind, Store};
 use preloop_sandbox::{Code, Driver, SandboxClient, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -540,45 +541,38 @@ async fn state_survives_restart_from_sqlite() {
     assert_eq!(restored.list().len(), 1);
 }
 
-/// The same flows across a real HTTP server with a remote agent.
+/// The same flows across a real TLS server with a remote agent.
 #[tokio::test]
 async fn remote_agent_and_client_over_connect() {
     use preloop_sandbox::SandboxApi as _;
-    let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
-    let auth = Auth {
-        client_token: Some("client-secret".into()),
-        provider_token: Some("provider-secret".into()),
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = router(service.clone(), auth);
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    let shutdown = CancellationToken::new();
-    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    let t = common::TestService::start().await;
+    let service = t.service.clone();
+    let dir = t.dir.path().to_path_buf();
     let fake = Arc::new(FakeDriver::new(
         "fake",
-        dir.path().join("host"),
+        dir.join("host"),
         FakeDriver::full_capabilities(),
     ));
+    let link = t.enroll("remote-host").await;
     let agent = Agent::new(
-        Arc::new(RemoteLink::new(&base, Some("provider-secret".into()))),
+        Arc::new(link),
         vec![fake as Arc<dyn Driver>],
-        AgentConfig::new("remote-host", dir.path().join("scratch")),
+        AgentConfig::new("remote-host", dir.join("scratch")),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(t.shutdown_token()));
 
-    // Wrong token is rejected.
-    let bad = SandboxClient::new(&base, Some("nope".into()));
+    // A wrong caller token is rejected, over the same TLS endpoint.
+    let ca = t.ca_pem();
+    let bad = SandboxClient::with_tls(&t.base, Some("nope".into()), &ca, None).unwrap();
     assert_eq!(bad.list().await.unwrap_err().code, Code::Unauthenticated);
 
-    let client = SandboxClient::new(&base, Some("client-secret".into()));
-    wait_for(|| !Service::list_providers(&service).is_empty()).await;
+    let client = t.client();
+    wait_for(|| {
+        Service::list_providers(&service)
+            .iter()
+            .any(|provider| provider.generation > 0 && !provider.drivers.is_empty())
+    })
+    .await;
     client.put_template(template("alpine")).await.unwrap();
     let lease = client
         .acquire(AcquireRequest {
@@ -606,7 +600,7 @@ async fn remote_agent_and_client_over_connect() {
     assert_eq!(stderr, b"err\n");
 
     // Upload a tar through a ticket, then download it back.
-    let src = dir.path().join("in.tar");
+    let src = dir.join("in.tar");
     {
         let mut builder = tar::Builder::new(std::fs::File::create(&src).unwrap());
         let data = b"payload";
@@ -623,7 +617,7 @@ async fn remote_agent_and_client_over_connect() {
         .upload(&lease.sandbox.id, "/work", &src)
         .await
         .unwrap();
-    let out = dir.path().join("out.tar");
+    let out = dir.join("out.tar");
     client
         .download(&lease.sandbox.id, "/work/dir", &out)
         .await
@@ -658,7 +652,6 @@ async fn remote_agent_and_client_over_connect() {
         .await
         .unwrap();
     wait_for(|| Service::list(&service).is_empty()).await;
-    shutdown.cancel();
 }
 
 #[tokio::test]

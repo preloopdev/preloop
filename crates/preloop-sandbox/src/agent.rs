@@ -86,16 +86,183 @@ impl ProviderLink for Arc<Service> {
     }
 }
 
-/// Remote link over Connect + HTTP blobs.
+/// Remote link over Connect + HTTPS blobs, authenticated by the client
+/// certificate issued at enrollment.
+#[derive(Debug)]
 pub struct RemoteLink {
-    client: connect::Client,
+    base: String,
+    http: parking_lot::RwLock<reqwest::Client>,
+    identity: parking_lot::RwLock<Option<crate::tls::AgentIdentity>>,
+    renew: tokio::sync::Mutex<()>,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// The agent only speaks TLS: the CA pin has no meaning behind a plaintext
+/// proxy that terminates TLS.
+fn normalize_base(base: &str) -> Result<String> {
+    let base = base.trim_end_matches('/');
+    if !base.starts_with("https://") {
+        return Err(Error::invalid(
+            "the sandbox API is always TLS; use an https:// URL",
+        ));
+    }
+    Ok(base.to_owned())
 }
 
 impl RemoteLink {
-    /// `base` like `https://sandbox.example:9191`, `token` the provider token.
-    pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
-        Self {
-            client: connect::Client::new(base, token),
+    /// Enroll with a join token and store the identity in `identity_dir`.
+    ///
+    /// The service CA is fetched first and checked against the token's pin,
+    /// so the CSR only reaches a service that holds the CA the operator
+    /// issued the token for.
+    pub async fn enroll(
+        base: impl Into<String>,
+        token: &str,
+        identity_dir: impl Into<PathBuf>,
+        name: &str,
+    ) -> Result<Self> {
+        let base = base.into();
+        let base = normalize_base(&base)?;
+        let pin = crate::tls::parse_join_token(token)?.ca_sha256.to_owned();
+        let ca_pem = crate::tls::fetch_ca(&base).await?;
+        if crate::tls::pem_fingerprint(&ca_pem)? != pin {
+            return Err(Error::new(
+                Code::Unauthenticated,
+                "sandbox service CA does not match the join token pin",
+            ));
+        }
+        let (key_pem, csr_pem) = crate::tls::generate_csr(name)?;
+        let http = crate::tls::http_client(&ca_pem, None)?;
+        let response: EnrollResponse = connect::Client::with_http(base.clone(), None, http)
+            .unary(
+                &format!("{PROVIDERS}/Enroll"),
+                &EnrollRequest {
+                    token: token.to_owned(),
+                    name: name.to_owned(),
+                    csr_pem,
+                },
+            )
+            .await?;
+        if crate::tls::pem_fingerprint(&response.ca_pem)? != pin {
+            return Err(Error::new(
+                Code::Unauthenticated,
+                "enrollment answered with a different CA",
+            ));
+        }
+        let identity = crate::tls::AgentIdentity {
+            dir: identity_dir.into(),
+            metadata: crate::tls::IdentityMetadata {
+                name: name.to_owned(),
+                base: base.clone(),
+                ca_sha256: pin,
+                issued_at: unix_now(),
+                expires_at: response.expires_at,
+            },
+            ca_pem: response.ca_pem,
+            cert_pem: response.cert_pem,
+            key_pem,
+        };
+        identity.save()?;
+        Self::from_identity(identity)
+    }
+
+    /// Load a stored identity, or enroll with `token` when there is none.
+    pub async fn connect(
+        identity_dir: impl Into<PathBuf>,
+        base: Option<&str>,
+        token: Option<&str>,
+        name: impl Into<String>,
+    ) -> Result<Self> {
+        let identity_dir = identity_dir.into();
+        if let Some(mut identity) = crate::tls::AgentIdentity::load(&identity_dir)? {
+            if let Some(base) = base {
+                identity.metadata.base = normalize_base(base)?;
+                identity.save()?;
+            }
+            return Self::from_identity(identity);
+        }
+        let base = base.ok_or_else(|| {
+            Error::invalid("`--join` is required on the first run (no stored identity)")
+        })?;
+        let token = token.ok_or_else(|| {
+            Error::new(
+                Code::Unauthenticated,
+                "a join token is required on the first run",
+            )
+        })?;
+        let name = name.into();
+        Self::enroll(base, token, identity_dir, &name).await
+    }
+
+    fn from_identity(identity: crate::tls::AgentIdentity) -> Result<Self> {
+        let http = crate::tls::http_client(&identity.ca_pem, Some(&identity.identity_pem()))?;
+        Ok(Self {
+            base: identity.metadata.base.clone(),
+            http: parking_lot::RwLock::new(http),
+            identity: parking_lot::RwLock::new(Some(identity)),
+            renew: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Base URL.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// The provider name this link's certificate is bound to.
+    pub fn name(&self) -> Option<String> {
+        self.identity
+            .read()
+            .as_ref()
+            .map(|identity| identity.metadata.name.clone())
+    }
+
+    fn client(&self) -> connect::Client {
+        connect::Client::with_http(self.base.clone(), None, self.http.read().clone())
+    }
+
+    /// Issue a fresh certificate and hot-reload the client identity.
+    ///
+    /// The service keeps the previous fingerprint valid until it expires, so
+    /// a failure after the server signed (before the files land) is safe.
+    pub async fn renew(&self) -> Result<()> {
+        let Some(identity) = self.identity.read().clone() else {
+            return Ok(());
+        };
+        let _guard = self.renew.lock().await;
+        let (key_pem, csr_pem) = crate::tls::generate_csr(&identity.metadata.name)?;
+        let response: RenewCertificateResponse = self
+            .client()
+            .unary(
+                &format!("{PROVIDERS}/RenewCertificate"),
+                &RenewCertificateRequest { csr_pem },
+            )
+            .await?;
+        let next = identity.renewed(response.cert_pem, key_pem, unix_now(), response.expires_at);
+        let http = crate::tls::http_client(&next.ca_pem, Some(&next.identity_pem()))?;
+        next.save()?;
+        *self.http.write() = http;
+        *self.identity.write() = Some(next);
+        Ok(())
+    }
+
+    async fn maybe_renew(&self) {
+        let due = self
+            .identity
+            .read()
+            .as_ref()
+            .is_some_and(|identity| identity.needs_renewal(unix_now()));
+        if !due {
+            return;
+        }
+        if let Err(error) = self.renew().await {
+            debug!(%error, "certificate renewal failed; retrying on the next heartbeat");
         }
     }
 
@@ -105,19 +272,14 @@ impl RemoteLink {
         id: &Session,
         ticket: &str,
     ) -> reqwest::RequestBuilder {
-        let mut request = self
-            .client
-            .http()
+        self.http
+            .read()
             .request(
                 method,
-                format!("{}/sandbox/v1/agent/blobs/{ticket}", self.client.base()),
+                format!("{}/sandbox/v1/agent/blobs/{ticket}", self.base),
             )
             .header("x-provider-id", &id.provider_id)
-            .header("x-provider-generation", id.generation.to_string());
-        if let Some(token) = self.client.token() {
-            request = request.bearer_auth(token);
-        }
-        request
+            .header("x-provider-generation", id.generation.to_string())
     }
 }
 
@@ -126,35 +288,38 @@ const PROVIDERS: &str = "preloop.sandbox.v1.Providers";
 #[async_trait]
 impl ProviderLink for RemoteLink {
     async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse> {
-        self.client
+        self.client()
             .unary(&format!("{PROVIDERS}/Register"), &request)
             .await
     }
     async fn heartbeat(&self, request: HeartbeatRequest) -> Result<()> {
-        self.client
+        // Heartbeats are the agent's slowest reliable tick: renew here so a
+        // long-polling agent still rotates its certificate in time.
+        self.maybe_renew().await;
+        self.client()
             .unary::<_, Empty>(&format!("{PROVIDERS}/Heartbeat"), &request)
             .await
             .map(|_| ())
     }
     async fn poll(&self, request: PollRequest) -> Result<PollResponse> {
-        self.client
+        self.client()
             .unary(&format!("{PROVIDERS}/Poll"), &request)
             .await
     }
     async fn report(&self, request: ReportRequest) -> Result<()> {
-        self.client
+        self.client()
             .unary::<_, Empty>(&format!("{PROVIDERS}/Report"), &request)
             .await
             .map(|_| ())
     }
     async fn report_exec(&self, request: ReportExecRequest) -> Result<()> {
-        self.client
+        self.client()
             .unary::<_, Empty>(&format!("{PROVIDERS}/ReportExec"), &request)
             .await
             .map(|_| ())
     }
     async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse> {
-        self.client
+        self.client()
             .unary(&format!("{PROVIDERS}/Reconcile"), &request)
             .await
     }

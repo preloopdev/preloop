@@ -196,7 +196,13 @@ service Sandboxes {
   rpc Pause(GetRequest) returns (Empty);
   rpc Resume(GetRequest) returns (Empty);
   rpc ListProviders(ListRequest) returns (ListProvidersResponse);
+  rpc DeleteProvider(DeleteProviderRequest) returns (Empty);
+  rpc CreateJoinToken(CreateJoinTokenRequest) returns (CreateJoinTokenResponse);
 }
+
+message CreateJoinTokenRequest { uint64 ttl_secs = 1; } // 0 = service default
+message CreateJoinTokenResponse { string token = 1; int64 expires_at = 2; }
+message DeleteProviderRequest { string name = 1; }
 
 message Empty {}
 message ListRequest {}
@@ -266,15 +272,38 @@ message ListProvidersResponse { repeated Provider providers = 1; }
 // ─── Providers (capacity owners) ──────────────────────────────────────
 
 service Providers {
+  // Enroll is authenticated by its join token alone (no client certificate).
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  // Every other RPC requires a client certificate issued by the service CA.
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(HeartbeatRequest) returns (Empty);
   rpc Poll(PollRequest) returns (PollResponse);   // long-poll
   rpc Report(ReportRequest) returns (Empty);      // fenced by generation
   rpc ReportExec(ReportExecRequest) returns (Empty);
   rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+  rpc RenewCertificate(RenewCertificateRequest) returns (RenewCertificateResponse);
 }
 
+message EnrollRequest {
+  string token = 1;                 // single use: plj1.<id>.<secret>.<ca_sha256>
+  string name = 2;                  // bound to the issued certificate
+  string csr_pem = 3;
+}
+message EnrollResponse {
+  string cert_pem = 1;              // 24h client certificate
+  string ca_pem = 2;                // CA the certificate chains to
+  int64 expires_at = 3;
+}
+message RenewCertificateRequest { string csr_pem = 1; }
+message RenewCertificateResponse { string cert_pem = 1; int64 expires_at = 2; }
+
 message DriverInfo { string driver = 1; Capabilities capabilities = 2; }
+
+// A client certificate fingerprint the service accepts for a provider.
+message ProviderCertificate {
+  string sha256 = 1;                // lowercase hex SHA-256 of the DER
+  int64 expires_at = 2;             // unix seconds
+}
 
 message Provider {
   string id = 1;
@@ -282,6 +311,7 @@ message Provider {
   uint64 generation = 3;
   repeated DriverInfo drivers = 4;
   int64 last_seen = 5;
+  repeated ProviderCertificate certificates = 110; // assigned range
 }
 
 message RegisterRequest { string name = 1; repeated DriverInfo drivers = 2; }
