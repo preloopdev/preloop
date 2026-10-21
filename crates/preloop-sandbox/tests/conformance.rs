@@ -43,8 +43,6 @@ async fn harness_with(
     harness_with_host(store, dir, host, caps).await
 }
 
-/// `host` is the fake driver's root: a restart test must reuse the machine
-/// directory the previous process created, or reconcile sees it as lost.
 async fn harness_with_host(
     store: Arc<dyn Store>,
     dir: tempfile::TempDir,
@@ -53,11 +51,23 @@ async fn harness_with_host(
 ) -> Harness {
     let mut config = ServiceConfig::new(dir.path().join("blobs"));
     config.acquire_wait = Duration::from_secs(10);
+    harness_with_host_config(store, dir, host, caps, config).await
+}
+
+/// `host` is the fake driver's root: a restart test must reuse the machine
+/// directory the previous process created, or reconcile sees it as lost.
+async fn harness_with_host_config(
+    store: Arc<dyn Store>,
+    dir: tempfile::TempDir,
+    host: std::path::PathBuf,
+    caps: Capabilities,
+    config: ServiceConfig,
+) -> Harness {
     let service = Service::open(store, config).await.unwrap();
     let fake = Arc::new(FakeDriver::new("fake", host, caps));
-    let shutdown = CancellationToken::new();
     let mut agent_config = AgentConfig::new("host-a", dir.path().join("scratch"));
     agent_config.reconcile = Duration::from_millis(300);
+    let shutdown = CancellationToken::new();
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![fake.clone() as Arc<dyn Driver>],
@@ -65,8 +75,18 @@ async fn harness_with_host(
     );
     tokio::spawn(agent.run(shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    // A restored provider row is listed before the new agent registers, so
-    // wait for the registration itself (generation bump), not for presence.
+    wait_for_registered(&service).await;
+    Harness {
+        service,
+        fake,
+        shutdown,
+        _dir: dir,
+    }
+}
+
+/// A restored provider row is listed before the new agent registers, so wait
+/// for the registration itself (generation bump), not for presence.
+async fn wait_for_registered(service: &Service) {
     let generation = service
         .list_providers()
         .iter()
@@ -80,12 +100,6 @@ async fn harness_with_host(
             .any(|provider| provider.generation > generation)
     })
     .await;
-    Harness {
-        service,
-        fake,
-        shutdown,
-        _dir: dir,
-    }
 }
 
 async fn harness() -> Harness {
@@ -1049,4 +1063,498 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
         .await
         .expect("a failed sandbox must not block its name");
     assert_ne!(lease.sandbox.id, sandbox_id);
+}
+
+// ─── At-least-once delivery, exec deadlines and disconnect ───────────
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use preloop_sandbox::agent::Session as ProviderSession;
+use preloop_sandbox::service::collect_exec;
+
+/// Causes the agent's reports to be lost, and counts deliveries that repeat.
+#[derive(Default)]
+struct Lossy {
+    /// Drop the next `Report` (the response never reaches the agent).
+    drop_report_once: AtomicBool,
+    /// Drop this many `ReportExec` calls.
+    drop_execs: AtomicUsize,
+    /// How many work ids the service delivered more than once.
+    redeliveries: AtomicUsize,
+    seen: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+struct LossyLink {
+    inner: Arc<Service>,
+    lossy: Arc<Lossy>,
+}
+
+#[async_trait::async_trait]
+impl ProviderLink for LossyLink {
+    async fn register(
+        &self,
+        request: RegisterRequest,
+    ) -> preloop_sandbox::Result<RegisterResponse> {
+        Service::register(&self.inner, request).await
+    }
+    async fn heartbeat(&self, request: HeartbeatRequest) -> preloop_sandbox::Result<()> {
+        Service::heartbeat(&self.inner, request)
+    }
+    async fn poll(&self, request: PollRequest) -> preloop_sandbox::Result<PollResponse> {
+        let response = Service::poll(&self.inner, request).await?;
+        let mut seen = self.lossy.seen.lock().unwrap();
+        for item in &response.work {
+            if !seen.insert(item.id.clone()) {
+                self.lossy.redeliveries.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        Ok(response)
+    }
+    async fn report(&self, request: ReportRequest) -> preloop_sandbox::Result<()> {
+        if self.lossy.drop_report_once.swap(false, Ordering::AcqRel) {
+            return Err(preloop_sandbox::Error::unavailable("injected lost report"));
+        }
+        Service::report(&self.inner, request).await
+    }
+    async fn report_exec(&self, request: ReportExecRequest) -> preloop_sandbox::Result<()> {
+        if self
+            .lossy
+            .drop_execs
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(preloop_sandbox::Error::unavailable(
+                "injected lost ReportExec",
+            ));
+        }
+        Service::report_exec(&self.inner, request).await
+    }
+    async fn reconcile(
+        &self,
+        request: ReconcileRequest,
+    ) -> preloop_sandbox::Result<ReconcileResponse> {
+        Service::reconcile(&self.inner, request).await
+    }
+    async fn fetch_blob(
+        &self,
+        id: &ProviderSession,
+        ticket: &str,
+        dest: &std::path::Path,
+    ) -> preloop_sandbox::Result<()> {
+        <Arc<Service> as ProviderLink>::fetch_blob(&self.inner, id, ticket, dest).await
+    }
+    async fn put_blob(
+        &self,
+        id: &ProviderSession,
+        ticket: &str,
+        src: &std::path::Path,
+    ) -> preloop_sandbox::Result<()> {
+        <Arc<Service> as ProviderLink>::put_blob(&self.inner, id, ticket, src).await
+    }
+}
+
+/// One service, one agent whose reports can be dropped, no warm pool.
+async fn lossy_harness(
+    configure: impl FnOnce(&mut ServiceConfig),
+    retry_backoff: Duration,
+) -> (Harness, Arc<Lossy>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    config.acquire_wait = Duration::from_secs(10);
+    configure(&mut config);
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    let fake = Arc::new(FakeDriver::new(
+        "fake",
+        dir.path().join("host"),
+        FakeDriver::full_capabilities(),
+    ));
+    let lossy = Arc::new(Lossy::default());
+    let link: Arc<dyn ProviderLink> = Arc::new(LossyLink {
+        inner: service.clone(),
+        lossy: lossy.clone(),
+    });
+    let mut agent_config = AgentConfig::new("host-a", dir.path().join("scratch"));
+    agent_config.reconcile = Duration::from_millis(300);
+    agent_config.retry_backoff = retry_backoff;
+    let shutdown = CancellationToken::new();
+    let agent = Agent::new(link, vec![fake.clone() as Arc<dyn Driver>], agent_config);
+    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    wait_for_registered(&service).await;
+    (
+        Harness {
+            service,
+            fake,
+            shutdown,
+            _dir: dir,
+        },
+        lossy,
+    )
+}
+
+/// A service with one registered provider and no agent: work stays queued
+/// until the test polls and reports it by hand.
+async fn manual_service(
+    configure: impl FnOnce(&mut ServiceConfig),
+) -> (Arc<Service>, tempfile::TempDir, RegisterResponse) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    configure(&mut config);
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    service.put_template(template("alpine")).await.unwrap();
+    let provider = service
+        .register(RegisterRequest {
+            name: "manual".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities(),
+            }],
+        })
+        .await
+        .unwrap();
+    (service, dir, provider)
+}
+
+async fn poll_now(service: &Arc<Service>, provider: &RegisterResponse) -> Vec<WorkItem> {
+    service
+        .poll(PollRequest {
+            provider_id: provider.provider_id.clone(),
+            generation: provider.generation,
+            wait_secs: 0,
+        })
+        .await
+        .unwrap()
+        .work
+}
+
+/// Acquire without blocking, leaving the create work queued for the test.
+async fn acquire_unreported(service: &Arc<Service>, key: &str) {
+    let error = service
+        .acquire(AcquireRequest {
+            idempotency_key: key.into(),
+            template: "alpine".into(),
+            wait_secs: Some(0),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::DeadlineExceeded);
+}
+
+#[tokio::test]
+async fn poll_returns_at_most_the_poll_batch() {
+    let (service, _dir, provider) = manual_service(|config| config.poll_batch = 2).await;
+    for key in ["a", "b", "c", "d", "e"] {
+        acquire_unreported(&service, key).await;
+    }
+    assert_eq!(poll_now(&service, &provider).await.len(), 2);
+    assert_eq!(poll_now(&service, &provider).await.len(), 2);
+    assert_eq!(poll_now(&service, &provider).await.len(), 1);
+    assert!(poll_now(&service, &provider).await.is_empty());
+}
+
+#[tokio::test]
+async fn unacknowledged_work_is_redelivered_and_re_registering_releases_it() {
+    let (service, _dir, provider) =
+        manual_service(|config| config.delivery_timeout = Duration::from_millis(100)).await;
+    acquire_unreported(&service, "first").await;
+    let delivered = poll_now(&service, &provider).await;
+    assert_eq!(delivered.len(), 1);
+    let work_id = delivered[0].id.clone();
+    // Still in flight: not delivered again early.
+    assert!(poll_now(&service, &provider).await.is_empty());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let redelivered = poll_now(&service, &provider).await;
+    assert_eq!(redelivered.len(), 1);
+    assert_eq!(redelivered[0].id, work_id, "same work id, redelivered");
+    // Acknowledging it completes the work; a duplicate report is not found.
+    service
+        .report(ReportRequest {
+            provider_id: provider.provider_id.clone(),
+            generation: provider.generation,
+            work_id: work_id.clone(),
+            ok: true,
+            native_ref: "psbx-manual-i1".into(),
+            error: String::new(),
+        })
+        .await
+        .unwrap();
+    let duplicate = service
+        .report(ReportRequest {
+            provider_id: provider.provider_id.clone(),
+            generation: provider.generation,
+            work_id,
+            ok: true,
+            native_ref: "psbx-manual-i1".into(),
+            error: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.code, Code::NotFound);
+
+    // Work the next generation has not acknowledged is redelivered to it.
+    acquire_unreported(&service, "second").await;
+    let pending = poll_now(&service, &provider).await;
+    assert_eq!(pending.len(), 1);
+    let pending_id = pending[0].id.clone();
+    let again = service
+        .register(RegisterRequest {
+            name: "manual".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(again.generation > provider.generation);
+    let released = poll_now(&service, &again).await;
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].id, pending_id);
+}
+
+#[tokio::test]
+async fn report_exec_orders_by_sequence_and_closes_on_exit() {
+    let (service, _dir, provider) = manual_service(|_| {}).await;
+    acquire_unreported(&service, "k").await;
+    let create = poll_now(&service, &provider).await;
+    assert_eq!(create.len(), 1);
+    service
+        .report(ReportRequest {
+            provider_id: provider.provider_id.clone(),
+            generation: provider.generation,
+            work_id: create[0].id.clone(),
+            ok: true,
+            native_ref: "psbx-manual-i1".into(),
+            error: String::new(),
+        })
+        .await
+        .unwrap();
+    let sandbox_id = service.list()[0].id.clone();
+    let stream = service
+        .exec(ExecRequest {
+            sandbox_id,
+            argv: vec!["true".into()],
+            ..ExecRequest::default()
+        })
+        .unwrap();
+    let work = poll_now(&service, &provider).await;
+    assert_eq!(work.len(), 1);
+    let exec_id = work[0].exec.as_ref().unwrap().exec_id.clone();
+    let report = |events: Vec<ExecEvent>, sequence: u64| ReportExecRequest {
+        provider_id: provider.provider_id.clone(),
+        generation: provider.generation,
+        exec_id: exec_id.clone(),
+        events,
+        sequence,
+    };
+    service
+        .report_exec(report(vec![ExecEvent::stdout(b"a".to_vec())], 1))
+        .await
+        .unwrap();
+    // A retried batch is dropped instead of duplicated.
+    service
+        .report_exec(report(vec![ExecEvent::stdout(b"b".to_vec())], 1))
+        .await
+        .unwrap();
+    // The exit closes the stream; events after it in the batch are ignored.
+    service
+        .report_exec(report(
+            vec![
+                ExecEvent::stdout(b"c".to_vec()),
+                ExecEvent::exit(0),
+                ExecEvent::stdout(b"d".to_vec()),
+            ],
+            2,
+        ))
+        .await
+        .unwrap();
+    let (code, stdout, stderr) = collect_exec(stream).await.unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, b"ac");
+    assert!(stderr.is_empty());
+    let late = service
+        .report_exec(report(vec![ExecEvent::stdout(b"late".to_vec())], 3))
+        .await
+        .unwrap_err();
+    assert_eq!(late.code, Code::NotFound);
+    service
+        .report(ReportRequest {
+            provider_id: provider.provider_id.clone(),
+            generation: provider.generation,
+            work_id: work[0].id.clone(),
+            ok: true,
+            native_ref: String::new(),
+            error: String::new(),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn exec_without_a_timeout_gets_the_service_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = dir.path().join("host");
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    config.exec_timeout = Duration::from_secs(1);
+    let h = harness_with_host_config(
+        store::open("memory:").await.unwrap(),
+        dir,
+        host,
+        FakeDriver::full_capabilities(),
+        config,
+    )
+    .await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (code, _, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            argv: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 124, "the service deadline killed the command");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn dropping_an_exec_stream_cancels_the_command() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let stream = h
+        .service
+        .exec(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            argv: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            ..ExecRequest::default()
+        })
+        .unwrap();
+    // Let the work reach the agent, then walk away.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(stream);
+    wait_for(|| h.fake.cancel_calls.load(Ordering::Acquire) > 0).await;
+    // The sandbox is still usable: the dropped exec left no state behind.
+    let (code, _, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            argv: vec!["true".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn a_lost_report_exec_is_retried_until_the_caller_sees_the_exit() {
+    let (h, lossy) = lossy_harness(|_| {}, Duration::from_millis(20)).await;
+    lossy.drop_execs.store(1, Ordering::Release);
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let (code, stdout, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            argv: vec!["sh".into(), "-c".into(), "printf hi".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(lossy.drop_execs.load(Ordering::Acquire), 0, "retried");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, b"hi");
+}
+
+#[tokio::test]
+async fn a_redelivered_create_is_not_executed_twice() {
+    let (h, lossy) = lossy_harness(
+        |config| config.delivery_timeout = Duration::from_millis(100),
+        // Slower than the visibility timeout, so a redelivery happens first.
+        Duration::from_millis(400),
+    )
+    .await;
+    lossy.drop_report_once.store(true, Ordering::Release);
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(lease.sandbox.state, SandboxState::Leased);
+    assert!(
+        lossy.redeliveries.load(Ordering::Acquire) > 0,
+        "the unacknowledged create was redelivered"
+    );
+    assert_eq!(
+        h.fake.create_calls.load(Ordering::Acquire),
+        1,
+        "a redelivered work item must not run again"
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_wait_is_bounded_by_the_work_timeout() {
+    let (service, _dir, provider) =
+        manual_service(|config| config.work_timeout = Duration::from_millis(100)).await;
+    acquire_unreported(&service, "k").await;
+    let create = poll_now(&service, &provider).await;
+    service
+        .report(ReportRequest {
+            provider_id: provider.provider_id.clone(),
+            generation: provider.generation,
+            work_id: create[0].id.clone(),
+            ok: true,
+            native_ref: "psbx-manual-i1".into(),
+            error: String::new(),
+        })
+        .await
+        .unwrap();
+    let sandbox_id = service.list()[0].id.clone();
+    let error = service
+        .snapshot(SnapshotRequest {
+            sandbox_id,
+            name: "golden".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Unavailable);
+    assert!(error.message.contains("snapshot"), "{}", error.message);
 }

@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -220,6 +220,11 @@ pub struct AgentConfig {
     pub heartbeat: Duration,
     /// Full inventory reconcile period.
     pub reconcile: Duration,
+    /// Work items run at once (`PRELOOP_SANDBOX_AGENT_CONCURRENCY`).
+    pub concurrency: usize,
+    /// First retry delay for failed polls and reports; doubles up to 15 s,
+    /// with jitter.
+    pub retry_backoff: Duration,
 }
 
 impl AgentConfig {
@@ -230,8 +235,71 @@ impl AgentConfig {
             scratch,
             heartbeat: Duration::from_secs(10),
             reconcile: Duration::from_secs(60),
+            concurrency: 32,
+            retry_backoff: Duration::from_millis(500),
         }
     }
+}
+
+/// Most a retry delay grows to.
+const BACKOFF_CAP: Duration = Duration::from_secs(15);
+
+/// How long a completed work id is remembered so a redelivery does not run
+/// it again. Longer than the service's delivery timeout.
+const DONE_RETENTION: Duration = Duration::from_secs(600);
+
+/// The result of one work item, kept so a redelivery can re-report it
+/// instead of re-executing.
+#[derive(Debug, Clone)]
+struct WorkOutcome {
+    ok: bool,
+    error: String,
+    native_ref: String,
+}
+
+impl WorkOutcome {
+    fn from_result(result: Result<String>) -> Self {
+        match result {
+            Ok(native_ref) => Self {
+                ok: true,
+                error: String::new(),
+                native_ref,
+            },
+            Err(error) => Self {
+                ok: false,
+                // Keep the code visible: an operator reading the service log
+                // can tell "not supported" from "provider is down".
+                error: format!(
+                    "{}: {}",
+                    serde_json::to_value(error.code)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
+                    error.message
+                ),
+                native_ref: String::new(),
+            },
+        }
+    }
+}
+
+/// What the agent knows about a delivered work id.
+enum WorkState {
+    Running,
+    Done(WorkOutcome),
+}
+
+/// A retried call stops for good on these: the service fenced this session
+/// (a newer generation registered) or forgot the work (it completed).
+fn fenced(error: &Error) -> bool {
+    error.code == Code::Aborted || error.code == Code::NotFound
+}
+
+/// Uniform jitter in `[base/2, base]`.
+fn jittered(base: Duration) -> Duration {
+    let nanos = base.as_nanos().max(1) as u64;
+    let low = nanos / 2;
+    Duration::from_nanos(low + rand::random::<u64>() % (nanos - low + 1))
 }
 
 /// The host agent.
@@ -239,6 +307,9 @@ pub struct Agent {
     link: Arc<dyn ProviderLink>,
     drivers: HashMap<String, Arc<dyn Driver>>,
     config: AgentConfig,
+    permits: Arc<Semaphore>,
+    /// Delivered work by id, so redelivery is not re-executed.
+    work: tokio::sync::Mutex<HashMap<String, (WorkState, Instant)>>,
 }
 
 impl Agent {
@@ -248,6 +319,7 @@ impl Agent {
         drivers: Vec<Arc<dyn Driver>>,
         config: AgentConfig,
     ) -> Arc<Self> {
+        let permits = Arc::new(Semaphore::new(config.concurrency.max(1)));
         Arc::new(Self {
             link,
             drivers: drivers
@@ -255,6 +327,8 @@ impl Agent {
                 .map(|driver| (driver.name().to_owned(), driver))
                 .collect(),
             config,
+            permits,
+            work: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -347,6 +421,7 @@ impl Agent {
             })
         };
         let mut result = None;
+        let mut backoff = self.config.retry_backoff;
         loop {
             let poll = self.link.poll(PollRequest {
                 provider_id: session.provider_id.clone(),
@@ -359,19 +434,23 @@ impl Agent {
             };
             match response {
                 Ok(response) => {
+                    backoff = self.config.retry_backoff;
                     for item in response.work {
-                        let agent = self.clone();
-                        let session = session.clone();
-                        tokio::spawn(async move { agent.handle(session, item).await });
+                        self.dispatch(session.clone(), stop.clone(), item).await;
                     }
                 }
-                Err(error) if error.code == Code::Aborted || error.code == Code::NotFound => {
+                Err(error) if fenced(&error) => {
                     result = Some(error);
                     break;
                 }
                 Err(error) => {
-                    debug!(%error, "poll failed; retrying");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    debug!(%error, "poll failed; backing off");
+                    let delay = jittered(backoff);
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_CAP);
                 }
             }
         }
@@ -379,6 +458,57 @@ impl Agent {
         let _ = heartbeat.await;
         let _ = reconcile.await;
         result
+    }
+
+    /// Hand one delivered item to a worker, unless this id is already running
+    /// or done (a redelivery), in which case its stored result is re-reported.
+    async fn dispatch(self: &Arc<Self>, session: Session, stop: CancellationToken, item: WorkItem) {
+        let work_id = item.id.clone();
+        let previous = {
+            let mut work = self.work.lock().await;
+            prune_work(&mut work);
+            match work.get(&work_id) {
+                Some((WorkState::Running, _)) => Some(None),
+                Some((WorkState::Done(outcome), _)) => Some(Some(outcome.clone())),
+                None => {
+                    work.insert(work_id.clone(), (WorkState::Running, Instant::now()));
+                    None
+                }
+            }
+        };
+        match previous {
+            // Already in hand; its own task will report.
+            Some(None) => {}
+            // Completed earlier: re-report the stored result, do not run it.
+            Some(Some(outcome)) => {
+                let agent = Arc::clone(self);
+                let session = session.clone();
+                let stop = stop.clone();
+                tokio::spawn(async move {
+                    agent.report_work(&session, &stop, work_id, &outcome).await;
+                });
+            }
+            None => {
+                // Backpressure: do not take more work than the agent can run.
+                let permit = tokio::select! {
+                    _ = stop.cancelled() => {
+                        // Not started: let the next session run it.
+                        self.work.lock().await.remove(&work_id);
+                        return;
+                    }
+                    permit = self.permits.clone().acquire_owned() => permit,
+                };
+                let Ok(permit) = permit else {
+                    self.work.lock().await.remove(&work_id);
+                    return;
+                };
+                let agent = Arc::clone(self);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    agent.handle(session, stop, item).await;
+                });
+            }
+        }
     }
 
     /// One inventory reconcile.
@@ -425,46 +555,82 @@ impl Agent {
             .ok_or_else(|| Error::precondition(format!("driver `{name}` is not on this host")))
     }
 
-    async fn handle(self: Arc<Self>, session: Session, item: WorkItem) {
+    /// Run one work item, remember its outcome, and report it until the
+    /// service acknowledges it (or fences this session).
+    async fn handle(self: Arc<Self>, session: Session, stop: CancellationToken, item: WorkItem) {
         let work_id = item.id.clone();
-        let result = self.run_work(&session, item).await;
-        let (ok, error, native_ref) = match result {
-            Ok(native_ref) => (true, String::new(), native_ref),
-            // Keep the code visible: an operator reading the service log can
-            // tell "not supported" from "provider is down".
-            Err(error) => (
-                false,
-                format!(
-                    "{}: {}",
-                    serde_json::to_value(error.code)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_owned))
-                        .unwrap_or_default(),
-                    error.message
-                ),
-                String::new(),
-            ),
-        };
-        if !ok {
-            warn!(%work_id, %error, "work failed");
+        let outcome = WorkOutcome::from_result(self.run_work(&session, &stop, item).await);
+        if !outcome.ok {
+            warn!(%work_id, error = %outcome.error, "work failed");
         }
-        if let Err(report_error) = self
-            .link
-            .report(ReportRequest {
-                provider_id: session.provider_id,
-                generation: session.generation,
-                work_id,
-                ok,
-                error,
-                native_ref,
-            })
-            .await
         {
-            debug!(%report_error, "report rejected");
+            let mut work = self.work.lock().await;
+            work.insert(
+                work_id.clone(),
+                (WorkState::Done(outcome.clone()), Instant::now()),
+            );
+        }
+        self.report_work(&session, &stop, work_id, &outcome).await;
+    }
+
+    /// Retry `Report` until the service acknowledges it; stop when fenced.
+    async fn report_work(
+        &self,
+        session: &Session,
+        stop: &CancellationToken,
+        work_id: String,
+        outcome: &WorkOutcome,
+    ) {
+        let mut backoff = self.config.retry_backoff;
+        loop {
+            match self
+                .link
+                .report(ReportRequest {
+                    provider_id: session.provider_id.clone(),
+                    generation: session.generation,
+                    work_id: work_id.clone(),
+                    ok: outcome.ok,
+                    error: outcome.error.clone(),
+                    native_ref: outcome.native_ref.clone(),
+                })
+                .await
+            {
+                Ok(()) => return,
+                Err(error) if fenced(&error) => {
+                    debug!(%work_id, %error, "report stopped");
+                    return;
+                }
+                Err(error) => {
+                    debug!(%work_id, %error, "report failed; retrying");
+                    if !self.wait_backoff(stop, backoff).await {
+                        return;
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_CAP);
+                }
+            }
         }
     }
 
-    async fn run_work(&self, session: &Session, item: WorkItem) -> Result<String> {
+    /// Sleep a jittered delay; false when the session is stopping.
+    async fn wait_backoff(&self, stop: &CancellationToken, delay: Duration) -> bool {
+        tokio::select! {
+            _ = stop.cancelled() => false,
+            _ = tokio::time::sleep(jittered(delay)) => true,
+        }
+    }
+
+    async fn run_work(
+        &self,
+        session: &Session,
+        stop: &CancellationToken,
+        item: WorkItem,
+    ) -> Result<String> {
+        if let Some(cancel) = item.cancel_exec {
+            self.driver(&cancel.target.driver)?
+                .cancel_exec(&cancel.target.native_ref, &cancel.exec_id)
+                .await?;
+            return Ok(String::new());
+        }
         if let Some(create) = item.create {
             return self.driver(&create.driver)?.create(&create).await;
         }
@@ -478,7 +644,7 @@ impl Agent {
             return Ok(String::new());
         }
         if let Some(exec) = item.exec {
-            self.run_exec(session, exec).await?;
+            self.run_exec(session, stop, exec).await?;
             return Ok(String::new());
         }
         if let Some(copy) = item.copy {
@@ -537,16 +703,29 @@ impl Agent {
         Err(Error::new(Code::Unimplemented, "unknown work item"))
     }
 
-    async fn run_exec(&self, session: &Session, exec: ExecWork) -> Result<()> {
+    async fn run_exec(
+        &self,
+        session: &Session,
+        stop: &CancellationToken,
+        exec: ExecWork,
+    ) -> Result<()> {
         let driver = self.driver(&exec.target.driver)?;
+        let cancel_driver = driver.clone();
         let (tx, mut rx) = mpsc::channel::<ExecEvent>(256);
         let native = exec.target.native_ref.clone();
         let request = exec.request.clone();
-        let run = tokio::spawn(async move { driver.exec(&native, &request, tx).await });
-        // Forward output in small batches.
+        let exec_id = exec.exec_id.clone();
+        let run_native = native.clone();
+        let run_exec_id = exec_id.clone();
+        let run =
+            tokio::spawn(async move { driver.exec(&run_native, &run_exec_id, &request, tx).await });
+        // Forward output in small batches. Sequences start at this session's
+        // generation base, so output from a re-registered session is never
+        // mistaken for a duplicate of the previous session's batches.
         let mut batch = Vec::new();
         let mut size = 0usize;
         let mut caller_gone = false;
+        let mut sequence = session.generation << 32;
         loop {
             let next = if batch.is_empty() {
                 rx.recv().await
@@ -554,7 +733,9 @@ impl Agent {
                 match tokio::time::timeout(Duration::from_millis(40), rx.recv()).await {
                     Ok(next) => next,
                     Err(_) => {
-                        caller_gone |= !self.flush(session, &exec.exec_id, &mut batch).await;
+                        caller_gone |= !self
+                            .flush(session, stop, &exec_id, &mut sequence, &mut batch)
+                            .await;
                         size = 0;
                         continue;
                     }
@@ -565,41 +746,105 @@ impl Agent {
                 + event.stderr.as_ref().map_or(0, Vec::len);
             batch.push(event);
             if size >= 64 * 1024 {
-                caller_gone |= !self.flush(session, &exec.exec_id, &mut batch).await;
+                caller_gone |= !self
+                    .flush(session, stop, &exec_id, &mut sequence, &mut batch)
+                    .await;
                 size = 0;
             }
+        }
+        if caller_gone {
+            // Nobody is listening any more: stop the command instead of
+            // letting it run unobserved.
+            let _ = cancel_driver.cancel_exec(&native, &exec_id).await;
         }
         let code = run
             .await
             .map_err(|e| Error::internal(format!("exec task: {e}")))??;
         batch.push(ExecEvent::exit(code));
         if !caller_gone {
-            self.flush(session, &exec.exec_id, &mut batch).await;
+            self.flush(session, stop, &exec_id, &mut sequence, &mut batch)
+                .await;
         }
         Ok(())
     }
 
-    /// Returns false once the caller has gone away.
-    async fn flush(&self, session: &Session, exec_id: &str, batch: &mut Vec<ExecEvent>) -> bool {
+    /// Report one batch, retrying until it is applied or the service fences
+    /// this session. Returns false once output should stop being sent.
+    async fn flush(
+        &self,
+        session: &Session,
+        stop: &CancellationToken,
+        exec_id: &str,
+        sequence: &mut u64,
+        batch: &mut Vec<ExecEvent>,
+    ) -> bool {
         if batch.is_empty() {
             return true;
         }
+        *sequence += 1;
+        let sequence = *sequence;
         let events = std::mem::take(batch);
-        match self
-            .link
-            .report_exec(ReportExecRequest {
-                provider_id: session.provider_id.clone(),
-                generation: session.generation,
-                exec_id: exec_id.to_owned(),
-                events,
-            })
-            .await
-        {
-            Ok(()) => true,
-            Err(error) => {
-                debug!(%error, "exec output dropped");
-                error.code != Code::NotFound
+        let mut backoff = self.config.retry_backoff;
+        loop {
+            match self
+                .link
+                .report_exec(ReportExecRequest {
+                    provider_id: session.provider_id.clone(),
+                    generation: session.generation,
+                    exec_id: exec_id.to_owned(),
+                    events: events.clone(),
+                    sequence,
+                })
+                .await
+            {
+                Ok(()) => return true,
+                Err(error) if fenced(&error) => {
+                    debug!(exec_id, %error, "exec output stopped");
+                    return false;
+                }
+                Err(error) => {
+                    debug!(exec_id, %error, "exec output not accepted; retrying");
+                    if !self.wait_backoff(stop, backoff).await {
+                        return false;
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_CAP);
+                }
             }
         }
+    }
+}
+
+/// Forget completed work ids after [`DONE_RETENTION`]; running ones stay.
+fn prune_work(work: &mut HashMap<String, (WorkState, Instant)>) {
+    work.retain(|_, (state, at)| match state {
+        WorkState::Running => true,
+        WorkState::Done(_) => at.elapsed() < DONE_RETENTION,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_stays_inside_the_backoff_window() {
+        for base in [
+            Duration::from_millis(1),
+            Duration::from_millis(500),
+            Duration::from_secs(15),
+        ] {
+            for _ in 0..100 {
+                let delay = jittered(base);
+                assert!(delay >= base / 2, "{delay:?} < {:?}", base / 2);
+                assert!(delay <= base, "{delay:?} > {base:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fenced_errors_end_retries() {
+        assert!(fenced(&Error::aborted("stale generation")));
+        assert!(fenced(&Error::not_found("exec not found")));
+        assert!(!fenced(&Error::unavailable("try again")));
     }
 }

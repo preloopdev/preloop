@@ -32,6 +32,34 @@ dial out. Bulk bytes never ride inside RPCs: `OpenStream` returns a short-lived
 ticket and a tar moves with plain `PUT`/`GET` on `/sandbox/v1/streams/<ticket>`;
 agents fetch and return blobs on `/sandbox/v1/agent/blobs/<ticket>`.
 
+### Work delivery
+
+Delivery is at-least-once. `Poll` returns at most `PRELOOP_SANDBOX_POLL_BATCH`
+items (default 64) and does not drain the queue: delivered items stay in
+flight, keyed by their work id, until the agent's `Report` for that id
+arrives. An unacknowledged item becomes visible again after the visibility
+timeout (`PRELOOP_SANDBOX_DELIVERY_TIMEOUT_SECS`, default 120 s) and is
+redelivered; re-registering a provider releases everything the previous
+generation still held, so a restarted agent picks its work back up.
+
+Agents dedupe by work id: a redelivered item that is still running is ignored,
+and a finished one re-reports its stored result instead of running again.
+Reports are retried with jittered exponential backoff (capped at 15 s) until
+the service accepts them; `Aborted` (a newer generation registered) and
+`NotFound` (the work completed) end the retry. `ReportExec` batches carry a
+per-exec sequence number, so a retried batch is applied once, in order, and the
+caller's exec stream closes on the exit event even if later batches arrive.
+
+An exec with `timeout_secs = 0` gets the service deadline
+(`PRELOOP_SANDBOX_EXEC_TIMEOUT_SECS`, default 3600 s); the driver kills the
+command at it and reports exit code 124. When the caller drops the exec
+response stream, the service queues `CancelExec` for the provider and drops
+the exec; the agent calls the driver's optional `cancel_exec` (SmolVM kills the
+exec child) and reports exit code 130. The service also sweeps execs and
+pending work past their deadlines; `Acquire` is bounded by its wait window,
+and every request that waits on a provider to report (`Snapshot`, copy, power)
+is bounded by the same work timeout.
+
 The Connect layer is hand-rolled (`crates/preloop-sandbox/src/connect.rs`):
 adding `connectrpc` would bring its own protobuf runtime, while the subset used
 here — JSON unary and server streaming — is small. Any Connect client generated
@@ -64,7 +92,10 @@ command per sandbox; callers needing several execs require `multi_exec`.
 
 A driver is the host-side, in-process interface a host agent drives
 (`crates/preloop-sandbox/src/driver.rs`). It is not a public plugin ABI: third
-parties integrate by implementing the Providers protocol.
+parties integrate by implementing the Providers protocol. `exec` carries the
+exec id and a non-zero deadline the driver enforces, and the optional
+`cancel_exec` kills a running command when the caller goes away (it may arrive
+before `exec` starts; drivers remember it and refuse to start that exec).
 
 | Driver | Where | Model |
 |---|---|---|
@@ -84,11 +115,12 @@ are the service's.
   generation, and a provider may not report output for another provider's
   exec, nor destroy another provider's machine.
 * **The provider token authenticates a role, not an identity.** Any holder can
-  register any provider *name*, which bumps that name's generation and fails
-  its in-flight work, poll its queue, or report its work items. Deployments
-  that hand the provider token to more than one trusted operator need
-  per-provider identities (a follow-up); on a single-operator tailnet the
-  shared token is the trust boundary, exactly like the engine token.
+  register any provider *name*, which bumps that name's generation, fences the
+  previous session and redelivers its in-flight work to the new one, poll its
+  queue, or report its work items. Deployments that hand the provider token to
+  more than one trusted operator need per-provider identities (a follow-up);
+  on a single-operator tailnet the shared token is the trust boundary, exactly
+  like the engine token.
 
 ## State
 
@@ -115,6 +147,10 @@ and debug-hold strategy; the machines under it are sandboxes.
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
 | `PRELOOP_SANDBOX_POOL_DRIVER` | driver the CI pool places on (default: first) |
 | `PRELOOP_SANDBOX_SMOLVM_SLOTS` | concurrent SmolVM sandboxes (0 = no cap) |
+| `PRELOOP_SANDBOX_POLL_BATCH` | most work items one `Poll` returns (default 64) |
+| `PRELOOP_SANDBOX_DELIVERY_TIMEOUT_SECS` | unacknowledged work redelivery delay (default 120) |
+| `PRELOOP_SANDBOX_EXEC_TIMEOUT_SECS` | default exec deadline (default 3600) |
+| `PRELOOP_SANDBOX_AGENT_CONCURRENCY` | work items an agent runs at once (default 32) |
 
 ## CLI
 
@@ -140,8 +176,9 @@ preloop sandbox ls | providers
   (idempotency, warm pools, placement errors, unsupported operations,
   snapshot → template → fork, create failure, lease expiry and preservation,
   orphan/lost reconcile, generation fencing, SQLite restart, streaming exec,
-  ticketed upload/download). Set `PRELOOP_SANDBOX_TEST_PG` to also run the
-  Postgres store test.
+  ticketed upload/download, poll batching, redelivery and report dedupe, exec
+  deadlines and disconnect cancellation). Set `PRELOOP_SANDBOX_TEST_PG` to
+  also run the Postgres store test.
 * `PRELOOP_SANDBOX_E2E_SMOLVM=1 cargo test -p preloop-sandbox --test smolvm_e2e`
   — real SmolVM: bake, snapshot, warm pool of branches, socket mount, files,
   streaming, cleanup.

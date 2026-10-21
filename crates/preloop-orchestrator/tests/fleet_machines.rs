@@ -101,10 +101,15 @@ impl SandboxDriver for RecordingDriver {
     async fn exec(
         &self,
         native_ref: &str,
+        exec_id: &str,
         request: &ExecRequest,
         output: tokio::sync::mpsc::Sender<ExecEvent>,
     ) -> preloop_sandbox::Result<i32> {
-        self.inner.exec(native_ref, request, output).await
+        self.inner.exec(native_ref, exec_id, request, output).await
+    }
+
+    async fn cancel_exec(&self, native_ref: &str, exec_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.cancel_exec(native_ref, exec_id).await
     }
 
     async fn copy_in(

@@ -36,6 +36,40 @@ fn smolvm_slots() -> u32 {
         .unwrap_or(0)
 }
 
+/// Service tuning: defaults overridden by the documented environment.
+fn sandbox_service_config(blob_dir: PathBuf) -> ServiceConfig {
+    let mut config = ServiceConfig::new(blob_dir);
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_POLL_BATCH")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        config.poll_batch = value;
+    }
+    if let Some(secs) =
+        env_nonempty("PRELOOP_SANDBOX_DELIVERY_TIMEOUT_SECS").and_then(|v| v.parse::<u64>().ok())
+    {
+        config.delivery_timeout = Duration::from_secs(secs);
+    }
+    if let Some(secs) =
+        env_nonempty("PRELOOP_SANDBOX_EXEC_TIMEOUT_SECS").and_then(|v| v.parse::<u64>().ok())
+    {
+        config.exec_timeout = Duration::from_secs(secs);
+    }
+    config
+}
+
+/// Agent tuning: defaults overridden by the documented environment.
+fn sandbox_agent_config(name: impl Into<String>, scratch: PathBuf) -> AgentConfig {
+    let mut config = AgentConfig::new(name, scratch);
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_AGENT_CONCURRENCY")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        config.concurrency = value;
+    }
+    config
+}
+
 /// Drivers attached to this host: `PRELOOP_SANDBOX_DRIVERS`, comma-separated
 /// (default `smolvm`). `named_prefix` lets the SmolVM inventory adopt the CI
 /// pool's caller-named machines.
@@ -87,7 +121,8 @@ impl LocalSandboxes {
         let store = store::open(&store_url)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
-        let service = Service::open(store, ServiceConfig::new(state.join("sandbox-blobs"))).await?;
+        let service =
+            Service::open(store, sandbox_service_config(state.join("sandbox-blobs"))).await?;
         let shutdown = CancellationToken::new();
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
 
@@ -108,7 +143,7 @@ impl LocalSandboxes {
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             drivers,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            sandbox_agent_config(local_provider_name(), state.join("sandbox-agent")),
         );
         let session = agent.register().await.ok();
         let provider_id = session
@@ -654,14 +689,14 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
         .store
         .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
     let store = store::open(&store_url).await?;
-    let service = Service::open(store, ServiceConfig::new(state.join("sandbox-blobs"))).await?;
+    let service = Service::open(store, sandbox_service_config(state.join("sandbox-blobs"))).await?;
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             host_drivers(None, smolvm_slots())?,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            sandbox_agent_config(local_provider_name(), state.join("sandbox-agent")),
         );
         tokio::spawn(agent.run(shutdown.clone()));
     }
@@ -683,7 +718,7 @@ async fn run_agent(service: &str, args: AgentArgs) -> anyhow::Result<()> {
     let agent = Agent::new(
         Arc::new(RemoteLink::new(service, args.provider_token)),
         host_drivers(None, args.slots)?,
-        AgentConfig::new(name, scratch),
+        sandbox_agent_config(name, scratch),
     );
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();

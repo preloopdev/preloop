@@ -241,7 +241,7 @@ message ExecRequest {
   map<string, string> env = 3;
   string workdir = 4;
   string user = 5;
-  uint64 timeout_secs = 6;
+  uint64 timeout_secs = 6;          // 0 = the service's exec deadline
   bytes stdin = 7;
 }
 message ExecEvent {
@@ -308,8 +308,11 @@ message CopyWork { SandboxWork target = 1; string ticket = 2; string path = 3; S
 message SnapshotWork { SandboxWork target = 1; string template = 2; }
 message StartWork { SandboxWork target = 1; bool forkable = 2; }
 
+// Cancel a running exec: its caller's response stream went away.
+message CancelExecWork { string exec_id = 1; SandboxWork target = 2; }
+
 message WorkItem {
-  string id = 1;
+  string id = 1;                    // redelivery reuses it; Report acknowledges it
   oneof work {
     CreateWork create = 2;
     SandboxWork destroy = 3;
@@ -320,8 +323,13 @@ message WorkItem {
     SandboxWork resume = 8;
     SandboxWork stop = 9;
     StartWork start = 10;
+    CancelExecWork cancel_exec = 120;
   }
 }
+// At most `PRELOOP_SANDBOX_POLL_BATCH` items. Delivered work stays in flight
+// until `Report` acknowledges it; unacknowledged work is redelivered after
+// the visibility timeout and when the provider re-registers. Work ids are
+// stable, so an agent dedupes redelivery instead of re-executing it.
 message PollResponse { repeated WorkItem work = 1; }
 
 message ReportRequest {
@@ -337,6 +345,11 @@ message ReportExecRequest {
   uint64 generation = 2;
   string exec_id = 3;
   repeated ExecEvent events = 4;
+  // Per-exec batch sequence, strictly increasing for the exec. The agent
+  // starts a session at its generation's base so a re-registered provider is
+  // never mistaken for a duplicate. The service drops a batch whose sequence
+  // it already applied. 0 is an unsequenced batch (hand-written clients).
+  uint64 sequence = 120;
 }
 
 message Observed { string driver = 1; string native_ref = 2; string sandbox_id = 3; uint64 incarnation = 4; }
