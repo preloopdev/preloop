@@ -1208,15 +1208,18 @@ fn nofile_ceiling() -> u64 {
 }
 
 /// The sysctl drop-in that raises the ceiling, with the reason it exists.
+/// Byte-identical to `contrib/systemd/90-preloop-nofile.conf`, which a hand
+/// install copies; a test pins the two together.
 #[cfg(any(target_os = "linux", test))]
 fn nofile_sysctl_drop_in(limit: u64) -> String {
     format!(
-        "# Written by `preloop server install`; removed by `preloop server uninstall`.\n\
-         # Every VMM the engine starts inherits the service unit's descriptor limit,\n\
-         # and SmolVM's virtiofs passthrough holds one host fd per image inode a guest\n\
-         # has looked up (the x86_64 golden carries ~985k). Linux refuses an\n\
-         # RLIMIT_NOFILE hard limit above fs.nr_open, so the unit cannot ask for more\n\
-         # than this.\n\
+        "# Preloop engine descriptor ceiling: every VMM the engine starts inherits the\n\
+         # service unit's LimitNOFILE, and SmolVM's virtiofs passthrough holds one host\n\
+         # fd per image inode a guest has looked up (the x86_64 golden carries ~985k).\n\
+         # Linux refuses an RLIMIT_NOFILE hard limit above fs.nr_open, so the unit\n\
+         # cannot ask for more than this. `preloop server install` writes this file and\n\
+         # removes it on uninstall; a hand install copies it to /etc/sysctl.d/ and runs\n\
+         # `sysctl -w fs.nr_open={limit}` for the current boot.\n\
          fs.nr_open = {limit}\n"
     )
 }
@@ -1236,31 +1239,32 @@ fn nofile_sysctl_drop_in(limit: u64) -> String {
 #[cfg(target_os = "linux")]
 fn provision_nofile_ceiling(dry_run: bool) -> Result<u64> {
     let current = nofile_ceiling();
-    if current < ENGINE_NOFILE_LIMIT {
-        let drop_in = Path::new(NOFILE_SYSCTL_DROP_IN);
-        if dry_run {
-            eprintln!(
-                "[preloop] would raise fs.nr_open {current} -> {ENGINE_NOFILE_LIMIT} and keep it \
-                 across reboots in {}",
-                drop_in.display()
-            );
-        } else {
-            // Persistent first: an earlier boot must not find a unit whose
-            // limit the kernel cannot grant.
-            if let Some(parent) = drop_in.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create {}", parent.display()))?;
-            }
-            std::fs::write(drop_in, nofile_sysctl_drop_in(ENGINE_NOFILE_LIMIT))
-                .with_context(|| format!("write {}", drop_in.display()))?;
-            // Then the running kernel, before the unit is written and started.
-            if let Err(error) = std::fs::write(FS_NR_OPEN, ENGINE_NOFILE_LIMIT.to_string()) {
-                eprintln!(
-                    "[preloop] warning: could not raise fs.nr_open to {ENGINE_NOFILE_LIMIT} \
-                     ({error}); the unit will ask for the current ceiling instead"
-                );
-            }
-        }
+    if current >= ENGINE_NOFILE_LIMIT {
+        return Ok(ENGINE_NOFILE_LIMIT);
+    }
+    let drop_in = Path::new(NOFILE_SYSCTL_DROP_IN);
+    if dry_run {
+        eprintln!(
+            "[preloop] would raise fs.nr_open {current} -> {ENGINE_NOFILE_LIMIT} and keep it \
+             across reboots in {}",
+            drop_in.display()
+        );
+        // Preview the unit a real run writes once the raise has landed.
+        return Ok(ENGINE_NOFILE_LIMIT);
+    }
+    // Persistent first: an earlier boot must not find a unit whose limit the
+    // kernel cannot grant.
+    if let Some(parent) = drop_in.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(drop_in, nofile_sysctl_drop_in(ENGINE_NOFILE_LIMIT))
+        .with_context(|| format!("write {}", drop_in.display()))?;
+    // Then the running kernel, before the unit is written and started.
+    if let Err(error) = std::fs::write(FS_NR_OPEN, ENGINE_NOFILE_LIMIT.to_string()) {
+        eprintln!(
+            "[preloop] warning: could not raise fs.nr_open to {ENGINE_NOFILE_LIMIT} \
+             ({error}); the unit will ask for the current ceiling instead"
+        );
     }
     let ceiling = nofile_ceiling();
     let limit = nofile_limit(ceiling);
@@ -1270,7 +1274,7 @@ fn provision_nofile_ceiling(dry_run: bool) -> Result<u64> {
              engine's VMMs need; the unit asks for {limit}. A guest walking the x86_64 golden \
              (~985k inodes) can still exhaust it — set `fs.nr_open = {ENGINE_NOFILE_LIMIT}` in \
              {} and reinstall.",
-            Path::new(NOFILE_SYSCTL_DROP_IN).display()
+            drop_in.display()
         );
     }
     Ok(limit)
@@ -2284,7 +2288,9 @@ WantedBy=multi-user.target
         // The engine's target sits above the stock ceiling on purpose: the
         // x86_64 golden carries ~985k inodes, so 1048576 leaves almost no
         // headroom for the engine and the VMM beside the guest's walk.
-        assert!(ENGINE_NOFILE_LIMIT > STOCK_FS_NR_OPEN);
+        const {
+            assert!(ENGINE_NOFILE_LIMIT > STOCK_FS_NR_OPEN);
+        }
 
         let stock = render_systemd_service(
             Path::new("/usr/local/bin/preloop"),
@@ -2312,6 +2318,12 @@ WantedBy=multi-user.target
     /// the engine back the stock ceiling, below the unit's `LimitNOFILE`.
     #[test]
     fn nofile_sysctl_drop_in_raises_the_ceiling_persistently() {
+        // The path is documented in deploy.mdx, shipped in contrib/, and
+        // removed by `server uninstall`; pin it so the three cannot drift.
+        assert_eq!(
+            NOFILE_SYSCTL_DROP_IN,
+            "/etc/sysctl.d/90-preloop-nofile.conf"
+        );
         let drop_in = nofile_sysctl_drop_in(ENGINE_NOFILE_LIMIT);
         let assignment = format!("fs.nr_open = {ENGINE_NOFILE_LIMIT}");
         assert!(drop_in.lines().any(|line| line == assignment));
@@ -2320,6 +2332,34 @@ WantedBy=multi-user.target
             drop_in
                 .lines()
                 .all(|line| line.starts_with('#') || line == assignment)
+        );
+    }
+
+    /// A host that publishes no ceiling (some containers) still gets a unit
+    /// that starts: the stock value is the safe assumption.
+    #[test]
+    fn nofile_ceiling_reads_the_kernel_or_falls_back_to_the_stock_value() {
+        assert_eq!(FS_NR_OPEN, "/proc/sys/fs/nr_open");
+        let ceiling = nofile_ceiling();
+        if cfg!(target_os = "linux") {
+            // The live value of `/proc/sys/fs/nr_open`.
+            assert!(ceiling > 0);
+        } else {
+            assert_eq!(ceiling, STOCK_FS_NR_OPEN);
+        }
+        assert_eq!(nofile_limit(ceiling), ceiling.min(ENGINE_NOFILE_LIMIT));
+    }
+
+    /// The shipped drop-in is what a hand install copies, so the installer must
+    /// write exactly those bytes; otherwise the two paths drift.
+    #[test]
+    fn contrib_sysctl_drop_in_matches_the_installer() {
+        assert_eq!(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../contrib/systemd/90-preloop-nofile.conf"
+            )),
+            nofile_sysctl_drop_in(ENGINE_NOFILE_LIMIT)
         );
     }
 

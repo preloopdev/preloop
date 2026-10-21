@@ -46,11 +46,11 @@ Delegate=cpu memory pids
 # (EMFILE/ESTALE).
 #
 # Linux refuses an RLIMIT_NOFILE hard limit above fs.nr_open (1048576 on stock
-# kernels), so a hand install must also raise that ceiling and keep it:
-#   echo 'fs.nr_open = 2097152' | sudo tee /etc/sysctl.d/90-preloop-nofile.conf
-#   sudo sysctl -w fs.nr_open=2097152
-# `preloop server install` writes that drop-in itself and renders this same
-# value, capped at whatever the kernel will grant.
+# kernels), so a hand install must also install and apply the sibling
+# `90-preloop-nofile.conf` as /etc/sysctl.d/90-preloop-nofile.conf before
+# starting this unit (or run `sysctl -w fs.nr_open=2097152` for the current
+# boot). `preloop server install` writes that drop-in itself and renders this
+# same value, capped at whatever the kernel will grant.
 LimitNOFILE=2097152
 StateDirectory=preloop
 StateDirectoryMode=0700
