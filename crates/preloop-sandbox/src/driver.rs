@@ -24,7 +24,7 @@ pub trait Driver: Send + Sync {
     /// Create and start a sandbox; returns its native reference.
     ///
     /// Drivers name native machines so [`Driver::inventory`] can recover
-    /// the sandbox id and incarnation (see [`native_name`]).
+    /// the sandbox id (see [`native_name`]).
     ///
     /// `work.mounts` and `work.sockets` were admitted against the host
     /// agent's allowlist before this call; a driver uses those paths as
@@ -100,22 +100,20 @@ pub fn unsupported(driver: &str, operation: &str) -> Error {
 /// Prefix of every native machine name the sandbox layer creates.
 pub const NATIVE_PREFIX: &str = "psbx";
 
-/// Native machine name encoding sandbox id and incarnation:
-/// `psbx-<id>-i<incarnation>`, where `<id>` is the id without its `sbx-`.
-pub fn native_name(sandbox_id: &str, incarnation: u64) -> String {
+/// Native machine name for a sandbox: `psbx-<id>`, where `<id>` is the id
+/// without its `sbx-`. Sandbox ids are never reused, so the name is unique.
+pub fn native_name(sandbox_id: &str) -> String {
     let bare = sandbox_id.strip_prefix("sbx-").unwrap_or(sandbox_id);
-    format!("{NATIVE_PREFIX}-{bare}-i{incarnation}")
+    format!("{NATIVE_PREFIX}-{bare}")
 }
 
 /// Parse a name produced by [`native_name`].
-pub fn parse_native_name(name: &str) -> Option<(String, u64)> {
-    let rest = name.strip_prefix(NATIVE_PREFIX)?.strip_prefix('-')?;
-    let (bare, incarnation) = rest.rsplit_once("-i")?;
-    let incarnation = incarnation.parse().ok()?;
+pub fn parse_native_name(name: &str) -> Option<String> {
+    let bare = name.strip_prefix(NATIVE_PREFIX)?.strip_prefix('-')?;
     if bare.is_empty() {
         return None;
     }
-    Some((format!("sbx-{bare}"), incarnation))
+    Some(format!("sbx-{bare}"))
 }
 
 /// Shell-quote one argument.
@@ -173,11 +171,13 @@ mod tests {
 
     #[test]
     fn native_names_round_trip() {
-        let name = native_name("sbx-3f2a9c", 4);
-        assert_eq!(name, "psbx-3f2a9c-i4");
-        assert_eq!(parse_native_name(&name), Some(("sbx-3f2a9c".into(), 4)));
+        let name = native_name("sbx-3f2a9c");
+        assert_eq!(name, "psbx-3f2a9c");
+        assert_eq!(parse_native_name(&name), Some("sbx-3f2a9c".into()));
         assert_eq!(parse_native_name("preloop-runner-1"), None);
-        assert_eq!(parse_native_name("psbx--i1"), None);
+        assert_eq!(parse_native_name("psbx-"), None);
+        // Caller-chosen names, e.g. the CI pool's, are not encoded names.
+        assert_eq!(parse_native_name("preloop-runner-0-1"), None);
     }
 
     #[test]

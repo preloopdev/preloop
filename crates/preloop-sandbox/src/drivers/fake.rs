@@ -94,7 +94,7 @@ impl Driver for FakeDriver {
         {
             return Err(Error::unavailable("injected create failure"));
         }
-        let name = native_name(&work.sandbox_id, work.incarnation);
+        let name = native_name(&work.sandbox_id);
         let dir = self.dir(&name)?;
         std::fs::create_dir_all(&dir).map_err(io("create"))?;
         if !work.template.native_ref.is_empty() {
@@ -277,12 +277,11 @@ impl Driver for FakeDriver {
                 .file_name()
                 .to_string_lossy()
                 .into_owned();
-            let (sandbox_id, incarnation) = parse_native_name(&name).unwrap_or_default();
+            let sandbox_id = parse_native_name(&name).unwrap_or_default();
             out.push(Observed {
                 driver: self.name.clone(),
                 native_ref: name,
                 sandbox_id,
-                incarnation,
             });
         }
         Ok(out)

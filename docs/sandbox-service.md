@@ -29,7 +29,8 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
 * **Providers** (capacity owners): `Register` (drivers + capabilities →
   provider id and fencing generation), `Heartbeat`, `Poll` (long-poll for
   work), `Report` / `ReportExec` (fenced by generation), `Reconcile` (full
-  inventory: lost sandboxes fail, orphans and stale incarnations are destroyed).
+  inventory: lost sandboxes fail, orphans are destroyed, and a `Terminating`
+  machine that is still there gets its destroy re-queued).
 
 Both are served with the Connect protocol, JSON codec, over one HTTP port:
 `POST /preloop.sandbox.v1.<Service>/<Method>`. Every RPC is unary or
@@ -67,10 +68,15 @@ from the `.proto` interoperates.
   (packing needs a stopped machine), `Start` boots it again, `--forkable` when
   it must serve forks. Both work under the same lease.
 * **Sandbox / Lease** — `Acquire` with the same idempotency key returns the same
-  lease. Lease environment is merged into every exec; injected files are written
-  before the lease is returned. Leases expire (the sandbox is destroyed);
-  `Release(PRESERVE)` keeps a sandbox for debugging until its window ends, and
-  the lease id keeps working as the debugging capability until then.
+  lease, provided the payload matches: the key is bound to the pool/template,
+  shape, requirements, purpose, network, mounts, sockets, options and name of
+  the request that first used it, and a reuse with any of those different is
+  `invalid_argument`. TTL, wait and injected files are call tactics, not
+  identity: they may change on a retry. Lease environment is merged into every
+  exec; injected files are written before the lease is returned. Leases expire
+  (the sandbox is destroyed); `Release(PRESERVE)` keeps a sandbox for debugging
+  until its window ends, and the lease id keeps working as the debugging
+  capability until then.
 
 Capabilities decide placement; nothing branches on driver names. A request no
 registered provider can satisfy fails with the unmet requirement named
@@ -183,7 +189,47 @@ the in-process and network APIs still return complete lists.
 The service keeps its working set in memory and writes through to its own
 store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
 `sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
-never references control tables.
+never references control tables. Writes are best-effort in the project's
+sense: in-memory state is authoritative, so a store failure is logged at error
+level with the record kind and never fails the caller's RPC.
+
+## Restart and failure
+
+The store is the only thing that survives a process: provider queues, pending
+work, exec streams, tickets and pool backoff are memory. Boot therefore starts
+with three decisions, before any provider is placed on or caller served:
+
+* **Every provider's generation is bumped and persisted.** An agent session
+  that outlived the process is fenced (`aborted`) on its next call and
+  re-registers with a fresh generation; until it does, its records are not
+  placed on. Sandboxes, leases, pools and templates are restored as they were.
+* **A sandbox caught `PROVISIONING` becomes `FAILED`** with `restarted while
+  creating: …`. It cannot be re-driven: the create request (shape, network,
+  mounts, sockets, options) is not on the record, so a second create would be
+  a different sandbox, and nothing will ever report the first. If the machine
+  did land, no record names it and the next reconcile destroys it as an
+  orphan. The caller's retry with the same key releases the failed record and
+  starts over.
+* **A sandbox left `TERMINATING` stays so.** Its destroy was decided but its
+  report died with the process; when the provider reports the machine in a
+  `Reconcile`, the service re-queues the destroy (bounded: three attempts,
+  after which the record is dropped and the machine is reaped as an orphan).
+  When the machine is missing from the inventory the record is dropped
+  immediately, so it stops holding a slot.
+
+Stop, start, pause, resume and snapshot are operations, not record states: the
+record moves only when their report lands, so a restart leaves the last settled
+state. A machine may therefore be stopped while the record says leased; the
+driver answers with its real state on the next operation, and the callers whose
+replies were lost see `unavailable`.
+
+A provider silent for `provider_lost_factor × provider_timeout` (default
+135 s) is declared lost. Its sandboxes are failed, its in-flight work is
+answered with `unavailable`, and its leases are released: the lease row is
+removed, so the caller's next `Renew` is `not_found` and its next `Acquire`
+with the same key starts over. `Renew` on a `FAILED` or `TERMINATING` sandbox
+is `failed_precondition` — a lease never outlives the machine it names, and
+one that did would promise capacity that cannot be used.
 
 ## Observability
 
@@ -278,6 +324,15 @@ becomes a template by content: a local pack is hashed and a registry tag is
 resolved to the digest the registry serves, so a rebuilt pack registers a new
 template instead of silently reusing the old one.
 
+The engine also sweeps orphaned SmolVM hypervisors under its home at pool
+startup and teardown (`OrphanPurge::All`). Those sweeps only see a machine's
+data directory, so the SmolVM driver writes an ownership marker into every
+machine it serves for a caller that is not the CI pool; the sweeps spare
+marked machines. Another caller's leased sandbox therefore survives an engine
+restart or stop, while pool machines stay unmarked and the sweep remains their
+crash backstop. The service's own delete path escalates to a targeted kill when
+`machine delete` refuses.
+
 | Variable | Effect |
 |---|---|
 | `PRELOOP_SANDBOX_LISTEN` | API address, or `off` |
@@ -330,8 +385,9 @@ preloop sandbox provider uncordon host-a
   restart, streaming exec, ticketed upload/download, lease ownership and list
   redaction, host mount/socket allowlisting, cordon/drain, pagination, request
   and blob caps, the boot blob sweep, artifact validation, digest-verified pack
-  materialization, and cache GC). Set `PRELOOP_SANDBOX_TEST_PG` to also run
-  the Postgres store test.
+  materialization, cache GC, restart fencing and recovery, terminating reaping,
+  lease release on provider loss, idempotency payload mismatch). Set
+  `PRELOOP_SANDBOX_TEST_PG` to also run the Postgres store test.
 * `PRELOOP_SANDBOX_E2E_SMOLVM=1 cargo test -p preloop-sandbox --test smolvm_e2e`
   — real SmolVM: bake, snapshot, warm pool of branches, socket mount, files,
   streaming, cleanup.

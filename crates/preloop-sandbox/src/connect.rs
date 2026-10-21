@@ -147,7 +147,7 @@ impl Error {
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(Code::Unavailable, message)
     }
-    /// `aborted` (fencing: stale generation or incarnation).
+    /// `aborted` (fencing: a stale provider generation).
     pub fn aborted(message: impl Into<String>) -> Self {
         Self::new(Code::Aborted, message)
     }

@@ -2446,9 +2446,10 @@ async fn settle_pool<P>(
 ///
 /// The pool runs its own teardown on every path it reaches; this is the
 /// backstop for the paths it does not. Both steps are safe against a live
-/// machine: the purge keys on this home's boot-config paths (and `All` is
-/// sound because by now this process is exiting, so nothing of ours can be
-/// running), and a mount whose hypervisor still exists is skipped.
+/// machine: the purge keys on this home's boot-config paths, spares machines
+/// the Sandbox Service marked as owned by a sandbox the CI pool does not hold
+/// (another caller's lease outlives this process), and a mount whose
+/// hypervisor still exists is skipped.
 struct VmTeardownOnExit;
 
 impl Drop for VmTeardownOnExit {
@@ -2467,9 +2468,9 @@ impl Drop for VmTeardownOnExit {
 /// `RunnerPool::run` never gets to run its own startup cleanup.
 ///
 /// Both steps are safe against a live machine: the purge keys on this home's
-/// boot-config paths (and `All` is sound because the caller is either exiting
-/// or holding the engine's socket, so nothing of ours is provisioning), and a
-/// mount whose hypervisor still exists is skipped.
+/// boot-config paths and spares Sandbox Service machines the CI pool does not
+/// own (see `OrphanPurge::All`), and a mount whose hypervisor still exists is
+/// skipped.
 fn purge_stuck_vms() {
     match preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms(
         preloop_sandbox::drivers::smolvm::cli::OrphanPurge::All,
