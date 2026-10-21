@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Fixed
+
+- **A SmolVM guest that walks its image no longer loses the ability to open
+  files.** SmolVM's virtiofs passthrough holds one host file descriptor per
+  image inode the guest has looked up, released only when the guest evicts the
+  inode, and every VMM inherits the engine unit's descriptor limit — systemd's
+  default 524288 hard. The x86_64 golden carries ~985k entries, so a `find /`
+  in a runner pinned 520,071 host descriptors in that runner's VMM, after which
+  every uncached open or exec failed with `EMFILE`/`ESTALE`. `preloop server
+  install` now raises `fs.nr_open` to 2097152 through
+  `/etc/sysctl.d/90-preloop-nofile.conf` and applies it to the running kernel
+  before rewriting the unit, because Linux refuses an `RLIMIT_NOFILE` hard
+  limit above `fs.nr_open` (1048576 on stock kernels) and systemd then either
+  clamps the request — silently handing the VMM less than the unit says — or
+  fails the start with `205/LIMITS`. The rendered value is capped at what the
+  kernel will actually grant, the installer reads the running service's
+  `Max open files` back and warns on a shortfall, and `uninstall` removes the
+  drop-in. User-scope units are unchanged because a user manager cannot raise
+  a hard limit above its own.
+
 ## [0.35.5] - 2026-10-21
 
 ### Security

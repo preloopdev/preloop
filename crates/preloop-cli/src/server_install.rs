@@ -64,6 +64,31 @@ const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/dev.preloop.server.plist";
 #[cfg(target_os = "linux")]
 const SYSTEMD_DIR: &str = "/etc/systemd/system";
 
+/// Descriptor limit the system-scope unit asks systemd for.
+///
+/// Every VMM inherits it, and SmolVM's virtiofs passthrough holds one host fd
+/// per image inode the guest has looked up, released only when the guest
+/// evicts it. The x86_64 golden carries ~985k entries, so systemd's default
+/// hard limit (524288) let a guest `find /` exhaust the VMM; twice the golden
+/// leaves room for the engine, the VMM, and a second walk.
+#[cfg(any(target_os = "linux", test))]
+const ENGINE_NOFILE_LIMIT: u64 = 2_097_152;
+
+/// `fs.nr_open` as stock kernels ship it: Linux refuses an `RLIMIT_NOFILE`
+/// hard limit above this, privileged or not.
+#[cfg(any(target_os = "linux", test))]
+const STOCK_FS_NR_OPEN: u64 = 1_048_576;
+
+/// The kernel's live ceiling on `RLIMIT_NOFILE`.
+#[cfg(any(target_os = "linux", test))]
+const FS_NR_OPEN: &str = "/proc/sys/fs/nr_open";
+
+/// sysctl drop-in that keeps the raised ceiling across boots. Sorts after the
+/// distro's vendor files (`50-*`) so the engine's need wins, and is removed by
+/// `preloop server uninstall`.
+#[cfg(any(target_os = "linux", test))]
+const NOFILE_SYSCTL_DROP_IN: &str = "/etc/sysctl.d/90-preloop-nofile.conf";
+
 #[derive(Debug, Parser)]
 pub(crate) struct ServerArgs {
     #[command(subcommand)]
@@ -376,7 +401,22 @@ fn install_systemd(
 ) -> Result<()> {
     let dry = args.dry_run;
     let dir = systemd_unit_dir(args.user);
-    let service = render_systemd_service(exe, home, args.user, args.systemd_credential.as_deref())?;
+    // Every VMM inherits the unit's descriptor limit, and the kernel caps that
+    // limit at `fs.nr_open`; provision the ceiling the engine's golden walk
+    // needs before rendering the unit, so the value written is attainable.
+    // User scope is unchanged: a user manager's hard limit is its own ceiling.
+    let nofile = if args.user {
+        ENGINE_NOFILE_LIMIT
+    } else {
+        provision_nofile_ceiling(dry)?
+    };
+    let service = render_systemd_service(
+        exe,
+        home,
+        args.user,
+        args.systemd_credential.as_deref(),
+        nofile,
+    )?;
     let socket = render_systemd_socket(args.listen);
     let update_service = render_systemd_update_service(exe, home, args.user)?;
     let timer = render_systemd_update_timer();
@@ -443,6 +483,11 @@ fn install_systemd(
             &systemctl_args(args.user, &["enable", "--now", "preloop-update.timer"]),
             dry,
         )?;
+    }
+    if !args.user {
+        // The unit file records what systemd was asked for; only the running
+        // process shows what the kernel granted.
+        verify_nofile_limit(args.user, nofile, dry);
     }
     if let Some(path) = &args.systemd_credential {
         eprintln!(
@@ -1115,6 +1160,14 @@ fn uninstall_systemd(args: &UninstallArgs, home: &Path) -> Result<()> {
                 remove_path(&path, dry)?;
             }
         }
+        // Our descriptor-ceiling drop-in goes too: nothing installed by
+        // Preloop should outlive the service. The running kernel keeps the
+        // raised value until the next boot — lowering a live ceiling could
+        // disturb unrelated processes, and it only ever caps a limit.
+        let drop_in = Path::new(NOFILE_SYSCTL_DROP_IN);
+        if drop_in.exists() || dry {
+            remove_path(drop_in, dry)?;
+        }
         // Only our own managed symlink, never an operator-installed binary.
         let managed_link = Path::new("/usr/local/bin/smolvm");
         let prefix = Path::new(SMOLVM_PREFIX_PARENT).join("smolvm-prefix");
@@ -1137,12 +1190,167 @@ fn uninstall_systemd(args: &UninstallArgs, home: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The descriptor limit a unit may ask for on a host whose ceiling is
+/// `ceiling`: the engine's need, capped at what the kernel can grant.
+#[cfg(any(target_os = "linux", test))]
+fn nofile_limit(ceiling: u64) -> u64 {
+    ceiling.min(ENGINE_NOFILE_LIMIT)
+}
+
+/// The kernel's live `RLIMIT_NOFILE` ceiling, falling back to the stock value
+/// when the kernel publishes none (a container without `/proc/sys/fs`).
+#[cfg(any(target_os = "linux", test))]
+fn nofile_ceiling() -> u64 {
+    std::fs::read_to_string(FS_NR_OPEN)
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(STOCK_FS_NR_OPEN)
+}
+
+/// The sysctl drop-in that raises the ceiling, with the reason it exists.
+/// Byte-identical to `contrib/systemd/90-preloop-nofile.conf`, which a hand
+/// install copies; a test pins the two together.
+#[cfg(any(target_os = "linux", test))]
+fn nofile_sysctl_drop_in(limit: u64) -> String {
+    format!(
+        "# Preloop engine descriptor ceiling: every VMM the engine starts inherits the\n\
+         # service unit's LimitNOFILE, and SmolVM's virtiofs passthrough holds one host\n\
+         # fd per image inode a guest has looked up (the x86_64 golden carries ~985k).\n\
+         # Linux refuses an RLIMIT_NOFILE hard limit above fs.nr_open, so the unit\n\
+         # cannot ask for more than this. `preloop server install` writes this file and\n\
+         # removes it on uninstall; a hand install copies it to /etc/sysctl.d/ and runs\n\
+         # `sysctl -w fs.nr_open={limit}` for the current boot.\n\
+         fs.nr_open = {limit}\n"
+    )
+}
+
+/// Raise the kernel's descriptor ceiling to what the engine's VMMs need, and
+/// report the limit the unit may ask for.
+///
+/// `LimitNOFILE` above `fs.nr_open` is unattainable: the kernel refuses the
+/// raise, and systemd then either clamps it — a silent downgrade the unit file
+/// cannot show — or fails the start with `205/LIMITS`. So the ceiling is
+/// provisioned first: persistently through a sysctl drop-in, and immediately
+/// through `/proc` so the restart this install performs lands on a limit that
+/// is attainable now rather than after the next boot.
+///
+/// Never fatal: a host that refuses the raise still gets a unit that starts,
+/// asking for the attainable ceiling, plus a warning naming the shortfall.
+#[cfg(target_os = "linux")]
+fn provision_nofile_ceiling(dry_run: bool) -> Result<u64> {
+    let current = nofile_ceiling();
+    if current >= ENGINE_NOFILE_LIMIT {
+        return Ok(ENGINE_NOFILE_LIMIT);
+    }
+    let drop_in = Path::new(NOFILE_SYSCTL_DROP_IN);
+    if dry_run {
+        eprintln!(
+            "[preloop] would raise fs.nr_open {current} -> {ENGINE_NOFILE_LIMIT} and keep it \
+             across reboots in {}",
+            drop_in.display()
+        );
+        // Preview the unit a real run writes once the raise has landed.
+        return Ok(ENGINE_NOFILE_LIMIT);
+    }
+    // Persistent first: an earlier boot must not find a unit whose limit the
+    // kernel cannot grant.
+    if let Some(parent) = drop_in.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(drop_in, nofile_sysctl_drop_in(ENGINE_NOFILE_LIMIT))
+        .with_context(|| format!("write {}", drop_in.display()))?;
+    // Then the running kernel, before the unit is written and started.
+    if let Err(error) = std::fs::write(FS_NR_OPEN, ENGINE_NOFILE_LIMIT.to_string()) {
+        eprintln!(
+            "[preloop] warning: could not raise fs.nr_open to {ENGINE_NOFILE_LIMIT} \
+             ({error}); the unit will ask for the current ceiling instead"
+        );
+    }
+    let ceiling = nofile_ceiling();
+    let limit = nofile_limit(ceiling);
+    if limit < ENGINE_NOFILE_LIMIT {
+        eprintln!(
+            "[preloop] warning: fs.nr_open is {ceiling}, below the {ENGINE_NOFILE_LIMIT} the \
+             engine's VMMs need; the unit asks for {limit}. A guest walking the x86_64 golden \
+             (~985k inodes) can still exhaust it — set `fs.nr_open = {ENGINE_NOFILE_LIMIT}` in \
+             {} and reinstall.",
+            drop_in.display()
+        );
+    }
+    Ok(limit)
+}
+
+/// The `Max open files` soft/hard pair from `/proc/<pid>/limits` — the one
+/// place that shows the limit a process actually got, rather than the one its
+/// unit asked for.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_limits(limits: &str) -> Option<(u64, u64)> {
+    let line = limits
+        .lines()
+        .find(|line| line.trim_start().starts_with("Max open files"))?;
+    let mut fields = line.split_whitespace().skip(3);
+    // `unlimited` is `RLIM_INFINITY`: above any requested value.
+    let value = |token: &str| match token {
+        "unlimited" => Some(u64::MAX),
+        other => other.parse().ok(),
+    };
+    let soft = value(fields.next()?)?;
+    let hard = value(fields.next()?)?;
+    Some((soft, hard))
+}
+
+/// Read the limit the running `preloop.service` was actually granted.
+#[cfg(target_os = "linux")]
+fn served_nofile_limit(user: bool) -> Option<(u64, u64)> {
+    let pid = Command::new("systemctl")
+        .args(systemctl_args(
+            user,
+            &["show", "preloop.service", "--property=MainPID", "--value"],
+        ))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)?;
+    parse_proc_limits(&std::fs::read_to_string(format!("/proc/{pid}/limits")).ok()?)
+}
+
+/// Confirm the service actually runs on the descriptor limit its unit asks
+/// for. The rendered unit says what systemd was told; only the running process
+/// shows what the kernel granted, and a clamped limit leaves no trace in the
+/// unit file.
+#[cfg(target_os = "linux")]
+fn verify_nofile_limit(user: bool, requested: u64, dry_run: bool) {
+    if dry_run {
+        eprintln!(
+            "[preloop] would verify the running service's `Max open files` is at least \
+             {requested}"
+        );
+        return;
+    }
+    match served_nofile_limit(user) {
+        Some((soft, hard)) if hard >= requested => {
+            eprintln!("[preloop] descriptor limit: {soft} soft / {hard} hard");
+        }
+        Some((soft, hard)) => eprintln!(
+            "[preloop] warning: the running service has {soft} soft / {hard} hard descriptors, \
+             below the {requested} its unit asks for; raise fs.nr_open and restart it"
+        ),
+        None => eprintln!(
+            "[preloop] note: could not read the running service's descriptor limit; check \
+             `systemctl show preloop.service` and /proc/<pid>/limits"
+        ),
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn render_systemd_service(
     exe: &Path,
     home: &Path,
     user: bool,
     credential: Option<&Path>,
+    nofile: u64,
 ) -> Result<String> {
     let exe_display = systemd_path(exe);
     let identity = if user {
@@ -1171,7 +1379,19 @@ fn render_systemd_service(
         // Delegate this unit's cgroup subtree so `_boot-vm` can place each VM
         // in its own capped `vm-<pid>` leaf (cpu/pids/memory). The provider
         // only passes SMOLVM_CGROUP_ROOT when it observes this delegation.
-        "Delegate=cpu memory pids\n".to_owned()
+        //
+        // Every VMM inherits this unit's descriptor limit, and SmolVM's
+        // virtiofs passthrough holds one host fd per image inode the guest has
+        // looked up, released only when the guest evicts it. The x86_64 golden
+        // carries ~985k entries, so systemd's default hard limit (524288) let a
+        // guest `find /` exhaust it, after which every uncached open or exec in
+        // that guest failed with EMFILE/ESTALE. `nofile` is capped at the
+        // host's `fs.nr_open` (raised by the installer): a higher value is
+        // unattainable and systemd would clamp it or refuse to start the unit.
+        //
+        // System scope only: a user unit cannot raise its hard limit above its
+        // manager's and would not start.
+        format!("Delegate=cpu memory pids\nLimitNOFILE={nofile}\n")
     };
     Ok(format!(
         r#"[Unit]
@@ -1990,6 +2210,7 @@ mod tests {
             Path::new(DEFAULT_HOME),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(unit.contains("ExecStart=/usr/local/bin/preloop serve"));
@@ -2003,8 +2224,9 @@ mod tests {
         assert!(unit.contains("WantedBy=multi-user.target"));
     }
 
-    /// The full default system-scope unit, byte for byte — the renderer is
-    /// the observable output, and contrib/systemd/preloop.service mirrors it.
+    /// The full default system-scope unit, byte for byte, on a host whose
+    /// `fs.nr_open` the installer has already raised — the renderer is the
+    /// observable output, and contrib/systemd/preloop.service mirrors it.
     #[test]
     fn systemd_service_default_system_scope_renders_exactly() {
         let unit = render_systemd_service(
@@ -2012,6 +2234,7 @@ mod tests {
             Path::new(DEFAULT_HOME),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert_eq!(
@@ -2043,12 +2266,154 @@ LockPersonality=true
 RestrictRealtime=true
 CapabilityBoundingSet=
 Delegate=cpu memory pids
+LimitNOFILE=2097152
 StateDirectory=preloop
 StateDirectoryMode=0700
 [Install]
 WantedBy=multi-user.target
 "#
         );
+    }
+
+    /// `RLIMIT_NOFILE` cannot exceed `fs.nr_open` — Linux refuses the raise
+    /// even for a privileged process — so a unit that asks for more is either
+    /// clamped by systemd (silently handing the VMM a smaller limit than the
+    /// unit shows) or fails to start with `205/LIMITS`. The unit must ask for
+    /// what the kernel will grant: on a stock host (1048576) that is the stock
+    /// ceiling, not the engine's 2097152 target.
+    #[test]
+    fn systemd_service_nofile_limit_is_capped_at_the_kernel_ceiling() {
+        assert_eq!(nofile_limit(STOCK_FS_NR_OPEN), STOCK_FS_NR_OPEN);
+        assert_eq!(nofile_limit(8_388_608), ENGINE_NOFILE_LIMIT);
+        // The engine's target sits above the stock ceiling on purpose: the
+        // x86_64 golden carries ~985k inodes, so 1048576 leaves almost no
+        // headroom for the engine and the VMM beside the guest's walk.
+        const {
+            assert!(ENGINE_NOFILE_LIMIT > STOCK_FS_NR_OPEN);
+        }
+
+        let stock = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new(DEFAULT_HOME),
+            false,
+            None,
+            nofile_limit(STOCK_FS_NR_OPEN),
+        )
+        .unwrap();
+        assert!(stock.contains(&format!("LimitNOFILE={STOCK_FS_NR_OPEN}\n")));
+        assert!(!stock.contains(&format!("LimitNOFILE={ENGINE_NOFILE_LIMIT}\n")));
+
+        let raised = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new(DEFAULT_HOME),
+            false,
+            None,
+            nofile_limit(ENGINE_NOFILE_LIMIT * 2),
+        )
+        .unwrap();
+        assert!(raised.contains(&format!("LimitNOFILE={ENGINE_NOFILE_LIMIT}\n")));
+    }
+
+    /// The drop-in is what survives a reboot: without it the next boot hands
+    /// the engine back the stock ceiling, below the unit's `LimitNOFILE`.
+    #[test]
+    fn nofile_sysctl_drop_in_raises_the_ceiling_persistently() {
+        // The path is documented in deploy.mdx, shipped in contrib/, and
+        // removed by `server uninstall`; pin it so the three cannot drift.
+        assert_eq!(
+            NOFILE_SYSCTL_DROP_IN,
+            "/etc/sysctl.d/90-preloop-nofile.conf"
+        );
+        let drop_in = nofile_sysctl_drop_in(ENGINE_NOFILE_LIMIT);
+        let assignment = format!("fs.nr_open = {ENGINE_NOFILE_LIMIT}");
+        assert!(drop_in.lines().any(|line| line == assignment));
+        // sysctl.d parses assignments and comments only.
+        assert!(
+            drop_in
+                .lines()
+                .all(|line| line.starts_with('#') || line == assignment)
+        );
+    }
+
+    /// A host that publishes no ceiling (some containers) still gets a unit
+    /// that starts: the stock value is the safe assumption.
+    #[test]
+    fn nofile_ceiling_reads_the_kernel_or_falls_back_to_the_stock_value() {
+        assert_eq!(FS_NR_OPEN, "/proc/sys/fs/nr_open");
+        let ceiling = nofile_ceiling();
+        if cfg!(target_os = "linux") {
+            // The live value of `/proc/sys/fs/nr_open`.
+            assert!(ceiling > 0);
+        } else {
+            assert_eq!(ceiling, STOCK_FS_NR_OPEN);
+        }
+        assert_eq!(nofile_limit(ceiling), ceiling.min(ENGINE_NOFILE_LIMIT));
+    }
+
+    /// The shipped drop-in is what a hand install copies, so the installer must
+    /// write exactly those bytes; otherwise the two paths drift.
+    #[test]
+    fn contrib_sysctl_drop_in_matches_the_installer() {
+        assert_eq!(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../contrib/systemd/90-preloop-nofile.conf"
+            )),
+            nofile_sysctl_drop_in(ENGINE_NOFILE_LIMIT)
+        );
+    }
+
+    /// What the unit asks for is not what the service got: only
+    /// `/proc/<pid>/limits` shows the kernel's answer, so the installer reads
+    /// it back instead of trusting the rendered text.
+    #[test]
+    fn parse_proc_limits_reads_the_actual_pair() {
+        let limits = "\
+Limit                     Soft Limit           Hard Limit           Units
+Max cpu time              unlimited            unlimited            seconds
+Max open files            1048576              1048576              files
+Max locked memory         8388608              8388608              bytes
+";
+        assert_eq!(parse_proc_limits(limits), Some((1_048_576, 1_048_576)));
+        // An unbounded pair is above any value the unit can ask for.
+        assert_eq!(
+            parse_proc_limits("Max open files unlimited unlimited files\n"),
+            Some((u64::MAX, u64::MAX))
+        );
+        assert_eq!(
+            parse_proc_limits("Max cpu time unlimited unlimited seconds\n"),
+            None
+        );
+    }
+
+    /// The shipped unit is the manual-install counterpart of the renderer's
+    /// output; the two must ask for the same descriptor limit or a packaging
+    /// install lands on a value `preloop server install` never writes.
+    #[test]
+    fn contrib_unit_matches_the_rendered_nofile_limit() {
+        let contrib = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contrib/systemd/preloop.service"
+        ));
+        let rendered = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new(DEFAULT_HOME),
+            false,
+            None,
+            ENGINE_NOFILE_LIMIT,
+        )
+        .unwrap();
+        let directive = |unit: &str| {
+            unit.lines()
+                .find_map(|line| line.strip_prefix("LimitNOFILE="))
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            directive(contrib),
+            directive(&rendered),
+            "contrib/systemd/preloop.service must match the rendered unit"
+        );
+        assert_eq!(directive(contrib).as_deref(), Some("2097152"));
     }
 
     /// The system-scope service must run under a dedicated non-root account:
@@ -2063,6 +2428,7 @@ WantedBy=multi-user.target
             Path::new(DEFAULT_HOME),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(unit.contains("User=preloop\nGroup=preloop\n"));
@@ -2070,6 +2436,12 @@ WantedBy=multi-user.target
         assert!(unit.contains("StateDirectory=preloop"));
         assert!(unit.contains("StateDirectoryMode=0700"));
         assert!(unit.contains("Delegate=cpu memory pids"));
+        // Every VMM inherits the unit's descriptor limit, and SmolVM's virtiofs
+        // passthrough holds one host fd per image inode the guest looked up, so
+        // the systemd default (524288) is below an x86_64 golden's inode count.
+        // The installer caps this at the host's `fs.nr_open` (see
+        // `systemd_service_nofile_limit_is_capped_at_the_kernel_ceiling`).
+        assert!(unit.contains(&format!("LimitNOFILE={ENGINE_NOFILE_LIMIT}\n")));
         assert!(unit.contains("ProtectKernelModules=true"));
         assert!(unit.contains("ProtectKernelLogs=true"));
         assert!(unit.contains("ProtectClock=true"));
@@ -2090,11 +2462,13 @@ WantedBy=multi-user.target
             Path::new("/Users/me/.preloop"),
             true,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(!user_unit.contains("User=preloop"));
         assert!(!user_unit.contains("StateDirectory="));
         assert!(!user_unit.contains("Delegate="));
+        assert!(!user_unit.contains("LimitNOFILE="));
         assert!(!user_unit.contains("SMOLVM_DATA_DIR="));
     }
 
@@ -2108,6 +2482,7 @@ WantedBy=multi-user.target
             Path::new(DEFAULT_HOME),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(!service.contains("ReadWritePaths=/usr/local/bin"));
@@ -2188,6 +2563,7 @@ WantedBy=multi-user.target
             Path::new("/srv/preloop"),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(!open.contains("ReadWritePaths="));
@@ -2198,6 +2574,7 @@ WantedBy=multi-user.target
             Path::new("/home/me/.preloop"),
             true,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(user_unit.contains("ReadWritePaths=/home/me/.preloop"));
@@ -2241,6 +2618,7 @@ WantedBy=multi-user.target
             Path::new(DEFAULT_HOME),
             false,
             Some(Path::new("/etc/preloop-secrets.enc")),
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(unit.contains("LoadCredentialEncrypted=preloop-secrets:/etc/preloop-secrets.enc"));
@@ -2249,6 +2627,7 @@ WantedBy=multi-user.target
             Path::new(DEFAULT_HOME),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(!plain.contains("LoadCredential="));
@@ -2266,6 +2645,7 @@ WantedBy=multi-user.target
             Path::new("/var/lib/preloop"),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(unit.contains("ExecStart=\"/opt/pre loop/preloop\" serve"));
@@ -2288,6 +2668,7 @@ WantedBy=multi-user.target
             Path::new("/Users/me/.preloop"),
             true,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         // ProtectHome=read-only would block ~/.preloop state; the unit must
@@ -2299,6 +2680,7 @@ WantedBy=multi-user.target
             Path::new(DEFAULT_HOME),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         // System scope relies on StateDirectory for the default home and
@@ -2349,6 +2731,7 @@ WantedBy=multi-user.target
             Path::new(DEFAULT_HOME),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         let update = render_systemd_update_service(
@@ -2370,6 +2753,7 @@ WantedBy=multi-user.target
             Path::new("/Users/me/.preloop"),
             true,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         let system = render_systemd_service(
@@ -2377,6 +2761,7 @@ WantedBy=multi-user.target
             Path::new(DEFAULT_HOME),
             false,
             None,
+            ENGINE_NOFILE_LIMIT,
         )
         .unwrap();
         assert!(user.contains("WantedBy=default.target"));
