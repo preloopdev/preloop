@@ -387,7 +387,7 @@ pub(crate) async fn upload_diagnostic_logs(
 
     // Create a simple zip of all log files
     let zip_path = runner_root
-        .join("_work")
+        .join("work")
         .join("_temp")
         .join(format!("{job_name}-diagnostics.zip"));
     if let Some(parent) = zip_path.parent() {

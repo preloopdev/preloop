@@ -110,54 +110,47 @@ async fn admit_webhook_upload(
     }
 }
 
-/// What the gated body reports to the middleware while it is being read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UploadEvent {
-    /// A data frame arrived, so the upload is still making progress.
-    Progress,
-    /// The body was read to its end, failed, or was dropped with the request.
-    Complete,
-}
-
 /// Wrap `body` so the middleware can watch the upload it is gating.
 ///
 /// The handler's extractor is what reads the body, so the only way to tell a
 /// progressing upload from a dormant one is to observe the frames it yields:
-/// `Progress` for every data frame, `Complete` at the body's end or error, and
-/// — because the sender is dropped with the body — `Complete` again through
-/// the channel closing when a request is dropped before it is read (a payload
-/// rejected as oversized), so such a request is never timed out on its way
-/// out.
+/// `progress` for every data frame and `complete` once at the body's end or
+/// error. The two signals are separate on purpose.
 ///
-/// The phase travels over a `watch` channel rather than a queue of events: it
-/// holds one value, so a `Progress` report is a store, not an allocation, and
-/// neither a burst of frames nor a receiver that has not looked yet can grow
-/// with the number of frames. That matters because a client can split an
-/// admitted 32 MiB body into millions of one-byte frames, and every frame is a
-/// poll here: a queue would hold one event per frame (the memory and CPU
-/// amplification a bounded one-slot queue avoided) while a bounded queue could
-/// drop the `Complete` queued behind a `Progress` and turn a successful upload
-/// into a spurious 408. Coalescing in a `watch` keeps both properties: the
-/// newest phase replaces the last, so `Complete` can never be crowded out and
-/// repeated `Progress` reports cost nothing extra. Only data frames pass
-/// through; a webhook delivery carries no trailers, and the `Bytes` extractor
-/// ignores them in any case.
-fn report_upload_events(body: Body, events: tokio::sync::watch::Sender<UploadEvent>) -> Body {
+/// Progress is coalesced (`try_send` on a one-slot channel): the middleware
+/// only needs to know that the body moved, not how often, so a chunked or
+/// HTTP/2 upload made of arbitrarily many small frames cannot queue one
+/// allocation per frame.
+///
+/// `complete` is a lossless oneshot because it must never be lost behind a
+/// queued `Progress`: a tiny body emits both before the middleware drains
+/// them, and a dropped `Complete` turns a successful upload into a spurious
+/// 408. It also covers the dropped-request path — the body owns the sender, so
+/// a request dropped before it is read (a payload rejected as oversized)
+/// resolves the oneshot with an error, which the middleware treats as
+/// complete, and such a request is never timed out on its way out. Only data
+/// frames pass through; a webhook delivery carries no trailers, and the
+/// `Bytes` extractor ignores them in any case.
+fn report_upload_events(
+    body: Body,
+    progress: tokio::sync::mpsc::Sender<()>,
+    complete: tokio::sync::oneshot::Sender<()>,
+) -> Body {
     use futures::Stream as _;
 
     let mut body = body.into_data_stream();
-    let mut events = Some(events);
+    let mut signals = Some((progress, complete));
     Body::from_stream(stream::poll_fn(move |cx| {
         let next = Pin::new(&mut body).poll_next(cx);
         match &next {
             Poll::Ready(Some(Ok(_))) => {
-                if let Some(events) = &events {
-                    events.send_replace(UploadEvent::Progress);
+                if let Some((progress, _)) = &signals {
+                    let _ = progress.try_send(());
                 }
             }
             Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
-                if let Some(events) = events.take() {
-                    events.send_replace(UploadEvent::Complete);
+                if let Some((_, complete)) = signals.take() {
+                    let _ = complete.send(());
                 }
             }
             Poll::Pending => {}
@@ -183,10 +176,11 @@ async fn limit_webhook_uploads(
 ) -> Result<Response, StatusCode> {
     let _permit = admit_webhook_upload(&gate).await?;
     let (parts, body) = request.into_parts();
-    let (events_tx, mut events) = tokio::sync::watch::channel(UploadEvent::Progress);
+    let (progress_tx, mut progress) = tokio::sync::mpsc::channel(1);
+    let (complete_tx, mut complete) = tokio::sync::oneshot::channel();
     let handler = next.run(Request::from_parts(
         parts,
-        report_upload_events(body, events_tx),
+        report_upload_events(body, progress_tx, complete_tx),
     ));
     tokio::pin!(handler);
 
@@ -204,15 +198,15 @@ async fn limit_webhook_uploads(
             () = tokio::time::sleep(gate.idle_budget) => {
                 return Err(StatusCode::REQUEST_TIMEOUT);
             }
-            // `changed` reports only the newest phase, so a burst of progress
-            // reports coalesces into one wake-up and a `Complete` can never
-            // sit behind a queued `Progress`; a closed sender means the body
-            // was dropped before it was read, which also ends the upload.
-            event = events.changed() => match event {
-                Ok(()) if *events.borrow() == UploadEvent::Complete => ingested = true,
-                Ok(()) => {}
-                Err(_) => ingested = true,
-            },
+            // Lossless: the body ended, failed, or was dropped (`Err`).
+            _ = &mut complete => ingested = true,
+            // Coalesced: one slot says the body moved; a closed channel means
+            // the body was dropped before it finished.
+            event = progress.recv() => {
+                if event.is_none() {
+                    ingested = true;
+                }
+            }
         }
     }
     Ok(handler.await)
@@ -1480,6 +1474,42 @@ mod tests {
         Arc::new(gate)
     }
 
+    /// Progress is coalesced through a one-slot channel, so arbitrarily many
+    /// small frames cannot queue one allocation each, while `Complete` is
+    /// delivered through its own lossless signal: a body that emits both
+    /// before the middleware drains anything must still report the end of the
+    /// upload.
+    #[tokio::test]
+    async fn upload_events_coalesce_progress_without_losing_complete() {
+        use futures::StreamExt as _;
+
+        let frames = 1024;
+        let body = Body::from_stream(futures::stream::iter(
+            (0..frames).map(|_| Ok::<_, std::io::Error>(Bytes::new())),
+        ));
+        let (progress_tx, mut progress) = tokio::sync::mpsc::channel(1);
+        let (complete_tx, complete) = tokio::sync::oneshot::channel();
+        let gated = report_upload_events(body, progress_tx, complete_tx);
+
+        let drained: Vec<_> = gated.into_data_stream().collect().await;
+        assert_eq!(drained.len(), frames);
+        assert!(drained.iter().all(Result::is_ok));
+        assert_eq!(
+            progress.len(),
+            1,
+            "a one-slot channel must coalesce per-frame progress"
+        );
+        assert!(
+            complete.await.is_ok(),
+            "Complete must not be lost behind queued progress"
+        );
+        assert!(progress.recv().await.is_some());
+        assert!(
+            progress.recv().await.is_none(),
+            "the body drops its senders when it ends"
+        );
+    }
+
     /// The upload gate over a stub handler that reads its body, so admission
     /// and the upload budgets are driven without the webhook handler's
     /// signature check or store.
@@ -1585,42 +1615,6 @@ mod tests {
             MAX_CONCURRENT_WEBHOOK_UPLOADS,
             "the idle upload must release its slot"
         );
-    }
-
-    /// A burst of one-byte frames must cost the gate one phase, not one event
-    /// per frame, and the completion after the burst must still be there.
-    ///
-    /// This is the amplification the queue had: an admitted 32 MiB body split
-    /// into one-byte frames is ~33.5M poll results, and a queue of events grew
-    /// with them. A `watch` keeps only the newest phase, so the burst stores
-    /// over itself and `Complete` cannot be crowded out by a `Progress` in
-    /// front of it — the two failures the unbounded and the one-slot queue
-    /// each had.
-    #[tokio::test]
-    async fn upload_events_coalesce_a_tiny_frame_burst_and_keep_complete() {
-        const FRAMES: usize = 100_000;
-        let (events_tx, mut events) = tokio::sync::watch::channel(UploadEvent::Progress);
-        let body = Body::from_stream(stream::iter(
-            (0..FRAMES).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(b"x"))),
-        ));
-        let body = report_upload_events(body, events_tx);
-
-        // The middleware does not look until the whole burst is in, which is
-        // the shape that let the queue grow with the frame count.
-        let collected = axum::body::to_bytes(body, FRAMES)
-            .await
-            .expect("the body drains");
-        assert_eq!(collected.len(), FRAMES);
-
-        // One phase replaced all of them, and it is the end state: a queue
-        // would still hold one `Progress` per frame here, with `Complete`
-        // behind them (or dropped, for the one-slot version).
-        assert_eq!(*events.borrow(), UploadEvent::Complete);
-        events
-            .changed()
-            .await
-            .expect("the completion is still pending");
-        assert_eq!(*events.borrow(), UploadEvent::Complete);
     }
 
     /// A tiny-frame upload that finishes must be admitted, not cut off at the

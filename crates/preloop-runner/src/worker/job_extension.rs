@@ -43,10 +43,10 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
             preloop_gha_protocol::workspace_dir_for_repository(repository)
                 .map(|p| p.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| "_work/default/default".to_owned());
+        .unwrap_or_else(|| "work/default/default".to_owned());
 
     // The runner owns everything below its working directory — its root,
-    // where `_work` and `.runner` live (the worker is spawned with
+    // where `work` and `.runner` live (the worker is spawned with
     // `current_dir(runner_root)`). A crafted job payload must never make the
     // runner delete arbitrary paths: workspace="/" or "/home/user" would
     // otherwise reach `remove_dir_all` below verbatim. Resolve the payload
@@ -234,7 +234,7 @@ pub fn inject_github_env(
     // Decode to a flat JSON object.
     let github = decode_typed_value(&raw_github);
 
-    let workspace = job.workspace.as_deref().unwrap_or("_work/default/default");
+    let workspace = job.workspace.as_deref().unwrap_or("work/default/default");
 
     // Core GITHUB_* variables
     let vars: Vec<(&str, String)> = vec![
@@ -326,6 +326,18 @@ pub fn inject_github_env(
                 .parent()
                 .and_then(|p| p.parent())
                 .map(|p| p.join("_temp").to_string_lossy().to_string())
+                .unwrap_or_else(|| "/tmp".to_string()),
+        ),
+        // The repository's own directory under the work folder, which hosted
+        // runners export (`/home/runner/work/<repo>` for a workspace of
+        // `/home/runner/work/<repo>/<repo>`) and actions that look for a
+        // sibling checkout read. A parity probe measured it UNSET on a
+        // preloop guest.
+        (
+            "RUNNER_WORKSPACE",
+            Path::new(workspace)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "/tmp".to_string()),
         ),
         ("RUNNER_TOOL_CACHE", tool_cache_dir(workspace)),
@@ -813,6 +825,13 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string()
+                    } else if ref_type.eq_ignore_ascii_case("containerRegistry") {
+                        ref_val
+                            .get("image")
+                            .and_then(|value| value.as_str())
+                            .filter(|image| !image.is_empty())
+                            .map(|image| format!("docker://{image}"))
+                            .unwrap_or_default()
                     } else if repo_type.eq_ignore_ascii_case("selfRepository") {
                         // v2.336.0 $/ self-repository action reference
                         // (PipelineConstants.SelfRepositoryAlias).

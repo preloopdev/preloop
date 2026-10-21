@@ -5,6 +5,11 @@ name: golden-security-scan
 # most recent `golden-x86_64` artifact and fails on high/critical findings that
 # already have a fixed package. `--only-fixed` keeps "Ubuntu has not patched
 # it yet" out of the red build; those are tracked exceptions.
+#
+# The SBOM scan covers the CI-baked x86_64 golden only. The aarch64 golden is
+# baked on an Apple Silicon host and published straight to GHCR, so it has no
+# Actions artifact; its freshness is checked from the pack's own config
+# (`.created`) against the same `golden_max_age_days` policy.
 on:
   schedule:
     # 05:00 UTC daily, after the weekly official-golden drift job.
@@ -29,7 +34,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Find and age-check the newest golden
+      - name: Find and age-check the newest x86_64 golden
         id: golden
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -55,6 +60,32 @@ jobs:
             exit 1
           fi
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Age-check the newest arm64 golden
+        run: |
+          set -euo pipefail
+          max_age="$(awk -F'"' '/^golden_max_age_days = / { print $2; exit }' official-image.toml)"
+          test -n "$max_age"
+          repo="preloopdev/preloop-arm64-smolvm-golden"
+          tag="latest-linux-arm64"
+          token="$(curl -fsSL "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token // empty')"
+          test -n "$token"
+          manifest="$(curl -fsSL \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "https://ghcr.io/v2/${repo}/manifests/${tag}")"
+          config_digest="$(jq -r '.config.digest // empty' <<<"$manifest")"
+          test -n "$config_digest"
+          created="$(curl -fsSL \
+            -H "Authorization: Bearer ${token}" \
+            "https://ghcr.io/v2/${repo}/blobs/${config_digest}" | jq -r '.created // empty')"
+          test -n "$created"
+          age=$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))
+          echo "newest arm64 golden: ${created} (${age}d old, max ${max_age}d)"
+          if [ "$age" -gt "$max_age" ]; then
+            echo "::error::latest arm64 golden is ${age}d old, past the ${max_age}d maximum; bake and publish a fresh one"
+            exit 1
+          fi
 
       - name: Download baked SBOM
         env:

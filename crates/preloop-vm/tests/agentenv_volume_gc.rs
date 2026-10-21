@@ -17,7 +17,7 @@
 
 use preloop_vm::agentenv::gc::{self, Config, Mode, Request, StagedVolume, StagingRegistry};
 use preloop_vm::agentenv::{AgentEnvProvider, AgentEnvVolume};
-use preloop_vm::{MachineName, MachineSpec, NetworkPolicy, VmProvider, VolumeMount};
+use preloop_vm::{MachineName, MachineRole, MachineSpec, NetworkPolicy, VmProvider, VolumeMount};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -430,6 +430,9 @@ fn spec(name: &str, bundle: &Path) -> MachineSpec {
         sockets: Vec::new(),
         dns: None,
         rosetta: false,
+        role: MachineRole::Image,
+        guest_volumes: None,
+        workload_init: None,
     }
 }
 

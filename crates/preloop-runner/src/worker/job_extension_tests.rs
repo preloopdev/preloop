@@ -279,14 +279,14 @@ fn setup_workspace_derives_repo_layout_from_claim_repository() {
         let resolved = setup_workspace(&message).unwrap();
         let expected = std::env::current_dir()
             .unwrap()
-            .join("_work")
+            .join("work")
             .join(&repo)
             .join(&repo);
         assert_eq!(resolved, expected.to_string_lossy());
         assert!(resolved.contains(&repo));
-        let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("_work").join(&repo));
+        let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("work").join(&repo));
     }
-    let work_root = std::env::current_dir().unwrap().join("_work");
+    let work_root = std::env::current_dir().unwrap().join("work");
     for sibling in ["_temp", "_actions", "_tool"] {
         let _ = std::fs::remove_dir(work_root.join(sibling));
     }
@@ -494,6 +494,36 @@ fn build_step_list_parses_action_reference() {
     assert!(
         matches!(&result[0].step_type, StepType::Action { uses, .. } if uses == "actions/checkout@v4")
     );
+}
+
+#[test]
+fn container_registry_reference_selects_docker_action() {
+    let steps = [serde_json::json!({
+        "id": "container-step",
+        "reference": {
+            "type": "containerRegistry",
+            "image": "alpine:3.20"
+        }
+    })];
+    let result = build_step_list(&steps, &serde_json::json!({}));
+    assert!(
+        matches!(&result[0].step_type, StepType::Action { uses, .. } if uses == "docker://alpine:3.20"),
+        "containerRegistry must dispatch as a Docker action, not an empty repository reference"
+    );
+}
+
+#[test]
+fn malformed_container_reference_does_not_dispatch_an_empty_docker_image() {
+    for reference in [
+        serde_json::json!({"type": "containerRegistry"}),
+        serde_json::json!({"type": "containerRegistry", "image": null}),
+        serde_json::json!({"type": "containerRegistry", "image": 7}),
+        serde_json::json!({"type": "containerRegistry", "image": ""}),
+    ] {
+        let steps = [serde_json::json!({"id": "invalid-image", "reference": reference})];
+        let result = build_step_list(&steps, &serde_json::json!({}));
+        assert!(matches!(&result[0].step_type, StepType::Action { uses, .. } if uses.is_empty()));
+    }
 }
 
 #[test]

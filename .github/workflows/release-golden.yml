@@ -232,6 +232,14 @@ jobs:
           # copy off the host filesystem.
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
+          # The official base is a digest-pinned OCI reference, not the
+          # official-golden sentinel, so the bake cannot infer that this is
+          # the hosted runner image. Select its hosted policy explicitly:
+          # residue cleanup, cloud/snap/apt/systemd-sysctl masks, ping's
+          # capability, the resolved stub and GitHub's sysctls. Without this
+          # an official bake would silently preserve the base as a custom
+          # image.
+          export PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1
           export PRELOOP_RUNNER_STORAGE_GB="$GOLDEN_GUEST_GIB"
           export PRELOOP_RUNNER_OVERLAY_GB="$GOLDEN_GUEST_GIB"
           # The runner-large base archive is ~17 GiB uncompressed, over

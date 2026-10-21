@@ -71,7 +71,7 @@ Create the token right before you configure the runner. In the repository or org
 <Steps>
 <Step title="Configure the runner">
 
-Run `configure` from the directory the runner will live in. That directory is the runner root. It holds the runner's configuration, `_work/` for job workspaces, and `externals/` for Node.
+Run `configure` from the directory the runner will live in. That directory is the runner root. It holds the runner's configuration, `work/` for job workspaces, and `externals/` for Node.
 
 ```sh
 mkdir -p ~/actions-runner && cd ~/actions-runner
@@ -173,7 +173,7 @@ gh api --method POST /repos/OWNER/REPO/actions/runners/remove-token --jq .token
 preloop-runner remove --token <REMOVE_TOKEN>
 ```
 
-`remove` deregisters the runner and deletes `.runner`, `.credentials`, and `.credentials_rsaparams`. It leaves `_work/` and `externals/` in place, so delete those yourself. If the server cannot deregister the runner, `remove` warns and deletes the local files anyway; remove the runner in the repository or organization runner settings to clear the leftover registration.
+`remove` deregisters the runner and deletes `.runner`, `.credentials`, and `.credentials_rsaparams`. It leaves `work/` and `externals/` in place, so delete those yourself. If the server cannot deregister the runner, `remove` warns and deletes the local files anyway; remove the runner in the repository or organization runner settings to clear the leftover registration.
 
 ## Troubleshooting
 

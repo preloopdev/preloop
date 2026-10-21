@@ -935,22 +935,26 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     // to tell a controller which VM to open a shell into. The environment is
     // applied by the launcher shell that sources the image's
     // `/etc/environment`, so the argv is `sh -c <launcher>` followed by the
-    // `KEY=value` entries in the same order `env` receives them.
-    let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
+    // `KEY=value` entries in the same order `env` receives them. PATH is not
+    // one of those entries: the launcher exports the image's own PATH and only
+    // falls back to the pool's list when the image declares none.
+    let fallback = preloop_orchestrator::guest_runner_path(&config);
     let machine = format!("PRELOOP_MACHINE_NAME={runner}");
     let expected_prefix = vec![
         "sh".to_owned(),
         "-c".to_owned(),
         [
-            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "PATH=; ",
+            "if [ -r '/etc/environment' ]; then set -a; . '/etc/environment'; set +a; fi; ",
+            &format!("[ -n \"$PATH\" ] || PATH='{fallback}'; "),
+            "export PATH; ",
             "exec /usr/bin/env ",
-            &format!("'{path}' '{machine}' "),
+            &format!("'{machine}' "),
             "'PRELOOP_CONTROL_ORIGIN=https://preloop.example' ",
             "'PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock' ",
             "\"$0\" \"$@\"",
         ]
         .concat(),
-        path.clone(),
         machine.clone(),
         "PRELOOP_CONTROL_ORIGIN=https://preloop.example".to_owned(),
         "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock".to_owned(),
@@ -1076,13 +1080,13 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .map(String::as_str)
             .collect();
         let machine_name = format!("PRELOOP_MACHINE_NAME={runner}");
-        // The runner's fallback PATH is the system directories a hosted step
-        // shell sees; the launcher replaces it with the image's
-        // `/etc/environment` PATH whenever the image declares one. The deleted
-        // Rust/Go language installs (and their `/usr/local/cargo/bin` and
+        // PATH is the launcher's: it exports the image's `/etc/environment`
+        // PATH whenever the image declares one, and only falls back to the
+        // pool's system directories when it does not. The deleted Rust/Go
+        // language installs (and their `/usr/local/cargo/bin` and
         // `/usr/local/go/bin` entries) are gone.
-        let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
-        let mut entries = vec![path.clone(), machine_name.clone()];
+        let fallback = preloop_orchestrator::guest_runner_path(&config);
+        let mut entries = vec![machine_name.clone()];
         entries.extend(expected.iter().map(|entry| (*entry).to_owned()));
         let pairs = entries
             .iter()
@@ -1090,7 +1094,10 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .collect::<Vec<_>>()
             .join(" ");
         let launcher = [
-            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "PATH=; ",
+            "if [ -r '/etc/environment' ]; then set -a; . '/etc/environment'; set +a; fi; ",
+            &format!("[ -n \"$PATH\" ] || PATH='{fallback}'; "),
+            "export PATH; ",
             "exec /usr/bin/env ",
             &pairs,
             " \"$0\" \"$@\"",

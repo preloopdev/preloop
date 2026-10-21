@@ -3207,27 +3207,19 @@ fn runner_storage_gib() -> u32 {
         .filter(|value| *value > 0)
         .unwrap_or(RUNNER_STORAGE_GIB)
 }
-/// Guest DNS resolver. The host's `/etc/resolv.conf` is commonly a loopback
-/// systemd-resolved stub, which is unreachable from a microVM; use the
-/// operator override when supplied and otherwise a public resolver. The
-/// default must answer from any network — an ISP-scoped resolver (e.g.
-/// Comcast's 75.75.75.75) silently times out for guests on every other
-/// carrier, which is how image pulls die with `lookup … i/o timeout`.
-fn runner_dns() -> String {
-    std::env::var("PRELOOP_RUNNER_DNS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "8.8.8.8".to_owned())
+
+/// Only an operator override is explicit guest DNS. When unset, the provider
+/// selects its resolver for the actual network backend and workload.
+fn runner_dns_for(backend: VmBackend) -> Option<String> {
+    runner_dns_override(backend, std::env::var("PRELOOP_RUNNER_DNS").ok().as_deref())
 }
 
-/// The guest DNS resolver to request, if this backend takes one.
-///
-/// AgentENV sandboxes always use the node's resolver and refuse a per-sandbox
-/// `dns`, so the runner default is not sent to them: sending it fails every
-/// golden build and runner-pool start on that backend.
-fn runner_dns_for(backend: VmBackend) -> Option<String> {
+fn runner_dns_override(backend: VmBackend, configured: Option<&str>) -> Option<String> {
     match backend {
-        VmBackend::Smolvm => Some(runner_dns()),
+        VmBackend::Smolvm => configured
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
         VmBackend::Agentenv => None,
     }
 }
@@ -6174,9 +6166,17 @@ mod tests {
     use clap::error::ErrorKind;
 
     #[test]
-    fn runner_dns_is_requested_only_where_the_backend_can_honour_it() {
-        assert_eq!(runner_dns_for(VmBackend::Agentenv), None);
-        assert_eq!(runner_dns_for(VmBackend::Smolvm), Some(runner_dns()));
+    fn runner_dns_preserves_provider_choice_unless_explicitly_overridden() {
+        assert_eq!(runner_dns_override(VmBackend::Smolvm, None), None);
+        assert_eq!(runner_dns_override(VmBackend::Smolvm, Some("  ")), None);
+        assert_eq!(
+            runner_dns_override(VmBackend::Smolvm, Some(" 10.0.0.53 ")),
+            Some("10.0.0.53".into())
+        );
+        assert_eq!(
+            runner_dns_override(VmBackend::Agentenv, Some("10.0.0.53")),
+            None
+        );
     }
 
     fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {

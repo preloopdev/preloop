@@ -53,13 +53,34 @@ preloop build-golden \
   --output dist/acme-aarch64
 ```
 
-`PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` changes the keyless Sigstore identity match; `PRELOOP_BASE_IMAGE_PUBKEY` switches verification to a public key. The base-image verification checks a Cosign signature and SPDX attestation. A configured image is used as-is; add organization-wide packages to that image rather than expecting `build-golden` to install a package list.
+`PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` changes the keyless Sigstore identity match; `PRELOOP_BASE_IMAGE_PUBKEY` switches verification to a public key. The base-image verification checks a Cosign signature and SPDX attestation. A configured image is used as supplied plus the runner contract; add organization-wide packages to that image rather than expecting `build-golden` to install a package list.
+
+### Custom bases and hosted adaptation
+
+A custom base keeps `/etc/hosts` and `/etc/fstab` exactly as supplied. A bake does not guess which routable mapping or which not-yet-attached device is residue, because a custom image's `10.20.30.40 internal-api.example` alias or an `/etc/fstab` entry for a volume attached after boot is indistinguishable from stale cloud state by content alone.
+
+The policy also covers the rest of the hosted runner's image setup. A custom base keeps its own systemd units, including `systemd-sysctl.service` and any snap/cloud/apt timers it ships, so `/etc/sysctl.conf` and `/etc/sysctl.d` tuning still applies at boot. Its `ping` binary is not modified, its resolver file is not rewritten, and the per-machine init does not overwrite its sysctl keys. The minimal runner contract still applies: the runner account and ownership, the writable tool cache and environment entries, apt index refresh, KVM access, the glibc check, and hostname resolution.
+
+The official runner image is a captured Azure VM, so it is classified differently: its bake always applies the hosted policy — dropping the bake host's own `/etc/hosts` mapping, commenting out `/etc/fstab` entries whose device does not exist in that guest, masking the cloud/snap/apt and `systemd-sysctl` units, restoring `ping`'s capability, pinning systemd-resolved's upstream, pointing `/etc/resolv.conf` at the stub while keeping its nameservers and resolver directives, and applying GitHub's sysctls per machine. To apply the same policy to a custom base that is itself a cloud VM dump or is meant to take the hosted runner's setup, opt in:
+
+```sh
+PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1 preloop build-golden ...
+PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1 preloop serve
+```
+
+Only `1`, `true`, `yes`, or `on` enable it; empty, `0`, and `false` leave it off. Enabling it can delete an intentional routable `/etc/hosts` mapping, comment out an `/etc/fstab` device that is not present at bake time, disable the image's own sysctl service, and replace its resolver configuration. Use it only when the base is a cloud or builder image dump, not for an organization's hand-maintained image.
+
+The official release bakes (`official-golden.yml`, `release-golden.yml`, and `scripts/build-golden-x86_64.sh` with its default base) set the opt-in explicitly. They bake the pinned digest reference rather than the official-golden sentinel, so the policy cannot infer that the image is the official one from the name.
+
+The policy is part of a custom environment's fingerprint, so changing the opt-in rebuilds the custom golden instead of adopting one baked under the other policy.
 
 ## What the bake and guest setup provide
 
-The served pool defaults to the `runner` account (UID 1001), writable `_work`, `/opt/hostedtoolcache`, and the `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` environment entries. A bake attempts to write `/etc/preloop-bake.json`, checks for a glibc loader, and refreshes apt indexes when apt exists. The contract does not choose language toolchains; use setup actions or a job container.
+The served pool defaults to the `runner` account (UID 1001), writable `work`, `/opt/hostedtoolcache`, and the `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` environment entries. The launcher sources `/etc/environment` with exports and keeps the image's PATH (the pool's list is only the fallback when the image declares none). A bake writes `/etc/preloop-bake.json`, checks for a glibc loader, creates or updates the runner account and ownership, refreshes apt indexes when apt exists, and configures KVM access.
 
-At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stack limit with unlimited hard limit and 65536 soft/hard file descriptors. Per-machine initialization applies:
+On the official runner image, and on a custom base only with `PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE`, the bake also restores `ping`'s file capability, masks the hosted image's Azure/cloud/snap/apt units (including `systemd-sysctl.service`), writes `DNS=` to a `resolved.conf.d` drop-in only when neither `resolved.conf` nor a drop-in already sets it, and points `/etc/resolv.conf` at the resolved stub as a regular file. The resolver rewrite keeps the image's configured upstream nameservers, `search`/`domain` directives and compatible `options` (such as `ndots`), so short corporate names still resolve inside containers; a stub-only file gains the image's effective `DNS=` from `resolved.conf` and its drop-ins (an empty assignment resets the list, matching systemd-resolved), falling back to `1.1.1.1` only when no upstream is configured anywhere. A configured `DNS=` is never overwritten. The contract does not choose language toolchains; use setup actions or a job container.
+
+At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stack limit with unlimited hard limit and 65536 soft/hard file descriptors. On the official image (or a base opted into the Clean policy), per-machine initialization also applies:
 
 | Guest setting | Value |
 |---|---:|
@@ -67,7 +88,11 @@ At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stac
 | `fs.inotify.max_user_watches` | `655360` |
 | `fs.inotify.max_user_instances` | `1280` |
 
-The engine also verifies that the guest hostname resolves to a local address and removes stale foreign mappings. The guest does not expose `/dev/kvm`: workloads that need nested virtualization must run on a runner outside the microVM pool.
+The engine also verifies that the guest hostname resolves to a local address and removes stale mappings *of that hostname only*; unrelated aliases on the same line and other lines are kept. On the Clean policy it points `/etc/resolv.conf` at systemd-resolved's `127.0.0.53` stub while keeping the guest's configured upstream nameservers, search/domain and options, and re-applies it inside every runner launch — the SmolVM agent rewrites the file before each start and interactive run. That is what lets a container resolve a compose `/etc/hosts` alias such as `postgres.localhost`; no `daemon.json` `dns` entry is written, because a loopback address there becomes the container's own loopback. A guest that cannot publish a resolved stub keeps its resolver and logs why.
+
+A custom base under the Preserve policy runs only the hostname half of that init: its sysctl tuning and resolver file are its own policy, and the runner launch does not rewrite them. The hosted process limits still apply because they are per-process runner machinery.
+
+The official runner pack is built for a managed layout: a runtime machine from it runs `/sbin/init` as its workload, so the guest has systemd as PID 1 and Docker's `systemd` cgroup driver, and keeps `/var/lib/docker` and `/var/lib/containerd` on the machine's own storage disk so Docker uses `overlay2` rather than `fuse-overlayfs`. Those guest-local directories start empty; Preloop does not migrate state into them. A custom pack keeps its baked container state and its own entrypoint/cmd: no guest-local volume or workload override is applied by default, because those directories may hold the images the pack exists for. Opt in with `PRELOOP_SMOLVM_WORKLOAD_INIT`, `PRELOOP_SMOLVM_GUEST_VOLUMES`, or the machine spec. OCI-image machines and the golden builder are unaffected: the builder's writes must stay in the overlay `pack create` captures. The guest does not expose `/dev/kvm`: workloads that need nested virtualization must run on a runner outside the microVM pool.
 
 ## Runner bundle discovery
 

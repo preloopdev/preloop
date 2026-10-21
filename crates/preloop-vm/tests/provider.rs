@@ -27,8 +27,8 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 mod unix {
     use super::*;
     use preloop_vm::{
-        ExecOutput, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, SocketMount,
-        VmProvider, VolumeMount,
+        ExecOutput, GuestVolume, MachineRole, MachineSpec, MachineState, NetworkPolicy,
+        SmolVmProvider, SocketMount, VmProvider, VolumeMount,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -183,6 +183,9 @@ esac
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
         }
     }
 
@@ -250,6 +253,9 @@ exit 0
                 guest: PathBuf::from("/run/preloop-engine.sock"),
             }],
             rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
         };
 
         SmolVmProvider::new(&executable)
@@ -707,6 +713,294 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
         assert!(
             args.windows(2).any(|pair| pair == ["--net-backend", "tsi"]),
             "the override must reach create's command line: {args:?}"
+        );
+    }
+
+    /// The official runner pack's layout is known, so a runtime machine from
+    /// it opts into the guest-local runtime state directories and the systemd
+    /// workload; both are what the guest's docker needs to run overlay2 under
+    /// the systemd cgroup driver.
+    #[tokio::test]
+    async fn official_pack_machines_get_guest_volumes_and_the_systemd_workload() {
+        let (directory, executable) = fake_smolvm();
+        let pack = directory
+            .path()
+            .join("preloop-ubuntu-24.04-x86_64.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("runner-0").unwrap());
+        spec.image = pack.display().to_string();
+        spec.network = NetworkPolicy::PublicOnly;
+        spec.role = MachineRole::OfficialPack;
+        spec.guest_volumes = None;
+        spec.workload_init = None;
+
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+
+        let args = captured_args(&executable);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--from", spec.image.as_str()])
+                && args
+                    .windows(2)
+                    .any(|pair| pair == ["--volume", "/var/lib/docker"])
+                && args
+                    .windows(2)
+                    .any(|pair| pair == ["--volume", "/var/lib/containerd"]),
+            "{args:?}"
+        );
+        // The workload block is last: everything after `--` is the workload.
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("a workload block");
+        assert_eq!(&args[separator + 1..], ["/sbin/init"], "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_systemd_pack_uses_the_tsi_stub_without_a_backend_override() {
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("official.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("unrestricted-systemd").unwrap());
+        spec.image = pack.display().to_string();
+        spec.role = MachineRole::OfficialPack;
+        spec.network = NetworkPolicy::Unrestricted;
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+        let args = captured_args(&executable);
+        assert!(!args.iter().any(|arg| arg == "--net-backend"));
+        assert!(
+            args.windows(2).any(|pair| pair == ["--dns", "127.0.0.53"]),
+            "{args:?}"
+        );
+    }
+
+    /// An arbitrary workload override does not make the guest a systemd host.
+    /// A shell that never starts `systemd-resolved` must keep the resolver
+    /// smolvm would configure instead of being pointed at a stub nothing
+    /// answers on.
+    #[tokio::test]
+    async fn a_custom_workload_without_systemd_gets_no_stub_resolver() {
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("acme.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("acme-shell").unwrap());
+        spec.image = pack.display().to_string();
+        spec.role = MachineRole::CustomPack;
+        spec.network = NetworkPolicy::Unrestricted;
+        spec.workload_init = Some(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "sleep infinity".to_owned(),
+        ]);
+
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+
+        let args = captured_args(&executable);
+        assert!(
+            args.windows(2).any(|pair| pair == ["--", "/bin/sh"]),
+            "the explicit workload must still be passed: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--dns"),
+            "a non-systemd workload has nothing answering on the stub: {args:?}"
+        );
+    }
+
+    /// A custom pack is the operator's data. Its `/var/lib/docker` may hold
+    /// the preloaded images the pack exists for, so no default guest-local
+    /// volume may be mounted over it, and its own entrypoint/cmd is what runs
+    /// unless the operator names a workload. Only explicit opt-ins (the spec
+    /// or the host override) add either.
+    #[tokio::test]
+    async fn custom_pack_machines_keep_their_packed_container_state() {
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("acme.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("acme-golden").unwrap());
+        spec.image = pack.display().to_string();
+        spec.network = NetworkPolicy::PublicOnly;
+        spec.role = MachineRole::CustomPack;
+        spec.guest_volumes = None;
+        spec.workload_init = None;
+
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+
+        let args = captured_args(&executable);
+        assert!(
+            !args.iter().any(|arg| arg == "--volume"),
+            "a custom pack must not get default guest volumes: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--"),
+            "a custom pack keeps its own entrypoint/cmd: {args:?}"
+        );
+
+        // An explicit list is the opt-in for a custom pack that wants the
+        // guest-local layout anyway.
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("acme.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("acme-golden").unwrap());
+        spec.image = pack.display().to_string();
+        spec.role = MachineRole::CustomPack;
+        spec.guest_volumes = Some(vec![GuestVolume::new("/srv/state").unwrap()]);
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+        let args = captured_args(&executable);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--volume", "/srv/state"]),
+            "{args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--volume", "/var/lib/docker"]),
+            "the explicit list replaces the default, it does not add to it: {args:?}"
+        );
+    }
+
+    /// A pack builder's root filesystem is about to be exported. Container
+    /// state on a guest-local volume lives on the storage disk, which
+    /// `pack create` does not capture, so the builder must never receive the
+    /// default mounts (or a workload that rewrites the state it exports).
+    #[tokio::test]
+    async fn pack_builders_do_not_obscure_the_state_they_export() {
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("acme.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("acme-builder").unwrap());
+        spec.image = pack.display().to_string();
+        spec.role = MachineRole::Builder;
+        spec.guest_volumes = None;
+        spec.workload_init = None;
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+
+        let args = captured_args(&executable);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--from", spec.image.as_str()]),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--volume"),
+            "a builder must keep its source container state visible: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--"),
+            "a builder keeps the pack's own workload: {args:?}"
+        );
+    }
+
+    /// Explicit spec values are the caller's deliberate choice: they are
+    /// honoured on any role, and `Some([])` is the explicit disable rather
+    /// than "use the default".
+    #[tokio::test]
+    async fn explicit_guest_volumes_disable_or_name_the_list_on_any_role() {
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("official.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("runner-0").unwrap());
+        spec.image = pack.display().to_string();
+        spec.role = MachineRole::OfficialPack;
+        spec.guest_volumes = Some(Vec::new());
+        spec.workload_init = Some(Vec::new());
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+        let args = captured_args(&executable);
+        assert!(!args.iter().any(|arg| arg == "--volume"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--"), "{args:?}");
+
+        let (_directory, executable) = fake_smolvm();
+        let mut spec = valid_spec(MachineName::new("runner-0").unwrap());
+        spec.guest_volumes = Some(vec![GuestVolume::new("/srv/state").unwrap()]);
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+        let args = captured_args(&executable);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--volume", "/srv/state"]),
+            "{args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--volume", "/var/lib/docker"]),
+            "an explicit list replaces the built-in default: {args:?}"
+        );
+
+        // A custom pack likewise keeps its own entrypoint unless the spec
+        // names a workload, and then exactly that command runs.
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("acme.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("acme-golden").unwrap());
+        spec.image = pack.display().to_string();
+        spec.role = MachineRole::CustomPack;
+        spec.workload_init = Some(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "sleep 1".to_owned(),
+        ]);
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+        let args = captured_args(&executable);
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("the explicit workload must be passed");
+        assert_eq!(
+            &args[separator + 1..],
+            ["/bin/sh", "-c", "sleep 1"],
+            "{args:?}"
+        );
+    }
+
+    /// The pack workload override is pack-only: an image machine still boots
+    /// its own entrypoint/keep-alive and never gains a trailing `--` block.
+    #[tokio::test]
+    async fn image_machines_ignore_the_pack_workload_override() {
+        let (_directory, executable) = fake_smolvm();
+        let mut spec = valid_spec(MachineName::new("builder-0").unwrap());
+        spec.workload_init = Some(vec!["/sbin/init".to_owned()]);
+        // An explicit guest volume is honoured wherever it is asked for; the
+        // role only gates the built-in default set.
+        spec.guest_volumes = Some(vec![GuestVolume::new("/var/lib/docker").unwrap()]);
+
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+
+        let args = captured_args(&executable);
+        assert!(!args.iter().any(|arg| arg == "--"), "{args:?}");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--volume", "/var/lib/docker"]),
+            "{args:?}"
         );
     }
 

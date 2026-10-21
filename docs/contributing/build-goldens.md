@@ -102,6 +102,11 @@ cargo build --release -p preloop-runner \
 
 export PRELOOP_HOME="$HOME/golden-bake/preloop-home"
 export PRELOOP_REQUIRE_BASE_DIGEST=1
+# This is the official runner image, but it is named by a local archive or a
+# digest, not the official-golden sentinel: select the hosted policy
+# explicitly so the bake still performs residue cleanup, masks the hosted
+# units, restores ping, and installs the resolver/sysctl adaptation.
+export PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1
 export PRELOOP_RUNNER_BASE_IMAGE="$HOME/golden-bake/runner-images.tar"
 export PRELOOP_RUNNER_STORAGE_GB=200
 export PRELOOP_RUNNER_OVERLAY_GB=200
@@ -120,7 +125,10 @@ sha256sum dist/preloop-ubuntu-24.04-x86_64 \
 `build-golden` bakes the image it is given: `--base-image <ref>` (or the
 configured `PRELOOP_RUNNER_BASE_IMAGE` / `[golden] base_image` when the flag is
 absent). There is no default — the official golden is published packed and
-cannot be built locally. The bake adds the runner contract only; see
+cannot be built locally. The bake adds the runner contract plus, when
+`PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1` selects the hosted policy, the hosted
+image's residue cleanup, unit masks, `ping` capability, resolver setup and
+per-machine sysctls; see
 [VM images](../control-plane/operate/vm-images.mdx#what-the-bake-and-guest-setup-provide).
 
 `build-golden` renames the `.smolmachine` sidecar to the requested output

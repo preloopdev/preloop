@@ -9,7 +9,15 @@ cd "$(dirname "$0")/.."
 # The official golden is baked from the digest-pinned official runner image.
 # There is no stock-Ubuntu default: `build-golden` needs the image it bakes,
 # and this script bakes — it never fetches the published packed golden.
-BASE_IMAGE="${BASE_IMAGE:-$(awk -F'"' '/^official_runner_image_base_amd64 = / { print $2; exit }' official-image.toml)}"
+if [ -z "${BASE_IMAGE:-}" ]; then
+  BASE_IMAGE="$(awk -F'"' '/^official_runner_image_base_amd64 = / { print $2; exit }' official-image.toml)"
+  # The pinned reference is a digest, not the official-golden sentinel, so the
+  # bake cannot infer that this is the hosted runner image. This script's
+  # default is the official base: select its hosted policy explicitly. An
+  # explicit BASE_IMAGE is an operator-supplied custom base and keeps the
+  # Preserve default unless the operator opts in themselves.
+  export PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE="${PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE:-1}"
+fi
 test -n "$BASE_IMAGE" || { echo "official_runner_image_base_amd64 missing from official-image.toml" >&2; exit 1; }
 
 echo "==> Building host CLI (release)"

@@ -33,16 +33,6 @@ Releases before v0.27.0 predate the changelog.
   origin, and the `golden` subsystem now reports the bytes it moved rather than
   zero.
 
-- **A successful webhook upload can no longer time out on its own completion.**
-  The upload gate coalesced progress reports onto a one-slot channel, so a tiny
-  body that delivered its last frame and its completion before the middleware
-  looked could lose the completion and be cut off with a spurious 408 under
-  load. The body now reports its phase over a `watch` channel, which holds one
-  value: a burst of one-byte frames is coalesced rather than queued, the
-  completion always replaces the last progress report instead of waiting
-  behind it, and a request dropped before its body is read still reports
-  completion through the closed channel.
-
 - **Snapshot capture is bounded end to end, and the shared object cache has a
   ceiling.** One run's merge attach, local workspace capture, or remote
   checkout fetch now runs under a single 90-minute backstop; on expiry only
@@ -153,6 +143,92 @@ Releases before v0.27.0 predate the changelog.
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
   rejected the retried job's otherwise valid runtime token with HTTP 403.
+- **Direct Docker actions retain their image reference.** Job messages carrying
+  a `containerRegistry` reference now select the `docker://` action handler
+  instead of being reconstructed as an empty remote-action reference.
+- **Guest DNS follows the selected network backend unless explicitly overridden.**
+  Unset `PRELOOP_RUNNER_DNS` no longer forces a public resolver over provider
+  defaults; unrestricted TSI systemd launches select the resolved stub.
+- **Container DNS reaches systemd-resolved's stub, so `/etc/hosts` aliases
+  resolve inside a compose network.** A GitHub-hosted runner's container
+  resolves a `postgres.localhost`-style service alias because its host's
+  `/etc/resolv.conf` names `127.0.0.53`; a preloop guest named its own resolver
+  (`75.75.75.75` on AgentENV, `100.96.0.1` on SmolVM), so Docker handed the
+  container that address as its only external server and the name came back
+  NXDOMAIN. The golden now points the resolver file at the stub, and the engine
+  re-applies it per machine and again inside every runner launch, because the
+  SmolVM agent rewrites the file at each start and before each interactive run.
+  The guest's configured upstream nameservers are kept as additional lines, and
+  the runtime step waits (bounded, 30 s) for systemd-resolved to publish the
+  stub on a freshly resumed guest; no `daemon.json` `dns` override is written,
+  since a loopback address there becomes the container's own loopback and every
+  lookup fails. A guest with no resolved stub keeps its resolver and logs why.
+- **Official-pack guests get managed systemd and ext4 container state.**
+  A runtime machine from the official pack runs `/sbin/init` as the workload,
+  which gives the guest `systemctl`, `journald`, `systemd-resolved` and
+  Docker's `systemd` cgroup driver, and mounts `/var/lib/docker` and
+  `/var/lib/containerd` on the machine's own storage disk so Docker picks
+  `overlay2` instead of degrading to `fuse-overlayfs`. Those guest-local
+  directories start empty; nothing migrates existing state into them. A custom
+  pack keeps its baked container state and its own entrypoint/cmd unless
+  `PRELOOP_SMOLVM_WORKLOAD_INIT`, `PRELOOP_SMOLVM_GUEST_VOLUMES`, or an
+  explicit machine list opts in (an empty value disables the managed default).
+  The golden builder is never given guest-local volumes or a replaced
+  workload: its container state must stay in the overlay `pack create`
+  captures. The resolved launch settings are part of the golden identity, so
+  changing either override rebuilds or re-unpacks the golden instead of
+  adopting one with the previous PID 1 or mounts.
+- **The runner sees the image's whole environment, not just its PATH.** The
+  guest launcher sourced `/etc/environment` without `set -a`, so entries such
+  as `ImageOS`, `ImageVersion`, `JAVA_HOME*`, `LANG` and `DEBIAN_FRONTEND`
+  stayed shell-local and the `exec env` dropped them (measured: ~60 fewer
+  variables than hosted, and `setup-*` actions could not find the tool cache).
+  It also replaced the image's PATH with the engine fallback, making
+  `/opt/pipx_bin`, `~/.local/bin` and `/usr/local/.ghcup/bin` unreachable while
+  those tools were installed. The launcher now exports the sourced entries and
+  keeps the image's PATH, using the fallback only when the image declares none.
+- **Guest parity residue from the runner image is cleaned at bake time, and
+  custom bases keep their own policy.** `ping` gets `cap_net_raw+ep` back (an
+  OCI layer carries no file capabilities), the official golden's bake host
+  `/etc/hosts` mapping is dropped, and `/etc/fstab` entries naming Azure disks
+  this guest does not have are commented out with their original text, so
+  `systemd-remount-fs.service` no longer fails on every boot. Systemd guests
+  also get `systemd-resolved`'s upstream pinned through a
+  `resolved.conf.d` drop-in (an image's own `DNS=`, in `resolved.conf` or a
+  drop-in, is never touched)
+  and the Azure/cloud-init/snap/apt units the hosted image never runs masked.
+  A user-provided base now preserves all of that policy by default: its
+  `/etc/hosts` and `/etc/fstab` stay unchanged, its `systemd-sysctl.service`
+  and snap/apt units stay enabled (so its `/etc/sysctl.conf` and
+  `/etc/sysctl.d` tuning still applies), its `ping` is not modified, and its
+  resolver and per-machine sysctl values are not rewritten.
+  `PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1` opts a custom base into the whole
+  hosted policy when that base is itself a cloud image dump. Official release
+  bakes set it explicitly because their base is a digest-pinned reference,
+  not the official-golden sentinel.
+- **Resolver rewrites keep `search`, `domain` and compatible options.** The
+  bake and per-machine steps used to replace `/etc/resolv.conf` with only the
+  stub, one upstream and a fixed `options edns0 trust-ad` line, so a short
+  corporate name that depended on `search corp.example` or on `ndots` stopped
+  resolving in guest steps and containers. Both paths now keep every
+  configured upstream nameserver, all `search`/`domain` directives and the
+  image's options (adding the hosted defaults only when absent), and remain
+  idempotent. When the file carries only the stub, the fallback upstream comes
+  from the effective `DNS=` in `resolved.conf` and its sorted drop-ins —
+  non-empty assignments append and an empty assignment clears the list, as in
+  systemd-resolved — so an internal resolver is used instead of `1.1.1.1`;
+  the public fallback remains only when no upstream is configured anywhere.
+  The write is still atomic and replaces a symlinked file with a regular one,
+  and the per-machine application follows the base's policy: only the
+  official or explicitly opted-in hosted policy rewrites it.
+- **The job workspace uses the hosted `work` folder.** A job's checkout now
+  lands at `<runner-root>/work/<repo>/<repo>` and `RUNNER_WORKSPACE` is
+  exported; `_work` is the official runner's self-hosted default, and workflows
+  that branch on the path or look for a sibling checkout saw the wrong shape.
+- **The per-machine runtime init's reports reach the engine log.** Each half
+  exits 0 whether it applied its change or skipped it, so a silently skipped
+  resolver rewrite was invisible in the journal; every non-empty output line is
+  now logged with the machine name.
 - **`github.token` and `GITHUB_TOKEN` populate on github.com registrations**
   (#626): `preloop-runner configure` now records which control plane the
   runner registered against (`.runner` `controlPlane`, derived from the

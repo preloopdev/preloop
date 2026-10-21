@@ -22,7 +22,7 @@ These flags apply to every command.
 
 | Flag | Default | Description | Official runner |
 |---|---|---|---|
-| `--runner-root <DIR>` | Current directory | Directory for the configuration files, `_work/`, and `externals/`. | None |
+| `--runner-root <DIR>` | Current directory | Directory for the configuration files, `work/`, and `externals/`. | None |
 | `--ca-bundle <FILE>` | Unset. Falls back to `SSL_CERT_FILE`. | PEM file of extra CA certificates for HTTPS requests. | None |
 
 ## configure
@@ -57,7 +57,7 @@ For a control-plane-managed runner, add labels with `PRELOOP_RUNNER_LABELS`;
 for this standalone runner, pass them to `configure --labels`.
 
 - `--runner-group` is stored in the runner's settings; it does not change the pool registration targets.
-- `--work` is saved in `.runner`, but job workspaces are always created under `_work/` in the runner root. Changing this value does not move them.
+- `--work` is saved in `.runner`, but job workspaces are always created under `work/<repo>/<repo>/` in the runner root, matching the GitHub-hosted layout. Changing this value does not move them.
 - With `--no-externals`, JavaScript actions use the `node` found on `PATH`. Its major version must match the action's Node version, or the action fails.
 
 ## run
@@ -76,7 +76,7 @@ for this standalone runner, pass them to `configure --labels`.
 |---|---|---|---|
 | `--token <TOKEN>` | Required | Remove token from GitHub. | `config.sh remove --token` |
 
-`remove` deregisters the runner with the server, then deletes `.runner`, `.credentials`, and `.credentials_rsaparams`. It leaves `_work/` and `externals/` in place. If the server cannot deregister the runner, it warns and deletes the local files anyway, so remove the runner in the repository or organization settings as well.
+`remove` deregisters the runner with the server, then deletes `.runner`, `.credentials`, and `.credentials_rsaparams`. It leaves `work/` and `externals/` in place. If the server cannot deregister the runner, it warns and deletes the local files anyway, so remove the runner in the repository or organization settings as well.
 
 ## lint
 
@@ -144,8 +144,8 @@ These variables are used by Preloop-managed runners and are not needed for a nor
 | `.credentials` | `configure` | OAuth client ID and authorization URL. |
 | `.credentials_rsaparams` | `configure` | RSA private key the runner uses to request access tokens. |
 | `externals/node20`, `externals/node24` | `configure` | Node runtimes for JavaScript actions. |
-| `_work/` | Jobs | Job workspaces, downloaded actions, and temporary files. |
-| `_work/_tool` | Jobs | Tool cache. The runner uses `/opt/hostedtoolcache` instead when that directory exists and is writable. |
+| `work/` | Jobs | Job workspaces (`work/<repo>/<repo>/`), downloaded actions, and temporary files. |
+| `work/_tool` | Jobs | Tool cache. The runner uses `/opt/hostedtoolcache` instead when that directory exists and is writable. |
 
 The configuration files are created with `0600` permissions. Treat them as secrets. Anyone with `.credentials_rsaparams` can request access tokens as this runner.
 
