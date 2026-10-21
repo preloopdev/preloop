@@ -239,8 +239,12 @@ pub async fn oidc_token(
         job_workflow_sha,
     };
 
+    // An empty `?audience=` is the caller asking for no audience in
+    // particular; minting `aud: ""` would produce a token no relying party
+    // accepts, so treat it as absent and use the default.
     let audience = query
         .audience
+        .filter(|audience| !audience.is_empty())
         .unwrap_or_else(|| oidc::default_audience(&claims_input.repository_owner));
 
     let now = SystemTime::now()
@@ -253,9 +257,12 @@ pub async fn oidc_token(
         claims["check_run_id"] = json!(check_run_id.to_string());
     }
 
-    let jwt = oidc_kp
-        .sign_jwt(&claims)
-        .map_err(|e| ApiError::internal(format!("OIDC token signing failed: {e}")))?;
+    let jwt = oidc_kp.sign_jwt(&claims).map_err(|error| {
+        // The crypto error detail goes to the server log, not the caller:
+        // internal error strings are rendered verbatim in the response.
+        tracing::error!(%error, "OIDC token signing failed");
+        ApiError::internal("OIDC token signing failed")
+    })?;
 
     // The id_token is a bearer credential: a step that echoes it into the job
     // log discloses it just as surely as a raw secret value. Register it into
@@ -263,8 +270,21 @@ pub async fn oidc_token(
     // handler — once the job can see the token, every mask pass over its log
     // output (AzDO appends, live-feed batches, persisted log uploads) already
     // redacts it.
-    crate::timeline_logs::register_runtime_mask_value(&shared, &plan_id, &run_id.to_string(), &jwt)
-        .await;
+    //
+    // The scope must be the token's canonical plan, not the raw path
+    // segment: authorization also accepts the orchestration spelling
+    // (`{plan}.{job}.__default`), but log storage and every mask reader key
+    // on the canonical plan — registering under the path spelling names a
+    // scope no reader resolves, and the token would leak unmasked into the
+    // job's retained logs (the rule `results_storage_plan_id` documents).
+    let mask_plan_id = crate::auth::results_storage_plan_id(&identity, &plan_id);
+    crate::timeline_logs::register_runtime_mask_value(
+        &shared,
+        &mask_plan_id,
+        &run_id.to_string(),
+        &jwt,
+    )
+    .await;
 
     Ok(Json(OidcTokenResponse { value: jwt }))
 }
@@ -532,6 +552,144 @@ mod tests {
             persisted, "log ***\n",
             "the persisted log must redact the id_token"
         );
+    }
+
+    impl OidcJob {
+        /// GET an arbitrary OIDC mint URI with this job's runtime token.
+        async fn mint_uri(&self, uri: String) -> axum::response::Response {
+            self.send(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", self.runtime_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+
+        /// Settle the job the way the runner's final event post does.
+        async fn settle(&self) {
+            let response = self
+                .send(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/_apis/v1/plans/{}/events", self.plan_id))
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", self.runtime_token),
+                        )
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "jobId": self.agent_job_id.to_string(),
+                                "result": "succeeded"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await;
+            assert!(
+                response.status().is_success(),
+                "settling the job must succeed: {}",
+                response.status()
+            );
+        }
+    }
+
+    fn decode_claims(jwt: &str) -> serde_json::Value {
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "a JWS compact token has three parts");
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            parts[1],
+        )
+        .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The runner may address its job with the orchestration spelling of the
+    /// plan (`{plan}.{job}.__default`), which authorization accepts. The
+    /// minted token's mask registration must still land under the canonical
+    /// plan, or the token leaks unmasked into the job's retained logs.
+    #[tokio::test]
+    async fn mint_via_orchestration_plan_spelling_still_masks_the_token() {
+        let job = OidcJob::submit().await;
+        let log_id = job.create_log().await;
+        job.append(log_id, "warmup\n").await;
+
+        let response = job
+            .mint_uri(format!(
+                "/runner/server/_apis/distributedtask/hubs/actions/plans/{}.{}.__default/jobs/{}/oidctoken?audience=api://mask-test",
+                job.plan_id, job.agent_job_id, job.agent_job_id
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "the mint must succeed");
+        let jwt = json_body(response).await["value"]
+            .as_str()
+            .expect("the mint response carries the token")
+            .to_owned();
+
+        job.append(log_id, &format!("echo {jwt}\n")).await;
+        assert_eq!(
+            job.streamed_log(log_id).await,
+            "warmup\necho ***\n",
+            "a token minted via the orchestration plan spelling must be masked in the job's logs"
+        );
+    }
+
+    /// The AzDO run-service spelling (`/{orchestration}//idtoken/{plan}/{job}`)
+    /// must route, mint for a live granted job, and deny a settled one.
+    #[tokio::test]
+    async fn run_service_route_mints_and_honors_liveness() {
+        let job = OidcJob::submit().await;
+        let uri = format!(
+            "/orch-1//idtoken/{}/{}?audience=api://svc",
+            job.plan_id, job.agent_job_id
+        );
+        let response = job.mint_uri(uri.clone()).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the run-service route must mint for a live granted job"
+        );
+        let jwt = json_body(response).await["value"]
+            .as_str()
+            .expect("the mint response carries the token")
+            .to_owned();
+        assert_eq!(decode_claims(&jwt)["aud"], "api://svc");
+
+        job.settle().await;
+        let response = job.mint_uri(uri).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a settled job must not mint via the run-service route"
+        );
+    }
+
+    /// An empty `?audience=` is the caller asking for no audience in
+    /// particular: it must fall back to the default audience, not mint a
+    /// token whose `aud` is the empty string.
+    #[tokio::test]
+    async fn empty_audience_falls_back_to_default() {
+        let job = OidcJob::submit().await;
+        let response = job
+            .mint_uri(format!(
+                "/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?audience=",
+                job.plan_id, job.agent_job_id
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let jwt = json_body(response).await["value"]
+            .as_str()
+            .expect("the mint response carries the token")
+            .to_owned();
+        assert_eq!(decode_claims(&jwt)["aud"], "https://github.com/owner");
     }
 
     /// Registering the id_token must widen the mask scope, not blanket it:
