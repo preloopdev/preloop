@@ -96,7 +96,9 @@ are the service's.
 ## Security model
 
 * Data-plane tickets are single-use, scoped to one sandbox and direction, and
-  short-lived; the URL carries its own token.
+  short-lived. `OpenStream` returns the stream URL and a separate `token`; the
+  caller sends it as `Authorization: Bearer <token>` on the upload or download,
+  so the URL alone is not enough.
 * `Report`/`ReportExec`/`Reconcile` are fenced by the provider's registration
   generation, and a provider may not report output for another provider's
   exec, nor destroy another provider's machine.
@@ -139,7 +141,8 @@ and debug-hold strategy; the machines under it are sandboxes.
 ```sh
 preloop sandbox serve --listen 0.0.0.0:9191            # standalone service (+ local SmolVM)
 preloop sandbox agent --service http://hub:9191        # join as a provider
-preloop sandbox template put --name alpine --image alpine:3.20
+# <digest> is a placeholder: substitute the image's real sha256 digest.
+preloop sandbox template put --name alpine --image alpine:3.20@sha256:<digest>
 preloop sandbox pool put --name alpine --template alpine --warm 2
 preloop sandbox acquire --pool alpine --env JOB=1      # → lease + sandbox JSON
 preloop sandbox exec sbx-… -- uname -a

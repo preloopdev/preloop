@@ -302,8 +302,10 @@ impl Service {
                 provider.id.clone(),
                 ProviderRec {
                     provider,
-                    // Restored providers must re-register (bumping their
-                    // generation) before they are placed on.
+                    // Restored providers keep their persisted generation, so
+                    // their agents need not re-register. Placement skips a
+                    // restored provider until its next heartbeat or poll
+                    // refreshes `seen`.
                     seen: Instant::now() - config.provider_timeout * 2,
                     queue: VecDeque::new(),
                     wake: Arc::new(Notify::new()),

@@ -22,7 +22,7 @@ digraph system_overview {
   subgraph cluster_pool {
     label="MicroVM pool"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
     pool [label="Runner pool (preloop-orchestrator)\non-demand forks or warm slots\ngolden cache, host memory cap", fillcolor="#fef3c7"];
-    provider [label="VmProvider (preloop-vm)\nSmolVM default; AgentENV opt-in\nPRELOOP_VM_BACKEND", fillcolor="#fef3c7"];
+    provider [label="VmProvider (preloop-sandbox)\nSmolVM (public driver)", fillcolor="#fef3c7"];
     vm [label="microVM per job\nCoW fork of the golden\nguest preloop-runner", fillcolor="#fef3c7"];
     { rank=same; pool; provider; vm; }
   }
