@@ -546,7 +546,10 @@ CREATE TABLE webhook_deliveries (
     lease_until             INTEGER,
     lease_token             TEXT,
     last_error              TEXT
-);
+    -- Added by V2026102001. SQLite stores an ALTER-added trailing column by
+    -- appending `, signer_app_id TEXT` directly before the original `)`, so
+    -- this fresh DDL mirrors that stored text for the migration parity test.
+, signer_app_id             TEXT);
 CREATE INDEX webhook_deliveries_claim ON webhook_deliveries(received_at)
     WHERE state IN ('received','processing');
 CREATE INDEX webhook_deliveries_prune ON webhook_deliveries(received_at)
