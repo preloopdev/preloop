@@ -1784,6 +1784,39 @@ pub fn expand_deferred_matrix_job(
     Ok(plans)
 }
 
+/// Cap deferred-matrix legs at the authority of the deferred node's own
+/// stored plan.
+///
+/// A job inside a reusable callee is first materialized as one deferred
+/// placeholder plan, and `expand_reusable_call` caps that placeholder at the
+/// caller: the OIDC grant is ANDed with the caller's and the token
+/// permissions are intersected with the caller's. The runtime fan-out
+/// (`expand_deferred_matrix_job`) re-derives each leg from the callee
+/// workflow alone, so without this cap a leg would mint OIDC tokens and
+/// carry token permissions the caller never granted. Legs also inherit the
+/// node's reusable-workflow ref/sha, which the fan-out cannot know.
+///
+/// A top-level deferred node has no caller; its stored plan carries its own
+/// declared authority and the cap is a no-op for it (callers pass `None` and
+/// skip this entirely when no plan was stored).
+pub fn cap_deferred_matrix_plans(plans: &mut [JobPlan], base: &JobPlan) {
+    for plan in plans.iter_mut() {
+        plan.oidc_id_token_granted &= base.oidc_id_token_granted;
+        plan.permissions = Some(intersect_permissions(
+            plan.permissions.as_ref(),
+            base.permissions.as_ref(),
+        ));
+        if plan.oidc_job_workflow_ref.is_none() {
+            plan.oidc_job_workflow_ref = base.oidc_job_workflow_ref.clone();
+        }
+        // The OIDC `job_workflow_sha` claim derives from the plan's
+        // `workflow_sha`; the fan-out leaves it unset for callee legs.
+        if plan.workflow_sha.is_none() {
+            plan.workflow_sha = base.workflow_sha.clone();
+        }
+    }
+}
+
 /// Strip the reusable-caller prefix from a runtime job key, recovering the
 /// callee-local id that the called workflow's own expressions and job map
 /// use. Run ids keep their prefix; only workflow lookups and `needs` context

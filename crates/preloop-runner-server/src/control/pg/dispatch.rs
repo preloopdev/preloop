@@ -7195,6 +7195,7 @@ fn expansion_plan(graph: &RunGraph, job: &QueuedJob) -> Option<ExpansionPlan> {
         needs_outputs,
         workflow_file,
         scoped_inputs,
+        base_plan: stored_plan.cloned(),
     })))
 }
 

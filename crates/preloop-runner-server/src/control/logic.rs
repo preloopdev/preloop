@@ -2157,6 +2157,13 @@ pub(crate) struct MatrixExpansionInputs {
     /// `inputs.dry_run` gets the caller's `with` value even on a
     /// push-triggered run whose dispatch map is empty.
     pub(crate) scoped_inputs: BTreeMap<String, serde_json::Value>,
+    /// The deferred node's own stored plan, present only for a node inside a
+    /// reusable callee (the expansion pass stores it alongside the node). It
+    /// already carries the caller's authority caps from
+    /// `expand_reusable_call` (OIDC grant ANDed, token permissions
+    /// intersected); the fan-out legs are capped at it so re-deriving them
+    /// from the callee workflow cannot widen what the caller granted.
+    pub(crate) base_plan: Option<preloop_gha_protocol::JobPlan>,
 }
 
 pub(crate) enum ExpansionPlan {
@@ -2392,6 +2399,7 @@ fn build_matrix_expansion(
         needs_outputs,
         workflow_file,
         scoped_inputs,
+        base_plan,
     } = inputs;
     let run_id = ctx.run_id;
     let workflow_yaml = workflow_file
@@ -2403,7 +2411,7 @@ fn build_matrix_expansion(
         tracing::warn!(%run_id, job = %node_id, %error, "workflow re-parse failed for dynamic matrix");
         ExecutionStatus::Failure
     })?;
-    let plans = preloop_gha_parser::expand_deferred_matrix_job(
+    let mut plans = preloop_gha_parser::expand_deferred_matrix_job(
         &workflow,
         &base_id,
         &expression,
@@ -2420,6 +2428,13 @@ fn build_matrix_expansion(
         tracing::warn!(%run_id, job = %node_id, %error, "dynamic matrix expansion failed");
         ExecutionStatus::Failure
     })?;
+    // A node inside a reusable callee was capped at its caller when the
+    // callee subtree was expanded; the fan-out above re-derives the legs
+    // from the callee workflow alone, so re-apply the stored plan's caps or
+    // the legs would exceed the caller's grant (OIDC included).
+    if let Some(base_plan) = &base_plan {
+        preloop_gha_parser::cap_deferred_matrix_plans(&mut plans, base_plan);
+    }
 
     let github_json = ctx.github_json.clone();
     let vars = ctx.submission.vars.clone();
@@ -2522,6 +2537,7 @@ jobs:
                 )]),
                 workflow_file: None,
                 scoped_inputs: scoped_inputs.clone(),
+                base_plan: None,
             })),
         )
         .expect("the deferred matrix must expand");
@@ -2548,6 +2564,142 @@ jobs:
             assert!(
                 preloop_gha_expressions::eval_bool(&condition, &context).unwrap(),
                 "cell `{}` must see `inputs.dry_run` in its `if:` context",
+                job.plan.id.0
+            );
+        }
+    }
+
+    const REUSABLE_CALLER_NO_GRANT: &str = r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#;
+
+    const REUSABLE_CALLEE_DEFERRED_MATRIX: &str = r#"
+on:
+  workflow_call:
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: echo setup
+  deploy:
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    strategy:
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo deploy
+"#;
+
+    /// A deferred-matrix job inside a reusable callee fans out through
+    /// `build_matrix_expansion`, which re-derives the legs from the callee
+    /// workflow alone. The legs must stay capped at the stored node's plan —
+    /// the one `expand_reusable_call` already ANDed with the caller's
+    /// (withheld) OIDC grant — or a callee could mint id-tokens its caller
+    /// never granted, unlike the identical statically expanded job.
+    #[tokio::test]
+    async fn matrix_expansion_inside_reusable_callee_keeps_caller_oidc_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let shared = state.shared();
+
+        // The stored placeholder plan for the callee's deferred node, built
+        // by the same parser chain the submit path runs.
+        let reusable = BTreeMap::from([(
+            ".github/workflows/reusable.yml".to_owned(),
+            REUSABLE_CALLEE_DEFERRED_MATRIX.to_owned(),
+        )]);
+        let caller =
+            preloop_gha_parser::parse_workflow(REUSABLE_CALLER_NO_GRANT).unwrap();
+        let caller_node =
+            preloop_gha_parser::expand_jobs_with_reusables(&caller, &reusable)
+                .unwrap()
+                .jobs
+                .remove(0);
+        assert!(!caller_node.oidc_id_token_granted);
+        let called =
+            preloop_gha_parser::parse_workflow(REUSABLE_CALLEE_DEFERRED_MATRIX).unwrap();
+        let base_plan = preloop_gha_parser::expand_reusable_call(
+            &called,
+            &caller_node,
+            &reusable,
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.base_id.ends_with("deploy"))
+        .expect("the callee deploy job must be planned");
+        assert!(base_plan.deferred_matrix.is_some());
+        assert!(
+            !base_plan.oidc_id_token_granted,
+            "the stored placeholder must already carry the caller's cap"
+        );
+
+        let submission = Arc::new(WorkflowSubmission {
+            workflow_yaml: REUSABLE_CALLER_NO_GRANT.to_owned(),
+            reusable_workflows: reusable,
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        });
+        let built = build_expansion(
+            &shared,
+            ExpansionPlan::Matrix(Box::new(MatrixExpansionInputs {
+                ctx: ExpansionContext {
+                    run_id: RunId::new(),
+                    submission,
+                    snapshot: None,
+                    github_json: serde_json::json!({}),
+                    workflow_path: ".github/workflows/ci.yml".to_owned(),
+                    workflow_ref: "owner/repo/.github/workflows/ci.yml@refs/heads/main"
+                        .to_owned(),
+                    head_sha: "0".repeat(40),
+                },
+                node_id: JobId("call/deploy".to_owned()),
+                base_id: "call/deploy".to_owned(),
+                expression: "${{ fromJSON(needs.setup.outputs.matrix) }}".to_owned(),
+                needs_outputs: BTreeMap::from([(
+                    "setup".to_owned(),
+                    BTreeMap::from([(
+                        "matrix".to_owned(),
+                        serde_json::json!({"include": [{"target": "a"}, {"target": "b"}]}),
+                    )]),
+                )]),
+                workflow_file: Some(".github/workflows/reusable.yml".to_owned()),
+                scoped_inputs: BTreeMap::new(),
+                base_plan: Some(base_plan),
+            })),
+        )
+        .expect("the deferred matrix must expand");
+
+        let BuiltExpansion::Matrix { jobs } = built else {
+            panic!("a matrix node must fan out");
+        };
+        assert_eq!(jobs.len(), 2, "both matrix cells must fan out");
+        for job in &jobs {
+            assert!(
+                !job.plan.oidc_id_token_granted,
+                "leg `{}` must inherit the caller's withheld id-token grant",
+                job.plan.id.0
+            );
+            assert!(
+                !job.artifacts.id_token_granted,
+                "leg `{}` must record a denied OIDC grant",
+                job.plan.id.0
+            );
+            assert!(
+                job.plan.oidc_job_workflow_ref.is_some(),
+                "leg `{}` must keep the reusable workflow ref for its claims",
                 job.plan.id.0
             );
         }
