@@ -124,7 +124,7 @@ async fn sandboxes(
             Err(e) => e.into_response(),
         },
         "Get" => match decode::<GetRequest>(&body) {
-            Ok(r) => reply(service.get(&r.sandbox_id)),
+            Ok(r) => reply(service.get(&r.sandbox_id, &r.lease_id)),
             Err(e) => e.into_response(),
         },
         "List" => reply(Ok(ListSandboxesResponse {
@@ -151,24 +151,39 @@ async fn sandboxes(
             Err(e) => e.into_response(),
         },
         "Stop" => match decode::<GetRequest>(&body) {
-            Ok(r) => reply(service.stop(&r.sandbox_id).await.map(|_| Empty {})),
+            Ok(r) => reply(
+                service
+                    .stop(&r.sandbox_id, &r.lease_id)
+                    .await
+                    .map(|_| Empty {}),
+            ),
             Err(e) => e.into_response(),
         },
         "Start" => match decode::<StartRequest>(&body) {
             Ok(r) => reply(
                 service
-                    .start(&r.sandbox_id, r.forkable)
+                    .start(&r.sandbox_id, &r.lease_id, r.forkable)
                     .await
                     .map(|_| Empty {}),
             ),
             Err(e) => e.into_response(),
         },
         "Pause" => match decode::<GetRequest>(&body) {
-            Ok(r) => reply(service.pause(&r.sandbox_id).await.map(|_| Empty {})),
+            Ok(r) => reply(
+                service
+                    .pause(&r.sandbox_id, &r.lease_id)
+                    .await
+                    .map(|_| Empty {}),
+            ),
             Err(e) => e.into_response(),
         },
         "Resume" => match decode::<GetRequest>(&body) {
-            Ok(r) => reply(service.resume(&r.sandbox_id).await.map(|_| Empty {})),
+            Ok(r) => reply(
+                service
+                    .resume(&r.sandbox_id, &r.lease_id)
+                    .await
+                    .map(|_| Empty {}),
+            ),
             Err(e) => e.into_response(),
         },
         other => Error::new(Code::Unimplemented, format!("unknown method {other}")).into_response(),

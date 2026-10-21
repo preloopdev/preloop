@@ -143,26 +143,26 @@ impl SandboxMachines {
         }
     }
 
-    async fn live(&self, name: &MachineName) -> Result<(String, String), VmError> {
+    /// `(sandbox, lease, native ref)` for a machine this adapter holds.
+    ///
+    /// A sandbox is driven only under the lease `Acquire` returned: a
+    /// machine this process never acquired (an engine restart left it
+    /// behind) cannot be used by name, because `List` redacts lease ids and
+    /// the lease is the capability.
+    async fn live(&self, name: &MachineName) -> Result<(String, String, String), VmError> {
         let entry = { self.entries.lock().await.get(name.as_str()).cloned() };
         match entry {
             Some(Entry::Live {
                 sandbox_id,
+                lease_id,
                 native_ref,
                 ..
-            }) => Ok((sandbox_id.clone(), native_ref.clone())),
+            }) => Ok((sandbox_id, lease_id, native_ref)),
             Some(Entry::Golden { .. }) => Err(VmError::InvalidSpec(format!(
                 "{} is a fork base; it cannot run commands",
                 name.as_str()
             ))),
-            // A machine this process never created (an engine restart, or a
-            // name the pool is adopting): the service is authoritative.
-            _ => match self.remote_by_name(name.as_str()).await.into_iter().next() {
-                Some(sandbox) if !sandbox.state.is_terminal() => {
-                    Ok((sandbox.id, sandbox.native_ref))
-                }
-                _ => Err(sandbox_error("exec", missing(name))),
-            },
+            _ => Err(sandbox_error("exec", missing(name))),
         }
     }
 
@@ -274,12 +274,13 @@ impl SandboxMachines {
             // branch base when the caller is provisioning a golden.
             Some(Entry::Live {
                 sandbox_id,
+                lease_id,
                 state: SandboxState::Stopped,
                 ..
             }) => {
                 let forkable = purpose == Purpose::Build;
                 self.api
-                    .start(&sandbox_id, forkable)
+                    .start(&sandbox_id, &lease_id, forkable)
                     .await
                     .map_err(|e| sandbox_error("start", e))?;
                 if let Some(Entry::Live {
@@ -298,15 +299,16 @@ impl SandboxMachines {
             // does explicitly for goldens).
             Some(Entry::Live {
                 sandbox_id,
+                lease_id,
                 forkable: false,
                 ..
             }) if purpose == Purpose::Build => {
                 self.api
-                    .stop(&sandbox_id)
+                    .stop(&sandbox_id, &lease_id)
                     .await
                     .map_err(|e| sandbox_error("start", e))?;
                 self.api
-                    .start(&sandbox_id, true)
+                    .start(&sandbox_id, &lease_id, true)
                     .await
                     .map_err(|e| sandbox_error("start", e))?;
                 if let Some(Entry::Live { forkable, .. }) =
@@ -317,24 +319,20 @@ impl SandboxMachines {
                 return Ok(());
             }
             Some(Entry::Live { .. } | Entry::Golden { .. }) => return Ok(()),
-            // Adopted from an earlier engine this process never created: the
-            // service is authoritative, so start it if it is stopped.
+            // Left by an earlier engine: the service still has it, but this
+            // adapter holds no lease for it and `List` redacts lease ids, so
+            // it cannot be started (or otherwise driven) by name.
             None => {
                 let Some(sandbox) = self.remote_by_name(name.as_str()).await.into_iter().next()
                 else {
                     return Err(sandbox_error("start", missing(name)));
                 };
-                match sandbox.state {
-                    SandboxState::Stopped => {
-                        self.api
-                            .start(&sandbox.id, purpose == Purpose::Build)
-                            .await
-                            .map_err(|e| sandbox_error("start", e))?;
-                    }
-                    state if !state.is_terminal() => {}
-                    _ => return Err(sandbox_error("start", missing(name))),
-                }
-                return Ok(());
+                return Err(VmError::InvalidSpec(format!(
+                    "machine `{}` is {} but this pool holds no lease for it; \
+                     the sandbox must be released before the name can be reused",
+                    name.as_str(),
+                    state_name(sandbox.state)
+                )));
             }
         };
         let template = self.ensure_image_template(&spec.image).await?;
@@ -421,11 +419,12 @@ impl SandboxMachines {
         if argv.is_empty() {
             return Err(VmError::InvalidSpec("argv cannot be empty".into()));
         }
-        let (sandbox_id, _) = self.live(name).await?;
+        let (sandbox_id, lease_id, _) = self.live(name).await?;
         let mut stream = self
             .api
             .exec(ExecRequest {
                 sandbox_id,
+                lease_id,
                 argv: argv.to_vec(),
                 env,
                 ..ExecRequest::default()
@@ -527,6 +526,22 @@ impl SandboxMachines {
             return None;
         }
         MachineName::new(native).ok().map(|native| (local, native))
+    }
+}
+
+/// Human-readable sandbox state for logs and adoption errors.
+fn state_name(state: SandboxState) -> &'static str {
+    match state {
+        SandboxState::SandboxStateUnspecified => "unspecified",
+        SandboxState::Provisioning => "provisioning",
+        SandboxState::Ready => "ready",
+        SandboxState::Leased => "leased",
+        SandboxState::Paused => "paused",
+        SandboxState::Stopped => "stopped",
+        SandboxState::Preserved => "preserved",
+        SandboxState::Terminating => "terminating",
+        SandboxState::Gone => "gone",
+        SandboxState::Failed => "failed",
     }
 }
 
@@ -664,6 +679,7 @@ impl VmProvider for SandboxMachines {
                 Some(Entry::Golden { template, spec }) => (template, spec),
                 Some(Entry::Live {
                     sandbox_id,
+                    lease_id,
                     spec,
                     forkable: true,
                     ..
@@ -672,6 +688,7 @@ impl VmProvider for SandboxMachines {
                     self.api
                         .snapshot(SnapshotRequest {
                             sandbox_id,
+                            lease_id,
                             name: template.clone(),
                         })
                         .await
@@ -744,8 +761,8 @@ impl VmProvider for SandboxMachines {
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
         // The pool stops a machine to pack it, to re-arm a fork base, or at
         // shutdown: the sandbox stays (with its disk) and can be started again.
-        let (sandbox_id, _) = self.live(name).await?;
-        match self.api.stop(&sandbox_id).await {
+        let (sandbox_id, lease_id, _) = self.live(name).await?;
+        match self.api.stop(&sandbox_id, &lease_id).await {
             Ok(()) => {
                 if let Some(Entry::Live { state, .. }) =
                     self.entries.lock().await.get_mut(name.as_str())
@@ -779,14 +796,17 @@ impl VmProvider for SandboxMachines {
                     Ok(()) => {
                         // The service destroys in the background; wait until
                         // the record is gone so a caller recreating the same
-                        // name (re-arm, retry) does not race it.
+                        // name (re-arm, retry) does not race it. `Get` is
+                        // scoped to a lease and this one is released, so use
+                        // the unscoped list.
                         for _ in 0..100 {
-                            match self.api.get(&sandbox_id).await {
-                                Ok(sandbox) if !sandbox.state.is_terminal() => {
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                }
-                                _ => break,
+                            let present = self.api.list().await.is_ok_and(|sandboxes| {
+                                sandboxes.iter().any(|sandbox| sandbox.id == sandbox_id)
+                            });
+                            if !present {
+                                break;
                             }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                         Ok(())
                     }
@@ -802,19 +822,15 @@ impl VmProvider for SandboxMachines {
             },
             Some(Entry::Defined(_)) => Ok(()),
             None => {
-                // Left by an earlier engine process: release whatever lease
-                // still holds a sandbox of this name.
-                for sandbox in self.remote_by_name(name.as_str()).await {
-                    if !sandbox.lease_id.is_empty() {
-                        let _ = self
-                            .api
-                            .release(ReleaseRequest {
-                                lease_id: sandbox.lease_id,
-                                mode: ReleaseMode::Destroy,
-                                ..ReleaseRequest::default()
-                            })
-                            .await;
-                    }
+                // Left by an earlier engine process. Its lease belongs to
+                // that process (List redacts lease ids), so the service frees
+                // it at expiry; this adapter can only drop the template.
+                if let Some(sandbox) = self.remote_by_name(name.as_str()).await.into_iter().next() {
+                    debug!(
+                        machine = name.as_str(),
+                        state = state_name(sandbox.state),
+                        "leaving a sandbox this pool holds no lease for to its lease expiry"
+                    );
                 }
                 let _ = self
                     .api
@@ -827,28 +843,40 @@ impl VmProvider for SandboxMachines {
 
     async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
         let entry = { self.entries.lock().await.get(name.as_str()).cloned() };
-        let sandbox_id = match entry {
+        let (sandbox_id, lease_id) = match entry {
             Some(Entry::Golden { .. }) => return Ok(MachineState::Running),
             Some(Entry::Defined(_)) => return Ok(MachineState::Stopped),
-            Some(Entry::Live { sandbox_id, .. }) => sandbox_id.clone(),
+            Some(Entry::Live {
+                sandbox_id,
+                lease_id,
+                ..
+            }) => (sandbox_id, lease_id),
             // Not ours: a golden left by an earlier engine, which the pool
             // adopts instead of rebaking. Ask the service before saying
-            // Missing, or every restart pays a full golden rebuild.
+            // Missing, or every restart pays a full golden rebuild. The list
+            // projection is unscoped, so this works without a lease.
             None => {
-                if let Some(golden) = self.remote_by_name(name.as_str()).await.into_iter().next() {
-                    golden.id
-                } else if let Some(entry) = self.remote_golden(name).await {
+                if let Some(sandbox) = self.remote_by_name(name.as_str()).await.into_iter().next() {
+                    return Ok(match sandbox.state {
+                        SandboxState::Leased | SandboxState::Preserved | SandboxState::Ready => {
+                            MachineState::Running
+                        }
+                        SandboxState::Paused | SandboxState::Stopped => MachineState::Stopped,
+                        SandboxState::Provisioning => MachineState::Unknown,
+                        _ => MachineState::Missing,
+                    });
+                }
+                if let Some(entry) = self.remote_golden(name).await {
                     self.entries
                         .lock()
                         .await
                         .insert(name.as_str().to_owned(), entry);
                     return Ok(MachineState::Running);
-                } else {
-                    return Ok(MachineState::Missing);
                 }
+                return Ok(MachineState::Missing);
             }
         };
-        match self.api.get(&sandbox_id).await {
+        match self.api.get(&sandbox_id, &lease_id).await {
             Ok(sandbox) => Ok(match sandbox.state {
                 SandboxState::Leased | SandboxState::Preserved | SandboxState::Ready => {
                     MachineState::Running
@@ -858,6 +886,10 @@ impl VmProvider for SandboxMachines {
                 _ => MachineState::Missing,
             }),
             Err(error) if error.code == Code::NotFound => Ok(MachineState::Missing),
+            // The service expired or consumed our lease (preservation, lease
+            // TTL): the machine is no longer ours to drive, which for the
+            // pool is the same as missing — it is recreated under a new name.
+            Err(error) if error.code == Code::PermissionDenied => Ok(MachineState::Missing),
             Err(error) => Err(sandbox_error("status", error)),
         }
     }
@@ -900,7 +932,7 @@ impl VmProvider for SandboxMachines {
         // API has no secret-reference primitive, so a value must never reach
         // argv or an exec env map. Deliver it as a 0600 file the command
         // sources, then remove it.
-        let (sandbox_id, _) = self.live(name).await?;
+        let (sandbox_id, lease_id, _) = self.live(name).await?;
         let mut script = String::from("set -a; ");
         for (key, source) in secrets {
             let value = resolve_secret(source)?;
@@ -925,7 +957,7 @@ impl VmProvider for SandboxMachines {
         tar_one_with_mode(&script_path, &entry, &tar_path, Some(0o600))
             .map_err(|e| VmError::RuntimeIo { source: e })?;
         self.api
-            .upload(&sandbox_id, "/var/tmp", &tar_path)
+            .upload(&sandbox_id, &lease_id, "/var/tmp", &tar_path)
             .await
             .map_err(|e| sandbox_error("exec_with_secret_env", e))?;
         // `sh -c <script> sh <argv…>`: `$0` is the placeholder, `$@` the
@@ -967,7 +999,7 @@ impl VmProvider for SandboxMachines {
         let tar_path = scratch.path().join("copy.tar");
         match (Self::split_guest(source), Self::split_guest(destination)) {
             (None, Some((machine, guest))) => {
-                let (sandbox_id, _) = self.live(&machine).await?;
+                let (sandbox_id, lease_id, _) = self.live(&machine).await?;
                 let guest = PathBuf::from(guest);
                 let entry = guest
                     .file_name()
@@ -981,14 +1013,14 @@ impl VmProvider for SandboxMachines {
                 tar_one(Path::new(source), &entry, &tar_path)
                     .map_err(|e| VmError::RuntimeIo { source: e })?;
                 self.api
-                    .upload(&sandbox_id, &parent, &tar_path)
+                    .upload(&sandbox_id, &lease_id, &parent, &tar_path)
                     .await
                     .map_err(|e| sandbox_error("copy", e))
             }
             (Some((machine, guest)), None) => {
-                let (sandbox_id, _) = self.live(&machine).await?;
+                let (sandbox_id, lease_id, _) = self.live(&machine).await?;
                 self.api
-                    .download(&sandbox_id, &guest, &tar_path)
+                    .download(&sandbox_id, &lease_id, &guest, &tar_path)
                     .await
                     .map_err(|e| sandbox_error("copy", e))?;
                 let unpack = scratch.path().join("out");

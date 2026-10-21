@@ -26,6 +26,10 @@ pub trait Driver: Send + Sync {
     ///
     /// Drivers name native machines so [`Driver::inventory`] can recover
     /// the sandbox id and incarnation (see [`native_name`]).
+    ///
+    /// `work.mounts` and `work.sockets` were admitted against the host
+    /// agent's allowlist before this call; a driver uses those paths as
+    /// given and must not resolve or widen them.
     async fn create(&self, work: &CreateWork) -> Result<String>;
 
     /// Destroy a sandbox. Destroying something already gone succeeds.

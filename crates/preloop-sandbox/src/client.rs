@@ -32,8 +32,8 @@ pub trait SandboxApi: Send + Sync {
     async fn renew(&self, request: RenewRequest) -> Result<Lease>;
     /// `Release`.
     async fn release(&self, request: ReleaseRequest) -> Result<()>;
-    /// `Get`.
-    async fn get(&self, sandbox_id: &str) -> Result<Sandbox>;
+    /// `Get`: one sandbox, for the lease that holds it.
+    async fn get(&self, sandbox_id: &str, lease_id: &str) -> Result<Sandbox>;
     /// `List`.
     async fn list(&self) -> Result<Vec<Sandbox>>;
     /// `ListProviders`.
@@ -41,19 +41,31 @@ pub trait SandboxApi: Send + Sync {
     /// `Exec`.
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>>;
     /// Upload a local tar, extracted at `guest_dir`.
-    async fn upload(&self, sandbox_id: &str, guest_dir: &str, tar: &Path) -> Result<()>;
+    async fn upload(
+        &self,
+        sandbox_id: &str,
+        lease_id: &str,
+        guest_dir: &str,
+        tar: &Path,
+    ) -> Result<()>;
     /// Download a tar of `guest_path` to `dest`.
-    async fn download(&self, sandbox_id: &str, guest_path: &str, dest: &Path) -> Result<()>;
+    async fn download(
+        &self,
+        sandbox_id: &str,
+        lease_id: &str,
+        guest_path: &str,
+        dest: &Path,
+    ) -> Result<()>;
     /// `Snapshot`.
     async fn snapshot(&self, request: SnapshotRequest) -> Result<Template>;
     /// `Stop`: power off, keeping the machine.
-    async fn stop(&self, sandbox_id: &str) -> Result<()>;
+    async fn stop(&self, sandbox_id: &str, lease_id: &str) -> Result<()>;
     /// `Start`: boot a stopped machine.
-    async fn start(&self, sandbox_id: &str, forkable: bool) -> Result<()>;
+    async fn start(&self, sandbox_id: &str, lease_id: &str, forkable: bool) -> Result<()>;
     /// `Pause`.
-    async fn pause(&self, sandbox_id: &str) -> Result<()>;
+    async fn pause(&self, sandbox_id: &str, lease_id: &str) -> Result<()>;
     /// `Resume`.
-    async fn resume(&self, sandbox_id: &str) -> Result<()>;
+    async fn resume(&self, sandbox_id: &str, lease_id: &str) -> Result<()>;
 
     /// Run to completion: `(exit, stdout, stderr)`.
     async fn exec_collect(&self, request: ExecRequest) -> Result<(i32, Vec<u8>, Vec<u8>)> {
@@ -94,8 +106,8 @@ impl SandboxApi for InProcess {
     async fn release(&self, request: ReleaseRequest) -> Result<()> {
         Service::release(&self.0, request).await
     }
-    async fn get(&self, sandbox_id: &str) -> Result<Sandbox> {
-        Service::get(&self.0, sandbox_id)
+    async fn get(&self, sandbox_id: &str, lease_id: &str) -> Result<Sandbox> {
+        Service::get(&self.0, sandbox_id, lease_id)
     }
     async fn list(&self) -> Result<Vec<Sandbox>> {
         Ok(Service::list(&self.0))
@@ -106,26 +118,38 @@ impl SandboxApi for InProcess {
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         Service::exec(&self.0, request)
     }
-    async fn upload(&self, sandbox_id: &str, guest_dir: &str, tar: &Path) -> Result<()> {
-        Service::upload_path(&self.0, sandbox_id, guest_dir, tar).await
+    async fn upload(
+        &self,
+        sandbox_id: &str,
+        lease_id: &str,
+        guest_dir: &str,
+        tar: &Path,
+    ) -> Result<()> {
+        Service::upload_path(&self.0, sandbox_id, lease_id, guest_dir, tar).await
     }
-    async fn download(&self, sandbox_id: &str, guest_path: &str, dest: &Path) -> Result<()> {
-        Service::download_path(&self.0, sandbox_id, guest_path, dest).await
+    async fn download(
+        &self,
+        sandbox_id: &str,
+        lease_id: &str,
+        guest_path: &str,
+        dest: &Path,
+    ) -> Result<()> {
+        Service::download_path(&self.0, sandbox_id, lease_id, guest_path, dest).await
     }
     async fn snapshot(&self, request: SnapshotRequest) -> Result<Template> {
         Service::snapshot(&self.0, request).await
     }
-    async fn stop(&self, sandbox_id: &str) -> Result<()> {
-        Service::stop(&self.0, sandbox_id).await
+    async fn stop(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
+        Service::stop(&self.0, sandbox_id, lease_id).await
     }
-    async fn start(&self, sandbox_id: &str, forkable: bool) -> Result<()> {
-        Service::start(&self.0, sandbox_id, forkable).await
+    async fn start(&self, sandbox_id: &str, lease_id: &str, forkable: bool) -> Result<()> {
+        Service::start(&self.0, sandbox_id, lease_id, forkable).await
     }
-    async fn pause(&self, sandbox_id: &str) -> Result<()> {
-        Service::pause(&self.0, sandbox_id).await
+    async fn pause(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
+        Service::pause(&self.0, sandbox_id, lease_id).await
     }
-    async fn resume(&self, sandbox_id: &str) -> Result<()> {
-        Service::resume(&self.0, sandbox_id).await
+    async fn resume(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
+        Service::resume(&self.0, sandbox_id, lease_id).await
     }
 }
 
@@ -212,11 +236,12 @@ impl SandboxApi for SandboxClient {
     async fn release(&self, request: ReleaseRequest) -> Result<()> {
         self.call::<_, Empty>("Release", &request).await.map(|_| ())
     }
-    async fn get(&self, sandbox_id: &str) -> Result<Sandbox> {
+    async fn get(&self, sandbox_id: &str, lease_id: &str) -> Result<Sandbox> {
         self.call(
             "Get",
             &GetRequest {
                 sandbox_id: sandbox_id.to_owned(),
+                lease_id: lease_id.to_owned(),
             },
         )
         .await
@@ -238,12 +263,19 @@ impl SandboxApi for SandboxClient {
             .await?
             .boxed())
     }
-    async fn upload(&self, sandbox_id: &str, guest_dir: &str, tar: &Path) -> Result<()> {
+    async fn upload(
+        &self,
+        sandbox_id: &str,
+        lease_id: &str,
+        guest_dir: &str,
+        tar: &Path,
+    ) -> Result<()> {
         let ticket: Ticket = self
             .call(
                 "OpenStream",
                 &OpenStreamRequest {
                     sandbox_id: sandbox_id.to_owned(),
+                    lease_id: lease_id.to_owned(),
                     kind: StreamKind::Upload,
                     path: guest_dir.to_owned(),
                 },
@@ -273,13 +305,20 @@ impl SandboxApi for SandboxClient {
         }
         Ok(())
     }
-    async fn download(&self, sandbox_id: &str, guest_path: &str, dest: &Path) -> Result<()> {
+    async fn download(
+        &self,
+        sandbox_id: &str,
+        lease_id: &str,
+        guest_path: &str,
+        dest: &Path,
+    ) -> Result<()> {
         use tokio::io::AsyncWriteExt as _;
         let ticket: Ticket = self
             .call(
                 "OpenStream",
                 &OpenStreamRequest {
                     sandbox_id: sandbox_id.to_owned(),
+                    lease_id: lease_id.to_owned(),
                     kind: StreamKind::Download,
                     path: guest_path.to_owned(),
                 },
@@ -316,42 +355,46 @@ impl SandboxApi for SandboxClient {
     async fn snapshot(&self, request: SnapshotRequest) -> Result<Template> {
         self.call("Snapshot", &request).await
     }
-    async fn stop(&self, sandbox_id: &str) -> Result<()> {
+    async fn stop(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
         self.call::<_, Empty>(
             "Stop",
             &GetRequest {
                 sandbox_id: sandbox_id.to_owned(),
+                lease_id: lease_id.to_owned(),
             },
         )
         .await
         .map(|_| ())
     }
-    async fn start(&self, sandbox_id: &str, forkable: bool) -> Result<()> {
+    async fn start(&self, sandbox_id: &str, lease_id: &str, forkable: bool) -> Result<()> {
         self.call::<_, Empty>(
             "Start",
             &StartRequest {
                 sandbox_id: sandbox_id.to_owned(),
+                lease_id: lease_id.to_owned(),
                 forkable,
             },
         )
         .await
         .map(|_| ())
     }
-    async fn pause(&self, sandbox_id: &str) -> Result<()> {
+    async fn pause(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
         self.call::<_, Empty>(
             "Pause",
             &GetRequest {
                 sandbox_id: sandbox_id.to_owned(),
+                lease_id: lease_id.to_owned(),
             },
         )
         .await
         .map(|_| ())
     }
-    async fn resume(&self, sandbox_id: &str) -> Result<()> {
+    async fn resume(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
         self.call::<_, Empty>(
             "Resume",
             &GetRequest {
                 sandbox_id: sandbox_id.to_owned(),
+                lease_id: lease_id.to_owned(),
             },
         )
         .await

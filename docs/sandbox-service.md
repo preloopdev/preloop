@@ -19,7 +19,10 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
 * **Sandboxes** (callers): `PutTemplate`, `PutPool`, `Acquire` (idempotency key,
   pool or template, identity to inject), `Renew`, `Release` (destroy or
   preserve), `Exec` (server-streaming), `OpenStream` (data-plane ticket),
-  `Snapshot`, `Pause`/`Resume`, `Get`/`List`.
+  `Snapshot`, `Stop`/`Start`, `Pause`/`Resume`, `Get`/`List`. Everything
+  scoped to one sandbox (`Get`, `Exec`, `OpenStream`, `Snapshot`, `Stop`,
+  `Start`, `Pause`, `Resume`) also carries the caller's `leaseId`; `List` is
+  the only sandbox read that is not scoped to one (and it redacts lease ids).
 * **Providers** (capacity owners): `Register` (drivers + capabilities →
   provider id and fencing generation), `Heartbeat`, `Poll` (long-poll for
   work), `Report` / `ReportExec` (fenced by generation), `Reconcile` (full
@@ -51,7 +54,8 @@ from the `.proto` interoperates.
 * **Sandbox / Lease** — `Acquire` with the same idempotency key returns the same
   lease. Lease environment is merged into every exec; injected files are written
   before the lease is returned. Leases expire (the sandbox is destroyed);
-  `Release(PRESERVE)` keeps a sandbox for debugging until its window ends.
+  `Release(PRESERVE)` keeps a sandbox for debugging until its window ends, and
+  the lease id keeps working as the debugging capability until then.
 
 Capabilities decide placement; nothing branches on driver names. A request no
 registered provider can satisfy fails with the unmet requirement named
@@ -78,8 +82,22 @@ are the service's.
 
 ## Security model
 
+* **The lease is the capability.** Every sandbox-scoped RPC presents the
+  `leaseId` `Acquire` returned, and the service checks it is that sandbox's
+  active lease. A missing or foreign lease is `PERMISSION_DENIED`; an unknown
+  sandbox is `NOT_FOUND`. `List` returns sandboxes with lease ids redacted,
+  and `Get` only echoes the lease the caller already presented, so holding the
+  client token alone cannot drive someone else's machine.
 * Data-plane tickets are single-use, scoped to one sandbox and direction, and
-  short-lived; the URL carries its own token.
+  short-lived; the URL carries its own token. `OpenStream` mints a ticket only
+  for the lease holder, and the ticket then authorizes the transfer itself.
+* **The host agent owns the mount policy.** A `Create` whose `Mount.host` or
+  `SocketMount.host` is outside the agent's allowlist is rejected with
+  `FAILED_PRECONDITION` before the driver runs (the caller sees it as the
+  sandbox's create failure, with the code and path in the message). Paths are
+  canonicalized, so `..` traversal and symlinks cannot step outside an allowed
+  tree. Forks arrive as `Create` work and take the same check. The default is
+  empty: deny every host mount and socket until an operator names the prefixes.
 * `Report`/`ReportExec`/`Reconcile` are fenced by the provider's registration
   generation, and a provider may not report output for another provider's
   exec, nor destroy another provider's machine.
@@ -115,6 +133,13 @@ and debug-hold strategy; the machines under it are sandboxes.
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
 | `PRELOOP_SANDBOX_POOL_DRIVER` | driver the CI pool places on (default: first) |
 | `PRELOOP_SANDBOX_SMOLVM_SLOTS` | concurrent SmolVM sandboxes (0 = no cap) |
+| `PRELOOP_SANDBOX_MOUNT_ALLOW` | comma-separated host directory prefixes the agent may mount into guests (default: none) |
+| `PRELOOP_SANDBOX_SOCKET_ALLOW` | comma-separated host socket prefixes the agent may mount (default: none) |
+
+The engine's embedded agent allows exactly the host paths its CI pool mounts
+(runner bundle, Node externals, control-bridge tree and control socket), plus
+anything the two `_ALLOW` variables add. A standalone `preloop sandbox serve`
+or `preloop sandbox agent` uses only those variables.
 
 ## CLI
 
@@ -124,13 +149,13 @@ preloop sandbox agent --service http://hub:9191        # join as a provider
 preloop sandbox template put --name alpine --image alpine:3.20
 preloop sandbox pool put --name alpine --template alpine --warm 2
 preloop sandbox acquire --pool alpine --env JOB=1      # → lease + sandbox JSON
-preloop sandbox exec sbx-… -- uname -a
-preloop sandbox cp ./dir sbx-…:/work                   # and sbx-…:/path ./out
-preloop sandbox stop sbx-…                            # power off, keep the disk
-preloop sandbox start sbx-… [--forkable]               # boot it again (bakes)
-preloop sandbox snapshot sbx-… --name golden
+preloop sandbox exec sbx-… --lease lse-… -- uname -a
+preloop sandbox cp ./dir sbx-…:/work --lease lse-…     # and sbx-…:/path ./out
+preloop sandbox stop sbx-… --lease lse-…               # power off, keep the disk
+preloop sandbox start sbx-… --lease lse-… [--forkable] # boot it again (bakes)
+preloop sandbox snapshot sbx-… --lease lse-… --name golden
 preloop sandbox release lse-… [--preserve 600]
-preloop sandbox ls | providers
+preloop sandbox ls | providers                        # lease ids are redacted
 ```
 
 ## Verification
@@ -140,7 +165,8 @@ preloop sandbox ls | providers
   (idempotency, warm pools, placement errors, unsupported operations,
   snapshot → template → fork, create failure, lease expiry and preservation,
   orphan/lost reconcile, generation fencing, SQLite restart, streaming exec,
-  ticketed upload/download). Set `PRELOOP_SANDBOX_TEST_PG` to also run the
+  ticketed upload/download, lease ownership and list redaction, host
+  mount/socket allowlisting). Set `PRELOOP_SANDBOX_TEST_PG` to also run the
   Postgres store test.
 * `PRELOOP_SANDBOX_E2E_SMOLVM=1 cargo test -p preloop-sandbox --test smolvm_e2e`
   — real SmolVM: bake, snapshot, warm pool of branches, socket mount, files,
