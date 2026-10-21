@@ -41,7 +41,7 @@ just dogfood    # E2E with the real runner
 - **Drop-in workflows**: users run their workflows unmodified.
 - **Run `just test-ci`** after each large chunk of work.
 - **`[skip ci]`** in a commit message skips the CI gate (including `contrib/pre-push`); use it only for docs/non-code changes.
-- **Supply-chain policy isolation**: a PR may carry any combination of the dependency/policy files (`deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, `supply-chain/`, any `Cargo.toml`, any `Cargo.lock`) and nothing else — no source, docs, changelog, other workflow, or script. Code that needs a dependency ships in a follow-up PR after that dependency/policy PR merges. There is no exception. Check before pushing: `just supply-chain-guard` (`supply-chain/README.md` holds the rule and the guard).
+- **Supply-chain policy isolation**: strict policy files (`deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, `supply-chain/`) may ship only with dependency/policy files, and `Cargo.toml`/`Cargo.lock` join that set only when a third-party lock entry (a `[[package]]` block with a `source` line) changes; first-party manifest and lockfile edits may ship with their code, while a new third-party dependency still needs its own PR first. There is no exception: check with `just supply-chain-guard` (`supply-chain/README.md` holds the rule and the guard).
 
 ## Dev VM (per-worktree Linux VM)
 
