@@ -51,6 +51,17 @@ fn placement_from_env() -> anyhow::Result<Arc<dyn Placement>> {
     })
 }
 
+/// Service config with the blob cap from `PRELOOP_SANDBOX_BLOB_MAX_BYTES`.
+fn service_config(state: &Path) -> anyhow::Result<ServiceConfig> {
+    let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
+    if let Some(raw) = env_nonempty("PRELOOP_SANDBOX_BLOB_MAX_BYTES") {
+        config.blob_max_bytes = raw.parse().with_context(|| {
+            format!("PRELOOP_SANDBOX_BLOB_MAX_BYTES must be a byte count, got `{raw}`")
+        })?;
+    }
+    Ok(config)
+}
+
 /// Drivers attached to this host: `PRELOOP_SANDBOX_DRIVERS`, comma-separated
 /// (default `smolvm`). `named_prefix` lets the SmolVM inventory adopt the CI
 /// pool's caller-named machines.
@@ -99,7 +110,7 @@ impl LocalSandboxes {
         let state = home.join("state");
         let store_url = env_nonempty("PRELOOP_SANDBOX_STORE_URL")
             .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
-        let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
+        let mut config = service_config(&state)?;
         config.placement = placement_from_env()?;
         let store = store::open(&store_url)
             .await
@@ -300,6 +311,28 @@ enum SandboxCommand {
     Ls,
     /// List providers and their capabilities.
     Providers,
+    /// Cordon, uncordon or drain a provider.
+    #[command(subcommand)]
+    Provider(ProviderCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    /// Stop placing new sandboxes on a provider.
+    Cordon {
+        /// Provider name.
+        name: String,
+    },
+    /// Allow placements on a provider again.
+    Uncordon {
+        /// Provider name.
+        name: String,
+    },
+    /// Cordon a provider, release its idle pool members, report leased sandboxes.
+    Drain {
+        /// Provider name.
+        name: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -620,6 +653,13 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
         ),
         SandboxCommand::Ls => print_json(&client.list().await?),
         SandboxCommand::Providers => print_json(&client.list_providers().await?),
+        SandboxCommand::Provider(provider) => match provider {
+            ProviderCommand::Cordon { name } => print_json(&client.cordon_provider(&name).await?),
+            ProviderCommand::Uncordon { name } => {
+                print_json(&client.uncordon_provider(&name).await?)
+            }
+            ProviderCommand::Drain { name } => print_json(&client.drain_provider(&name).await?),
+        },
     }
 }
 
@@ -670,7 +710,7 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     let store_url = args
         .store
         .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
-    let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
+    let mut config = service_config(&state)?;
     config.placement = placement_from_env()?;
     let store = store::open(&store_url).await?;
     let service = Service::open(store, config).await?;
