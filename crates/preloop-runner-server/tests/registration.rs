@@ -3816,6 +3816,820 @@ async fn preserve_on_failure_carries_the_run_id_for_the_debug_session() {
     }
 }
 
+/// A session that reached a terminal state must not accept further mutation.
+///
+/// `DebugSessionRegistry::close` keeps a `resumed` record — and its controller
+/// lease — so a reconnecting agent can still read the outcome, which leaves
+/// that record reachable through the operations surface. Operations are
+/// therefore gated on the session still being open. Without the gate a
+/// controller could rewrite the outcome of a finished session: flip it back to
+/// `retrying`, publish a verdict no worker will ever consume, and re-enter the
+/// open-session set that `GET /api/v1/debug/sessions` and the reaper read.
+#[tokio::test]
+async fn a_finished_debug_session_rejects_further_operations() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let (agent_job_id, worker_token) = {
+        let inner = state.test_tx().await;
+        let (_, record) = inner.job_requests.iter().next().unwrap();
+        (
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    let lease = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/lease"),
+        json!({ "controller": "finishing-agent" }),
+    )
+    .await;
+    let continue_op = json!({
+        "request_id": "finish-1",
+        "expected_version": lease["session_version"],
+        "lease_id": lease["lease_id"],
+        "operation": { "operation": "continue" }
+    });
+    let continued = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        continue_op.clone(),
+    )
+    .await;
+    assert_eq!(continued["status"], "resuming");
+
+    // The real sequence: the worker collects the verdict and *then* reports
+    // the session closed. The lease is still held, so the record is retained
+    // for the reconnecting agent — this is the state the mutation path used to
+    // accept.
+    let poll = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &worker_token,
+    )
+    .await;
+    assert_eq!(poll["verdict"], "continue");
+    let closed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/close"),
+        json!({ "state": "resumed" }),
+        &worker_token,
+    )
+    .await;
+    assert_eq!(closed["ok"], true);
+
+    let finished = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(finished["state"], "resumed");
+    let finished_version = finished["version"].as_u64().unwrap();
+
+    // A successful request id keeps replaying its recorded response, even
+    // after the session closed: idempotency is what protects a client retry.
+    let replayed = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        continue_op.clone(),
+    )
+    .await;
+    assert_eq!(
+        replayed, continued,
+        "a replay must return the recorded response verbatim"
+    );
+
+    let refused = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "finish-2",
+            "expected_version": finished_version,
+            "lease_id": lease["lease_id"],
+            "operation": { "operation": "retry" }
+        }),
+        "preloop-system-token",
+    )
+    .await;
+    assert_eq!(
+        refused,
+        StatusCode::BAD_REQUEST,
+        "a resumed session must refuse a retry instead of re-opening"
+    );
+
+    // The refused operation must leave no trace: no state change, no re-entry
+    // into the open-session set, and no audit entry claiming it happened.
+    let after = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(after["state"], "resumed");
+    assert_eq!(after["version"], finished_version);
+    let listed = request_json(&app, Method::GET, "/api/v1/debug/sessions", Value::Null).await;
+    assert!(
+        listed["sessions"].as_array().unwrap().is_empty(),
+        "a finished session must not reappear as open: {listed}"
+    );
+    let audit = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/audit"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        audit.as_array().unwrap().len(),
+        1,
+        "the refused operation must not be recorded as a mutation: {audit}"
+    );
+
+    // The refused request id was not recorded either. When the job fails again
+    // the worker opens the next pause on the same record, and the same request
+    // id is then evaluated afresh instead of replaying a stale response.
+    let reopened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    assert_eq!(
+        reopened["session_id"].as_str(),
+        Some(session_id.as_str()),
+        "a second failure must reopen the same session record"
+    );
+    let reopened_version = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}"),
+        Value::Null,
+    )
+    .await["version"]
+        .as_u64()
+        .unwrap();
+    let retried = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "finish-2",
+            "expected_version": reopened_version,
+            "lease_id": lease["lease_id"],
+            "operation": { "operation": "retry" }
+        }),
+    )
+    .await;
+    assert_eq!(
+        retried["status"], "retrying",
+        "the refused request id must be evaluated afresh, not replayed: {retried}"
+    );
+
+    // `abort` is terminal the moment it is issued, before the worker collects
+    // it: a retry after it is refused exactly like one after a resume.
+    let aborted = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "finish-3",
+            "expected_version": retried["new_version"],
+            "lease_id": lease["lease_id"],
+            "operation": { "operation": "abort" }
+        }),
+    )
+    .await;
+    assert_eq!(aborted["status"], "aborting");
+    let refused_after_abort = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "finish-4",
+            "expected_version": aborted["new_version"],
+            "lease_id": lease["lease_id"],
+            "operation": { "operation": "retry" }
+        }),
+        "preloop-system-token",
+    )
+    .await;
+    assert_eq!(
+        refused_after_abort,
+        StatusCode::BAD_REQUEST,
+        "an aborted session must refuse a retry instead of running again"
+    );
+}
+
+/// A closed session ends the worker's verdict long poll.
+///
+/// `close` keeps a terminal record while a controller still holds the lease, so
+/// a reconnecting controller can read the outcome. The *worker* must not keep
+/// polling that record: its documented exit is an explicit verdict or a missing
+/// session, so a poll that answers `verdict: null` forever holds the job — and
+/// the machine behind it — until the pause ceiling, long after the session was
+/// closed. A closed session therefore has to read as gone from the worker's
+/// side while staying readable for controllers.
+#[tokio::test]
+async fn a_closed_debug_session_ends_the_verdict_poll() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let (agent_job_id, worker_token) = {
+        let inner = state.test_tx().await;
+        let (_, record) = inner.job_requests.iter().next().unwrap();
+        (
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    // The controller holds the lease across the close, which is what makes the
+    // record survive for a reconnecting reader.
+    let _lease = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/lease"),
+        json!({ "controller": "closing-agent" }),
+    )
+    .await;
+    let closed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/close"),
+        json!({ "state": "resumed" }),
+        &worker_token,
+    )
+    .await;
+    assert_eq!(closed["ok"], true);
+
+    let readable = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        readable["state"], "resumed",
+        "a reconnecting controller must still read the outcome"
+    );
+
+    let poll = request_status_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &worker_token,
+    )
+    .await;
+    assert_eq!(
+        poll,
+        StatusCode::NOT_FOUND,
+        "a closed session must end the worker's poll so it resumes the job"
+    );
+}
+
+/// A verdict that the worker has not acknowledged is redelivered, not lost.
+///
+/// `continue` and `abort` move the session to a terminal state when they are
+/// issued, before the worker has collected them, and they are delivered on
+/// every poll until the worker closes the session. Without the redelivery a
+/// lost HTTP response turns the operator's verdict into "no decision": the
+/// worker keeps the failed conclusion instead of accepting it (or, for
+/// `abort`, pauses again on the next failure).
+#[tokio::test]
+async fn a_debug_verdict_is_redelivered_until_the_worker_closes() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let (agent_job_id, worker_token) = {
+        let inner = state.test_tx().await;
+        let (_, record) = inner.job_requests.iter().next().unwrap();
+        (
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    let lease = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/lease"),
+        json!({ "controller": "redelivery-agent" }),
+    )
+    .await;
+    let continued = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "redeliver-1",
+            "expected_version": lease["session_version"],
+            "lease_id": lease["lease_id"],
+            "operation": { "operation": "continue" }
+        }),
+    )
+    .await;
+    assert_eq!(continued["status"], "resuming");
+
+    // The response to the first poll was lost, so the worker polls again and
+    // has to see the same verdict — not `verdict: null`, which its loop reads
+    // as "keep polling" until the pause ceiling.
+    for poll in 0..2 {
+        let verdict = request_json_with_bearer(
+            &app,
+            Method::GET,
+            &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+            Value::Null,
+            &worker_token,
+        )
+        .await;
+        assert_eq!(
+            verdict["verdict"], "continue",
+            "poll {poll} must redeliver the unacknowledged verdict: {verdict}"
+        );
+    }
+
+    // The worker acts on the verdict and reports the close; that is what ends
+    // the poll, and the verdict must not outlive it.
+    let closed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/close"),
+        json!({ "state": "resumed" }),
+        &worker_token,
+    )
+    .await;
+    assert_eq!(closed["ok"], true);
+    let after_close = request_status_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &worker_token,
+    )
+    .await;
+    assert_eq!(
+        after_close,
+        StatusCode::NOT_FOUND,
+        "the close ends the poll: a redelivered verdict cannot outlive the session"
+    );
+}
+
+/// Claim the next queued job of the shared test pool through the real
+/// poll/acquire path, and report the runner's session and the logical job id
+/// it now owns.
+async fn claim_next_queued_job(
+    app: &axum::Router,
+    state: &AppState,
+    runner_id: i64,
+    runner_name: &str,
+    token: &str,
+) -> (String, String) {
+    let session = request_json_with_bearer(
+        app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": runner_id, "name": runner_name},
+            "ownerName": "dap claim",
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "useFipsEncryption": false
+        }),
+        token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+    let delivered = poll_message(app, token, &session_id).await;
+    assert!(!delivered.is_null(), "poll must claim a queued job");
+    let body: Value = serde_json::from_str(
+        delivered["body"]
+            .as_str()
+            .expect("the claim message must carry a body"),
+    )
+    .unwrap();
+    let runner_request_id = body["runner_request_id"]
+        .as_str()
+        .expect("the claim message must identify the claimed request")
+        .to_owned();
+    request_json_with_bearer(
+        app,
+        Method::POST,
+        &format!("/broker/{runner_id}/acquirejob"),
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        token,
+    )
+    .await;
+    let job_id = {
+        let inner = state.test_tx().await;
+        let claimed_request = *inner
+            .session_active_requests
+            .get(&session_id)
+            .expect("the claim must be pinned to the runner's session");
+        inner.job_requests[&claimed_request].job_id.0.clone()
+    };
+    (session_id, job_id)
+}
+
+/// Only the runner serving a job may publish that job's DAP port, and a
+/// registration is replaced exactly when it is the same job or a finished one.
+///
+/// The registration is the entire authorization for the websocket proxy that
+/// follows — it dials `127.0.0.1:{port}` on the engine host, so whatever
+/// registered it receives the operator's debug traffic and answers for the
+/// debug adapter. A runner listen token proves *some* registered machine, not
+/// the machine running this job, so the handler has to bind the registration
+/// to the job's owning runner; without that any registered runner could
+/// hijack another run's debug channel. The other direction matters too: after
+/// runner loss the map still holds the dead runner's entry, and the job's new
+/// owner — which passed the ownership check — must be able to repair the
+/// channel instead of being locked out by it. Only a second *live* job of the
+/// same run is refused, because a run has a single debug channel.
+#[tokio::test]
+async fn debug_dap_registration_binds_to_the_current_job_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    // The liveness sweep below runs inline, like the neighbouring runner-loss
+    // tests do, so the hand-off does not depend on reaper timing.
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let listen_token = |runner_id: i64| {
+        state
+            .local_jwt(json!({
+                "sub": format!("preloop-runner-listen-{runner_id}"),
+                "scp": "ActionsRuntime.RunnerListen",
+            }))
+            .unwrap()
+    };
+    let register = |name: &str| {
+        let app = app.clone();
+        let name = name.to_owned();
+        async move {
+            let registered = request_json(
+                &app,
+                Method::POST,
+                "/runner/server/_apis/distributedtask/pools/1/agents",
+                json!({
+                    "name": name,
+                    "labels": [{"id": 0, "name": "self-hosted", "type": "user"}]
+                }),
+            )
+            .await;
+            registered["id"].as_i64().unwrap()
+        }
+    };
+
+    let runner_a = register("dap-owner").await;
+    let runner_b = register("dap-intruder").await;
+    let token_a = listen_token(runner_a);
+    let token_b = listen_token(runner_b);
+
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // Runner A claims the run's job, which is what binds the job to a machine.
+    let (session_a, job_a) =
+        claim_next_queued_job(&app, &state, runner_a, "dap-owner", &token_a).await;
+    assert_eq!(job_a, "build", "the run's only job must be claimed");
+
+    let uri = format!("/api/v1/runs/{run_id}/debug");
+    // (1) A runner that does not serve the job cannot register.
+    let foreign = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &uri,
+        json!({ "port": 4712, "job_id": job_a }),
+        &token_b,
+    )
+    .await;
+    assert_eq!(
+        foreign,
+        StatusCode::FORBIDDEN,
+        "a runner that does not serve the job must not register its DAP port"
+    );
+    let unregistered = {
+        let inner = state.inner.lock().await;
+        inner.dap_ports.get(&run_id).map(|entry| entry.port)
+    };
+    assert_eq!(
+        unregistered, None,
+        "a refused registration must not be recorded"
+    );
+
+    // (2) The owning runner registers, and may update its own port (a
+    // restarted bridge binds a new one).
+    let owner = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &uri,
+        json!({ "port": 4713, "job_id": job_a }),
+        &token_a,
+    )
+    .await;
+    assert_eq!(owner, StatusCode::OK);
+    let steal = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &uri,
+        json!({ "port": 4714, "job_id": job_a }),
+        &token_b,
+    )
+    .await;
+    assert_eq!(steal, StatusCode::FORBIDDEN);
+    let registered_port = {
+        let inner = state.inner.lock().await;
+        inner.dap_ports.get(&run_id).map(|entry| entry.port)
+    };
+    assert_eq!(
+        registered_port,
+        Some(4713),
+        "the intruder must not have replaced the live registration"
+    );
+    let update = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &uri,
+        json!({ "port": 4715, "job_id": job_a }),
+        &token_a,
+    )
+    .await;
+    assert_eq!(update, StatusCode::OK);
+    let updated_port = {
+        let inner = state.inner.lock().await;
+        inner.dap_ports.get(&run_id).map(|entry| entry.port)
+    };
+    assert_eq!(
+        updated_port,
+        Some(4715),
+        "the owner's update must replace its own registration"
+    );
+
+    // (3) The runner goes deaf mid-attempt: the liveness sweep purges it and
+    // requeues the job for a fresh machine, but the run keeps the dead
+    // runner's registration. Its new owner must be able to repair the channel.
+    state.test_set_runner_liveness(Duration::from_secs(600));
+    state
+        .test_db_mutate(|tx| {
+            let cutoff = crate::store::now_us() - 3_600_000_000;
+            tx.set_session_seen(&session_a, cutoff).unwrap();
+        })
+        .await;
+    reap_once(&shared).await;
+    let survived = {
+        let inner = state.inner.lock().await;
+        inner.dap_ports.get(&run_id).map(|entry| entry.port)
+    };
+    assert_eq!(
+        survived,
+        Some(4715),
+        "the purge requeues the job but keeps the dead runner's registration — \
+         exactly the entry the replacement has to be allowed to overwrite"
+    );
+    let runner_c = register("dap-replacement").await;
+    let token_c = listen_token(runner_c);
+    let (_replacement_session, replacement_job) =
+        claim_next_queued_job(&app, &state, runner_c, "dap-replacement", &token_c).await;
+    assert_eq!(
+        replacement_job, job_a,
+        "the replacement claims the same logical job"
+    );
+    let replacement = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &uri,
+        json!({ "port": 4716, "job_id": replacement_job }),
+        &token_c,
+    )
+    .await;
+    assert_eq!(
+        replacement,
+        StatusCode::OK,
+        "the job's new owner must replace the dead runner's registration"
+    );
+    complete_job(&state, run_id, &job_a, ExecutionStatus::Success).await;
+
+    // (4) Two overlapping jobs of one run, each on its own runner: the run has
+    // one debug channel, so a registration for the second job is refused while
+    // the first job is still running.
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo build\n  test:\n    runs-on: self-hosted\n    steps:\n      - run: echo test\n",
+        "owner/repo",
+    )
+    .await;
+    let two_job_run: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    // Fresh runners: a runner already holds one verified session from the
+    // hand-off above, and the pool refuses to open a second one for it.
+    let runner_d = register("dap-first-job").await;
+    let token_d = listen_token(runner_d);
+    let runner_e = register("dap-second-job").await;
+    let token_e = listen_token(runner_e);
+    let (_session, first_job) =
+        claim_next_queued_job(&app, &state, runner_d, "dap-first-job", &token_d).await;
+    let (_session, second_job) =
+        claim_next_queued_job(&app, &state, runner_e, "dap-second-job", &token_e).await;
+    assert_ne!(
+        first_job, second_job,
+        "the two overlapping jobs must land on two runners"
+    );
+    let two_job_uri = format!("/api/v1/runs/{two_job_run}/debug");
+    let first = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &two_job_uri,
+        json!({ "port": 4801, "job_id": first_job }),
+        &token_d,
+    )
+    .await;
+    assert_eq!(first, StatusCode::OK);
+    let second = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &two_job_uri,
+        json!({ "port": 4802, "job_id": second_job }),
+        &token_e,
+    )
+    .await;
+    assert_eq!(
+        second,
+        StatusCode::CONFLICT,
+        "a second live job must not take the run's debug channel from the first"
+    );
+
+    // (5) Once the first job is finished, the second job may register.
+    complete_job(&state, two_job_run, &first_job, ExecutionStatus::Success).await;
+    let after_first = request_status_with_bearer(
+        &app,
+        Method::POST,
+        &two_job_uri,
+        json!({ "port": 4802, "job_id": second_job }),
+        &token_e,
+    )
+    .await;
+    assert_eq!(
+        after_first,
+        StatusCode::OK,
+        "a finished job must not keep holding the run's debug channel"
+    );
+}
+
 #[tokio::test]
 async fn runner_lease_expiration_disconnect_reaper() {
     let temp = tempfile::tempdir().unwrap();

@@ -2302,6 +2302,12 @@ pub struct InnerState {
     /// OIDC issuer URL used in the `iss` claim and discovery document.
     pub oidc_issuer: String,
     pub dap_ports: BTreeMap<RunId, DapPortRegistration>,
+    /// Serializes DAP port registrations per run, so the backend reads that
+    /// authorize a registration and the `dap_ports` write they authorize
+    /// cannot interleave with a competing registration for the same run. Held
+    /// across those awaits instead of `inner`: one global mutex must not be
+    /// parked on a backend round trip (see `debug::register_dap_port`).
+    pub dap_registration_locks: BTreeMap<RunId, std::sync::Arc<tokio::sync::Mutex<()>>>,
     /// OIDC signing keypair (RS256) for id-token minting.
     pub oidc_keypair: Option<oidc::OidcKeypair>,
     /// Live debug sessions holding paused jobs open.

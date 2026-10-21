@@ -4,6 +4,7 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use preloop_gha_protocol::debug_session::plausible_machine_name;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{OFFICIAL_GOLDEN, is_official_golden};
 use preloop_orchestrator::{RunnerPool, RunnerPoolConfig, artifact_payload};
@@ -589,6 +590,20 @@ pub(crate) fn vm_provider(backend: VmBackend) -> Box<dyn preloop_vm::VmProvider>
     }
 }
 
+/// Refuse a machine name that must not reach a guest tool's argv.
+///
+/// The guest helpers below are the only places that address a guest, and the
+/// name they receive may come from the engine's session projection. A name
+/// with a separator, `..`, a leading `-`, or control characters could address a
+/// different machine or be parsed as a flag, so it never reaches the argument
+/// vector.
+fn checked_machine(machine: &str) -> anyhow::Result<&str> {
+    if !plausible_machine_name(machine) {
+        anyhow::bail!("refusing to address a guest named {machine:?}");
+    }
+    Ok(machine)
+}
+
 /// A command that runs an argv inside `machine`'s guest, for whichever backend
 /// owns that machine. The caller appends the guest argv.
 ///
@@ -597,6 +612,7 @@ pub(crate) fn vm_provider(backend: VmBackend) -> Box<dyn preloop_vm::VmProvider>
 /// guest per backend: SmolVM by machine name, AgentENV by the sandbox id the
 /// engine recorded in its registry.
 pub(crate) fn guest_exec_command(machine: &str) -> anyhow::Result<std::process::Command> {
+    let machine = checked_machine(machine)?;
     match vm_backend()? {
         VmBackend::Smolvm => {
             let mut command = smolvm_command()?;
@@ -618,6 +634,7 @@ pub(crate) fn guest_upload_command(
     local: &str,
     remote: &str,
 ) -> anyhow::Result<std::process::Command> {
+    let machine = checked_machine(machine)?;
     match vm_backend()? {
         VmBackend::Smolvm => {
             let mut command = smolvm_command()?;
@@ -635,6 +652,7 @@ pub(crate) fn guest_upload_command(
 
 /// An interactive shell attached to `machine`'s guest.
 pub(crate) fn guest_shell_command(machine: &str) -> anyhow::Result<std::process::Command> {
+    let machine = checked_machine(machine)?;
     match vm_backend()? {
         VmBackend::Smolvm => {
             let mut command = smolvm_command()?;
@@ -653,6 +671,7 @@ pub(crate) fn guest_shell_command(machine: &str) -> anyhow::Result<std::process:
 /// Resume an AgentENV sandbox before an attach. SmolVM's shell command owns
 /// its own lifecycle, so it needs no separate resume command.
 pub(crate) fn guest_resume_command(machine: &str) -> anyhow::Result<Option<std::process::Command>> {
+    let machine = checked_machine(machine)?;
     if vm_backend()? != VmBackend::Agentenv {
         return Ok(None);
     }
@@ -669,6 +688,7 @@ pub(crate) fn guest_resume_command(machine: &str) -> anyhow::Result<Option<std::
 }
 
 pub(crate) fn resume_guest_if_needed(machine: &str) -> anyhow::Result<()> {
+    let machine = checked_machine(machine)?;
     let Some(mut resume) = guest_resume_command(machine)? else {
         return Ok(());
     };
@@ -5880,6 +5900,12 @@ fn find_debug_machine(
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name().to_string_lossy().to_string();
+            // A marker written before the door rule existed can carry any
+            // bytes a worker chose, and this listing feeds a path join and a
+            // guest tool's argv, so a non-conforming file is not offered.
+            if !plausible_machine_name(&name) {
+                return None;
+            }
             if let Some(prefix) = prefix {
                 if name.contains(prefix) {
                     Some(name)
@@ -8309,6 +8335,98 @@ mod tests {
         assert!(
             !probe_engine_health_within(&client, &base, LOOPBACK_PROBE_TIMEOUT).await,
             "the loopback budget still refuses a stalled endpoint"
+        );
+    }
+
+    #[test]
+    fn guest_helpers_refuse_a_hostile_machine_name() {
+        // These helpers are the only places that address a guest, and the name
+        // may come from the engine's session projection. The refusal happens
+        // before the backend is consulted, so it holds whichever backend is
+        // configured; `PRELOOP_HOME` points at a scratch dir so a regressed
+        // guard cannot run a tool that writes under the operator's real home.
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("PRELOOP_HOME");
+        unsafe { std::env::set_var("PRELOOP_HOME", home.path()) };
+
+        let mut refusals: Vec<(&str, Option<String>)> = Vec::new();
+        for hostile in [
+            "../../../../etc/passwd",
+            "/tmp/x",
+            "-flag",
+            "a b",
+            "nul\0byte",
+        ] {
+            refusals.extend([
+                (
+                    hostile,
+                    guest_exec_command(hostile).err().map(|e| e.to_string()),
+                ),
+                (
+                    hostile,
+                    guest_shell_command(hostile).err().map(|e| e.to_string()),
+                ),
+                (
+                    hostile,
+                    guest_upload_command(hostile, "/tmp/local", "/work/remote")
+                        .err()
+                        .map(|e| e.to_string()),
+                ),
+                (
+                    hostile,
+                    guest_resume_command(hostile).err().map(|e| e.to_string()),
+                ),
+                (
+                    hostile,
+                    resume_guest_if_needed(hostile).err().map(|e| e.to_string()),
+                ),
+            ]);
+        }
+
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("PRELOOP_HOME", previous) },
+            None => unsafe { std::env::remove_var("PRELOOP_HOME") },
+        }
+
+        for (hostile, message) in refusals {
+            let message = message.unwrap_or_else(|| panic!("{hostile:?} must be refused"));
+            assert!(
+                message.contains("refusing to address a guest"),
+                "{hostile:?} was refused with an unexpected error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostile_marker_file_is_never_offered_as_a_machine() {
+        // `preloop shell` takes this listing's winner, joins it into
+        // `$PRELOOP_HOME/state/debug/<name>`, and hands it to a guest tool, so
+        // a stale marker written before the door rule existed — or a name
+        // that only looks like a prefix match — must not be offered.
+        let directory = tempfile::tempdir().unwrap();
+        for hostile in ["-flag", ".hidden", "a..b", "a b", "x:y"] {
+            std::fs::write(directory.path().join(hostile), "stale").unwrap();
+        }
+        let error = find_debug_machine(directory.path(), None).unwrap_err();
+        assert!(
+            error.to_string().contains("no preserved VMs found"),
+            "{error}"
+        );
+        let error = find_debug_machine(directory.path(), Some(&"hid".to_owned())).unwrap_err();
+        assert!(
+            error.to_string().contains("no preserved VMs found"),
+            "{error}"
+        );
+
+        std::fs::write(directory.path().join("preloop-runner-0-1"), "claimed").unwrap();
+        assert_eq!(
+            find_debug_machine(directory.path(), None).unwrap(),
+            "preloop-runner-0-1"
+        );
+        assert_eq!(
+            find_debug_machine(directory.path(), Some(&"runner".to_owned())).unwrap(),
+            "preloop-runner-0-1"
         );
     }
 }

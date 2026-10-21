@@ -717,6 +717,7 @@ pub(crate) fn remove_run_everywhere(
     // `pending_expansions`) is a scheduling table now: the backend's
     // `DELETE FROM runs` cascades it, and memory holds no copy.
     inner.dap_ports.remove(&run_id);
+    inner.dap_registration_locks.remove(&run_id);
 
     // Plan-keyed secret maskers are derived from the run's own secrets; the
     // run's plans are gone, so the cached arcs would only be reclaimed by a

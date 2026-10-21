@@ -838,6 +838,10 @@ pub(crate) async fn complete_job_settling(
         let mut inner = shared.state.inner.lock().await;
         crate::live_logs::close_live_log(&mut inner, &live_log_key);
         inner.dap_ports.remove(&completion.run_id);
+        // The run cannot accept a registration anymore, so the mutex that
+        // serialized them is dead weight. An in-flight registration holds its
+        // own `Arc` and finishes against a map entry nobody reads.
+        inner.dap_registration_locks.remove(&completion.run_id);
     }
     // Refresh the next-job labels from the committed scheduling state. The
     // ready-queue depth itself now comes from the 5s sampler snapshot.

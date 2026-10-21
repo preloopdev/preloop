@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use preloop_gha_protocol::debug_session::{
     ChangeCategory, DebugSession, RevertPolicy, SessionLeaseRequest, SessionLeaseResponse,
     SessionOperation, SessionOperationRequest, SessionOperationResponse, StepSummary, Verdict,
-    WorkspaceChange,
+    WorkspaceChange, plausible_machine_name,
 };
 
 /// Claims the engine's host-side attach marker for the duration of a
@@ -49,6 +49,12 @@ impl DebugAttach {
         let Some(machine) = machine else {
             return Ok(None);
         };
+        if !plausible_machine_name(machine) {
+            anyhow::bail!(
+                "session records an unusable machine name {machine:?} — refusing to \
+                 touch `$PRELOOP_HOME/state/debug`"
+            );
+        }
         let marker = crate::preloop_home()
             .join("state")
             .join("debug")
@@ -2264,5 +2270,82 @@ mod tests {
             run_in_guest(&session(), "echo hi");
             assert_sandbox_carried(executable);
         });
+    }
+
+    #[test]
+    fn every_machine_name_the_vm_crate_builds_passes_the_shared_predicate() {
+        // The engine validates the names it creates with
+        // `preloop_vm::MachineName`, and this process refuses anything the
+        // shared predicate rejects before the name reaches a path join or a
+        // guest tool's argv. If the two rules drift so that a real machine name
+        // fails the predicate, `claim` would stop guarding the operator's own
+        // VMs, so a name the engine accepts must always pass.
+        let candidates = [
+            "preloop-runner-0-1".to_owned(),
+            "a".repeat(63),
+            "a".to_owned(),
+            "A1-b2".to_owned(),
+            "x-y-z".to_owned(),
+            format!("preloop-runner-{}-{}", 3, 17),
+        ];
+        for candidate in &candidates {
+            if preloop_vm::MachineName::new(candidate.clone()).is_ok() {
+                assert!(
+                    plausible_machine_name(candidate),
+                    "{candidate:?} is a valid MachineName but the predicate refuses it"
+                );
+            }
+        }
+        assert!(
+            plausible_machine_name(&format!("preloop-runner-{}-{}", 3, 17)),
+            "the pool's {{prefix}}-{{slot}}-{{gen}} shape must pass the predicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_a_hostile_machine_name_before_touching_the_home() {
+        // The guard runs before the marker path is built, so the write cannot
+        // happen even when the parent directories exist. `PRELOOP_HOME` is a
+        // scratch dir and the traversal target lands inside it, so a regressed
+        // guard cannot touch anything outside the tempdir.
+        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("PRELOOP_HOME");
+        unsafe { std::env::set_var("PRELOOP_HOME", home.path()) };
+
+        let absolute = home.path().join("absolute-sentinel");
+        let absolute = absolute.to_str().unwrap().to_owned();
+        let traversal_error = DebugAttach::claim(Some("../../sentinel"))
+            .await
+            .err()
+            .expect("a traversal name must be refused");
+        let absolute_error = DebugAttach::claim(Some(&absolute))
+            .await
+            .err()
+            .expect("an absolute name must be refused");
+
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("PRELOOP_HOME", previous) },
+            None => unsafe { std::env::remove_var("PRELOOP_HOME") },
+        }
+
+        for error in [&traversal_error, &absolute_error] {
+            assert!(
+                error.to_string().contains("unusable machine name"),
+                "{error}"
+            );
+        }
+        assert!(
+            !home.path().join("sentinel").exists(),
+            "the traversal target must not exist"
+        );
+        assert!(
+            !std::path::Path::new(&absolute).exists(),
+            "the absolute target must not exist"
+        );
+        assert!(
+            !home.path().join("state").exists(),
+            "no marker path may be created for a refused name"
+        );
     }
 }

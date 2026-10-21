@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **A finished debug session no longer accepts controller mutations.** An
+  operation against a session that is no longer open — `resumed`, `aborted`, or
+  `abandoned` — is rejected with `400`, and the rejection is not recorded,
+  while a previously successful request ID still replays its recorded response.
+  A closed session ends the worker's verdict poll, so a held job resumes
+  instead of hanging. An issued verdict — `continue`, `abort`, or `retry` — is
+  redelivered on every poll until the worker reports the close, so a lost HTTP
+  response cannot turn the decision into "no decision" or strand the worker on
+  a session that will never answer again.
+
+- **DAP port registration is bound to the runner that currently owns the job.**
+  Only that runner may register a port for the job with its listen token at
+  `POST /api/v1/runs/RUN_ID/debug`; another runner gets `403`. A registration
+  is replaced when it is for the same job — any owner, so a reclaim or hand-off
+  can repair the port — or when the registered job is no longer in progress; a
+  registration for a different job that is still in progress is refused with
+  `409`. The ownership read is repeated under the lock that publishes the
+  registration, so a hand-off that commits between the check and the write
+  cannot leave a runner that no longer serves the job holding its port. This
+  binds listen-token registrations only: it does not repair the
+  worker's own registration, which is separately broken and predates this
+  change, and the legacy DAP proxy still connects to the fixed local port
+  `4711` when nothing is registered.
+
+- **Worker-supplied machine names are restricted before they reach a host path
+  or a guest-tool argument.** A name must be ASCII letters, digits, `-`, `_`,
+  or `.`, start with a letter or digit, contain no `..`, and be at most 63
+  bytes. The server drops any other name at the session door and the CLI
+  refuses it before any path join or guest-tool invocation.
+
 ## [0.35.5] - 2026-10-21
 
 ### Security

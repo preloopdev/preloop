@@ -2803,21 +2803,42 @@ jobs:
 
     // Official runner batch shape: `ActionReferenceList` of
     // `{nameWithOwner, ref, path}`. Local (`./`) and docker refs are dropped.
-    let response = request_json(
-        &app,
-        Method::POST,
-        &format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}"),
-        json!({
-            "actions": [
-                {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""},
-                {"nameWithOwner": "owner/repo", "ref": "main", "path": "sub/dir"},
-                {"nameWithOwner": "actions/setup-node.js", "ref": "v4", "path": ""},
-                {"nameWithOwner": "./.github/actions/local", "ref": ""},
-                {"nameWithOwner": "docker://alpine:3.20", "ref": ""}
-            ]
-        }),
-    )
-    .await;
+    //
+    // The ref→SHA lookup is best-effort by contract: a transient failure leaves
+    // the ref in the ticket and caches the miss for `ACTION_SHA_NEGATIVE_TTL`
+    // (60 s). A loaded CI host can fail one lookup while its siblings succeed
+    // (shard 4, run cfcc9f74), so retry once from a cleared cache before
+    // asserting the pinned shape — the mock answers deterministically, so a
+    // second miss means the behavior under test is broken.
+    let payload = json!({
+        "actions": [
+            {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""},
+            {"nameWithOwner": "owner/repo", "ref": "main", "path": "sub/dir"},
+            {"nameWithOwner": "actions/setup-node.js", "ref": "v4", "path": ""},
+            {"nameWithOwner": "./.github/actions/local", "ref": ""},
+            {"nameWithOwner": "docker://alpine:3.20", "ref": ""}
+        ]
+    });
+    let batch_url = format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}");
+    let expected_refs = [
+        "actions/checkout@v4",
+        "owner/repo@main",
+        "actions/setup-node.js@v4",
+    ];
+    let all_pinned = |response: &serde_json::Value| {
+        expected_refs
+            .iter()
+            .all(|key| response["actions"][*key]["resolvedSha"].is_string())
+    };
+    let mut response = request_json(&app, Method::POST, &batch_url, payload.clone()).await;
+    if !all_pinned(&response) {
+        state.action_sha_cache.lock().unwrap().clear();
+        response = request_json(&app, Method::POST, &batch_url, payload).await;
+        assert!(
+            all_pinned(&response),
+            "ref→SHA lookup stayed unavailable across a retry: {response}"
+        );
+    }
 
     // Reply is an `ActionDownloadInfoCollection`: `actions` keyed by
     // `nameWithOwner@ref`, each entry an `ActionDownloadInfo`.
