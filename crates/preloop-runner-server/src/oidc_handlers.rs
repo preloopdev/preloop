@@ -548,9 +548,7 @@ mod tests {
     impl OidcJob {
         /// Submit the standard OIDC workflow with an operator
         /// `[token_permissions_ceiling]` installed on the state first.
-        async fn submit_with_ceiling(
-            ceiling: crate::config::TokenPermissionsCeiling,
-        ) -> Self {
+        async fn submit_with_ceiling(ceiling: crate::config::TokenPermissionsCeiling) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
             state.token_permissions_ceiling = Some(ceiling);
