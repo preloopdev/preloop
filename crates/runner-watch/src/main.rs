@@ -4868,10 +4868,7 @@ mod tests {
     fn replay_workflow_submissions_materializes_scenario_07_workflow() {
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let scenario_root = workspace_root.join("experiments/mitm/scenarios");
-        let golden_root = workspace_root.join(format!(
-            ".runner-watch/golden/v{}/07-step-failure",
-            golden_runner_version()
-        ));
+        let golden_root = golden_scenario_dir(&workspace_root, "07-step-failure");
         let submissions = replay_workflow_submissions(&golden_root, &scenario_root)
             .expect("checked-in scenario 07 replay metadata should be readable");
 
@@ -4960,6 +4957,41 @@ mod tests {
             (parts.next(), parts.next(), parts.next())
         });
         versions.pop().unwrap_or(pinned)
+    }
+
+    /// Golden directory for `scenario`: the shipped runner's corpus when its
+    /// flat capture exists, otherwise the newest corpus that has it.
+    ///
+    /// `runner_version` can move ahead of the flat captures — v2.337.0 carries
+    /// only nested `gh-official/*` captures, while the older flat scenarios
+    /// live under v2.336.0. Reading the pin blindly turns this replay test
+    /// into a missing-file panic instead of exercising the materializer.
+    fn golden_scenario_dir(workspace_root: &Path, scenario: &str) -> PathBuf {
+        let golden_root = workspace_root.join(".runner-watch/golden");
+        let pinned = golden_root.join(format!("v{}/{scenario}", golden_runner_version()));
+        if pinned.join("flows.jsonl").is_file() {
+            return pinned;
+        }
+        let Ok(entries) = std::fs::read_dir(&golden_root) else {
+            return pinned;
+        };
+        let mut versions: Vec<(Vec<u64>, PathBuf)> = entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| {
+                let version = entry.file_name().into_string().ok()?;
+                let version = version.strip_prefix('v')?;
+                let candidate = entry.path().join(scenario);
+                candidate.join("flows.jsonl").is_file().then(|| {
+                    let key = version
+                        .split('.')
+                        .map(|part| part.parse().unwrap_or(0))
+                        .collect();
+                    (key, candidate)
+                })
+            })
+            .collect();
+        versions.sort_by(|left, right| left.0.cmp(&right.0));
+        versions.pop().map(|(_, path)| path).unwrap_or(pinned)
     }
 
     /// Minimal isolated temp directory (runner-watch has no tempfile dev-dep;

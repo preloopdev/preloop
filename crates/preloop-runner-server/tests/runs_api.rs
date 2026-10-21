@@ -3779,7 +3779,13 @@ async fn action_download_requires_a_ticket_for_the_action_it_serves() {
         .unwrap()
         .as_secs()
         + 3600;
-    let good = state.sign_action_ticket("acme", "public-action", "v1", future);
+    let good = state.sign_action_ticket(
+        crate::blob_store::BLOB_SYSTEM_OWNER,
+        "acme",
+        "public-action",
+        "v1",
+        future,
+    );
 
     let get = |uri: String| {
         let app = app.clone();
@@ -3808,7 +3814,7 @@ async fn action_download_requires_a_ticket_for_the_action_it_serves() {
     // exfiltration path: ask for a repo the workflow was never granted.
     assert_eq!(
         get(format!(
-            "/api/v1/actions/download/acme/private/v1?exp={future}&sig={good}"
+            "/api/v1/actions/download/acme/private/v1?exp={future}&job=system&sig={good}"
         ))
         .await,
         StatusCode::NOT_FOUND,
@@ -3818,7 +3824,7 @@ async fn action_download_requires_a_ticket_for_the_action_it_serves() {
     // Right action, forged signature.
     assert_eq!(
         get(format!(
-            "/api/v1/actions/download/acme/public-action/v1?exp={future}&sig=AAAA"
+            "/api/v1/actions/download/acme/public-action/v1?exp={future}&job=system&sig=AAAA"
         ))
         .await,
         StatusCode::NOT_FOUND,
@@ -3831,10 +3837,16 @@ async fn action_download_requires_a_ticket_for_the_action_it_serves() {
         .unwrap()
         .as_secs()
         - 1;
-    let stale = state.sign_action_ticket("acme", "public-action", "v1", past);
+    let stale = state.sign_action_ticket(
+        crate::blob_store::BLOB_SYSTEM_OWNER,
+        "acme",
+        "public-action",
+        "v1",
+        past,
+    );
     assert_eq!(
         get(format!(
-            "/api/v1/actions/download/acme/public-action/v1?exp={past}&sig={stale}"
+            "/api/v1/actions/download/acme/public-action/v1?exp={past}&job=system&sig={stale}"
         ))
         .await,
         StatusCode::NOT_FOUND,
@@ -3844,7 +3856,7 @@ async fn action_download_requires_a_ticket_for_the_action_it_serves() {
     // The ticket it was actually minted for.
     assert_eq!(
         get(format!(
-            "/api/v1/actions/download/acme/public-action/v1?exp={future}&sig={good}"
+            "/api/v1/actions/download/acme/public-action/v1?exp={future}&job=system&sig={good}"
         ))
         .await,
         StatusCode::OK,
@@ -3889,14 +3901,20 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .unwrap()
         .as_secs()
         + 3600;
-    let signature = state.sign_action_ticket("test-owner", "test-repo", "v1", expires_at);
+    let signature = state.sign_action_ticket(
+        crate::blob_store::BLOB_SYSTEM_OWNER,
+        "test-owner",
+        "test-repo",
+        "v1",
+        expires_at,
+    );
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
                 .uri(format!(
-                    "/api/v1/actions/download/test-owner/test-repo/v1?exp={expires_at}&sig={signature}"
+                    "/api/v1/actions/download/test-owner/test-repo/v1?exp={expires_at}&job=system&sig={signature}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -3913,7 +3931,13 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     assert_eq!(bytes.as_ref(), b"dummy-tar-content");
 
     // 1b. Successful cache hit for dotted repo name and special character in tag
-    let dotted_sig = state.sign_action_ticket("test.owner", "test.repo.js", "v1#tag", expires_at);
+    let dotted_sig = state.sign_action_ticket(
+        crate::blob_store::BLOB_SYSTEM_OWNER,
+        "test.owner",
+        "test.repo.js",
+        "v1#tag",
+        expires_at,
+    );
     let enc_ref = percent_encode_path_segment("v1#tag");
     let response = app
         .clone()
@@ -3921,7 +3945,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
             Request::builder()
                 .method(Method::GET)
                 .uri(format!(
-                    "/api/v1/actions/download/test.owner/test.repo.js/{enc_ref}?exp={expires_at}&sig={dotted_sig}"
+                    "/api/v1/actions/download/test.owner/test.repo.js/{enc_ref}?exp={expires_at}&job=system&sig={dotted_sig}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -3948,7 +3972,13 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     tokio::fs::write(pct_dir.join("action.tar.gz"), b"pct-tar-content")
         .await
         .unwrap();
-    let pct_sig = state.sign_action_ticket("test-owner", "test-repo", "v1%tag", expires_at);
+    let pct_sig = state.sign_action_ticket(
+        crate::blob_store::BLOB_SYSTEM_OWNER,
+        "test-owner",
+        "test-repo",
+        "v1%tag",
+        expires_at,
+    );
     let enc_pct_ref = percent_encode_path_segment("v1%tag"); // "v1%25tag"
     let response = app
         .clone()
@@ -3956,7 +3986,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
             Request::builder()
                 .method(Method::GET)
                 .uri(format!(
-                    "/api/v1/actions/download/test-owner/test-repo/{enc_pct_ref}?exp={expires_at}&sig={pct_sig}"
+                    "/api/v1/actions/download/test-owner/test-repo/{enc_pct_ref}?exp={expires_at}&job=system&sig={pct_sig}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -3996,14 +4026,20 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     let miss_temp = tempfile::tempdir().unwrap();
     let miss_state = AppState::new(miss_temp.path().to_path_buf()).await.unwrap();
     let miss_app = crate::routes::app(miss_state.clone(), CancellationToken::new());
-    let miss_sig = miss_state.sign_action_ticket("test-owner", "test-repo", "v1#beta", expires_at);
+    let miss_sig = miss_state.sign_action_ticket(
+        crate::blob_store::BLOB_SYSTEM_OWNER,
+        "test-owner",
+        "test-repo",
+        "v1#beta",
+        expires_at,
+    );
     let enc_hash_ref = percent_encode_path_segment("v1#beta");
     let response = miss_app
         .oneshot(
             Request::builder()
                 .method(Method::GET)
                 .uri(format!(
-                    "/api/v1/actions/download/test-owner/test-repo/{enc_hash_ref}?exp={expires_at}&sig={miss_sig}"
+                    "/api/v1/actions/download/test-owner/test-repo/{enc_hash_ref}?exp={expires_at}&job=system&sig={miss_sig}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -4062,8 +4098,13 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
 
     // action_download_ticket returns None for absolute refs
     assert!(
-        crate::actions::action_download_ticket(&state, "test-owner/test-repo@/tmp/escape", None)
-            .is_none()
+        crate::actions::action_download_ticket(
+            &state,
+            crate::blob_store::BLOB_SYSTEM_OWNER,
+            "test-owner/test-repo@/tmp/escape",
+            None,
+        )
+        .is_none()
     );
 }
 
@@ -4359,3 +4400,9 @@ jobs:
         "a settled job token must not mint an action ticket"
     );
 }
+
+#[path = "support/credential_lifecycle.rs"]
+mod credential_lifecycle;
+
+#[path = "support/token_revocation.rs"]
+mod token_revocation;

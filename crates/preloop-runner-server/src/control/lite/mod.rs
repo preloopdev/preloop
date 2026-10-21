@@ -40,6 +40,7 @@ pub(crate) use testview::TestDb;
 #[cfg(test)]
 mod tests;
 mod timelines;
+mod token_revocation;
 mod webhooks;
 
 use super::types::*;

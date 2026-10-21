@@ -877,6 +877,15 @@ pub async fn broker_acquire_job(
         });
     let mut token_applied = false;
     let mut token_untrusted = false;
+    // Every job-owned installation token is tracked against the attempt that
+    // will receive it, so terminal completion/cancel/retry/timeout paths can
+    // revoke it. Side-channel mints elsewhere deliberately do not use this.
+    let provenance = crate::github_token_revocation::JobTokenProvenance {
+        request_id,
+        run_id,
+        job_id: ctx.request.job_id.clone(),
+        agent_job_id: ctx.request.agent_job_id,
+    };
     let token_request = github_token_request;
     if let Some(token_request) = token_request {
         token_untrusted = token_request.untrusted;
@@ -892,7 +901,7 @@ pub async fn broker_acquire_job(
         // until the 600s disconnect reaper notices. A refusal under the `error`
         // policy is a configuration fault that no retry can clear, so the claim
         // is failed terminally instead of being returned to the queue.
-        let minted = match mint_dispatch_github_token(&shared, &token_request).await {
+        let minted = match mint_dispatch_github_token(&shared, &token_request, &provenance).await {
             Ok(minted) => minted,
             Err(error) => {
                 fail_unclaimable_request(&shared, request_id).await;
@@ -901,7 +910,7 @@ pub async fn broker_acquire_job(
         };
         if let Some(minted) = minted {
             tracing::info!(
-                token_len = minted.token.len(),
+                token_len = minted.token.expose().len(),
                 "minted dispatch GitHub token at claim"
             );
             apply_minted_token_to_message(&mut message, &minted, false);
@@ -921,7 +930,14 @@ pub async fn broker_acquire_job(
         // fetch fails on auth. Re-derive the request from the run's
         // submission and the job's declared permissions — the same inputs
         // `build_job_artifacts` used — and mint under that policy.
-        let derived = if shared.state.github_app.is_none() {
+        // Under `error` the request must be derived even with no App at all:
+        // the mint attempt then refuses loudly instead of the common PAT
+        // fallback silently supplying a credential the operator forbade.
+        let app_configured =
+            shared.state.github_app.is_some() || shared.state.github_apps.is_some();
+        let error_policy =
+            shared.state.github_mint_failure == crate::github_app::MintFailurePolicy::Error;
+        let derived = if !app_configured && !error_policy {
             None
         } else {
             // The wire variable carries repository-token scopes only; the
@@ -969,16 +985,17 @@ pub async fn broker_acquire_job(
                 repository = %token_request.repository,
                 "broker acquire: re-derived missing dispatch token request at claim"
             );
-            let minted = match mint_dispatch_github_token(&shared, &token_request).await {
-                Ok(minted) => minted,
-                Err(error) => {
-                    fail_unclaimable_request(&shared, request_id).await;
-                    return Err(error);
-                }
-            };
+            let minted =
+                match mint_dispatch_github_token(&shared, &token_request, &provenance).await {
+                    Ok(minted) => minted,
+                    Err(error) => {
+                        fail_unclaimable_request(&shared, request_id).await;
+                        return Err(error);
+                    }
+                };
             if let Some(minted) = minted {
                 tracing::info!(
-                    token_len = minted.token.len(),
+                    token_len = minted.token.expose().len(),
                     "minted re-derived dispatch GitHub token at claim"
                 );
                 apply_minted_token_to_message(&mut message, &minted, true);
@@ -1018,6 +1035,21 @@ pub async fn broker_acquire_job(
                 ctx.id_token_granted.unwrap_or(false),
             )
             .fork_restricted;
+        if !fork_restricted
+            && shared.state.github_mint_failure == crate::github_app::MintFailurePolicy::Error
+        {
+            // Defence in depth: `mint_dispatch_github_token` and the derived
+            // request path already refuse under this policy. Never inject the
+            // static PAT here — it is repository-unscoped and ignores
+            // `permissions:`, exactly what the operator forbade.
+            fail_unclaimable_request(&shared, request_id).await;
+            return Err(ApiError::bad_gateway(
+                "PRELOOP_GITHUB_APP_MINT_FAILURE=error: refusing to dispatch a job without a \
+                 GitHub App installation token; no static PAT fallback is permitted. Configure \
+                 a GitHub App that covers this repository (and install it on the owner), or set \
+                 mint_failure to `local`/`pat` explicitly",
+            ));
+        }
         if !fork_restricted && let Some(pat) = shared.state.static_github_pat() {
             // A static PAT is embedded only when its OAuth scopes are
             // verified (fresh cache, or re-introspected here: the job may have
@@ -1034,7 +1066,7 @@ pub async fn broker_acquire_job(
                     apply_minted_token_to_message(
                         &mut message,
                         &MintedGitHubToken {
-                            token: pat,
+                            token: preloop_gha_protocol::SecretString::new(pat),
                             effective_permissions: None,
                         },
                         false,
@@ -1240,7 +1272,7 @@ pub fn re_mint_snapshot_credentials(
 /// grant everything requested, the set the token actually carries.
 #[derive(Debug)]
 pub struct MintedGitHubToken {
-    pub token: String,
+    pub token: preloop_gha_protocol::SecretString,
     pub effective_permissions: Option<BTreeMap<String, String>>,
 }
 
@@ -1263,14 +1295,14 @@ pub(crate) fn apply_minted_token_to_message(
     minted: &MintedGitHubToken,
     re_derived: bool,
 ) {
-    let token = &minted.token;
+    let token = minted.token.expose();
     message.variables.insert(
         "system.github.token".to_owned(),
-        preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+        preloop_gha_protocol::azdo::VariableValue::secret(token.to_owned()),
     );
     message.variables.insert(
         "github_token".to_owned(),
-        preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+        preloop_gha_protocol::azdo::VariableValue::secret(token.to_owned()),
     );
     // Restate only repository-token scopes when an installation narrowed the
     // mint. OIDC and other Actions-only capabilities have dedicated protocol
@@ -1293,7 +1325,7 @@ pub(crate) fn apply_minted_token_to_message(
         Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) => {
             github.insert(
                 "token".to_owned(),
-                preloop_gha_protocol::azdo::PipelineContextData::String(token.clone()),
+                preloop_gha_protocol::azdo::PipelineContextData::String(token.to_owned()),
             );
             if !re_derived {
                 tracing::info!("patched minted token into github context");
@@ -1311,7 +1343,7 @@ pub(crate) fn apply_minted_token_to_message(
 /// bookkeeping `broker_complete_job` performs so the run summary, the session
 /// slot and the concurrency release all behave as they do for a
 /// runner-reported failure.
-async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
+pub(crate) async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
     // One transaction: drop the deferred token request (nothing will consume
     // it, and leaving it behind keeps the job's requested permissions alive
     // for a request that is already terminal), clear the session binding and
@@ -1454,6 +1486,7 @@ pub async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usize {
 pub async fn mint_dispatch_github_token(
     shared: &Arc<SharedState>,
     request: &GitHubTokenRequest,
+    provenance: &crate::github_token_revocation::JobTokenProvenance,
 ) -> Result<Option<MintedGitHubToken>, ApiError> {
     let started = std::time::Instant::now();
     let Some(app) = crate::github_app::select_app_for_repo(shared, &request.repository).await
@@ -1461,13 +1494,31 @@ pub async fn mint_dispatch_github_token(
         // No registered GitHub App covers this repository. The legacy
         // single-App path always had an App, so mint failures flowed through
         // the configured mint-failure policy; apply the default App's policy
-        // rather than silently bypassing it. An untrusted fork job must never
-        // fall back to the PAT (it is repository-unscoped and ignores
-        // `permissions:`), so it keeps the local runtime token instead.
+        // rather than silently bypassing it. With no App at all the same
+        // operator policy still decides: `error` must refuse instead of
+        // letting the broker's common PAT fallback run. An untrusted fork job
+        // must never fall back to the PAT (it is repository-unscoped and
+        // ignores `permissions:`), so it keeps the local runtime token.
         if request.untrusted {
             return Ok(None);
         }
         let Some(default_app) = &shared.state.github_app else {
+            // No App is configured at all. `error` still refuses here; the
+            // other policies keep their historic behaviour and leave the
+            // common, scope-verified PAT fallback to the acquire path.
+            if shared.state.github_mint_failure == crate::github_app::MintFailurePolicy::Error {
+                return Err(ApiError::bad_gateway(format!(
+                    "No GitHub App installation token can be minted for {}: no GitHub App is \
+                     configured and PRELOOP_GITHUB_APP_MINT_FAILURE=error forbids the static PAT \
+                     fallback. Configure a GitHub App (and install it on the repository owner) \
+                     or set mint_failure to `local`/`pat` explicitly",
+                    request.repository
+                )));
+            }
+            warn!(
+                repository = %request.repository,
+                "No GitHub App is configured; job retains the local runtime token or the scope-verified PAT fallback"
+            );
             return Ok(None);
         };
         warn!(
@@ -1480,7 +1531,10 @@ pub async fn mint_dispatch_github_token(
         )
         .map_err(|refusal| {
             ApiError::bad_gateway(format!(
-                "GitHub App token minting failed for {}: {refusal}",
+                "No GitHub App installation token can be minted for {} because no registered \
+                 GitHub App covers that repository: {refusal}. Install the App on the \
+                 repository owner, or set PRELOOP_GITHUB_APP_MINT_FAILURE=local or `pat` \
+                 explicitly if a static credential fallback is intended",
                 request.repository
             ))
         })?;
@@ -1496,7 +1550,7 @@ pub async fn mint_dispatch_github_token(
                     "No registered GitHub App covers the repository; using configured PAT fallback"
                 );
                 Some(MintedGitHubToken {
-                    token,
+                    token: preloop_gha_protocol::SecretString::new(token),
                     effective_permissions: None,
                 })
             }
@@ -1538,15 +1592,31 @@ pub async fn mint_dispatch_github_token(
     )
     .await
     {
-        Ok((token, narrowed)) => {
+        Ok(minted) => {
             // The token carries the clamped set when the ceiling reduced the
             // request (or when the installation narrowed it): restate it so
             // the wire `system.github.token.permissions` variable reports
             // what the token actually carries.
-            let effective_permissions =
-                narrowed.or_else(|| ceiling_clamped.then(|| ceiling.permissions.clone()));
+            let effective_permissions = minted
+                .effective_permissions
+                .clone()
+                .or_else(|| ceiling_clamped.then(|| ceiling.permissions.clone()));
+            // Durability gate: the revocation row commits before this token
+            // can reach a job message. A tracking failure revokes the fresh
+            // credential inline (best effort) and refuses the dispatch.
+            crate::github_token_revocation::track_job_token(
+                shared,
+                provenance.clone(),
+                minted.token.expose(),
+                minted.expires_at,
+                &app.app_id,
+                minted.installation_id,
+                &request.repository,
+            )
+            .await
+            .map_err(ApiError::bad_gateway)?;
             Some(MintedGitHubToken {
-                token,
+                token: minted.token,
                 effective_permissions,
             })
         }
@@ -1590,7 +1660,7 @@ pub async fn mint_dispatch_github_token(
                 );
             }
             fallback.map(|token| MintedGitHubToken {
-                token,
+                token: preloop_gha_protocol::SecretString::new(token),
                 effective_permissions: None,
             })
         }
@@ -1671,6 +1741,34 @@ pub async fn broker_complete_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
+    // A single-use runner's registration may already be gone (immediate
+    // post-terminal purge) while the runner retries a completion the server
+    // already accepted. Permit only the exact, already-settled attempt as a
+    // no-op: nothing is written, no credential is revived, and the token
+    // still may not claim or read anything.
+    if let Some(bearer) = crate::auth::bearer_from_headers(&headers)
+        && let Some(job) = shared.state.job_uuid_from_token(bearer)
+        && job == request.job_id
+        && let Ok(record) = shared
+            .state
+            .backend
+            .request(crate::control::backend::RequestKey::AgentJobId(job))
+            .await
+        && record.result.is_some()
+        && record.owner_runner_id == Some(runner_id)
+        && shared
+            .state
+            .verify_local_jwt_claims(bearer)
+            .and_then(|claims| {
+                claims
+                    .get("scp")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .is_some_and(|scope| scope == format!("Actions.Results:{}:{}", record.plan_id, job))
+    {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     authenticated_runner_id_for_job(
         &shared,
         &headers,

@@ -167,6 +167,9 @@ async fn authorize_live_log_read(
     if key != caller.to_string() {
         return Err(ApiError::forbidden("live-log read job mismatch"));
     }
+    // Reads are job-scoped too: a settled or lease-expired attempt's token
+    // must not keep following (or reopening) its retained feed.
+    crate::auth::require_live_job(&shared.state, caller).await?;
     Ok((key, job_id.to_owned()))
 }
 
@@ -387,20 +390,16 @@ pub async fn ws_live_logs(
         };
         // Unresolved and foreign targets share one generic 403: distinct
         // messages would reveal whether the job UUID resolves.
-        crate::auth::authorize_reporting_request(&shared.state, &headers, request.as_ref())
-            .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
-        // A settled attempt's credential is spent. Reads of its retained feed
-        // stay available (`live_log_stream`), but a *frame* from it must not
+        // A settled attempt's credential is spent. A *frame* from it must not
         // be accepted: `record_live_log_wrapper` reopens a closed key by
         // clearing its retained tail, so a replayed credential could wipe a
-        // completed job's history and forge lines into it. Same rule the
-        // Results writes apply (`auth::require_live_results_job`); a retry
-        // streams under its own, live attempt's credential.
-        if let Some(record) = request.as_ref()
-            && matches!(record.result, Some(status) if status.is_terminal())
-        {
-            return Err(ApiError::forbidden("live-log ingest job is not live"));
-        }
+        // completed job's history and forge lines into it. The liveness rule
+        // also covers cancellation, the reaper's deadline flag, and an expired
+        // lease — not just a settled request row; a retry streams under its
+        // own, live attempt's credential.
+        crate::auth::authorize_live_reporting_request(&shared.state, &headers, request.as_ref())
+            .await
+            .map_err(|_| ApiError::forbidden("live-log ingest job is not live"))?;
         Some(agent_job_id)
     } else {
         None

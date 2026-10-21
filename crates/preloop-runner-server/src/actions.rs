@@ -387,6 +387,10 @@ pub fn percent_encode_path_segment(input: &str) -> String {
 pub struct ActionTicketQuery {
     #[serde(default)]
     exp: Option<u64>,
+    /// Owning job (`system` for control-plane-minted tickets). Covered by the
+    /// HMAC, so it cannot be swapped for another job's id.
+    #[serde(default)]
+    job: Option<String>,
     #[serde(default)]
     sig: Option<String>,
 }
@@ -425,15 +429,35 @@ pub async fn download_action_tarball(
     // make the engine fetch an arbitrary repository with the engine's own
     // GitHub credential. Answer 404 rather than 403: an unauthorised caller
     // learns nothing about which actions exist.
+    let owner_job = ticket
+        .job
+        .as_deref()
+        .filter(|job| !job.is_empty())
+        .unwrap_or("");
     let authorised = match (ticket.exp, ticket.sig.as_deref()) {
-        (Some(expires_at), Some(signature)) => shared
+        (Some(expires_at), Some(signature)) if !owner_job.is_empty() => shared
             .state
-            .verify_action_ticket(&owner, &repo, &git_ref, expires_at, signature),
+            .verify_action_ticket(owner_job, &owner, &repo, &git_ref, expires_at, signature),
         _ => false,
     };
     if !authorised {
         warn!("rejected action download with missing or invalid ticket: {owner}/{repo}@{git_ref}");
         return Err(ApiError::not_found("action archive not found"));
+    }
+    // The URL is a derived credential handed to a job. Stop serving it once
+    // that job is no longer live, instead of leaving a 20-minute replay
+    // window after completion/cancellation/timeout. Control-plane tickets
+    // (`system`) have no job to check.
+    if owner_job != crate::blob_store::BLOB_SYSTEM_OWNER {
+        let job = owner_job
+            .parse::<uuid::Uuid>()
+            .map_err(|_| ApiError::not_found("action archive not found"))?;
+        if !crate::auth::job_is_live(&shared.state, job)
+            .await
+            .map_err(|_| ApiError::not_found("action archive not found"))?
+        {
+            return Err(ApiError::not_found("action archive not found"));
+        }
     }
 
     let cache_dir = shared
@@ -619,6 +643,7 @@ pub async fn download_action_tarball(
 
 pub fn action_download_ticket(
     state: &AppState,
+    job: &str,
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, serde_json::Value)> {
@@ -658,20 +683,23 @@ pub fn action_download_ticket(
     let runner_url = runner_base_url();
     // The download route is bearerless and reachable from inside runner VMs,
     // so the URL itself has to be the capability: signed, scoped to this one
-    // action, and short-lived (20 minutes — minted at job setup and used
-    // within minutes, so a leaked URL is a briefly-open window).
+    // action and this owning job, and short-lived (20 minutes — minted at job
+    // setup and used within minutes, so a leaked URL is a briefly-open
+    // window). The serve-time gate additionally requires the owning job to
+    // still be live.
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or_default()
         + ACTION_TICKET_TTL_SECS;
-    let signature = state.sign_action_ticket(owner, repo, git_ref, expires_at);
+    let signature = state.sign_action_ticket(job, owner, repo, git_ref, expires_at);
     let enc_owner = percent_encode_path_segment(owner);
     let enc_repo = percent_encode_path_segment(repo);
     let enc_ref = percent_encode_path_segment(git_ref);
+    let enc_job = percent_encode_path_segment(job);
     let url = format!(
         "{runner_url}/api/v1/actions/download/{enc_owner}/{enc_repo}/{enc_ref}\
-?exp={expires_at}&sig={signature}"
+?exp={expires_at}&job={enc_job}&sig={signature}"
     );
     Some((
         key,
@@ -711,8 +739,12 @@ pub async fn collect_runnerresolve_refs(
     extend_with_local_composites(shared, run_id, &mut declared, &requests).await?;
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
-    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        resolve_action_download_parts(state, &action, version.as_deref()).await
+    let ticket_job = action_ticket_owner(identity);
+    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| {
+        let ticket_job = ticket_job.clone();
+        async move {
+            resolve_action_download_parts(state, &ticket_job, &action, version.as_deref()).await
+        }
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
@@ -728,7 +760,7 @@ pub async fn collect_runnerresolve_refs(
         return Err(error);
     }
     for parts in resolved.into_iter().flatten() {
-        if let Some((key, value)) = runnerresolve_action_from_parts(state, parts) {
+        if let Some((key, value)) = runnerresolve_action_from_parts(state, &ticket_job, parts) {
             actions.entry(key).or_insert(value);
         }
     }
@@ -771,8 +803,12 @@ pub async fn collect_action_download_infos(
     extend_with_local_composites(shared, run_id, &mut declared, &requests).await?;
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
-    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        resolve_action_download_parts(state, &action, version.as_deref()).await
+    let ticket_job = action_ticket_owner(identity);
+    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| {
+        let ticket_job = ticket_job.clone();
+        async move {
+            resolve_action_download_parts(state, &ticket_job, &action, version.as_deref()).await
+        }
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
@@ -788,7 +824,7 @@ pub async fn collect_action_download_infos(
     }
     let mut actions = BTreeMap::new();
     for parts in resolved.into_iter().flatten() {
-        if let Some((key, value)) = action_download_info_from_parts(state, parts) {
+        if let Some((key, value)) = action_download_info_from_parts(state, &ticket_job, parts) {
             actions.insert(key, value);
         }
     }
@@ -2355,6 +2391,16 @@ fn collect_runnerresolve_requests(
     }
 }
 
+/// The job owner string signed into an action-download ticket. The system
+/// identity mints control-plane tickets that need no liveness check; every
+/// job-scoped caller gets a ticket that dies with its attempt.
+fn action_ticket_owner(identity: &crate::auth::ResultsIdentity) -> String {
+    match identity {
+        crate::auth::ResultsIdentity::Job(job) => job.job_id.to_string(),
+        crate::auth::ResultsIdentity::System => crate::blob_store::BLOB_SYSTEM_OWNER.to_owned(),
+    }
+}
+
 /// Resolve one action reference to its pinned download parts, shared by both
 /// the JobServer (`ActionDownloadInfo`) and Launch (`runnerresolve`) wire
 /// shapes. Returns `(lookup_key, name_with_owner, ref, resolved_sha,
@@ -2375,10 +2421,11 @@ fn collect_runnerresolve_requests(
 /// ref-keyed behavior.
 async fn resolve_action_download_parts(
     state: &AppState,
+    job: &str,
     action: &str,
     version_override: Option<&str>,
 ) -> Option<ResolvedActionParts> {
-    let (key, _) = action_download_ticket(state, action, version_override)?;
+    let (key, _) = action_download_ticket(state, job, action, version_override)?;
     let (name, git_ref) = key.split_once('@')?;
     let name = name.to_string();
     let git_ref = git_ref.to_string();
@@ -2398,9 +2445,10 @@ async fn resolve_action_download_parts(
 
 fn runnerresolve_action_from_parts(
     state: &AppState,
+    job: &str,
     (key, name, git_ref, resolved_sha_opt, effective_ref): ResolvedActionParts,
 ) -> Option<(String, serde_json::Value)> {
-    let (_, ticket) = action_download_ticket(state, &name, Some(&effective_ref))?;
+    let (_, ticket) = action_download_ticket(state, job, &name, Some(&effective_ref))?;
     let tar_url = ticket.get("url")?.as_str()?.to_string();
     let archive_sha256_pin = archive_sha256_pin_for(state, &name, resolved_sha_opt.as_deref());
     let mut entry = json!({
@@ -2418,9 +2466,10 @@ fn runnerresolve_action_from_parts(
 
 fn action_download_info_from_parts(
     state: &AppState,
+    job: &str,
     (key, name, git_ref, resolved_sha, effective_ref): ResolvedActionParts,
 ) -> Option<(String, ActionDownloadInfo)> {
-    let (_, ticket) = action_download_ticket(state, &name, Some(&effective_ref))?;
+    let (_, ticket) = action_download_ticket(state, job, &name, Some(&effective_ref))?;
     let tar_url = ticket.get("url")?.as_str()?.to_string();
     Some((
         key,
@@ -2469,8 +2518,14 @@ pub async fn runnerresolve_action(
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, serde_json::Value)> {
-    let parts = resolve_action_download_parts(state, action, version_override).await?;
-    runnerresolve_action_from_parts(state, parts)
+    let parts = resolve_action_download_parts(
+        state,
+        crate::blob_store::BLOB_SYSTEM_OWNER,
+        action,
+        version_override,
+    )
+    .await?;
+    runnerresolve_action_from_parts(state, crate::blob_store::BLOB_SYSTEM_OWNER, parts)
 }
 
 /// One `ActionDownloadInfo` entry in the official `ActionDownloadInfoCollection` wire shape.
@@ -2479,8 +2534,14 @@ pub async fn action_download_info_entry(
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, ActionDownloadInfo)> {
-    let parts = resolve_action_download_parts(state, action, version_override).await?;
-    action_download_info_from_parts(state, parts)
+    let parts = resolve_action_download_parts(
+        state,
+        crate::blob_store::BLOB_SYSTEM_OWNER,
+        action,
+        version_override,
+    )
+    .await?;
+    action_download_info_from_parts(state, crate::blob_store::BLOB_SYSTEM_OWNER, parts)
 }
 
 #[cfg(test)]
@@ -2816,14 +2877,19 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3600;
-        let sig = shared
-            .state
-            .sign_action_ticket("o", "r", "main", expires_at);
+        let sig = shared.state.sign_action_ticket(
+            crate::blob_store::BLOB_SYSTEM_OWNER,
+            "o",
+            "r",
+            "main",
+            expires_at,
+        );
         (
             State(shared.clone()),
             Path(("o".to_owned(), "r".to_owned(), "main".to_owned())),
             Query(ActionTicketQuery {
                 exp: Some(expires_at),
+                job: Some(crate::blob_store::BLOB_SYSTEM_OWNER.to_owned()),
                 sig: Some(sig),
             }),
         )
@@ -3714,8 +3780,13 @@ jobs:
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let (_, ticket) =
-            action_download_ticket(&state, "actions/checkout@v4", None).expect("ticket must mint");
+        let (_, ticket) = action_download_ticket(
+            &state,
+            crate::blob_store::BLOB_SYSTEM_OWNER,
+            "actions/checkout@v4",
+            None,
+        )
+        .expect("ticket must mint");
         let url = ticket.get("url").and_then(|u| u.as_str()).unwrap();
         let exp: u64 = url
             .split('?')

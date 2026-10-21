@@ -1729,7 +1729,7 @@ async fn legacy_runner_aliases_require_registration_and_bound_runner_credentials
                 .header("x-preloop-provision-token", "one-time-provision")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({"name": "provisioned", "labels": []}).to_string(),
+                    json!({"name": "provisioned", "labels": [], "ephemeral": true}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -1996,7 +1996,7 @@ async fn legacy_provision_token_is_consumed_atomically() {
             .header("x-preloop-provision-token", "concurrent-provision")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                json!({"name": "concurrent", "labels": []}).to_string(),
+                json!({"name": "concurrent", "labels": [], "ephemeral": true}).to_string(),
             ))
             .unwrap()
     };
@@ -3091,9 +3091,10 @@ async fn timeline_read_surfaces_control_db_failures() {
     );
 }
 /// A job's reporting credential remains valid only while its attempt is live.
-/// Timeline reads remain available after settlement; writes do not.
+/// A settled job's runtime token may neither mutate nor read timeline records;
+/// native/UI reads use the system API.
 #[tokio::test]
-async fn settled_job_token_cannot_mutate_timeline_records() {
+async fn settled_job_token_cannot_mutate_or_read_timeline_records() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
@@ -3158,7 +3159,11 @@ async fn settled_job_token_cannot_mutate_timeline_records() {
         )
         .await
         .unwrap();
-    assert_eq!(read.status(), StatusCode::OK);
+    assert_eq!(
+        read.status(),
+        StatusCode::FORBIDDEN,
+        "the stricter post-job contract revokes reads too; native/UI reads use the system API"
+    );
 }
 
 /// A timeline PATCH that the control DB rejects must not answer 200
@@ -3917,18 +3922,26 @@ async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
             .expect("trusted job defers a token request");
         assert!(fork_request.untrusted);
         assert!(!trusted_request.untrusted);
-        let fork_mint = crate::broker::mint_dispatch_github_token(&shared, &fork_request).await;
+        let provenance = crate::github_token_revocation::JobTokenProvenance {
+            request_id: 1,
+            run_id: preloop_gha_protocol::RunId::new(),
+            job_id: preloop_gha_protocol::JobId("build".to_owned()),
+            agent_job_id: uuid::Uuid::new_v4(),
+        };
+        let fork_mint =
+            crate::broker::mint_dispatch_github_token(&shared, &fork_request, &provenance).await;
         assert!(
             matches!(fork_mint, Ok(None)),
             "fork job must not receive the PAT fallback under the `pat` policy"
         );
         let trusted_mint =
-            crate::broker::mint_dispatch_github_token(&shared, &trusted_request).await;
+            crate::broker::mint_dispatch_github_token(&shared, &trusted_request, &provenance).await;
         assert_eq!(
             trusted_mint
                 .expect("trusted job's mint failure is not a dispatch error")
                 .expect("pat policy hands the PAT to a trusted job")
-                .token,
+                .token
+                .expose(),
             "github_pat_broad",
             "the PAT fallback still applies to trusted jobs"
         );
@@ -4104,7 +4117,18 @@ async fn replay_step_log_upload_is_masked_before_persist() {
         }),
     )
     .await;
-    let run_id = accepted["run_id"].as_str().unwrap();
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    // Signed replay paths name the live attempt (production handlers always
+    // mint a UUID owner). Use this run's attempt, which is live while queued.
+    let job_id = state
+        .test_tx()
+        .await
+        .job_requests
+        .values()
+        .find(|request| request.run_id.to_string() == run_id)
+        .expect("submitted attempt")
+        .agent_job_id
+        .to_string();
 
     // Bytes as a masking-buggy runner (or a direct PUT) would send them:
     // the secret raw and base64-encoded, unredacted.
@@ -4112,7 +4136,7 @@ async fn replay_step_log_upload_is_masked_before_persist() {
     let b64 = base64::engine::general_purpose::STANDARD.encode(secret);
     let body = format!("raw={secret} b64={b64}\n");
 
-    let path = format!("/replay/results/{run_id}/job-1/step-abc.txt");
+    let path = format!("/replay/results/{job_id}/{job_id}/step-abc.txt");
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -4137,8 +4161,8 @@ async fn replay_step_log_upload_is_masked_before_persist() {
         temp.path()
             .join("replay")
             .join("results")
-            .join(run_id)
-            .join("job-1")
+            .join(&job_id)
+            .join(&job_id)
             .join("step-abc.txt"),
     )
     .await
@@ -4163,14 +4187,16 @@ async fn replay_result_upload_accepts_bodies_above_axum_default_limit() {
 
     // Axum's default Bytes extractor limit is 2 MiB. A real step log can
     // exceed that while remaining well below the replay upload cap.
+    let job = uuid::Uuid::new_v4();
+    register_live_job(&state, job, "plan-large").await;
     let body = vec![b'R'; 3 * 1024 * 1024];
-    let path = "/replay/results/plan-large/job-large/step-large.txt";
+    let path = format!("/replay/results/{job}/{job}/step-large.txt");
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
         + 3600;
-    let sig = sign_replay_upload_ticket(&state, path, expires_at);
+    let sig = sign_replay_upload_ticket(&state, &path, expires_at);
     let uri = format!("{path}?se={expires_at}&sig={sig}");
 
     let response = app
@@ -4189,8 +4215,8 @@ async fn replay_result_upload_accepts_bodies_above_axum_default_limit() {
         temp.path()
             .join("replay")
             .join("results")
-            .join("plan-large")
-            .join("job-large")
+            .join(job.to_string())
+            .join(job.to_string())
             .join("step-large.txt"),
     )
     .await
@@ -4204,13 +4230,15 @@ async fn replay_result_upload_rejects_bodies_over_cap() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    let path = "/replay/results/plan-too-large/job-too-large/step-too-large.txt";
+    let job = uuid::Uuid::new_v4();
+    register_live_job(&state, job, "plan-too-large").await;
+    let path = format!("/replay/results/{job}/{job}/step-too-large.txt");
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
         + 3600;
-    let sig = sign_replay_upload_ticket(&state, path, expires_at);
+    let sig = sign_replay_upload_ticket(&state, &path, expires_at);
     let uri = format!("{path}?se={expires_at}&sig={sig}");
 
     // Stream one byte over the cap without constructing a correspondingly

@@ -69,6 +69,52 @@ impl ControlBackend for LiteBackend {
         self.record_token_request(run_id, request_id, token_request)
             .await
     }
+    async fn record_github_token_revocation(
+        &self,
+        revocation: NewGitHubTokenRevocation,
+    ) -> Result<(), ControlError> {
+        self.record_github_token_revocation(revocation).await
+    }
+    async fn due_github_token_revocations(
+        &self,
+        now_us: i64,
+        limit: usize,
+        claim_lease_us: i64,
+    ) -> Result<Vec<GitHubTokenRevocation>, ControlError> {
+        self.due_github_token_revocations(now_us, limit, claim_lease_us)
+            .await
+    }
+    async fn settle_github_token_revocation(
+        &self,
+        token_hash: &str,
+        resolution: TokenRevocationResolution,
+    ) -> Result<(), ControlError> {
+        self.settle_github_token_revocation(token_hash, resolution)
+            .await
+    }
+    async fn expire_github_token_revocations(
+        &self,
+        cleanup_before_us: i64,
+    ) -> Result<usize, ControlError> {
+        self.expire_github_token_revocations(cleanup_before_us)
+            .await
+    }
+    async fn job_token_dispatchable(
+        &self,
+        token_hash: &str,
+        now_us: i64,
+    ) -> Result<Option<bool>, ControlError> {
+        self.job_token_dispatchable(token_hash, now_us).await
+    }
+    async fn retry_github_token_revocation(
+        &self,
+        token_hash: &str,
+        error: &str,
+        next_attempt_at_us: i64,
+    ) -> Result<(), ControlError> {
+        self.retry_github_token_revocation(token_hash, error, next_attempt_at_us)
+            .await
+    }
     async fn complete_job(
         &self,
         completion: JobCompletionInput,
@@ -591,6 +637,9 @@ impl ControlBackend for LiteBackend {
     }
     async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError> {
         self.runner_exists(runner_id).await
+    }
+    async fn runner_credentials_usable(&self, runner_id: i64) -> Result<bool, ControlError> {
+        self.runner_credentials_usable(runner_id).await
     }
     async fn runner_for_client(&self, client_id: &str) -> Result<Option<i64>, ControlError> {
         self.runner_for_client(client_id).await

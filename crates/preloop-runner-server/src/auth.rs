@@ -5,16 +5,101 @@ pub async fn require_protocol_bearer(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let authorized = bearer_token(&request).is_some_and(|token| {
-        token == shared.state.system_token || shared.state.verify_local_jwt_claims(token).is_some()
-    });
-    if authorized {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::unauthorized(
+    let bearer = bearer_token(&request).map(str::to_owned);
+    let Some(token) = bearer.as_deref() else {
+        return Err(ApiError::unauthorized(
             "runner or job protocol token required",
-        ))
+        ));
+    };
+    if token == shared.state.system_token {
+        return Ok(next.run(request).await);
     }
+    let Some(claims) = shared.state.verify_local_jwt_claims(token) else {
+        return Err(ApiError::unauthorized(
+            "runner or job protocol token required",
+        ));
+    };
+    // This middleware fronts both runner and results routes, so it accepts
+    // only the credential classes those routes actually speak. In particular,
+    // URL-capability JWTs (blob read/write tokens) are not protocol bearers:
+    // they are minted for `/twirp-blob` only, and accepting one here would
+    // revive a copied terminal URL on generic routes until the JWT expires.
+    if claims.get("sub").and_then(|value| value.as_str()) == Some("preloop-blob") {
+        return Err(ApiError::unauthorized(
+            "blob URL credentials are not protocol bearers",
+        ));
+    }
+    // A registration grant exchanged from a VM's one-time provision token is
+    // bound to that token; once it is consumed, the copied grant must not
+    // reach any generic protected route. Unbound operator/RunnerManage grants
+    // are unchanged.
+    if claims.get("pvt_hash").is_some() {
+        if !runner_registration_bearer_authorized(&shared.state, token) {
+            return Err(ApiError::unauthorized(
+                "registration grant has already been consumed",
+            ));
+        }
+        return Ok(next.run(request).await);
+    }
+    // A listen token is only as good as the registration behind it: a spent
+    // ephemeral runner or a purged identity must fail here too, not only in
+    // the scoped handlers.
+    if runner_listen_claims(&claims) {
+        if registered_runner_id(&shared, token).await.is_none() {
+            return Err(ApiError::unauthorized(
+                "runner registration is no longer valid",
+            ));
+        }
+        return Ok(next.run(request).await);
+    }
+    // Unbound operator/runner-manager grants keep their management semantics.
+    if runner_registration_claims(&claims) {
+        return Ok(next.run(request).await);
+    }
+    // A job runtime token is a bearer that workflow code can read (the runner
+    // exports it as `ACTIONS_RUNTIME_TOKEN`), so it must stop authenticating
+    // once its attempt is no longer live. Final-reporting routes are the one
+    // exception: they settle or idempotently re-report the attempt that the
+    // token already owns, and denying them would strand a timed-out job.
+    if let Some(job) = shared.state.job_uuid_from_token(token) {
+        if !is_final_reporting_route(request.method(), request.uri().path()) {
+            require_live_job(&shared.state, job).await?;
+        }
+        return Ok(next.run(request).await);
+    }
+    // Debug-worker tokens name a job too, and the same revocation rule
+    // applies: a completed attempt must not keep driving its debug session.
+    if let Some(job) = shared.state.job_uuid_from_debug_token(token) {
+        require_live_job(&shared.state, job).await?;
+        return Ok(next.run(request).await);
+    }
+    Err(ApiError::unauthorized(
+        "unsupported protocol credential class",
+    ))
+}
+
+/// Whether a route is the attempt's final-reporting path.
+///
+/// These routes are authenticated by the attempt's own token but must keep
+/// working after the attempt is settled or timed out: the runner may report
+/// completion late, and a duplicate report must be idempotent. `renewjob` is
+/// included because it is a heartbeat with no read/write authority — its
+/// handler already answers `409` for a settled attempt, which the runner
+/// classifies correctly; middleware `403` would look like an auth failure.
+/// Every other job-token route is denied once the attempt is no longer live.
+fn is_final_reporting_route(method: &axum::http::Method, path: &str) -> bool {
+    if *method == axum::http::Method::POST {
+        return (path.starts_with("/broker/")
+            && (path.ends_with("/completejob") || path.ends_with("/renewjob")))
+            || path.contains("/_apis/v1/FinishJob/")
+            || ((path.starts_with("/_apis/v1/plans/")
+                || path.starts_with("/runner/server/_apis/v1/plans/"))
+                && path.ends_with("/events"));
+    }
+    // Legacy runner `PATCH .../hubs/actions/plans/{run}/jobs/{job}` completion.
+    *method == axum::http::Method::PATCH
+        && path.starts_with("/runner/server/_apis/distributedtask/hubs/actions/plans/")
+        && path.contains("/jobs/")
 }
 /// Require the system credential or a Results job runtime token.
 ///
@@ -30,6 +115,9 @@ pub async fn require_results_protocol_bearer(
         .ok_or_else(|| ApiError::unauthorized("system or job runtime token required"))?;
     let identity = results_identity(&shared.state, bearer)
         .map_err(|_| ApiError::unauthorized("system or job runtime token required"))?;
+    if let ResultsIdentity::Job(job) = &identity {
+        require_live_job(&shared.state, job.job_id).await?;
+    }
     request.extensions_mut().insert(identity);
     Ok(next.run(request).await)
 }
@@ -92,13 +180,15 @@ pub fn authorize_reporting_request(
 /// the target *and* the attempt must still be live.
 ///
 /// A settled attempt's runtime credential is spent — the rule the Results
-/// writes ([`require_live_results_job`]), the cache and artifact writes, and
-/// the live-log ingest all apply — so it must not keep mutating the run's
-/// records (timeline records, logs, console logs) after the attempt has
-/// settled. The credential is handed to workflow code and outlives the
-/// attempt, so without this a finished job could rewrite its own step records
-/// and annotations for the rest of the token's lifetime. Reads stay available,
-/// and the system identity bypasses exactly as it does everywhere else.
+/// operations ([`require_live_results_job`]), the cache and artifact writes,
+/// the forge relay, blob URLs, and the live-log paths all apply — so it must
+/// not keep reading or mutating the run's records (timeline records, logs,
+/// console logs) after the attempt has settled. The credential is handed to
+/// workflow code and outlives the attempt, so without this a finished job
+/// could rewrite its own step records and annotations, or keep reading the
+/// run's retained output, for the rest of the token's lifetime. The system
+/// identity bypasses exactly as it does everywhere else, and final-reporting
+/// completion routes deliberately do not use this helper.
 pub async fn authorize_live_reporting_request(
     state: &AppState,
     headers: &HeaderMap,
@@ -130,12 +220,19 @@ pub async fn require_results_bearer(
         // forged) upload would let workflow code overwrite another job's
         // stored logs. Only PUT is a write; other methods fall through to
         // normal routing (404 for unregistered methods).
-        if request.method() == axum::http::Method::PUT
-            && !verify_replay_upload_ticket(&shared.state, request.uri())
-        {
-            return Err(ApiError::unauthorized(
-                "replay blob upload requires a signed URL ticket",
-            ));
+        if request.method() == axum::http::Method::PUT {
+            if !verify_replay_upload_ticket(&shared.state, request.uri()) {
+                return Err(ApiError::unauthorized(
+                    "replay blob upload requires a signed URL ticket",
+                ));
+            }
+            // The ticket is a bearerless upload capability reachable from
+            // inside the job VM. It is bound to the job segment of the signed
+            // path, and stops working when that attempt stops being live
+            // instead of surviving until the ticket's one-hour expiry.
+            let job = replay_ticket_job_id(request.uri().path())
+                .ok_or_else(|| ApiError::unauthorized("replay blob ticket does not name a job"))?;
+            require_live_job(&shared.state, job).await?;
         }
         return Ok(next.run(request).await);
     }
@@ -156,7 +253,13 @@ pub async fn require_results_bearer(
     };
     // The typed identity is authenticated before body extraction. Handlers
     // then compare decoded plan/job ids against this same identity instead of
-    // re-parsing a bearer string independently.
+    // re-parsing a bearer string independently. The middleware also enforces
+    // liveness uniformly: every Twirp route is job-scoped, and a settled,
+    // timed-out, cancelled, or lease-expired attempt's runtime token must not
+    // keep minting upload/download URLs or reading results metadata.
+    if let ResultsIdentity::Job(job) = &identity {
+        require_live_job(&shared.state, job.job_id).await?;
+    }
     request.extensions_mut().insert(identity);
     Ok(next.run(request).await)
 }
@@ -180,12 +283,14 @@ pub async fn require_results_bearer(
 ///      with 403 and an upload URL (`write`) rejects GET with 403 - a
 ///      bearerless PUT to a signed download URL can no longer overwrite the
 ///      finalized blob (round-3 finding 3);
-///   4. writes require the owning job to still be live: the JWT's `job`
-///      claim names the owner recorded at mint time, so a completed job's
-///      upload URL stops working immediately instead of at TTL sweep. A
-///      presented bearer is verified and must match the `job` claim. The
-///      `system` owner (control-plane-minted URLs) skips the liveness check,
-///      as it did when empty owners meant "system".
+///   4. the owning job must still be live for BOTH operations: the JWT's
+///      `job` claim names the owner recorded at mint time, so a completed,
+///      cancelled, timed-out, or lease-expired job's upload and download URLs
+///      stop working immediately instead of at TTL sweep. A presented job
+///      bearer is verified and must match the `job` claim — a live job cannot
+///      spend a URL another job minted. The `system` owner
+///      (control-plane-minted URLs) skips the liveness check, as it did when
+///      empty owners meant "system".
 ///   5. diag uploads additionally require the token's `jti` to still be
 ///      registered in `diag_upload_tokens`: the per-job cap evicts the
 ///      oldest token, and eviction must invalidate — a signature alone
@@ -254,30 +359,39 @@ async fn authorize_blob_request(
         }
     }
 
+    // The control-plane credential is not a guest credential and may inspect
+    // any stored blob (it can also mint fresh URLs). No job-liveness rule is
+    // applied to it.
+    if bearer_from_headers(request.headers()) == Some(state.system_token.as_str()) {
+        return Ok(next.run(request).await);
+    }
     match bearer_from_headers(request.headers()) {
-        Some(bearer) if bearer == state.system_token => Ok(next.run(request).await),
         Some(bearer) => {
             let job_id = match results_identity(state, bearer) {
                 Ok(ResultsIdentity::Job(identity)) => identity.job_id.to_string(),
                 _ => return Err(ApiError::unauthorized("results-service job token required")),
             };
-            if is_write {
-                if owner == job_id {
-                    Ok(next.run(request).await)
-                } else {
-                    Err(ApiError::forbidden("blob token is not owned by this job"))
-                }
-            } else {
-                Ok(next.run(request).await)
+            // Ownership binds both operations, not just writes: a live job
+            // must not use its own bearer to read a URL minted for another
+            // job. (A bearerless request is indistinguishable from the URL's
+            // legitimate holder, so only the owner-liveness rule applies
+            // there.)
+            if owner != job_id {
+                return Err(ApiError::forbidden("blob token is not owned by this job"));
             }
+            let job_uuid = owner
+                .parse::<uuid::Uuid>()
+                .map_err(|_| ApiError::forbidden("blob token owner is not a job"))?;
+            require_live_job(state, job_uuid).await?;
+            Ok(next.run(request).await)
         }
         // Bearerless Azure-SDK-style flow: the unguessable, server-minted URL
-        // is the credential. Writes additionally require the owning job to be
-        // live - a completed job's minted URL must not keep accepting data.
-        // The `system` owner (control-plane-minted URLs) is not a job and
-        // skips this check.
+        // is the credential. Both reads and writes stop working once the
+        // owning attempt is no longer live; the URL is a derived credential
+        // and must not outlive the job that minted it. The `system` owner
+        // (control-plane-minted URLs) is not a job and skips this check.
         None => {
-            if is_write && owner != crate::blob_store::BLOB_SYSTEM_OWNER {
+            if owner != crate::blob_store::BLOB_SYSTEM_OWNER {
                 let job_uuid = owner
                     .parse::<uuid::Uuid>()
                     .map_err(|_| ApiError::forbidden("blob token owner is not a job"))?;
@@ -288,13 +402,14 @@ async fn authorize_blob_request(
     }
 }
 
-/// Require the calling job to be live before a Results write.
+/// Require the calling job to be live before a Results operation.
 ///
 /// Resolves the job's request record and rejects when the job is unknown
-/// (purged) or has settled/projected to a terminal status — the stale
-/// credential replay window. The system identity (engine) bypasses: it
-/// manages the lifecycle itself. Reads are unaffected; each handler decides
-/// whether it is a write.
+/// (purged), has settled, was cancelled, exceeded its deadline, or lost its
+/// runner lease — the stale credential replay window. Callers use it for
+/// reads as well as writes: a runtime token is handed to workflow code and
+/// must not keep minting URLs or reading results after the attempt ends. The
+/// system identity (engine) bypasses: it manages the lifecycle itself.
 pub async fn require_live_results_job(
     state: &AppState,
     identity: &ResultsIdentity,
@@ -306,23 +421,106 @@ pub async fn require_live_results_job(
     require_live_job(state, job_uuid).await
 }
 
-/// Liveness predicate on a job, resolved from the control backend: a job is
-/// live while its request record still exists and has not settled to a
-/// terminal status. A purged or unknown job is not live.
+/// Liveness predicate on a job, resolved from the control backend.
 ///
-/// Liveness follows the request record, not the projected run status:
-/// cancellation projects `run.jobs` to Cancelled immediately while the
-/// request stays unsettled until the runner finishes reporting — the window
-/// where its final step updates, logs, and uploads must still land. Only a
-/// settled (or purged) request is stale.
+/// A job is live only while its attempt can still do work:
+///   * the request record exists (a purged or unknown job is not live);
+///   * it has not settled to a terminal result;
+///   * the reaper has not flagged its deadline (`timeout_triggered`);
+///   * its runner has renewed within [`HUNG_WORKER_LEASE_SECONDS`]; a claimed
+///     attempt with no first renewal is bounded by `claimed_at` plus the same
+///     startup window, and only an unclaimed request falls back to the
+///     runner-facing lock; and
+///   * its logical job has not been settled terminal — cancellation projects
+///     `jobs` to Cancelled immediately while the request row stays unsettled
+///     until the runner reports, and the old rule admitted that whole window.
+///
+/// The lease check is direct and matches the reaper's
+/// [`HUNG_WORKER_LEASE_SECONDS`] window. The timeout check is the persisted
+/// `timeout_triggered` flag, which the reaper sets on its sweep: it is the
+/// engine's observed deadline, not a fresh wall-clock computation at request
+/// time. (The request record does not carry `job_timeout_s`; the reaper's
+/// tick is the authority, and a stricter dispatch predicate that reads it is
+/// compatible.) Final completion routes bypass this predicate (see
+/// [`is_final_reporting_route`]) so late and duplicate reports remain
+/// possible.
 pub async fn job_is_live(state: &AppState, job_uuid: uuid::Uuid) -> Result<bool, ApiError> {
-    match state
+    let record = match state
         .backend
         .request(crate::control::backend::RequestKey::AgentJobId(job_uuid))
         .await
     {
-        Ok(record) => Ok(!matches!(record.result, Some(status) if status.is_terminal())),
-        Err(crate::control::ControlError::NotFound(_)) => Ok(false),
+        Ok(record) => record,
+        Err(crate::control::ControlError::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(ApiError::from(error)),
+    };
+    if matches!(record.result, Some(status) if status.is_terminal()) {
+        return Ok(false);
+    }
+    // The reaper has decided the attempt exceeded its `timeout-minutes`.
+    // Cancellation is queued but the request stays open for the final report;
+    // every non-reporting credential is spent at this point.
+    if record.timeout_triggered {
+        return Ok(false);
+    }
+    // Match the reaper's lease rule so delegation of a live session's token
+    // does not outlive its runner by more than one reaper window. A request
+    // with no renewal yet is admitted: it predates the first renewjob, and
+    // `locked_until` (when present) still bounds it.
+    if let Some(renewed_at) = record.last_renewed_at {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(renewed_at)
+            .unwrap_or_default();
+        if elapsed
+            >= std::time::Duration::from_secs(crate::distributed_task::HUNG_WORKER_LEASE_SECONDS)
+        {
+            return Ok(false);
+        }
+    } else if let Some(claimed_at) = record
+        .claimed_at
+        .filter(|claimed| *claimed > std::time::UNIX_EPOCH)
+    {
+        // Claim happened, first renewjob has not. The runner-facing lock is
+        // 45 minutes, so anchor this case on the claim stamp and the same
+        // short window the reaper uses; otherwise a token copied at acquire
+        // and a worker killed before the first renewal would outlive the
+        // stated 180-second bound.
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(claimed_at)
+            .unwrap_or_default();
+        if elapsed
+            >= std::time::Duration::from_secs(crate::distributed_task::HUNG_WORKER_LEASE_SECONDS)
+        {
+            return Ok(false);
+        }
+    } else if !record.locked_until.is_empty()
+        && let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(&record.locked_until)
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if deadline.timestamp() <= now {
+            return Ok(false);
+        }
+    }
+    // Cancellation settles the logical job immediately, before the runner has
+    // reported and before the reaper's lease timeout. A stolen runtime token
+    // must not keep reading or writing through that window.
+    match state
+        .backend
+        .job_queue_state(record.run_id, &record.job_id)
+        .await
+    {
+        Ok(Some((_, status)))
+            if matches!(
+                status.as_str(),
+                "success" | "failure" | "skipped" | "cancelled" | "timed_out"
+            ) =>
+        {
+            Ok(false)
+        }
+        Ok(_) => Ok(true),
         Err(error) => Err(ApiError::from(error)),
     }
 }
@@ -337,7 +535,7 @@ pub async fn require_live_job(state: &AppState, job_uuid: uuid::Uuid) -> Result<
         Ok(())
     } else {
         Err(ApiError::forbidden(
-            "job is not live; writes are rejected for completed or unknown jobs",
+            "job is not live; job-scoped credentials are rejected for completed or unknown jobs",
         ))
     }
 }
@@ -416,16 +614,11 @@ pub async fn require_runner_admin_bearer(
     }
     let manager_token = bearer_token(&request)
         .and_then(|token| shared.state.verify_local_jwt_claims(token))
-        .and_then(|claims| {
-            claims
-                .get("scp")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        })
-        .is_some_and(|scope| {
-            scope
-                .split_whitespace()
-                .any(|value| value == "ActionsRuntime.RunnerManage")
+        .is_some_and(|claims| {
+            runner_manager_claims(&claims)
+                // A grant minted from a one-time VM provision token is scoped
+                // to registering that VM, never to deleting other runners.
+                && claims.get("pvt_hash").is_none()
         });
     if manager_token {
         return Ok(next.run(request).await);
@@ -469,17 +662,7 @@ pub fn admin_caller(
     }
     if state
         .verify_local_jwt_claims(token)
-        .and_then(|claims| {
-            claims
-                .get("scp")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        })
-        .is_some_and(|scope| {
-            scope
-                .split_whitespace()
-                .any(|value| value == "ActionsRuntime.RunnerManage")
-        })
+        .is_some_and(|claims| runner_manager_claims(&claims) && claims.get("pvt_hash").is_none())
     {
         return Ok(AdminCaller::RunnerManager);
     }
@@ -519,20 +702,51 @@ pub async fn require_runner_bearer(
     }
     Err(ApiError::unauthorized("runner listen token required"))
 }
-pub fn runner_registration_bearer_authorized(state: &AppState, token: &str) -> bool {
-    token == state.system_token.as_str()
-        || state.verify_local_jwt_claims(token).is_some_and(|claims| {
-            claims.get("sub").and_then(|value| value.as_str())
-                == Some("preloop-runner-registration")
-                && claims
-                    .get("scp")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|scope| {
-                        scope
-                            .split_whitespace()
-                            .any(|value| value == "ActionsRuntime.RunnerManage")
-                    })
+fn runner_listen_claims(claims: &serde_json::Value) -> bool {
+    claims
+        .get("scp")
+        .and_then(|value| value.as_str())
+        .is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .any(|value| value == "ActionsRuntime.RunnerListen")
         })
+}
+
+fn runner_manager_claims(claims: &serde_json::Value) -> bool {
+    claims
+        .get("scp")
+        .and_then(|value| value.as_str())
+        .is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .any(|value| value == "ActionsRuntime.RunnerManage")
+        })
+}
+
+fn runner_registration_claims(claims: &serde_json::Value) -> bool {
+    claims.get("sub").and_then(|value| value.as_str()) == Some("preloop-runner-registration")
+        && runner_manager_claims(claims)
+}
+
+/// A registration grant is either the operator's system/RunnerManage
+/// credential or a grant bound to a pending one-time provision token. A bound
+/// grant stops authorizing the moment that provision token is consumed, so a
+/// copy of the exchanged bearer cannot keep registering runners.
+pub fn runner_registration_bearer_authorized(state: &AppState, token: &str) -> bool {
+    if token == state.system_token.as_str() {
+        return true;
+    }
+    let Some(claims) = state.verify_local_jwt_claims(token) else {
+        return false;
+    };
+    if !runner_registration_claims(&claims) {
+        return false;
+    }
+    match claims.get("pvt_hash").and_then(|value| value.as_str()) {
+        Some(hash) => pending_provision_token_by_hash(state, hash).is_some(),
+        None => true,
+    }
 }
 
 /// Require the credential that is allowed to create a runner identity through
@@ -580,7 +794,7 @@ pub async fn require_legacy_runner_bearer(
 
 const PROVISION_TOKEN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
-fn pending_provision_token(state: &AppState, token: &str) -> bool {
+pub(crate) fn pending_provision_token(state: &AppState, token: &str) -> bool {
     state
         .pending_registrations
         .read()
@@ -593,6 +807,39 @@ fn provision_token_is_fresh(issued_at: std::time::SystemTime) -> bool {
     std::time::SystemTime::now()
         .duration_since(issued_at)
         .is_ok_and(|age| age <= PROVISION_TOKEN_MAX_AGE)
+}
+
+/// Hash a provision token for embedding in a registration grant. The raw
+/// token never enters the JWT, so a copied grant reveals no reusable
+/// registration credential.
+pub fn provision_token_hash(token: &str) -> String {
+    preloop_gha_protocol::crypto::sha256_hex(token)
+}
+
+fn pending_provision_token_by_hash(state: &AppState, hash: &str) -> Option<String> {
+    state.pending_registrations.read().ok().and_then(|pending| {
+        pending
+            .iter()
+            .find(|(token, issued_at)| {
+                provision_token_is_fresh(**issued_at)
+                    && provision_token_hash(token.as_str()) == hash
+            })
+            .map(|(token, _)| token.clone())
+    })
+}
+
+/// The raw pending provision token a bound registration grant names.
+///
+/// Used by the agent-registration handler to consume the same one-time
+/// credential it was minted from, so the grant and the header path cannot
+/// authorize separate registrations.
+pub fn bound_provision_token(state: &AppState, token: &str) -> Option<String> {
+    let claims = state.verify_local_jwt_claims(token)?;
+    if !runner_registration_claims(&claims) {
+        return None;
+    }
+    let hash = claims.get("pvt_hash")?.as_str()?;
+    pending_provision_token_by_hash(state, hash)
 }
 
 /// Atomically consume a pool-issued registration credential. The middleware
@@ -670,17 +917,18 @@ pub fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
-/// Whether the runner still has a live registration. Agent deregistration and
-/// machine teardown both route through [`crate::runner_lifecycle::purge_runner_identity`],
-/// which removes the registration entry — that removal is what revokes every
-/// listen token previously issued to the runner. A JWT that outlives its
-/// runner must not authenticate or resolve to an identity, or a stolen token
-/// would keep creating sessions and pulling work after teardown.
+/// Whether this runner's credentials are still valid. Agent deregistration and
+/// machine teardown remove the registration, but the authoritative rule is
+/// [`crate::control::ControlBackend::runner_credentials_usable`]: a single-use (`--ephemeral`)
+/// runner whose attempt has settled is spent even if its row still exists, so
+/// its listen token stops authenticating before (or without) cleanup. A JWT
+/// that outlives its runner's usable window must not create sessions or pull
+/// work.
 async fn runner_registered(shared: &Arc<SharedState>, runner_id: i64) -> bool {
     shared
         .state
         .backend
-        .runner_exists(runner_id)
+        .runner_credentials_usable(runner_id)
         .await
         .unwrap_or(false)
 }
@@ -744,6 +992,22 @@ pub fn verify_replay_upload_ticket(state: &AppState, uri: &axum::http::Uri) -> b
 
 fn replay_ticket_payload(path: &str, expires_at: u64) -> String {
     format!("replay-blob\n{expires_at}\n{path}")
+}
+
+/// The agent job a signed replay upload path belongs to.
+///
+/// Every mint uses `/replay/results/{plan}/{job}/{file}` (see the
+/// `Get*SignedBlobURL` handlers), and the signature covers the exact path, so
+/// the segment before the file name is the owner the server signed. Parsing
+/// from the right keeps this correct even when an opaque plan segment itself
+/// contains a slash. A path that does not carry a UUID owner is rejected by
+/// the caller — a valid signature alone must not authorize a ticket that names
+/// no live job.
+fn replay_ticket_job_id(path: &str) -> Option<uuid::Uuid> {
+    let rest = path.strip_prefix("/replay/results/")?;
+    let mut segments = rest.rsplit('/');
+    let _file = segments.next()?;
+    segments.next()?.parse::<uuid::Uuid>().ok()
 }
 
 /// Marker extension: the request arrived through the mounted control socket.
@@ -1081,6 +1345,13 @@ pub async fn require_worker_bearer(
         bearer_token(&request).and_then(|token| shared.state.job_uuid_from_debug_token(token));
     match job {
         Some(job) => {
+            // A settled/unknown job is reported exactly like a missing
+            // session: the debug surface deliberately does not let a caller
+            // probe which attempt ids exist.
+            match job_is_live(&shared.state, job).await? {
+                true => {}
+                false => return Err(ApiError::not_found("no such debug session")),
+            }
             request.extensions_mut().insert(WorkerJob(job));
             Ok(next.run(request).await)
         }
@@ -1115,6 +1386,13 @@ pub async fn require_job_runtime_bearer(
     let job = bearer_token(&request).and_then(|token| shared.state.job_uuid_from_token(token));
     match job {
         Some(job) => {
+            // Same shape as the backend's "no active job request" answer for
+            // a settled attempt: the exchange must not distinguish missing
+            // from spent ids.
+            match job_is_live(&shared.state, job).await? {
+                true => {}
+                false => return Err(ApiError::not_found("no active job request")),
+            }
             request.extensions_mut().insert(JobRuntimeIdentity(job));
             Ok(next.run(request).await)
         }

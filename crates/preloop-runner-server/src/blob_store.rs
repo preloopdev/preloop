@@ -299,7 +299,9 @@ pub async fn blob_put(
     }
     // If a bearer is present and verifies as a job identity, require
     // the job to be live. Bearerless PUTs (Azure SDK compat) cannot be
-    // attributed; their liveness is enforced at URL-mint time.
+    // attributed, but `auth::authorize_blob_request` enforces the URL
+    // owner's liveness before this handler runs, so this is defense in
+    // depth for direct handler callers.
     if let Some(bearer) = crate::auth::bearer_from_headers(&headers)
         && let Ok(identity) = crate::auth::results_identity(&shared.state, bearer)
         && crate::auth::require_live_results_job(&shared.state, &identity)
@@ -483,7 +485,7 @@ pub async fn blob_put(
             match stream_body_to_file(body, &tmp_path, MAX_ASSEMBLED_BYTES).await {
                 Ok(size) => match tokio::fs::rename(&tmp_path, &data_path).await {
                     Ok(()) => {
-                        info!(kind, token, size, "blob single-shot upload");
+                        info!(kind, jti = %stage_name, size, "blob single-shot upload");
                         StatusCode::CREATED
                     }
                     Err(e) => {

@@ -879,6 +879,29 @@ impl LiteBackend {
                 }
                 PurgeGuard::RegistrationToken => exists && !owns_session()?,
                 PurgeGuard::IfPhantom => exists && !owns_session()?,
+                PurgeGuard::SpentEphemeral => {
+                    if !exists {
+                        false
+                    } else {
+                        let spent: bool = tx
+                            .prepare_cached(
+                                "SELECT ephemeral AND ephemeral_spent FROM runners \
+                                 WHERE runner_id = ?1",
+                            )
+                            .map_err(db)?
+                            .query_row([runner_id], |row| row.get(0))
+                            .map_err(db)?;
+                        let active: bool = tx
+                            .prepare_cached(
+                                "SELECT EXISTS (SELECT 1 FROM job_requests \
+                                 WHERE runner_id = ?1 AND result IS NULL)",
+                            )
+                            .map_err(db)?
+                            .query_row([runner_id], |row| row.get(0))
+                            .map_err(db)?;
+                        spent && !active
+                    }
+                }
             };
             if !allowed {
                 return Ok(None);

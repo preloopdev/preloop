@@ -430,7 +430,13 @@ async fn persisted_token_request_without_trust_metadata_fails_closed() {
         declared: true,
         untrusted: old.untrusted,
     };
-    let mint = crate::broker::mint_dispatch_github_token(&shared, &old_request).await;
+    let provenance = crate::github_token_revocation::JobTokenProvenance {
+        request_id: 1,
+        run_id: preloop_gha_protocol::RunId::new(),
+        job_id: preloop_gha_protocol::JobId("build".to_owned()),
+        agent_job_id: uuid::Uuid::new_v4(),
+    };
+    let mint = crate::broker::mint_dispatch_github_token(&shared, &old_request, &provenance).await;
     assert!(
         matches!(mint, Ok(None)),
         "a request whose trust metadata was never recorded must not receive the PAT fallback"
@@ -1336,7 +1342,13 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
             state: state.clone(),
             shutdown,
         });
-        let mint = crate::broker::mint_dispatch_github_token(&shared, &request).await;
+        let provenance = crate::github_token_revocation::JobTokenProvenance {
+            request_id: 1,
+            run_id: preloop_gha_protocol::RunId::new(),
+            job_id: preloop_gha_protocol::JobId("build".to_owned()),
+            agent_job_id: uuid::Uuid::new_v4(),
+        };
+        let mint = crate::broker::mint_dispatch_github_token(&shared, &request, &provenance).await;
         match policy {
             // The job still runs; it just has no GitHub credential.
             MintFailurePolicy::LocalJwt => assert!(matches!(mint, Ok(None))),
@@ -3071,7 +3083,9 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
         }
     });
 
-    // Opening a session for a job you are not is refused outright.
+    // Opening a session for a job you are not is refused outright. The
+    // attacker token names no live attempt, so the liveness gate answers with
+    // the same 404 as a missing session (ids stay unprobeable).
     assert_eq!(
         request_status_with_bearer(
             &app,
@@ -3081,7 +3095,7 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
             &attacker_token,
         )
         .await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
 
     let opened = request_json_with_bearer(
@@ -3342,7 +3356,8 @@ async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
             asking_for_itself.clone()
         )
         .await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND,
+        "a token naming no live attempt is answered like a missing request"
     );
     assert_eq!(
         refused(runtime_token.clone(), json!({ "agent_job_id": stranger })).await,
@@ -3916,4 +3931,395 @@ async fn runner_lease_expiration_disconnect_reaper() {
         let run = inner.runs.get(&run_id).unwrap();
         assert_eq!(run.status, ExecutionStatus::Failure);
     }
+}
+
+/// Provisioned registration never receives the system credential, and the
+/// exchanged RunnerManage grant is bound to the same one-time provision token:
+/// consuming it at agent creation makes every copy of the grant unusable.
+#[tokio::test]
+async fn provision_registration_grant_is_one_shot_and_never_system() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let provision = format!("provision-{}", uuid::Uuid::new_v4());
+    stage_provision_token(&state, &provision);
+
+    let exchange_uri = "/api/v3/actions/runner-registration";
+    let exchanged = request_json_with_bearer(
+        &app,
+        Method::POST,
+        exchange_uri,
+        json!({"url": "http://127.0.0.1:9090", "runner_event": "register"}),
+        &provision,
+    )
+    .await;
+    let grant = exchanged["token"].as_str().unwrap().to_owned();
+    assert_ne!(
+        grant, state.system_token,
+        "the guest must not receive the system token"
+    );
+    let claims = state
+        .verify_local_jwt_claims(&grant)
+        .expect("bound registration grant verifies while the provision token is pending");
+    assert!(
+        claims
+            .get("pvt_hash")
+            .and_then(|value| value.as_str())
+            .is_some(),
+        "the grant must carry the provision binding"
+    );
+    assert!(
+        claims.get("pvt_hash").and_then(|value| value.as_str())
+            != Some(crate::auth::provision_token_hash(&state.system_token).as_str()),
+        "the binding is to the provision token, not the system token"
+    );
+    let generic_route = "/runner/server/_apis/distributedtask/pools";
+    assert_eq!(
+        request_status_with_bearer(&app, Method::GET, generic_route, Value::Null, &grant).await,
+        StatusCode::OK,
+        "a still-pending provision-bound grant may use the generic protocol surface"
+    );
+
+    let register = |bearer: String, ephemeral: bool| {
+        let app = app.clone();
+        async move {
+            request_status_with_bearer(
+                &app,
+                Method::POST,
+                "/runner/server/_apis/v1/Agent/1/0",
+                json!({
+                    "name": format!("vm-{}", uuid::Uuid::new_v4()),
+                    "version": "2.335.1",
+                    "ephemeral": ephemeral,
+                    "labels": [{"name": "self-hosted", "type": "system"}]
+                }),
+                &bearer,
+            )
+            .await
+        }
+    };
+    // A pool grant cannot mint a persistent registration; the rejected
+    // attempt restores the one-time token for the correct ephemeral retry.
+    assert_eq!(
+        register(grant.clone(), false).await,
+        StatusCode::BAD_REQUEST,
+        "provisioned registrations must be ephemeral"
+    );
+    assert!(
+        state
+            .pending_registrations
+            .read()
+            .unwrap()
+            .get(&provision)
+            .is_some(),
+        "a rejected registration must not consume the one-time token"
+    );
+    assert_eq!(
+        register(grant.clone(), true).await,
+        StatusCode::OK,
+        "a pending provision-bound grant registers the ephemeral VM"
+    );
+    assert!(
+        state
+            .pending_registrations
+            .read()
+            .unwrap()
+            .get(&provision)
+            .is_none(),
+        "agent creation consumes the provision token the grant was bound to"
+    );
+    assert_eq!(
+        register(grant.clone(), true).await,
+        StatusCode::UNAUTHORIZED,
+        "a copied exchanged grant cannot register again after consumption"
+    );
+    assert_eq!(
+        request_status_with_bearer(&app, Method::GET, generic_route, Value::Null, &grant).await,
+        StatusCode::UNAUTHORIZED,
+        "the generic middleware must reject the consumed grant too"
+    );
+
+    // The raw provision token is spent too.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            exchange_uri,
+            json!({"url": "http://127.0.0.1:9090"}),
+            &provision,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // An operator system token still exchanges and registers normally.
+    let operator = request_json_with_bearer(
+        &app,
+        Method::POST,
+        exchange_uri,
+        json!({"url": "http://127.0.0.1:9090"}),
+        &state.system_token,
+    )
+    .await;
+    let operator_grant = operator["token"].as_str().unwrap();
+    assert!(
+        state
+            .verify_local_jwt_claims(operator_grant)
+            .unwrap()
+            .get("pvt_hash")
+            .is_none(),
+        "operator grants are not provision-bound"
+    );
+    assert_eq!(
+        register(operator_grant.to_owned(), false).await,
+        StatusCode::OK,
+        "operator system/manual registration may remain persistent"
+    );
+
+    // A provision-bound grant is registration-only: it cannot delete agents.
+    let second = format!("provision-{}", uuid::Uuid::new_v4());
+    stage_provision_token(&state, &second);
+    let admin_bound = request_json_with_bearer(
+        &app,
+        Method::POST,
+        exchange_uri,
+        json!({"url": "http://127.0.0.1:9090"}),
+        &second,
+    )
+    .await;
+    let admin_bound = admin_bound["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::DELETE,
+            "/runner/server/_apis/distributedtask/pools/1/agents/999",
+            Value::Null,
+            &admin_bound,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "provision-bound grants must not reach runner administration"
+    );
+}
+
+/// A single-use runner's borrowed listen credential stops authenticating as
+/// soon as its attempt settles, even before/without the registration row
+/// being purged. A fresh idle ephemeral runner is still usable.
+#[tokio::test]
+async fn spent_ephemeral_runner_credentials_are_denied_before_purge() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let shared = state.shared();
+    let agent_job = uuid::Uuid::new_v4();
+    let run_key = register_live_job_in(&state, agent_job, "plan-ephemeral", "owner/repo").await;
+
+    let register_ephemeral = |name: String| {
+        let app = app.clone();
+        let bearer = state.system_token.clone();
+        async move {
+            let exchanged = request_json_with_bearer(
+                &app,
+                Method::POST,
+                "/api/v3/actions/runner-registration",
+                json!({"url": "http://127.0.0.1:9090"}),
+                &bearer,
+            )
+            .await;
+            let grant = exchanged["token"].as_str().unwrap().to_owned();
+            let registered = request_json_with_bearer(
+                &app,
+                Method::POST,
+                "/runner/server/_apis/v1/Agent/1/0",
+                json!({
+                    "name": name,
+                    "version": "2.335.1",
+                    "ephemeral": true,
+                    "labels": [{"name": "self-hosted", "type": "system"}]
+                }),
+                &grant,
+            )
+            .await;
+            registered["id"].as_i64().expect("registered runner id")
+        }
+    };
+    let spent = register_ephemeral("spent-vm".to_owned()).await;
+    let fresh = register_ephemeral("fresh-vm".to_owned()).await;
+
+    let listen = |id: i64| {
+        state
+            .local_jwt(json!({
+                "sub": format!("preloop-runner-listen-{id}"),
+                "scp": "ActionsRuntime.RunnerListen Framework.GenericRead Identity.ReadRefs LocationService.Connect",
+                "jti": uuid::Uuid::new_v4().to_string()
+            }))
+            .unwrap()
+    };
+    // Fresh idle single-use runner: no attempt yet, so its credentials work.
+    assert_eq!(
+        crate::auth::registered_runner_id(&shared, &listen(fresh)).await,
+        Some(fresh)
+    );
+    let fresh_listen = listen(fresh);
+    let generic_route = "/runner/server/_apis/distributedtask/pools";
+    assert_eq!(
+        request_status_with_bearer(&app, Method::GET, generic_route, Value::Null, &fresh_listen)
+            .await,
+        StatusCode::OK,
+        "a fresh single-use runner's listen token reaches the generic protocol surface"
+    );
+
+    // Give the spent runner a terminal attempt.
+    let updated = state
+        .test_db_mutate(|tx| {
+            // The claim transaction sets the lifetime marker; model both
+            // effects here because this fixture did not run a real claim.
+            tx.execute(
+                "UPDATE runners SET ephemeral_spent = 1 WHERE runner_id = ?1",
+                (spent,),
+            )?;
+            tx.execute(
+                "UPDATE job_requests SET runner_id = ?2, result = 'success', finished_at = ?3 \
+                 WHERE agent_job_id = ?1",
+                (agent_job.to_string(), spent, crate::store::now_us()),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    assert_eq!(
+        crate::auth::registered_runner_id(&shared, &listen(spent)).await,
+        None,
+        "a spent ephemeral runner's listen token must not authenticate"
+    );
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::GET,
+            generic_route,
+            Value::Null,
+            &listen(spent)
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "the generic middleware must reject the spent listen token too"
+    );
+    assert!(
+        !crate::auth::runner_registration_bearer_authorized(&state, &listen(spent)),
+        "a listen token is not a registration credential anyway"
+    );
+
+    // The orchestrator's teardown hook may purge a single-use registration
+    // immediately after the accepted completion. The runner's late retry of
+    // that same completion must still be an idempotent no-op, not an auth
+    // failure that makes the official runner treat an accepted result as
+    // failed.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/api/v1/runners/purge",
+            json!({"name": "spent-vm"}),
+            &state.system_token,
+        )
+        .await,
+        StatusCode::OK
+    );
+    let runtime = state.mint_runtime_token(&agent_job.to_string(), &agent_job);
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            &format!("/broker/{spent}/completejob"),
+            json!({
+                "jobId": agent_job,
+                "planId": agent_job.to_string(),
+                "conclusion": "success"
+            }),
+            &runtime,
+        )
+        .await,
+        StatusCode::NO_CONTENT,
+        "a late retry of an already-settled completion is a no-op after purge"
+    );
+    // Other runners are unaffected.
+    assert_eq!(
+        crate::auth::registered_runner_id(&shared, &listen(fresh)).await,
+        Some(fresh)
+    );
+    let _ = run_key;
+    let _ = app;
+}
+
+/// A provision-bound grant may authorize at most one registration even when
+/// many requests pass the pre-consumption check concurrently. The loser must
+/// not fall back to the (stale) bearer authorization and register an extra or
+/// persistent runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_provision_registration_grant_registers_exactly_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let provision = format!("provision-{}", uuid::Uuid::new_v4());
+    stage_provision_token(&state, &provision);
+    let exchanged = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v3/actions/runner-registration",
+        json!({"url": "http://127.0.0.1:9090"}),
+        &provision,
+    )
+    .await;
+    let grant = exchanged["token"].as_str().unwrap().to_owned();
+
+    let mut set = tokio::task::JoinSet::new();
+    for index in 0..16 {
+        let app = app.clone();
+        let grant = grant.clone();
+        set.spawn(async move {
+            request_status_with_bearer(
+                &app,
+                Method::POST,
+                "/runner/server/_apis/v1/Agent/1/0",
+                json!({
+                    "name": format!("race-vm-{index}"),
+                    "version": "2.335.1",
+                    "ephemeral": true,
+                    "labels": [{"name": "self-hosted", "type": "system"}]
+                }),
+                &grant,
+            )
+            .await
+        });
+    }
+    let mut statuses = Vec::new();
+    while let Some(status) = set.join_next().await {
+        statuses.push(status.expect("registration task"));
+    }
+    let accepted = statuses
+        .iter()
+        .filter(|status| **status == StatusCode::OK)
+        .count();
+    assert_eq!(accepted, 1, "exactly one request may consume the grant");
+    assert!(
+        statuses
+            .iter()
+            .all(|status| *status == StatusCode::OK || *status == StatusCode::UNAUTHORIZED),
+        "losers must fail closed: {statuses:?}"
+    );
+    assert_eq!(
+        state.test_tx().await.runners.len(),
+        1,
+        "no loser may create an extra runner"
+    );
+    assert!(
+        state
+            .pending_registrations
+            .read()
+            .unwrap()
+            .get(&provision)
+            .is_none(),
+        "the one-time token is consumed once"
+    );
 }

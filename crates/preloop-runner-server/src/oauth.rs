@@ -11,11 +11,12 @@ pub async fn github_registration_token(
     // The runner sends `Authorization: RemoteAuth <token>` (the official
     // runner does the same against GitHub, where the token is one GitHub
     // issued). GitHub validates because it issued the token; this control
-    // plane cannot validate third-party credentials, so the only credential
-    // it accepts is its own system token. The conformance harness replays
-    // goldens that carry a real GitHub-issued registration token, which this
-    // control plane could never have minted; that harness opts into
-    // permissive mode explicitly (PRELOOP_REGISTRATION_POLICY=permissive).
+    // plane cannot validate third-party credentials, so it accepts its own
+    // system token or a pending one-time provision credential (the pool's
+    // guest configure path). The conformance harness replays goldens that
+    // carry a real GitHub-issued registration token, which this control plane
+    // could never have minted; that harness opts into permissive mode
+    // explicitly (PRELOOP_REGISTRATION_POLICY=permissive).
     let auth = request
         .headers()
         .get("authorization")
@@ -26,8 +27,12 @@ pub async fn github_registration_token(
         .or_else(|| auth.strip_prefix("Bearer "));
     let missing = provided.is_none_or(|token| token.is_empty());
     let trusted = provided == Some(shared.state.system_token.as_str());
+    // Pool-provisioned configure flows hold a one-time provision credential,
+    // not the engine's system token. Accepting it here lets the guest exchange
+    // for a registration grant without ever receiving the admin credential.
+    let bound = provided.filter(|token| crate::auth::pending_provision_token(&shared.state, token));
     let accepted = match shared.state.registration_policy {
-        RegistrationPolicy::Strict => trusted,
+        RegistrationPolicy::Strict => trusted || bound.is_some(),
         // Conformance replays send a real GitHub-issued token this control
         // plane cannot verify; the harness opts in explicitly. Even then,
         // workflow code reaching the mounted socket must not mint a new
@@ -40,6 +45,7 @@ pub async fn github_registration_token(
     if missing || !accepted {
         return Err(ApiError::unauthorized("invalid registration credential"));
     }
+    let bound_hash = bound.map(crate::auth::provision_token_hash);
 
     let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
         .await
@@ -47,11 +53,18 @@ pub async fn github_registration_token(
     let payload: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| ApiError::bad_request(format!("invalid registration body: {error}")))?;
 
-    let token = shared.state.local_jwt(json!({
+    let mut claims = json!({
         "sub": "preloop-runner-registration",
         "scp": "ActionsRuntime.RunnerManage Framework.GenericRead Identity.ReadRefs LocationService.Connect",
         "jti": uuid::Uuid::new_v4().to_string()
-    }))?;
+    });
+    if let Some(hash) = bound_hash {
+        // Bind the grant to the same one-time provision credential the VM
+        // was issued. The grant stops verifying when that token is consumed,
+        // and it is excluded from runner-administration routes.
+        claims["pvt_hash"] = json!(hash);
+    }
+    let token = shared.state.local_jwt(claims)?;
     let _requested_url = payload
         .get("url")
         .and_then(|v| v.as_str())
@@ -262,6 +275,18 @@ pub async fn oauth2_token(
                 "client ID not registered: {client_id}"
             )));
         };
+        // The RSA key proves possession, but possession is not enough once a
+        // single-use runner's attempt has settled: its registration may
+        // outlive the machine if purge failed or the server restarted.
+        if !backend
+            .runner_credentials_usable(id)
+            .await
+            .map_err(ApiError::from)?
+        {
+            return Err(ApiError::unauthorized(
+                "runner credentials are no longer valid",
+            ));
+        }
         let Some(pubkey) = backend
             .runner_rsa_public_key(id)
             .await

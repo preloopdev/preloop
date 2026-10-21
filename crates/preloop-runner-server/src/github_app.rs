@@ -222,6 +222,16 @@ impl MintFailurePolicy {
         )
     }
 
+    /// [`Self::from_env_or_config`] for the engine state.
+    ///
+    /// Parsed at startup even when no App is configured: under `error` a
+    /// deployment with no App (or an App that does not cover the repository)
+    /// must refuse the job instead of silently handing it the static PAT.
+    /// A typo in the variable is a startup error in every mode.
+    pub fn load(config: &crate::config::ConfigFile) -> anyhow::Result<Self> {
+        Self::from_env_or_config(&config.github)
+    }
+
     /// [`Self::from_env`] against an explicit value, so the mapping is testable
     /// without mutating process-wide environment state.
     fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
@@ -678,6 +688,14 @@ impl MintLedger {
         entries.insert(sha256_hex(token), entry);
         let now = SystemTime::now();
         entries.retain(|_, entry| entry.expires_at > now);
+    }
+
+    /// Drop a token from offline acceptance. Called after the remote revoke
+    /// succeeded (or GitHub said it is already invalid) and when tracking a
+    /// freshly minted job token fails, so an undelivered or revoked credential
+    /// cannot authenticate a dispatch.
+    pub fn forget(&self, token_hash: &str) {
+        self.entries.lock().remove(token_hash);
     }
 
     /// Look a token up. Returns `None` when unknown or expired.
@@ -1310,6 +1328,18 @@ pub async fn installation_for_repo(
     installation_id_for(&api_base(), app, &app_jwt, owner).await
 }
 
+/// A freshly minted installation token plus the facts the job-token lifecycle
+/// needs to track it (attempt association and remote revocation).
+#[derive(Clone, Debug)]
+pub struct MintedInstallationToken {
+    pub token: preloop_gha_protocol::SecretString,
+    pub expires_at: SystemTime,
+    pub installation_id: u64,
+    /// Permission scopes the token actually carries, present only when the
+    /// request was narrowed to the installation's grants.
+    pub effective_permissions: Option<BTreeMap<String, String>>,
+}
+
 /// Mint an installation token for `repository`, scoped to `permissions`.
 ///
 /// `repository` is an `owner/repo` slug: the owner selects the installation and
@@ -1329,7 +1359,9 @@ pub async fn get_or_mint_token(
     Ok(
         mint_for_repository(&api_base(), creds, repository, permissions, false)
             .await?
-            .0,
+            .token
+            .expose()
+            .to_owned(),
     )
 }
 
@@ -1341,15 +1373,15 @@ pub async fn get_or_mint_token(
 /// the installation lacks, so refusing the whole claim would cost the job its
 /// GitHub authority for a scope it could never have carried.
 ///
-/// The second element is the set the token *actually* carries, present only
-/// when narrowing occurred. Callers must restate it to the job: a token that
-/// silently holds less than the job was told is a 403 with no explanation.
+/// The returned [`MintedInstallationToken`] carries the mint's expiry and
+/// installation id so the caller can durably track revocation before handing
+/// the credential to a job.
 pub async fn get_or_mint_token_declared(
     creds: &GitHubAppCredentials,
     repository: &str,
     permissions: &BTreeMap<String, String>,
     declared: bool,
-) -> anyhow::Result<(String, Option<BTreeMap<String, String>>)> {
+) -> anyhow::Result<MintedInstallationToken> {
     mint_for_repository(&api_base(), creds, repository, permissions, declared).await
 }
 
@@ -1362,7 +1394,9 @@ pub async fn get_or_mint_token_at(
     Ok(
         mint_for_repository(api_base, creds, repository, permissions, false)
             .await?
-            .0,
+            .token
+            .expose()
+            .to_owned(),
     )
 }
 
@@ -1373,7 +1407,7 @@ async fn mint_for_repository(
     repository: &str,
     permissions: &BTreeMap<String, String>,
     declared: bool,
-) -> anyhow::Result<(String, Option<BTreeMap<String, String>>)> {
+) -> anyhow::Result<MintedInstallationToken> {
     let (owner, repo) = split_repository(repository)?;
     let app_jwt = sign_app_jwt(&creds.app_id, &creds.private_key)?;
     let installation_id = installation_id_for(api_base, creds, &app_jwt, owner).await?;
@@ -1453,7 +1487,12 @@ async fn mint_for_repository(
             .unwrap_or(0),
         "minted GitHub App installation token"
     );
-    Ok((token, narrowed))
+    Ok(MintedInstallationToken {
+        token: preloop_gha_protocol::SecretString::new(token),
+        expires_at,
+        installation_id,
+        effective_permissions: narrowed,
+    })
 }
 
 /// Permission scopes this installation currently holds, keyed snake_case.
@@ -2946,10 +2985,10 @@ mod tests {
         )
         .await
         .expect("mint a policy-default token");
-        assert_eq!(declared.0, "ghs_stub_installation_token");
-        assert_eq!(defaulted.0, "ghs_stub_installation_token");
+        assert_eq!(declared.token.expose(), "ghs_stub_installation_token");
+        assert_eq!(defaulted.token.expose(), "ghs_stub_installation_token");
         assert!(
-            declared.1.is_none() && defaulted.1.is_none(),
+            declared.effective_permissions.is_none() && defaulted.effective_permissions.is_none(),
             "a mint GitHub accepted was never narrowed, so there is nothing to restate"
         );
 

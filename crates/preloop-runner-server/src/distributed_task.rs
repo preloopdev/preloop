@@ -143,6 +143,18 @@ async fn render_session_message(
         // a real GitHub credential. Without one the job's token surface stays
         // empty — never the job-scoped runtime token, which is an engine
         // credential (`broker_acquire_job` documents the full reasoning).
+        if !fork_restricted
+            && shared.state.github_mint_failure == crate::github_app::MintFailurePolicy::Error
+        {
+            // This legacy poll path never mints an App token. Under `error`
+            // that is a configuration/route mismatch, not a licence to embed
+            // the repository-unscoped static PAT: fail the attempt loudly.
+            crate::broker::fail_unclaimable_request(shared, ctx.request.request_id).await;
+            return Err(ApiError::bad_gateway(
+                "PRELOOP_GITHUB_APP_MINT_FAILURE=error: this job was delivered on the legacy \
+                 poll path, which has no GitHub App mint; refusing the static PAT fallback",
+            ));
+        }
         if !fork_restricted && let Some(pat) = shared.state.static_github_pat() {
             // The PAT is embedded only when its OAuth scopes are verified
             // (fresh cache, or re-introspected here: the job may have queued
@@ -159,7 +171,7 @@ async fn render_session_message(
                     crate::broker::apply_minted_token_to_message(
                         &mut msg,
                         &crate::broker::MintedGitHubToken {
-                            token: pat,
+                            token: preloop_gha_protocol::SecretString::new(pat),
                             effective_permissions: None,
                         },
                         false,
@@ -803,6 +815,11 @@ pub(crate) async fn complete_job_settling(
             "job completion status must be terminal",
         ));
     }
+    // Retain the attempt identity for post-settlement runner teardown: a
+    // single-use (`--ephemeral`) runner must lose its registration (and thus
+    // its RSA/OAuth-issued listen tokens) when its one job ends, even if the
+    // orchestrator's fire-and-forget purge notification never arrives.
+    let settled_attempt = completion.agent_job_id;
     mask_completion_payload(&shared, &mut completion).await?;
     let outcome = shared
         .state
@@ -1025,7 +1042,63 @@ pub(crate) async fn complete_job_settling(
             }
         });
     }
+    // Off the response path: the runner is waiting on this completion to turn
+    // its slot over. Reconcile a single-use runner's registration once its
+    // only attempt has settled; this includes the reaper's lease-expiry
+    // completion, so a dead orchestrator cannot leave a stolen listen token
+    // valid until the next server restart.
+    if let Some(agent_job_id) = settled_attempt {
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move {
+            purge_finished_ephemeral_runner(&shared, agent_job_id).await;
+        });
+    }
     Ok(Json(record))
+}
+
+/// Retire a single-use runner registration after its attempt settles.
+///
+/// The orchestrator normally posts `/api/v1/runners/purge` before deleting a
+/// machine, but that notification is fire-and-forget and is lost if the host
+/// crashes or the control plane is unreachable. Credential validity does not
+/// depend on this delete: `runner_credentials_usable` already denies a spent
+/// ephemeral runner's listen JWT and OAuth exchange. Purging is cleanup, and
+/// the reaper retries it every tick. Persistent runners are left registered.
+async fn purge_finished_ephemeral_runner(shared: &Arc<SharedState>, agent_job_id: uuid::Uuid) {
+    let backend = &shared.state.backend;
+    let Ok(record) = backend
+        .request(crate::control::backend::RequestKey::AgentJobId(
+            agent_job_id,
+        ))
+        .await
+    else {
+        return;
+    };
+    let Some(runner_id) = record.owner_runner_id else {
+        return;
+    };
+    // Eligibility and the delete share one backend transaction: an ephemeral
+    // runner with a settled attempt and no unsettled one is purged, and a
+    // concurrent claim cannot slip in between the check and the delete. A
+    // failure is retried by the reaper; credential validity itself does not
+    // depend on this cleanup succeeding.
+    match backend
+        .purge_runner_guarded(runner_id, crate::control::PurgeGuard::SpentEphemeral)
+        .await
+    {
+        Ok(Some(_)) => tracing::info!(
+            runner_id,
+            %agent_job_id,
+            "retired single-use runner registration after terminal attempt"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::error!(
+            runner_id,
+            %agent_job_id,
+            ?error,
+            "ephemeral runner purge after terminal attempt failed; reaper will retry"
+        ),
+    }
 }
 
 #[cfg(test)]

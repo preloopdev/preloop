@@ -24,6 +24,7 @@ pub mod github_app_setup;
 pub mod github_breaker;
 pub mod github_pr;
 pub mod github_push;
+pub mod github_token_revocation;
 pub mod scheduler;
 pub mod shared_http;
 pub mod token_ceiling;
