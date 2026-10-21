@@ -2032,13 +2032,12 @@ pub fn load_or_generate_oidc_keypair(
     let certificate_path = state_dir.join("oidc-cert.der");
     // The key files below are forced to 0600, but a state dir created with
     // the process umask (typically 0755) still lets any local user
-    // enumerate it. When the server creates the dir, make it owner-only; a
-    // pre-existing dir keeps the operator's chosen permissions.
-    let dir_preexisting = state_dir.exists();
+    // enumerate it. Hold the dir to the same rule as the files: owner-only
+    // whenever it grants group/other access. (Checking "did we create it"
+    // instead would race the HMAC key loader, which creates the same dir
+    // concurrently at startup.)
     std::fs::create_dir_all(state_dir)?;
-    if !dir_preexisting {
-        set_private_dir_permissions(state_dir)?;
-    }
+    set_private_dir_permissions(state_dir)?;
 
     if key_path.exists() {
         set_private_file_permissions(&key_path)?;
@@ -2101,8 +2100,10 @@ fn store_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()
 fn set_private_dir_permissions(path: &std::path::Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if std::fs::metadata(path)?.mode() & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     Ok(())
 }
