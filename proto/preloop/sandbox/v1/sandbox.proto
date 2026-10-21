@@ -196,15 +196,27 @@ service Sandboxes {
   rpc Pause(GetRequest) returns (Empty);
   rpc Resume(GetRequest) returns (Empty);
   rpc ListProviders(ListRequest) returns (ListProvidersResponse);
+  rpc CordonProvider(ProviderControlRequest) returns (Provider);
+  rpc UncordonProvider(ProviderControlRequest) returns (Provider);
+  rpc DrainProvider(ProviderControlRequest) returns (DrainProviderResult);
 }
 
 message Empty {}
-message ListRequest {}
+message ListRequest {
+  uint32 page_size = 180;           // 0 = default (100); capped at 1000
+  string page_token = 181;          // `next_page_token` from the previous page
+}
 message PutTemplateRequest { TemplateSpec template = 1; }
-message ListTemplatesResponse { repeated Template templates = 1; }
+message ListTemplatesResponse {
+  repeated Template templates = 1;
+  string next_page_token = 180;     // empty on the last page
+}
 message DeleteTemplateRequest { string name = 1; }
 message PutPoolRequest { PoolSpec pool = 1; }
-message ListPoolsResponse { repeated PoolSpec pools = 1; }
+message ListPoolsResponse {
+  repeated PoolSpec pools = 1;
+  string next_page_token = 180;
+}
 message DeletePoolRequest { string name = 1; }
 
 message AcquireRequest {
@@ -233,7 +245,10 @@ enum ReleaseMode {
 }
 message ReleaseRequest { string lease_id = 1; ReleaseMode mode = 2; uint64 preserve_ttl_secs = 3; }
 message GetRequest { string sandbox_id = 1; }
-message ListSandboxesResponse { repeated Sandbox sandboxes = 1; }
+message ListSandboxesResponse {
+  repeated Sandbox sandboxes = 1;
+  string next_page_token = 180;
+}
 
 message ExecRequest {
   string sandbox_id = 1;
@@ -261,7 +276,20 @@ message OpenStreamRequest { string sandbox_id = 1; StreamKind kind = 2; string p
 message Ticket { string url = 1; string token = 2; int64 expires_at = 3; }
 message SnapshotRequest { string sandbox_id = 1; string name = 2; }
 message StartRequest { string sandbox_id = 1; bool forkable = 2; }
-message ListProvidersResponse { repeated Provider providers = 1; }
+message ListProvidersResponse {
+  repeated Provider providers = 1;
+  string next_page_token = 180;
+}
+
+// `CordonProvider`, `UncordonProvider` and `DrainProvider` target one
+// provider by its registered name (or its id).
+message ProviderControlRequest { string name = 1; }
+
+// `DrainProvider`: cordon, release idle pool members, report what is left.
+message DrainProviderResult {
+  uint32 released_pool_members = 1; // idle members released by this drain
+  uint32 leased_remaining = 2;      // leased sandboxes still on the provider
+}
 
 // ─── Providers (capacity owners) ──────────────────────────────────────
 
@@ -282,6 +310,7 @@ message Provider {
   uint64 generation = 3;
   repeated DriverInfo drivers = 4;
   int64 last_seen = 5;
+  bool cordoned = 180;              // no new placements; survives re-registration
 }
 
 message RegisterRequest { string name = 1; repeated DriverInfo drivers = 2; }

@@ -470,9 +470,17 @@ pub struct Lease {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Empty {}
 
-/// List request (no filters yet).
+/// List request: page size and the token of the previous page.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListRequest {}
+#[serde(rename_all = "camelCase", default)]
+pub struct ListRequest {
+    /// Items per page (0 = default 100; capped at 1000).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub page_size: u32,
+    /// Opaque continuation token from the previous response.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub page_token: String,
+}
 
 /// `PutTemplate`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,6 +496,9 @@ pub struct PutTemplateRequest {
 pub struct ListTemplatesResponse {
     /// Templates.
     pub templates: Vec<Template>,
+    /// Continuation token; empty on the last page.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub next_page_token: String,
 }
 
 /// `DeleteTemplate`.
@@ -512,6 +523,9 @@ pub struct PutPoolRequest {
 pub struct ListPoolsResponse {
     /// Pools.
     pub pools: Vec<PoolSpec>,
+    /// Continuation token; empty on the last page.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub next_page_token: String,
 }
 
 /// `DeletePool`.
@@ -626,6 +640,9 @@ pub struct GetRequest {
 pub struct ListSandboxesResponse {
     /// Sandboxes.
     pub sandboxes: Vec<Sandbox>,
+    /// Continuation token; empty on the last page.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub next_page_token: String,
 }
 
 /// `Exec`.
@@ -763,6 +780,9 @@ pub struct Provider {
     pub drivers: Vec<DriverInfo>,
     /// Unix seconds.
     pub last_seen: i64,
+    /// No new placements are made here; survives re-registration.
+    #[serde(skip_serializing_if = "is_false")]
+    pub cordoned: bool,
 }
 
 /// `ListProviders`.
@@ -771,6 +791,29 @@ pub struct Provider {
 pub struct ListProvidersResponse {
     /// Providers.
     pub providers: Vec<Provider>,
+    /// Continuation token; empty on the last page.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub next_page_token: String,
+}
+
+/// `CordonProvider` / `UncordonProvider` / `DrainProvider`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProviderControlRequest {
+    /// Provider name (or id).
+    pub name: String,
+}
+
+/// `DrainProvider` result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DrainProviderResult {
+    /// Idle pool members released by this drain.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub released_pool_members: u32,
+    /// Leased sandboxes still running on the provider (not killed).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub leased_remaining: u32,
 }
 
 /// `Register`.

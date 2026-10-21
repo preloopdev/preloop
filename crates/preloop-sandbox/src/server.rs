@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::StreamExt as _;
@@ -14,6 +14,9 @@ use tokio::io::AsyncWriteExt as _;
 use crate::api::*;
 use crate::connect::{self, Code, Error};
 use crate::service::Service;
+
+/// Maximum request body for one Connect RPC.
+pub const CONNECT_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Bearer tokens. `None` disables the check (loopback / tests only).
 #[derive(Debug, Clone, Default)]
@@ -74,6 +77,9 @@ pub fn router(service: Arc<Service>, auth: Auth) -> Router {
             get(agent_blob_get).put(agent_blob_put),
         )
         .route("/sandbox/v1/healthz", get(|| async { "ok" }))
+        // Bulk bytes travel over the ticketed data plane, never in RPCs.
+        // This bounds every unary request (and the single Exec envelope).
+        .layer(DefaultBodyLimit::max(CONNECT_BODY_LIMIT))
         .with_state(AppState { service, auth })
 }
 
@@ -97,16 +103,18 @@ async fn sandboxes(
             Ok(r) => reply(service.delete_template(&r.name).await.map(|_| Empty {})),
             Err(e) => e.into_response(),
         },
-        "ListTemplates" => reply(Ok(ListTemplatesResponse {
-            templates: service.list_templates(),
-        })),
+        "ListTemplates" => match decode::<ListRequest>(&body) {
+            Ok(r) => reply(service.list_templates_page(&r)),
+            Err(e) => e.into_response(),
+        },
         "PutPool" => match decode::<PutPoolRequest>(&body) {
             Ok(r) => reply(service.put_pool(r.pool).await),
             Err(e) => e.into_response(),
         },
-        "ListPools" => reply(Ok(ListPoolsResponse {
-            pools: service.list_pools(),
-        })),
+        "ListPools" => match decode::<ListRequest>(&body) {
+            Ok(r) => reply(service.list_pools_page(&r)),
+            Err(e) => e.into_response(),
+        },
         "DeletePool" => match decode::<DeletePoolRequest>(&body) {
             Ok(r) => reply(service.delete_pool(&r.name).await.map(|_| Empty {})),
             Err(e) => e.into_response(),
@@ -127,12 +135,26 @@ async fn sandboxes(
             Ok(r) => reply(service.get(&r.sandbox_id)),
             Err(e) => e.into_response(),
         },
-        "List" => reply(Ok(ListSandboxesResponse {
-            sandboxes: service.list(),
-        })),
-        "ListProviders" => reply(Ok(ListProvidersResponse {
-            providers: service.list_providers(),
-        })),
+        "List" => match decode::<ListRequest>(&body) {
+            Ok(r) => reply(service.list_page(&r)),
+            Err(e) => e.into_response(),
+        },
+        "ListProviders" => match decode::<ListRequest>(&body) {
+            Ok(r) => reply(service.list_providers_page(&r)),
+            Err(e) => e.into_response(),
+        },
+        "CordonProvider" => match decode::<ProviderControlRequest>(&body) {
+            Ok(r) => reply(service.set_provider_cordon(&r.name, true).await),
+            Err(e) => e.into_response(),
+        },
+        "UncordonProvider" => match decode::<ProviderControlRequest>(&body) {
+            Ok(r) => reply(service.set_provider_cordon(&r.name, false).await),
+            Err(e) => e.into_response(),
+        },
+        "DrainProvider" => match decode::<ProviderControlRequest>(&body) {
+            Ok(r) => reply(service.drain_provider(&r.name).await),
+            Err(e) => e.into_response(),
+        },
         "Exec" => match connect::decode_stream_request::<ExecRequest>(&body) {
             Ok(r) => match service.exec(r) {
                 Ok(stream) => connect::stream_response(stream),
@@ -215,20 +237,94 @@ async fn providers(
     }
 }
 
-async fn write_body(path: &std::path::Path, body: Body) -> Result<(), Error> {
+/// A rejected blob body: the cap was exceeded or the transfer failed.
+enum BodyWriteError {
+    TooLarge(u64),
+    Failed(Error),
+}
+
+impl From<Error> for BodyWriteError {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl IntoResponse for BodyWriteError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::TooLarge(max_bytes) => payload_too_large(max_bytes),
+            Self::Failed(error) => error.into_response(),
+        }
+    }
+}
+
+fn payload_too_large(max_bytes: u64) -> Response {
+    let error = Error::new(
+        Code::OutOfRange,
+        format!("blob exceeds the {max_bytes} byte limit"),
+    );
+    let body = serde_json::to_vec(&error).unwrap_or_default();
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        body,
+    )
+        .into_response()
+}
+
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+async fn remove_partial(path: &std::path::Path) {
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+async fn write_body(
+    path: &std::path::Path,
+    body: Body,
+    max_bytes: u64,
+) -> std::result::Result<(), BodyWriteError> {
     let mut file = tokio::fs::File::create(path)
         .await
         .map_err(|e| Error::internal(format!("blob write: {e}")))?;
+    let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| Error::unavailable(format!("upload: {e}")))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| Error::internal(format!("blob write: {e}")))?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                drop(file);
+                remove_partial(path).await;
+                return Err(Error::unavailable(format!("upload: {error}")).into());
+            }
+        };
+        written = written.saturating_add(chunk.len() as u64);
+        if written > max_bytes {
+            drop(file);
+            remove_partial(path).await;
+            return Err(BodyWriteError::TooLarge(max_bytes));
+        }
+        if let Err(error) = file.write_all(&chunk).await {
+            drop(file);
+            remove_partial(path).await;
+            return Err(Error::internal(format!("blob write: {error}")).into());
+        }
     }
-    file.flush()
-        .await
-        .map_err(|e| Error::internal(format!("blob write: {e}")))
+    if let Err(error) = file.flush().await {
+        drop(file);
+        remove_partial(path).await;
+        return Err(Error::internal(format!("blob write: {error}")).into());
+    }
+    Ok(())
 }
 
 async fn file_response(path: &std::path::Path) -> Result<Response, Error> {
@@ -254,18 +350,28 @@ async fn stream_upload(
     body: Body,
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
-    let result = async {
-        let (kind, path) = app.service.claim_ticket(&ticket, token)?;
-        if kind != StreamKind::Upload {
-            return Err(Error::invalid("ticket is not an upload"));
-        }
-        write_body(&path, body).await?;
-        app.service.finish_upload(&ticket).await
+    let max_bytes = app.service.config().blob_max_bytes;
+    let (kind, path) = match app.service.claim_ticket(&ticket, token) {
+        Ok(claimed) => claimed,
+        Err(error) => return error.into_response(),
+    };
+    if kind != StreamKind::Upload {
+        return Error::invalid("ticket is not an upload").into_response();
     }
-    .await;
-    match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => error.into_response(),
+    if content_length(&headers).is_some_and(|length| length > max_bytes) {
+        return payload_too_large(max_bytes);
+    }
+    match write_body(&path, body, max_bytes).await {
+        Ok(()) => match app.service.finish_upload(&ticket).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => error.into_response(),
+        },
+        Err(error) => {
+            // The ticket's bytes are incomplete: consume it so nothing can
+            // extract a truncated tar.
+            app.service.drop_ticket(&ticket);
+            error.into_response()
+        }
     }
 }
 
@@ -328,10 +434,18 @@ async fn agent_blob_put(
         check(&app.auth.provider_token, &headers)?;
         let (id, generation) = provider_headers(&headers)?;
         let path = app.service.agent_blob(&id, generation, &ticket)?;
-        write_body(&path, body).await
+        Ok::<_, Error>(path)
     }
     .await;
-    match result {
+    let path = match result {
+        Ok(path) => path,
+        Err(error) => return error.into_response(),
+    };
+    let max_bytes = app.service.config().blob_max_bytes;
+    if content_length(&headers).is_some_and(|length| length > max_bytes) {
+        return payload_too_large(max_bytes);
+    }
+    match write_body(&path, body, max_bytes).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
     }

@@ -12,6 +12,12 @@ Releases before v0.27.0 predate the changelog.
 - **Sandbox Service** (`preloop-sandbox`) replaces `preloop-vm`; the
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
   service. The AgentENV backend moved to the private build.
+- **Sandbox Service: provider cordon/drain, pagination and request caps.**
+  `CordonProvider`/`UncordonProvider`/`DrainProvider` (and
+  `preloop sandbox provider …`) stop new placements and release idle pool
+  members; `List*` RPCs are paginated (`pageSize` up to 1000); unary RPCs are
+  capped at 4 MiB and blob uploads at `PRELOOP_SANDBOX_BLOB_MAX_BYTES`
+  (default 8 GiB), with orphaned blobs swept at boot.
 
 ### Fixed
 

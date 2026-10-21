@@ -39,6 +39,8 @@ pub struct ServiceConfig {
     pub preserve_ttl: Duration,
     /// Directory for data-plane blobs.
     pub blob_dir: PathBuf,
+    /// Maximum bytes accepted for one blob upload (data plane).
+    pub blob_max_bytes: u64,
     /// How long a data-plane ticket stays valid.
     pub ticket_ttl: Duration,
     /// How long a caller waits for a provider to report a snapshot, copy,
@@ -59,6 +61,7 @@ impl ServiceConfig {
             create_timeout: Duration::from_secs(1800),
             preserve_ttl: Duration::from_secs(600),
             blob_dir,
+            blob_max_bytes: DEFAULT_BLOB_MAX_BYTES,
             ticket_ttl: Duration::from_secs(300),
             work_timeout: Duration::from_secs(900),
             provider_lost_factor: 3,
@@ -68,6 +71,15 @@ impl ServiceConfig {
 
 /// Pause between warm-pool refills after a creation failure.
 const POOL_FAILURE_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Default `ListRequest.page_size`.
+pub const DEFAULT_PAGE_SIZE: u32 = 100;
+
+/// Largest accepted `ListRequest.page_size`.
+pub const MAX_PAGE_SIZE: u32 = 1000;
+
+/// Default cap for one blob upload: 8 GiB.
+pub const DEFAULT_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Names are identifiers: they reach driver-native names, snapshot paths and
 /// pool configuration, so path separators and traversal are rejected.
@@ -91,6 +103,26 @@ fn now() -> i64 {
         .unwrap_or_default()
 }
 
+/// Remove every file a previous process left in the blob directory.
+fn sweep_blob_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!(path = %path.display(), "removed orphaned sandbox blob"),
+                Err(error) => warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not remove orphaned sandbox blob"
+                ),
+            }
+        }
+    }
+}
+
 fn new_id(prefix: &str) -> String {
     format!(
         "{prefix}-{}",
@@ -102,6 +134,46 @@ fn new_id(prefix: &str) -> String {
 pub fn template_digest(spec: &TemplateSpec) -> String {
     let canonical = serde_json::to_vec(spec).unwrap_or_default();
     format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
+}
+
+/// Page `items` (already ordered by id) as the request asks.
+///
+/// The token is the base64url encoding of the last returned id: callers pass
+/// it back untouched, and an id that has since disappeared still resumes at
+/// the right position.
+fn paginate<T>(
+    items: impl IntoIterator<Item = (String, T)>,
+    request: &ListRequest,
+) -> Result<(Vec<T>, String)> {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let limit = match request.page_size {
+        0 => DEFAULT_PAGE_SIZE,
+        size => size.min(MAX_PAGE_SIZE),
+    } as usize;
+    let after = if request.page_token.is_empty() {
+        None
+    } else {
+        let decoded = engine
+            .decode(request.page_token.as_bytes())
+            .map_err(|_| Error::invalid("invalid page token"))?;
+        Some(String::from_utf8(decoded).map_err(|_| Error::invalid("invalid page token"))?)
+    };
+    let items: Vec<(String, T)> = items.into_iter().collect();
+    let start = after
+        .as_ref()
+        .map_or(0, |after| items.partition_point(|(id, _)| id <= after));
+    let mut page = Vec::with_capacity(limit.min(items.len()));
+    let mut last = None;
+    for (id, item) in items.into_iter().skip(start) {
+        if page.len() == limit {
+            let token = last.expect("a full page has a last id");
+            return Ok((page, engine.encode(token)));
+        }
+        last = Some(id);
+        page.push(item);
+    }
+    Ok((page, String::new()))
 }
 
 #[derive(Debug)]
@@ -239,6 +311,10 @@ impl Service {
     pub async fn open(store: Arc<dyn Store>, config: ServiceConfig) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&config.blob_dir)
             .map_err(|e| Error::internal(format!("blob dir: {e}")))?;
+        // Tickets are memory-only, so every file left in the blob directory
+        // belongs to a previous process: an upload interrupted by shutdown or
+        // a staging tar whose call never finished. Nothing can claim them.
+        sweep_blob_dir(&config.blob_dir);
         let mut state = State::default();
         for template in load::<Template>(&*store, Kind::Templates).await? {
             state.templates.insert(template.spec.name.clone(), template);
@@ -604,6 +680,22 @@ impl Service {
         self.state.lock().templates.values().cloned().collect()
     }
 
+    /// `ListTemplates` page, ordered by name.
+    pub fn list_templates_page(&self, request: &ListRequest) -> Result<ListTemplatesResponse> {
+        let state = self.state.lock();
+        let (templates, next_page_token) = paginate(
+            state
+                .templates
+                .iter()
+                .map(|(name, template)| (name.clone(), template.clone())),
+            request,
+        )?;
+        Ok(ListTemplatesResponse {
+            templates,
+            next_page_token,
+        })
+    }
+
     /// `PutPool`.
     pub async fn put_pool(&self, pool: PoolSpec) -> Result<PoolSpec> {
         validate_name("pool", &pool.name)?;
@@ -628,6 +720,22 @@ impl Service {
     /// `ListPools`.
     pub fn list_pools(&self) -> Vec<PoolSpec> {
         self.state.lock().pools.values().cloned().collect()
+    }
+
+    /// `ListPools` page, ordered by name.
+    pub fn list_pools_page(&self, request: &ListRequest) -> Result<ListPoolsResponse> {
+        let state = self.state.lock();
+        let (pools, next_page_token) = paginate(
+            state
+                .pools
+                .iter()
+                .map(|(name, pool)| (name.clone(), pool.clone())),
+            request,
+        )?;
+        Ok(ListPoolsResponse {
+            pools,
+            next_page_token,
+        })
     }
 
     /// `DeletePool`: idle members are destroyed; leased ones finish.
@@ -725,6 +833,9 @@ impl Service {
         let mut full = false;
         let mut best: Option<(usize, String, String)> = None;
         for (provider_id, rec) in &state.providers {
+            if rec.provider.cordoned {
+                continue;
+            }
             if require_online && rec.seen.elapsed() > self.config.provider_timeout {
                 continue;
             }
@@ -1335,6 +1446,22 @@ impl Service {
         self.state.lock().sandboxes.values().cloned().collect()
     }
 
+    /// `List` page, ordered by id.
+    pub fn list_page(&self, request: &ListRequest) -> Result<ListSandboxesResponse> {
+        let state = self.state.lock();
+        let (sandboxes, next_page_token) = paginate(
+            state
+                .sandboxes
+                .iter()
+                .map(|(id, sandbox)| (id.clone(), sandbox.clone())),
+            request,
+        )?;
+        Ok(ListSandboxesResponse {
+            sandboxes,
+            next_page_token,
+        })
+    }
+
     /// `ListProviders`.
     pub fn list_providers(&self) -> Vec<Provider> {
         self.state
@@ -1343,6 +1470,22 @@ impl Service {
             .values()
             .map(|rec| rec.provider.clone())
             .collect()
+    }
+
+    /// `ListProviders` page, ordered by provider id.
+    pub fn list_providers_page(&self, request: &ListRequest) -> Result<ListProvidersResponse> {
+        let state = self.state.lock();
+        let (providers, next_page_token) = paginate(
+            state
+                .providers
+                .iter()
+                .map(|(id, rec)| (id.clone(), rec.provider.clone())),
+            request,
+        )?;
+        Ok(ListProvidersResponse {
+            providers,
+            next_page_token,
+        })
     }
 
     fn usable(sandbox: &Sandbox) -> Result<()> {
@@ -1889,6 +2032,93 @@ impl Service {
         Ok(())
     }
 
+    /// Find a provider by its registered name, falling back to its id.
+    fn provider_id_for(state: &State, reference: &str) -> Result<String> {
+        if reference.is_empty() {
+            return Err(Error::invalid("provider name is required"));
+        }
+        for (id, rec) in &state.providers {
+            if id == reference || rec.provider.name == reference {
+                return Ok(id.clone());
+            }
+        }
+        Err(Error::not_found(format!(
+            "provider `{reference}` not found"
+        )))
+    }
+
+    /// `CordonProvider` / `UncordonProvider`: stop or resume placements.
+    /// Existing leases and warm members are untouched.
+    pub async fn set_provider_cordon(&self, reference: &str, cordoned: bool) -> Result<Provider> {
+        let (provider, ops) = {
+            let mut state = self.state.lock();
+            let id = Self::provider_id_for(&state, reference)?;
+            let rec = state.providers.get_mut(&id).expect("provider looked up");
+            rec.provider.cordoned = cordoned;
+            let provider = rec.provider.clone();
+            let ops = vec![self.put(Kind::Providers, &id, &provider)];
+            (provider, ops)
+        };
+        info!(provider = %provider.id, cordoned, "provider cordon changed");
+        self.persist(ops).await;
+        self.changed.notify_waiters();
+        Ok(provider)
+    }
+
+    /// `DrainProvider`: cordon, release idle pool members, and report the
+    /// leases still running. Leased sandboxes are not killed.
+    pub async fn drain_provider(&self, reference: &str) -> Result<DrainProviderResult> {
+        let (result, ops) = {
+            let mut state = self.state.lock();
+            let id = Self::provider_id_for(&state, reference)?;
+            let rec = state.providers.get_mut(&id).expect("provider looked up");
+            rec.provider.cordoned = true;
+            let provider = rec.provider.clone();
+            let mut ops = vec![self.put(Kind::Providers, &id, &provider)];
+            let idle: Vec<String> = state
+                .sandboxes
+                .values()
+                .filter(|sandbox| {
+                    sandbox.provider_id == id
+                        && !sandbox.pool.is_empty()
+                        && sandbox.lease_id.is_empty()
+                        && sandbox.state != SandboxState::Terminating
+                        && !sandbox.state.is_terminal()
+                })
+                .map(|sandbox| sandbox.id.clone())
+                .collect();
+            let released_pool_members = idle.len() as u32;
+            for sandbox_id in idle {
+                self.destroy_locked(&mut state, &sandbox_id, &mut ops);
+            }
+            let leased_remaining = state
+                .sandboxes
+                .values()
+                .filter(|sandbox| {
+                    sandbox.provider_id == id
+                        && !sandbox.lease_id.is_empty()
+                        && !sandbox.state.is_terminal()
+                })
+                .count() as u32;
+            (
+                DrainProviderResult {
+                    released_pool_members,
+                    leased_remaining,
+                },
+                ops,
+            )
+        };
+        info!(
+            provider = %reference,
+            released = result.released_pool_members,
+            leased = result.leased_remaining,
+            "provider drained"
+        );
+        self.persist(ops).await;
+        self.changed.notify_waiters();
+        Ok(result)
+    }
+
     /// `Register`: same name → same id, next generation. In-flight work of
     /// the previous generation fails; its sandboxes wait for `Reconcile`.
     pub async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse> {
@@ -1907,12 +2137,19 @@ impl Service {
                 .providers
                 .get(&id)
                 .map_or(1, |rec| rec.provider.generation + 1);
+            // Cordon is an operator decision about the provider record: a
+            // re-registration must not clear it.
+            let cordoned = state
+                .providers
+                .get(&id)
+                .is_some_and(|rec| rec.provider.cordoned);
             let provider = Provider {
                 id: id.clone(),
                 name: request.name,
                 generation,
                 drivers: request.drivers,
                 last_seen: now(),
+                cordoned,
             };
             let wake = state
                 .providers
@@ -2371,4 +2608,48 @@ pub async fn collect_exec(
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn items(count: usize) -> Vec<(String, usize)> {
+        (0..count)
+            .map(|index| (format!("id-{index:04}"), index))
+            .collect()
+    }
+
+    #[test]
+    fn pages_are_ordered_and_carry_a_token_until_exhausted() {
+        let mut request = ListRequest::default();
+        let (page, token) = paginate(items(250), &request).unwrap();
+        assert_eq!(page, (0..100usize).collect::<Vec<_>>());
+        assert!(!token.is_empty());
+        request.page_token = token;
+        let (page, token) = paginate(items(250), &request).unwrap();
+        assert_eq!(page, (100..200usize).collect::<Vec<_>>());
+        assert!(!token.is_empty());
+        request.page_token = token;
+        let (page, token) = paginate(items(250), &request).unwrap();
+        assert_eq!(page, (200..250usize).collect::<Vec<_>>());
+        assert!(token.is_empty());
+    }
+
+    #[test]
+    fn page_size_is_capped_and_tokens_are_validated() {
+        let request = ListRequest {
+            page_size: 5000,
+            page_token: String::new(),
+        };
+        let (page, _) = paginate(items(1500), &request).unwrap();
+        assert_eq!(page.len(), MAX_PAGE_SIZE as usize);
+
+        let request = ListRequest {
+            page_token: "not base64!".into(),
+            ..ListRequest::default()
+        };
+        let error = paginate(items(3), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument);
+    }
 }
