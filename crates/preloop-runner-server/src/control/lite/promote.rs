@@ -852,7 +852,7 @@ pub(super) fn promote_run(
         let graph = jobs::run_graph(tx, run_id)?;
         for mut job in candidates {
             let needs = jobs::job_needs(tx, run_id, &job.job_id)?;
-            let (if_condition, ctx_json) = {
+            let (if_condition, ctx_json, deferred) = {
                 let spec = jobs::load_spec(tx, run_id, &job.job_id)?;
                 let ctx: String = tx
                     .prepare_cached(
@@ -866,12 +866,23 @@ pub(super) fn promote_run(
                     .optional()
                     .map_err(db)?
                     .unwrap_or_else(|| "{}".to_owned());
-                (spec.and_then(|s| s.if_condition), ctx)
+                let deferred = spec.as_ref().and_then(|s| s.deferred_matrix.clone());
+                (spec.and_then(|s| s.if_condition), ctx, deferred)
             };
             let condition_context: preloop_gha_expressions::Context =
                 serde_json::from_str(&ctx_json).unwrap_or_default();
-            let decision =
-                dependency_decision(&graph, &needs, if_condition.as_deref(), &condition_context)?;
+            // A deferred-matrix node is a placeholder: a condition that reads
+            // `shard.*` cannot be judged before the fan-out (there is no
+            // shard identity yet, so it would evaluate false and skip every
+            // shard). Approve the expansion and let each materialized shard
+            // evaluate the condition against its own context.
+            let decision = if deferred.is_some()
+                && crate::runtime_scheduling::condition_defers_to_shards(if_condition.as_deref())
+            {
+                DependencyDecision::Run
+            } else {
+                dependency_decision(&graph, &needs, if_condition.as_deref(), &condition_context)?
+            };
             if decision == DependencyDecision::Run {
                 tx.prepare_cached(
                     "UPDATE jobs SET deps_ready_at = COALESCE(deps_ready_at, ?3) \
@@ -883,7 +894,6 @@ pub(super) fn promote_run(
             }
             let spec = jobs::load_spec(tx, run_id, &job.job_id)?;
             let reusable = spec.as_ref().and_then(|s| s.reusable_call.clone());
-            let deferred = spec.as_ref().and_then(|s| s.deferred_matrix.clone());
             match decision {
                 DependencyDecision::Run if reusable.is_some() => {
                     settled = true;

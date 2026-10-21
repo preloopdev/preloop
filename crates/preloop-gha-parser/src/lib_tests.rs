@@ -3381,18 +3381,27 @@ jobs:
     let shas = BTreeMap::new();
 
     let expanded = expand_jobs_with_reusables_and_shas(&caller, &reusable, &shas).unwrap();
-    // We expect package to depend on both matrix instances of the reusable
-    // workflow call. With deferred materialization those are the two caller
-    // nodes; their callee subtrees materialize at runtime per passed gate.
+    // The declared need is preserved: `needs: build` resolves by base id, so
+    // the scheduler waits on both matrix instances of the reusable call, and
+    // `needs.build` stays addressable by its declared name. Rewriting it to
+    // the concrete `build (os)` ids would hide that context entry.
     let package_job = expanded
         .jobs
         .iter()
         .find(|j| j.base_id == "package")
         .unwrap();
-    assert_eq!(package_job.needs.len(), 2);
-    let needs_ids: Vec<String> = package_job.needs.iter().map(|n| n.0.clone()).collect();
-    assert!(needs_ids.contains(&"build (ubuntu-latest)".to_owned()));
-    assert!(needs_ids.contains(&"build (windows-latest)".to_owned()));
+    assert_eq!(package_job.needs, vec![JobId("build".to_owned())]);
+    let mut legs: Vec<&str> = expanded
+        .jobs
+        .iter()
+        .filter(|j| j.base_id == "build")
+        .map(|j| j.id.0.as_str())
+        .collect();
+    legs.sort_unstable();
+    assert_eq!(
+        legs,
+        vec!["build (ubuntu-latest)", "build (windows-latest)"]
+    );
 }
 
 #[test]
@@ -4803,5 +4812,364 @@ jobs:
         assert_eq!(job.shard_total, None);
         assert!(!job.env.contains_key("PRELOOP_SHARD_INDEX"));
         assert!(!job.env.contains_key("PRELOOP_SHARD_COUNT"));
+    }
+}
+
+/// A `needs`-deferred matrix keeps one un-suffixed placeholder even when the
+/// job also declares `parallelism:`: the runtime fan-out materializes
+/// cells × shards, so giving the placeholder a shard identity would both
+/// double-count and (through the needs rewrite) point dependents at ids the
+/// fan-out never produces.
+#[test]
+fn parallelism_deferred_matrix_placeholder_stays_unsharded() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo setup
+  test:
+    needs: [setup]
+    runs-on: ubuntu-latest
+    parallelism: 4
+    strategy:
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo hi
+  downstream:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo done
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs_with_reusables(&workflow, &BTreeMap::new())
+        .unwrap()
+        .jobs;
+    let placeholder = jobs.iter().find(|job| job.base_id == "test").unwrap();
+    assert_eq!(placeholder.id.0, "test");
+    assert_eq!(placeholder.shard_index, None);
+    assert_eq!(placeholder.shard_total, None);
+    assert!(placeholder.deferred_matrix.is_some());
+    assert!(!placeholder.env.contains_key("PRELOOP_SHARD_INDEX"));
+    assert!(!placeholder.env.contains_key("PRELOOP_SHARD_COUNT"));
+
+    // The declared need survives the post-expansion rewrite: base-id
+    // matching fans it in over every runtime cell and shard, and
+    // `needs.test` stays addressable by its declared name.
+    let downstream = jobs.iter().find(|job| job.base_id == "downstream").unwrap();
+    assert_eq!(downstream.needs, vec![JobId("test".to_owned())]);
+}
+
+/// The combined matrix × shard product is capped where the deferred matrix is
+/// actually resolved: 8 cells × 256 shards would be 2048 plans, so the
+/// runtime fan-out refuses before materializing anything.
+#[test]
+fn deferred_matrix_shard_product_is_capped() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo setup
+  test:
+    needs: [setup]
+    runs-on: ubuntu-latest
+    parallelism: 256
+    strategy:
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let placeholder = expand_jobs(&workflow)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.base_id == "test")
+        .unwrap();
+    let expression = placeholder
+        .deferred_matrix
+        .clone()
+        .expect("deferred matrix");
+
+    let mut needs_outputs = BTreeMap::new();
+    let mut setup_outputs = BTreeMap::new();
+    setup_outputs.insert(
+        "matrix".to_owned(),
+        json!(
+            "{\"include\": [{\"os\": \"a\"}, {\"os\": \"b\"}, {\"os\": \"c\"}, {\"os\": \"d\"}, \
+             {\"os\": \"e\"}, {\"os\": \"f\"}, {\"os\": \"g\"}, {\"os\": \"h\"}]}"
+        ),
+    );
+    needs_outputs.insert("setup".to_owned(), setup_outputs);
+
+    let error =
+        crate::expand_deferred_matrix_job(&workflow, "test", &expression, &needs_outputs, None)
+            .expect_err("8 cells × 256 shards must be refused");
+    match error {
+        ParserError::JobFanoutTooLarge {
+            cells,
+            shards,
+            total,
+            limit,
+            ..
+        } => {
+            assert_eq!((cells, shards, total, limit), (8, 256, 2048, 1024));
+        }
+        other => panic!("expected a fan-out cap error, got {other:?}"),
+    }
+}
+
+/// A static matrix is checked against the same product cap before any plan is
+/// materialized, so a crafted workflow fails on the budget rather than on the
+/// allocator.
+#[test]
+fn matrix_times_shard_product_is_capped() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: 64
+    strategy:
+      matrix:
+        a: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, \
+            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let error = expand_jobs(&workflow).expect_err("32 cells × 64 shards must be refused");
+    assert!(
+        matches!(error, ParserError::JobFanoutTooLarge { limit: 1024, .. }),
+        "got {error:?}"
+    );
+
+    // Exactly at the cap is allowed: 16 cells × 64 shards = 1024.
+    let at_cap = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: 64
+    strategy:
+      matrix:
+        a: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    assert_eq!(expand_jobs(&at_cap).unwrap().len(), 1024);
+}
+
+/// Shard expansion is deterministic: the same workflow expands to the same
+/// ids, display names and shard env vars on every run, so a re-run cannot
+/// drift off the partition it executed before.
+#[test]
+fn shard_expansion_is_deterministic() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: 3
+    strategy:
+      matrix:
+        os: [a, b]
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let fingerprint = |plans: &[preloop_gha_protocol::JobPlan]| {
+        plans
+            .iter()
+            .map(|plan| {
+                (
+                    plan.id.0.clone(),
+                    plan.name.clone(),
+                    plan.base_id.clone(),
+                    plan.shard_index,
+                    plan.shard_total,
+                    plan.env.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = fingerprint(&expand_jobs(&workflow).unwrap());
+    let second = fingerprint(&expand_jobs(&workflow).unwrap());
+    assert_eq!(first, second);
+    let ids: Vec<&str> = first.iter().map(|entry| entry.0.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "test (a) (shard 1/3)",
+            "test (a) (shard 2/3)",
+            "test (a) (shard 3/3)",
+            "test (b) (shard 1/3)",
+            "test (b) (shard 2/3)",
+            "test (b) (shard 3/3)",
+        ]
+    );
+}
+
+/// A deployment environment that reads the shard context resolves per shard,
+/// so OIDC subjects and secret scoping match the deployment the gate sees.
+#[test]
+fn shard_environment_resolves_per_shard() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    parallelism: 2
+    environment: prod-${{ shard.index }}
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].oidc_environment.as_deref(), Some("prod-1"));
+    assert_eq!(jobs[1].oidc_environment.as_deref(), Some("prod-2"));
+}
+
+/// A reusable caller's env overrides the callee's, but a reserved shard name
+/// must not: the callee shard's partition identity is generated, not
+/// inherited, or every shard would run the same partition.
+#[test]
+fn reusable_caller_env_does_not_override_callee_shard_identity() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: octo/demo/.github/workflows/build.yml@v1
+    env:
+      PRELOOP_SHARD_INDEX: "1"
+      PRELOOP_SHARD_COUNT: "1"
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    parallelism: 2
+    steps:
+      - run: echo hi
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+
+    let caller_node = &expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs[0];
+    let called_parsed = parse_workflow(called).unwrap();
+    let subtree =
+        crate::expand_reusable_call(&called_parsed, caller_node, &reusable, &BTreeMap::new())
+            .unwrap()
+            .jobs;
+
+    assert_eq!(subtree.len(), 2);
+    for (position, plan) in subtree.iter().enumerate() {
+        let index = (position + 1).to_string();
+        assert_eq!(
+            plan.env.get("PRELOOP_SHARD_INDEX"),
+            Some(&index),
+            "callee shard {} keeps its generated index",
+            position + 1
+        );
+        assert_eq!(plan.env.get("PRELOOP_SHARD_COUNT"), Some(&"2".to_owned()));
+    }
+}
+
+/// The runtime deferred fan-out with a single resolved matrix cell produces
+/// shard legs with an id suffix but no `matrix_index`. That shape is why the
+/// scheduler must link legs to the placeholder by base id (they cannot
+/// replace the `<base>` row by id), so pin it here.
+#[test]
+fn deferred_single_cell_fan_out_keeps_shard_identity_without_matrix_index() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo setup
+  test:
+    needs: [setup]
+    runs-on: ubuntu-latest
+    parallelism: 2
+    strategy:
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let expression = expand_jobs(&workflow)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.base_id == "test")
+        .and_then(|job| job.deferred_matrix)
+        .expect("deferred matrix");
+    let mut needs_outputs = BTreeMap::new();
+    let mut setup_outputs = BTreeMap::new();
+    setup_outputs.insert(
+        "matrix".to_owned(),
+        json!("{\"include\": [{\"os\": \"linux\"}]}"),
+    );
+    needs_outputs.insert("setup".to_owned(), setup_outputs);
+
+    let plans =
+        crate::expand_deferred_matrix_job(&workflow, "test", &expression, &needs_outputs, None)
+            .unwrap();
+    assert_eq!(plans.len(), 2);
+    let ids: Vec<&str> = plans.iter().map(|plan| plan.id.0.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["test (linux) (shard 1/2)", "test (linux) (shard 2/2)"]
+    );
+    for (position, plan) in plans.iter().enumerate() {
+        assert_eq!(plan.base_id, "test");
+        assert_eq!(plan.matrix_index, None, "one cell carries no matrix index");
+        assert_eq!(plan.matrix_total, None);
+        assert_eq!(plan.shard_index, Some(position + 1));
+        assert_eq!(plan.shard_total, Some(2));
+        assert_eq!(
+            plan.env.get("PRELOOP_SHARD_INDEX"),
+            Some(&(position + 1).to_string())
+        );
     }
 }

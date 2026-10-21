@@ -7316,6 +7316,28 @@ impl PgBackend {
             BuiltExpansion::Matrix { jobs } | BuiltExpansion::Reusable { jobs, .. } => jobs,
         };
         let job_count = jobs.len();
+        // Runtime fan-out is the first point the real cell × shard product is
+        // known. Re-apply the per-run job limit before any leg is registered:
+        // submit counted this node as one job, so a large deferred product
+        // would otherwise bypass the cap and mint thousands of durable rows.
+        if let Some(remaining) = remaining_job_budget(&tx, run_id).await?
+            && job_count as u64 > remaining
+        {
+            tracing::warn!(
+                %run_id,
+                job = %node_id.0,
+                adding = job_count,
+                remaining,
+                "runtime expansion refused by the per-run job limit"
+            );
+            sweep
+                .settle_node(run_id, &node_id, ExecutionStatus::Failure)
+                .await?;
+            let outcome = std::mem::take(&mut sweep.outcome);
+            sweep.flush().await?;
+            tx.commit().await.map_err(db)?;
+            return Ok(outcome);
+        }
         match built {
             BuiltExpansion::Matrix { jobs } if jobs.is_empty() => {
                 // An empty matrix concludes the node as skipped.
@@ -7452,7 +7474,7 @@ impl PgBackend {
                 queue_state: logic::QueueState::Blocked,
                 remaining_needs: plan.needs.len() as i32,
                 base_id: plan.base_id.clone(),
-                parent_job_id: node_parent(&plan, &job_id),
+                parent_job_id: node_parent(&plan, placeholder),
                 pool_key: crate::control::types::compute_pool_key(
                     &plan.runs_on,
                     plan.runner_group.as_deref(),
@@ -7570,9 +7592,51 @@ impl PgBackend {
     }
 }
 
-/// A built job's parent: its matrix parent when it expanded from one.
-fn node_parent(plan: &preloop_gha_protocol::JobPlan, job_id: &JobId) -> Option<String> {
-    if plan.base_id != job_id.0 && plan.matrix_index.is_some() {
+/// The run's remaining per-run job budget, from `namespace_limits`
+/// (`max_jobs_per_run`; `None` means the namespace sets no limit).
+///
+/// Runtime fan-out materializes jobs *after* submit admission, so the
+/// submit-time cap no longer sees them; expansion re-applies the same limit
+/// against the rows already in the run. Lite backend parity.
+async fn remaining_job_budget(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+) -> Result<Option<u64>, ControlError> {
+    let row = tx
+        .query_opt(
+            "SELECT l.max_jobs_per_run, \
+                    (SELECT count(*) FROM jobs j WHERE j.run_id = r.run_id) \
+             FROM runs r JOIN namespace_limits l ON l.namespace_id = r.namespace_id \
+             WHERE r.run_id = $1::text::uuid",
+            &[&run_id.0.to_string()],
+        )
+        .await
+        .map_err(db)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let limit: Option<i32> = row.get(0);
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let existing: i64 = row.get(1);
+    Ok(Some(
+        u64::try_from(limit.max(0))
+            .unwrap_or(0)
+            .saturating_sub(u64::try_from(existing).unwrap_or(0)),
+    ))
+}
+
+/// A built job's parent node: the node it expanded from.
+///
+/// Matrix legs hang off their matrix parent so `rebuild_jobs` can drop the
+/// replaced parent from the run view. A `parallelism:` fan-out needs the same
+/// link when the matrix produced a single cell: its legs are
+/// `<base> (shard i/N)`, so they cannot replace the `<base>` placeholder row
+/// by id, and without a parent that placeholder would stay a live pending
+/// node and block every dependent.
+fn node_parent(plan: &preloop_gha_protocol::JobPlan, placeholder: &JobId) -> Option<String> {
+    if plan.base_id != plan.id.0 && (plan.matrix_index.is_some() || plan.base_id == placeholder.0) {
         Some(plan.base_id.clone())
     } else {
         None

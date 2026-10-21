@@ -429,8 +429,38 @@ pub enum DependencyDecision {
     Error,
 }
 
+/// Whether a job condition must be evaluated per shard rather than on the
+/// pre-expansion node.
+///
+/// `parallelism:` is a preloop extension, so `shard` is a known expression
+/// context (`eval::CTX_JOB_IF`), but only materialized shard plans carry a
+/// value for it. On a deferred-matrix placeholder the context is absent, so
+/// `shard.index == 2` compares `null` and skips the whole job. The condition
+/// is deferred to the fan-out cells in that case.
+pub(crate) fn condition_defers_to_shards(if_condition: Option<&str>) -> bool {
+    let Some(condition) = if_condition else {
+        return false;
+    };
+    let effective = preloop_gha_expressions::effective_condition(Some(condition));
+    match preloop_gha_expressions::collect_contexts(&effective) {
+        Ok(contexts) => contexts.contains("shard"),
+        // Unparseable span: stay conservative, exactly like the parser's
+        // deferred-value check — if it mentions `shard`, do not judge it here.
+        Err(_) => effective.to_ascii_lowercase().contains("shard"),
+    }
+}
+
 pub fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecision {
     if job.needs.is_empty() {
+        return DependencyDecision::Run;
+    }
+    // A deferred-matrix node is a placeholder, not a job: the matrix — and
+    // with `parallelism:`, the shard identity — only exists once the runtime
+    // fan-out materializes its cells. A condition reading `shard.*` would
+    // evaluate against a missing context here and skip every cell (the
+    // placeholder has no shard to test), so approve the expansion and let
+    // each materialized shard evaluate its own condition.
+    if job.deferred_matrix.is_some() && condition_defers_to_shards(job.if_condition.as_deref()) {
         return DependencyDecision::Run;
     }
     let direct_statuses = job
@@ -1779,5 +1809,29 @@ bogus_field = true
             toml::from_str("[environments]\n\"owner/repo\" = [\"prod\"]\n")
                 .expect("bare registry must still parse");
         assert!(config.environment_rules.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod deferred_shard_condition_tests {
+    use super::condition_defers_to_shards;
+
+    /// A condition that reads the preloop `shard` context cannot be judged on
+    /// the pre-expansion placeholder: it has no shard identity, so the
+    /// comparison would be against `null` and skip every shard. Everything
+    /// else keeps evaluating at promotion time.
+    #[test]
+    fn shard_conditions_defer_to_the_fan_out() {
+        assert!(condition_defers_to_shards(Some("${{ shard.index == 2 }}")));
+        assert!(condition_defers_to_shards(Some(
+            "shard.count > 1 && github.event_name == 'push'"
+        )));
+        assert!(!condition_defers_to_shards(Some(
+            "${{ matrix.os == 'ubuntu-latest' }}"
+        )));
+        assert!(!condition_defers_to_shards(Some(
+            "${{ needs.build.result == 'success' }}"
+        )));
+        assert!(!condition_defers_to_shards(None));
     }
 }

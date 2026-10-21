@@ -1763,9 +1763,15 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             job.shard_index.zip(job.shard_total),
         );
 
-        // Evaluate condition for root jobs (no needs) outside the lock.
+        // Evaluate condition for root jobs (no needs) outside the lock. A
+        // deferred-matrix node whose condition reads `shard.*` is left to the
+        // runtime fan-out instead: the placeholder has no shard identity yet,
+        // so evaluating here compares against `null` and would skip the node
+        // before any shard exists.
+        let defer_to_shards = job.deferred_matrix.is_some()
+            && crate::runtime_scheduling::condition_defers_to_shards(job.if_condition.as_deref());
         let mut skipped = false;
-        if job.needs.is_empty() {
+        if job.needs.is_empty() && !defer_to_shards {
             let condition =
                 preloop_gha_expressions::effective_condition(job.if_condition.as_deref());
             let should_run = preloop_gha_expressions::eval_bool(&condition, &condition_context)

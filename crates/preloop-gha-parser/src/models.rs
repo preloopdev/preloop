@@ -77,6 +77,31 @@ pub enum ParserError {
         /// Maximum allowed combinations.
         limit: usize,
     },
+    /// Matrix cells × `parallelism:` shards exceeded the per-job fan-out cap.
+    #[error(
+        "job `{job_id}` expands to {cells} matrix cells × {shards} shards ({total} jobs), \
+         exceeding the per-job fan-out limit of {limit}"
+    )]
+    JobFanoutTooLarge {
+        /// Job id.
+        job_id: String,
+        /// Matrix cells (1 when the job has no matrix).
+        cells: usize,
+        /// Shards per cell (1 when the job is not sharded).
+        shards: usize,
+        /// `cells * shards`.
+        total: usize,
+        /// Maximum allowed fan-out for one job.
+        limit: usize,
+    },
+    /// A workflow expanded past the parser's hard ceiling on job plans.
+    #[error("workflow expands to more than {limit} job plans (at job `{job_id}`)")]
+    TooManyJobPlans {
+        /// Job whose fan-out crossed the limit.
+        job_id: String,
+        /// Maximum allowed plans.
+        limit: usize,
+    },
     /// Local reusable workflow was referenced but not supplied.
     #[error("local reusable workflow `{path}` was not found")]
     MissingReusableWorkflow {

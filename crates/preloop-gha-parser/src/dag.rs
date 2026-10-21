@@ -100,8 +100,21 @@ pub fn needs_graph_from_pairs(jobs: &[(String, Vec<String>)]) -> NeedsGraph {
 /// A declared need may name one concrete expanded job or a base job, in which
 /// case it expands to every matrix sibling with that base id. Validation runs
 /// before server state is mutated, so invalid workflows cannot queue jobs.
+///
+/// Matches are resolved through id/base indexes rather than a scan per need:
+/// with matrix × `parallelism:` fan-out a run can hold thousands of plans, and
+/// the naive `O(jobs × plans)` walk (with a string clone per candidate) turned
+/// submit into a CPU sink.
 pub fn validate_job_plans(jobs: &[JobPlan]) -> Result<(), ParserError> {
+    use std::collections::HashMap;
+
     let mut graph = NeedsGraph::new();
+    let mut by_id: HashMap<&str, usize> = HashMap::with_capacity(jobs.len());
+    let mut by_base: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, job) in jobs.iter().enumerate() {
+        by_id.insert(job.id.0.as_str(), index);
+        by_base.entry(job.base_id.as_str()).or_default().push(index);
+    }
 
     for job in jobs {
         if let Some(condition) = &job.if_condition {
@@ -115,18 +128,24 @@ pub fn validate_job_plans(jobs: &[JobPlan]) -> Result<(), ParserError> {
         }
         let mut expanded_needs = Vec::new();
         for need in &job.needs {
-            let matches = jobs
-                .iter()
-                .filter(|candidate| candidate.id == *need || candidate.base_id == need.0)
-                .map(|candidate| candidate.id.0.clone())
-                .collect::<Vec<_>>();
-            if matches.is_empty() {
+            let mut matched: Vec<usize> = Vec::new();
+            if let Some(&index) = by_id.get(need.0.as_str()) {
+                matched.push(index);
+            }
+            if let Some(indices) = by_base.get(need.0.as_str()) {
+                for &index in indices {
+                    if !matched.contains(&index) {
+                        matched.push(index);
+                    }
+                }
+            }
+            if matched.is_empty() {
                 return Err(ParserError::UnknownNeed {
                     job_id: job.id.0.clone(),
                     need: need.0.clone(),
                 });
             }
-            expanded_needs.extend(matches);
+            expanded_needs.extend(matched.into_iter().map(|index| jobs[index].id.0.clone()));
         }
         expanded_needs.sort();
         expanded_needs.dedup();

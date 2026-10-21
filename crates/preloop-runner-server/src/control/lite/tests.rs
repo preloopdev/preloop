@@ -55,3 +55,68 @@ async fn run_number_fingerprint_and_unknown_request() {
         ControlError::NotFound(_)
     ));
 }
+
+/// Runtime fan-out pays for its jobs after submit admission, so the per-run
+/// namespace limit is re-applied against the rows already in the run. `None`
+/// (no limits row) must stay unlimited, or every deferred expansion on a
+/// default install would be refused.
+#[test]
+fn remaining_job_budget_applies_the_namespace_run_limit() {
+    use preloop_gha_protocol::RunId;
+
+    let backend = LiteBackend::in_memory().unwrap();
+    let run_id = RunId::new();
+    let (unlimited, remaining, exhausted) = backend
+        .write(|tx| {
+            let namespace: String = tx
+                .query_row("SELECT namespace_id FROM namespaces", [], |row| row.get(0))
+                .map_err(super::db)?;
+            tx.execute(
+                "INSERT INTO runs (run_id, namespace_id, repository, workflow_path, \
+                     run_number, event, ref, ref_type, head_sha, workflow_ref, status, origin) \
+                 VALUES (?1, ?2, 'owner/repo', '.github/workflows/ci.yml', 1, 'push', \
+                     'refs/heads/main', 'branch', 'abc123', \
+                     'owner/repo/.github/workflows/ci.yml@refs/heads/main', 'queued', 'api')",
+                rusqlite::params![run_id.0.to_string(), namespace],
+            )
+            .map_err(super::db)?;
+            let insert_job = |job_id: &str, order: i64| {
+                tx.execute(
+                    "INSERT INTO jobs (run_id, job_id, namespace_id, kind, base_id, status, \
+                         queue_state, remaining_needs, pool_key, runs_on, priority, run_order, \
+                         job_order, created_at) \
+                     VALUES (?1, ?2, ?3, 'job', ?2, 'pending', 'blocked', 0, '', '[]', 0, 0, \
+                         ?4, ?4)",
+                    rusqlite::params![run_id.0.to_string(), job_id, namespace, order],
+                )
+                .map_err(super::db)?;
+                Ok::<(), ControlError>(())
+            };
+            insert_job("build", 1)?;
+
+            // No limits row: unlimited.
+            let unlimited = super::expansion::remaining_job_budget(tx, run_id, &namespace)?;
+
+            tx.execute(
+                "INSERT INTO namespace_limits (namespace_id, max_jobs_per_run) VALUES (?1, 3)",
+                [&namespace],
+            )
+            .map_err(super::db)?;
+            let remaining = super::expansion::remaining_job_budget(tx, run_id, &namespace)?;
+
+            // The run is already past the limit: nothing more may be added.
+            insert_job("test", 2)?;
+            insert_job("lint", 3)?;
+            let exhausted = super::expansion::remaining_job_budget(tx, run_id, &namespace)?;
+            Ok((unlimited, remaining, exhausted))
+        })
+        .unwrap();
+
+    assert_eq!(unlimited, None);
+    assert_eq!(
+        remaining,
+        Some(2),
+        "3 per run minus the row already admitted"
+    );
+    assert_eq!(exhausted, Some(0));
+}

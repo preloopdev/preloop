@@ -303,6 +303,45 @@ fn built_matrix_leg(
     }
 }
 
+/// One materialized `parallelism:` shard leg of a deferred matrix whose
+/// resolved cell count is one: the id is `<base> (shard i/N)` and the plan
+/// deliberately carries **no** `matrix_index`, exactly as
+/// `expand_deferred_matrix_job` builds it for a single-cell matrix.
+fn built_shard_leg(
+    run_id: RunId,
+    job_id: &str,
+    base_id: &str,
+    index: usize,
+    total: usize,
+) -> crate::control::logic::BuiltJob {
+    let plan: preloop_gha_protocol::JobPlan = serde_json::from_value(serde_json::json!({
+        "id": job_id,
+        "base_id": base_id,
+        "name": job_id,
+        "runs_on": ["self-hosted"],
+        "shard_index": index,
+        "shard_total": total,
+        "fail_fast": true,
+        "continue_on_error": false,
+    }))
+    .expect("shard leg plan decodes");
+    crate::control::logic::BuiltJob {
+        plan,
+        condition_context: preloop_gha_expressions::Context::default(),
+        artifacts: crate::runs::BuiltJobArtifacts {
+            agent_msg: job_message(job_id, index as i64),
+            job_request: request_record(run_id, job_id, index as i64),
+            id_token_granted: false,
+            oidc_ctx: crate::state::OidcJobContext {
+                environment: None,
+                job_workflow_ref: None,
+                job_workflow_sha: None,
+            },
+            github_token_request: None,
+        },
+    }
+}
+
 pub(crate) fn submit_run(run_id: RunId, jobs: Vec<SubmitJob>) -> SubmitRun {
     let mut record = run_record(run_id);
     record.run_number = NEXT_FIXTURE_RUN_NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1257,6 +1296,105 @@ pub(crate) mod suite {
             record.status.is_terminal(),
             "the run must finalize once the dependent settles, got {:?}",
             record.status
+        );
+    }
+
+    /// A deferred matrix that resolves to a single cell still fans out into
+    /// `parallelism:` shards. Those legs are `<base> (shard i/N)` with no
+    /// `matrix_index`, so they do not replace the placeholder row by id; the
+    /// expansion must still link them to it. Otherwise the placeholder stays
+    /// a live pending node in the run view and its dependents wait forever.
+    pub(crate) async fn sharded_single_cell_deferred_expansion_links_legs(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        let mut after = submit_job(run_id, "after", 3);
+        after.queued.needs = vec![JobId("fan".to_owned())];
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "gen", 1), fan, after],
+            ))
+            .await
+            .unwrap();
+
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        assert_eq!(claim.job.job_id, JobId("fan".to_owned()));
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix {
+                    jobs: vec![
+                        built_shard_leg(run_id, "fan (shard 1/2)", "fan", 1, 2),
+                        built_shard_leg(run_id, "fan (shard 2/2)", "fan", 2, 2),
+                    ],
+                }),
+            })
+            .await
+            .unwrap();
+
+        let record = backend.run_record(run_id).await.unwrap();
+        assert!(
+            record
+                .jobs
+                .contains_key(&JobId("fan (shard 1/2)".to_owned())),
+            "both shards must materialize: {:?}",
+            record.jobs.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            record
+                .jobs
+                .contains_key(&JobId("fan (shard 2/2)".to_owned()))
+        );
+        assert!(
+            !record.jobs.contains_key(&JobId("fan".to_owned())),
+            "the replaced placeholder must leave the run view: {:?}",
+            record.jobs.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            record.jobs.get(&JobId("after".to_owned())),
+            Some(&ExecutionStatus::Pending),
+            "the dependent waits for the shards, not forever"
+        );
+
+        for shard in ["fan (shard 1/2)", "fan (shard 2/2)"] {
+            backend
+                .complete_job(JobCompletionInput {
+                    run_id,
+                    job_id: JobId(shard.to_owned()),
+                    agent_job_id: None,
+                    status: ExecutionStatus::Success,
+                    outputs: BTreeMap::new(),
+                    runner_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("after".to_owned())),
+            Some(&ExecutionStatus::Queued),
+            "the dependent runs once every shard is green, got {:?}",
+            record.jobs
         );
     }
 
@@ -8612,6 +8750,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn sharded_single_cell_deferred_expansion_links_legs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::sharded_single_cell_deferred_expansion_links_legs(&backend).await;
+    }
+
+    #[tokio::test]
     async fn cancelled_run_discards_in_flight_expansion() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -10388,6 +10534,14 @@ mod lite {
     #[tokio::test]
     async fn matrix_fail_fast_settles_dependent_and_run() {
         suite::matrix_fail_fast_settles_dependent_and_run(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn sharded_single_cell_deferred_expansion_links_legs() {
+        suite::sharded_single_cell_deferred_expansion_links_legs(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]

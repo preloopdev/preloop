@@ -251,6 +251,25 @@ fn insert_shard_context(
     }
 }
 
+/// Insert a shard's `PRELOOP_SHARD_INDEX` / `PRELOOP_SHARD_COUNT` env vars.
+///
+/// These are the shard's own identity, so they win over any workflow- or
+/// caller-supplied value with the same name: a reusable-workflow caller's
+/// env is merged on top of the callee's, and a caller that happens to set a
+/// reserved name must not turn every callee shard into the same partition.
+fn insert_shard_env(
+    env: &mut BTreeMap<String, String>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
+) {
+    if let (Some(index), Some(total)) = (shard_index, shard_total) {
+        // Preloop's own names, deliberately not Buildkite's: this is a
+        // preloop extension and the contract is preloop's to version.
+        env.insert("PRELOOP_SHARD_INDEX".to_owned(), index.to_string());
+        env.insert("PRELOOP_SHARD_COUNT".to_owned(), total.to_string());
+    }
+}
+
 fn expression_context(
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
@@ -559,39 +578,47 @@ fn id_token_granted(permissions: Option<&Value>) -> bool {
     }
 }
 
+/// Resolve a deployment environment's name at parse time.
+///
+/// The name feeds OIDC subject derivation and secret scoping, so it must be
+/// the same string the runner-facing job message will carry. That means the
+/// full per-cell context, not just `matrix.*`: a sharded job's
+/// `environment: prod-${{ shard.index }}` names a different deployment per
+/// shard, and leaving the plan without one would select unscoped secrets and
+/// mint a ref-based OIDC subject while the deployment gate saw the resolved
+/// name.
+///
+/// `None` when the name cannot be resolved yet (it reads `needs.*` or
+/// `github.workspace`, or otherwise fails to evaluate): the server leaves the
+/// message template raw and finishes the name once the needs complete.
 fn resolved_environment(
-    environment: Option<&Value>,
+    raw: &str,
     matrix: &indexmap::IndexMap<String, Value>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> Option<String> {
-    let value = match environment? {
-        Value::String(value) => value,
-        Value::Object(values) => values.get("name")?.as_str()?,
-        _ => return None,
-    };
-    let trimmed = value.trim();
-    let expression = trimmed.strip_prefix("${{")?.strip_suffix("}}")?.trim();
-    let key = expression.strip_prefix("matrix.")?;
-    matrix.get(key).and_then(|value| match value {
-        Value::String(value) => Some(value.clone()),
-        Value::Number(value) => Some(value.to_string()),
-        Value::Bool(value) => Some(value.to_string()),
-        _ => None,
-    })
+    if crate::eval::resolves_after_job_build(raw) {
+        return None;
+    }
+    let context = expression_context(matrix, None, None, shard_index, shard_total);
+    crate::eval::resolve_string(raw, &context).ok()
 }
 
 fn oidc_environment(
     environment: Option<&Value>,
     matrix: &indexmap::IndexMap<String, Value>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 ) -> Option<String> {
-    match environment? {
-        Value::String(value) if !value.trim().starts_with("${{") => Some(value.clone()),
-        Value::Object(values) => match values.get("name")?.as_str()? {
-            value if !value.trim().starts_with("${{") => Some(value.to_owned()),
-            _ => resolved_environment(environment, matrix),
-        },
-        Value::String(_) => resolved_environment(environment, matrix),
-        _ => None,
+    let name = match environment? {
+        Value::String(value) => value.as_str(),
+        Value::Object(values) => values.get("name")?.as_str()?,
+        _ => return None,
+    };
+    if !name.contains("${{") {
+        return Some(name.to_owned());
     }
+    resolved_environment(name, matrix, shard_index, shard_total)
 }
 
 /// Maximum `parallelism:` shards for one job.
@@ -654,6 +681,55 @@ fn shard_display_name(name: String, index: usize, total: usize) -> String {
     )
 }
 
+/// Maximum combined fan-out for one job: matrix cells × `parallelism:` shards.
+///
+/// `parallelism:` is a second synthetic axis, so the two per-axis caps
+/// multiply. Without a product cap one 256-cell matrix job with
+/// `parallelism: 256` would materialize 65,536 plans (and DAG validation and
+/// the job-message build would pay for every one) before the run-level job cap
+/// is checked. Bounding the product keeps the extension's worst case within a
+/// small multiple of what a plain 256-cell matrix already allowed.
+const MAX_JOB_FANOUT: usize = 1024;
+
+/// Hard ceiling on the job plans one workflow expansion may produce.
+///
+/// The server's per-run cap (`max_jobs_per_run`, default 500) is enforced only
+/// after expansion, and webhook submits skip it entirely, so the expander
+/// needs its own ceiling: this bounds the plan count before DAG validation
+/// runs and before a single giant allocation. It is deliberately generous —
+/// an operator who raised the run cap above it is still bounded here.
+const MAX_EXPANDED_JOB_PLANS: usize = 16_384;
+
+/// Reject a job whose combined matrix × shard fan-out exceeds
+/// [`MAX_JOB_FANOUT`]. Applied wherever cells and shards are multiplied:
+/// parse-time expansion and the runtime deferred fan-out.
+fn check_fanout(job_id: &str, cells: usize, shards: usize) -> Result<(), ParserError> {
+    let total = cells.saturating_mul(shards);
+    if total > MAX_JOB_FANOUT {
+        return Err(ParserError::JobFanoutTooLarge {
+            job_id: job_id.to_owned(),
+            cells,
+            shards,
+            total,
+            limit: MAX_JOB_FANOUT,
+        });
+    }
+    Ok(())
+}
+
+/// Reject a workflow whose next fan-out would cross
+/// [`MAX_EXPANDED_JOB_PLANS`]. Called before the plans are materialized, so a
+/// crafted workflow fails on the budget rather than on the allocator.
+fn check_plan_budget(job_id: &str, existing: usize, adding: usize) -> Result<(), ParserError> {
+    if existing.saturating_add(adding) > MAX_EXPANDED_JOB_PLANS {
+        return Err(ParserError::TooManyJobPlans {
+            job_id: job_id.to_owned(),
+            limit: MAX_EXPANDED_JOB_PLANS,
+        });
+    }
+    Ok(())
+}
+
 /// Expand all jobs for a workflow.
 pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
@@ -668,13 +744,26 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
         // runtime fan-out (`expand_deferred_matrix_job`) replaces it with
         // cells × shards. Fanning shards here too would double-count.
         let shard_total = if matrix_deferred { 1 } else { shards };
+        // A deferred matrix has one placeholder now; its resolved cells are
+        // checked against the product cap by the runtime fan-out.
+        check_fanout(job_id, matrix_count, shards)?;
+        check_plan_budget(
+            job_id,
+            plans.len(),
+            matrix_count.saturating_mul(shard_total),
+        )?;
         for (matrix_index, matrix) in matrixes.into_iter().enumerate() {
             for shard in 1..=shard_total {
-                let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
+                let sharded = shard_total > 1;
+                let oidc_environment = oidc_environment(
+                    job.environment.as_ref(),
+                    &matrix,
+                    sharded.then_some(shard),
+                    sharded.then_some(shard_total),
+                );
                 let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
                 let mut env = global_env.clone();
                 env.extend(job.env.clone().into_strings());
-                let sharded = shards > 1;
                 let mut plan = job_plan_from_job(
                     job_id,
                     job,
@@ -683,7 +772,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                     (matrix_count > 1).then_some(matrix_index + 1),
                     (matrix_count > 1).then_some(matrix_count),
                     sharded.then_some(shard),
-                    sharded.then_some(shards),
+                    sharded.then_some(shard_total),
                     env,
                     oidc_environment,
                     workflow.permissions.as_ref(),
@@ -841,12 +930,7 @@ fn job_plan_from_job(
         _ => (expanded_id, name),
     };
     let mut env = env;
-    if let (Some(index), Some(total)) = (shard_index, shard_total) {
-        // Preloop's own names, deliberately not Buildkite's: this is a
-        // preloop extension and the contract is preloop's to version.
-        env.insert("PRELOOP_SHARD_INDEX".to_owned(), index.to_string());
-        env.insert("PRELOOP_SHARD_COUNT".to_owned(), total.to_string());
-    }
+    insert_shard_env(&mut env, shard_index, shard_total);
     Ok(JobPlan {
         id: JobId(expanded_id),
         base_id: job_id.to_owned(),
@@ -1165,6 +1249,9 @@ fn expand_jobs_with_reusables_internal(
             )?
             .into_cells();
             let matrix_count = matrices.len();
+            // Caller placeholders are real plans too: bound their fan-out
+            // before building one plan per matrix cell.
+            check_plan_budget(job_id, plans.len(), matrix_count)?;
             for (matrix_index, matrix) in matrices.into_iter().enumerate() {
                 let expanded_job_id = matrix_expand::expanded_job_id(job_id, &matrix);
                 // Evaluate the caller's `with:` expressions in the caller
@@ -1316,13 +1403,26 @@ fn expand_jobs_with_reusables_internal(
         // Like `expand_jobs`: a needs-deferred matrix keeps one placeholder;
         // the runtime fan-out replaces it with cells × shards.
         let shard_total = if matrix_deferred { 1 } else { shards };
+        // A deferred matrix has one placeholder now; its resolved cells are
+        // checked against the product cap by the runtime fan-out.
+        check_fanout(job_id, matrix_count, shards)?;
+        check_plan_budget(
+            job_id,
+            plans.len(),
+            matrix_count.saturating_mul(shard_total),
+        )?;
         for (matrix_index, matrix) in matrix_cells.into_iter().enumerate() {
             for shard in 1..=shard_total {
-                let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
+                let sharded = shard_total > 1;
+                let oidc_environment = oidc_environment(
+                    job.environment.as_ref(),
+                    &matrix,
+                    sharded.then_some(shard),
+                    sharded.then_some(shard_total),
+                );
                 let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
                 let mut env = global_env.clone();
                 env.extend(job.env.clone().into_strings());
-                let sharded = shards > 1;
                 let mut plan = job_plan_from_job(
                     job_id,
                     job,
@@ -1331,7 +1431,7 @@ fn expand_jobs_with_reusables_internal(
                     (matrix_count > 1).then_some(matrix_index + 1),
                     (matrix_count > 1).then_some(matrix_count),
                     sharded.then_some(shard),
-                    sharded.then_some(shards),
+                    sharded.then_some(shard_total),
                     env,
                     oidc_environment,
                     workflow.permissions.as_ref(),
@@ -1427,13 +1527,23 @@ pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event(
         event_name,
     )?;
 
-    // Post-process: Rewrite needs to replace base job IDs of reusable calls with their expanded inner job IDs.
+    // Post-process: rewrite a need that names a reusable caller to its
+    // expanded inner job ids — the caller placeholder is not part of the plan
+    // set, so nothing else can resolve it. A need that already matches a
+    // plan's `base_id` is left declared: it fans in over every matrix cell and
+    // `parallelism:` shard through base-id matching, and `needs.<id>` stays
+    // addressed by the declared name. Rewriting it to concrete
+    // `test (shard 1/4)` ids would both hide `needs.test.result` /
+    // `needs.test.outputs` and drop the sibling shards from a selected-job
+    // dependency closure.
     let expanded_ids: std::collections::HashSet<String> =
         plans.iter().map(|p| p.id.0.clone()).collect();
+    let base_ids: std::collections::HashSet<String> =
+        plans.iter().map(|p| p.base_id.clone()).collect();
     for plan in &mut plans {
         let mut new_needs = Vec::new();
         for need in &plan.needs {
-            if expanded_ids.contains(&need.0) {
+            if expanded_ids.contains(&need.0) || base_ids.contains(&need.0) {
                 new_needs.push(need.clone());
             } else {
                 let prefix = format!("{}/", need.0);
@@ -1537,6 +1647,10 @@ pub fn expand_reusable_call(
         // callee's. The caller plan already merged both in that order, so a
         // single extend reproduces the final winner of the parse-time path.
         plan.env.extend(caller_plan.env.clone());
+        // ...except the callee shard's own identity: the merge must not
+        // overwrite `PRELOOP_SHARD_INDEX` / `PRELOOP_SHARD_COUNT`, or every
+        // shard of the callee job would run the same partition.
+        insert_shard_env(&mut plan.env, plan.shard_index, plan.shard_total);
         plan.inputs.extend(caller_plan.inputs.clone());
         plan.secrets_inherit = caller_plan.secrets_inherit;
         plan.secrets_map.extend(caller_plan.secrets_map.clone());
@@ -1960,6 +2074,11 @@ pub fn expand_deferred_matrix_job(
     // placeholder carried no shards (fanning there would double-count), so the
     // runtime fan-out produces cells × shards.
     let shards = resolve_parallelism(job_id, job)?;
+    // The matrix is only resolvable now, so this is the first point where the
+    // combined product is known: reject before materializing anything rather
+    // than registering a fan-out the run can never absorb.
+    check_fanout(job_id, matrix_count, shards)?;
+    check_plan_budget(job_id, 0, matrix_count.saturating_mul(shards))?;
 
     let global_env = workflow.env.clone().into_strings();
     let mut plans = Vec::new();
@@ -1972,11 +2091,16 @@ pub fn expand_deferred_matrix_job(
 
     for (matrix_index, matrix) in combinations.into_iter().enumerate() {
         for shard in 1..=shards {
-            let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
+            let sharded = shards > 1;
+            let oidc_environment = oidc_environment(
+                job.environment.as_ref(),
+                &matrix,
+                sharded.then_some(shard),
+                sharded.then_some(shards),
+            );
             let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
             let mut env = global_env.clone();
             env.extend(job.env.clone().into_strings());
-            let sharded = shards > 1;
             let mut plan = job_plan_from_job(
                 job_id,
                 job,
