@@ -720,11 +720,17 @@ pub(crate) fn remove_run_everywhere(
 
     // Plan-keyed secret maskers are derived from the run's own secrets; the
     // run's plans are gone, so the cached arcs would only be reclaimed by a
-    // later masker-cache eviction. Drop them with the run.
+    // later masker-cache eviction. Drop them with the run. Runtime registrations
+    // (a minted OIDC `id_token`, see `register_runtime_mask_value`) are keyed by
+    // the plan *and* the run id — run-keyed log URIs resolve through the run
+    // scope — so the run's own entry goes too: leaving it would hold every JWT
+    // the run ever minted for the life of the process.
     for plan_id in &keys.plan_ids {
         inner.plan_secret_masker.remove(plan_id);
         inner.plan_secret_masker_pending.remove(plan_id);
+        inner.plan_runtime_masks.remove(plan_id);
     }
+    inner.plan_runtime_masks.remove(&run_id.to_string());
 
     RunRemoval {
         log_keys,
@@ -1492,6 +1498,14 @@ mod tests {
         inner
             .plan_secret_masker
             .insert(plan_id.clone(), Arc::new(vec!["s3cret".to_owned()]));
+        // A run that minted OIDC tokens owns a runtime entry under its plan
+        // scope and under the run scope (run-keyed log URIs resolve through it).
+        inner
+            .plan_runtime_masks
+            .insert(plan_id.clone(), vec!["minted-jwt".to_owned()]);
+        inner
+            .plan_runtime_masks
+            .insert(run_id.to_string(), vec!["minted-jwt".to_owned()]);
         inner.diag_upload_tokens.insert(
             "diag-token".to_owned(),
             DiagUploadToken {
@@ -1532,6 +1546,11 @@ mod tests {
         assert!(inner.timeline_events_order.is_empty());
         assert!(inner.dap_ports.is_empty());
         assert!(inner.plan_secret_masker.is_empty());
+        assert!(
+            inner.plan_runtime_masks.is_empty(),
+            "run-scoped runtime masks retained: {:?}",
+            inner.plan_runtime_masks
+        );
         assert!(inner.diag_upload_tokens.is_empty());
     }
 }

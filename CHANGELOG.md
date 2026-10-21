@@ -28,12 +28,154 @@ Releases before v0.27.0 predate the changelog.
   credentials remain unrevokable by the engine — see
   `docs/control-plane/github/tokens.mdx` for the outage/crash window.
 
+## [0.35.5] - 2026-10-21
+
+### Security
+
+- **Webhook ingress bounds and times out body uploads.** The GitHub webhook
+  route buffers at most eight request bodies (each up to the 32 MiB route
+  limit) at once, so an unauthenticated caller can no longer use the ingress
+  as a memory amplifier before the HMAC check. An upload is cut off with 408
+  if it is still arriving after 10 s, or if it stops sending for 3 s — holding
+  a slot now costs an actual transfer instead of just a connection — and a
+  delivery that arrives while every slot is taken waits up to 1 s for one
+  rather than being shed outright. Those budgets cover the upload alone: once
+  the body is in, the handler keeps its own acknowledgement budget, so a slow
+  but valid delivery is still recorded. A shed or timed-out request never
+  reached the store and has no local payload to replay, so recovering one
+  means redelivering it from GitHub's delivery log; `preloop webhooks replay`
+  cannot help. With `--record-flows`, the webhook body is no longer buffered
+  by the flow recorder ahead of the route's own admission.
 ### Fixed
 
+- **A stale pinned guest-agent rootfs can no longer make every VM
+  unstoppable.** The engine exports `SMOLVM_AGENT_ROOTFS` to every smolvm
+  child (the child's `HOME`/data directory is isolated), and an inherited
+  variable wins over the rootfs that ships beside the binary — so after a
+  hand-upgraded smolvm prefix the engine kept booting the old agent found in
+  the data directory, and smolvm ≥ 1.16 refused every `machine stop` with
+  `running guest agent does not support safe shutdown; VM left unchanged;
+  update the guest agent before retrying`, which the pool retried for hours.
+  On Linux the rootfs shipped next to the resolved binary is now the first
+  candidate, and on every platform a candidate that agrees with it is
+  preferred; a boot from a provably mismatched agent is refused up front with
+  both rootfs paths, both agent hashes, the host version, and the remedy. Two
+  identical trees are not enough on their own: when the agent they hold
+  advertises no `quiesced-shutdown-v1` while the resolved host requires it,
+  the boot is refused too — that is what a smolvm upgraded without its rootfs
+  looks like. `preloop update --ensure-runtime` refreshes the rootfs the engine
+  exports (`<data dir>/agent-rootfs`, where `<data dir>` is `SMOLVM_DATA_DIR`
+  or the effective Preloop home's `smolvm`), keeps the rootfs beside the
+  resolved binary in step, records the version in `.preloop-agent-version`, and
+  repairs the install whenever either tree stops matching the installed
+  smolvm — not only when the binary is reinstalled. It never installs a sibling
+  it has just proven stale, and it refuses to claim a repair while
+  `SMOLVM_AGENT_ROOTFS` pins a tree that does not hold the host's agent. A
+  refused stop now also names the rootfs Preloop exported and the agent version
+  the guest logged at boot.
+- **Self-built pull-request merges can fetch missing LFS objects.** A run on
+  an engine-built merge is served from a repository that exists only in the
+  engine, but its Git LFS objects still live upstream. The attached snapshot
+  recorded no upstream repository, so the LFS batch route treated every miss
+  as a 404 and jobs could not check out golden or other LFS-backed fixtures.
+  `attach_merge` and `attach_prebuilt_merge` now record the merge's upstream
+  `owner/repo`, with visibility left unknown so the existing route attempts a
+  fetch — App or PAT credentials when configured, anonymously otherwise.
+- **Snapshot cache deepening uses the GitHub App installation token.** A
+  shallow or partial workspace whose GitHub origin is private used to deepen
+  only with the static PAT over HTTPS, so an App-only deployment could not
+  recover the full history, and an SSH origin never received a credential at
+  all. The deepen fetch now prefers a contents-read App installation token,
+  falls back to the PAT, and fetches an SSH origin over HTTPS with that token.
+  The credential is scoped to the configured forge origin and never sent over
+  plaintext HTTP.
+
+- **Partial-clone workspaces fail the submission instead of publishing a
+  broken snapshot.** A workspace cloned with `--filter` whose objects the
+  remote could not supply left holes in the object cache. A reused cache
+  skipped the connectivity check, so the snapshot could publish a HEAD whose
+  trees or blobs no job could read. The submission is now refused with an
+  operator message when HEAD's own history is incomplete. Holes that only other
+  branches or tags reach are still published, as before; publish skips only refs
+  whose target object is absent.
+  Cache deepening also fetches tags, so objects reachable only from a tag are
+  recovered.
+
+- **Workspace snapshots build when the state directory is on another
+  filesystem.** The snapshot object cache initialized itself with
+  `git clone --bare --local`, which hardlinks object files; a workspace on a
+  bind mount, overlay or shared volume makes the kernel refuse the link with
+  `EXDEV` ("Invalid cross-device link"), and the submission failed with a 500
+  before any job ran. The clone now copies objects (`--no-hardlinks`) when the
+  workspace and the cache root are on different devices, and retries as a copy
+  if a hardlinked clone fails anyway, keeping the same-filesystem fast path.
+
+- **Submissions for repositories with thousands of refs no longer hang while
+  staging the snapshot.** `git cat-file --batch-check` was fed thousands of
+  object ids over a pipe and its answer was read only after every id had been
+  written; once the 64 KiB stdout pipe filled, the child stopped reading stdin
+  and the parent stopped draining stdout, so the submission sat there until
+  the client gave up. Git's stdin is now written while stdout and stderr are
+  drained concurrently.
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
   rejected the retried job's otherwise valid runtime token with HTTP 403.
+- **`github.token` and `GITHUB_TOKEN` populate on github.com registrations**
+  (#626): `preloop-runner configure` now records which control plane the
+  runner registered against (`.runner` `controlPlane`, derived from the
+  `--url` host), and a `.runner` written before that field existed is
+  classified from the `gitHubUrl` it already carries, so an upgraded runner
+  recovers the token surface without re-registering. On a github.com
+  registration, `github.token` and the `GITHUB_TOKEN` env var resolve from
+  the job's `system.github.token` variable (or its `github_token` alias) —
+  mirroring the official runner, which builds `githubContext["token"]` from
+  that variable in `ExecutionContext.InitializeJob` — so `gh`,
+  `github-script`, and checkout's `${{ github.token }}` default authenticate
+  instead of seeing an empty value. Engine registrations keep the fence:
+  there the claim owns that slot, holding the GitHub credential it minted
+  (which the runner reads from the `github.token` context) or nothing at all,
+  and it is never exported to a step. The job-scoped runtime JWT is delivered
+  through `SystemVssConnection` and never enters that variable or the step
+  environment. On both planes a workflow's own `env: GITHUB_TOKEN` no longer
+  replaces `${{ github.token }}`, and the
+  `base64("x-access-token:<token>")` header actions/checkout persists is
+  masked for either alias. `secrets.GITHUB_TOKEN` resolution is unchanged in
+  both modes. Missing, unreadable, or malformed `.runner` metadata now fails
+  the job before any workflow, container, or service work instead of silently
+  selecting the engine plane; an unknown `controlPlane` value or an
+  unparseable `gitHubUrl` is an error, and job execution reuses the
+  registration state validated at worker startup rather than re-reading
+  `.runner` per job.
+
+### Changed
+
+- **Webhook installation-coverage lookups are cached per App.** The receiver
+  called `GET /repos/{owner}/{repo}/installation` on every signed delivery
+  before enqueueing it, so each delivery paid a GitHub API round trip inside
+  the ingress' upload slot and spent one request of the App's rate limit.
+  Only a validated positive is retained, for ten minutes. A definitive 404,
+  timeout, rate limit, 5xx, unparseable body, missing/mismatched `app_id`, or
+  suspended installation denies that delivery without being cached, so the
+  next delivery can discover a new grant immediately. Simultaneous deliveries
+  for one repository share one lookup; unrelated repositories and Apps do not
+  serialize. Signature-verified `installation` and `installation_repositories`
+  events invalidate the signer's affected answers before ordinary gating —
+  deleted/suspended installations clear all of that App's answers, and
+  added/removed repositories are re-confirmed on the next ordinary delivery.
+  Lifecycle payloads never grant access, and a payload's `app_id` is never
+  used in place of the verified signer. The cache is process-local: a
+  lifecycle event missed by a process leaves its positive valid for at most
+  the ten-minute fallback TTL, so this is not immediate distributed
+  revocation. At capacity the oldest checked answer is evicted individually,
+  and setup/doctor installation checks stay uncached.
+- **Webhook processing keeps the verified signer's App identity.** The signer
+  App id is persisted with the durable delivery and pins credential selection
+  throughout that delivery's processing (including its spawned processing task
+  and check-run reporting), so a delivery signed by App B is not processed with
+  another App's installation credentials just because that App sorts first in
+  the registry. Job-runtime token minting remains a separate repository-scoped
+  selection path; this change does not alter it.
 
 ## [0.35.0] - 2026-10-19
 
@@ -223,6 +365,48 @@ Releases before v0.27.0 predate the changelog.
   the action-download path logs a WARN with its run and reason, and a local
   composite source that cannot be read is treated as incomplete, never
   remembered as an empty answer.
+
+- **Runner mask hints are now applied in job logs.** The engine already stamped
+  `maskHints` (regex and variable) into every job message, but the runner
+  ignored the list, so pattern-shaped redaction the official runner performs
+  never happened. `run_job` now consumes it: regex hints compile once per job
+  and join the same scan as value masks on every runner egress — durable step
+  logs, check-run annotations, the live-log drain, and the retroactive re-mask —
+  and variable hints mask the named variable's value. The assembled step log
+  (`log_content`, and every slice and upload derived from it) additionally takes
+  the pattern pass over the whole text with line preservation, so a hint whose
+  pattern spans a newline still redacts it while the record count — and every
+  line checkpoint — stays intact. A hint whose pattern does not compile is
+  skipped with a warning. The completion `environment.url` guard applies the
+  hint patterns too, so a URL matching one is dropped rather than published.
+
+- **Credential-shaped container and service `env:` values are masked.** A
+  service declared as `services: db: env: POSTGRES_PASSWORD: …` showed the value
+  verbatim on the `##[command]docker create … -e` line, in the docker debug
+  trace, and in service `docker logs` output. Values whose `env` name matches
+  PASSWORD, PASSWD, SECRET, TOKEN, API_KEY, APIKEY, PRIVATE_KEY, CREDENTIAL, or
+  ACCESS_KEY (case-insensitive) are now registered as job masks before the first
+  recorded docker line, so every sink shows `***`; an empty workflow value is
+  passed as a bare `-e KEY`, which makes Docker inherit the key from the runner
+  process, so the runner's own value for a credential-shaped key is registered
+  too. The match deliberately over-masks (a `TOKEN_BUDGET=5` becomes `***`) —
+  documented at the registration site. The container-create error paths that
+  embed docker output mask it as well.
+
+- **Minted OIDC `id_token`s are redacted from logs.** A step that curls
+  `ACTIONS_ID_TOKEN_REQUEST_URL` and echoes the response leaked the bearer JWT
+  into its log. The token endpoint now registers each minted `id_token` into the
+  job's server-side mask scope before the response is sent, widening the running
+  stream masker in place (the withheld tail is flushed through the rebuilt
+  masker, so no log bytes are dropped), so both the live feed and the persisted
+  log show `***`. Unrelated content is unchanged. Registration is node-local,
+  like the existing claim-time scope merges, and bounded: each scope keeps the
+  64 most recent registrations and drops the oldest first, so a job that mints a
+  token per call cannot grow the scope — or rebuild every live masker from a
+  longer list on each mint — for the run's life. Retention removes the run's own
+  scope entry with its plan scopes. The per-log masker mutex is held across the
+  append of a widened masker's flushed tail, so a concurrent append never
+  interleaves with it.
 - **GitHub Apps created by the manifest flow now subscribe to
   `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
   signal joins the creation-time `default_events`, and `actions: read` joins
@@ -2882,7 +3066,8 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.0...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.5...HEAD
+[0.35.5]: https://github.com/preloopdev/preloop/compare/v0.35.0...v0.35.5
 [0.35.0]: https://github.com/preloopdev/preloop/compare/v0.34.4...v0.35.0
 [0.33.7]: https://github.com/preloopdev/preloop/compare/v0.33.6...v0.33.7
 [0.33.6]: https://github.com/preloopdev/preloop/compare/v0.33.5...v0.33.6
