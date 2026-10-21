@@ -9,10 +9,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::*;
 use crate::connect::{Error, Result};
-use crate::driver::{Driver, native_name, parse_native_name};
+use crate::driver::{
+    Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, ExecCancels, native_name, parse_native_name,
+};
 
 /// Fake driver.
 pub struct FakeDriver {
@@ -21,6 +24,11 @@ pub struct FakeDriver {
     capabilities: Capabilities,
     /// Fail the next N creates (tests).
     pub fail_creates: AtomicU32,
+    /// How many creates actually ran (redelivery dedupe tests).
+    pub create_calls: AtomicU32,
+    /// How many `cancel_exec` calls the agent delivered (disconnect tests).
+    pub cancel_calls: AtomicU32,
+    cancels: ExecCancels,
 }
 
 impl FakeDriver {
@@ -33,6 +41,9 @@ impl FakeDriver {
             root,
             capabilities,
             fail_creates: AtomicU32::new(0),
+            create_calls: AtomicU32::new(0),
+            cancel_calls: AtomicU32::new(0),
+            cancels: ExecCancels::default(),
         }
     }
 
@@ -70,54 +81,19 @@ impl FakeDriver {
     fn guest(root: &Path, guest: &str) -> PathBuf {
         root.join(guest.trim_start_matches('/'))
     }
-}
 
-fn io(context: &str) -> impl Fn(std::io::Error) -> Error + '_ {
-    move |error| Error::internal(format!("fake {context}: {error}"))
-}
-
-#[async_trait]
-impl Driver for FakeDriver {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        self.capabilities.clone()
-    }
-
-    async fn create(&self, work: &CreateWork) -> Result<String> {
-        if self
-            .fail_creates
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(Error::unavailable("injected create failure"));
-        }
-        let name = native_name(&work.sandbox_id);
-        let dir = self.dir(&name)?;
-        std::fs::create_dir_all(&dir).map_err(io("create"))?;
-        if !work.template.native_ref.is_empty() {
-            let source = self.root.join("snapshots").join(&work.template.native_ref);
-            copy_tree(&source, &dir).map_err(io("restore"))?;
-        }
-        Ok(name)
-    }
-
-    async fn destroy(&self, native_ref: &str) -> Result<()> {
-        let dir = self.dir(native_ref)?;
-        match std::fs::remove_dir_all(dir) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io("destroy")(error)),
-            _ => Ok(()),
-        }
-    }
-
-    async fn exec(
+    /// The command half of [`Driver::exec`], split out so the cancel registry
+    /// is cleaned up on every path.
+    async fn exec_inner(
         &self,
         native_ref: &str,
         request: &ExecRequest,
         output: mpsc::Sender<ExecEvent>,
+        cancel: CancellationToken,
     ) -> Result<i32> {
+        if cancel.is_cancelled() {
+            return Ok(EXEC_CANCELLED);
+        }
         let root = self.dir(native_ref)?;
         if !root.is_dir() {
             return Err(Error::not_found("sandbox is gone"));
@@ -181,28 +157,105 @@ impl Driver for FakeDriver {
             output,
             true,
         ));
-        let status = if request.timeout_secs > 0 {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(request.timeout_secs),
-                child.wait(),
-            )
-            .await
-            {
-                Ok(status) => status.map_err(io("wait"))?,
-                Err(_) => {
-                    let _ = child.kill().await;
-                    return Err(Error::new(
-                        crate::connect::Code::DeadlineExceeded,
-                        "exec timed out",
-                    ));
+        let end = {
+            let wait = async {
+                if request.timeout_secs == 0 {
+                    return child.wait().await.map(WaitEnd::Status).map_err(io("wait"));
                 }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(request.timeout_secs),
+                    child.wait(),
+                )
+                .await
+                {
+                    Ok(status) => status.map(WaitEnd::Status).map_err(io("wait")),
+                    Err(_) => Ok(WaitEnd::TimedOut),
+                }
+            };
+            tokio::select! {
+                end = wait => end?,
+                _ = cancel.cancelled() => WaitEnd::Cancelled,
             }
-        } else {
-            child.wait().await.map_err(io("wait"))?
         };
+        // Dropping the wait on cancel (or on the deadline) leaves the child
+        // running; kill it before returning so nothing outlives the exec.
+        if !matches!(end, WaitEnd::Status(_)) {
+            let _ = child.kill().await;
+        }
         let _ = stdout.await;
         let _ = stderr.await;
-        Ok(status.code().unwrap_or(-1))
+        Ok(match end {
+            WaitEnd::Status(status) => status.code().unwrap_or(-1),
+            WaitEnd::TimedOut => EXEC_TIMED_OUT,
+            WaitEnd::Cancelled => EXEC_CANCELLED,
+        })
+    }
+}
+
+enum WaitEnd {
+    Status(std::process::ExitStatus),
+    TimedOut,
+    Cancelled,
+}
+
+fn io(context: &str) -> impl Fn(std::io::Error) -> Error + '_ {
+    move |error| Error::internal(format!("fake {context}: {error}"))
+}
+
+#[async_trait]
+impl Driver for FakeDriver {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities.clone()
+    }
+
+    async fn create(&self, work: &CreateWork) -> Result<String> {
+        if self
+            .fail_creates
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Error::unavailable("injected create failure"));
+        }
+        self.create_calls.fetch_add(1, Ordering::AcqRel);
+        let name = native_name(&work.sandbox_id, work.incarnation);
+        let dir = self.dir(&name)?;
+        std::fs::create_dir_all(&dir).map_err(io("create"))?;
+        if !work.template.native_ref.is_empty() {
+            let source = self.root.join("snapshots").join(&work.template.native_ref);
+            copy_tree(&source, &dir).map_err(io("restore"))?;
+        }
+        Ok(name)
+    }
+
+    async fn destroy(&self, native_ref: &str) -> Result<()> {
+        let dir = self.dir(native_ref)?;
+        match std::fs::remove_dir_all(dir) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io("destroy")(error)),
+            _ => Ok(()),
+        }
+    }
+
+    async fn exec(
+        &self,
+        native_ref: &str,
+        exec_id: &str,
+        request: &ExecRequest,
+        output: mpsc::Sender<ExecEvent>,
+    ) -> Result<i32> {
+        let cancel = self.cancels.start(exec_id);
+        let result = self.exec_inner(native_ref, request, output, cancel).await;
+        self.cancels.finish(exec_id);
+        result
+    }
+
+    async fn cancel_exec(&self, _native_ref: &str, exec_id: &str) -> Result<()> {
+        self.cancel_calls.fetch_add(1, Ordering::AcqRel);
+        self.cancels.cancel(exec_id);
+        Ok(())
     }
 
     async fn copy_in(&self, native_ref: &str, tar: &Path, guest_dir: &str) -> Result<()> {

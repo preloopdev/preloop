@@ -5,13 +5,23 @@
 //! language. Every method is intent-level; how a backend creates a machine
 //! (cold boot, fork, snapshot restore) is its own business.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::api::{Capabilities, CreateWork, ExecEvent, ExecRequest, HostReport, Observed};
 use crate::connect::{Error, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
+
+/// Exit status reported when a driver killed the command at its deadline
+/// (the same convention as the shell's `timeout`).
+pub const EXEC_TIMED_OUT: i32 = 124;
+
+/// Exit status reported when the caller of an exec went away and the driver
+/// cancelled the command.
+pub const EXEC_CANCELLED: i32 = 130;
 /// A sandbox backend on one host (or one remote endpoint, for connectors).
 #[async_trait]
 pub trait Driver: Send + Sync {
@@ -34,13 +44,26 @@ pub trait Driver: Send + Sync {
     /// Destroy a sandbox. Destroying something already gone succeeds.
     async fn destroy(&self, native_ref: &str) -> Result<()>;
 
-    /// Run a command, forwarding output; returns the exit status.
+    /// Run command `exec_id` on the sandbox, forwarding output; returns the
+    /// exit status. `request.timeout_secs` is never zero: the service fills
+    /// in its default deadline, and the driver kills the command at it
+    /// (reporting [`EXEC_TIMED_OUT`]).
     async fn exec(
         &self,
         native_ref: &str,
+        exec_id: &str,
         request: &ExecRequest,
         output: mpsc::Sender<ExecEvent>,
     ) -> Result<i32>;
+
+    /// Kill the command of a running exec because its caller went away.
+    ///
+    /// A cancel may arrive before the exec starts: backends that can should
+    /// remember it and refuse to start that exec id. Cancelling an exec that
+    /// already finished succeeds.
+    async fn cancel_exec(&self, _native_ref: &str, _exec_id: &str) -> Result<()> {
+        Err(unsupported(self.name(), "cancel_exec"))
+    }
 
     /// Extract a tar archive into `guest_dir`.
     async fn copy_in(&self, native_ref: &str, tar: &Path, guest_dir: &str) -> Result<()>;
@@ -165,6 +188,56 @@ pub fn posix_exec_argv(request: &ExecRequest) -> Vec<String> {
     vec!["sh".into(), "-c".into(), script]
 }
 
+/// Cancellation state for a driver's running execs, keyed by exec id.
+///
+/// [`Driver::cancel_exec`] can arrive before [`Driver::exec`] starts — the
+/// caller's stream may drop between the work being delivered and the command
+/// starting — so a cancel for an unknown exec records a pre-cancelled marker
+/// that the next `exec` for that id observes instead of spawning a child.
+#[derive(Default)]
+pub struct ExecCancels {
+    tokens: parking_lot::Mutex<HashMap<String, CancellationToken>>,
+}
+
+impl ExecCancels {
+    /// Register exec `exec_id`; the token is already cancelled when a cancel
+    /// for it arrived first.
+    pub fn start(&self, exec_id: &str) -> CancellationToken {
+        let token = CancellationToken::new();
+        let mut tokens = self.tokens.lock();
+        if tokens
+            .get(exec_id)
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            token.cancel();
+        }
+        tokens.insert(exec_id.to_owned(), token.clone());
+        token
+    }
+
+    /// Cancel `exec_id`, remembering it when no exec is running yet.
+    pub fn cancel(&self, exec_id: &str) {
+        let mut tokens = self.tokens.lock();
+        match tokens.get(exec_id) {
+            Some(token) => token.cancel(),
+            None => {
+                let token = CancellationToken::new();
+                token.cancel();
+                tokens.insert(exec_id.to_owned(), token);
+            }
+        }
+        // Markers for execs that never start would otherwise accumulate.
+        if tokens.len() > 4096 {
+            tokens.retain(|_, token| !token.is_cancelled());
+        }
+    }
+
+    /// Forget a finished exec.
+    pub fn finish(&self, exec_id: &str) {
+        self.tokens.lock().remove(exec_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +276,23 @@ mod tests {
             argv[2],
             "export K='v w'; printf %s 'aGk=' | base64 -d | su -m -s /bin/sh 'runner' -c ''\\''cat'\\'''"
         );
+    }
+
+    #[test]
+    fn exec_cancels_survive_the_start_race() {
+        let cancels = ExecCancels::default();
+        // A cancel before the exec starts refuses to start it.
+        cancels.cancel("exe-early");
+        let token = cancels.start("exe-early");
+        assert!(token.is_cancelled());
+        cancels.finish("exe-early");
+        // A cancel while running cancels the running token.
+        let token = cancels.start("exe-running");
+        assert!(!token.is_cancelled());
+        cancels.cancel("exe-running");
+        assert!(token.is_cancelled());
+        cancels.finish("exe-running");
+        // A cancel after it finished is harmless.
+        cancels.cancel("exe-late");
     }
 }

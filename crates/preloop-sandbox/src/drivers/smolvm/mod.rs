@@ -16,6 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use self::cli::{
@@ -26,7 +27,10 @@ use self::cli::{
 use self::pack::{ArtifactCache, ArtifactPin, LocalImage, PackFormat, select_artifact};
 use crate::api::*;
 use crate::connect::{Code, Error, Result};
-use crate::driver::{Driver, NATIVE_PREFIX, native_name, parse_native_name, shell_quote};
+use crate::driver::{
+    Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, ExecCancels, NATIVE_PREFIX, native_name,
+    parse_native_name, shell_quote,
+};
 
 /// Driver name.
 pub const NAME: &str = "smolvm";
@@ -49,6 +53,7 @@ pub struct SmolvmDriver {
     cache: ArtifactCache,
     /// Artifact each live machine keeps resident, by native name.
     pins: Mutex<HashMap<String, ArtifactPin>>,
+    cancels: ExecCancels,
 }
 
 impl SmolvmDriver {
@@ -61,6 +66,7 @@ impl SmolvmDriver {
             formats: pack::default_formats(),
             cache: ArtifactCache::from_env(std::env::temp_dir().join("preloop-sandbox-artifacts")),
             pins: Mutex::new(HashMap::new()),
+            cancels: ExecCancels::default(),
         }
     }
 
@@ -166,6 +172,57 @@ impl SmolvmDriver {
             LocalImage::Reference(_) => None,
         };
         Ok((materialized.into_image(), pin))
+    }
+
+    /// The command half of [`Driver::exec`], split out so the cancel registry
+    /// is cleaned up on every path.
+    async fn exec_inner(
+        &self,
+        name: &MachineName,
+        request: &ExecRequest,
+        argv: &[String],
+        output: mpsc::Sender<ExecEvent>,
+        cancel: CancellationToken,
+    ) -> Result<i32> {
+        if cancel.is_cancelled() {
+            return Ok(EXEC_CANCELLED);
+        }
+        let (tx, mut rx) = mpsc::channel::<OutputChunk>(64);
+        let forward = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                let event = match chunk {
+                    OutputChunk::Stdout(bytes) => ExecEvent::stdout(bytes),
+                    OutputChunk::Stderr(bytes) => ExecEvent::stderr(bytes),
+                };
+                if output.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let run = self.provider.exec_stream(name, argv, tx);
+        let code = {
+            let wait = async {
+                if request.timeout_secs == 0 {
+                    return run.await.map_err(vm_error);
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(request.timeout_secs),
+                    run,
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(vm_error),
+                    // Dropping the stream killed the CLI child (`kill_on_drop`).
+                    Err(_) => Ok(EXEC_TIMED_OUT),
+                }
+            };
+            tokio::select! {
+                result = wait => result?,
+                _ = cancel.cancelled() => EXEC_CANCELLED,
+            }
+        };
+        let _ = forward.await;
+        Ok(code)
     }
 }
 
@@ -533,34 +590,21 @@ impl Driver for SmolvmDriver {
     async fn exec(
         &self,
         native_ref: &str,
+        exec_id: &str,
         request: &ExecRequest,
         output: mpsc::Sender<ExecEvent>,
     ) -> Result<i32> {
         let name = machine(native_ref)?;
         let argv = crate::driver::posix_exec_argv(request);
-        let (tx, mut rx) = mpsc::channel::<OutputChunk>(64);
-        let forward = tokio::spawn(async move {
-            while let Some(chunk) = rx.recv().await {
-                let event = match chunk {
-                    OutputChunk::Stdout(bytes) => ExecEvent::stdout(bytes),
-                    OutputChunk::Stderr(bytes) => ExecEvent::stderr(bytes),
-                };
-                if output.send(event).await.is_err() {
-                    return;
-                }
-            }
-        });
-        let run = self.provider.exec_stream(&name, &argv, tx);
-        let code = if request.timeout_secs > 0 {
-            tokio::time::timeout(std::time::Duration::from_secs(request.timeout_secs), run)
-                .await
-                .map_err(|_| Error::new(Code::DeadlineExceeded, "exec timed out"))?
-        } else {
-            run.await
-        }
-        .map_err(vm_error)?;
-        let _ = forward.await;
-        Ok(code)
+        let cancel = self.cancels.start(exec_id);
+        let result = self.exec_inner(&name, request, &argv, output, cancel).await;
+        self.cancels.finish(exec_id);
+        result
+    }
+
+    async fn cancel_exec(&self, _native_ref: &str, exec_id: &str) -> Result<()> {
+        self.cancels.cancel(exec_id);
+        Ok(())
     }
 
     async fn copy_in(&self, native_ref: &str, tar: &Path, guest_dir: &str) -> Result<()> {

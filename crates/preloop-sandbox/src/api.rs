@@ -804,7 +804,7 @@ pub struct ExecRequest {
     /// Guest user.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub user: String,
-    /// Timeout (0 = none).
+    /// Deadline in seconds (0 = the service's exec deadline).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub timeout_secs: u64,
     /// Standard input.
@@ -1226,6 +1226,16 @@ pub struct StartWork {
     pub forkable: bool,
 }
 
+/// Cancel a running exec whose caller's stream went away.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CancelExecWork {
+    /// Exec id.
+    pub exec_id: String,
+    /// Target.
+    pub target: SandboxWork,
+}
+
 /// `Start`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1254,7 +1264,7 @@ pub struct SnapshotWork {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkItem {
-    /// Work id.
+    /// Work id: stable across redelivery; `Report` acknowledges it.
     pub id: String,
     /// Create.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1283,9 +1293,13 @@ pub struct WorkItem {
     /// Start a stopped machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start: Option<StartWork>,
+    /// Cancel a running exec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_exec: Option<CancelExecWork>,
 }
 
-/// `Poll` result.
+/// `Poll` result: at most the service's poll batch. Unacknowledged work is
+/// redelivered after the visibility timeout or when the provider re-registers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PollResponse {
@@ -1325,6 +1339,10 @@ pub struct ReportExecRequest {
     pub exec_id: String,
     /// Events, in order.
     pub events: Vec<ExecEvent>,
+    /// Per-exec batch sequence, strictly increasing for the exec; the service
+    /// drops a batch it already applied. 0 is unsequenced.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub sequence: u64,
 }
 
 /// One observed sandbox.

@@ -55,7 +55,7 @@ fn placement_from_env() -> anyhow::Result<Arc<dyn Placement>> {
     })
 }
 
-/// Service config with the blob cap from `PRELOOP_SANDBOX_BLOB_MAX_BYTES`.
+/// Service tuning: defaults overridden by the documented environment.
 fn service_config(state: &Path) -> anyhow::Result<ServiceConfig> {
     let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
     if let Some(raw) = env_nonempty("PRELOOP_SANDBOX_BLOB_MAX_BYTES") {
@@ -63,7 +63,35 @@ fn service_config(state: &Path) -> anyhow::Result<ServiceConfig> {
             format!("PRELOOP_SANDBOX_BLOB_MAX_BYTES must be a byte count, got `{raw}`")
         })?;
     }
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_POLL_BATCH")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        config.poll_batch = value;
+    }
+    if let Some(secs) =
+        env_nonempty("PRELOOP_SANDBOX_DELIVERY_TIMEOUT_SECS").and_then(|v| v.parse::<u64>().ok())
+    {
+        config.delivery_timeout = Duration::from_secs(secs);
+    }
+    if let Some(secs) =
+        env_nonempty("PRELOOP_SANDBOX_EXEC_TIMEOUT_SECS").and_then(|v| v.parse::<u64>().ok())
+    {
+        config.exec_timeout = Duration::from_secs(secs);
+    }
     Ok(config)
+}
+
+/// Agent tuning: defaults overridden by the documented environment.
+fn sandbox_agent_config(name: impl Into<String>, scratch: PathBuf) -> AgentConfig {
+    let mut config = AgentConfig::new(name, scratch);
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_AGENT_CONCURRENCY")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        config.concurrency = value;
+    }
+    config
 }
 
 /// Drivers attached to this host: `PRELOOP_SANDBOX_DRIVERS`, comma-separated
@@ -163,8 +191,9 @@ impl LocalSandboxes {
             access.allow_mounts(pool.sandbox_mount_prefixes());
             access.allow_sockets(pool.sandbox_socket_prefixes());
         }
-        let mut agent_config = AgentConfig::new(local_provider_name(), state.join("sandbox-agent"))
-            .with_access(access);
+        let mut agent_config =
+            sandbox_agent_config(local_provider_name(), state.join("sandbox-agent"))
+                .with_access(access);
         agent_config.metrics = metrics;
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -838,7 +867,8 @@ async fn serve_standalone(
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {
-        let mut agent_config = AgentConfig::new(local_provider_name(), state.join("sandbox-agent"));
+        let mut agent_config =
+            sandbox_agent_config(local_provider_name(), state.join("sandbox-agent"));
         agent_config.metrics = metrics;
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -871,7 +901,7 @@ async fn run_agent(
     let name = args.name.unwrap_or_else(local_provider_name);
     let state = crate::preloop_home().join("state");
     let scratch = state.join("sandbox-agent");
-    let mut agent_config = AgentConfig::new(name, scratch).with_access(HostAccess::from_env());
+    let mut agent_config = sandbox_agent_config(name, scratch).with_access(HostAccess::from_env());
     agent_config.metrics =
         preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     let agent = Agent::new(

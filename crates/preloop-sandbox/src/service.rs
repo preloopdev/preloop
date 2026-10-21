@@ -18,6 +18,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::api::*;
@@ -58,6 +59,14 @@ pub struct ServiceConfig {
     /// callers wanting real export build one from
     /// `Observability::meter()` and overwrite this field.
     pub metrics: crate::metrics::SandboxMetrics,
+    /// Most work items one `Poll` returns (`PRELOOP_SANDBOX_POLL_BATCH`).
+    pub poll_batch: usize,
+    /// How long delivered work stays in flight before it is redelivered
+    /// (`PRELOOP_SANDBOX_DELIVERY_TIMEOUT_SECS`).
+    pub delivery_timeout: Duration,
+    /// An exec with no explicit deadline gets this one
+    /// (`PRELOOP_SANDBOX_EXEC_TIMEOUT_SECS`).
+    pub exec_timeout: Duration,
 }
 
 impl ServiceConfig {
@@ -76,6 +85,9 @@ impl ServiceConfig {
             provider_lost_factor: 3,
             placement: Arc::new(LeastLoaded),
             metrics: crate::metrics::SandboxMetrics::default(),
+            poll_batch: 64,
+            delivery_timeout: Duration::from_secs(120),
+            exec_timeout: Duration::from_secs(3600),
         }
     }
 }
@@ -98,6 +110,12 @@ pub const DEFAULT_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// attempts the record is dropped and the machine becomes an orphan the same
 /// reconcile destroys.
 const MAX_DESTROY_ATTEMPTS: u32 = 3;
+
+/// How long after its deadline an exec is swept. The driver enforces the
+/// deadline itself (exit 124) and its clock starts after delivery, so the
+/// sweep waits out the delivery and report latency before ending the caller's
+/// stream as a backstop.
+const EXEC_SWEEP_GRACE: Duration = Duration::from_secs(5);
 
 /// Names are identifiers: they reach driver-native names, snapshot paths and
 /// pool configuration, so path separators and traversal are rejected.
@@ -258,12 +276,23 @@ enum Pending {
 struct PendingWork {
     provider_id: String,
     kind: Pending,
+    /// When the service stops waiting (and forgets the work).
+    deadline: Instant,
+}
+
+/// Work delivered to a provider and not yet acknowledged.
+struct InFlight {
+    work: WorkItem,
+    /// When the item becomes visible for redelivery.
+    visible_at: Instant,
 }
 
 struct ProviderRec {
     provider: Provider,
     seen: Instant,
     queue: VecDeque<WorkItem>,
+    /// Delivered work, keyed by work id, until `Report` acknowledges it.
+    in_flight: HashMap<String, InFlight>,
     wake: Arc<Notify>,
     /// Latest reported host sample, with the instant it was received for
     /// age reporting. Memory-only: a `Heartbeat` never persists (fenced
@@ -274,6 +303,21 @@ struct ProviderRec {
     /// wholesale on every `Heartbeat` that reports stats (never merged),
     /// so a sandbox the driver stops reporting falls out on its own.
     sandbox_stats: HashMap<String, SandboxRuntimeStats>,
+}
+
+/// One running exec, as seen by the service.
+struct Exec {
+    sandbox_id: String,
+    /// The `Report`-acknowledged work item that started it.
+    work_id: String,
+    tx: mpsc::Sender<Result<ExecEvent>>,
+    /// Last `ReportExec` batch sequence applied.
+    sequence: u64,
+    /// Absolute deadline for the whole command.
+    deadline: Instant,
+    /// Fires when the service stops forwarding this exec, so the watcher
+    /// that detects a dropped caller stream releases its sender.
+    finished: CancellationToken,
 }
 
 /// Data-plane blob for one ticket.
@@ -360,17 +404,18 @@ fn authorize(state: &State, sandbox: &Sandbox, lease_id: &str) -> Result<()> {
 }
 
 /// Close every open exec stream of a sandbox, so a destroyed or failed
-/// sandbox cannot leave a caller streaming forever. Returns the persist ops.
+/// sandbox cannot leave a caller streaming forever.
 fn close_execs(state: &mut State, sandbox_id: &str, reason: &str) {
     let stale: Vec<String> = state
         .execs
         .iter()
-        .filter(|(_, (owner, _))| owner == sandbox_id)
+        .filter(|(_, exec)| exec.sandbox_id == sandbox_id)
         .map(|(exec_id, _)| exec_id.clone())
         .collect();
     for exec_id in stale {
-        if let Some((_, tx)) = state.execs.remove(&exec_id) {
-            let _ = tx.try_send(Err(Error::unavailable(reason.to_owned())));
+        if let Some(exec) = state.execs.remove(&exec_id) {
+            exec.finished.cancel();
+            let _ = exec.tx.try_send(Err(Error::unavailable(reason.to_owned())));
         }
     }
 }
@@ -386,7 +431,7 @@ struct State {
     injected: HashSet<String>,
     providers: BTreeMap<String, ProviderRec>,
     pending: HashMap<String, PendingWork>,
-    execs: HashMap<String, (String, mpsc::Sender<Result<ExecEvent>>)>,
+    execs: HashMap<String, Exec>,
     blobs: HashMap<String, Blob>,
     /// Last creation failure per pool, to back off refills.
     pool_backoff: HashMap<String, Instant>,
@@ -467,6 +512,7 @@ impl Service {
                     // fences everything it still believes.
                     seen: Instant::now() - config.provider_timeout * 2,
                     queue: VecDeque::new(),
+                    in_flight: HashMap::new(),
                     wake: Arc::new(Notify::new()),
                     host: None,
                     host_sampled_at: None,
@@ -704,6 +750,33 @@ impl Service {
             for id in timed_out {
                 self.fail_locked(&mut state, &id, "create timed out", &mut ops);
                 self.config.metrics.record_create_failure("timeout");
+            }
+            // Execs past their deadline: the driver should have killed the
+            // command already; this is the backstop for a lost provider. The
+            // caller gets an error and the guest command is cancelled.
+            let over_deadline: Vec<String> = state
+                .execs
+                .iter()
+                .filter(|(_, exec)| exec.deadline + EXEC_SWEEP_GRACE <= Instant::now())
+                .map(|(exec_id, _)| exec_id.clone())
+                .collect();
+            for exec_id in over_deadline {
+                self.fail_exec_locked(
+                    &mut state,
+                    &exec_id,
+                    Error::new(Code::DeadlineExceeded, "exec timed out"),
+                );
+            }
+            // Work nobody will ever acknowledge: fail whatever still waits
+            // on it so nothing leaks when a provider loses a report.
+            let stale_work: Vec<String> = state
+                .pending
+                .iter()
+                .filter(|(_, work)| work.deadline <= Instant::now())
+                .map(|(work_id, _)| work_id.clone())
+                .collect();
+            for work_id in stale_work {
+                self.expire_pending_locked(&mut state, &work_id, &mut ops);
             }
             // Expired tickets.
             let stale: Vec<String> = state
@@ -1306,20 +1379,101 @@ impl Service {
         work: WorkItem,
         kind: Pending,
     ) -> Result<()> {
+        let deadline = self.pending_deadline(state, &kind);
+        let work_id = work.id.clone();
+        state.pending.insert(
+            work_id.clone(),
+            PendingWork {
+                provider_id: provider_id.to_owned(),
+                kind,
+                deadline,
+            },
+        );
+        if let Err(error) = self.enqueue_work(state, provider_id, work) {
+            // The queue never got it; do not leave a waiter behind.
+            state.pending.remove(&work_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Queue work without tracking a report (cancellations are fire-and-forget).
+    fn enqueue_work(&self, state: &mut State, provider_id: &str, work: WorkItem) -> Result<()> {
         let rec = state
             .providers
             .get_mut(provider_id)
             .ok_or_else(|| Error::unavailable(format!("provider {provider_id} is gone")))?;
-        state.pending.insert(
-            work.id.clone(),
-            PendingWork {
-                provider_id: provider_id.to_owned(),
-                kind,
-            },
-        );
         rec.queue.push_back(work);
         rec.wake.notify_one();
         Ok(())
+    }
+
+    /// When the service stops waiting for a work item.
+    fn pending_deadline(&self, state: &State, kind: &Pending) -> Instant {
+        match kind {
+            Pending::Create { .. } => Instant::now() + self.config.create_timeout,
+            Pending::Exec { exec_id } => state.execs.get(exec_id).map_or_else(
+                || Instant::now() + self.config.exec_timeout + EXEC_SWEEP_GRACE,
+                |exec| exec.deadline + EXEC_SWEEP_GRACE,
+            ),
+            _ => Instant::now() + self.config.work_timeout,
+        }
+    }
+
+    /// Fail a work item whose deadline passed, naming the operation.
+    fn expire_pending_locked(&self, state: &mut State, work_id: &str, ops: &mut Vec<Op>) {
+        let message = match state.pending.get(work_id).map(|work| &work.kind) {
+            Some(Pending::Create { .. }) => "create timed out",
+            Some(Pending::Exec { .. }) => "exec timed out",
+            _ => "work timed out",
+        };
+        let error = Error::new(Code::DeadlineExceeded, message);
+        self.complete_locked(state, work_id, Err(error), ops);
+    }
+
+    /// Drop an exec's work from the queue and its in-flight set: nothing will
+    /// start (or restart) the command.
+    fn forget_work_locked(state: &mut State, provider_id: &str, work_id: &str) {
+        state.pending.remove(work_id);
+        if let Some(rec) = state.providers.get_mut(provider_id) {
+            rec.in_flight.remove(work_id);
+            rec.queue.retain(|item| item.id != work_id);
+        }
+    }
+
+    /// Stop forwarding an exec: end the caller's stream with `error`, forget
+    /// its work, and ask the provider to kill the guest command.
+    fn fail_exec_locked(&self, state: &mut State, exec_id: &str, error: Error) {
+        let Some(exec) = state.execs.remove(exec_id) else {
+            return;
+        };
+        exec.finished.cancel();
+        let _ = exec.tx.try_send(Err(error));
+        let Some(sandbox) = state.sandboxes.get(&exec.sandbox_id).cloned() else {
+            if let Some(pending) = state.pending.get(&exec.work_id) {
+                let provider_id = pending.provider_id.clone();
+                Self::forget_work_locked(state, &provider_id, &exec.work_id);
+            }
+            return;
+        };
+        Self::forget_work_locked(state, &sandbox.provider_id, &exec.work_id);
+        self.request_cancel_locked(state, &sandbox, exec_id);
+    }
+
+    /// Queue a `CancelExec` for a sandbox that still holds the command.
+    fn request_cancel_locked(&self, state: &mut State, sandbox: &Sandbox, exec_id: &str) {
+        if sandbox.state.is_terminal() || sandbox.native_ref.is_empty() {
+            return;
+        }
+        let work = WorkItem {
+            id: new_id("wrk"),
+            cancel_exec: Some(CancelExecWork {
+                exec_id: exec_id.to_owned(),
+                target: Self::target(sandbox),
+            }),
+            ..WorkItem::default()
+        };
+        let _ = self.enqueue_work(state, &sandbox.provider_id, work);
     }
 
     fn target(sandbox: &Sandbox) -> SandboxWork {
@@ -2031,7 +2185,14 @@ impl Service {
     }
 
     /// `Exec`: stream output then the exit status.
-    pub fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
+    ///
+    /// A zero `timeout_secs` gets the service deadline
+    /// ([`ServiceConfig::exec_timeout`]). Dropping the returned stream queues
+    /// a `CancelExec` for the provider and drops the exec state.
+    pub fn exec(
+        self: &Arc<Self>,
+        request: ExecRequest,
+    ) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         let _span = tracing::info_span!("sandbox.exec", sandbox_id = %request.sandbox_id).entered();
         if request.argv.is_empty() {
             return Err(Error::invalid("argv is required"));
@@ -2052,13 +2213,27 @@ impl Service {
         }
         // The lease is the caller's capability: a provider never sees it.
         merged.lease_id.clear();
+        if merged.timeout_secs == 0 {
+            merged.timeout_secs = self.config.exec_timeout.as_secs().max(1);
+        }
+        let deadline = Instant::now() + Duration::from_secs(merged.timeout_secs);
         let exec_id = new_id("exe");
+        let work_id = new_id("wrk");
         let (tx, rx) = mpsc::channel(256);
-        state
-            .execs
-            .insert(exec_id.clone(), (sandbox.id.clone(), tx));
+        let finished = CancellationToken::new();
+        state.execs.insert(
+            exec_id.clone(),
+            Exec {
+                sandbox_id: sandbox.id.clone(),
+                work_id: work_id.clone(),
+                tx: tx.clone(),
+                sequence: 0,
+                deadline,
+                finished: finished.clone(),
+            },
+        );
         let work = WorkItem {
-            id: new_id("wrk"),
+            id: work_id,
             exec: Some(ExecWork {
                 exec_id: exec_id.clone(),
                 target: Self::target(&sandbox),
@@ -2074,9 +2249,22 @@ impl Service {
                 exec_id: exec_id.clone(),
             },
         ) {
-            state.execs.remove(&exec_id);
+            if let Some(exec) = state.execs.remove(&exec_id) {
+                exec.finished.cancel();
+            }
             return Err(error);
         }
+        drop(state);
+        // The sender held here keeps the channel open until either the exec
+        // finishes (`finished`) or the caller drops the stream (`closed`).
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            let held = tx;
+            tokio::select! {
+                _ = held.closed() => service.cancel_disconnected(&exec_id).await,
+                _ = finished.cancelled() => {}
+            }
+        });
         let metrics = self.config.metrics.clone();
         Ok(record_exec_metrics(
             metrics,
@@ -2085,8 +2273,26 @@ impl Service {
         ))
     }
 
+    /// The caller's exec stream went away: drop the exec and tell the
+    /// provider to kill the guest command.
+    async fn cancel_disconnected(&self, exec_id: &str) {
+        let mut state = self.state.lock();
+        let Some(exec) = state.execs.remove(exec_id) else {
+            // Completed in the meantime; there is nothing to cancel.
+            return;
+        };
+        let Some(sandbox) = state.sandboxes.get(&exec.sandbox_id).cloned() else {
+            return;
+        };
+        Self::forget_work_locked(&mut state, &sandbox.provider_id, &exec.work_id);
+        self.request_cancel_locked(&mut state, &sandbox, exec_id);
+    }
+
     /// Run a command to completion, collecting output (convenience).
-    pub async fn exec_collect(&self, request: ExecRequest) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+    pub async fn exec_collect(
+        self: &Arc<Self>,
+        request: ExecRequest,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         collect_exec(self.exec(request)?).await
     }
 
@@ -2367,8 +2573,9 @@ impl Service {
             )?;
             (sandbox, source_template)
         };
-        let native_ref = rx
+        let native_ref = tokio::time::timeout(self.config.work_timeout, rx)
             .await
+            .map_err(|_| Error::unavailable("provider did not report the snapshot"))?
             .map_err(|_| Error::unavailable("provider dropped the snapshot"))??;
         let spec = TemplateSpec {
             name: request.name.clone(),
@@ -2676,8 +2883,9 @@ impl Service {
         Ok(result)
     }
 
-    /// `Register`: same name → same id, next generation. In-flight work of
-    /// the previous generation fails; its sandboxes wait for `Reconcile`.
+    /// `Register`: same name → same id, next generation. Work the previous
+    /// generation holds in flight is redelivered to the new one; its
+    /// sandboxes wait for `Reconcile`.
     pub async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse> {
         if request.name.is_empty() {
             return Err(Error::invalid("name is required"));
@@ -2708,38 +2916,35 @@ impl Service {
                 last_seen: now(),
                 cordoned,
             };
-            let wake = state
-                .providers
-                .get(&id)
-                .map(|rec| rec.wake.clone())
-                .unwrap_or_else(|| Arc::new(Notify::new()));
+            // Everything the old generation had queued or in flight is
+            // unacknowledged: hand it to the new one.
+            let (queue, wake) = match state.providers.remove(&id) {
+                Some(rec) => {
+                    let mut queue = rec.queue;
+                    let mut redeliver: Vec<InFlight> = rec.in_flight.into_values().collect();
+                    redeliver.sort_by_key(|item| item.visible_at);
+                    for item in redeliver.into_iter().rev() {
+                        queue.push_front(item.work);
+                    }
+                    (queue, rec.wake)
+                }
+                None => (VecDeque::new(), Arc::new(Notify::new())),
+            };
             state.providers.insert(
                 id.clone(),
                 ProviderRec {
                     provider: provider.clone(),
                     seen: Instant::now(),
-                    queue: VecDeque::new(),
-                    wake,
+                    queue,
+                    in_flight: HashMap::new(),
+                    wake: wake.clone(),
                     host: None,
                     host_sampled_at: None,
                     sandbox_stats: HashMap::new(),
                 },
             );
-            let mut ops = vec![self.put(Kind::Providers, &id, &provider)];
-            let stale: Vec<String> = state
-                .pending
-                .iter()
-                .filter(|(_, work)| work.provider_id == id)
-                .map(|(work_id, _)| work_id.clone())
-                .collect();
-            for work_id in stale {
-                self.complete_locked(
-                    &mut state,
-                    &work_id,
-                    Err(Error::unavailable("provider re-registered")),
-                    &mut ops,
-                );
-            }
+            wake.notify_waiters();
+            let ops = vec![self.put(Kind::Providers, &id, &provider)];
             (
                 RegisterResponse {
                     provider_id: id,
@@ -2778,10 +2983,16 @@ impl Service {
     }
 
     /// `Poll`: long-poll for work.
+    ///
+    /// At most [`ServiceConfig::poll_batch`] items per call. Delivered items
+    /// stay in flight until `Report` acknowledges them; in-flight items whose
+    /// visibility timeout expired become visible again and are redelivered,
+    /// and a re-registration releases everything the previous generation held
+    /// (see [`Service::register`]).
     pub async fn poll(&self, request: PollRequest) -> Result<PollResponse> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(request.wait_secs.min(55));
         loop {
-            let wake = {
+            let (wake, next_visible) = {
                 let mut state = self.state.lock();
                 self.fence(&state, &request.provider_id, request.generation)?;
                 let rec = state
@@ -2790,17 +3001,48 @@ impl Service {
                     .ok_or_else(|| Error::not_found("provider not registered"))?;
                 rec.seen = Instant::now();
                 rec.provider.last_seen = now();
-                if !rec.queue.is_empty() {
-                    return Ok(PollResponse {
-                        work: rec.queue.drain(..).collect(),
-                    });
+                let at = Instant::now();
+                // Visibility timeout: unacknowledged work is delivered again.
+                let expired: Vec<String> = rec
+                    .in_flight
+                    .iter()
+                    .filter(|(_, item)| item.visible_at <= at)
+                    .map(|(work_id, _)| work_id.clone())
+                    .collect();
+                for work_id in expired {
+                    if let Some(item) = rec.in_flight.remove(&work_id) {
+                        rec.queue.push_back(item.work);
+                    }
                 }
-                rec.wake.clone()
+                let batch = self.config.poll_batch.max(1);
+                let mut work = Vec::with_capacity(batch.min(rec.queue.len()));
+                while work.len() < batch {
+                    let Some(item) = rec.queue.pop_front() else {
+                        break;
+                    };
+                    rec.in_flight.insert(
+                        item.id.clone(),
+                        InFlight {
+                            work: item.clone(),
+                            visible_at: at + self.config.delivery_timeout,
+                        },
+                    );
+                    work.push(item);
+                }
+                if !work.is_empty() {
+                    return Ok(PollResponse { work });
+                }
+                let next = rec.in_flight.values().map(|item| item.visible_at).min();
+                (rec.wake.clone(), next)
             };
-            if tokio::time::timeout_at(deadline, wake.notified())
-                .await
-                .is_err()
-            {
+            let wake = wake.notified();
+            tokio::pin!(wake);
+            let until = next_visible.map_or(deadline, tokio::time::Instant::from_std);
+            tokio::select! {
+                _ = tokio::time::sleep_until(until.min(deadline)) => {}
+                _ = &mut wake => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
                 return Ok(PollResponse::default());
             }
         }
@@ -2811,11 +3053,19 @@ impl Service {
         let ops = {
             let mut state = self.state.lock();
             self.fence(&state, &request.provider_id, request.generation)?;
-            let owner = state
+            let Some(owner) = state
                 .pending
                 .get(&request.work_id)
                 .map(|work| work.provider_id.clone())
-                .ok_or_else(|| Error::not_found("unknown or completed work"))?;
+            else {
+                // Completed work, or a fire-and-forget cancellation: accept
+                // the acknowledgement so the delivery is not repeated.
+                if let Some(rec) = state.providers.get_mut(&request.provider_id) {
+                    rec.in_flight.remove(&request.work_id);
+                    rec.queue.retain(|item| item.id != request.work_id);
+                }
+                return Err(Error::not_found("unknown or completed work"));
+            };
             if owner != request.provider_id {
                 return Err(Error::new(
                     Code::PermissionDenied,
@@ -2847,6 +3097,12 @@ impl Service {
             return;
         };
         let provider_id = work.provider_id;
+        if let Some(rec) = state.providers.get_mut(&provider_id) {
+            // The work may have been redelivered (queued) between the
+            // provider reading it and this report.
+            rec.in_flight.remove(work_id);
+            rec.queue.retain(|item| item.id != work_id);
+        }
         match work.kind {
             Pending::Create { sandbox_id, driver } => match result {
                 Ok(native_ref) => {
@@ -2898,9 +3154,10 @@ impl Service {
                 // Success is signalled by the exit event (`ReportExec`); a
                 // failed exec work ends the stream with the error.
                 if let Err(error) = result
-                    && let Some((_, tx)) = state.execs.remove(&exec_id)
+                    && let Some(exec) = state.execs.remove(&exec_id)
                 {
-                    let _ = tx.try_send(Err(error));
+                    exec.finished.cancel();
+                    let _ = exec.tx.try_send(Err(error));
                 }
             }
             Pending::Copy { reply } | Pending::Snapshot { reply } => {
@@ -2961,45 +3218,63 @@ impl Service {
     }
 
     /// `ReportExec`: forward output; an exit event ends the stream.
+    ///
+    /// Batches carry a per-exec `sequence`; a batch the service already
+    /// applied (a retried `ReportExec`) is acknowledged and dropped. The
+    /// caller's stream closes on the exit event even if later batches arrive.
     pub async fn report_exec(&self, request: ReportExecRequest) -> Result<()> {
         let tx = {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
             self.fence(&state, &request.provider_id, request.generation)?;
-            let owner = state
+            let sandbox_id = state
                 .execs
                 .get(&request.exec_id)
-                .map(|(sandbox_id, _)| sandbox_id.clone());
-            if let Some(sandbox_id) = owner {
-                // Only the provider that owns the sandbox may report output
-                // for its exec: a leaked exec id must not inject output into
-                // another provider's stream.
-                let mine = state
-                    .sandboxes
-                    .get(&sandbox_id)
-                    .is_some_and(|sandbox| sandbox.provider_id == request.provider_id);
-                if !mine {
-                    return Err(Error::new(
-                        Code::PermissionDenied,
-                        "exec belongs to another provider",
-                    ));
-                }
+                .map(|exec| exec.sandbox_id.clone())
+                .ok_or_else(|| {
+                    // Caller went away (or the exec finished); stop the agent.
+                    Error::not_found("exec not found")
+                })?;
+            // Only the provider that owns the sandbox may report output for
+            // its exec: a leaked exec id must not inject output into another
+            // provider's stream.
+            let mine = state
+                .sandboxes
+                .get(&sandbox_id)
+                .is_some_and(|sandbox| sandbox.provider_id == request.provider_id);
+            if !mine {
+                return Err(Error::new(
+                    Code::PermissionDenied,
+                    "exec belongs to another provider",
+                ));
             }
-            state.execs.get(&request.exec_id).map(|(_, tx)| tx.clone())
+            let exec = state
+                .execs
+                .get_mut(&request.exec_id)
+                .ok_or_else(|| Error::not_found("exec not found"))?;
+            if request.sequence != 0 {
+                if request.sequence <= exec.sequence {
+                    // A retry of a batch already delivered.
+                    return Ok(());
+                }
+                exec.sequence = request.sequence;
+            }
+            exec.tx.clone()
         };
-        let Some(tx) = tx else {
-            // Caller went away; tell the agent to stop sending.
-            return Err(Error::not_found("exec not found"));
-        };
-        let mut done = false;
+        let mut exited = false;
         for event in request.events {
-            done |= event.exit_code.is_some();
+            let exit = event.exit_code.is_some();
             if tx.send(Ok(event)).await.is_err() {
-                done = true;
+                // The caller dropped its stream: leave the state for the
+                // disconnect watcher, which cancels the guest command.
+                return Ok(());
+            }
+            if exit {
+                exited = true;
                 break;
             }
         }
-        if done {
-            self.state.lock().execs.remove(&request.exec_id);
+        if exited && let Some(exec) = self.state.lock().execs.remove(&request.exec_id) {
+            exec.finished.cancel();
         }
         Ok(())
     }

@@ -21,6 +21,7 @@ opentelemetry.workspace = true
 parking_lot.workspace = true
 postgres_rustls.workspace = true
 preloop-observability = { path = "../preloop-observability" }
+rand.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true

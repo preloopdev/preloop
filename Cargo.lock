@@ -2924,6 +2924,7 @@ dependencies = [
  "parking_lot",
  "postgres_rustls",
  "preloop-observability",
+ "rand 0.10.2",
  "reqwest",
  "rusqlite",
  "rustls",
