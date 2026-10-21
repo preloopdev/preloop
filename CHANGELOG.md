@@ -8,40 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
-### Security
-
-- **Webhook ingress bounds and times out body uploads.** The GitHub webhook
-  route buffers at most eight request bodies (each up to the 32 MiB route
-  limit) at once, so an unauthenticated caller can no longer use the ingress
-  as a memory amplifier before the HMAC check. An upload is cut off with 408
-  if it is still arriving after 10 s, or if it stops sending for 3 s — holding
-  a slot now costs an actual transfer instead of just a connection — and a
-  delivery that arrives while every slot is taken waits up to 1 s for one
-  rather than being shed outright. Those budgets cover the upload alone: once
-  the body is in, the handler keeps its own acknowledgement budget, so a slow
-  but valid delivery is still recorded. A shed or timed-out request never
-  reached the store and has no local payload to replay, so recovering one
-  means redelivering it from GitHub's delivery log; `preloop webhooks replay`
-  cannot help. With `--record-flows`, the webhook body is no longer buffered
-  by the flow recorder ahead of the route's own admission.
 ### Fixed
-
-- **Workspace snapshots build when the state directory is on another
-  filesystem.** The snapshot object cache initialized itself with
-  `git clone --bare --local`, which hardlinks object files; a workspace on a
-  bind mount, overlay or shared volume makes the kernel refuse the link with
-  `EXDEV` ("Invalid cross-device link"), and the submission failed with a 500
-  before any job ran. The clone now copies objects (`--no-hardlinks`) when the
-  workspace and the cache root are on different devices, and retries as a copy
-  if a hardlinked clone fails anyway, keeping the same-filesystem fast path.
-
-- **Submissions for repositories with thousands of refs no longer hang while
-  staging the snapshot.** `git cat-file --batch-check` was fed thousands of
-  object ids over a pipe and its answer was read only after every id had been
-  written; once the 64 KiB stdout pipe filled, the child stopped reading stdin
-  and the parent stopped draining stdout, so the submission sat there until
-  the client gave up. Git's stdin is now written while stdout and stderr are
-  drained concurrently.
 
 - **Snapshot capture is bounded end to end, and the shared object cache has a
   ceiling.** One run's merge attach, local workspace capture, or remote
@@ -60,6 +27,95 @@ Releases before v0.27.0 predate the changelog.
   never while a capture pin or an alternates reference protects it; clone
   hardlinks make the ceiling soft.
 
+## [0.35.5] - 2026-10-21
+
+### Security
+
+- **Webhook ingress bounds and times out body uploads.** The GitHub webhook
+  route buffers at most eight request bodies (each up to the 32 MiB route
+  limit) at once, so an unauthenticated caller can no longer use the ingress
+  as a memory amplifier before the HMAC check. An upload is cut off with 408
+  if it is still arriving after 10 s, or if it stops sending for 3 s — holding
+  a slot now costs an actual transfer instead of just a connection — and a
+  delivery that arrives while every slot is taken waits up to 1 s for one
+  rather than being shed outright. Those budgets cover the upload alone: once
+  the body is in, the handler keeps its own acknowledgement budget, so a slow
+  but valid delivery is still recorded. A shed or timed-out request never
+  reached the store and has no local payload to replay, so recovering one
+  means redelivering it from GitHub's delivery log; `preloop webhooks replay`
+  cannot help. With `--record-flows`, the webhook body is no longer buffered
+  by the flow recorder ahead of the route's own admission.
+### Fixed
+
+- **A stale pinned guest-agent rootfs can no longer make every VM
+  unstoppable.** The engine exports `SMOLVM_AGENT_ROOTFS` to every smolvm
+  child (the child's `HOME`/data directory is isolated), and an inherited
+  variable wins over the rootfs that ships beside the binary — so after a
+  hand-upgraded smolvm prefix the engine kept booting the old agent found in
+  the data directory, and smolvm ≥ 1.16 refused every `machine stop` with
+  `running guest agent does not support safe shutdown; VM left unchanged;
+  update the guest agent before retrying`, which the pool retried for hours.
+  On Linux the rootfs shipped next to the resolved binary is now the first
+  candidate, and on every platform a candidate that agrees with it is
+  preferred; a boot from a provably mismatched agent is refused up front with
+  both rootfs paths, both agent hashes, the host version, and the remedy. Two
+  identical trees are not enough on their own: when the agent they hold
+  advertises no `quiesced-shutdown-v1` while the resolved host requires it,
+  the boot is refused too — that is what a smolvm upgraded without its rootfs
+  looks like. `preloop update --ensure-runtime` refreshes the rootfs the engine
+  exports (`<data dir>/agent-rootfs`, where `<data dir>` is `SMOLVM_DATA_DIR`
+  or the effective Preloop home's `smolvm`), keeps the rootfs beside the
+  resolved binary in step, records the version in `.preloop-agent-version`, and
+  repairs the install whenever either tree stops matching the installed
+  smolvm — not only when the binary is reinstalled. It never installs a sibling
+  it has just proven stale, and it refuses to claim a repair while
+  `SMOLVM_AGENT_ROOTFS` pins a tree that does not hold the host's agent. A
+  refused stop now also names the rootfs Preloop exported and the agent version
+  the guest logged at boot.
+- **Self-built pull-request merges can fetch missing LFS objects.** A run on
+  an engine-built merge is served from a repository that exists only in the
+  engine, but its Git LFS objects still live upstream. The attached snapshot
+  recorded no upstream repository, so the LFS batch route treated every miss
+  as a 404 and jobs could not check out golden or other LFS-backed fixtures.
+  `attach_merge` and `attach_prebuilt_merge` now record the merge's upstream
+  `owner/repo`, with visibility left unknown so the existing route attempts a
+  fetch — App or PAT credentials when configured, anonymously otherwise.
+- **Snapshot cache deepening uses the GitHub App installation token.** A
+  shallow or partial workspace whose GitHub origin is private used to deepen
+  only with the static PAT over HTTPS, so an App-only deployment could not
+  recover the full history, and an SSH origin never received a credential at
+  all. The deepen fetch now prefers a contents-read App installation token,
+  falls back to the PAT, and fetches an SSH origin over HTTPS with that token.
+  The credential is scoped to the configured forge origin and never sent over
+  plaintext HTTP.
+
+- **Partial-clone workspaces fail the submission instead of publishing a
+  broken snapshot.** A workspace cloned with `--filter` whose objects the
+  remote could not supply left holes in the object cache. A reused cache
+  skipped the connectivity check, so the snapshot could publish a HEAD whose
+  trees or blobs no job could read. The submission is now refused with an
+  operator message when HEAD's own history is incomplete. Holes that only other
+  branches or tags reach are still published, as before; publish skips only refs
+  whose target object is absent.
+  Cache deepening also fetches tags, so objects reachable only from a tag are
+  recovered.
+
+- **Workspace snapshots build when the state directory is on another
+  filesystem.** The snapshot object cache initialized itself with
+  `git clone --bare --local`, which hardlinks object files; a workspace on a
+  bind mount, overlay or shared volume makes the kernel refuse the link with
+  `EXDEV` ("Invalid cross-device link"), and the submission failed with a 500
+  before any job ran. The clone now copies objects (`--no-hardlinks`) when the
+  workspace and the cache root are on different devices, and retries as a copy
+  if a hardlinked clone fails anyway, keeping the same-filesystem fast path.
+
+- **Submissions for repositories with thousands of refs no longer hang while
+  staging the snapshot.** `git cat-file --batch-check` was fed thousands of
+  object ids over a pipe and its answer was read only after every id had been
+  written; once the 64 KiB stdout pipe filled, the child stopped reading stdin
+  and the parent stopped draining stdout, so the submission sat there until
+  the client gave up. Git's stdin is now written while stdout and stderr are
+  drained concurrently.
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
@@ -90,6 +146,35 @@ Releases before v0.27.0 predate the changelog.
   unparseable `gitHubUrl` is an error, and job execution reuses the
   registration state validated at worker startup rather than re-reading
   `.runner` per job.
+
+### Changed
+
+- **Webhook installation-coverage lookups are cached per App.** The receiver
+  called `GET /repos/{owner}/{repo}/installation` on every signed delivery
+  before enqueueing it, so each delivery paid a GitHub API round trip inside
+  the ingress' upload slot and spent one request of the App's rate limit.
+  Only a validated positive is retained, for ten minutes. A definitive 404,
+  timeout, rate limit, 5xx, unparseable body, missing/mismatched `app_id`, or
+  suspended installation denies that delivery without being cached, so the
+  next delivery can discover a new grant immediately. Simultaneous deliveries
+  for one repository share one lookup; unrelated repositories and Apps do not
+  serialize. Signature-verified `installation` and `installation_repositories`
+  events invalidate the signer's affected answers before ordinary gating —
+  deleted/suspended installations clear all of that App's answers, and
+  added/removed repositories are re-confirmed on the next ordinary delivery.
+  Lifecycle payloads never grant access, and a payload's `app_id` is never
+  used in place of the verified signer. The cache is process-local: a
+  lifecycle event missed by a process leaves its positive valid for at most
+  the ten-minute fallback TTL, so this is not immediate distributed
+  revocation. At capacity the oldest checked answer is evicted individually,
+  and setup/doctor installation checks stay uncached.
+- **Webhook processing keeps the verified signer's App identity.** The signer
+  App id is persisted with the durable delivery and pins credential selection
+  throughout that delivery's processing (including its spawned processing task
+  and check-run reporting), so a delivery signed by App B is not processed with
+  another App's installation credentials just because that App sorts first in
+  the registry. Job-runtime token minting remains a separate repository-scoped
+  selection path; this change does not alter it.
 
 ## [0.35.0] - 2026-10-19
 
@@ -487,7 +572,7 @@ Releases before v0.27.0 predate the changelog.
   process-wide roots as the engine (bundled Mozilla, the OS store read with a
   5 s deadline, and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`) instead of
   reqwest's platform verifier, so a hung `trustd`/`securityd` can no longer
-  stall them. `preloop runner lint` also gains a 30 s request / 10 s connect
+  stall them. `preloop-runner lint` also gains a 30 s request / 10 s connect
   deadline. A bundle certificate the anchor parser cannot read is dropped
   instead of failing the set, so one malformed entry in
   `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE` no longer takes Postgres TLS
@@ -3115,7 +3200,8 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.0...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.5...HEAD
+[0.35.5]: https://github.com/preloopdev/preloop/compare/v0.35.0...v0.35.5
 [0.35.0]: https://github.com/preloopdev/preloop/compare/v0.34.4...v0.35.0
 [0.33.7]: https://github.com/preloopdev/preloop/compare/v0.33.6...v0.33.7
 [0.33.6]: https://github.com/preloopdev/preloop/compare/v0.33.5...v0.33.6
