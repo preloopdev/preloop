@@ -2148,8 +2148,57 @@ async fn cmd_engine(
         // the Warm/OnDemand seed picked from the enable switch alone.
         Err(_) => pool_status.set_mode(preloop_observability::status::PoolMode::Disabled),
     }
+    // Resolve the VM substrate and run the guest-agent rootfs guard *before*
+    // the server exists. `pool_available` decides whether the control plane
+    // demands a provision token from every registering runner, so a pool the
+    // guard disables has to be known here: clearing the pool afterwards would
+    // leave the server in pool-managed assignment mode with no pool to mint a
+    // token, and jobs the engine could otherwise hand to an ordinary runner
+    // would wait on the provisioning list forever.
+    //
+    // The guard fails the pool fast, once, on a rootfs the resolved smolvm
+    // cannot manage. Booting from it would leave every machine unstoppable
+    // ("running guest agent does not support safe shutdown; VM left
+    // unchanged"), which the pool would otherwise retry, with the same opaque
+    // error, for hours. The engine keeps serving so `preloop status` and the
+    // recovery commands still work; the guard's message names both rootfs
+    // paths, both agent hashes, the host version, and the remedy.
+    let mut backend = None;
+    let mut agent_guard_error = None;
+    if let Ok(config) = &pool_config {
+        if !pool_enabled {
+            if config.use_fork {
+                tracing::info!(
+                    "warm runner pool disabled; forking one VM per queued job from the golden"
+                );
+            } else {
+                tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
+            }
+        }
+        // Supervisor-side, once, before any VM boots: systemd's
+        // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
+        // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
+        // get no cpu/memory/pids limit files. This performs the same
+        // vacate-then-enable dance `smolvm serve` does. It is the only
+        // place Preloop writes to the cgroup hierarchy — the CLI paths
+        // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
+        // root read-only and never mutate it.
+        preloop_vm::init_vm_cgroup_delegation();
+        let selected = vm_backend()?;
+        tracing::info!(backend = selected.as_str(), "VM substrate selected");
+        backend = Some(selected);
+        if selected == VmBackend::Smolvm
+            && let Err(error) = preloop_vm::agent_rootfs::guard(std::path::Path::new("smolvm"))
+        {
+            tracing::error!("{error}");
+            tracing::error!("runner pool disabled until the smolvm guest agent is repaired");
+            pool_status.set_mode(preloop_observability::status::PoolMode::Disabled);
+            agent_guard_error = Some(error);
+        }
+    }
     let pool_available = match &pool_config {
-        Ok(_) => true,
+        Ok(_) if agent_guard_error.is_none() => true,
+        Ok(_) => false,
         Err(error) => {
             // "jobs queue until a runner is available" was the old message,
             // but a missing bundle means no runner will EVER become
@@ -2165,6 +2214,10 @@ async fn cmd_engine(
             );
             false
         }
+    };
+    let pool_config = match pool_config {
+        Ok(config) if agent_guard_error.is_none() => Some(config),
+        _ => None,
     };
     let mut server = tokio::spawn(preloop_runner_server::serve(
         preloop_runner_server::ServerConfig {
@@ -2194,6 +2247,14 @@ async fn cmd_engine(
         result = &mut server => return result?,
         result = wait_for_engine_socket(&socket, listen) => result?,
     }
+    // This process now owns the engine socket, so no other engine on this home
+    // is provisioning. The machines the stale agent left unstoppable are still
+    // running: `machine stop` refuses them, and the pool's own startup cleanup
+    // will not run because the pool is disabled. Reap them here, where the
+    // purge cannot race a live engine.
+    if agent_guard_error.is_some() {
+        purge_stuck_vms();
+    }
 
     // Every way out of this process — the normal shutdown below, a pool that
     // never recovers, an error return like a failed `vm_backend()` — must not
@@ -2202,31 +2263,6 @@ async fn cmd_engine(
     let _vm_teardown = VmTeardownOnExit;
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let pool_config = pool_config.ok();
-    let mut backend = None;
-    if let Some(config) = &pool_config {
-        if !pool_enabled {
-            if config.use_fork {
-                tracing::info!(
-                    "warm runner pool disabled; forking one VM per queued job from the golden"
-                );
-            } else {
-                tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
-            }
-        }
-        // Supervisor-side, once, before any VM boots: systemd's
-        // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
-        // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
-        // get no cpu/memory/pids limit files. This performs the same
-        // vacate-then-enable dance `smolvm serve` does. It is the only
-        // place Preloop writes to the cgroup hierarchy — the CLI paths
-        // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
-        // root read-only and never mutate it.
-        preloop_vm::init_vm_cgroup_delegation();
-        let selected = vm_backend()?;
-        tracing::info!(backend = selected.as_str(), "VM substrate selected");
-        backend = Some(selected);
-    }
 
     let spawn_pool = |config: &RunnerPoolConfig,
                       pool_shutdown: tokio_util::sync::CancellationToken,
@@ -2442,23 +2478,37 @@ struct VmTeardownOnExit;
 
 impl Drop for VmTeardownOnExit {
     fn drop(&mut self) {
-        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
-            Ok(killed) if killed > 0 => {
-                tracing::info!(
-                    killed,
-                    "purged orphaned SmolVM hypervisor processes at exit"
-                )
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "orphaned hypervisor purge at exit failed"),
+        purge_stuck_vms();
+    }
+}
+
+/// Kill the detached hypervisors and layer mounts nothing can reach any more.
+///
+/// Two callers: the exit backstop above, and the startup path where the
+/// guest-agent guard disables the runner pool. The second is the case this
+/// sweep exists for — a guest agent the resolved smolvm cannot stop refused
+/// every `machine stop`, so the machines of the previous engine are still
+/// running when the next one starts, and disabling the pool means
+/// `RunnerPool::run` never gets to run its own startup cleanup.
+///
+/// Both steps are safe against a live machine: the purge keys on this home's
+/// boot-config paths (and `All` is sound because the caller is either exiting
+/// or holding the engine's socket, so nothing of ours is provisioning), and a
+/// mount whose hypervisor still exists is skipped.
+fn purge_stuck_vms() {
+    match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
+        Ok(killed) if killed > 0 => {
+            tracing::info!(killed, "purged orphaned SmolVM hypervisor processes")
         }
-        match preloop_vm::detach_orphaned_layer_mounts() {
-            Ok(detached) if detached > 0 => {
-                tracing::info!(detached, "detached orphaned SmolVM layer mounts at exit")
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "orphaned layer-mount detach at exit failed"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "orphaned hypervisor purge failed"),
+    }
+    match preloop_vm::detach_orphaned_layer_mounts() {
+        Ok(detached) if detached > 0 => {
+            tracing::info!(detached, "detached orphaned SmolVM layer mounts")
         }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "orphaned layer-mount detach failed"),
     }
 }
 

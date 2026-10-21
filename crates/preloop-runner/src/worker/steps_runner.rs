@@ -1523,7 +1523,8 @@ pub async fn run_steps(
         let mut cleanup_log = Vec::new();
         let mut cleanup_content = String::new();
         if let Some(state) = &job.container_state {
-            if let Err(e) = super::container_ops::cleanup_containers(state, &mut cleanup_log).await
+            if let Err(e) =
+                super::container_ops::cleanup_containers(state, job, &mut cleanup_log).await
             {
                 warn!("Container cleanup failed: {e:#}");
             }
@@ -1894,7 +1895,7 @@ async fn initialize_containers(
     use super::container_ops::*;
 
     // Check Docker availability
-    if !check_docker(log).await? {
+    if !check_docker(job, log).await? {
         anyhow::bail!("Docker is not available");
     }
 
@@ -1902,10 +1903,10 @@ async fn initialize_containers(
     let network = generate_network_name();
 
     // Clean up stale containers from previous runs
-    cleanup_stale(&label, log).await?;
+    cleanup_stale(&label, job, log).await?;
 
     // Create job network
-    create_network(&network, &label, log).await?;
+    create_network(&network, &label, job, log).await?;
 
     // A container's network namespace resolves the engine origin the job
     // message advertises (the runner's loopback bridge) to the container
@@ -1960,7 +1961,7 @@ async fn initialize_containers(
             &runner_externals,
             &runner_actions,
             &toolcache,
-            job.container_engine.as_deref(),
+            job,
             log,
         )
         .await?;
@@ -1972,21 +1973,13 @@ async fn initialize_containers(
     let mut service_containers = Vec::new();
     for service in service_specs {
         let name = container_name(&service.image, &label);
-        let id = start_service_container(
-            service,
-            &name,
-            &label,
-            &network,
-            job.container_engine.as_deref(),
-            log,
-        )
-        .await?;
+        let id = start_service_container(service, &name, &label, &network, job, log).await?;
         service_containers.push((service.alias.clone(), id, name));
     }
 
     // Wait for health checks
     if !service_containers.is_empty() {
-        wait_for_services_healthy(&service_containers, log).await?;
+        wait_for_services_healthy(&service_containers, job, log).await?;
     }
 
     // Store container state in job context

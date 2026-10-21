@@ -26,6 +26,7 @@ use crate::client::run_service::RunServiceClient;
 use crate::settings::RunnerRegistration;
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
+use preloop_gha_protocol::azdo::MaskHint;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -238,6 +239,11 @@ pub async fn run_job(
     for mask in super::steps_runner::proxy_password_masks(|name| std::env::var(name).ok()) {
         job_ctx.add_mask(&mask);
     }
+    // Register the job message's mask hints before any step output can reach
+    // the logs: `MaskType::Regex` patterns redact spans value masking would
+    // miss, `MaskType::Variable` hints mask the named variable's current
+    // value (Worker.cs InitializeSecretMasker parity).
+    job_ctx.apply_mask_hints(&mask_hints_from_message(&job_message));
     // The worker resolved and validated `.runner` before calling `run_job`;
     // use that state here and everywhere downstream. Container/service
     // expressions are evaluated before workspace setup calls
@@ -505,7 +511,7 @@ pub async fn run_job(
         Some(super::live_logs::LiveLogQueue::connect(
             feed_url,
             token,
-            job_ctx.live_masks.clone(),
+            job_ctx.live_mask_set(),
         ))
     } else {
         None
@@ -1387,6 +1393,27 @@ fn is_job_not_found(error: &anyhow::Error) -> bool {
     )
 }
 
+/// Parse the job message's `mask` array (the wire form of
+/// `AgentJobRequestMessage::mask_hints`) into hints.
+///
+/// Malformed entries are skipped with a warning: a hint arriving on the wire
+/// must never fail or panic the job.
+fn mask_hints_from_message(job_message: &serde_json::Value) -> Vec<MaskHint> {
+    job_message
+        .get("mask")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| match serde_json::from_value(entry.clone()) {
+            Ok(hint) => Some(hint),
+            Err(error) => {
+                warn!(%error, "skipping malformed mask hint");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Whether an error is an HTTP 401 — the token the worker presents was
 /// rejected, which for a long-running job means the server-issued OAuth
 /// token expired mid-job and must be re-acquired.
@@ -1399,3 +1426,45 @@ fn is_unauthorized(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 #[path = "job_runner_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod mask_hint_tests {
+    use super::mask_hints_from_message;
+    use preloop_gha_protocol::azdo::MaskType;
+
+    #[test]
+    fn mask_hints_parse_from_job_message_wire_shape() {
+        let message = serde_json::json!({
+            "mask": [
+                { "type": "regex", "value": r"user:[^@\s]+@host" },
+                { "type": "variable", "value": "MY_SECRET" },
+            ]
+        });
+        let hints = mask_hints_from_message(&message);
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].hint_type, MaskType::Regex);
+        assert_eq!(hints[0].value, r"user:[^@\s]+@host");
+        assert_eq!(hints[1].hint_type, MaskType::Variable);
+        assert_eq!(hints[1].value, "MY_SECRET");
+    }
+
+    #[test]
+    fn mask_hints_skip_malformed_entries_without_failing() {
+        let message = serde_json::json!({
+            "mask": [
+                { "type": "regex", "value": "ok-pattern" },
+                { "type": "nonsense", "value": "x" },
+                "not-an-object",
+            ]
+        });
+        let hints = mask_hints_from_message(&message);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].value, "ok-pattern");
+    }
+
+    #[test]
+    fn mask_hints_absent_or_wrong_shape_yield_none() {
+        assert!(mask_hints_from_message(&serde_json::json!({})).is_empty());
+        assert!(mask_hints_from_message(&serde_json::json!({ "mask": "oops" })).is_empty());
+    }
+}

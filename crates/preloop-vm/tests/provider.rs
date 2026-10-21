@@ -1003,4 +1003,184 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
             "SMOLVM_CGROUP_ROOT="
         );
     }
+
+    /// A rootfs tree the guard can read: `sbin/init` marks it as a real
+    /// rootfs, and the agent binary carries the boot banner, its version, and
+    /// (when asked) the quiesced-shutdown capability.
+    fn write_agent_rootfs(path: &Path, agent: &str, capability: bool) {
+        fs::create_dir_all(path.join("sbin")).unwrap();
+        fs::write(path.join("sbin/init"), b"#!/bin/sh\n").unwrap();
+        let mut binary = Vec::from(&b"smolvm-agent started, deferred boot work in progress"[..]);
+        binary.extend_from_slice(agent.as_bytes());
+        if capability {
+            binary.extend_from_slice(b"quiesced-shutdown-v1");
+        }
+        fs::create_dir_all(path.join("usr/local/bin")).unwrap();
+        fs::write(path.join("usr/local/bin/smolvm-agent"), binary).unwrap();
+    }
+
+    /// A smolvm stand-in that records every invocation and reports a version,
+    /// so a test can prove which commands did and did not run.
+    fn recording_smolvm(directory: &Path) -> PathBuf {
+        let executable = directory.join("smolvm");
+        write_executable(
+            &executable,
+            r##"#!/bin/sh
+printf '%s\n' "$*" >> "$0.invocations"
+if [ "${1-}" = "--version" ]; then
+  printf 'smolvm 1.30.1\n'
+fi
+exit 0
+"##,
+        );
+        executable
+    }
+
+    fn invocations(executable: &Path) -> String {
+        fs::read_to_string(executable.with_extension("invocations")).unwrap_or_default()
+    }
+
+    /// The failure that motivated the guard: an operator pinned a stale guest
+    /// agent (or an old data-directory copy outranked the shipped one), so the
+    /// host would refuse to stop every guest it booted. The provider must
+    /// refuse the boot instead, name both trees, and never launch smolvm.
+    #[tokio::test]
+    async fn a_guest_agent_that_does_not_match_the_binary_refuses_to_boot() {
+        let _env_guard = TEST_ENV_MUTEX.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = recording_smolvm(directory.path());
+        write_agent_rootfs(&directory.path().join("agent-rootfs"), "1.30.1", true);
+        let stale = directory.path().join("stale-rootfs");
+        write_agent_rootfs(&stale, "1.14.2", false);
+
+        let saved = std::env::var_os("SMOLVM_AGENT_ROOTFS");
+        unsafe { std::env::set_var("SMOLVM_AGENT_ROOTFS", &stale) };
+        let result = SmolVmProvider::new(&executable)
+            .create(&valid_spec(MachineName::new("runner").unwrap()))
+            .await;
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("SMOLVM_AGENT_ROOTFS", value),
+                None => std::env::remove_var("SMOLVM_AGENT_ROOTFS"),
+            }
+        }
+
+        let error = result.expect_err("a mismatched guest agent must refuse to boot");
+        let VmError::GuestAgentMismatch { report } = error else {
+            panic!("expected the guest-agent mismatch error, got {error}");
+        };
+        let shipped = directory.path().join("agent-rootfs");
+        for needle in [
+            stale.display().to_string(),
+            shipped.display().to_string(),
+            "does not match host smolvm 1.30.1".to_owned(),
+            "preloop update --ensure-runtime".to_owned(),
+        ] {
+            assert!(report.contains(&needle), "{needle:?} missing from {report}");
+        }
+        let launched = invocations(&executable);
+        assert!(
+            !launched.contains("machine"),
+            "the guard must refuse before any smolvm command runs; saw: {launched}"
+        );
+    }
+
+    /// The matching layout booted by the engine itself: nothing pinned, the
+    /// rootfs shipped with the binary is the one the engine exports, and the
+    /// boot proceeds — the guard must never false-positive here.
+    #[tokio::test]
+    async fn the_binaries_own_guest_agent_boots_without_a_guard_finding() {
+        let _env_guard = TEST_ENV_MUTEX.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = recording_smolvm(directory.path());
+        let shipped = directory.path().join("agent-rootfs");
+        write_agent_rootfs(&shipped, "1.30.1", true);
+        let saved = std::env::var_os("SMOLVM_AGENT_ROOTFS");
+        unsafe { std::env::remove_var("SMOLVM_AGENT_ROOTFS") };
+
+        let result = SmolVmProvider::new(&executable)
+            .create(&valid_spec(MachineName::new("runner").unwrap()))
+            .await;
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("SMOLVM_AGENT_ROOTFS", value),
+                None => std::env::remove_var("SMOLVM_AGENT_ROOTFS"),
+            }
+        }
+
+        result.expect("the agent that ships with the binary must be accepted");
+        assert!(
+            invocations(&executable).contains("machine create"),
+            "the boot command must have run; saw: {}",
+            invocations(&executable)
+        );
+    }
+
+    /// When smolvm still refuses a stop (the machine was booted before the
+    /// guard existed, or its agent is stale for another reason), the surfaced
+    /// error must name the rootfs Preloop pinned and the agent version that
+    /// actually booted, so the failure is diagnosable without a second
+    /// investigation.
+    #[tokio::test]
+    async fn a_refused_stop_reports_the_pinned_rootfs_and_the_guest_agent_version() {
+        let _env_guard = TEST_ENV_MUTEX.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("smolvm");
+        write_executable(
+            &executable,
+            r##"#!/bin/sh
+case "${1-}:${2-}" in
+  machine:data-dir) cat "$0.dataroot" ;;
+  machine:stop)
+    printf '%s\n' 'running guest agent does not support safe shutdown; VM left unchanged; update the guest agent before retrying' >&2
+    exit 1
+    ;;
+esac
+exit 0
+"##,
+        );
+        let rootfs = directory.path().join("stale-rootfs");
+        write_agent_rootfs(&rootfs, "1.14.2", false);
+        let machine_dir = directory.path().join("machine");
+        fs::create_dir_all(&machine_dir).unwrap();
+        fs::write(
+            machine_dir.join("agent-console.log"),
+            "{\"level\":\"INFO\",\"fields\":{\"message\":\"smolvm-agent started, deferred boot work in \
+             progress\",\"version\":\"1.14.2\"},\"target\":\"smolvm_agent\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            executable.with_extension("dataroot"),
+            format!("{}\n", machine_dir.display()),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("SMOLVM_AGENT_ROOTFS");
+        unsafe { std::env::set_var("SMOLVM_AGENT_ROOTFS", &rootfs) };
+        let result = SmolVmProvider::new(&executable)
+            .stop(&MachineName::new("runner").unwrap())
+            .await;
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("SMOLVM_AGENT_ROOTFS", value),
+                None => std::env::remove_var("SMOLVM_AGENT_ROOTFS"),
+            }
+        }
+
+        let error = result.expect_err("the stop was refused");
+        let message = error.to_string();
+        let rootfs_path = rootfs.display().to_string();
+        for needle in [
+            "does not support safe shutdown",
+            "guest-agent diagnostics",
+            rootfs_path.as_str(),
+            "1.14.2",
+            "preloop update --ensure-runtime",
+        ] {
+            assert!(
+                message.contains(needle),
+                "{needle:?} missing from {message}"
+            );
+        }
+    }
 }

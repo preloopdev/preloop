@@ -1812,6 +1812,7 @@ pub(crate) mod suite {
             attempts: 0,
             lease_until_us: None,
             lease_token: None,
+            signer_app_id: None,
             last_error: None,
         };
         assert!(backend.enqueue_webhook_delivery(&delivery).await.unwrap());
