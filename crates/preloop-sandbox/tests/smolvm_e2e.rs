@@ -15,6 +15,9 @@ use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
 use preloop_sandbox::{Driver, Service, ServiceConfig, store};
 use tokio_util::sync::CancellationToken;
 
+/// Alpine 3.20's multi-arch index digest: the e2e pulls the real image.
+const ALPINE_3_20: &str = "sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc";
+
 async fn run(service: &Arc<Service>, sandbox: &str, script: &str) -> (i32, String) {
     let (code, stdout, stderr) = service
         .exec_collect(ExecRequest {
@@ -63,7 +66,13 @@ async fn smolvm_golden_fork_pool_end_to_end() {
         .put_template(TemplateSpec {
             name: "alpine".into(),
             os: "linux".into(),
-            image: Some("alpine:3.20".into()),
+            artifacts: vec![Artifact {
+                format: Artifact::OCI_IMAGE.into(),
+                arch: host_arch().into(),
+                reference: format!("docker.io/library/alpine@{ALPINE_3_20}"),
+                digest: ALPINE_3_20.into(),
+                size_bytes: 0,
+            }],
             ..TemplateSpec::default()
         })
         .await

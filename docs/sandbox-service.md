@@ -39,9 +39,16 @@ from the `.proto` interoperates.
 
 ## Model
 
-* **Template** — a logical image: an OCI image (optionally per architecture), a
-  driver-specific `recipe` interpreted by the selected driver, or a snapshot
-  captured by `Snapshot` (then bound to the provider and driver that hold it).
+* **Template** — a logical image: one or more `Artifact`s
+  (`format`, `arch`, `ref`, `digest`), a driver-specific `recipe` interpreted
+  by the selected driver, or a snapshot captured by `Snapshot` (then bound to
+  the provider and driver that hold it). `PutTemplate` requires a
+  `sha256:` digest on every artifact and a digest-pinned (`@sha256:…`)
+  registry ref; a driver materializes the first artifact whose format and
+  architecture it supports, so one template can serve several hosts. Formats
+  are `oci-image` (the backend pulls the registry image itself) and
+  `smolmachine` (a monolithic pack at `file://…` or a digest-pinned OCI
+  artifact on GHCR).
 * **Pool** — template + shape + network + mounts + warm target + max. The
   service keeps `warm` idle sandboxes per pool (the generic warm pool) and
   refills after each claim, backing off after creation failures.
@@ -76,6 +83,16 @@ parties integrate by implementing the Providers protocol.
 relays (the CLI's branches keep them), so the driver stays on the CLI and pools
 are the service's.
 
+Each driver owns materialization behind `PackFormat`
+(`crates/preloop-sandbox/src/drivers/smolvm/pack.rs`): `oci-image` hands the
+digest-pinned reference to SmolVM, `smolmachine` fetches a `file://` pack or a
+registry artifact blob into a content-addressed cache and verifies its sha256
+before booting. The cache lives under the driver's data directory
+(`<state>/sandbox-cache` in the engine), is bounded by
+`PRELOOP_SANDBOX_CACHE_MAX_BYTES` (default 50 GiB), and evicts
+least-recently-used artifacts after each materialization — never one a running
+sandbox still references.
+
 ## Security model
 
 * Data-plane tickets are single-use, scoped to one sandbox and direction, and
@@ -105,7 +122,10 @@ through an in-process agent, and serves the API on `PRELOOP_SANDBOX_LISTEN`
 (`preloop_orchestrator::fleet::SandboxMachines`) acquires every VM from it:
 goldens are build sandboxes, forks are acquires from the golden's snapshot
 template, and deletes are releases. The pool keeps its golden, packed-artifact
-and debug-hold strategy; the machines under it are sandboxes.
+and debug-hold strategy; the machines under it are sandboxes. An image string
+becomes a template by content: a local pack is hashed and a registry tag is
+resolved to the digest the registry serves, so a rebuilt pack registers a new
+template instead of silently reusing the old one.
 
 | Variable | Effect |
 |---|---|
@@ -115,13 +135,16 @@ and debug-hold strategy; the machines under it are sandboxes.
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
 | `PRELOOP_SANDBOX_POOL_DRIVER` | driver the CI pool places on (default: first) |
 | `PRELOOP_SANDBOX_SMOLVM_SLOTS` | concurrent SmolVM sandboxes (0 = no cap) |
+| `PRELOOP_SANDBOX_CACHE_DIR` | artifact cache directory (default `<state>/sandbox-cache`) |
+| `PRELOOP_SANDBOX_CACHE_MAX_BYTES` | artifact cache budget (default 50 GiB) |
 
 ## CLI
 
 ```sh
 preloop sandbox serve --listen 0.0.0.0:9191            # standalone service (+ local SmolVM)
 preloop sandbox agent --service http://hub:9191        # join as a provider
-preloop sandbox template put --name alpine --image alpine:3.20
+preloop sandbox template put --name alpine --artifact \
+  format=oci-image,arch=aarch64,ref=alpine@sha256:…,digest=sha256:…
 preloop sandbox pool put --name alpine --template alpine --warm 2
 preloop sandbox acquire --pool alpine --env JOB=1      # → lease + sandbox JSON
 preloop sandbox exec sbx-… -- uname -a
@@ -140,8 +163,9 @@ preloop sandbox ls | providers
   (idempotency, warm pools, placement errors, unsupported operations,
   snapshot → template → fork, create failure, lease expiry and preservation,
   orphan/lost reconcile, generation fencing, SQLite restart, streaming exec,
-  ticketed upload/download). Set `PRELOOP_SANDBOX_TEST_PG` to also run the
-  Postgres store test.
+  ticketed upload/download, artifact validation, digest-verified pack
+  materialization, and cache GC). Set `PRELOOP_SANDBOX_TEST_PG` to also run
+  the Postgres store test.
 * `PRELOOP_SANDBOX_E2E_SMOLVM=1 cargo test -p preloop-sandbox --test smolvm_e2e`
   — real SmolVM: bake, snapshot, warm pool of branches, socket mount, files,
   streaming, cleanup.

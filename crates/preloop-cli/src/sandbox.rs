@@ -19,6 +19,7 @@ use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
+use preloop_sandbox::drivers::smolvm::pack::ArtifactCache;
 use preloop_sandbox::server::{Auth, router};
 use preloop_sandbox::{Driver, SandboxApi, SandboxClient, Service, ServiceConfig, store};
 use tokio_util::sync::CancellationToken;
@@ -38,10 +39,12 @@ fn smolvm_slots() -> u32 {
 
 /// Drivers attached to this host: `PRELOOP_SANDBOX_DRIVERS`, comma-separated
 /// (default `smolvm`). `named_prefix` lets the SmolVM inventory adopt the CI
-/// pool's caller-named machines.
+/// pool's caller-named machines; `cache` holds the packed artifacts drivers
+/// materialize.
 pub(crate) fn host_drivers(
     named_prefix: Option<&str>,
     slots: u32,
+    cache: &ArtifactCache,
 ) -> anyhow::Result<Vec<Arc<dyn Driver>>> {
     let names = env_nonempty("PRELOOP_SANDBOX_DRIVERS").unwrap_or_else(|| "smolvm".into());
     let mut drivers: Vec<Arc<dyn Driver>> = Vec::new();
@@ -52,7 +55,8 @@ pub(crate) fn host_drivers(
     {
         drivers.push(match name {
             "smolvm" => {
-                let mut driver = SmolvmDriver::new(SmolVmProvider::default(), slots);
+                let mut driver =
+                    SmolvmDriver::new(SmolVmProvider::default(), slots).with_cache(cache.clone());
                 if let Some(prefix) = named_prefix {
                     driver = driver.with_named_prefix(prefix);
                 }
@@ -94,7 +98,11 @@ impl LocalSandboxes {
         let local = Arc::new(SmolVmProvider::default());
         let prefix =
             env_nonempty("PRELOOP_RUNNER_NAME_PREFIX").unwrap_or_else(|| "preloop-runner".into());
-        let drivers = host_drivers(Some(&prefix), smolvm_slots())?;
+        let drivers = host_drivers(
+            Some(&prefix),
+            smolvm_slots(),
+            &ArtifactCache::from_env(state.join("sandbox-cache")),
+        )?;
         let pool_driver = env_nonempty("PRELOOP_SANDBOX_POOL_DRIVER").unwrap_or_else(|| {
             drivers
                 .first()
@@ -313,7 +321,7 @@ struct AgentArgs {
 
 #[derive(Debug, Subcommand)]
 enum TemplateCommand {
-    /// Register a template from an OCI image or a driver recipe.
+    /// Register a template from one or more artifacts, or a driver recipe.
     Put {
         /// Name.
         #[arg(long)]
@@ -321,9 +329,15 @@ enum TemplateCommand {
         /// Guest OS.
         #[arg(long, default_value = "linux")]
         os: String,
-        /// OCI image.
-        #[arg(long, conflicts_with = "recipe")]
-        image: Option<String>,
+        /// Artifact as comma-separated `key=value` pairs:
+        /// `format=oci-image|smolmachine,arch=…,ref=…,digest=sha256:…[,size=…]`.
+        /// Repeat for several formats or architectures.
+        #[arg(
+            long = "artifact",
+            value_name = "KEY=VALUE,…",
+            conflicts_with = "recipe"
+        )]
+        artifact: Vec<String>,
         /// Driver-specific recipe interpreted by the selected driver.
         #[arg(long)]
         recipe: Option<String>,
@@ -454,6 +468,34 @@ fn parse_kv(value: &str) -> Result<(String, String), String> {
         .ok_or_else(|| format!("expected KEY=VALUE, got `{value}`"))
 }
 
+/// Parse one `--artifact` value:
+/// `format=…,arch=…,ref=…,digest=sha256:…[,size=…]`.
+fn parse_artifact(raw: &str) -> anyhow::Result<Artifact> {
+    let mut artifact = Artifact::default();
+    for pair in raw.split(',') {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("expected key=value in `{raw}`, got `{pair}`"))?;
+        match key.trim() {
+            "format" => artifact.format = value.trim().to_owned(),
+            "arch" => artifact.arch = value.trim().to_owned(),
+            "ref" => artifact.reference = value.trim().to_owned(),
+            "digest" => artifact.digest = value.trim().to_owned(),
+            "size" => {
+                artifact.size_bytes = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid artifact size `{value}`"))?;
+            }
+            other => anyhow::bail!("unknown artifact field `{other}`"),
+        }
+    }
+    artifact
+        .validate()
+        .map_err(|error| anyhow::anyhow!("artifact `{raw}`: {error}"))?;
+    Ok(artifact)
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -468,7 +510,7 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
         SandboxCommand::Template(TemplateCommand::Put {
             name,
             os,
-            image,
+            artifact,
             recipe,
             driver,
         }) => print_json(
@@ -476,7 +518,10 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
                 .put_template(TemplateSpec {
                     name,
                     os,
-                    image,
+                    artifacts: artifact
+                        .iter()
+                        .map(|raw| parse_artifact(raw))
+                        .collect::<anyhow::Result<Vec<_>>>()?,
                     recipe,
                     requires: Requirements {
                         driver: driver.unwrap_or_default(),
@@ -660,7 +705,11 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     if !args.no_local {
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
-            host_drivers(None, smolvm_slots())?,
+            host_drivers(
+                None,
+                smolvm_slots(),
+                &ArtifactCache::from_env(state.join("sandbox-cache")),
+            )?,
             AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
         );
         tokio::spawn(agent.run(shutdown.clone()));
@@ -679,10 +728,15 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
 
 async fn run_agent(service: &str, args: AgentArgs) -> anyhow::Result<()> {
     let name = args.name.unwrap_or_else(local_provider_name);
-    let scratch = crate::preloop_home().join("state").join("sandbox-agent");
+    let state = crate::preloop_home().join("state");
+    let scratch = state.join("sandbox-agent");
     let agent = Agent::new(
         Arc::new(RemoteLink::new(service, args.provider_token)),
-        host_drivers(None, args.slots)?,
+        host_drivers(
+            None,
+            args.slots,
+            &ArtifactCache::from_env(state.join("sandbox-cache")),
+        )?,
         AgentConfig::new(name, scratch),
     );
     let shutdown = CancellationToken::new();

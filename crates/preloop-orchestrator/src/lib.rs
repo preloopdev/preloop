@@ -1988,7 +1988,7 @@ async fn stream_golden_body(
 }
 
 /// SHA-256 of a file, lowercase hex.
-async fn sha256_file(path: &Path) -> Result<String, String> {
+pub(crate) async fn sha256_file(path: &Path) -> Result<String, String> {
     let hashed = path.to_owned();
     let display = path.display().to_string();
     match tokio::task::spawn_blocking(move || {

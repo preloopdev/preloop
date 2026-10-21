@@ -25,11 +25,25 @@ impl Drop for Harness {
     }
 }
 
+/// A syntactically valid digest-pinned artifact for the fake driver, which
+/// boots nothing: these tests exercise the service, not a registry.
+const TEST_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+fn oci_artifact() -> Artifact {
+    Artifact {
+        format: Artifact::OCI_IMAGE.into(),
+        arch: host_arch().into(),
+        reference: format!("ghcr.io/preloop/alpine@{TEST_DIGEST}"),
+        digest: TEST_DIGEST.into(),
+        size_bytes: 0,
+    }
+}
+
 fn template(name: &str) -> TemplateSpec {
     TemplateSpec {
         name: name.into(),
         os: "linux".into(),
-        image: Some("alpine:3.20".into()),
+        artifacts: vec![oci_artifact()],
         ..TemplateSpec::default()
     }
 }
@@ -715,7 +729,7 @@ async fn invalid_names_are_rejected() {
             .put_template(TemplateSpec {
                 name: name.into(),
                 os: "linux".into(),
-                image: Some("alpine:3.20".into()),
+                artifacts: vec![oci_artifact()],
                 ..TemplateSpec::default()
             })
             .await
@@ -732,6 +746,92 @@ async fn invalid_names_are_rejected() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn templates_require_digest_pinned_artifacts() {
+    let h = harness().await;
+    let base = template("alpine");
+
+    let mut tag = base.clone();
+    tag.artifacts[0].reference = "ghcr.io/preloop/alpine:3.20".into();
+    let error = h.service.put_template(tag).await.unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(error.message.contains("digest-pinned"), "{}", error.message);
+
+    let mut undigested = base.clone();
+    undigested.artifacts[0].digest = "sha256:not-a-digest".into();
+    let error = h.service.put_template(undigested).await.unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(error.message.contains("sha256"), "{}", error.message);
+
+    let mut mismatched = base.clone();
+    mismatched.artifacts[0].digest = format!("sha256:{}", "b".repeat(64));
+    let error = h.service.put_template(mismatched).await.unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(
+        error.message.contains("does not match"),
+        "{}",
+        error.message
+    );
+
+    let mut unknown_format = base.clone();
+    unknown_format.artifacts[0].format = "raw-disk".into();
+    let error = h.service.put_template(unknown_format).await.unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(
+        error.message.contains("unsupported artifact format"),
+        "{}",
+        error.message
+    );
+
+    let mut both_sources = base.clone();
+    both_sources.recipe = Some("smolmachine:/tmp/runner.smolmachine".into());
+    let error = h.service.put_template(both_sources).await.unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+
+    let mut duplicate = base.clone();
+    duplicate.artifacts.push(duplicate.artifacts[0].clone());
+    let error = h.service.put_template(duplicate).await.unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(error.message.contains("twice"), "{}", error.message);
+
+    // A local pack needs a digest, not a registry pin.
+    h.service
+        .put_template(TemplateSpec {
+            name: "pack".into(),
+            os: "linux".into(),
+            artifacts: vec![Artifact {
+                format: Artifact::SMOLMACHINE.into(),
+                arch: host_arch().into(),
+                reference: "file:///tmp/runner.smolmachine".into(),
+                digest: format!("sha256:{}", "c".repeat(64)),
+                size_bytes: 4096,
+            }],
+            ..TemplateSpec::default()
+        })
+        .await
+        .unwrap();
+
+    // An OCI-pack ref without a digest pin is still mutable.
+    let error = h
+        .service
+        .put_template(TemplateSpec {
+            name: "oci-pack".into(),
+            os: "linux".into(),
+            artifacts: vec![Artifact {
+                format: Artifact::SMOLMACHINE.into(),
+                arch: host_arch().into(),
+                reference: "ghcr.io/preloop/runner:latest".into(),
+                digest: format!("sha256:{}", "d".repeat(64)),
+                size_bytes: 0,
+            }],
+            ..TemplateSpec::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(error.message.contains("digest-pinned"), "{}", error.message);
 }
 
 #[tokio::test]
@@ -840,7 +940,7 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         .put_template(TemplateSpec {
             name: "alpine".into(),
             os: "linux".into(),
-            image: Some("alpine:3.20".into()),
+            artifacts: vec![oci_artifact()],
             requires: Requirements {
                 driver: "ghost".into(),
                 ..Requirements::default()

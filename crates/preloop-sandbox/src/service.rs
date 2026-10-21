@@ -541,17 +541,27 @@ impl Service {
     pub async fn put_template(&self, spec: TemplateSpec) -> Result<Template> {
         validate_name("template", &spec.name)?;
         let sources = [
-            spec.image.is_some() || !spec.images_by_arch.is_empty(),
+            !spec.artifacts.is_empty(),
             spec.recipe.is_some(),
             spec.snapshot_of.is_some(),
         ];
         if sources.iter().filter(|set| **set).count() != 1 {
             return Err(Error::invalid(
-                "exactly one template source is required: image/imagesByArch, recipe, or snapshotOf",
+                "exactly one template source is required: artifacts, recipe, or snapshotOf",
             ));
         }
         if spec.snapshot_of.is_some() {
             return Err(Error::invalid("snapshot templates are created by Snapshot"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for artifact in &spec.artifacts {
+            artifact.validate().map_err(Error::invalid)?;
+            if !seen.insert((artifact.format.as_str(), artifact.arch.as_str())) {
+                return Err(Error::invalid(format!(
+                    "artifact for format `{}` and arch `{}` is declared twice",
+                    artifact.format, artifact.arch
+                )));
+            }
         }
         let template = Template {
             digest: template_digest(&spec),
