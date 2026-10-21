@@ -488,7 +488,11 @@ Releases before v0.27.0 predate the changelog.
   5 s deadline, and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`) instead of
   reqwest's platform verifier, so a hung `trustd`/`securityd` can no longer
   stall them. `preloop runner lint` also gains a 30 s request / 10 s connect
-  deadline. The login-keychain writability probe's cleanup delete (`security
+  deadline. A bundle certificate the anchor parser cannot read is dropped
+  instead of failing the set, so one malformed entry in
+  `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE` no longer takes Postgres TLS
+  (which adds the list strictly) down with it. The login-keychain writability
+  probe's cleanup delete (`security
   delete-generic-password`) is now killed after 2 s instead of leaking its
   child and guard thread forever, and the secrets/policy API config
   load-and-write (which can reach the keychain for the sealing key) runs on

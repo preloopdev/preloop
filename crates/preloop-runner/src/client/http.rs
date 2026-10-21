@@ -107,7 +107,7 @@ fn build_reqwest_client(ca_pem: Option<&[u8]>, socket: Option<&Path>) -> Result<
     // verifier: on macOS that verifier calls `SecTrustEvaluateWithError`
     // inside the handshake, which asks `trustd`/`securityd` with no deadline,
     // so a hung trust daemon would hang every runner request.
-    builder = builder.use_preconfigured_tls(crate::client::tls::client_config(ca_pem)?);
+    builder = builder.use_preconfigured_tls(preloop_observability::tls::client_config(ca_pem)?);
     if let Some(socket) = socket {
         #[cfg(unix)]
         {

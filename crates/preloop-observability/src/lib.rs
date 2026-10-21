@@ -23,6 +23,7 @@ pub mod deadline;
 pub mod metrics;
 pub mod prometheus;
 pub mod status;
+pub mod tls;
 pub mod vm_telemetry;
 
 /// middleware's span parent extraction.
