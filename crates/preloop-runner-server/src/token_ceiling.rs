@@ -47,6 +47,28 @@ pub struct CeilingOutcome {
     pub clamped: Vec<CeilingClampDetail>,
 }
 
+/// Whether the operator ceiling permits the `id-token` scope at `write` —
+/// the only level that can mint an OIDC token.
+///
+/// `apply_ceiling` never sees this scope: it clamps the GitHub App token
+/// request, whose permission map excludes Actions-only scopes (`id-token`
+/// among them) by construction. The OIDC grant is therefore capped here
+/// instead, at the two points that decide it: `build_job_artifacts` (which
+/// records the grant and emits the request URL) and the `oidctoken` mint
+/// handler (the backstop for rows recorded before a ceiling was configured
+/// or by any other path). No ceiling configured → permitted.
+pub fn ceiling_allows_id_token(ceiling: Option<&TokenPermissionsCeiling>) -> bool {
+    let Some(ceiling) = ceiling else {
+        return true;
+    };
+    let cap = ceiling
+        .scopes
+        .get("id-token")
+        .copied()
+        .unwrap_or(ceiling.r#default);
+    cap.rank() >= crate::config::PermissionLevel::Write.rank()
+}
+
 /// Cap `requested` at the operator ceiling. `None` (no ceiling configured)
 /// returns the request unchanged with no clamps.
 pub fn apply_ceiling(
@@ -119,6 +141,39 @@ mod tests {
             .iter()
             .map(|(scope, level)| ((*scope).to_owned(), (*level).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn id_token_cap_follows_scope_then_default() {
+        // No ceiling: the OIDC grant is uncapped.
+        assert!(ceiling_allows_id_token(None));
+        // A scope entry governs, at write or above only.
+        assert!(!ceiling_allows_id_token(Some(&ceiling(
+            PermissionLevel::Write,
+            &[("id-token", PermissionLevel::None)],
+            false,
+        ))));
+        assert!(!ceiling_allows_id_token(Some(&ceiling(
+            PermissionLevel::Write,
+            &[("id-token", PermissionLevel::Read)],
+            false,
+        ))));
+        assert!(ceiling_allows_id_token(Some(&ceiling(
+            PermissionLevel::None,
+            &[("id-token", PermissionLevel::Write)],
+            false,
+        ))));
+        // Without a scope entry the default governs.
+        assert!(!ceiling_allows_id_token(Some(&ceiling(
+            PermissionLevel::None,
+            &[],
+            false,
+        ))));
+        assert!(ceiling_allows_id_token(Some(&ceiling(
+            PermissionLevel::Write,
+            &[],
+            false,
+        ))));
     }
 
     #[test]

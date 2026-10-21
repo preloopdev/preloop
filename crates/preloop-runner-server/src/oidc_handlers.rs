@@ -72,6 +72,17 @@ pub async fn oidc_token(
             "id-token: write permission is required to request an OIDC token",
         ));
     }
+    // The operator ceiling is the hard cap above the recorded grant: a row
+    // recorded before the ceiling was configured (or by a path that did not
+    // apply it) must not mint past it. Same denial as an ungranted job — the
+    // caller learns nothing about which layer refused.
+    if !crate::token_ceiling::ceiling_allows_id_token(
+        shared.state.token_permissions_ceiling.as_ref(),
+    ) {
+        return Err(ApiError::forbidden(
+            "id-token: write permission is required to request an OIDC token",
+        ));
+    }
 
     // Get the OIDC signing keypair (node-local crypto).
     let (oidc_kp, issuer) = {
@@ -531,6 +542,104 @@ mod tests {
         assert_eq!(
             persisted, "log ***\n",
             "the persisted log must redact the id_token"
+        );
+    }
+
+    impl OidcJob {
+        /// Submit the standard OIDC workflow with an operator
+        /// `[token_permissions_ceiling]` installed on the state first.
+        async fn submit_with_ceiling(
+            ceiling: crate::config::TokenPermissionsCeiling,
+        ) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+            state.token_permissions_ceiling = Some(ceiling);
+            let app = crate::routes::app(state.clone(), CancellationToken::new());
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/runs")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+                        )
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "workflow_yaml": OIDC_WORKFLOW,
+                                "event": "push",
+                                "repository": "owner/repo",
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let (plan_id, agent_job_id) = {
+                let tx = state.test_tx().await;
+                tx.ready()
+                    .next()
+                    .or_else(|| tx.pending_jobs.front())
+                    .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
+                    .expect("the submitted job must be queued")
+            };
+            let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+            Self {
+                app,
+                state,
+                temp,
+                plan_id,
+                agent_job_id,
+                runtime_token,
+            }
+        }
+
+        /// GET an arbitrary OIDC mint URI with this job's runtime token.
+        async fn mint_uri(&self, uri: String) -> axum::response::Response {
+            self.send(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", self.runtime_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+    }
+
+    /// The operator ceiling is documented as a hard cap on the GitHub
+    /// authority a workflow may request, and its scope table accepts an
+    /// `id-token` entry. A ceiling of `id-token: none` must therefore deny
+    /// the OIDC mint even when the workflow declares `id-token: write`.
+    #[tokio::test]
+    async fn oidc_mint_denied_when_operator_ceiling_caps_id_token() {
+        let job = OidcJob::submit_with_ceiling(crate::config::TokenPermissionsCeiling {
+            r#default: crate::config::PermissionLevel::Read,
+            scopes: std::collections::BTreeMap::from([(
+                "id-token".to_owned(),
+                crate::config::PermissionLevel::None,
+            )]),
+            allow_create_approve_pr: false,
+        })
+        .await;
+        let response = job
+            .mint_uri(format!(
+                "/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken",
+                job.plan_id, job.agent_job_id
+            ))
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a ceiling of id-token: none must deny the mint"
         );
     }
 

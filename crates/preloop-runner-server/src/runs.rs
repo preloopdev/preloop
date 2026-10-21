@@ -2815,8 +2815,13 @@ pub(crate) fn build_job_artifacts(
 
     // Fork-restricted jobs never receive an OIDC grant: no request URL is
     // emitted here (and the broker restates it only for granted jobs), and
-    // the `oidctoken` endpoint refuses via `id_token_grants`.
-    let id_token_granted = policy.id_token_granted;
+    // the `oidctoken` endpoint refuses via the recorded grant. The operator
+    // ceiling caps the grant as well: its scope table accepts an `id-token`
+    // entry even though the App-token clamp never sees that scope.
+    let id_token_granted = policy.id_token_granted
+        && crate::token_ceiling::ceiling_allows_id_token(
+            shared.state.token_permissions_ceiling.as_ref(),
+        );
     if id_token_granted {
         let oidc_url = format!(
             "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
