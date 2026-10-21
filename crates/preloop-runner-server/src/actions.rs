@@ -908,7 +908,14 @@ fn action_manifest_directory(uses: &str) -> Option<String> {
     let mut segments = repo_part.split('/');
     segments.next()?;
     segments.next()?;
-    manifest_directory_from_path(&segments.collect::<Vec<_>>().join("/"))
+    let directory: Vec<&str> = segments.collect();
+    // An empty segment (a doubled or trailing slash) is not a path this
+    // helper fetches: fall back to the root manifest rather than resolving
+    // it into a different, shallower directory.
+    if directory.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    manifest_directory_from_path(&directory.join("/"))
 }
 
 /// Normalize a repository-relative directory from a `uses:` path or an
@@ -3430,6 +3437,42 @@ jobs:
         assert!(
             manifest_nested_uses(&serde_json::json!({"content": "!!!not-base64!!!"})).is_empty()
         );
+    }
+
+    /// A nested reference cannot smuggle a manifest path out of the
+    /// repository it names: every unsafe segment makes the directory `None`,
+    /// so the fetch falls back to the root manifest instead of an arbitrary
+    /// path, and the reference still names only `b/tools`.
+    #[test]
+    fn nested_reference_directories_cannot_escape_the_repository() {
+        for uses in [
+            "b/tools/../../escape@v1",
+            "b/tools/./x@v1",
+            "b/tools//x@v1",
+            "b/tools/a\\b@v1",
+        ] {
+            // Single-quote the scalar: `${{` would otherwise start a flow
+            // mapping and the whole manifest would fail to parse.
+            let yaml = format!("runs:\n  using: composite\n  steps:\n    - uses: '{uses}'\n");
+            let (nested, _) = manifest_nested_uses_from_yaml(yaml.as_bytes());
+            assert_eq!(
+                nested,
+                BTreeSet::from([("b/tools".to_owned(), None)]),
+                "{uses} must name the repository root"
+            );
+        }
+        // A dynamic directory names no fixed repository path, so the remote
+        // reference is not declared at all: nothing is admitted for it.
+        let dynamic =
+            "runs:\n  using: composite\n  steps:\n    - uses: 'b/tools/${{ matrix.dir }}@v1'\n";
+        assert!(
+            manifest_nested_uses_from_yaml(dynamic.as_bytes())
+                .0
+                .is_empty()
+        );
+        // A NUL cannot travel through YAML at all, so the manifest read fails
+        // closed; the helper itself also refuses the segment.
+        assert_eq!(manifest_directory_from_path("x\0y"), None);
     }
 
     /// Commit `files` as one snapshot and mirror it into a fresh engine state,
