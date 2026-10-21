@@ -2924,6 +2924,102 @@ pub(crate) mod suite {
         assert_eq!(row.environment, "staging");
     }
 
+    /// A job whose `environment:` name defers to `needs` outputs records no
+    /// environment in its OIDC context at submit (the parser resolves only
+    /// literals and `matrix.*` there). Once hydration resolves the name for
+    /// the runner message and the gate, the OIDC grant must report the same
+    /// resolved name: the minted id-token's `sub`/`environment` claims are
+    /// built from this context, so a stale `None` mints a ref-shaped `sub`
+    /// with no `environment` claim for a job that *is* environment-scoped —
+    /// indistinguishable from a plain branch job to a cloud trust policy.
+    pub(crate) async fn deferred_environment_name_reaches_oidc_grant(
+        backend: &dyn ControlBackend,
+    ) {
+        backend
+            .set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+                EnvironmentRulesMap::new(),
+            ));
+        let run_id = RunId::new();
+        let mut submit = submit_run(
+            run_id,
+            vec![
+                submit_job(run_id, "build", 1),
+                submit_job(run_id, "deploy", 2),
+            ],
+        );
+        submit
+            .record
+            .job_needs
+            .insert(JobId("deploy".to_owned()), vec![JobId("build".to_owned())]);
+        submit.jobs[1].id_token_granted = true;
+        submit.jobs[1].oidc_context = Some(crate::state::OidcJobContext {
+            environment: None,
+            job_workflow_ref: None,
+            job_workflow_sha: None,
+        });
+        let deploy = &mut submit.jobs[1].queued;
+        deploy.needs = vec![JobId("build".to_owned())];
+        deploy.environment = Some(serde_json::json!("${{ needs.build.outputs.env }}"));
+        deploy.environment_gate = Some(crate::models::EnvironmentGateState {
+            environment_name: Some("${{ needs.build.outputs.env }}".to_owned()),
+            ..Default::default()
+        });
+        deploy.message.actions_environment =
+            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: "${{ needs.build.outputs.env }}".to_owned(),
+                url: None,
+            });
+        backend.submit_run(submit).await.unwrap();
+
+        let (runner, session) = live_runner(backend, "env-oidc-runner").await;
+        let claimed = match backend.poll_session(poll(&session, runner)).await.unwrap() {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected the build job, got {other:?}"),
+        };
+        let mut outputs = preloop_gha_protocol::OutputMap::new();
+        outputs.insert("env".to_owned(), serde_json::json!("staging"));
+        backend
+            .settle_job(SettleJob {
+                completion: preloop_gha_protocol::JobCompletion {
+                    run_id,
+                    job_id: JobId("build".to_owned()),
+                    agent_job_id: Some(claimed.request.agent_job_id),
+                    status: ExecutionStatus::Success,
+                    outputs,
+                    annotations: Vec::new(),
+                    step_results: Vec::new(),
+                    environment_url: None,
+                },
+                settle: Some(AttemptSettle {
+                    agent_job_id: claimed.request.agent_job_id,
+                    runner_id: runner,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let outcome = backend.promote_ready_jobs(Some(run_id)).await.unwrap();
+        assert_eq!(
+            outcome.promoted, 1,
+            "the resolved environment name releases the parked job"
+        );
+
+        let request = backend
+            .request(RequestKey::Job(run_id, JobId("deploy".to_owned())))
+            .await
+            .unwrap();
+        let grant = backend
+            .oidc_grant(&request.plan_id, request.agent_job_id)
+            .await
+            .unwrap();
+        assert!(grant.granted, "the deploy job holds an id-token grant");
+        assert_eq!(
+            grant.context.environment.as_deref(),
+            Some("staging"),
+            "the OIDC context must carry the hydrated environment name"
+        );
+    }
+
     /// The `environment_approvals` audit row outlives the decision, the job
     /// and the run: it is written in the decision's own transaction and
     /// archival never deletes it. `backdate` moves the completed run past the
@@ -8820,6 +8916,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn deferred_environment_name_reaches_oidc_grant() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::deferred_environment_name_reaches_oidc_grant(&backend).await;
+    }
+
+    #[tokio::test]
     async fn environment_approval_audit_survives_archival() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -10538,6 +10642,12 @@ mod lite {
     #[tokio::test]
     async fn deferred_environment_name_releases_after_needs() {
         suite::deferred_environment_name_releases_after_needs(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deferred_environment_name_reaches_oidc_grant() {
+        suite::deferred_environment_name_reaches_oidc_grant(&LiteBackend::in_memory().unwrap())
             .await;
     }
 

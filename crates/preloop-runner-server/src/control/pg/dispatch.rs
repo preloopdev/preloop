@@ -2998,6 +2998,32 @@ impl<'a> Sweep<'a> {
         };
         sched_helpers::hydrate_needs_context(&mut queued, &record);
         PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
+        // Follow the hydrated name into the recorded OIDC context (the
+        // lite backend's hydrate_message does the same write-back). The
+        // parser records `oidc_environment` at expansion, when a deferred
+        // name (`${{ needs.* }}`, `${{ vars.* }}`) is still a template, and
+        // the mint path reads only `job_specs` — without this, a deferred-
+        // environment job mints the ref form of `sub` with no `environment`
+        // claim, indistinguishable from a plain branch job to a cloud trust
+        // policy. Only a missing or unexpanded-template value is filled.
+        if let Some(name) = queued
+            .message
+            .actions_environment
+            .as_ref()
+            .map(|environment| environment.name.as_str())
+            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+        {
+            let name = name.to_owned();
+            self.tx
+                .execute(
+                    "UPDATE job_specs SET oidc_environment = $3 \
+                     WHERE run_id = $1::text::uuid AND job_id = $2 \
+                     AND (oidc_environment IS NULL OR oidc_environment LIKE '%${{%')",
+                    &[&run_id.0.to_string(), &job_id.0, &name],
+                )
+                .await
+                .map_err(db)?;
+        }
         let runs_on = queued.runs_on.clone();
         let environment_gate = queued.environment_gate.clone();
         self.messages
