@@ -43,22 +43,29 @@ pub async fn register_dap_port(
     let caller_runner_id = caller
         .runner_id
         .ok_or_else(|| ApiError::forbidden("runner identity is required to register a DAP port"))?;
-    // Fast reject, before the node-local lock: the backend reads below must not
-    // make every other control-plane path on this node queue behind a caller
-    // that plainly does not serve this job.
+    // Fast reject, before taking the run's registration lock: a caller that
+    // plainly does not serve this job must not make the legitimate owner wait.
     dap_registration_statuses(&shared, run_id, &payload.job_id).await?;
     dap_registration_owner(&shared, run_id, &payload.job_id, caller_runner_id).await?;
-    let mut inner = shared.state.inner.lock().await;
-    // Both checks are repeated here, under the lock the insert takes, and the
-    // ownership one last. The handoff that moves a job to another runner is a
-    // backend transaction this node's map is not part of, so the checks above
-    // cannot authorize the write: a request can pass them, lose the job, and
-    // still reach `dap_ports.insert`. Re-reading here leaves no await between
-    // the last check and the insert, so a stale request is left only the window
-    // a handoff needs to commit inside those few instructions — a window
-    // queueing requests cannot widen. Registration runs once per DAP bridge
-    // start, so paying for one indexed lookup under the lock is cheap next to
-    // publishing a channel for a job the caller no longer serves.
+
+    // Serialize the check-then-insert for this run, and only this run. The
+    // backend reads that authorize the write must not run while holding
+    // `inner`: that is one global mutex guarding every control-plane map on
+    // this node, so a single registered runner could otherwise pin it for as
+    // long as the backend took to answer and stall unrelated runs. The
+    // per-run lock keeps the property the checks need — no competing
+    // registration for the same run can interleave between them and the
+    // insert — without putting those awaits behind the global lock.
+    let run_lock = dap_registration_lock(&shared, run_id).await;
+    let _run_guard = run_lock.lock().await;
+
+    // The checks above are repeated here, after the serialization point, and
+    // the ownership one last. A request can pass them, lose the job to a
+    // handoff, and still reach the insert; re-reading narrows that to the
+    // window a handoff needs to commit inside the final lookup, which no
+    // amount of queueing requests can widen. The lookup itself must stay
+    // outside `inner`, so it is the last thing done before the map write
+    // rather than something performed under the global lock.
     //
     // Refuse only what would take the channel away from a debug target that is
     // still live: another job of this run that is still running. Everything
@@ -68,10 +75,14 @@ pub async fn register_dap_port(
     // here rather than reused from the fast reject above because a job this
     // run requeued and re-claimed since then is in progress again, and
     // replacing its channel would cut off a live debug target.
-    if let Some(existing) = inner
-        .dap_ports
-        .get(&run_id)
-        .map(|entry| entry.job_id.clone())
+    let existing = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .dap_ports
+            .get(&run_id)
+            .map(|entry| entry.job_id.clone())
+    };
+    if let Some(existing) = existing
         && existing != payload.job_id
     {
         let jobs = dap_registration_statuses(&shared, run_id, &payload.job_id).await?;
@@ -85,6 +96,7 @@ pub async fn register_dap_port(
         }
     }
     dap_registration_owner(&shared, run_id, &payload.job_id, caller_runner_id).await?;
+    let mut inner = shared.state.inner.lock().await;
     inner.dap_ports.insert(
         run_id,
         DapPortRegistration {
@@ -100,6 +112,24 @@ pub async fn register_dap_port(
         "Registered DAP port"
     );
     Ok(StatusCode::OK)
+}
+
+/// The mutex that serializes DAP port registrations for one run.
+///
+/// Created on first use so a run that never starts a debug bridge costs
+/// nothing, and dropped with the run's other node-local state. `inner` is held
+/// only long enough to clone the entry; the caller awaits the per-run mutex,
+/// never the global one.
+async fn dap_registration_lock(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut inner = shared.state.inner.lock().await;
+    inner
+        .dap_registration_locks
+        .entry(run_id)
+        .or_default()
+        .clone()
 }
 
 /// The run's job statuses, refusing a job that is not in progress.
