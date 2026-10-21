@@ -16,9 +16,17 @@ Releases before v0.27.0 predate the changelog.
   inode, and every VMM inherits the engine unit's descriptor limit — systemd's
   default 524288 hard. The x86_64 golden carries ~985k entries, so a `find /`
   in a runner pinned 520,071 host descriptors in that runner's VMM, after which
-  every uncached open or exec failed with `EMFILE`/`ESTALE`. The system-scope
-  unit now sets `LimitNOFILE=2097152`; user-scope units are unchanged because a
-  user manager cannot raise a hard limit above its own.
+  every uncached open or exec failed with `EMFILE`/`ESTALE`. `preloop server
+  install` now raises `fs.nr_open` to 2097152 through
+  `/etc/sysctl.d/90-preloop-nofile.conf` and applies it to the running kernel
+  before rewriting the unit, because Linux refuses an `RLIMIT_NOFILE` hard
+  limit above `fs.nr_open` (1048576 on stock kernels) and systemd then either
+  clamps the request — silently handing the VMM less than the unit says — or
+  fails the start with `205/LIMITS`. The rendered value is capped at what the
+  kernel will actually grant, the installer reads the running service's
+  `Max open files` back and warns on a shortfall, and `uninstall` removes the
+  drop-in. User-scope units are unchanged because a user manager cannot raise
+  a hard limit above its own.
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
