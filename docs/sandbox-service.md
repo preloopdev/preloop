@@ -59,6 +59,10 @@ registered provider can satisfy fails with the unmet requirement named
 operation a backend does not declare (`Pause`, `Snapshot`) fails with
 `failed_precondition` instead of being emulated. `one_shot` backends run one
 command per sandbox; callers needing several execs require `multi_exec`.
+Placement also enforces each provider's declared per-sandbox ceiling
+(`maxVcpus`/`maxMemoryMib`, zero meaning unreported): a `Shape` asking for more
+vCPUs or memory is rejected by name instead of being sent to a driver that
+cannot boot it.
 
 ## Drivers
 
@@ -71,6 +75,15 @@ parties integrate by implementing the Providers protocol.
 | `smolvm` | public | CLI. Golden-fork: a build sandbox starts `--branchable`; `Snapshot` keeps it as the fork base; sandboxes from the snapshot template are `machine branch` clones. |
 | `fake` | public | Process-backed, for tests and conformance. |
 | Private drivers | private build | See the private repository for driver-specific implementations. |
+
+A clone inherits the fork base's full configuration, so a fork request is a
+delta: the `smolvm` driver applies network, mounts, shape, overlay size and
+Rosetta by stopping the clone, running `machine update`, and starting it again
+(with `--branchable` when the request asks for a snapshot-capable clone). A
+request that changes nothing forks without that stop and start. Settings SmolVM
+cannot change on an existing machine (sockets, DNS, role, guest volumes and
+workload) fail with `failed_precondition` naming the field rather than
+returning a clone that silently differs from the request.
 
 `smolvm serve` has native fork pools, but its clones lose `--mount-socket`
 relays (the CLI's branches keep them), so the driver stays on the CLI and pools

@@ -233,6 +233,73 @@ async fn placement_rejects_unsatisfiable_requirements_by_name() {
 }
 
 #[tokio::test]
+async fn placement_rejects_a_shape_the_provider_cannot_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut caps = FakeDriver::full_capabilities();
+    caps.max_vcpus = 2;
+    caps.max_memory_mib = 2048;
+    let h = harness_with(store::open("memory:").await.unwrap(), dir, caps).await;
+    h.service.put_template(template("alpine")).await.unwrap();
+
+    let error = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "too-many-cpus".into(),
+            template: "alpine".into(),
+            shape: Shape {
+                cpus: 4,
+                ..Shape::default()
+            },
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    assert!(
+        error.message.contains("shape=4cpus/0mib"),
+        "{}",
+        error.message
+    );
+
+    let error = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "too-much-memory".into(),
+            template: "alpine".into(),
+            shape: Shape {
+                memory_mib: 4096,
+                ..Shape::default()
+            },
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    assert!(
+        error.message.contains("shape=0cpus/4096mib"),
+        "{}",
+        error.message
+    );
+
+    // A shape inside both ceilings still places.
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "fits".into(),
+            template: "alpine".into(),
+            shape: Shape {
+                cpus: 2,
+                memory_mib: 2048,
+                ..Shape::default()
+            },
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(lease.sandbox.template, "alpine");
+}
+
+#[tokio::test]
 async fn unsupported_operations_fail_instead_of_being_emulated() {
     let dir = tempfile::tempdir().unwrap();
     let mut caps = FakeDriver::full_capabilities();
