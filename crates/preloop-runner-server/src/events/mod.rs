@@ -161,9 +161,20 @@ pub(crate) const SKIP_CI_LABELS: &[&str] = &[
     "***NO_CI***",
 ];
 
-/// Whether a single commit message carries any skip-CI label.
+/// Whether a single commit message carries any bracketed skip-CI label.
+///
+/// GitHub applies commit-message skip instructions only to `push` and
+/// `pull_request`; callers for other events (`workflow_run`) must keep using
+/// this label-only predicate.
 pub(crate) fn has_skip_label(message: &str) -> bool {
-    SKIP_CI_LABELS.iter().any(|label| message.contains(label)) || has_skip_checks_trailer(message)
+    SKIP_CI_LABELS.iter().any(|label| message.contains(label))
+}
+
+/// Whether a commit message carries either a bracketed label or the
+/// `skip-checks: true` trailer. Only the push adapter uses this: the trailer is
+/// a GitHub `push`/`pull_request` instruction, not a general workflow marker.
+pub(crate) fn has_skip_instruction(message: &str) -> bool {
+    has_skip_label(message) || has_skip_checks_trailer(message)
 }
 
 /// Whether `line` is GitHub's `skip-checks: true` trailer.
@@ -191,9 +202,10 @@ fn looks_like_trailer(line: &str) -> bool {
 /// the bracketed labels do.
 ///
 /// A trailer section is the message's last paragraph: consecutive `Key: value`
-/// lines separated from the body by a blank line. `skip-checks` must be the
-/// last trailer, so only the final non-empty line is considered; a message
-/// whose trailer section is not separated from the body does not match.
+/// lines. GitHub requires it to be preceded by **two empty lines**.
+/// `skip-checks` must be the last trailer, so only the final non-empty line is
+/// considered; a message whose trailer section is not separated from the body
+/// by two empty lines does not match.
 fn has_skip_checks_trailer(message: &str) -> bool {
     let lines: Vec<&str> = message.lines().collect();
     let Some(last) = lines.iter().rposition(|line| !line.trim().is_empty()) else {
@@ -202,17 +214,32 @@ fn has_skip_checks_trailer(message: &str) -> bool {
     if !is_skip_checks_trailer(lines[last]) {
         return false;
     }
-    // Walk back over the trailer block; it must start after a blank line.
-    for line in lines[..last].iter().rev() {
+    // Walk back over the trailer block; it must start after two empty lines.
+    for (index, line) in lines[..last].iter().enumerate().rev() {
         let line = line.trim();
         if line.is_empty() {
-            return true;
+            return index > 0 && lines[index - 1].trim().is_empty();
         }
         if !looks_like_trailer(line) {
             return false;
         }
     }
     false
+}
+
+#[cfg(test)]
+mod skip_predicate_tests {
+    use super::*;
+
+    #[test]
+    fn trailer_is_a_push_instruction_not_a_shared_label() {
+        let message = "chore: config\n\n\nskip-checks: true";
+        assert!(
+            !has_skip_label(message),
+            "workflow_run must not inherit the push trailer"
+        );
+        assert!(has_skip_instruction(message));
+    }
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 //!   carries a `skip-checks: true` trailer
 //! - trust_tier = Trusted for default branch, Internal otherwise
 
-use super::has_skip_label;
+use super::has_skip_instruction;
 use crate::events::trust_tier::TrustTier;
 use crate::events::{EffectiveEvent, EventAdapter};
 use serde_json::Value;
@@ -30,7 +30,7 @@ fn has_skip_ci(payload: &Value) -> bool {
             commit
                 .get("message")
                 .and_then(|m| m.as_str())
-                .is_some_and(has_skip_label)
+                .is_some_and(has_skip_instruction)
         });
     }
 
@@ -40,7 +40,7 @@ fn has_skip_ci(payload: &Value) -> bool {
         .get("head_commit")
         .and_then(|hc| hc.get("message"))
         .and_then(|m| m.as_str())
-        .is_some_and(has_skip_label)
+        .is_some_and(has_skip_instruction)
 }
 
 /// Determine whether this is a push to the default branch.
@@ -290,19 +290,19 @@ mod tests {
 
     #[test]
     fn skip_checks_trailer_in_commit_message() {
-        assert!(push_with_message("chore: regenerate config\n\nskip-checks: true").is_empty());
+        assert!(push_with_message("chore: regenerate config\n\n\nskip-checks: true").is_empty());
     }
 
     #[test]
     fn skip_checks_trailer_without_space_and_case_insensitive() {
-        assert!(push_with_message("chore: regenerate config\n\nSKIP-CHECKS:TRUE").is_empty());
+        assert!(push_with_message("chore: regenerate config\n\n\nSKIP-CHECKS:TRUE").is_empty());
     }
 
     #[test]
     fn skip_checks_trailer_after_other_trailers() {
         assert!(
             push_with_message(
-                "chore: regenerate config\n\nSigned-off-by: A <a@example.com>\nskip-checks: true"
+                "chore: regenerate config\n\n\nSigned-off-by: A <a@example.com>\nskip-checks: true"
             )
             .is_empty()
         );
@@ -312,7 +312,7 @@ mod tests {
     fn skip_checks_trailer_must_be_last_trailer() {
         assert_eq!(
             push_with_message(
-                "chore: regenerate config\n\nskip-checks: true\nSigned-off-by: A <a@example.com>"
+                "chore: regenerate config\n\n\nskip-checks: true\nSigned-off-by: A <a@example.com>"
             )
             .len(),
             1,
@@ -330,9 +330,18 @@ mod tests {
     }
 
     #[test]
+    fn skip_checks_trailer_requires_two_empty_lines() {
+        assert_eq!(
+            push_with_message("chore: regenerate config\n\nskip-checks: true").len(),
+            1,
+            "GitHub requires two empty lines before the trailer section"
+        );
+    }
+
+    #[test]
     fn skip_checks_trailer_with_false_value_does_not_skip() {
         assert_eq!(
-            push_with_message("chore: regenerate config\n\nskip-checks: false").len(),
+            push_with_message("chore: regenerate config\n\n\nskip-checks: false").len(),
             1
         );
     }
@@ -345,7 +354,7 @@ mod tests {
             "repository": { "default_branch": "main" },
             "commits": [
                 {"message": "first: clean"},
-                {"message": "second: config\n\nskip-checks: true"}
+                {"message": "second: config\n\n\nskip-checks: true"}
             ]
         });
         assert!(Adapter.project(&payload).is_empty());
