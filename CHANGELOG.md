@@ -16,8 +16,12 @@ Releases before v0.27.0 predate the changelog.
   root, where none exists, so the `uses:` inside it — `pnpm/action-setup`,
   `actions/setup-node` — were rejected as "not declared in the run's
   workflow" and the job failed before its first step. The allowlist now keeps
-  the action's directory, reads `path/action.yml`, and records that directory
-  in the per-run resolution ledger for later download waves.
+  the action's directory everywhere it travels — the workflow's `uses:`, the
+  official `ActionDownloadInfo` `path`, a parent manifest's nested `uses:`,
+  and the per-run resolution ledger — and reads `path/action.yml`. A
+  repository named at both its root and a subpath keeps both manifests, and
+  one adjudication reads a bounded number of them, so a workflow cannot
+  multiply contents reads through subpaths or refs.
 
 ## [0.35.5] - 2026-10-21
 

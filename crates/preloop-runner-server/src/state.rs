@@ -732,19 +732,29 @@ pub type ActionArchiveSha256Pins =
     std::sync::Mutex<std::collections::HashMap<(String, String, String), String>>;
 
 /// Nested `uses:` of a composite action's manifest: (`owner`, `repo`,
-/// `ref`, manifest directory) (owner/repo lowercased) → normalized
-/// `owner/repo` scopes nested inside the action's `action.yml`/`action.yaml`.
-/// Populated lazily from the forge contents API the first time a run asks to
-/// resolve an action that is not directly declared in its workflow
-/// (composite actions stage their nested `uses:` in later waves, after the
-/// parent's own download). The directory component keeps `owner/repo/path@ref`
-/// composites pointed at `path/action.yml` instead of the repository root.
-/// Only definitive answers are cached — a 200 (even with no nested uses)
-/// or a 404 (no manifest). Transient failures are not cached, so the next
-/// adjudication retries instead of failing closed for the process lifetime.
+/// `ref`, manifest directory) (owner/repo lowercased) → the remote actions
+/// nested inside the action's `action.yml`/`action.yaml`, each with the
+/// directory holding its own manifest. Populated lazily from the forge
+/// contents API the first time a run asks to resolve an action that is not
+/// directly declared in its workflow (composite actions stage their nested
+/// `uses:` in later waves, after the parent's own download). The directory
+/// component keeps `owner/repo/path@ref` composites pointed at
+/// `path/action.yml` instead of the repository root, and the nested action's
+/// directory does the same for the next wave. Only definitive answers are
+/// cached — a 200 (even with no nested uses) or a 404 (no manifest).
+/// Transient failures are not cached, so the next adjudication retries
+/// instead of failing closed for the process lifetime. Bounded; a full memo
+/// is cleared rather than evicted entry by entry.
 pub type ActionManifestNestedUses = std::sync::Mutex<
-    std::collections::HashMap<(String, String, String, String), std::collections::BTreeSet<String>>,
+    std::collections::HashMap<
+        (String, String, String, String),
+        std::collections::BTreeSet<crate::actions::ManifestAction>,
+    >,
 >;
+
+/// Maximum entries in [`ActionManifestNestedUses`]. A full memo is cleared,
+/// which only costs re-reads.
+pub const MAX_ACTION_MANIFEST_MEMO: usize = 4096;
 
 /// Per-run action-resolution ledger: `RunId` → (`owner/repo`, `ref`,
 /// manifest directory) triples this run has already resolved tickets for.
@@ -765,12 +775,16 @@ pub const MAX_RESOLVED_USES_PER_RUN: usize = 4096;
 /// Nested `uses:` of composite manifests read through the GitHub contents API
 /// for runs without a workspace snapshot: (`owner/repo` lowercased, commit,
 /// composite directory) → the manifest's nested references, or `None` when the
-/// commit has no readable manifest there. Only definitive reads are memoised;
+/// commit has no readable manifest there. Remote references keep the
+/// directory holding their own manifest. Only definitive reads are memoised;
 /// a transient failure is retried on the next adjudication.
 pub type LocalCompositeNestedUses = std::sync::Mutex<
     std::collections::HashMap<
         (String, String, String),
-        Option<(std::collections::BTreeSet<String>, Vec<String>)>,
+        Option<(
+            std::collections::BTreeSet<crate::actions::ManifestAction>,
+            Vec<String>,
+        )>,
     >,
 >;
 
@@ -781,8 +795,12 @@ pub const MAX_LOCAL_COMPOSITE_MEMO: usize = 4096;
 /// Remote actions a run's local composites reach, per run. A run's answer is
 /// fixed by its immutable commit, so a traversal that reached a definitive
 /// answer is remembered; see `local_composite_declared_for_run`.
-pub type LocalCompositeDeclared =
-    std::sync::Mutex<std::collections::HashMap<RunId, Arc<std::collections::BTreeSet<String>>>>;
+pub type LocalCompositeDeclared = std::sync::Mutex<
+    std::collections::HashMap<
+        RunId,
+        Arc<std::collections::BTreeSet<crate::actions::ManifestAction>>,
+    >,
+>;
 
 /// Maximum runs in [`LocalCompositeDeclared`]. A full memo is cleared, which
 /// only costs a re-traversal.
