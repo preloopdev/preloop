@@ -19,7 +19,8 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
 * **Sandboxes** (callers): `PutTemplate`, `PutPool`, `Acquire` (idempotency key,
   pool or template, identity to inject), `Renew`, `Release` (destroy or
   preserve), `Exec` (server-streaming), `OpenStream` (data-plane ticket),
-  `Snapshot`, `Pause`/`Resume`, `Get`/`List`.
+  `Snapshot`, `Pause`/`Resume`, `Get`/`List`, `Stats` (read-only per-provider
+  host and sandbox inventory).
 * **Providers** (capacity owners): `Register` (drivers + capabilities →
   provider id and fencing generation), `Heartbeat`, `Poll` (long-poll for
   work), `Report` / `ReportExec` (fenced by generation), `Reconcile` (full
@@ -97,6 +98,71 @@ store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
 `sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
 never references control tables.
 
+## Observability
+
+The service records its own `preloop.sandbox.*` instruments on the process's
+shared meter (`Observability::meter()`), so a standalone `preloop sandbox
+serve` and the in-process engine export the same set: `/metrics` replaces dots
+with underscores, appends `_seconds` to durations, and `_total` to counters.
+Every value is recorded from the service's own state transitions — callers
+never push numbers in — so a service with no caller still reports accurate
+gauges.
+
+**Inventory**
+
+* `preloop.sandbox.sandboxes` (gauge, `state`/`provider`/`template`) — live
+  sandboxes per combination, recorded from the service's own inventory on
+  every maintenance tick.
+* `preloop.sandbox.pool.warm_depth` (gauge, `pool`) — idle, unleased
+  sandboxes currently held for a pool.
+
+**Acquire, creation, and leases**
+
+* `preloop.sandbox.acquire.duration` (histogram) — acquire latency from
+  request to a ready sandbox or failure.
+* `preloop.sandbox.acquire.failures` (counter, `reason`) — failed acquires by
+  Connect error code; `failed_precondition` is an unmet placement requirement.
+* `preloop.sandbox.create.failures` (counter, `reason`) — `timeout` (the
+  provider never reported) or `reported` (it reported a failure).
+* `preloop.sandbox.lease.transitions` (counter, `outcome`) — `renewed`,
+  `expired`, or `preserved`.
+
+**Pools and reconcile**
+
+* `preloop.sandbox.pool.refill_failures` (counter, `pool`) — warm-pool
+  refills that could not place a sandbox.
+* `preloop.sandbox.reconcile.lost` (counter) — sandboxes a provider's
+  inventory no longer reports; they are failed as lost.
+* `preloop.sandbox.reconcile.orphans` (counter) — provider-observed machines
+  no record owns, sent back for destruction as orphans or stale incarnations.
+
+**Exec**
+
+* `preloop.sandbox.exec.duration` (histogram) — request to the terminal exit
+  event.
+* `preloop.sandbox.exec.exit` (counter, `class`) — `success`, `failure`,
+  `error`, or `unknown`.
+
+Acquire, Release, Exec, and Reconcile also emit tracing spans carrying the
+pool, template, sandbox, or lease being touched.
+
+### Runtime stats
+
+Host and per-sandbox facts only the owning driver can measure travel on the
+provider's `Heartbeat`: a `HostReport` with a `HostSample` (RAM, swap, engine
+and summed guest RSS, top processes) plus one `SandboxRuntimeStats` per
+sandbox (native ref, pid, memory, data directory, start time). Every field is
+optional and best-effort — a backend that cannot measure something omits it
+instead of reporting a fabricated zero, and an empty report never fails or
+delays the heartbeat. A report replaces that provider's previous sandbox set
+rather than merging into it.
+
+`Stats` exposes the stored inventory read-only, per registered provider:
+`ProviderStats` carries the provider's id, name and drivers, its latest
+`HostSample` with `host_sample_age_secs` (0 when never sampled), and its
+`SandboxStats` — each `Sandbox` record with the runtime facts the provider
+last reported (default/empty when never reported).
+
 ## How preloop uses it
 
 `preloop engine` runs the service in-process with this host's drivers attached
@@ -131,6 +197,7 @@ preloop sandbox start sbx-… [--forkable]               # boot it again (bakes)
 preloop sandbox snapshot sbx-… --name golden
 preloop sandbox release lse-… [--preserve 600]
 preloop sandbox ls | providers
+preloop sandbox stats                                   # per-provider host + sandbox inventory
 ```
 
 ## Verification

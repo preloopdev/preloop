@@ -26,7 +26,10 @@ OpenTelemetry names are converted to Prometheus names by replacing dots and hyph
 - `preloop_job_completed_total` and `preloop_job_queue_wait_seconds` for conclusions and queue latency;
 - `preloop_broker_poll_total`, `preloop_runner_session_transition_total`, and `preloop_concurrency_decision_total` for protocol and scheduling activity;
 - `preloop_job_queue_depth`, `preloop_job_claimable`, `preloop_job_unclaimable`, and `preloop_job_dependency_blocked` for queue pressure;
-- `preloop_pool_desired`, `preloop_pool_idle`, `preloop_pool_busy`, and `preloop_pool_slot_failures_total` for the local runner pool; and
+- `preloop_pool_desired`, `preloop_pool_idle`, `preloop_pool_busy`, and `preloop_pool_slot_failures_total` for the local runner pool;
+- `preloop_sandbox_sandboxes`, `preloop_sandbox_pool_warm_depth`, and `preloop_sandbox_pool_refill_failures_total` for Sandbox Service inventory and warm-pool pressure;
+- `preloop_sandbox_acquire_duration_seconds`, `preloop_sandbox_acquire_failures_total`, `preloop_sandbox_create_failures_total`, and `preloop_sandbox_lease_transitions_total` for acquire latency, creation failures, and lease outcomes;
+- `preloop_sandbox_reconcile_lost_total`, `preloop_sandbox_reconcile_orphans_total`, `preloop_sandbox_exec_duration_seconds`, and `preloop_sandbox_exec_exit_total` for reconcile activity and exec latency/exit class; and
 - `preloop_host_mem_*`, `preloop_host_swap_*`, `preloop_host_engine_rss_bytes`, `preloop_host_vm_rss_bytes`, and host RAM pressure gauges when host telemetry is available.
 
 HTTP request metrics use bounded labels for method, route template, surface, and status class. Surfaces include native, runner, broker, results, Git, OIDC, and live logs; concrete IDs and query strings are not labels.
@@ -58,6 +61,7 @@ No OTLP endpoint is assumed when these variables are absent; Preloop does not si
 - ready, dependency-blocked, concurrency-blocked, pending-expansion, claimable, and unclaimable jobs;
 - concurrency groups, scheduler state, registered runners and sessions, leases, and assignments;
 - runner-pool desired/preparing/building/provisioning/idle/busy/paused counts and queue labels;
+- the `vms` fleet section and host-memory-pressure conditions, derived from the Sandbox Service's `Stats` inventory — sandboxes across registered providers plus the pool provider's latest host sample and its age — rather than by sampling the engine process directly;
 - control-store backend and failure streak, state-directory storage, cache/artifact usage, and retention activity;
 - GitHub webhook/check-run health and rate-limit observations;
 - debug-session counts, OTLP enabled/export timestamps/dropped records, task heartbeats, and active conditions.
