@@ -29,6 +29,7 @@ preloop-cache = { path = "../preloop-cache" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
 preloop-gha-expressions = { path = "../preloop-gha-expressions" }
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }
+preloop-sandbox = { path = "../preloop-sandbox" }
 preloop-socket-activation = { path = "../preloop-socket-activation" }
 serde_urlencoded = "0.7"
 percent-encoding = "2"

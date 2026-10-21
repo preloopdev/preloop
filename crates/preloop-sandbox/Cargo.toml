@@ -17,6 +17,7 @@ base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
+opentelemetry.workspace = true
 parking_lot.workspace = true
 postgres_rustls.workspace = true
 preloop-observability = { path = "../preloop-observability" }
@@ -37,6 +38,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+opentelemetry_sdk.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util", "net"] }
 tower = { workspace = true, features = ["util"] }

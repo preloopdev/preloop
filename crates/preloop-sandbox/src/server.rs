@@ -155,6 +155,7 @@ async fn sandboxes(
             Ok(r) => reply(service.drain_provider(&r.name).await),
             Err(e) => e.into_response(),
         },
+        "Stats" => reply(Ok(service.stats())),
         "Exec" => match connect::decode_stream_request::<ExecRequest>(&body) {
             Ok(r) => match service.exec(r) {
                 Ok(stream) => connect::stream_response(stream),

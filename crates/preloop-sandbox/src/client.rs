@@ -44,6 +44,8 @@ pub trait SandboxApi: Send + Sync {
     async fn uncordon_provider(&self, name: &str) -> Result<Provider>;
     /// `DrainProvider`: cordon, release idle pool members, report leases.
     async fn drain_provider(&self, name: &str) -> Result<DrainProviderResult>;
+    /// `Stats`.
+    async fn stats(&self) -> Result<StatsResponse>;
     /// `Exec`.
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>>;
     /// Upload a local tar, extracted at `guest_dir`.
@@ -129,6 +131,9 @@ impl SandboxApi for InProcess {
     }
     async fn drain_provider(&self, name: &str) -> Result<DrainProviderResult> {
         Service::drain_provider(&self.0, name).await
+    }
+    async fn stats(&self) -> Result<StatsResponse> {
+        Ok(Service::stats(&self.0))
     }
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         Service::exec(&self.0, request)
@@ -357,6 +362,9 @@ impl SandboxApi for SandboxClient {
             },
         )
         .await
+    }
+    async fn stats(&self) -> Result<StatsResponse> {
+        self.call("Stats", &ListRequest {}).await
     }
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         Ok(self

@@ -1181,7 +1181,7 @@ async fn main() -> anyhow::Result<()> {
         Command::BuildGolden(args) => cmd_build_golden(args).await,
         Command::GoldenPath(args) => cmd_golden_path(args).await,
         Command::Update(args) => update::run(args).await,
-        Command::Sandbox(args) => sandbox::run(args).await,
+        Command::Sandbox(args) => sandbox::run(args, observability.clone()).await,
         // Local configuration commands must not spawn the engine.
         Command::Setup(args) => github_setup::cmd_setup(args).await,
         Command::Init(args) => init::run(args, Some(observability.clone())).await,
@@ -1390,7 +1390,12 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     let payload = artifact_payload(&output, &config.base_image);
     // The bake runs through a private, in-process sandbox service with this
     // host's SmolVM driver: `pack` writes a portable `.smolmachine`.
-    let sandboxes = crate::sandbox::LocalSandboxes::start(&preloop_home(), Some(&config)).await?;
+    let sandboxes = crate::sandbox::LocalSandboxes::start(
+        &preloop_home(),
+        Some(&config),
+        preloop_observability::Observability::noop(),
+    )
+    .await?;
     RunnerPool::new(sandboxes.machines(), config)?
         .rebuild_artifact()
         .await?;
@@ -2178,6 +2183,10 @@ async fn cmd_engine(
         Ok(config) if agent_guard_error.is_none() => Some(config),
         _ => None,
     };
+    // The pool publishes its sandbox service through this handle once it
+    // starts; the runner server reads it for `/api/v1/status` and the
+    // host-metrics sampler. Created before `serve` so both share one handle.
+    let sandbox_handle = preloop_runner_server::SandboxHandle::new();
     let mut server = tokio::spawn(preloop_runner_server::serve(
         preloop_runner_server::ServerConfig {
             listen,
@@ -2188,7 +2197,8 @@ async fn cmd_engine(
             pool_preparing: Some(pool_preparing.clone()),
             pending_registrations: pool_available.then_some(pending_registrations),
             pool_status: Some(pool_status.clone()),
-            observability: Some(observability),
+            observability: Some(observability.clone()),
+            sandbox: Some(sandbox_handle.clone()),
             github: Some(github),
             require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
             state_dir,
@@ -2225,7 +2235,17 @@ async fn cmd_engine(
     let shutdown = tokio_util::sync::CancellationToken::new();
 
     // The runner pool gets its machines from the embedded Sandbox Service.
-    let sandboxes = sandbox::LocalSandboxes::start(&home, pool_config.as_ref()).await?;
+    let sandboxes = sandbox::LocalSandboxes::start(
+        &home,
+        pool_config.as_ref(),
+        observability.clone(),
+    )
+    .await?;
+    // Publish the service (and the provider whose host sample is this
+    // engine's host) to the already-running server for status and host
+    // metrics.
+    let (sandbox_api, sandbox_provider_id) = sandboxes.api_and_provider_id();
+    sandbox_handle.set(sandbox_api, sandbox_provider_id);
     let machines = sandboxes.machines();
 
     let spawn_pool = |config: &RunnerPoolConfig,

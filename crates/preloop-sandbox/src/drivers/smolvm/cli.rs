@@ -4,6 +4,7 @@
 //! The SmolVM driver ([`super::SmolvmDriver`]) is built on these; the CI
 //! runner pool also uses them directly for host-local SmolVM concerns.
 
+use crate::api::{HostReport, SandboxRuntimeStats};
 use async_trait::async_trait;
 use preloop_observability::deadline;
 use serde::{Deserialize, Serialize};
@@ -2100,6 +2101,72 @@ impl SmolVmProvider {
             )));
         }
         Ok(PathBuf::from(dir))
+    }
+
+    /// Best-effort host + per-sandbox facts for `Heartbeat`: this host's
+    /// memory reality ([`preloop_observability::vm_telemetry::sample_host`])
+    /// plus, per live machine, its memory from the `_boot-vm` pid (from one
+    /// `ps` scan, attributed by boot-config path — the same evidence
+    /// [`kill_vm_processes_in`] kills by) and its start time. Configured
+    /// shape and a real process start time are not retained by this driver
+    /// after create/boot, so they are absent rather than fabricated; start
+    /// time falls back to the data directory's filesystem creation time.
+    /// The pid and data directory stay here: only aggregates leave the
+    /// service's client API.
+    pub async fn host_report(&self) -> HostReport {
+        let host = preloop_observability::vm_telemetry::sample_host().into();
+        let names = match self.list().await {
+            Ok(names) => names,
+            Err(_) => {
+                return HostReport {
+                    host,
+                    sandboxes: Vec::new(),
+                };
+            }
+        };
+        let roots = machine_data_roots();
+        let mut pid_by_dir: HashMap<PathBuf, u32> = HashMap::new();
+        if !roots.is_empty()
+            && let Ok(output) =
+                run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)
+            && let Ok(text) = complete_inventory("ps", &output)
+        {
+            for line in text.lines() {
+                if !line.contains(BOOT_VM_PROCESS) {
+                    continue;
+                }
+                let Some(pid) = line
+                    .split_whitespace()
+                    .next()
+                    .and_then(|token| token.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                for dir in boot_config_dirs(line, &roots) {
+                    pid_by_dir.insert(canonical_path(&dir), pid);
+                }
+            }
+        }
+        let mut sandboxes = Vec::with_capacity(names.len());
+        for name in names {
+            let data_dir = self.machine_data_dir_direct(&name).await.ok();
+            let pid = data_dir
+                .as_ref()
+                .and_then(|dir| pid_by_dir.get(&canonical_path(dir)).copied());
+            let memory_bytes = pid.and_then(preloop_observability::vm_telemetry::process_rss_bytes);
+            let start_time = data_dir
+                .as_ref()
+                .and_then(|dir| std::fs::metadata(dir).ok())
+                .and_then(|meta| meta.created().ok())
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64);
+            sandboxes.push(SandboxRuntimeStats {
+                native_ref: name.as_str().to_owned(),
+                memory_bytes,
+                start_time,
+            });
+        }
+        HostReport { host, sandboxes }
     }
 }
 

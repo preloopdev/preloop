@@ -110,16 +110,16 @@
 <!-- src_host -->
 <g id="node4" class="node">
 <title>src_host</title>
-<path fill="#ede9fe" stroke="#cbd5e1" d="M204.15,-128.04C204.15,-128.04 51.12,-128.04 51.12,-128.04 45.13,-128.04 39.12,-122.04 39.12,-116.04 39.12,-116.04 39.12,-93.96 39.12,-93.96 39.12,-87.96 45.12,-81.96 51.12,-81.96 51.12,-81.96 204.15,-81.96 204.15,-81.96 210.15,-81.96 216.15,-87.96 216.15,-93.96 216.15,-93.96 216.15,-116.04 216.15,-116.04 216.15,-122.04 210.15,-128.04 204.15,-128.04"/>
-<text xml:space="preserve" text-anchor="middle" x="127.64" y="-112.55" font-family="Helvetica,sans-Serif" font-size="11.00">Host and VM telemetry</text>
-<text xml:space="preserve" text-anchor="middle" x="127.64" y="-100.55" font-family="Helvetica,sans-Serif" font-size="11.00">sample_host(): RAM, swap, RSS</text>
-<text xml:space="preserve" text-anchor="middle" x="127.64" y="-88.55" font-family="Helvetica,sans-Serif" font-size="11.00">VM fleet registry</text>
+<path fill="#ede9fe" stroke="#cbd5e1" d="M201.15,-128.04C201.15,-128.04 54.12,-128.04 54.12,-128.04 48.13,-128.04 42.12,-122.04 42.12,-116.04 42.12,-116.04 42.12,-93.96 42.12,-93.96 42.12,-87.96 48.12,-81.96 54.12,-81.96 54.12,-81.96 201.15,-81.96 201.15,-81.96 207.15,-81.96 213.15,-87.96 213.15,-93.96 213.15,-93.96 213.15,-116.04 213.15,-116.04 213.15,-122.04 207.15,-128.04 201.15,-128.04"/>
+<text xml:space="preserve" text-anchor="middle" x="127.64" y="-112.55" font-family="Helvetica,sans-Serif" font-size="11.00">Sandbox provider telemetry</text>
+<text xml:space="preserve" text-anchor="middle" x="127.64" y="-100.55" font-family="Helvetica,sans-Serif" font-size="11.00">host_report(): RAM, swap, RSS</text>
+<text xml:space="preserve" text-anchor="middle" x="127.64" y="-88.55" font-family="Helvetica,sans-Serif" font-size="11.00">host + per&#45;sandbox stats</text>
 </g>
 <!-- src_host&#45;&gt;sampler -->
 <g id="edge6" class="edge">
 <title>src_host&#45;&gt;sampler</title>
-<path fill="none" stroke="#64748b" d="M216.29,-121.74C249.25,-128.03 286.57,-135.16 318.99,-141.35"/>
-<polygon fill="#64748b" stroke="#64748b" points="318.39,-143.55 325.2,-142.54 319.24,-139.08 318.39,-143.55"/>
+<path fill="none" stroke="#64748b" d="M213.3,-121.17C246.97,-127.6 285.57,-134.97 318.97,-141.35"/>
+<polygon fill="#64748b" stroke="#64748b" points="318.15,-143.51 324.96,-142.49 319.01,-139.04 318.15,-143.51"/>
 </g>
 <!-- src_github -->
 <g id="node5" class="node">

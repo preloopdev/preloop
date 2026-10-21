@@ -54,6 +54,10 @@ pub struct ServiceConfig {
     /// `PRELOOP_SANDBOX_PLACEMENT` selects a built-in one in the CLI and the
     /// engine; the default is [`LeastLoaded`].
     pub placement: Arc<dyn Placement>,
+    /// `preloop.sandbox.*` instruments. Defaults to a no-op registry;
+    /// callers wanting real export build one from
+    /// `Observability::meter()` and overwrite this field.
+    pub metrics: crate::metrics::SandboxMetrics,
 }
 
 impl ServiceConfig {
@@ -71,6 +75,7 @@ impl ServiceConfig {
             work_timeout: Duration::from_secs(900),
             provider_lost_factor: 3,
             placement: Arc::new(LeastLoaded),
+            metrics: crate::metrics::SandboxMetrics::default(),
         }
     }
 }
@@ -230,6 +235,15 @@ struct ProviderRec {
     seen: Instant,
     queue: VecDeque<WorkItem>,
     wake: Arc<Notify>,
+    /// Latest reported host sample, with the instant it was received for
+    /// age reporting. Memory-only: a `Heartbeat` never persists (fenced
+    /// liveness data is a restart source, not durable state).
+    host: Option<HostSample>,
+    host_sampled_at: Option<Instant>,
+    /// Latest per-sandbox runtime facts, keyed by native ref. Replaced
+    /// wholesale on every `Heartbeat` that reports stats (never merged),
+    /// so a sandbox the driver stops reporting falls out on its own.
+    sandbox_stats: HashMap<String, SandboxRuntimeStats>,
 }
 
 /// Data-plane blob for one ticket.
@@ -418,6 +432,9 @@ impl Service {
                     seen: Instant::now() - config.provider_timeout * 2,
                     queue: VecDeque::new(),
                     wake: Arc::new(Notify::new()),
+                    host: None,
+                    host_sampled_at: None,
+                    sandbox_stats: HashMap::new(),
                 },
             );
         }
@@ -543,6 +560,7 @@ impl Service {
             for lease_id in expired {
                 info!(%lease_id, "lease expired; destroying sandbox");
                 self.release_locked(&mut state, &lease_id, ReleaseMode::Destroy, 0, &mut ops);
+                self.config.metrics.record_lease_transition("expired");
             }
             // A stopped sandbox holds no host capacity, but it does hold
             // disk: the create sweep below still applies to its record.
@@ -570,6 +588,7 @@ impl Service {
                 .collect();
             for id in timed_out {
                 self.fail_locked(&mut state, &id, "create timed out", &mut ops);
+                self.config.metrics.record_create_failure("timeout");
             }
             // Expired tickets.
             let stale: Vec<String> = state
@@ -635,6 +654,27 @@ impl Service {
             for pool in pools {
                 self.fill_pool_locked(&mut state, &pool, &mut ops);
             }
+            // Live sandboxes by state/provider/template: every combination
+            // present this tick, and a zero for every combination that was
+            // live last tick but is gone now, so a drained pool falls to 0
+            // instead of keeping its last value.
+            let mut counts: HashMap<(&'static str, String, String), u64> = HashMap::new();
+            for sandbox in state.sandboxes.values() {
+                *counts
+                    .entry((
+                        sandbox.state.as_metric_label(),
+                        sandbox.provider_id.clone(),
+                        sandbox.template.clone(),
+                    ))
+                    .or_insert(0) += 1;
+            }
+            self.config
+                .metrics
+                .record_sandbox_counts(counts.into_iter().map(
+                    |((sandbox_state, provider, template), count)| {
+                        (sandbox_state.to_owned(), provider, template, count)
+                    },
+                ));
             ops
         };
         if !ops.is_empty() {
@@ -663,6 +703,9 @@ impl Service {
                     && matches!(s.state, SandboxState::Ready | SandboxState::Provisioning)
             })
             .count() as u32;
+        self.config
+            .metrics
+            .record_pool_warm_depth(&pool.name, idle as u64);
         let live = members
             .iter()
             .filter(|s| s.state != SandboxState::Terminating)
@@ -673,12 +716,16 @@ impl Service {
         }
         for _ in 0..missing {
             let Ok(placement) = self.pool_placement(state, pool, &Requirements::default()) else {
+                self.config.metrics.record_pool_refill_failure(&pool.name);
                 return;
             };
             match self.create_locked(state, placement, &pool.name, Purpose::Runner, "", ops) {
                 Ok(_) => {}
                 // No capacity right now: try again next pass.
-                Err(_) => return,
+                Err(_) => {
+                    self.config.metrics.record_pool_refill_failure(&pool.name);
+                    return;
+                }
             }
         }
     }
@@ -1261,6 +1308,7 @@ impl Service {
                 lease.idempotency_key.clear();
                 ops.push(self.put(Kind::Leases, lease_id, &*lease));
             }
+            self.config.metrics.record_lease_transition("preserved");
             return;
         }
         state.leases.remove(lease_id);
@@ -1269,6 +1317,7 @@ impl Service {
         ops.push(self.remove(Kind::Leases, lease_id));
         if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
             sandbox.lease_id.clear();
+
         }
         // Failed sandboxes may still hold a native machine: destroy_locked
         // handles both cases.
@@ -1279,6 +1328,25 @@ impl Service {
 
     /// `Acquire`.
     pub async fn acquire(self: &Arc<Self>, request: AcquireRequest) -> Result<AcquireResponse> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "sandbox.acquire",
+            pool = %request.pool,
+            template = %request.template,
+        );
+        let started = Instant::now();
+        let this = self.clone();
+        let result = async move { this.acquire_inner(request).await }
+            .instrument(span)
+            .await;
+        let reason = result.as_ref().err().map(|error| error.code.as_str());
+        self.config
+            .metrics
+            .record_acquire(started.elapsed(), reason);
+        result
+    }
+
+    async fn acquire_inner(self: &Arc<Self>, request: AcquireRequest) -> Result<AcquireResponse> {
         if request.idempotency_key.is_empty() {
             return Err(Error::invalid("idempotencyKey is required"));
         }
@@ -1563,10 +1631,12 @@ impl Service {
             (lease, ops)
         };
         self.persist(ops).await;
+        self.config.metrics.record_lease_transition("renewed");
         Ok(lease)
     }
 
     /// `Release`.
+    #[tracing::instrument(skip(self), fields(lease_id = %request.lease_id, mode = ?request.mode))]
     pub async fn release(&self, request: ReleaseRequest) -> Result<()> {
         let ops = {
             let mut state = self.state.lock();
@@ -1667,6 +1737,45 @@ impl Service {
         })
     }
 
+    /// `Stats`: per-provider host sample + capacity and sandboxes by state
+    /// with their latest reported runtime facts. Aggregates only — the
+    /// stored report never carries host PIDs, process names or data-dir
+    /// paths, because every client-token holder can read this.
+    pub fn stats(&self) -> StatsResponse {
+        let state = self.state.lock();
+        let providers = state
+            .providers
+            .values()
+            .map(|rec| {
+                let sandboxes = state
+                    .sandboxes
+                    .values()
+                    .filter(|sandbox| sandbox.provider_id == rec.provider.id)
+                    .map(|sandbox| SandboxStats {
+                        sandbox: sandbox.clone(),
+                        runtime: rec
+                            .sandbox_stats
+                            .get(&sandbox.native_ref)
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
+                    .collect();
+                ProviderStats {
+                    provider_id: rec.provider.id.clone(),
+                    name: rec.provider.name.clone(),
+                    drivers: rec.provider.drivers.clone(),
+                    host: rec.host.clone().unwrap_or_default(),
+                    host_sample_age_secs: rec
+                        .host_sampled_at
+                        .map(|at| at.elapsed().as_secs() as i64)
+                        .unwrap_or(0),
+                    sandboxes,
+                }
+            })
+            .collect();
+        StatsResponse { providers }
+    }
+
     fn usable(sandbox: &Sandbox) -> Result<()> {
         match sandbox.state {
             SandboxState::Leased | SandboxState::Preserved | SandboxState::Ready => Ok(()),
@@ -1683,6 +1792,7 @@ impl Service {
 
     /// `Exec`: stream output then the exit status.
     pub fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
+        let _span = tracing::info_span!("sandbox.exec", sandbox_id = %request.sandbox_id).entered();
         if request.argv.is_empty() {
             return Err(Error::invalid("argv is required"));
         }
@@ -1727,7 +1837,12 @@ impl Service {
             state.execs.remove(&exec_id);
             return Err(error);
         }
-        Ok(tokio_stream_from(rx))
+        let metrics = self.config.metrics.clone();
+        Ok(record_exec_metrics(
+            metrics,
+            Instant::now(),
+            tokio_stream_from(rx),
+        ))
     }
 
     /// Run a command to completion, collecting output (convenience).
@@ -2365,6 +2480,9 @@ impl Service {
                     seen: Instant::now(),
                     queue: VecDeque::new(),
                     wake,
+                    host: None,
+                    host_sampled_at: None,
+                    sandbox_stats: HashMap::new(),
                 },
             );
             let mut ops = vec![self.put(Kind::Providers, &id, &provider)];
@@ -2403,6 +2521,18 @@ impl Service {
         if let Some(rec) = state.providers.get_mut(&request.provider_id) {
             rec.seen = Instant::now();
             rec.provider.last_seen = now();
+            if let Some(host) = request.host {
+                rec.host = Some(host);
+                rec.host_sampled_at = Some(Instant::now());
+            }
+            if !request.sandboxes.is_empty() || !rec.sandbox_stats.is_empty() {
+                rec.sandbox_stats = request
+                    .sandboxes
+                    .into_iter()
+                    .filter(|stats| !stats.native_ref.is_empty())
+                    .map(|stats| (stats.native_ref.clone(), stats))
+                    .collect();
+            }
         }
         Ok(())
     }
@@ -2515,7 +2645,10 @@ impl Service {
                     ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
                     state.created_at.remove(&sandbox_id);
                 }
-                Err(error) => self.fail_locked(state, &sandbox_id, &error.message, ops),
+                Err(error) => {
+                    self.config.metrics.record_create_failure("reported");
+                    self.fail_locked(state, &sandbox_id, &error.message, ops);
+                }
             },
             Pending::Destroy { sandbox_id } => {
                 // A failed destroy still drops the record: the machine is
@@ -2638,6 +2771,7 @@ impl Service {
     }
 
     /// `Reconcile`: diff a provider's inventory against the records.
+    #[tracing::instrument(skip(self, request), fields(provider_id = %request.provider_id))]
     pub async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse> {
         let (response, ops) = {
             let mut state = self.state.lock();
@@ -2660,6 +2794,7 @@ impl Service {
                 })
                 .map(|s| s.id.clone())
                 .collect();
+            self.config.metrics.record_reconcile_lost(lost.len() as u64);
             for id in lost {
                 warn!(sandbox = %id, "sandbox missing from provider inventory");
                 if state
@@ -2727,6 +2862,9 @@ impl Service {
                     });
                 }
             }
+            self.config
+                .metrics
+                .record_reconcile_orphans(destroy.len() as u64);
             (ReconcileResponse { destroy }, ops)
         };
         self.persist(ops).await;
@@ -2784,6 +2922,45 @@ fn tokio_stream_from(
     mut rx: mpsc::Receiver<Result<ExecEvent>>,
 ) -> BoxStream<'static, Result<ExecEvent>> {
     futures::stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed()
+}
+
+/// Wrap an exec stream so its duration and exit class are recorded once its
+/// terminal event (an exit code, or a stream error) passes through.
+fn record_exec_metrics(
+    metrics: crate::metrics::SandboxMetrics,
+    started: Instant,
+    stream: BoxStream<'static, Result<ExecEvent>>,
+) -> BoxStream<'static, Result<ExecEvent>> {
+    futures::stream::unfold((stream, false), move |(mut stream, done)| {
+        let metrics = metrics.clone();
+        async move {
+            if done {
+                return None;
+            }
+            match stream.next().await {
+                Some(Ok(event)) => {
+                    if let Some(code) = event.exit_code {
+                        let class = if code == 0 { "success" } else { "failure" };
+                        metrics.record_exec(started.elapsed(), class);
+                        Some((Ok(event), (stream, true)))
+                    } else {
+                        Some((Ok(event), (stream, false)))
+                    }
+                }
+                Some(Err(error)) => {
+                    metrics.record_exec(started.elapsed(), "error");
+                    Some((Err(error), (stream, true)))
+                }
+                // Dropped without a terminal event (e.g. the pending work
+                // was stranded): still a real duration worth recording.
+                None => {
+                    metrics.record_exec(started.elapsed(), "unknown");
+                    None
+                }
+            }
+        }
+    })
+    .boxed()
 }
 
 /// Drain an exec stream into `(exit, stdout, stderr)`.

@@ -514,6 +514,22 @@ impl SandboxState {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Gone | Self::Failed)
     }
+
+    /// Lowercase label for metrics (matches the proto value names).
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::SandboxStateUnspecified => "unspecified",
+            Self::Provisioning => "provisioning",
+            Self::Ready => "ready",
+            Self::Leased => "leased",
+            Self::Paused => "paused",
+            Self::Stopped => "stopped",
+            Self::Preserved => "preserved",
+            Self::Terminating => "terminating",
+            Self::Gone => "gone",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// A sandbox record.
@@ -555,6 +571,8 @@ pub struct Sandbox {
     /// Preserved sandboxes expire at this Unix second (0 = n/a).
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub preserve_until: i64,
+    /// Configured size, for capacity accounting.
+    pub shape: Shape,
 }
 
 fn is_zero_i64(value: &i64) -> bool {
@@ -945,6 +963,138 @@ pub struct DrainProviderResult {
     pub leased_remaining: u32,
 }
 
+/// Host facts only the owning driver can measure, reported on `Heartbeat`.
+/// Every field is `None` when unmeasured — never a fabricated zero.
+///
+/// Aggregates only: host process names, PIDs and paths never reach the wire,
+/// because every client-token holder can read `Stats`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HostSample {
+    /// Total host RAM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_total_bytes: Option<u64>,
+    /// Host RAM available for new work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_available_bytes: Option<u64>,
+    /// Total host swap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_total_bytes: Option<u64>,
+    /// Free host swap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_free_bytes: Option<u64>,
+    /// The host agent's own RSS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_rss_bytes: Option<u64>,
+    /// Summed guest-VM RSS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_rss_bytes: Option<u64>,
+}
+
+impl From<preloop_observability::vm_telemetry::HostSample> for HostSample {
+    fn from(sample: preloop_observability::vm_telemetry::HostSample) -> Self {
+        Self {
+            mem_total_bytes: sample.mem_total_bytes,
+            mem_available_bytes: sample.mem_available_bytes,
+            swap_total_bytes: sample.swap_total_bytes,
+            swap_free_bytes: sample.swap_free_bytes,
+            engine_rss_bytes: sample.engine_rss_bytes,
+            vm_rss_bytes: sample.vm_rss_bytes,
+        }
+    }
+}
+
+impl HostSample {
+    /// Fraction of host RAM consumed, or `None` when unmeasured. Available
+    /// falling to zero must read as pressure, never as headroom.
+    pub fn ram_used_fraction(&self) -> Option<f64> {
+        match (self.mem_total_bytes, self.mem_available_bytes) {
+            (Some(total), Some(available)) if total > 0 => {
+                Some(1.0 - available as f64 / total as f64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Fraction of swap consumed, or `None` when the host has no swap or it
+    /// is unmeasured. Swap is pressure, never headroom.
+    pub fn swap_used_fraction(&self) -> Option<f64> {
+        match (self.swap_total_bytes, self.swap_free_bytes) {
+            (Some(total), Some(free)) if total > 0 => Some(1.0 - free as f64 / total as f64),
+            _ => None,
+        }
+    }
+}
+
+/// Per-sandbox runtime facts only the owning driver can measure. Aggregates
+/// only: the hypervisor PID and host data-directory path stay on the
+/// provider that measured them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SandboxRuntimeStats {
+    /// Driver-native reference (matches [`Sandbox::native_ref`]). This is the
+    /// heartbeat's key; a `Stats` response already nests the stats under the
+    /// sandbox record.
+    pub native_ref: String,
+    /// RSS or cgroup `memory.current`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    /// Unix seconds, best-effort (a data-directory timestamp when no
+    /// process start time is recoverable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<i64>,
+}
+
+/// What a driver reports at `Heartbeat`: its host sample plus every
+/// sandbox it currently owns that it can say anything about. Batched so a
+/// 10s heartbeat and a reconcile need not each re-measure. Never an error:
+/// an unmeasurable report is the default (empty), not a failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HostReport {
+    /// Host sample (every field `None` when unmeasured).
+    pub host: HostSample,
+    /// This driver's current sandboxes.
+    pub sandboxes: Vec<SandboxRuntimeStats>,
+}
+
+/// One sandbox in a `Stats` response: its record plus the latest runtime
+/// facts its provider reported (default/empty when never reported).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SandboxStats {
+    /// The sandbox record.
+    pub sandbox: Sandbox,
+    /// Latest runtime facts.
+    pub runtime: SandboxRuntimeStats,
+}
+
+/// One provider in a `Stats` response.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProviderStats {
+    /// Provider id.
+    pub provider_id: String,
+    /// Display name.
+    pub name: String,
+    /// Drivers and capacity.
+    pub drivers: Vec<DriverInfo>,
+    /// Latest reported host sample.
+    pub host: HostSample,
+    /// Age of `host` at request time; 0 when never sampled.
+    pub host_sample_age_secs: i64,
+    /// This provider's sandboxes.
+    pub sandboxes: Vec<SandboxStats>,
+}
+
+/// `Stats`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StatsResponse {
+    /// Providers.
+    pub providers: Vec<ProviderStats>,
+}
+
 /// `Register`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -973,6 +1123,14 @@ pub struct HeartbeatRequest {
     pub provider_id: String,
     /// Generation.
     pub generation: u64,
+    /// Host sample (every field `None` when unmeasured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostSample>,
+    /// This provider's measurable sandboxes, most recently active first and
+    /// capped at 512 entries so one heartbeat stays bounded. Replaces the
+    /// prior report — not a merge.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sandboxes: Vec<SandboxRuntimeStats>,
 }
 
 /// `Poll`.

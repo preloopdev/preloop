@@ -5,6 +5,8 @@
 //! gets its machines from it. The same service is reachable over HTTP
 //! (Connect) so other hosts can join as providers (`preloop sandbox agent`)
 //! and other callers can acquire sandboxes (`preloop sandbox acquire`).
+//! `preloop sandbox stats` prints each provider's host sample, capacity and
+//! sandboxes with their runtime facts.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -116,9 +118,13 @@ impl LocalSandboxes {
     /// bundle, Node externals, control bridge) and control socket are the
     /// embedded agent's allowlist, so the pool keeps working while every
     /// other host path is refused.
+    ///
+    /// `observability` supplies the in-process meter the service and its local
+    /// agent record `preloop.sandbox.*` instruments on.
     pub(crate) async fn start(
         home: &Path,
         pool: Option<&RunnerPoolConfig>,
+        observability: preloop_observability::Observability,
     ) -> anyhow::Result<Self> {
         let state = home.join("state");
         let store_url = env_nonempty("PRELOOP_SANDBOX_STORE_URL")
@@ -128,6 +134,8 @@ impl LocalSandboxes {
         let store = store::open(&store_url)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
+        let metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+        config.metrics = metrics.clone();
         let service = Service::open(store, config).await?;
         let shutdown = CancellationToken::new();
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -155,11 +163,13 @@ impl LocalSandboxes {
             access.allow_mounts(pool.sandbox_mount_prefixes());
             access.allow_sockets(pool.sandbox_socket_prefixes());
         }
+        let mut agent_config = AgentConfig::new(local_provider_name(), state.join("sandbox-agent"))
+            .with_access(access);
+        agent_config.metrics = metrics;
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             drivers,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent"))
-                .with_access(access),
+            agent_config,
         );
         let session = agent.register().await.ok();
         let provider_id = session
@@ -206,6 +216,16 @@ impl LocalSandboxes {
             pool_capabilities,
             shutdown,
         })
+    }
+
+    /// The service API plus the provider id this process's agent registered
+    /// under — the pool provider whose host sample describes this engine's
+    /// host. Used to publish live sandbox telemetry to the runner server.
+    pub(crate) fn api_and_provider_id(&self) -> (Arc<dyn SandboxApi>, String) {
+        (
+            Arc::new(preloop_sandbox::InProcess(self.service.clone())),
+            self.provider_id.clone(),
+        )
     }
 
     /// The runner pool's machine provider, pinned to the pool driver
@@ -340,6 +360,8 @@ enum SandboxCommand {
     /// Cordon, uncordon or drain a provider.
     #[command(subcommand)]
     Provider(ProviderCommand),
+    /// Per-provider host sample, capacity and sandboxes with their runtime facts.
+    Stats,
 }
 
 #[derive(Debug, Subcommand)]
@@ -570,7 +592,10 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 }
 
 /// Entry point for `preloop sandbox`.
-pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(
+    args: SandboxArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let SandboxArgs {
         service,
         token,
@@ -589,8 +614,8 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
         Ok(lease.clone())
     };
     match command {
-        SandboxCommand::Serve(serve) => serve_standalone(serve).await,
-        SandboxCommand::Agent(agent) => run_agent(&service, agent).await,
+        SandboxCommand::Serve(serve) => serve_standalone(serve, observability).await,
+        SandboxCommand::Agent(agent) => run_agent(&service, agent, observability).await,
         SandboxCommand::Template(TemplateCommand::Put {
             name,
             os,
@@ -743,6 +768,7 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
             }
             ProviderCommand::Drain { name } => print_json(&client.drain_provider(&name).await?),
         },
+        SandboxCommand::Stats => print_json(&client.stats().await?),
     }
 }
 
@@ -794,7 +820,10 @@ async fn copy(
     }
 }
 
-async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
+async fn serve_standalone(
+    args: ServeSandboxArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let home = crate::preloop_home();
     let state = home.join("state");
     let store_url = args
@@ -803,10 +832,14 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     let mut config = service_config(&state)?;
     config.placement = placement_from_env()?;
     let store = store::open(&store_url).await?;
+    let metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+    config.metrics = metrics.clone();
     let service = Service::open(store, config).await?;
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {
+        let mut agent_config = AgentConfig::new(local_provider_name(), state.join("sandbox-agent"));
+        agent_config.metrics = metrics;
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             host_drivers(
@@ -814,8 +847,7 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
                 smolvm_slots(),
                 &ArtifactCache::from_env(state.join("sandbox-cache")),
             )?,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent"))
-                .with_access(HostAccess::from_env()),
+            agent_config.with_access(HostAccess::from_env()),
         );
         tokio::spawn(agent.run(shutdown.clone()));
     }
@@ -831,10 +863,17 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_agent(service: &str, args: AgentArgs) -> anyhow::Result<()> {
+async fn run_agent(
+    service: &str,
+    args: AgentArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let name = args.name.unwrap_or_else(local_provider_name);
     let state = crate::preloop_home().join("state");
     let scratch = state.join("sandbox-agent");
+    let mut agent_config = AgentConfig::new(name, scratch).with_access(HostAccess::from_env());
+    agent_config.metrics =
+        preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     let agent = Agent::new(
         Arc::new(RemoteLink::new(service, args.provider_token)),
         host_drivers(
@@ -842,7 +881,7 @@ async fn run_agent(service: &str, args: AgentArgs) -> anyhow::Result<()> {
             args.slots,
             &ArtifactCache::from_env(state.join("sandbox-cache")),
         )?,
-        AgentConfig::new(name, scratch).with_access(HostAccess::from_env()),
+        agent_config,
     );
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();

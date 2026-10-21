@@ -140,6 +140,8 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 pool_status: None,
                 observability: Some(observability.clone()),
+                // No co-hosted pool: there is no sandbox service to query.
+                sandbox: None,
                 // The standalone server has no runner pool to share with, so
                 // it keeps AppState's private funnel.
                 github: None,

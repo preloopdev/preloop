@@ -19,7 +19,8 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
 * **Sandboxes** (callers): `PutTemplate`, `PutPool`, `Acquire` (idempotency key,
   pool or template, identity to inject), `Renew`, `Release` (destroy or
   preserve), `Exec` (server-streaming), `OpenStream` (data-plane ticket),
-  `Snapshot`, `Stop`/`Start`, `Pause`/`Resume`, `Get`/`List`, and the provider
+  `Snapshot`, `Stop`/`Start`, `Pause`/`Resume`, `Get`/`List`, `Stats`
+  (read-only per-provider host and sandbox aggregates), and the provider
   lifecycle controls `CordonProvider`, `UncordonProvider`, `DrainProvider`.
   Everything scoped to one sandbox (`Get`, `Exec`, `OpenStream`, `Snapshot`,
   `Stop`, `Start`, `Pause`, `Resume`) also carries the caller's `leaseId`;
@@ -184,6 +185,86 @@ store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
 `sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
 never references control tables.
 
+## Observability
+
+The service records its own `preloop.sandbox.*` instruments on the process's
+shared meter (`Observability::meter()`), so a standalone `preloop sandbox
+serve` and the in-process engine export the same set: `/metrics` replaces dots
+with underscores, appends `_seconds` to durations, and `_total` to counters.
+Every value is recorded from the service's own state transitions — callers
+never push numbers in — so a service with no caller still reports accurate
+gauges.
+
+**Inventory**
+
+* `preloop.sandbox.sandboxes` (gauge, `state`/`provider`/`template`) — live
+  sandboxes per combination, recorded from the service's own inventory on
+  every maintenance tick. A combination that disappears is recorded as zero
+  on the next tick instead of keeping its last value, so a drained pool
+  reads as `0`.
+* `preloop.sandbox.pool.warm_depth` (gauge, `pool`) — idle, unleased
+  sandboxes currently held for a pool.
+* `preloop.sandbox.heartbeat.truncated` (counter) — per-sandbox runtime
+  entries a heartbeat dropped because the host runs more than the
+  per-heartbeat cap.
+
+**Acquire, creation, and leases**
+
+* `preloop.sandbox.acquire.duration` (histogram) — acquire latency from
+  request to a ready sandbox or failure.
+* `preloop.sandbox.acquire.failures` (counter, `reason`) — failed acquires by
+  Connect error code; `failed_precondition` is an unmet placement requirement.
+* `preloop.sandbox.create.failures` (counter, `reason`) — `timeout` (the
+  provider never reported) or `reported` (it reported a failure).
+* `preloop.sandbox.lease.transitions` (counter, `outcome`) — `renewed`,
+  `expired`, or `preserved`.
+
+**Pools and reconcile**
+
+* `preloop.sandbox.pool.refill_failures` (counter, `pool`) — warm-pool
+  refills that could not place a sandbox.
+* `preloop.sandbox.reconcile.lost` (counter) — sandboxes a provider's
+  inventory no longer reports; they are failed as lost.
+* `preloop.sandbox.reconcile.orphans` (counter) — provider-observed machines
+  no record owns, sent back for destruction as orphans or stale incarnations.
+
+**Exec**
+
+* `preloop.sandbox.exec.duration` (histogram) — request to the terminal exit
+  event.
+* `preloop.sandbox.exec.exit` (counter, `class`) — `success`, `failure`,
+  `error`, or `unknown`.
+
+Acquire, Release, Exec, and Reconcile also emit tracing spans carrying the
+pool, template, sandbox, or lease being touched.
+
+### Runtime stats
+
+Host and per-sandbox facts only the owning driver can measure travel on the
+provider's `Heartbeat`: a `HostReport` with a `HostSample` (RAM, swap, engine
+and summed guest RSS) plus one `SandboxRuntimeStats` per sandbox (native ref,
+memory, start time). Every field is optional and best-effort — a backend that
+cannot measure something omits it instead of reporting a fabricated zero, and
+an empty report never fails or delays the heartbeat. A report replaces that
+provider's previous sandbox set rather than merging into it.
+
+One heartbeat carries at most 512 per-sandbox entries, most recently active
+first: "active" is work the agent handled for that native ref, falling back
+to newest start time. A host running more sandboxes drops the tail; the agent
+logs it and increments `preloop.sandbox.heartbeat.truncated` by the number of
+dropped entries. The cap bounds both the wire payload and the stored
+per-provider report.
+
+`Stats` exposes the stored inventory read-only, per registered provider:
+`ProviderStats` carries the provider's id, name and drivers, its latest
+`HostSample` with `host_sample_age_secs` (0 when never sampled), and its
+`SandboxStats` — each `Sandbox` record with the runtime facts the provider
+last reported (default/empty when never reported). Every client-token holder
+can read `Stats`, so it carries aggregates only: host process names, PIDs and
+data-directory paths stay on the provider that measured them. An unavailable
+`Stats` read is reported as an unknown fleet (source `unavailable` plus a
+`vm_sample_unavailable` condition), never as an empty one.
+
 ## How preloop uses it
 
 `preloop engine` runs the service in-process with this host's drivers attached
@@ -233,6 +314,7 @@ preloop sandbox start sbx-… --lease lse-… [--forkable] # boot it again (bake
 preloop sandbox snapshot sbx-… --lease lse-… --name golden
 preloop sandbox release lse-… [--preserve 600]
 preloop sandbox ls | providers                        # lease ids are redacted
+preloop sandbox stats                                   # per-provider host + sandbox inventory
 preloop sandbox provider cordon host-a               # no new placements
 preloop sandbox provider drain host-a                # cordon + release idle pool members
 preloop sandbox provider uncordon host-a
