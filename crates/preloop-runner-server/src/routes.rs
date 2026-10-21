@@ -126,11 +126,16 @@ enum UploadEvent {
 /// — because the sender is dropped with the body — `Complete` again through
 /// the channel closing when a request is dropped before it is read (a payload
 /// rejected as oversized), so such a request is never timed out on its way
-/// out. Progress is coalesced (`try_send` on a one-slot channel): the
-/// middleware only needs to know that the body moved, not how often. Only data
+/// out. The channel is unbounded because `Complete` must never be lost behind
+/// a queued `Progress`: a tiny body emits both before the middleware drains
+/// them, and a dropped `Complete` turns a successful upload into a spurious
+/// 408. The body is size-capped, so the event count is bounded too. Only data
 /// frames pass through; a webhook delivery carries no trailers, and the
 /// `Bytes` extractor ignores them in any case.
-fn report_upload_events(body: Body, events: tokio::sync::mpsc::Sender<UploadEvent>) -> Body {
+fn report_upload_events(
+    body: Body,
+    events: tokio::sync::mpsc::UnboundedSender<UploadEvent>,
+) -> Body {
     use futures::Stream as _;
 
     let mut body = body.into_data_stream();
@@ -140,12 +145,12 @@ fn report_upload_events(body: Body, events: tokio::sync::mpsc::Sender<UploadEven
         match &next {
             Poll::Ready(Some(Ok(_))) => {
                 if let Some(events) = &events {
-                    let _ = events.try_send(UploadEvent::Progress);
+                    let _ = events.send(UploadEvent::Progress);
                 }
             }
             Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
                 if let Some(events) = events.take() {
-                    let _ = events.try_send(UploadEvent::Complete);
+                    let _ = events.send(UploadEvent::Complete);
                 }
             }
             Poll::Pending => {}
@@ -171,7 +176,7 @@ async fn limit_webhook_uploads(
 ) -> Result<Response, StatusCode> {
     let _permit = admit_webhook_upload(&gate).await?;
     let (parts, body) = request.into_parts();
-    let (events_tx, mut events) = tokio::sync::mpsc::channel(1);
+    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let handler = next.run(Request::from_parts(
         parts,
         report_upload_events(body, events_tx),

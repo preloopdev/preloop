@@ -641,10 +641,10 @@ impl BreakerRegistryInner {
         if !matches!(key.bucket, GithubCredentialBucket::InstallationToken(_)) {
             return;
         }
-        if let Some(position) = self.unnamed.iter().position(|candidate| candidate == key) {
-            if let Some(key) = self.unnamed.remove(position) {
-                self.unnamed.push_back(key);
-            }
+        if let Some(position) = self.unnamed.iter().position(|candidate| candidate == key)
+            && let Some(key) = self.unnamed.remove(position)
+        {
+            self.unnamed.push_back(key);
         }
     }
 }
