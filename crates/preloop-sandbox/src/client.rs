@@ -74,6 +74,10 @@ pub trait SandboxApi: Send + Sync {
     async fn pause(&self, sandbox_id: &str, lease_id: &str) -> Result<()>;
     /// `Resume`.
     async fn resume(&self, sandbox_id: &str, lease_id: &str) -> Result<()>;
+    /// `CreateJoinToken`: mint a single-use provider enrollment token.
+    async fn create_join_token(&self, ttl_secs: u64) -> Result<CreateJoinTokenResponse>;
+    /// `DeleteProvider`: remove a provider and revoke its certificates.
+    async fn delete_provider(&self, name: &str) -> Result<()>;
 
     /// Run to completion: `(exit, stdout, stderr)`.
     async fn exec_collect(&self, request: ExecRequest) -> Result<(i32, Vec<u8>, Vec<u8>)> {
@@ -171,6 +175,12 @@ impl SandboxApi for InProcess {
     async fn resume(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
         Service::resume(&self.0, sandbox_id, lease_id).await
     }
+    async fn create_join_token(&self, ttl_secs: u64) -> Result<CreateJoinTokenResponse> {
+        Service::create_join_token(&self.0, std::time::Duration::from_secs(ttl_secs)).await
+    }
+    async fn delete_provider(&self, name: &str) -> Result<()> {
+        Service::delete_provider(&self.0, name).await
+    }
 }
 
 const SANDBOXES: &str = "preloop.sandbox.v1.Sandboxes";
@@ -182,11 +192,23 @@ pub struct SandboxClient {
 }
 
 impl SandboxClient {
-    /// `base` like `http://127.0.0.1:9191`.
+    /// `base` like `https://127.0.0.1:9191` (system trust store).
     pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
         Self {
             inner: connect::Client::new(base, token),
         }
+    }
+
+    /// `base` like `https://127.0.0.1:9191`, trusting only `ca_pem`.
+    pub fn with_tls(
+        base: impl Into<String>,
+        token: Option<String>,
+        ca_pem: &str,
+        identity_pem: Option<&[u8]>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: connect::Client::with_tls(base, token, ca_pem, identity_pem)?,
+        })
     }
 
     async fn call<Req: serde::Serialize + Sync, Resp: serde::de::DeserializeOwned>(
@@ -505,6 +527,20 @@ impl SandboxApi for SandboxClient {
             &GetRequest {
                 sandbox_id: sandbox_id.to_owned(),
                 lease_id: lease_id.to_owned(),
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn create_join_token(&self, ttl_secs: u64) -> Result<CreateJoinTokenResponse> {
+        self.call("CreateJoinToken", &CreateJoinTokenRequest { ttl_secs })
+            .await
+    }
+    async fn delete_provider(&self, name: &str) -> Result<()> {
+        self.call::<_, Empty>(
+            "DeleteProvider",
+            &DeleteProviderRequest {
+                name: name.to_owned(),
             },
         )
         .await

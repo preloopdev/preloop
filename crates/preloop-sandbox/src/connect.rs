@@ -292,17 +292,39 @@ pub struct Client {
 }
 
 impl Client {
-    /// `base` like `http://host:9191`; `token` is sent as a bearer.
+    /// `base` like `https://host:9191`; `token` is sent as a bearer.
     pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
+        Self::with_http(base, token, http)
+    }
+
+    /// Build over an already configured HTTP client (private CA, mTLS
+    /// identity, timeouts).
+    pub fn with_http(
+        base: impl Into<String>,
+        token: Option<String>,
+        http: reqwest::Client,
+    ) -> Self {
         Self {
             http,
             base: base.into().trim_end_matches('/').to_owned(),
             token,
         }
+    }
+
+    /// Build over HTTPS trusting only `ca_pem`, optionally presenting the
+    /// client certificate in `identity_pem`.
+    pub fn with_tls(
+        base: impl Into<String>,
+        token: Option<String>,
+        ca_pem: &str,
+        identity_pem: Option<&[u8]>,
+    ) -> Result<Self> {
+        let http = crate::tls::http_client(ca_pem, identity_pem)?;
+        Ok(Self::with_http(base, token, http))
     }
 
     /// Base URL.

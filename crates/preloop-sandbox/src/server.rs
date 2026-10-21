@@ -1,30 +1,46 @@
 //! HTTP surface: Connect routes for both services plus the ticketed data plane.
+//!
+//! Everything is served over TLS. Callers hold the one client bearer token;
+//! capacity owners authenticate with a client certificate issued by the
+//! service CA (see [`crate::tls`]), except for `Enroll` which is authenticated
+//! by a single-use join token.
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::StreamExt as _;
 use tokio::io::AsyncWriteExt as _;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::*;
 use crate::connect::{self, Code, Error};
-use crate::service::Service;
+use crate::service::{ProviderIdentity, Service};
+use crate::tls::{PeerIdentity, ServerTls, TlsListener};
 
 /// Maximum request body for one Connect RPC.
 pub const CONNECT_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
-/// Bearer tokens. `None` disables the check (loopback / tests only).
+/// Bearer token for `Sandboxes` callers. Always required: the listener speaks
+/// TLS even on loopback.
 #[derive(Debug, Clone, Default)]
 pub struct Auth {
-    /// Token for `Sandboxes` callers.
-    pub client_token: Option<String>,
-    /// Token for `Providers` (host agents, connectors).
-    pub provider_token: Option<String>,
+    /// Token callers present as `Authorization: Bearer …`.
+    pub client_token: String,
+}
+
+impl Auth {
+    /// Build from a token.
+    pub fn new(client_token: impl Into<String>) -> Self {
+        Self {
+            client_token: client_token.into(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -41,10 +57,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-fn check(expected: &Option<String>, headers: &HeaderMap) -> Result<(), Error> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
+fn check(expected: &str, headers: &HeaderMap) -> Result<(), Error> {
     match bearer(headers) {
         Some(token)
             if token.len() == expected.len()
@@ -64,6 +77,9 @@ fn check(expected: &Option<String>, headers: &HeaderMap) -> Result<(), Error> {
 }
 
 /// Build the router.
+///
+/// `Providers` reads the peer certificate from `ConnectInfo<PeerIdentity>`, so
+/// serve it with [`serve`] (or `Router::into_make_service_with_connect_info`).
 pub fn router(service: Arc<Service>, auth: Auth) -> Router {
     Router::new()
         .route("/preloop.sandbox.v1.Sandboxes/{method}", post(sandboxes))
@@ -76,11 +92,45 @@ pub fn router(service: Arc<Service>, auth: Auth) -> Router {
             "/sandbox/v1/agent/blobs/{ticket}",
             get(agent_blob_get).put(agent_blob_put),
         )
+        .route("/sandbox/v1/ca.pem", get(ca_pem))
         .route("/sandbox/v1/healthz", get(|| async { "ok" }))
         // Bulk bytes travel over the ticketed data plane, never in RPCs.
         // This bounds every unary request (and the single Exec envelope).
         .layer(DefaultBodyLimit::max(CONNECT_BODY_LIMIT))
         .with_state(AppState { service, auth })
+}
+
+/// Serve the API over TLS until `shutdown`.
+///
+/// Each connection completes a handshake first; the peer's certificate (when
+/// presented) becomes [`ConnectInfo<PeerIdentity>`] for the handlers.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    service: Arc<Service>,
+    auth: Auth,
+    tls: Arc<ServerTls>,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let app = router(service, auth);
+    axum::serve(
+        TlsListener::new(listener, tls.acceptor.clone()),
+        app.into_make_service_with_connect_info::<PeerIdentity>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.cancelled().await })
+    .await
+}
+
+/// The service CA, for agents that pin it before enrolling.
+async fn ca_pem(State(app): State<AppState>) -> Response {
+    match app.service.ca_pem() {
+        Some(pem) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/x-pem-file")],
+            pem,
+        )
+            .into_response(),
+        None => Error::not_found("this service has no CA").into_response(),
+    }
 }
 
 async fn sandboxes(
@@ -156,6 +206,17 @@ async fn sandboxes(
             Err(e) => e.into_response(),
         },
         "Stats" => reply(Ok(service.stats())),
+        "DeleteProvider" => match decode::<DeleteProviderRequest>(&body) {
+            Ok(r) => reply(service.delete_provider(&r.name).await.map(|_| Empty {})),
+            Err(e) => e.into_response(),
+        },
+        "CreateJoinToken" => match decode::<CreateJoinTokenRequest>(&body) {
+            Ok(r) => {
+                let ttl = std::time::Duration::from_secs(r.ttl_secs);
+                reply(service.create_join_token(ttl).await)
+            }
+            Err(e) => e.into_response(),
+        },
         "Exec" => match connect::decode_stream_request::<ExecRequest>(&body) {
             Ok(r) => match service.exec(r) {
                 Ok(stream) => connect::stream_response(stream),
@@ -213,41 +274,87 @@ async fn sandboxes(
     }
 }
 
+fn require_identity(identity: &ProviderIdentity, provider_id: &str) -> Result<(), Error> {
+    if provider_id != identity.provider_id {
+        return Err(Error::new(
+            Code::PermissionDenied,
+            "provider id does not match the client certificate",
+        ));
+    }
+    Ok(())
+}
+
 async fn providers(
     State(app): State<AppState>,
     Path(method): Path<String>,
-    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<PeerIdentity>,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = check(&app.auth.provider_token, &headers) {
-        return error.into_response();
-    }
     let service = app.service;
     use connect::{decode, unary_response as reply};
+    // `Enroll` is the one RPC authenticated by its join token instead of a
+    // client certificate; every other method needs an enrolled identity.
+    if method == "Enroll" {
+        return match decode::<EnrollRequest>(&body) {
+            Ok(request) => reply(service.enroll(request).await),
+            Err(error) => error.into_response(),
+        };
+    }
+    let fingerprint = match peer.fingerprint() {
+        Ok(fingerprint) => fingerprint.to_owned(),
+        Err(error) => return error.into_response(),
+    };
+    let identity = match service.provider_identity(&fingerprint) {
+        Ok(identity) => identity,
+        Err(error) => return error.into_response(),
+    };
     match method.as_str() {
         "Register" => match decode::<RegisterRequest>(&body) {
-            Ok(r) => reply(service.register(r).await),
-            Err(e) => e.into_response(),
+            Ok(request) => reply(
+                service
+                    .register_enrolled(request, &identity.provider_id)
+                    .await,
+            ),
+            Err(error) => error.into_response(),
         },
         "Heartbeat" => match decode::<HeartbeatRequest>(&body) {
-            Ok(r) => reply(service.heartbeat(r).map(|_| Empty {})),
-            Err(e) => e.into_response(),
+            Ok(request) => match require_identity(&identity, &request.provider_id) {
+                Ok(()) => reply(service.heartbeat(request).map(|_| Empty {})),
+                Err(error) => error.into_response(),
+            },
+            Err(error) => error.into_response(),
         },
         "Poll" => match decode::<PollRequest>(&body) {
-            Ok(r) => reply(service.poll(r).await),
-            Err(e) => e.into_response(),
+            Ok(request) => match require_identity(&identity, &request.provider_id) {
+                Ok(()) => reply(service.poll(request).await),
+                Err(error) => error.into_response(),
+            },
+            Err(error) => error.into_response(),
         },
         "Report" => match decode::<ReportRequest>(&body) {
-            Ok(r) => reply(service.report(r).await.map(|_| Empty {})),
-            Err(e) => e.into_response(),
+            Ok(request) => match require_identity(&identity, &request.provider_id) {
+                Ok(()) => reply(service.report(request).await.map(|_| Empty {})),
+                Err(error) => error.into_response(),
+            },
+            Err(error) => error.into_response(),
         },
         "ReportExec" => match decode::<ReportExecRequest>(&body) {
-            Ok(r) => reply(service.report_exec(r).await.map(|_| Empty {})),
-            Err(e) => e.into_response(),
+            Ok(request) => match require_identity(&identity, &request.provider_id) {
+                Ok(()) => reply(service.report_exec(request).await.map(|_| Empty {})),
+                Err(error) => error.into_response(),
+            },
+            Err(error) => error.into_response(),
         },
         "Reconcile" => match decode::<ReconcileRequest>(&body) {
-            Ok(r) => reply(service.reconcile(r).await),
-            Err(e) => e.into_response(),
+            Ok(request) => match require_identity(&identity, &request.provider_id) {
+                Ok(()) => reply(service.reconcile(request).await),
+                Err(error) => error.into_response(),
+            },
+            Err(error) => error.into_response(),
+        },
+        "RenewCertificate" => match decode::<RenewCertificateRequest>(&body) {
+            Ok(request) => reply(service.renew_certificate(request, &fingerprint).await),
+            Err(error) => error.into_response(),
         },
         other => Error::new(Code::Unimplemented, format!("unknown method {other}")).into_response(),
     }
@@ -428,11 +535,13 @@ fn provider_headers(headers: &HeaderMap) -> Result<(String, u64), Error> {
 async fn agent_blob_get(
     State(app): State<AppState>,
     Path(ticket): Path<String>,
+    ConnectInfo(peer): ConnectInfo<PeerIdentity>,
     headers: HeaderMap,
 ) -> Response {
     let result = async {
-        check(&app.auth.provider_token, &headers)?;
+        let identity = app.service.provider_identity(peer.fingerprint()?)?;
         let (id, generation) = provider_headers(&headers)?;
+        require_identity(&identity, &id)?;
         let path = app.service.agent_blob(&id, generation, &ticket)?;
         file_response(&path).await
     }
@@ -443,12 +552,14 @@ async fn agent_blob_get(
 async fn agent_blob_put(
     State(app): State<AppState>,
     Path(ticket): Path<String>,
+    ConnectInfo(peer): ConnectInfo<PeerIdentity>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
     let result = async {
-        check(&app.auth.provider_token, &headers)?;
+        let identity = app.service.provider_identity(peer.fingerprint()?)?;
         let (id, generation) = provider_headers(&headers)?;
+        require_identity(&identity, &id)?;
         let path = app.service.agent_blob(&id, generation, &ticket)?;
         Ok::<_, Error>(path)
     }

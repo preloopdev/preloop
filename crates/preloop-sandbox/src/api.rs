@@ -931,6 +931,19 @@ pub struct Provider {
     /// No new placements are made here; survives re-registration.
     #[serde(skip_serializing_if = "is_false")]
     pub cordoned: bool,
+    /// Client certificates this provider may authenticate with.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<ProviderCertificate>,
+}
+
+/// A provider client certificate the service accepts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProviderCertificate {
+    /// Lowercase hex SHA-256 of the certificate DER.
+    pub sha256: String,
+    /// Unix seconds after which the certificate is rejected.
+    pub expires_at: i64,
 }
 
 /// `ListProviders`.
@@ -1376,4 +1389,73 @@ pub struct ReconcileRequest {
 pub struct ReconcileResponse {
     /// Orphans: machines no live record owns.
     pub destroy: Vec<SandboxWork>,
+}
+
+/// `Enroll`: exchange a join token for a client certificate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EnrollRequest {
+    /// Single-use join token (`plj1.<id>.<secret>.<ca_sha256>`).
+    pub token: String,
+    /// Provider name the certificate is bound to.
+    pub name: String,
+    /// PEM certificate signing request.
+    pub csr_pem: String,
+}
+
+/// `Enroll` result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EnrollResponse {
+    /// PEM leaf certificate.
+    pub cert_pem: String,
+    /// PEM CA certificate the leaf chains to.
+    pub ca_pem: String,
+    /// Unix seconds.
+    pub expires_at: i64,
+}
+
+/// `RenewCertificate`: replace an expiring client certificate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RenewCertificateRequest {
+    /// PEM certificate signing request for a fresh key.
+    pub csr_pem: String,
+}
+
+/// `RenewCertificate` result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RenewCertificateResponse {
+    /// PEM leaf certificate.
+    pub cert_pem: String,
+    /// Unix seconds.
+    pub expires_at: i64,
+}
+
+/// `CreateJoinToken`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CreateJoinTokenRequest {
+    /// Lifetime in seconds (0 = service default).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub ttl_secs: u64,
+}
+
+/// `CreateJoinToken` result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CreateJoinTokenResponse {
+    /// `plj1.<id>.<secret>.<ca_sha256>`; printed once and never recoverable.
+    pub token: String,
+    /// Unix seconds.
+    pub expires_at: i64,
+}
+
+/// `DeleteProvider`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DeleteProviderRequest {
+    /// Provider name.
+    pub name: String,
 }

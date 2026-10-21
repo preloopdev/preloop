@@ -25,6 +25,7 @@ use crate::api::*;
 use crate::connect::{Code, Error, Result};
 use crate::placement::{Candidate, CandidateId, LeastLoaded, Placement, PlacementRequest};
 use crate::store::{Kind, Store};
+use crate::tls;
 
 /// Tunables.
 #[derive(Debug, Clone)]
@@ -67,6 +68,9 @@ pub struct ServiceConfig {
     /// An exec with no explicit deadline gets this one
     /// (`PRELOOP_SANDBOX_EXEC_TIMEOUT_SECS`).
     pub exec_timeout: Duration,
+    /// CA that issues provider client certificates. `None` disables
+    /// `Enroll` and `RenewCertificate` (an in-process-only service).
+    pub ca: Option<Arc<crate::tls::ServiceCa>>,
 }
 
 impl ServiceConfig {
@@ -88,6 +92,7 @@ impl ServiceConfig {
             poll_batch: 64,
             delivery_timeout: Duration::from_secs(120),
             exec_timeout: Duration::from_secs(3600),
+            ca: None,
         }
     }
 }
@@ -116,6 +121,16 @@ const MAX_DESTROY_ATTEMPTS: u32 = 3;
 /// sweep waits out the delivery and report latency before ending the caller's
 /// stream as a backstop.
 const EXEC_SWEEP_GRACE: Duration = Duration::from_secs(5);
+
+/// The provider a client certificate authenticates, resolved from the leaf's
+/// SHA-256 fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderIdentity {
+    /// Provider id.
+    pub provider_id: String,
+    /// Provider name; `Register` must use exactly this name.
+    pub name: String,
+}
 
 /// Names are identifiers: they reach driver-native names, snapshot paths and
 /// pool configuration, so path separators and traversal are rejected.
@@ -320,6 +335,15 @@ struct Exec {
     finished: CancellationToken,
 }
 
+/// A single-use join token; only the secret's hash is stored.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JoinTokenRecord {
+    id: String,
+    secret_sha256: String,
+    expires_at: i64,
+}
+
 /// Data-plane blob for one ticket.
 struct Blob {
     sandbox_id: String,
@@ -430,6 +454,7 @@ struct State {
     lease_by_key: HashMap<String, String>,
     injected: HashSet<String>,
     providers: BTreeMap<String, ProviderRec>,
+    join_tokens: BTreeMap<String, JoinTokenRecord>,
     pending: HashMap<String, PendingWork>,
     execs: HashMap<String, Exec>,
     blobs: HashMap<String, Blob>,
@@ -519,6 +544,9 @@ impl Service {
                     sandbox_stats: HashMap::new(),
                 },
             );
+        }
+        for token in load::<JoinTokenRecord>(&*store, Kind::JoinTokens).await? {
+            state.join_tokens.insert(token.id.clone(), token);
         }
         let service = Arc::new(Self {
             state: Mutex::new(state),
@@ -852,6 +880,32 @@ impl Service {
                 .collect();
             for id in failed {
                 self.destroy_locked(&mut state, &id, &mut ops);
+            }
+            // Expired join tokens and client certificates: neither can
+            // authenticate anything anymore, so forget them rather than
+            // grow the store forever.
+            let stale_tokens: Vec<String> = state
+                .join_tokens
+                .iter()
+                .filter(|(_, token)| token.expires_at <= t)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in stale_tokens {
+                state.join_tokens.remove(&id);
+                ops.push(self.remove(Kind::JoinTokens, &id));
+            }
+            let mut pruned = Vec::new();
+            for rec in state.providers.values_mut() {
+                let before = rec.provider.certificates.len();
+                rec.provider
+                    .certificates
+                    .retain(|certificate| certificate.expires_at > t);
+                if rec.provider.certificates.len() != before {
+                    pruned.push(rec.provider.clone());
+                }
+            }
+            for provider in pruned {
+                ops.push(self.put(Kind::Providers, &provider.id, &provider));
             }
             // Warm pools.
             let pools: Vec<PoolSpec> = state.pools.values().cloned().collect();
@@ -2170,6 +2224,11 @@ impl Service {
         StatsResponse { providers }
     }
 
+    /// PEM of the service CA, when TLS is configured.
+    pub fn ca_pem(&self) -> Option<String> {
+        self.config.ca.as_ref().map(|ca| ca.pem().to_owned())
+    }
+
     fn usable(sandbox: &Sandbox) -> Result<()> {
         match sandbox.state {
             SandboxState::Leased | SandboxState::Preserved | SandboxState::Ready => Ok(()),
@@ -2887,17 +2946,52 @@ impl Service {
     /// generation holds in flight is redelivered to the new one; its
     /// sandboxes wait for `Reconcile`.
     pub async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse> {
+        self.register_inner(request, None).await
+    }
+
+    /// `Register` for a provider authenticated by a client certificate.
+    ///
+    /// The provider id came from the certificate fingerprint. Re-checking it
+    /// under the same lock as the registration closes the window where a
+    /// concurrently removed provider could otherwise be re-created by name.
+    pub async fn register_enrolled(
+        &self,
+        request: RegisterRequest,
+        provider_id: &str,
+    ) -> Result<RegisterResponse> {
+        self.register_inner(request, Some(provider_id)).await
+    }
+
+    async fn register_inner(
+        &self,
+        request: RegisterRequest,
+        enrolled: Option<&str>,
+    ) -> Result<RegisterResponse> {
         if request.name.is_empty() {
             return Err(Error::invalid("name is required"));
         }
         let (response, ops) = {
             let mut state = self.state.lock();
-            let existing = state
-                .providers
-                .values()
-                .find(|rec| rec.provider.name == request.name)
-                .map(|rec| rec.provider.id.clone());
-            let id = existing.unwrap_or_else(|| new_id("prv"));
+            if let Some(provider_id) = enrolled {
+                let rec = state.providers.get(provider_id).ok_or_else(|| {
+                    Error::new(Code::PermissionDenied, "client certificate is not enrolled")
+                })?;
+                if rec.provider.name != request.name {
+                    return Err(Error::new(
+                        Code::PermissionDenied,
+                        "provider name does not match the client certificate",
+                    ));
+                }
+            }
+            let id = match enrolled {
+                Some(provider_id) => provider_id.to_owned(),
+                None => state
+                    .providers
+                    .values()
+                    .find(|rec| rec.provider.name == request.name)
+                    .map(|rec| rec.provider.id.clone())
+                    .unwrap_or_else(|| new_id("prv")),
+            };
             let generation = state
                 .providers
                 .get(&id)
@@ -2908,6 +3002,13 @@ impl Service {
                 .providers
                 .get(&id)
                 .is_some_and(|rec| rec.provider.cordoned);
+            // Enrollment owns the identity: re-registering keeps the
+            // certificates that authenticate this provider.
+            let certificates = state
+                .providers
+                .get(&id)
+                .map(|rec| rec.provider.certificates.clone())
+                .unwrap_or_default();
             let provider = Provider {
                 id: id.clone(),
                 name: request.name,
@@ -2915,6 +3016,7 @@ impl Service {
                 drivers: request.drivers,
                 last_seen: now(),
                 cordoned,
+                certificates,
             };
             // Everything the old generation had queued or in flight is
             // unacknowledged: hand it to the new one.
@@ -2957,6 +3059,269 @@ impl Service {
         self.persist(ops).await;
         self.changed.notify_waiters();
         Ok(response)
+    }
+
+    // ─── Enrollment and identity ───────────────────────────────────
+
+    /// Mint a single-use join token for provider enrollment.
+    pub async fn create_join_token(&self, ttl: Duration) -> Result<CreateJoinTokenResponse> {
+        let ca = self.config.ca.as_ref().ok_or_else(|| {
+            Error::precondition("enrollment is unavailable: the service has no TLS CA")
+        })?;
+        let ttl = if ttl.is_zero() {
+            Duration::from_secs(3600)
+        } else {
+            ttl
+        };
+        let id = new_id("jt");
+        let secret = tls::random_hex(32);
+        let seconds = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
+        let expires_at = now().saturating_add(seconds);
+        let record = JoinTokenRecord {
+            id: id.clone(),
+            secret_sha256: tls::sha256_hex(secret.as_bytes()),
+            expires_at,
+        };
+        self.state
+            .lock()
+            .join_tokens
+            .insert(id.clone(), record.clone());
+        self.persist(vec![self.put(Kind::JoinTokens, &id, &record)])
+            .await;
+        Ok(CreateJoinTokenResponse {
+            token: tls::join_token(&id, &secret, ca.sha256_hex()),
+            expires_at,
+        })
+    }
+
+    /// The provider a client certificate authenticates, by leaf fingerprint.
+    ///
+    /// Removed providers and revoked certificates (pruned at expiry) are not
+    /// found, which is what denies them at the RPC boundary.
+    pub fn provider_identity(&self, fingerprint_sha256: &str) -> Result<ProviderIdentity> {
+        let t = now();
+        let state = self.state.lock();
+        state
+            .providers
+            .values()
+            .find(|rec| {
+                rec.provider.certificates.iter().any(|certificate| {
+                    certificate.sha256 == fingerprint_sha256 && certificate.expires_at > t
+                })
+            })
+            .map(|rec| ProviderIdentity {
+                provider_id: rec.provider.id.clone(),
+                name: rec.provider.name.clone(),
+            })
+            .ok_or_else(|| Error::new(Code::PermissionDenied, "client certificate is not enrolled"))
+    }
+
+    /// `Enroll`: exchange a join token for a client certificate.
+    ///
+    /// The certificate is signed before the token is consumed, so a malformed
+    /// CSR does not burn a valid token; a token that reaches the store lookup
+    /// is removed whether or not binding the provider then succeeds.
+    pub async fn enroll(&self, request: EnrollRequest) -> Result<EnrollResponse> {
+        let ca = self.config.ca.clone().ok_or_else(|| {
+            Error::precondition("enrollment is unavailable: the service has no TLS CA")
+        })?;
+        let parts = tls::parse_join_token(&request.token)?;
+        if !constant_time_eq(parts.ca_sha256.as_bytes(), ca.sha256_hex().as_bytes()) {
+            return Err(Error::new(
+                Code::Unauthenticated,
+                "join token was issued for a different CA",
+            ));
+        }
+        validate_name("provider", &request.name)?;
+        let signed = ca.sign_client(&request.csr_pem, &request.name, tls::CLIENT_CERT_LIFETIME)?;
+        let ops = {
+            let mut state = self.state.lock();
+            let t = now();
+            let record = state
+                .join_tokens
+                .get(parts.id)
+                .ok_or_else(|| Error::new(Code::Unauthenticated, "unknown or used join token"))?;
+            if record.expires_at <= t {
+                return Err(Error::new(Code::Unauthenticated, "join token expired"));
+            }
+            if !constant_time_eq(
+                record.secret_sha256.as_bytes(),
+                tls::sha256_hex(parts.secret.as_bytes()).as_bytes(),
+            ) {
+                return Err(Error::new(Code::Unauthenticated, "bad join token"));
+            }
+            state.join_tokens.remove(parts.id);
+            let mut ops = vec![self.remove(Kind::JoinTokens, parts.id)];
+            let existing = state
+                .providers
+                .values()
+                .find(|rec| rec.provider.name == request.name)
+                .map(|rec| rec.provider.id.clone());
+            let id = existing.unwrap_or_else(|| new_id("prv"));
+            let (seen, queue, wake) = state
+                .providers
+                .get(&id)
+                .map(|rec| (rec.seen, rec.queue.clone(), rec.wake.clone()))
+                .unwrap_or_else(|| {
+                    (
+                        // Enrolled but never registered: not placeable yet.
+                        Instant::now() - self.config.provider_timeout * 2,
+                        VecDeque::new(),
+                        Arc::new(Notify::new()),
+                    )
+                });
+            let mut provider = state
+                .providers
+                .get(&id)
+                .map(|rec| rec.provider.clone())
+                .unwrap_or_else(|| Provider {
+                    id: id.clone(),
+                    name: request.name.clone(),
+                    ..Provider::default()
+                });
+            provider.name = request.name.clone();
+            // Re-enrolling replaces earlier certificates: issuing a new token
+            // means these credentials, not accumulated old ones.
+            provider.certificates = vec![ProviderCertificate {
+                sha256: signed.sha256.clone(),
+                expires_at: signed.expires_at,
+            }];
+            state.providers.insert(
+                id.clone(),
+                ProviderRec {
+                    provider: provider.clone(),
+                    seen,
+                    queue,
+                    wake,
+                },
+            );
+            ops.push(self.put(Kind::Providers, &id, &provider));
+            ops
+        };
+        self.persist(ops).await;
+        self.changed.notify_waiters();
+        info!(provider = %request.name, "provider enrolled");
+        Ok(EnrollResponse {
+            cert_pem: signed.cert_pem,
+            ca_pem: ca.pem().to_owned(),
+            expires_at: signed.expires_at,
+        })
+    }
+
+    /// `RenewCertificate`: issue a new certificate for an enrolled provider.
+    ///
+    /// The previous fingerprint stays valid until it expires, so a client
+    /// that fails to store the new key keeps working.
+    pub async fn renew_certificate(
+        &self,
+        request: RenewCertificateRequest,
+        fingerprint_sha256: &str,
+    ) -> Result<RenewCertificateResponse> {
+        let ca = self.config.ca.clone().ok_or_else(|| {
+            Error::precondition("enrollment is unavailable: the service has no TLS CA")
+        })?;
+        let (signed, ops) = {
+            let mut state = self.state.lock();
+            let t = now();
+            let id = state
+                .providers
+                .values()
+                .find(|rec| {
+                    rec.provider.certificates.iter().any(|certificate| {
+                        certificate.sha256 == fingerprint_sha256 && certificate.expires_at > t
+                    })
+                })
+                .map(|rec| rec.provider.id.clone())
+                .ok_or_else(|| {
+                    Error::new(Code::PermissionDenied, "client certificate is not enrolled")
+                })?;
+            let rec = state.providers.get_mut(&id).expect("resolved above");
+            let signed = ca.sign_client(
+                &request.csr_pem,
+                &rec.provider.name,
+                tls::CLIENT_CERT_LIFETIME,
+            )?;
+            rec.provider
+                .certificates
+                .retain(|certificate| certificate.expires_at > t);
+            rec.provider.certificates.push(ProviderCertificate {
+                sha256: signed.sha256.clone(),
+                expires_at: signed.expires_at,
+            });
+            rec.seen = Instant::now();
+            rec.provider.last_seen = t;
+            let provider = rec.provider.clone();
+            (signed, vec![self.put(Kind::Providers, &id, &provider)])
+        };
+        self.persist(ops).await;
+        Ok(RenewCertificateResponse {
+            cert_pem: signed.cert_pem,
+            expires_at: signed.expires_at,
+        })
+    }
+
+    /// Remove a provider, its certificates and its machine records.
+    ///
+    /// The host's machines are unreachable once it can no longer authenticate,
+    /// so their records and leases are dropped instead of pinning names and
+    /// capacity until a reconcile that can never come.
+    pub async fn delete_provider(&self, name: &str) -> Result<()> {
+        let ops = {
+            let mut state = self.state.lock();
+            let Some(id) = state
+                .providers
+                .values()
+                .find(|rec| rec.provider.name == name)
+                .map(|rec| rec.provider.id.clone())
+            else {
+                return Err(Error::not_found(format!(
+                    "provider `{name}` is not registered"
+                )));
+            };
+            state.providers.remove(&id);
+            let mut ops = vec![self.remove(Kind::Providers, &id)];
+            let stale: Vec<String> = state
+                .pending
+                .iter()
+                .filter(|(_, work)| work.provider_id == id)
+                .map(|(work_id, _)| work_id.clone())
+                .collect();
+            for work_id in stale {
+                self.complete_locked(
+                    &mut state,
+                    &work_id,
+                    Err(Error::unavailable("provider was removed")),
+                    &mut ops,
+                );
+            }
+            let sandboxes: Vec<String> = state
+                .sandboxes
+                .values()
+                .filter(|sandbox| sandbox.provider_id == id)
+                .map(|sandbox| sandbox.id.clone())
+                .collect();
+            let leases: Vec<String> = state
+                .leases
+                .values()
+                .filter(|lease| sandboxes.contains(&lease.sandbox_id))
+                .map(|lease| lease.id.clone())
+                .collect();
+            for lease_id in leases {
+                if let Some(lease) = state.leases.remove(&lease_id) {
+                    state.lease_by_key.remove(&lease.idempotency_key);
+                    state.injected.remove(&lease_id);
+                    ops.push(self.remove(Kind::Leases, &lease_id));
+                }
+            }
+            for sandbox_id in sandboxes {
+                self.destroy_locked(&mut state, &sandbox_id, &mut ops);
+            }
+            ops
+        };
+        self.persist(ops).await;
+        self.changed.notify_waiters();
+        info!(provider = name, "provider removed");
+        Ok(())
     }
 
     /// `Heartbeat`.

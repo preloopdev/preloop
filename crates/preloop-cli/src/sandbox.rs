@@ -2,8 +2,8 @@
 //!
 //! The engine runs a Sandbox Service in-process with this host's SmolVM
 //! driver attached through an in-process host agent; the CI runner pool
-//! gets its machines from it. The same service is reachable over HTTP
-//! (Connect) so other hosts can join as providers (`preloop sandbox agent`)
+//! gets its machines from it. The same service is reachable over HTTPS
+//! (Connect) so other hosts can enroll as providers (`preloop sandbox agent`)
 //! and other callers can acquire sandboxes (`preloop sandbox acquire`).
 //! `preloop sandbox stats` prints each provider's host sample, capacity and
 //! sandboxes with their runtime facts.
@@ -23,14 +23,15 @@ use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
 use preloop_sandbox::drivers::smolvm::pack::ArtifactCache;
-use preloop_sandbox::server::{Auth, router};
+use preloop_sandbox::server::{Auth, serve as serve_api};
 use preloop_sandbox::{
-    Driver, LeastLoaded, Placement, SandboxApi, SandboxClient, Service, ServiceConfig, store,
+    Driver, LeastLoaded, Placement, SandboxApi, SandboxClient, ServerTls, Service, ServiceConfig,
+    store, tls,
 };
 use tokio_util::sync::CancellationToken;
 
-/// Default loopback address of the engine's sandbox API.
-pub(crate) const DEFAULT_SANDBOX_URL: &str = "http://127.0.0.1:9191";
+/// Default address of the engine's sandbox API.
+pub(crate) const DEFAULT_SANDBOX_URL: &str = "https://127.0.0.1:9191";
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
@@ -162,6 +163,14 @@ impl LocalSandboxes {
         let store = store::open(&store_url)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
+        let tls = ServerTls::load_or_create(
+            &state,
+            tls::sans_from_env(),
+            env_path("PRELOOP_SANDBOX_TLS_CERT").as_deref(),
+            env_path("PRELOOP_SANDBOX_TLS_KEY").as_deref(),
+        )
+        .context("configuring the sandbox API TLS")?;
+        config.ca = Some(tls.ca.clone());
         let metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
         config.metrics = metrics.clone();
         let service = Service::open(store, config).await?;
@@ -213,16 +222,16 @@ impl LocalSandboxes {
             let addr: SocketAddr = listen
                 .parse()
                 .context("PRELOOP_SANDBOX_LISTEN must be a socket address or `off`")?;
-            let auth = api_auth(&addr)?;
+            let auth = Auth::new(resolve_client_token(&state)?);
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
-                    tracing::info!(%addr, "sandbox API listening");
-                    let app = router(service.clone(), auth);
+                    tracing::info!(%addr, "sandbox API listening (https)");
                     let stop = shutdown.clone();
+                    let service = service.clone();
                     tokio::spawn(async move {
-                        let _ = axum::serve(listener, app)
-                            .with_graceful_shutdown(async move { stop.cancelled().await })
-                            .await;
+                        if let Err(error) = serve_api(listener, service, auth, tls, stop).await {
+                            tracing::warn!(%error, "sandbox API server stopped");
+                        }
                     });
                 }
                 Err(error) => {
@@ -231,8 +240,13 @@ impl LocalSandboxes {
             }
         }
         // Wait for the local agent so the pool's first acquire can place.
+        // An enrollment record (no drivers yet) does not count.
         for _ in 0..200 {
-            if !service.list_providers().is_empty() {
+            if service
+                .list_providers()
+                .iter()
+                .any(|provider| !provider.drivers.is_empty())
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -311,19 +325,64 @@ fn local_provider_name() -> String {
     )
 }
 
-/// Tokens are optional only on loopback.
-fn api_auth(addr: &SocketAddr) -> anyhow::Result<Auth> {
-    let auth = Auth {
-        client_token: env_nonempty("PRELOOP_SANDBOX_TOKEN"),
-        provider_token: env_nonempty("PRELOOP_SANDBOX_PROVIDER_TOKEN"),
-    };
-    if !addr.ip().is_loopback() && (auth.client_token.is_none() || auth.provider_token.is_none()) {
-        anyhow::bail!(
-            "the sandbox API on {addr} is not loopback: set PRELOOP_SANDBOX_TOKEN and \
-             PRELOOP_SANDBOX_PROVIDER_TOKEN"
-        );
+/// A path from a non-empty environment variable.
+fn env_path(key: &str) -> Option<PathBuf> {
+    env_nonempty(key).map(PathBuf::from)
+}
+
+/// The client token: `PRELOOP_SANDBOX_TOKEN`, else one generated on first
+/// start into `<state>/sandbox-client-token` (mode 0600).
+fn resolve_client_token(state: &Path) -> anyhow::Result<String> {
+    if let Some(token) = env_nonempty("PRELOOP_SANDBOX_TOKEN") {
+        return Ok(token);
     }
-    Ok(auth)
+    let path = state.join("sandbox-client-token");
+    if let Ok(token) = std::fs::read_to_string(&path) {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Ok(token.to_owned());
+        }
+    }
+    let token = tls::random_hex(32);
+    tls::write_private(&path, token.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(token)
+}
+
+/// The token a local deployment wrote, when there is one.
+fn local_client_token(home: &Path) -> Option<String> {
+    std::fs::read_to_string(home.join("state/sandbox-client-token"))
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+/// The CA a local deployment wrote, when there is one.
+fn local_ca(home: &Path) -> Option<PathBuf> {
+    let path = home.join("state").join(tls::CA_DIR).join(tls::CA_CERT_FILE);
+    path.is_file().then_some(path)
+}
+
+/// Build the caller client, resolving the token and CA from flags, the
+/// environment, then the local state directory.
+fn sandbox_client(
+    service: &str,
+    token: Option<String>,
+    ca: Option<PathBuf>,
+) -> anyhow::Result<SandboxClient> {
+    let home = crate::preloop_home();
+    let token = token.or_else(|| local_client_token(&home)).context(
+        "set --token (or PRELOOP_SANDBOX_TOKEN), or run against a local service that wrote \
+         state/sandbox-client-token",
+    )?;
+    match ca.or_else(|| local_ca(&home)) {
+        Some(path) => {
+            let pem = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading sandbox CA {}", path.display()))?;
+            Ok(SandboxClient::with_tls(service, Some(token), &pem, None)?)
+        }
+        None => Ok(SandboxClient::new(service, Some(token))),
+    }
 }
 
 /// `preloop sandbox`.
@@ -332,7 +391,8 @@ pub(crate) struct SandboxArgs {
     /// Sandbox API base URL.
     #[arg(long, env = "PRELOOP_SANDBOX_URL", default_value = DEFAULT_SANDBOX_URL, global = true)]
     service: String,
-    /// Bearer token for the Sandboxes API.
+    /// Bearer token for the Sandboxes API. For `agent`'s first run this is the
+    /// join token (`plj1.…`).
     #[arg(
         long,
         env = "PRELOOP_SANDBOX_TOKEN",
@@ -343,6 +403,9 @@ pub(crate) struct SandboxArgs {
     /// Lease id from `acquire`; the capability for every sandbox-scoped command.
     #[arg(long = "lease", env = "PRELOOP_SANDBOX_LEASE", global = true)]
     lease_id: Option<String>,
+    /// CA certificate for the Sandbox Service (PEM).
+    #[arg(long, env = "PRELOOP_SANDBOX_CA", global = true)]
+    ca: Option<PathBuf>,
     #[command(subcommand)]
     command: SandboxCommand,
 }
@@ -384,9 +447,10 @@ enum SandboxCommand {
     Snapshot(SnapshotArgs),
     /// List sandboxes.
     Ls,
-    /// List providers and their capabilities.
-    Providers,
-    /// Cordon, uncordon or drain a provider.
+    /// Join tokens for provider enrollment.
+    #[command(subcommand)]
+    Token(TokenCommand),
+    /// Providers (capacity owners).
     #[command(subcommand)]
     Provider(ProviderCommand),
     /// Per-provider host sample, capacity and sandboxes with their runtime facts.
@@ -394,7 +458,19 @@ enum SandboxCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum TokenCommand {
+    /// Mint a single-use join token for `sandbox agent`.
+    Create {
+        /// Lifetime (`30s`, `10m`, `1h`, `2d`).
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ProviderCommand {
+    /// List providers and their capabilities.
+    Ls,
     /// Stop placing new sandboxes on a provider.
     Cordon {
         /// Provider name.
@@ -407,6 +483,11 @@ enum ProviderCommand {
     },
     /// Cordon a provider, release its idle pool members, report leased sandboxes.
     Drain {
+        /// Provider name.
+        name: String,
+    },
+    /// Remove a provider and revoke its certificates.
+    Rm {
         /// Provider name.
         name: String,
     },
@@ -427,12 +508,24 @@ struct ServeSandboxArgs {
 
 #[derive(Debug, Args)]
 struct AgentArgs {
-    /// Stable provider name.
+    /// Service URL to enroll with (`https://host:9191`). Required on the
+    /// first run; the URL is stored with the identity.
+    #[arg(long)]
+    join: Option<String>,
+    /// Stable provider name. Stored with the identity on first run.
     #[arg(long)]
     name: Option<String>,
-    /// Provider token.
-    #[arg(long, env = "PRELOOP_SANDBOX_PROVIDER_TOKEN", hide_env_values = true)]
-    provider_token: Option<String>,
+    /// Join token (`plj1.…`) for the first run. Defaults to the global
+    /// `--token`; later runs reuse the stored identity.
+    #[arg(
+        long = "join-token",
+        env = "PRELOOP_SANDBOX_JOIN_TOKEN",
+        hide_env_values = true
+    )]
+    join_token: Option<String>,
+    /// Identity directory (default `<home>/state/sandbox-identity`).
+    #[arg(long)]
+    identity: Option<PathBuf>,
     /// Concurrent sandbox cap for the SmolVM driver (0 = none).
     #[arg(long, default_value_t = 0)]
     slots: u32,
@@ -615,6 +708,23 @@ fn parse_artifact(raw: &str) -> anyhow::Result<Artifact> {
     Ok(artifact)
 }
 
+/// Parse `30s`, `10m`, `1h` or `2d`.
+fn parse_ttl(value: &str) -> anyhow::Result<Duration> {
+    let value = value.trim();
+    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let number: u64 = number
+        .parse()
+        .with_context(|| format!("expected a duration like 30m, 1h or 2d, got `{value}`"))?;
+    let seconds = match unit {
+        "s" => number,
+        "m" => number.saturating_mul(60),
+        "h" => number.saturating_mul(3600),
+        "d" => number.saturating_mul(86_400),
+        _ => anyhow::bail!("expected a duration like 30m, 1h or 2d, got `{value}`"),
+    };
+    Ok(Duration::from_secs(seconds))
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -628,11 +738,25 @@ pub(crate) async fn run(
     let SandboxArgs {
         service,
         token,
+        ca,
         lease_id,
         command,
     } = args;
-    let client = SandboxClient::new(service.clone(), token);
-    let lease = lease_id.unwrap_or_default();
+    match command {
+        SandboxCommand::Serve(serve) => serve_standalone(serve, observability).await,
+        SandboxCommand::Agent(agent) => run_agent(&service, token, agent, observability).await,
+        command => {
+            let client = sandbox_client(&service, token, ca)?;
+            run_client(client, command, lease_id.unwrap_or_default()).await
+        }
+    }
+}
+
+async fn run_client(
+    client: SandboxClient,
+    command: SandboxCommand,
+    lease: String,
+) -> anyhow::Result<()> {
     let lease_id = || -> anyhow::Result<String> {
         if lease.is_empty() {
             anyhow::bail!(
@@ -643,8 +767,9 @@ pub(crate) async fn run(
         Ok(lease.clone())
     };
     match command {
-        SandboxCommand::Serve(serve) => serve_standalone(serve, observability).await,
-        SandboxCommand::Agent(agent) => run_agent(&service, agent, observability).await,
+        SandboxCommand::Serve(_) | SandboxCommand::Agent(_) => {
+            unreachable!("serve and agent run without a caller client")
+        }
         SandboxCommand::Template(TemplateCommand::Put {
             name,
             os,
@@ -789,8 +914,15 @@ pub(crate) async fn run(
                 .await?,
         ),
         SandboxCommand::Ls => print_json(&client.list().await?),
-        SandboxCommand::Providers => print_json(&client.list_providers().await?),
+        SandboxCommand::Token(TokenCommand::Create { ttl }) => {
+            let ttl = parse_ttl(&ttl)?;
+            let response = client.create_join_token(ttl.as_secs()).await?;
+            println!("{}", response.token);
+            Ok(())
+        }
         SandboxCommand::Provider(provider) => match provider {
+            ProviderCommand::Ls => print_json(&client.list_providers().await?),
+            ProviderCommand::Rm { name } => Ok(client.delete_provider(&name).await?),
             ProviderCommand::Cordon { name } => print_json(&client.cordon_provider(&name).await?),
             ProviderCommand::Uncordon { name } => {
                 print_json(&client.uncordon_provider(&name).await?)
@@ -861,6 +993,13 @@ async fn serve_standalone(
     let mut config = service_config(&state)?;
     config.placement = placement_from_env()?;
     let store = store::open(&store_url).await?;
+    let tls = ServerTls::load_or_create(
+        &state,
+        tls::sans_from_env(),
+        env_path("PRELOOP_SANDBOX_TLS_CERT").as_deref(),
+        env_path("PRELOOP_SANDBOX_TLS_KEY").as_deref(),
+    )?;
+    config.ca = Some(tls.ca.clone());
     let metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     config.metrics = metrics.clone();
     let service = Service::open(store, config).await?;
@@ -881,31 +1020,44 @@ async fn serve_standalone(
         );
         tokio::spawn(agent.run(shutdown.clone()));
     }
-    let auth = api_auth(&args.listen)?;
+    let auth = Auth::new(resolve_client_token(&state)?);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    eprintln!("[preloop] sandbox service on http://{}", args.listen);
-    axum::serve(listener, router(service, auth))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    eprintln!("[preloop] sandbox service on https://{}", args.listen);
+    let stop = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        stop.cancel();
+    });
+    serve_api(listener, service, auth, tls, shutdown.clone()).await?;
     shutdown.cancel();
     Ok(())
 }
 
 async fn run_agent(
     service: &str,
+    client_token: Option<String>,
     args: AgentArgs,
     observability: preloop_observability::Observability,
 ) -> anyhow::Result<()> {
-    let name = args.name.unwrap_or_else(local_provider_name);
-    let state = crate::preloop_home().join("state");
-    let scratch = state.join("sandbox-agent");
-    let mut agent_config = sandbox_agent_config(name, scratch).with_access(HostAccess::from_env());
+    let home = crate::preloop_home();
+    let state = home.join("state");
+    let identity_dir = args
+        .identity
+        .unwrap_or_else(|| state.join("sandbox-identity"));
+    let initial_name = args.name.unwrap_or_else(local_provider_name);
+    let base = args.join.as_deref().or(Some(service));
+    let join_token = args.join_token.or(client_token);
+    let link =
+        RemoteLink::connect(&identity_dir, base, join_token.as_deref(), &initial_name).await?;
+    // An existing identity owns the name it was enrolled under.
+    let name = link.name().unwrap_or(initial_name);
+    let base = link.base().to_owned();
+    let mut agent_config =
+        sandbox_agent_config(name, state.join("sandbox-agent")).with_access(HostAccess::from_env());
     agent_config.metrics =
         preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     let agent = Agent::new(
-        Arc::new(RemoteLink::new(service, args.provider_token)),
+        Arc::new(link),
         host_drivers(
             None,
             args.slots,
@@ -919,7 +1071,7 @@ async fn run_agent(
         let _ = tokio::signal::ctrl_c().await;
         stop.cancel();
     });
-    eprintln!("[preloop] sandbox agent joining {service}");
+    eprintln!("[preloop] sandbox agent joining {base}");
     agent.run(shutdown).await;
     Ok(())
 }
