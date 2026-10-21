@@ -388,19 +388,24 @@ impl Drop for EnvLockStillHeld {
 ///   `_boot-vm` processes and sweeps data dirs under the Preloop home; left
 ///   unset it resolves to the developer's `~/.preloop`, where a running
 ///   engine's VMs live.
+/// - `PRELOOP_SHUTDOWN_JOB_GRACE_SECS` -> 0. A `RunAction::Wait` job never
+///   finishes, and the default grace would hold every fixture's teardown for
+///   ten minutes after each cancel. These tests model shutdown, not the
+///   grace itself (the lib's own tests cover that).
 struct HermeticEnvGuard {
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
 impl HermeticEnvGuard {
     fn new(root: &Path) -> Self {
-        let pins: [(&'static str, std::ffi::OsString); 3] = [
+        let pins: [(&'static str, std::ffi::OsString); 4] = [
             (
                 "PRELOOP_GOLDEN_URL",
                 "http://127.0.0.1:1/preloop-golden-unreachable".into(),
             ),
             ("PRELOOP_SKIP_DISK_PREFLIGHT", "1".into()),
             ("PRELOOP_HOME", root.join("preloop-home").into_os_string()),
+            ("PRELOOP_SHUTDOWN_JOB_GRACE_SECS", "0".into()),
         ];
         let previous = pins
             .iter()
@@ -778,15 +783,18 @@ async fn fork_golden_is_marked_forkable_after_guest_provisioning() {
     run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
 
     let snapshot = provider.snapshot().await;
-    let golden = format!("{}-golden", fixture.config.name_prefix);
+    // Golden names are fingerprint-keyed (`<prefix>-golden-<fingerprint>`),
+    // so a rotation can stage a successor beside the one serving.
+    let golden_prefix = format!("{}-golden-", fixture.config.name_prefix);
     // The golden boots the configured image itself: there is no packed
     // artifact on this backend to unpack, and none may be built.
     let spec = snapshot
         .created_specs
         .iter()
-        .find(|spec| spec.name.as_str() == golden)
+        .find(|spec| spec.name.as_str().starts_with(&golden_prefix))
         .expect("golden machine specification");
     assert_eq!(spec.image, fixture.config.base_image);
+    let golden = spec.name.as_str().to_owned();
 
     let events = &snapshot.events;
     let golden_starts = events
@@ -1222,7 +1230,7 @@ async fn cancellation_during_golden_prepare_removes_the_golden_machine() {
     let mut config = fixture.config.clone();
     config.use_fork = true;
     config.control_socket = Some(fixture.root.join("engine.sock"));
-    let golden = format!("{}-golden", config.name_prefix);
+    let golden_prefix = format!("{}-golden-", config.name_prefix);
     let gate = Arc::new(Notify::new());
     let provider = Arc::new(
         RecordingVmProvider::with_machines(&[], vec![RunAction::Wait])
@@ -1235,10 +1243,9 @@ async fn cancellation_during_golden_prepare_removes_the_golden_machine() {
 
     provider
         .wait_until(|state| {
-            state
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::Start(name) if name == &golden))
+            state.events.iter().any(
+                |event| matches!(event, Event::Start(name) if name.starts_with(&golden_prefix)),
+            )
         })
         .await;
 
@@ -1249,6 +1256,14 @@ async fn cancellation_during_golden_prepare_removes_the_golden_machine() {
     result.unwrap().unwrap();
 
     let snapshot = provider.snapshot().await;
+    let golden = snapshot
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::Start(name) if name.starts_with(&golden_prefix) => Some(name.clone()),
+            _ => None,
+        })
+        .expect("the golden started before the shutdown");
     assert!(
         !snapshot.machines.contains_key(&golden),
         "the teardown must delete the half-prepared golden: {:?}",

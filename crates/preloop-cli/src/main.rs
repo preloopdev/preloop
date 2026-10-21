@@ -2316,7 +2316,16 @@ async fn cmd_engine(
     };
 
     shutdown.cancel();
-    settle_pool(&mut pool, Duration::from_secs(30)).await;
+    // The pool itself gives a busy runner up to `PRELOOP_SHUTDOWN_JOB_GRACE_SECS`
+    // (600s by default) to finish its job before the teardown stops it. This
+    // outer window must cover that drain, or it would abort the pool at 30s
+    // and the exit guard's purge would kill the very VM the grace exists to
+    // protect. The extra margin is the teardown that follows the drain.
+    settle_pool(
+        &mut pool,
+        preloop_orchestrator::shutdown_job_grace() + Duration::from_secs(30),
+    )
+    .await;
     server.abort();
     let _ = std::fs::remove_file(socket);
     match result {

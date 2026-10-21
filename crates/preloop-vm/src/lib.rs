@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub mod agent_rootfs;
 pub mod agentenv;
@@ -575,6 +575,19 @@ pub trait VmProvider: Send + Sync {
     ) -> Result<(), VmError> {
         self.fork(golden, clone).await
     }
+    /// Reclaim the extracted layer store a deleted golden alone used.
+    ///
+    /// Called before deletion while its pack pointer still exists. Entries
+    /// referenced by surviving machines must be kept. Providers without a
+    /// host-visible shared store keep the default no-op.
+    async fn reclaim_retired_golden_layers(
+        &self,
+        retired: &MachineName,
+        survivors: &[MachineName],
+    ) -> Result<u64, VmError> {
+        let _ = (retired, survivors);
+        Ok(0)
+    }
     /// Remove `pack/` build intermediates from a machine's data directory once
     /// its finished disk exists (issue #295).
     ///
@@ -700,6 +713,15 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
         volumes: &[VolumeMount],
     ) -> Result<(), VmError> {
         (**self).fork_with_volumes(golden, clone, volumes).await
+    }
+    async fn reclaim_retired_golden_layers(
+        &self,
+        retired: &MachineName,
+        survivors: &[MachineName],
+    ) -> Result<u64, VmError> {
+        (**self)
+            .reclaim_retired_golden_layers(retired, survivors)
+            .await
     }
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
         (**self).stop(name).await
@@ -1437,6 +1459,7 @@ fn prune_pack_dir_in(data_dir: &Path) -> Result<bool, VmError> {
         return Ok(false);
     }
     let bytes = dir_size_bytes(&canonical_pack);
+    preserve_shared_pack_pointer(&canonical_dir, &canonical_pack);
     std::fs::remove_dir_all(&canonical_pack).map_err(|source| VmError::RuntimeIo { source })?;
     info!(
         machine_dir = %canonical_dir.display(),
@@ -1444,6 +1467,105 @@ fn prune_pack_dir_in(data_dir: &Path) -> Result<bool, VmError> {
         "removed pack/ build intermediates beside finished disk"
     );
     Ok(true)
+}
+
+/// Bytes from a `pack prune --layers-only` summary line.
+///
+/// The line is `Removed <N> shared layer(s), reclaimed <X>` where `X` counts
+/// only bytes actually freed on disk (a layer another entry still hard-links
+/// frees nothing). An unrecognized summary reads as 0: the reclamation still
+/// happened, it just cannot be measured from this output.
+fn parse_reclaimed_bytes(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.rsplit_once("reclaimed "))
+        .and_then(|(_, tail)| tail.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Filename SmolVM uses for a machine's pointer to the node-shared extraction
+/// it was created from. SmolVM writes it inside `pack/`; pruning that directory
+/// carries it beside the machine's disk so retirement can still find the entry.
+const SHARED_PACK_POINTER_FILE: &str = ".pack-shared";
+
+/// The shared store entry a machine's `pack/.pack-shared` pointer names.
+///
+/// SmolVM writes the absolute path of the node-shared extraction there when a
+/// `machine create --from` used the shared store; a machine with a private
+/// extraction (macOS's per-machine sparse image, or a create that could not
+/// share) has no pointer and no entry of its own to reclaim.
+///
+/// The pointer is a file on a host this code does not control, and what it
+/// names is removed recursively, so the shape is checked rather than trusted:
+/// an absolute path that resolves to a real directory *inside* `root`, never
+/// the root itself, never through a symlink, and never the `_shared` store
+/// root — that root is the parent of the entries, shared by construction.
+fn shared_store_entry_path(root: &Path, pointer: &str) -> Option<PathBuf> {
+    let named = PathBuf::from(pointer.trim());
+    if !named.is_absolute() {
+        return None;
+    }
+    let entry = named.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    let metadata = std::fs::symlink_metadata(&named).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return None;
+    }
+    if entry == root || !entry.starts_with(&root) {
+        return None;
+    }
+    // `<root>/_shared/<entry>`: the store root is not one golden's entry, and
+    // anything else under the machine-data root is not a store entry at all.
+    let parent = entry.parent()?;
+    let parent_is_store = parent.file_name().and_then(|name| name.to_str()) == Some("_shared")
+        || parent
+            .parent()
+            .and_then(|grandparent| grandparent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("_shared");
+    if !parent_is_store {
+        return None;
+    }
+    if entry.file_name().and_then(|name| name.to_str()) == Some("_shared") {
+        return None;
+    }
+    Some(entry)
+}
+
+/// Carry a machine's shared-store pointer out of `pack/` before it is removed.
+///
+/// Retirement finds the store entry a golden was extracted into through this
+/// pointer, and `pack/` is exactly what [`prune_pack_dir_in`] deletes once the
+/// disk exists. A pointer left inside would make every retired golden's
+/// extracted layers unreachable: the layers-only sweep still sees the entry
+/// naming them and keeps them. The pointer therefore moves beside the machine's
+/// disk. Best effort — a machine without one has no store entry of its own.
+fn preserve_shared_pack_pointer(data_dir: &Path, pack: &Path) {
+    let Ok(pointer) = std::fs::read_to_string(pack.join(SHARED_PACK_POINTER_FILE)) else {
+        return;
+    };
+    if let Err(error) = std::fs::write(data_dir.join(SHARED_PACK_POINTER_FILE), &pointer) {
+        warn!(
+            machine_dir = %data_dir.display(),
+            %error,
+            "could not preserve the shared layer-store pointer"
+        );
+    }
+}
+
+/// The store entry a machine's data directory names: the durable pointer
+/// [`preserve_shared_pack_pointer`] leaves beside the disk, or the original one
+/// inside a `pack/` that has not been pruned yet.
+fn shared_entry_in_data_dir(data_dir: &Path, root: &Path) -> Option<PathBuf> {
+    let pointer = [
+        data_dir.join(SHARED_PACK_POINTER_FILE),
+        data_dir.join("pack").join(SHARED_PACK_POINTER_FILE),
+    ]
+    .into_iter()
+    .find_map(|path| std::fs::read_to_string(path).ok())?;
+    shared_store_entry_path(root, &pointer)
 }
 
 /// Remove `pack/` intermediates inside machine data dirs no registry row
@@ -1522,6 +1644,20 @@ fn prune_unregistered_pack_dirs(
         }
     }
     Ok(pruned)
+}
+
+impl SmolVmProvider {
+    /// The shared store entry a machine was extracted into, when it has one.
+    ///
+    /// Best-effort by design: an unreadable data dir, a machine whose pointer
+    /// is missing, or a layout this build does not recognize all mean "this
+    /// machine has no entry of its own to reclaim", never an error — the
+    /// caller reclaims what it can and leaves the rest.
+    async fn shared_store_entry(&self, name: &MachineName) -> Option<PathBuf> {
+        let data_dir = self.machine_data_dir(name).await.ok()?;
+        let root = machine_data_root()?;
+        shared_entry_in_data_dir(&data_dir, &root)
+    }
 }
 
 #[async_trait]
@@ -1757,6 +1893,59 @@ impl VmProvider for SmolVmProvider {
             }
         }
         result.map(|_| ())
+    }
+
+    async fn reclaim_retired_golden_layers(
+        &self,
+        retired: &MachineName,
+        survivors: &[MachineName],
+    ) -> Result<u64, VmError> {
+        let mut freed = 0u64;
+        if let Some(entry) = self.shared_store_entry(retired).await {
+            // A store entry any surviving machine still points at is shared:
+            // it is not this golden's to reclaim, and removing it would cost
+            // the next fork an extraction.
+            let shared = {
+                let mut shared = false;
+                for survivor in survivors {
+                    if self.shared_store_entry(survivor).await.as_deref() == Some(entry.as_path()) {
+                        shared = true;
+                        break;
+                    }
+                }
+                shared
+            };
+            if !shared {
+                let bytes = dir_size_bytes(&entry);
+                std::fs::remove_dir_all(&entry).map_err(|source| VmError::RuntimeIo { source })?;
+                freed = freed.saturating_add(bytes);
+                info!(
+                    store = %entry.display(),
+                    reclaimed_bytes = bytes,
+                    "reclaimed a retired golden's shared layer store entry"
+                );
+            }
+        }
+        // The store is node-shared and content-addressed, so the layers a
+        // golden used are only *its* to reclaim once no entry names them any
+        // more: the entry above is gone, and SmolVM's own collection keeps
+        // every layer a surviving entry still lists. Missing the subcommand is
+        // not a failure — an older SmolVM simply has nothing to collect.
+        let collected = self
+            .recovery(
+                "pack prune --layers-only",
+                &["pack".into(), "prune".into(), "--layers-only".into()],
+            )
+            .await
+            .map(|output| parse_reclaimed_bytes(&String::from_utf8_lossy(&output.stdout)));
+        match collected {
+            Ok(bytes) => freed = freed.saturating_add(bytes),
+            Err(VmError::Command { message, .. }) if message.contains("unexpected argument") => {
+                debug!("this SmolVM has no shared-layer collection; skipping");
+            }
+            Err(error) => warn!(%error, "shared layer collection failed"),
+        }
+        Ok(freed)
     }
 
     async fn prune_pack_intermediates(&self, name: &MachineName) -> Result<bool, VmError> {
@@ -4502,6 +4691,92 @@ mod tests {
     }
 
     use super::*;
+
+    /// The store pointer is host-writable text naming a directory this code
+    /// removes recursively, so only a real store entry strictly inside the
+    /// machine-data root is accepted.
+    #[test]
+    fn shared_store_entry_accepts_only_a_store_entry_inside_the_root() {
+        let temp = tempfile::tempdir().expect("scratch dir");
+        let root = temp.path().join("vms");
+        let entry = root.join("_shared").join("ea92da8f");
+        std::fs::create_dir_all(&entry).expect("store entry");
+        let canonical = entry.canonicalize().expect("entry path");
+
+        assert_eq!(
+            shared_store_entry_path(&root, &entry.display().to_string()),
+            Some(canonical)
+        );
+        // The store root is shared by construction: never one golden's entry.
+        assert_eq!(
+            shared_store_entry_path(&root, &root.join("_shared").display().to_string()),
+            None
+        );
+        // Outside the machine-data root, missing, relative, or the root itself.
+        let outside = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        assert_eq!(
+            shared_store_entry_path(&root, &outside.display().to_string()),
+            None
+        );
+        assert_eq!(
+            shared_store_entry_path(&root, &root.join("_shared/nope").display().to_string()),
+            None
+        );
+        assert_eq!(shared_store_entry_path(&root, "_shared/ea92da8f"), None);
+        assert_eq!(
+            shared_store_entry_path(&root, &root.display().to_string()),
+            None
+        );
+        // A symlink is refused even when it resolves inside: the pointer is
+        // not allowed to make this code follow a link out of the store.
+        #[cfg(unix)]
+        {
+            let link = root.join("_shared").join("link");
+            std::os::unix::fs::symlink(&entry, &link).expect("symlink");
+            assert_eq!(
+                shared_store_entry_path(&root, &link.display().to_string()),
+                None
+            );
+        }
+    }
+
+    /// Pruning `pack/` must not take the pointer to the extracted layer store
+    /// with it: retirement reclaims the entry through that pointer, and the
+    /// layers-only sweep keeps every layer a surviving entry still names.
+    #[test]
+    fn pruning_pack_intermediates_preserves_the_shared_store_pointer() {
+        let temp = tempfile::tempdir().expect("scratch dir");
+        let root = temp.path().join("vms");
+        let data_dir = root.join("pool-golden-aaaaaaaaaaaa");
+        let entry = root.join("_shared").join("ea92da8f");
+        std::fs::create_dir_all(&entry).expect("store entry");
+        std::fs::create_dir_all(data_dir.join("pack")).expect("pack dir");
+        // Both files a finished create leaves behind: the disk, and the pack
+        // the pruning reclaims.
+        std::fs::write(data_dir.join("storage.raw"), b"disk").expect("disk");
+        std::fs::write(data_dir.join("pack").join("storage.ext4"), b"ext4").expect("intermediate");
+        std::fs::write(
+            data_dir.join("pack").join(SHARED_PACK_POINTER_FILE),
+            entry.display().to_string(),
+        )
+        .expect("pointer");
+
+        // Before pruning, the original location answers for the machine.
+        let canonical = entry.canonicalize().expect("entry path");
+        assert_eq!(
+            shared_entry_in_data_dir(&data_dir, &root),
+            Some(canonical.clone())
+        );
+        assert!(prune_pack_dir(&data_dir).expect("prune"));
+        assert!(!data_dir.join("pack").exists(), "pack/ is gone");
+
+        assert_eq!(
+            shared_entry_in_data_dir(&data_dir, &root),
+            Some(canonical),
+            "the durable pointer still names the entry retirement must reclaim"
+        );
+    }
 
     #[test]
     fn cgroup_root_dir_trims_the_leading_slash_of_proc_self_cgroup_paths() {

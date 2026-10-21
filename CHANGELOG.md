@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- **Stage golden rotations without draining running jobs.** Mutable official
+  golden sources are polled every `PRELOOP_GOLDEN_POLL_SECS` (default 300; 0
+  disables polling). The old golden serves while its successor is prepared;
+  new forks switch generations when ready, idle old runners are replaced, and
+  busy runners finish before the old golden's files are reclaimed. Disk
+  preflight keeps the serving generation when staging cannot fit. Restart
+  during staging can adopt the previous generation. Fixed AgentENV snapshot
+  names have no polling trigger. Retired generations are not retained for rollback.
+
 ## [0.35.5] - 2026-10-21
 
 ### Security
