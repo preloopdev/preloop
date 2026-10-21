@@ -10,11 +10,9 @@ digraph vm_pool {
   }
 
   subgraph cluster_provider {
-    label="VM providers (preloop-vm)"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    label="VM providers (preloop-sandbox)"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
     contract [label="VmProvider trait\ncreate, start_forkable, fork\nexec, copy, pack, delete\ncapabilities()", fillcolor="#bae6fd"];
-    smolvm [label="SmolVmProvider — default\nlibkrun: Hypervisor.framework / KVM\nforks the packed golden", fillcolor="#e0f2fe"];
-    agentenv [label="AgentENV — opt-in\nPRELOOP_VM_BACKEND=agentenv\naenv snapshots, KVM host", fillcolor="#e0f2fe"];
-    { rank=same; smolvm; agentenv; }
+    smolvm [label="SmolVmProvider — public driver\nlibkrun: Hypervisor.framework / KVM\nforks the packed golden", fillcolor="#e0f2fe"];
   }
 
   subgraph cluster_vm {
@@ -25,12 +23,10 @@ digraph vm_pool {
   }
 
   server -> pool [label="queued jobs drive the target"];
-  pool -> contract [label="resolves the backend\nat startup"];
+  pool -> contract [label="resolves the driver\nat startup"];
   contract -> smolvm;
-  contract -> agentenv [label="PRELOOP_VM_BACKEND"];
   pool -> golden [label="download or bake, then\nstart_forkable"];
   golden -> jobvm [label="fork, one clone per job"];
-  agentenv -> jobvm [label="start from snapshot", style=dashed];
   jobvm -> bridge [label="job traffic"];
   bridge -> server [label="registers, polls, sends\nlogs and results", style=dashed, constraint=false];
 }

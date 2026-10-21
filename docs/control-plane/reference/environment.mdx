@@ -130,10 +130,10 @@ Numeric values in this group are decimal integers. Retention, cache, and job-lim
 | `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Prefix for runner machine names. |
 | `PRELOOP_RUNNER_USER` | `runner` for `serve`; `root` for `build-golden` | Guest account used for job steps. An empty value disables account switching in `serve`; `root` restores root. |
 | `PRELOOP_RUNNER_UID` | `1001` | Numeric guest runner UID. |
-| `PRELOOP_RUNNER_DNS` | Provider default | Explicit SmolVM guest DNS override. When unset or empty, preserve provider selection: TSI with a systemd workload uses the resolved stub, virtio-net uses its gateway. AgentENV uses its node resolver. |
+| `PRELOOP_RUNNER_DNS` | Provider default | Explicit SmolVM guest DNS override. When unset or empty, preserve provider selection: TSI with a systemd workload uses the resolved stub, virtio-net uses its gateway. |
 | `PRELOOP_RUNNER_PACK_PROXY` | Falls back to `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy` | HTTP proxy for packed-golden export traffic. |
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Falls back to `NO_PROXY`, `no_proxy` | Proxy bypass list for packed-golden export traffic. |
-| `PRELOOP_RUNNER_BUNDLE` | Auto-discovered Linux `preloop-runner` bundle | Directory containing the Linux guest runner. Invalid paths fall through discovery and then fail startup if no bundle is found. On the AgentENV backend the host tree is archived into a content-addressed read-only volume, so a bundle change publishes a new volume. |
+| `PRELOOP_RUNNER_BUNDLE` | Auto-discovered Linux `preloop-runner` bundle | Directory containing the Linux guest runner. Invalid paths fall through discovery and then fail startup if no bundle is found. |
 | `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` for `serve` | Shared read-only Node runtime externals. |
 | `PRELOOP_SMOLVM_NET_BACKEND` | `virtio-net` | SmolVM public-only network backend. Exact lowercase `tsi` selects TSI; any other value selects `virtio-net`. |
 | `PRELOOP_SMOLVM_WORKLOAD_INIT` | `/sbin/init` (official runner pack only) | Command a runtime pack machine runs as its workload, overriding the pack's recorded entrypoint/cmd. The default gives the official runner pack's guest systemd as PID 1 (`systemctl`, `journald`, `systemd-resolved`, and Docker's `systemd` cgroup driver). A custom pack keeps its own entrypoint/cmd unless this is set; an empty value disables the managed workload. OCI-image machines and the golden builder are unaffected. |
@@ -147,30 +147,9 @@ The official packed golden defaults are digest-pinned per architecture. The curr
 
 ## VM backend
 
-The engine boots each job in a microVM through one provider. SmolVM is the default everywhere; AgentENV is opt-in.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `PRELOOP_VM_BACKEND` | `smolvm` | `smolvm` or `agentenv` (`aenv` is accepted as an alias). An unrecognized value stops startup rather than falling back. AgentENV needs Linux ≥ 6.8 with `/dev/kvm` and `aenv` on `PATH`. |
+The engine boots each job in a microVM through SmolVM, the public driver. A host agent attaches the drivers named in `PRELOOP_SANDBOX_DRIVERS` (default `smolvm`).
 
 <AccordionGroup>
-  <Accordion title="AgentENV backend variables">
-    These apply when `PRELOOP_VM_BACKEND=agentenv`, which drives the `aenv` CLI.
-
-    | Variable | Default | Purpose |
-    |---|---|---|
-    | `PRELOOP_AENV_BINARY` | `aenv` on `PATH` | Path to the `aenv` executable. |
-    | `PRELOOP_AENV_TTL_SECS` | `3600` | Sandbox TTL the provider requests and re-arms. Values below `60` are ignored. |
-    | `PRELOOP_AENV_MANAGE_EGRESS` | `on` | `0`, `false`, `no`, or `off` skips the engine-egress reconciliation with a warning; `dry-run` logs the planned actions and changes nothing. |
-    | `PRELOOP_AENV_ENGINE_IP` | Read from the runner URL | Engine IPv4 address, when the runner URL does not name one and the guest must still reach the engine. |
-    | `PRELOOP_AENV_CONFIG` | `/var/lib/aenv/config/config.toml` | AgentENV node configuration the egress reconciliation reads. |
-    | `PRELOOP_VOLUMES_GC` | `auto` | `auto` or `off`: whether the engine collects superseded runner volumes on its own, after it populates one and every `PRELOOP_VOLUMES_GC_INTERVAL_SECS`. `off` stops those passes and leaves `preloop volumes gc` for manual runs. |
-    | `PRELOOP_VOLUMES_KEEP_PREVIOUS` | `1` | Superseded volumes kept per kind for a rollback. `0` reclaims every superseded volume. |
-    | `PRELOOP_VOLUMES_GC_GRACE_SECS` | `3600` | How long a volume is left alone after it was created. |
-    | `PRELOOP_VOLUMES_GC_INTERVAL_SECS` | `21600` | Period between automatic collection passes; `0` disables the periodic pass. |
-
-    AgentENV sandboxes cannot reach a private engine until the node deny-list and host firewall admit exactly the engine's address and port. The engine reconciles both itself and needs passwordless `sudo` for `iptables` and `systemctl`; set `PRELOOP_AENV_MANAGE_EGRESS=0` to keep the defaults and open them by hand.
-  </Accordion>
   <Accordion title="Update and golden-build variables">
     These are mainly for operators building images or running self-updates.
 
