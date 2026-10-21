@@ -163,6 +163,7 @@ message Sandbox {
   int64 created_at = 12;
   string name = 13;
   int64 preserve_until = 14;
+  Shape shape = 15;                 // configured size, for capacity accounting
 }
 
 message Lease {
@@ -196,6 +197,7 @@ service Sandboxes {
   rpc Pause(GetRequest) returns (Empty);
   rpc Resume(GetRequest) returns (Empty);
   rpc ListProviders(ListRequest) returns (ListProvidersResponse);
+  rpc Stats(ListRequest) returns (StatsResponse);
 }
 
 message Empty {}
@@ -263,6 +265,52 @@ message SnapshotRequest { string sandbox_id = 1; string name = 2; }
 message StartRequest { string sandbox_id = 1; bool forkable = 2; }
 message ListProvidersResponse { repeated Provider providers = 1; }
 
+// Host and per-sandbox facts only the owning driver can measure, reported
+// on `Heartbeat` and surfaced read-only by `Stats`. Every field is itself
+// optional or empty-means-unmeasured: a driver that cannot measure
+// something omits it rather than fabricating a zero.
+message HostTopProcess {
+  uint32 pid = 1;
+  string name = 2;
+  uint64 rss_bytes = 3;
+}
+message HostSample {
+  optional uint64 mem_total_bytes = 1;
+  optional uint64 mem_available_bytes = 2;
+  optional uint64 swap_total_bytes = 3;
+  optional uint64 swap_free_bytes = 4;
+  optional uint64 engine_rss_bytes = 5;      // the host agent's own RSS
+  optional uint64 vm_rss_bytes = 6;          // summed guest-VM RSS
+  repeated HostTopProcess top_processes = 7;
+}
+message SandboxRuntimeStats {
+  string native_ref = 1;
+  optional uint32 pid = 2;
+  optional uint64 memory_bytes = 3;          // RSS or cgroup memory.current
+  string data_dir = 4;
+  optional int64 start_time = 5;             // unix seconds
+}
+// What a provider reports at `Heartbeat`, batched so a 10s heartbeat and a
+// reconcile need not each re-measure.
+message HostReport {
+  HostSample host = 1;
+  repeated SandboxRuntimeStats sandboxes = 2;
+}
+message SandboxStats {
+  Sandbox sandbox = 1;
+  SandboxRuntimeStats runtime = 2;           // default/empty when unmeasured
+}
+message ProviderStats {
+  string provider_id = 1;
+  string name = 2;
+  repeated DriverInfo drivers = 3;
+  HostSample host = 4;
+  int64 host_sample_age_secs = 5;            // 0 = never sampled
+  repeated SandboxStats sandboxes = 6;
+}
+message StatsResponse { repeated ProviderStats providers = 1; }
+
+
 // ─── Providers (capacity owners) ──────────────────────────────────────
 
 service Providers {
@@ -286,7 +334,12 @@ message Provider {
 
 message RegisterRequest { string name = 1; repeated DriverInfo drivers = 2; }
 message RegisterResponse { string provider_id = 1; uint64 generation = 2; }
-message HeartbeatRequest { string provider_id = 1; uint64 generation = 2; }
+message HeartbeatRequest {
+  string provider_id = 1;
+  uint64 generation = 2;
+  HostSample host = 3;
+  repeated SandboxRuntimeStats sandboxes = 4; // this provider's full current set
+}
 message PollRequest { string provider_id = 1; uint64 generation = 2; uint64 wait_secs = 3; }
 
 message CreateWork {

@@ -320,9 +320,12 @@ impl Agent {
                     tokio::select! {
                         _ = stop.cancelled() => return,
                         _ = tick.tick() => {
+                            let (host, sandboxes) = agent.collect_host_report().await;
                             if let Err(error) = agent.link.heartbeat(HeartbeatRequest {
                                 provider_id: session.provider_id.clone(),
                                 generation: session.generation,
+                                host,
+                                sandboxes,
                             }).await && error.code == Code::Aborted {
                                 stop.cancel();
                                 return;
@@ -416,6 +419,23 @@ impl Agent {
             }
             Err(error) => debug!(%error, "reconcile failed"),
         }
+    }
+
+    /// Fan out `host_report` over every driver on this host: one host
+    /// sample (the first driver to measure one wins; they describe the
+    /// same host) plus every driver's current sandboxes, merged. Never
+    /// fails — a driver without the hook contributes nothing.
+    pub async fn collect_host_report(&self) -> (Option<HostSample>, Vec<SandboxRuntimeStats>) {
+        let mut host = None;
+        let mut sandboxes = Vec::new();
+        for driver in self.drivers.values() {
+            let report = driver.host_report().await;
+            if host.is_none() && report.host != HostSample::default() {
+                host = Some(report.host);
+            }
+            sandboxes.extend(report.sandboxes);
+        }
+        (host, sandboxes)
     }
 
     fn driver(&self, name: &str) -> Result<Arc<dyn Driver>> {

@@ -1,47 +1,6 @@
 #![allow(missing_docs)]
-use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::path::Path;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
-
-use parking_lot::RwLock;
-
-use crate::status::{VmConfigured, VmCount, VmFleetSnapshot, VmHostUsage, VmSource};
-
-#[derive(Debug, Clone)]
-pub struct VmRuntimeInfo {
-    pub name: String,
-    pub role: String,
-    pub activity: String,
-    pub pid: Option<u32>,
-    pub start_time: Option<u64>,
-    pub cpus: u16,
-    pub memory_mib: u32,
-    pub storage_gb: u32,
-    pub overlay_gb: Option<u32>,
-    pub data_dir: Option<PathBuf>,
-    pub created_at: Option<SystemTime>,
-}
-
-#[derive(Debug, Default)]
-pub struct VmTelemetryRegistry {
-    inner: RwLock<HashMap<String, VmRuntimeInfo>>,
-}
-
-impl VmTelemetryRegistry {
-    pub fn register(&self, info: VmRuntimeInfo) {
-        self.inner.write().insert(info.name.clone(), info);
-    }
-
-    pub fn deregister(&self, name: &str) {
-        self.inner.write().remove(name);
-    }
-
-    pub fn snapshot(&self) -> Vec<VmRuntimeInfo> {
-        self.inner.read().values().cloned().collect()
-    }
-}
 
 /// Sample host memory reality: totals, availability, engine RSS, VM RSS,
 /// and the top RSS processes. Linux reads `/proc` (`VmRSS` is already KiB,
@@ -255,73 +214,19 @@ fn sample_host_linux() -> HostSample {
     }
 }
 
-pub fn build_fleet_snapshot(
-    registry: &VmTelemetryRegistry,
-    sample_age: Option<Duration>,
-    capabilities: HashMap<String, bool>,
-) -> VmFleetSnapshot {
-    let infos = registry.snapshot();
-    let runner = infos.iter().filter(|i| i.role == "runner").count() as u32;
-    let golden = infos.iter().filter(|i| i.role == "golden").count() as u32;
-    let vcpus: u32 = infos.iter().map(|i| u32::from(i.cpus)).sum();
-    let memory_bytes: u64 = infos
-        .iter()
-        .map(|i| u64::from(i.memory_mib) * 1024 * 1024)
-        .sum();
-    let storage_bytes: u64 = infos
-        .iter()
-        .map(|i| u64::from(i.storage_gb) * 1024 * 1024 * 1024)
-        .sum();
-    let overlay_bytes: u64 = infos
-        .iter()
-        .filter_map(|i| i.overlay_gb.map(|v| u64::from(v) * 1024 * 1024 * 1024))
-        .sum();
-
-    let source = if capabilities.get("cpu").copied().unwrap_or(false) {
-        VmSource::CgroupV2
-    } else if capabilities.get("process").copied().unwrap_or(false) {
-        VmSource::Process
-    } else {
-        VmSource::Unavailable
-    };
-
-    let host = sample_host();
-    VmFleetSnapshot {
-        source,
-        sample_age_seconds: sample_age.map(|d| d.as_secs_f64()),
-        capabilities,
-        count: VmCount {
-            runner,
-            golden,
-            unavailable: 0,
-        },
-        configured: VmConfigured {
-            vcpus,
-            memory_bytes,
-            storage_bytes,
-            overlay_bytes,
-        },
-        host_usage: VmHostUsage {
-            cpu_cores: None,
-            memory_bytes: None,
-            sparse_disk_allocated_bytes: None,
-            mem_total_bytes: host.mem_total_bytes,
-            mem_available_bytes: host.mem_available_bytes,
-            swap_total_bytes: host.swap_total_bytes,
-            swap_free_bytes: host.swap_free_bytes,
-            engine_rss_bytes: host.engine_rss_bytes,
-            vm_rss_bytes: host.vm_rss_bytes,
-        },
-        top_consumers: Vec::new(),
-        host_top_processes: host
-            .top_processes
-            .iter()
-            .map(|process| crate::status::HostTopProcess {
-                pid: process.pid,
-                name: process.name.clone(),
-                rss_bytes: process.rss_bytes,
-            })
-            .collect(),
+/// One process's RSS (`VmRSS` from `/proc/<pid>/status`, already KiB) for a
+/// driver reporting per-sandbox memory at `Heartbeat`. Linux only; every
+/// other platform returns `None` rather than a fabricated value.
+pub fn process_rss_bytes(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        parse_status_rss_kib(&status).map(|kib| kib.saturating_mul(1024))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -376,5 +281,12 @@ mod tests {
         };
         assert_eq!(no_swap.swap_used_fraction(), None);
         assert_eq!(HostSample::unavailable().ram_used_fraction(), None);
+    }
+
+    #[test]
+    fn process_rss_bytes_of_a_bogus_pid_is_none() {
+        // Never a fabricated value when the process cannot be read (also
+        // covers non-Linux platforms, where this always returns `None`).
+        assert_eq!(process_rss_bytes(u32::MAX), None);
     }
 }

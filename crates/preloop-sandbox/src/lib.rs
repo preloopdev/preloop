@@ -16,6 +16,7 @@ pub mod connect;
 pub mod driver;
 pub mod drivers;
 pub mod guest_privilege;
+pub mod metrics;
 pub mod server;
 pub mod service;
 pub mod store;

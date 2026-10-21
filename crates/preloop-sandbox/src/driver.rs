@@ -7,11 +7,10 @@
 
 use std::path::Path;
 
+use crate::api::{Capabilities, CreateWork, ExecEvent, ExecRequest, HostReport, Observed};
+use crate::connect::{Error, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-
-use crate::api::{Capabilities, CreateWork, ExecEvent, ExecRequest, Observed};
-use crate::connect::{Error, Result};
 
 /// A sandbox backend on one host (or one remote endpoint, for connectors).
 #[async_trait]
@@ -78,6 +77,15 @@ pub trait Driver: Send + Sync {
 
     /// Every sandbox this driver owns on this host.
     async fn inventory(&self) -> Result<Vec<Observed>>;
+
+    /// Best-effort host + per-sandbox runtime facts, sent on every
+    /// `Heartbeat`. Never fails: a backend that cannot measure any of this
+    /// returns the default (empty) report rather than an error — stats
+    /// collection must not block heartbeat delivery or create false
+    /// liveness negatives.
+    async fn host_report(&self) -> HostReport {
+        HostReport::default()
+    }
 }
 
 /// The error for an operation a backend does not declare.

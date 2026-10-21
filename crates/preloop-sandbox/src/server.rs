@@ -133,6 +133,7 @@ async fn sandboxes(
         "ListProviders" => reply(Ok(ListProvidersResponse {
             providers: service.list_providers(),
         })),
+        "Stats" => reply(Ok(service.stats())),
         "Exec" => match connect::decode_stream_request::<ExecRequest>(&body) {
             Ok(r) => match service.exec(r) {
                 Ok(stream) => connect::stream_response(stream),

@@ -433,4 +433,16 @@ impl Driver for SmolvmDriver {
             })
             .collect())
     }
+
+    async fn host_report(&self) -> HostReport {
+        let mut report = self.provider.host_report().await;
+        // Only this driver's own sandboxes: `list()` sees every machine
+        // smolvm knows about (goldens the pool manages separately,
+        // adopted or foreign machines), matching `inventory`'s ownership
+        // filter.
+        report
+            .sandboxes
+            .retain(|s| s.native_ref.starts_with(NATIVE_PREFIX) || self.adopts(&s.native_ref));
+        report
+    }
 }

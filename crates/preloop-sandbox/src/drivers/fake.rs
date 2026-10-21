@@ -285,6 +285,31 @@ impl Driver for FakeDriver {
         }
         Ok(out)
     }
+
+    async fn host_report(&self) -> HostReport {
+        let host = preloop_observability::vm_telemetry::sample_host().into();
+        let mut sandboxes = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.root.join("sandboxes")) else {
+            return HostReport { host, sandboxes };
+        };
+        for entry in entries.flatten() {
+            let native_ref = entry.file_name().to_string_lossy().into_owned();
+            let start_time = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.created().ok())
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64);
+            sandboxes.push(SandboxRuntimeStats {
+                native_ref,
+                pid: None,
+                memory_bytes: None,
+                data_dir: entry.path().display().to_string(),
+                start_time,
+            });
+        }
+        HostReport { host, sandboxes }
+    }
 }
 
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
