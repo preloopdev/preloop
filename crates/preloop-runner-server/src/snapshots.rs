@@ -2681,21 +2681,51 @@ async fn run_git_with_stdin(
     let mut stdin = child.stdin.take().ok_or_else(|| {
         ApiError::internal(format!("failed to {operation}: Git stdin was not piped"))
     })?;
-    stdin
-        .write_all(input)
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        ApiError::internal(format!("failed to {operation}: Git stdout was not piped"))
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        ApiError::internal(format!("failed to {operation}: Git stderr was not piped"))
+    })?;
+    // Drain the child's output while its stdin is still being written. A
+    // write-all-then-read sequence deadlocks as soon as both pipes fill:
+    // `cat-file --batch-check` over a repository with thousands of refs (the
+    // router workspace sends ~4800 object ids) answers per line, so once the
+    // 64 KiB stdout pipe is full the child stops reading stdin, and the
+    // parent waits forever for a write the child will never accept.
+    let write = async move {
+        let written = stdin.write_all(input).await;
+        drop(stdin);
+        written
+    };
+    let read_stdout = async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    };
+    let read_stderr = async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    };
+    let (written, stdout, stderr, status) =
+        tokio::join!(write, read_stdout, read_stderr, child.wait());
+    let status =
+        status.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let stdout =
+        stdout.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let stderr =
+        stderr.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
+    let output = std::process::Output {
+        status,
+        stdout,
+        stderr,
+    };
     if !output.status.success() {
         return Err(ApiError::internal(format!(
             "failed to {operation}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
+    written.map_err(|error| ApiError::internal(format!("failed to {operation}: {error}")))?;
     Ok(output)
 }
 
@@ -2729,6 +2759,46 @@ async fn cache_holds_commit(repository: &FsPath, sha: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Whether a local clone can hardlink object files from the workspace.
+///
+/// `git clone --local` hardlinks loose objects and pack files instead of
+/// copying them, and `link(2)` refuses to cross filesystems (`EXDEV`). The
+/// workspace and the state directory routinely sit on different ones: a
+/// workspace bind mount, a container overlay, or a shared volume whose files
+/// live on another mount while reporting the overlay's single `st_dev`. When
+/// either side cannot be probed, copy rather than risk the link.
+fn local_clone_can_hardlink(common_dir: &FsPath, cache_root: &FsPath) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(common_dir), Ok(cache_root)) =
+        (std::fs::metadata(common_dir), std::fs::metadata(cache_root))
+    else {
+        return false;
+    };
+    common_dir.dev() == cache_root.dev()
+}
+
+/// Clone the workspace into the snapshot object cache staging directory.
+///
+/// `hardlink` selects the fast path (`--local`), which links object files and
+/// can only work within one filesystem. The copy path (`--no-hardlinks`) is
+/// slower but crosses device boundaries and overlay layers that the `st_dev`
+/// probe above cannot see.
+async fn clone_object_cache(
+    workspace: &FsPath,
+    staging: &FsPath,
+    hardlink: bool,
+) -> Result<(), ApiError> {
+    let mut clone = Command::new("git");
+    clone.args(["clone", "--bare", "--local", "--quiet"]);
+    if !hardlink {
+        clone.arg("--no-hardlinks");
+    }
+    clone.arg(workspace).arg(staging);
+    run_git(&mut clone, "initialize snapshot object cache")
+        .await
+        .map(|_| ())
+}
+
 async fn ensure_object_cache(
     state_dir: &FsPath,
     workspace: &FsPath,
@@ -2754,12 +2824,27 @@ async fn ensure_object_cache(
     let mut cloned = false;
     if !repository.is_dir() {
         let staging = root.join(format!("{key}.{}.tmp", uuid::Uuid::new_v4()));
-        let mut clone = Command::new("git");
-        clone
-            .args(["clone", "--bare", "--local", "--quiet"])
-            .arg(workspace)
-            .arg(&staging);
-        if let Err(error) = run_git(&mut clone, "initialize snapshot object cache").await {
+        let hardlink = local_clone_can_hardlink(common_dir, &root);
+        let cloned_into_staging = match clone_object_cache(workspace, &staging, hardlink).await {
+            Ok(()) => Ok(()),
+            // The probe answers for the paths it can stat, not for every layer
+            // underneath them: an overlay reports one `st_dev` while its files
+            // still refuse links across layers, and a mount can change between
+            // the probe and the clone. A hardlinked clone that fails is retried
+            // as a copy before the submission is refused.
+            Err(error) if hardlink => {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                warn!(
+                    workspace = %workspace.display(),
+                    staging = %staging.display(),
+                    error = error.message(),
+                    "hardlinked snapshot object cache clone failed; retrying with copied objects"
+                );
+                clone_object_cache(workspace, &staging, false).await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = cloned_into_staging {
             let _ = tokio::fs::remove_dir_all(&staging).await;
             return Err(error);
         }
@@ -7032,15 +7117,15 @@ mod snapshot_staging_tests {
 
     /// A directory on a different filesystem from the state directory,
     /// unmounted when it goes out of scope.
-    struct OtherFilesystem {
-        path: PathBuf,
+    pub(super) struct OtherFilesystem {
+        pub(super) path: PathBuf,
         /// Device node of a RAM disk to detach on drop; `None` for a
         /// borrowed mount such as `/dev/shm`.
         ram_disk: Option<String>,
     }
 
     impl OtherFilesystem {
-        fn create(reference: &FsPath, scratch: &FsPath) -> Option<Self> {
+        pub(super) fn create(reference: &FsPath, scratch: &FsPath) -> Option<Self> {
             if let Some(path) = OTHER_DEVICE_CANDIDATES
                 .iter()
                 .map(FsPath::new)
@@ -7458,7 +7543,9 @@ mod github_remote_slug_selection_tests {
 
 #[cfg(test)]
 mod object_cache_tests {
+    use super::snapshot_staging_tests::OtherFilesystem;
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     fn git(directory: &FsPath, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
@@ -7579,6 +7666,89 @@ mod object_cache_tests {
             .unwrap();
 
         assert!(cache_has(&healed, &detached));
+    }
+
+    /// Path of a loose object inside an object directory.
+    fn loose_object(objects: &FsPath, sha: &str) -> PathBuf {
+        objects.join(&sha[..2]).join(&sha[2..])
+    }
+
+    /// The production layout that used to fail submissions with a 500: the
+    /// workspace on one filesystem and the state directory on another.
+    /// `git clone --local` hardlinks objects, and a hardlink across devices is
+    /// refused with `EXDEV`; the cache must copy the objects instead.
+    #[tokio::test]
+    async fn cache_clone_copies_objects_across_filesystems() {
+        let temp = tempfile::tempdir().unwrap();
+        let (work, common_dir, on_branch, _) = detached_workspace(temp.path());
+        let Some(other) = OtherFilesystem::create(temp.path(), temp.path()) else {
+            eprintln!("skipping: no second filesystem is available");
+            return;
+        };
+        let state_guard = tempfile::tempdir_in(&other.path).unwrap();
+        let state = state_guard.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        assert!(!local_clone_can_hardlink(&common_dir, &state));
+
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+            .await
+            .expect("a workspace on another filesystem must still build the cache");
+
+        assert!(cache_has(&cache, &on_branch));
+        assert_eq!(
+            std::fs::metadata(loose_object(&cache.objects, &on_branch))
+                .unwrap()
+                .nlink(),
+            1,
+            "the cross-filesystem clone copies objects instead of hardlinking them"
+        );
+    }
+
+    /// The same-filesystem fast path stays: the clone hardlinks the
+    /// workspace's objects instead of paying for a copy.
+    #[tokio::test]
+    async fn cache_clone_hardlinks_on_one_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let (work, common_dir, on_branch, _) = detached_workspace(temp.path());
+        let state = temp.path().join("state");
+
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+            .await
+            .unwrap();
+
+        assert!(cache_has(&cache, &on_branch));
+        assert_eq!(
+            std::fs::metadata(loose_object(&cache.objects, &on_branch))
+                .unwrap()
+                .nlink(),
+            2,
+            "the same-filesystem clone hardlinks the workspace's objects"
+        );
+    }
+}
+
+#[cfg(test)]
+mod git_stdin_tests {
+    use super::*;
+
+    /// Pin the pipe deadlock behind the router submission: `cat` echoes as it
+    /// reads, so writing a megabyte before reading a byte filled both pipes —
+    /// the child stopped reading stdin once stdout filled, and the parent
+    /// stopped reading stdout once stdin filled. `present_objects` sends
+    /// ~4800 object ids to `git cat-file --batch-check`, which is enough to
+    /// trigger the same standoff.
+    #[tokio::test]
+    async fn large_stdin_payload_is_drained_while_written() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "cat"]);
+        let input = vec![b'x'; 1024 * 1024];
+
+        let output = run_git_with_stdin(&mut command, &input, "echo large input")
+            .await
+            .expect("a large stdin payload must not deadlock against its output");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, input);
     }
 }
 

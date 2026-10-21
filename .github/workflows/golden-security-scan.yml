@@ -59,9 +59,10 @@ jobs:
       - name: Download baked SBOM
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOLDEN_RUN_ID: ${{ steps.golden.outputs.run_id }}
         run: |
           set -euo pipefail
-          gh run download "${{ steps.golden.outputs.run_id }}" \
+          gh run download "$GOLDEN_RUN_ID" \
             -n golden-sbom-x86_64 -D dist
           test -s dist/preloop-ubuntu-24.04-x86_64.apt-sbom.cdx.json
 
