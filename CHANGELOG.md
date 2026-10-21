@@ -19,8 +19,10 @@ Releases before v0.27.0 predate the changelog.
   the action's directory everywhere it travels — the workflow's `uses:`, the
   official `ActionDownloadInfo` `path`, a parent manifest's nested `uses:`,
   and the per-run resolution ledger — and reads `path/action.yml`. A
-  repository named at both its root and a subpath keeps both manifests, and
-  one adjudication reads a bounded number of them, so a workflow cannot
+  subdirectory composite that a root composite names is read in the wave
+  that needs it, even when the root's own request came earlier. A repository
+  named at both its root and a subpath keeps both manifests, and one
+  adjudication fetches at most 256 uncached manifests, so a workflow cannot
   multiply contents reads through subpaths or refs.
 
 ## [0.35.5] - 2026-10-21

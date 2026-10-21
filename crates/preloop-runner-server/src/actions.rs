@@ -688,16 +688,15 @@ pub fn action_download_ticket(
 pub const MAX_ACTION_BATCH_SIZE: usize = 256;
 /// Maximum concurrent outbound GitHub ref resolution requests.
 pub const MAX_ACTION_CONCURRENCY: usize = 16;
-/// Most composite manifests one adjudication reads to close the nested
-/// `uses:` graph. Real jobs nest a few levels deep; the cap bounds the
-/// contents reads a hostile workflow or runner can force by declaring one
-/// repository at many subpaths or by asking for many refs of it.
-const MAX_MANIFEST_SOURCES_PER_ADJUDICATION: usize = 512;
-/// Most manifest directories one adjudication reads for a single declared
-/// repository. A repository named at more subpaths than this keeps its first
-/// directories in sorted order; the rest stay unread (and their nested
-/// actions denied) rather than multiplying contents reads.
-const MAX_MANIFEST_DIRECTORIES_PER_SCOPE: usize = 16;
+/// Most manifests one adjudication fetches from GitHub. Manifests already in
+/// the nested-uses memo cost nothing; only uncached reads draw on this budget.
+/// A manifest past the budget is not read, so whatever only it would authorize
+/// stays denied for this wave and is retried on the next one.
+const MAX_MANIFEST_FETCHES_PER_ADJUDICATION: usize = 256;
+/// Most manifest directories one adjudication reads for one repository at one
+/// ref, the repository root included. A workflow naming a repository at many
+/// subpaths cannot multiply reads past this.
+const MAX_MANIFEST_DIRECTORIES_PER_REF: usize = 16;
 
 type ResolvedActionParts = (String, String, String, Option<String>, String);
 
@@ -708,6 +707,23 @@ type ResolvedActionParts = (String, String, String, Option<String>, String);
 /// ledger — carry the manifest location with it.
 pub(crate) type ManifestAction = (String, Option<String>);
 
+/// One manifest to read: `owner/repo`, the ref it is read at, and its
+/// directory (`None` at the repository root).
+type ManifestSource = (String, String, Option<String>);
+
+/// Which manifest directory an action request names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RequestedDirectory {
+    /// No path. The request may be for the repository root or for any subpath
+    /// the run declares or a manifest names, so all of those are read.
+    Unspecified,
+    /// A path that cannot be fetched safely. Only the root manifest is read,
+    /// the conservative answer the reference alone gives.
+    Root,
+    /// The manifest directory the request names.
+    Subpath(String),
+}
+
 /// One action reference a runner asked to resolve, normalized from either
 /// protocol shape.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -717,15 +733,16 @@ struct ActionRequest {
     action: String,
     /// The ref override the request supplied; `None` when `action` embeds it.
     version: Option<String>,
-    /// The directory holding the action's manifest, when the reference names
-    /// one: the official `ActionDownloadInfo` `path`, or the subpath in a
-    /// `runnerresolve` reference.
-    directory: Option<String>,
+    /// The manifest directory the request names.
+    directory: RequestedDirectory,
 }
 
 impl ActionRequest {
     fn new(action: String, version: Option<String>) -> Self {
-        let directory = action_manifest_directory(&action);
+        let directory = match reference_subpath(&action) {
+            Some(path) => requested_directory(&path),
+            None => RequestedDirectory::Unspecified,
+        };
         Self {
             action,
             version,
@@ -734,21 +751,16 @@ impl ActionRequest {
     }
 
     /// Build from the official `ActionDownloadInfo` reference, whose `path`
-    /// names the subdirectory of a composite action's manifest. A path that
-    /// cannot be fetched safely is dropped, leaving the conservative answer
-    /// the reference alone gives.
+    /// names the subdirectory of a composite action's manifest. An empty path
+    /// names nothing; an unsafe one falls back to the root manifest.
     fn from_reference(reference: ActionReference) -> Option<Self> {
         if reference.name_with_owner.is_empty() {
             return None;
         }
         let version = (!reference.r#ref.is_empty()).then_some(reference.r#ref);
         let mut request = Self::new(reference.name_with_owner, version);
-        if let Some(directory) = reference
-            .path
-            .as_deref()
-            .and_then(manifest_directory_from_path)
-        {
-            request.directory = Some(directory);
+        if let Some(path) = reference.path.as_deref().filter(|path| !path.is_empty()) {
+            request.directory = requested_directory(path);
         }
         Some(request)
     }
@@ -904,30 +916,38 @@ pub fn normalize_action_owner_repo(uses: &str) -> Option<String> {
 /// segments): the conservative answer is the root manifest, which never
 /// authorizes anything the reference did not already name.
 fn action_manifest_directory(uses: &str) -> Option<String> {
-    let repo_part = uses.split('@').next().unwrap_or(uses);
+    reference_subpath(uses).and_then(|path| manifest_directory_from_path(&path))
+}
+
+/// The path after `owner/repo` in a `uses:`-style reference, before any `@ref`.
+/// `None` when the reference names only the repository.
+fn reference_subpath(reference: &str) -> Option<String> {
+    let repo_part = reference.split('@').next().unwrap_or(reference);
     let mut segments = repo_part.split('/');
     segments.next()?;
     segments.next()?;
-    let directory: Vec<&str> = segments.collect();
-    // An empty segment (a doubled or trailing slash) is not a path this
-    // helper fetches: fall back to the root manifest rather than resolving
-    // it into a different, shallower directory.
-    if directory.iter().any(|segment| segment.is_empty()) {
-        return None;
+    let path: Vec<&str> = segments.collect();
+    (!path.is_empty()).then(|| path.join("/"))
+}
+
+/// Classify a manifest path a reference names.
+fn requested_directory(path: &str) -> RequestedDirectory {
+    match manifest_directory_from_path(path) {
+        Some(directory) => RequestedDirectory::Subpath(directory),
+        None => RequestedDirectory::Root,
     }
-    manifest_directory_from_path(&directory.join("/"))
 }
 
 /// Normalize a repository-relative directory from a `uses:` path or an
 /// `ActionDownloadInfo` reference's `path`.
 ///
-/// A directory that cannot be fetched safely (empty, `.`/`..` segments,
-/// dynamic expressions, backslashes, NUL) yields `None`; callers fall back to
-/// the root manifest, which never authorizes anything the reference did not
-/// already name.
+/// A directory that cannot be fetched safely (any empty segment, so leading,
+/// trailing and doubled slashes too, or `.`/`..` segments, dynamic expressions,
+/// backslashes, NUL) yields `None`; callers fall back to the root manifest,
+/// which never authorizes anything the reference did not already name.
 fn manifest_directory_from_path(path: &str) -> Option<String> {
     let mut directory: Vec<&str> = Vec::new();
-    for segment in path.trim_matches('/').split('/') {
+    for segment in path.split('/') {
         if segment.is_empty()
             || segment == "."
             || segment == ".."
@@ -939,7 +959,7 @@ fn manifest_directory_from_path(path: &str) -> Option<String> {
         }
         directory.push(segment);
     }
-    (!directory.is_empty()).then(|| directory.join("/"))
+    Some(directory.join("/"))
 }
 
 /// Normalize a bare `owner/repo` slug (e.g. the run's repository) to its
@@ -2160,15 +2180,17 @@ async fn read_snapshot_file(
 /// Nested `uses:` of a composite action's manifest, memoized per
 /// (`owner`, `repo`, `ref`, directory). Each nested action keeps the directory
 /// holding its own manifest. Only definitive answers are cached (see
-/// [`ActionManifestNestedUses`]); a transient failure returns an empty set
-/// uncached so the next adjudication retries.
+/// [`ActionManifestNestedUses`]); a transient failure answers empty uncached so
+/// the next adjudication retries. A manifest that is neither cached nor within
+/// `fetches_left` is not read, and `None` tells the caller it was skipped.
 async fn nested_action_uses(
     state: &AppState,
     owner: &str,
     repo: &str,
     directory: Option<&str>,
     git_ref: &str,
-) -> BTreeSet<ManifestAction> {
+    fetches_left: &mut usize,
+) -> Option<BTreeSet<ManifestAction>> {
     let key = (
         owner.to_lowercase(),
         repo.to_lowercase(),
@@ -2178,16 +2200,20 @@ async fn nested_action_uses(
     if let Ok(cache) = state.action_manifest_nested_uses.lock()
         && let Some(cached) = cache.get(&key)
     {
-        return cached.clone();
+        return Some(cached.clone());
     }
-    // A transient failure yields `None`: fail closed for this adjudication
-    // without poisoning the cache — the next wave retries the fetch.
+    if *fetches_left == 0 {
+        return None;
+    }
+    *fetches_left -= 1;
+    // A transient failure yields an empty answer for this adjudication without
+    // poisoning the cache — the next wave retries the fetch.
     // Definitive answers (even empty: a non-composite action, or a repo
     // with no manifest, never grows nested uses at this ref) are cached.
     let Some(nested) =
         fetch_action_manifest_nested_uses(state, owner, repo, directory, git_ref).await
     else {
-        return BTreeSet::new();
+        return Some(BTreeSet::new());
     };
     if let Ok(mut cache) = state.action_manifest_nested_uses.lock() {
         if cache.len() >= crate::state::MAX_ACTION_MANIFEST_MEMO {
@@ -2195,7 +2221,7 @@ async fn nested_action_uses(
         }
         cache.insert(key, nested.clone());
     }
-    nested
+    Some(nested)
 }
 
 /// Fetch `action.yml`/`action.yaml` at `directory` for (`owner`, `repo`,
@@ -2364,170 +2390,143 @@ fn manifest_nested_uses_from_yaml(decoded: &[u8]) -> (BTreeSet<ManifestAction>, 
     (nested, local)
 }
 
+/// One action request that names a remote action, with its place in the batch.
+struct RemoteRequest {
+    index: usize,
+    scope: String,
+    git_ref: String,
+    directory: RequestedDirectory,
+}
+
 /// Enforce the run's declared-action allowlist on one resolution batch.
 ///
-/// Every requested remote action must be in `declared`, or be nested inside
-/// the manifest of an action this run already resolved (the transitive
-/// composite closure: a composite action's nested `uses:` arrive in later
-/// waves, after the parent's own download, so they cannot be in the
-/// workflow's direct set). Anything else fails the whole batch with 403 —
-/// no ticket is minted for an undeclared action, closing the download
-/// oracle.
+/// Every requested remote action must be declared in the workflow, or be named
+/// by a manifest this run reads. A composite action's nested `uses:` arrive in
+/// later waves, after the parent's own download, so the closure starts from the
+/// manifests the run's earlier waves recorded on its ledger. Anything else
+/// fails the whole batch with 403: no ticket is minted for an undeclared
+/// action, closing the download oracle.
 ///
-/// Requests that are not remote actions (local `./`, `docker://`,
-/// self-repo `$/`, expression-driven) are left to the resolver, which drops
-/// them exactly as before: they can never mint a ticket.
+/// A repository is admitted only when the workflow or a manifest already read
+/// names it. A directory only selects which manifest of an admitted repository
+/// is read: a request names its directory, and a request that names none reads
+/// the root and every directory the run knows for its repository. Each such
+/// directory is read at every ref the run works with, so a subdirectory named
+/// by a manifest is read even when the request for its repository came in an
+/// earlier wave.
 ///
-/// On success, this batch's admitted (`owner/repo`, `ref`, directory) triples
-/// are recorded on the run's resolution ledger for later waves.
+/// Requests that are not remote actions (local `./`, `docker://`, self-repo `$/`,
+/// expression-driven) are left to the resolver, which drops them exactly as
+/// before: they can never mint a ticket.
+///
+/// On success, this batch's manifest reads are recorded on the run's resolution
+/// ledger for later waves.
 async fn enforce_declared_actions(
     state: &AppState,
     run_id: RunId,
     declared: &DeclaredActions,
     requests: &[ActionRequest],
 ) -> Result<(), ApiError> {
-    // (batch index, owner/repo, ref, request directory) for requests
-    // naming a remote action.
-    let mut remote: Vec<(usize, String, String, Option<String>)> = Vec::new();
-    for (index, request) in requests.iter().enumerate() {
-        if let Some(owner_repo) = normalize_action_owner_repo(&request.action) {
-            remote.push((
-                index,
-                owner_repo,
-                request.version.clone().unwrap_or_default(),
-                request.directory.clone(),
-            ));
-        }
-    }
-
-    let mut admitted: BTreeSet<usize> = BTreeSet::new();
-    // (`owner/repo`, `ref`, manifest directory) triples whose manifests may
-    // authorize nested uses: this batch's direct hits plus earlier batches'
-    // ledger. Unique and capped, so one request cannot force an unbounded
-    // manifest fan-out.
-    let mut sources = ManifestSources::default();
-    for (index, owner_repo, git_ref, request_directory) in &remote {
-        if !declared.scopes.contains(owner_repo) {
-            continue;
-        }
-        admitted.insert(*index);
-        // The download request names only `owner/repo`; the subpath of a
-        // composite action is in the workflow's `uses:` line, or in the
-        // official reference's `path`. Read the exact directory the request
-        // names; otherwise read every directory the workflow declared for
-        // this repository, plus the root manifest (the pre-subpath answer,
-        // for a root action reached through another composite).
-        let mut directories: Vec<Option<String>> = Vec::new();
-        match request_directory {
-            Some(directory) => directories.push(Some(directory.clone())),
-            None => {
-                if let Some(declared_directories) = declared.directories_for(owner_repo) {
-                    directories.extend(declared_directories.iter().cloned());
-                }
-                // The root manifest is the pre-subpath answer: read it too
-                // when a request names no directory, so a root action reached
-                // through another composite still authorizes its nested uses.
-                if !directories.contains(&None) {
-                    directories.push(None);
-                }
-            }
-        }
-        if directories.len() > MAX_MANIFEST_DIRECTORIES_PER_SCOPE {
-            sources.truncated = true;
-        }
-        for directory in directories
-            .into_iter()
-            .take(MAX_MANIFEST_DIRECTORIES_PER_SCOPE)
-        {
-            sources.push(owner_repo, git_ref, directory);
-        }
-    }
-
-    // Fast path: everything directly declared — no manifest fetch needed.
-    // The transitive closure below only runs when some request is not
-    // directly declared, so ordinary job setups never pay for it.
-    let mut unadmitted: Vec<(usize, String, String, Option<String>)> = remote
+    let remote: Vec<RemoteRequest> = requests
         .iter()
-        .filter(|(index, _, _, _)| !admitted.contains(index))
-        .cloned()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            Some(RemoteRequest {
+                index,
+                scope: normalize_action_owner_repo(&request.action)?,
+                git_ref: request.version.clone().unwrap_or_default(),
+                directory: request.directory.clone(),
+            })
+        })
         .collect();
-    if !unadmitted.is_empty() {
-        // Seed cross-batch sources: nested refs arrive in later waves, after
-        // the parent's own download, so earlier batches' ledger entries must
-        // be consultable here.
-        if let Ok(ledger) = state.action_resolved_uses.lock()
-            && let Some(prior) = ledger.get(&run_id)
-        {
-            for (owner_repo, git_ref, directory) in prior {
-                sources.push(owner_repo, git_ref, directory.clone());
-            }
+
+    // Directly declared requests are admitted now.
+    let mut admitted: BTreeSet<usize> = remote
+        .iter()
+        .filter(|request| declared.scopes.contains(&request.scope))
+        .map(|request| request.index)
+        .collect();
+    // Directories found named by the manifests this adjudication has read,
+    // per repository.
+    let mut named: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+    let mut sources = ManifestSources::default();
+    push_working_sources(&mut sources, &remote, &admitted, declared, &named, &[]);
+
+    // Fast path: everything directly declared, so no manifest is read here.
+    // The closure only runs when some request is not directly declared, so
+    // ordinary job setups never pay for it.
+    if remote
+        .iter()
+        .any(|request| !admitted.contains(&request.index))
+    {
+        let seeds: Vec<ManifestSource> = state
+            .action_resolved_uses
+            .lock()
+            .ok()
+            .and_then(|ledger| ledger.get(&run_id).cloned())
+            .unwrap_or_default();
+        for (scope, git_ref, directory) in &seeds {
+            sources.push(scope, git_ref, directory.clone());
         }
-        // Transitive composite closure, to a fixpoint within the batch: each
-        // newly admitted action's manifest may admit further nested actions.
-        // Nested references keep their own directory, so a subpath composite
-        // in a parent manifest points the next wave at `path/action.yml`.
-        let mut checked: BTreeSet<(String, String, Option<String>)> = BTreeSet::new();
+        let mut fetches_left = MAX_MANIFEST_FETCHES_PER_ADJUDICATION;
+        let mut checked: BTreeSet<ManifestSource> = BTreeSet::new();
+        // Fixpoint: admitting a request can queue manifests whose nested uses
+        // admit further requests, so repeat until no new manifest is queued.
         loop {
-            let mut nested: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
-            let mut newly_checked = false;
-            for (owner_repo, git_ref, directory) in &sources.entries {
-                if !checked.insert((owner_repo.clone(), git_ref.clone(), directory.clone())) {
-                    continue;
+            for request in &remote {
+                if !admitted.contains(&request.index) && named.contains_key(&request.scope) {
+                    admitted.insert(request.index);
                 }
-                newly_checked = true;
+            }
+            push_working_sources(&mut sources, &remote, &admitted, declared, &named, &seeds);
+            let pending: Vec<ManifestSource> = sources
+                .entries
+                .iter()
+                .filter(|source| !checked.contains(*source))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for source in pending {
+                checked.insert(source.clone());
+                let (scope, git_ref, directory) = source;
                 // `normalize_action_owner_repo` always yields `owner/repo`.
-                let (owner, repo) = owner_repo
-                    .split_once('/')
-                    .unwrap_or((owner_repo.as_str(), ""));
-                for (scope, nested_directory) in
-                    nested_action_uses(state, owner, repo, directory.as_deref(), git_ref).await
+                let (owner, repo) = scope.split_once('/').unwrap_or((scope.as_str(), ""));
+                match nested_action_uses(
+                    state,
+                    owner,
+                    repo,
+                    directory.as_deref(),
+                    &git_ref,
+                    &mut fetches_left,
+                )
+                .await
                 {
-                    nested.entry(scope).or_default().insert(nested_directory);
+                    Some(nested) => {
+                        for (nested_scope, nested_directory) in nested {
+                            named
+                                .entry(nested_scope)
+                                .or_default()
+                                .insert(nested_directory);
+                        }
+                    }
+                    // Past the fetch budget: this manifest is not read, so what
+                    // it names stays denied this wave.
+                    None => sources.truncated = true,
                 }
             }
-            if !newly_checked {
-                break;
-            }
-            let mut progressed = false;
-            unadmitted.retain(|(index, owner_repo, git_ref, request_directory)| {
-                let Some(directories) = nested.get(owner_repo) else {
-                    return true;
-                };
-                admitted.insert(*index);
-                let mut chosen = directories.clone();
-                if let Some(directory) = request_directory {
-                    chosen.insert(Some(directory.clone()));
-                }
-                if chosen.len() > MAX_MANIFEST_DIRECTORIES_PER_SCOPE {
-                    sources.truncated = true;
-                }
-                for directory in chosen.into_iter().take(MAX_MANIFEST_DIRECTORIES_PER_SCOPE) {
-                    sources.push(owner_repo, git_ref, directory);
-                }
-                progressed = true;
-                false
-            });
-            if !progressed {
-                break;
-            }
-        }
-        if sources.truncated {
-            warn!(
-                run_id = %run_id.0,
-                manifest_sources = sources.entries.len(),
-                "action manifest reads reached this adjudication's cap; nested actions behind unread manifests stay denied"
-            );
         }
     }
 
     let denied: Vec<String> = remote
         .iter()
-        .filter(|(index, _, _, _)| !admitted.contains(index))
-        .map(|(_, owner_repo, git_ref, _)| {
-            if git_ref.is_empty() {
-                owner_repo.clone()
+        .filter(|request| !admitted.contains(&request.index))
+        .map(|request| {
+            if request.git_ref.is_empty() {
+                request.scope.clone()
             } else {
-                format!("{owner_repo}@{git_ref}")
+                format!("{}@{}", request.scope, request.git_ref)
             }
         })
         .collect();
@@ -2542,13 +2541,20 @@ async fn enforce_declared_actions(
             denied.join(", ")
         )));
     }
+    if sources.truncated {
+        warn!(
+            run_id = %run_id.0,
+            manifest_sources = sources.entries.len(),
+            "action manifest reads reached this adjudication's limits; nested actions behind unread manifests stay denied"
+        );
+    }
 
-    // Ledger this batch's admitted sources for later waves' closures.
+    // Ledger this batch's manifest reads for later waves' closures.
     if let Ok(mut ledger) = state.action_resolved_uses.lock() {
         let entry = ledger.entry(run_id).or_default();
-        for resolved in &sources.entries {
-            if !entry.contains(resolved) {
-                entry.push(resolved.clone());
+        for source in &sources.entries {
+            if !entry.contains(source) {
+                entry.push(source.clone());
             }
         }
         if entry.len() > crate::state::MAX_RESOLVED_USES_PER_RUN {
@@ -2559,30 +2565,78 @@ async fn enforce_declared_actions(
     Ok(())
 }
 
-/// The manifests one adjudication may read, deduplicated and capped.
+/// Queue the manifest reads this adjudication needs.
 ///
-/// A workflow can declare one repository at many subpaths, and a runner can
-/// ask for many refs of it; without a cap each request would multiply forge
-/// contents reads. Dropped sources fail closed: whatever only they would
-/// authorize stays denied.
+/// An admitted request reads the directory it names. A request naming none
+/// reads the root and every directory the workflow declares for its repository.
+/// Every directory found in a manifest read so far is read at each ref the run
+/// works with, the admitted requests' refs and the ledger's, so a subdirectory
+/// named by a manifest is read for any later wave that needs it.
+fn push_working_sources(
+    sources: &mut ManifestSources,
+    remote: &[RemoteRequest],
+    admitted: &BTreeSet<usize>,
+    declared: &DeclaredActions,
+    named: &BTreeMap<String, BTreeSet<Option<String>>>,
+    seeds: &[ManifestSource],
+) {
+    for request in remote
+        .iter()
+        .filter(|request| admitted.contains(&request.index))
+    {
+        let (scope, git_ref) = (request.scope.as_str(), request.git_ref.as_str());
+        match &request.directory {
+            RequestedDirectory::Subpath(directory) => {
+                sources.push(scope, git_ref, Some(directory.clone()));
+            }
+            RequestedDirectory::Root => sources.push(scope, git_ref, None),
+            RequestedDirectory::Unspecified => {
+                sources.push(scope, git_ref, None);
+                for directory in declared.directories_for(scope).into_iter().flatten() {
+                    sources.push(scope, git_ref, directory.clone());
+                }
+            }
+        }
+        for directory in named.get(scope).into_iter().flatten() {
+            sources.push(scope, git_ref, directory.clone());
+        }
+    }
+    for (scope, git_ref, _) in seeds {
+        for directory in named.get(scope).into_iter().flatten() {
+            sources.push(scope, git_ref, directory.clone());
+        }
+    }
+}
+
+/// The manifests one adjudication reads: deduplicated, with at most
+/// [`MAX_MANIFEST_DIRECTORIES_PER_REF`] directories per repository and ref, and
+/// at most as many entries as the run's ledger holds.
 #[derive(Default)]
 struct ManifestSources {
-    seen: BTreeSet<(String, String, Option<String>)>,
-    entries: Vec<(String, String, Option<String>)>,
-    /// A source or directory was dropped. Logged once per adjudication.
+    seen: BTreeSet<ManifestSource>,
+    entries: Vec<ManifestSource>,
+    per_ref: BTreeMap<(String, String), usize>,
+    /// A source was dropped by a limit.
     truncated: bool,
 }
 
 impl ManifestSources {
     fn push(&mut self, scope: &str, git_ref: &str, directory: Option<String>) {
-        let source = (scope.to_owned(), git_ref.to_owned(), directory);
+        let source: ManifestSource = (scope.to_owned(), git_ref.to_owned(), directory);
         if self.seen.contains(&source) {
             return;
         }
-        if self.entries.len() >= MAX_MANIFEST_SOURCES_PER_ADJUDICATION {
+        let directories = self
+            .per_ref
+            .entry((scope.to_owned(), git_ref.to_owned()))
+            .or_default();
+        if *directories >= MAX_MANIFEST_DIRECTORIES_PER_REF
+            || self.entries.len() >= crate::state::MAX_RESOLVED_USES_PER_RUN
+        {
             self.truncated = true;
             return;
         }
+        *directories += 1;
         self.seen.insert(source.clone());
         self.entries.push(source);
     }
@@ -4704,9 +4758,10 @@ jobs:
         }
     }
 
-    /// A workflow that declares one repository at many subpaths cannot make a
-    /// single adjudication read every manifest: the directories are capped, so
-    /// the contents fan-out stays bounded. The dropped directories fail closed.
+    /// One adjudication reads at most [`MAX_MANIFEST_DIRECTORIES_PER_REF`]
+    /// directories for a repository at one ref, however many subpaths the
+    /// workflow declares for it. The unlisted request in the same batch is what
+    /// runs the closure; it stays denied.
     #[tokio::test]
     async fn declared_subpath_directories_are_bounded_per_adjudication() {
         let fixture = forge_fixture(
@@ -4718,37 +4773,100 @@ jobs:
         )
         .await;
         let mut declared = DeclaredActions::default();
-        for index in 0..(MAX_MANIFEST_DIRECTORIES_PER_SCOPE + 8) {
+        for index in 0..(MAX_MANIFEST_DIRECTORIES_PER_REF + 8) {
             declared.insert("acme/actions".to_owned(), Some(format!("sub{index}")));
         }
 
-        // An undeclared request runs the closure, which reads the declared
-        // directories of `acme/actions`.
         let error = enforce_declared_actions(
             &fixture.shared.state,
             RunId(uuid::Uuid::new_v4()),
             &declared,
-            &requests(&[("attacker/unlisted", Some("v1"))]),
+            &requests(&[
+                ("acme/actions", Some("v1")),
+                ("attacker/unlisted", Some("v1")),
+            ]),
         )
         .await
-        .expect_err("the closure cannot admit anything: the stub has no manifests");
+        .expect_err("the unlisted request stays denied");
         assert_eq!(error.status(), StatusCode::FORBIDDEN);
 
-        let read = fixture
+        // Each read manifest is two contents requests (`action.yml`, then
+        // `action.yaml`), both in the same directory.
+        let directories: BTreeSet<String> = fixture
             .stub
             .contents
             .lock()
             .iter()
-            .filter(|(path, _, _)| path.ends_with("action.yml"))
-            .count();
+            .map(|(path, _, _)| {
+                path.trim_end_matches("action.yaml")
+                    .trim_end_matches("action.yml")
+                    .trim_end_matches('/')
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            directories.len(),
+            MAX_MANIFEST_DIRECTORIES_PER_REF,
+            "{directories:?}"
+        );
+    }
+
+    /// A root composite's same-repository subdirectory composite is read in the
+    /// wave after the root's own request. The first wave requests the
+    /// repository alone (the runnerresolve shape carries no path), so nothing
+    /// is read then. The second wave's nested action is admitted only if the
+    /// subdirectory's manifest, which the root's manifest names, is read.
+    #[tokio::test]
+    async fn same_repository_subdirectory_is_read_in_a_later_wave() {
+        let root = composite_manifest(&["acme/actions/setup@v1"]);
+        let setup =
+            composite_manifest(&["pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0"]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[
+                    ("action.yml", root.as_str()),
+                    ("setup/action.yml", setup.as_str()),
+                ]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let mut declared = DeclaredActions::default();
+        declared.insert("acme/actions".to_owned(), None);
+
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("acme/actions", Some("v1"))]),
+        )
+        .await
+        .expect("the root composite is declared");
+
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("pnpm/action-setup", Some(NESTED_REF))]),
+        )
+        .await
+        .expect("the nested action of the subdirectory composite must be admitted");
+
+        let contents = fixture.stub.contents.lock().clone();
         assert!(
-            read <= MAX_MANIFEST_DIRECTORIES_PER_SCOPE,
-            "one adjudication read {read} manifests for one scope"
+            contents
+                .iter()
+                .any(|(path, git_ref, _)| path == "setup/action.yml" && git_ref == "v1"),
+            "the subdirectory manifest must be read: {contents:?}"
         );
     }
 
     /// The official `ActionDownloadInfo` reference's `path` is the composite's
-    /// manifest directory; unsafe or dynamic paths fall back to the root.
+    /// manifest directory. An empty path names nothing, and an unsafe one falls
+    /// back to the root manifest alone.
     #[test]
     fn action_request_keeps_the_official_reference_path() {
         let reference = |path: Option<&str>| ActionReference {
@@ -4758,31 +4876,46 @@ jobs:
         };
         let request = ActionRequest::from_reference(reference(Some(".github/setup"))).unwrap();
         assert_eq!(request.action, "TanStack/config");
-        assert_eq!(request.directory.as_deref(), Some(".github/setup"));
-
         assert_eq!(
-            ActionRequest::from_reference(reference(None))
-                .unwrap()
-                .directory,
-            None
+            request.directory,
+            RequestedDirectory::Subpath(".github/setup".to_owned())
         );
+
+        for named_nothing in [None, Some("")] {
+            assert_eq!(
+                ActionRequest::from_reference(reference(named_nothing))
+                    .unwrap()
+                    .directory,
+                RequestedDirectory::Unspecified,
+                "{named_nothing:?} names no directory"
+            );
+        }
         for unsafe_path in [
-            "",
-            "/",
             ".",
             "..",
             "../escape",
             "a/../b",
+            "a//b",
             "${{ matrix.dir }}",
         ] {
             assert_eq!(
                 ActionRequest::from_reference(reference(Some(unsafe_path)))
                     .unwrap()
                     .directory,
-                None,
+                RequestedDirectory::Root,
                 "{unsafe_path} must fall back to the root manifest"
             );
         }
+
+        // A `runnerresolve` reference carries its subpath in the string.
+        assert_eq!(
+            ActionRequest::new("owner/repo/sub@v1".to_owned(), None).directory,
+            RequestedDirectory::Subpath("sub".to_owned())
+        );
+        assert_eq!(
+            ActionRequest::new("owner/repo@v1".to_owned(), None).directory,
+            RequestedDirectory::Unspecified
+        );
         assert!(ActionRequest::from_reference(ActionReference::default()).is_none());
     }
 
