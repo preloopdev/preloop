@@ -1462,7 +1462,12 @@ async fn missing_objects_reachable_from(repository: &FsPath, rev: &str) -> Resul
     verify
         .env("GIT_DIR", repository)
         .args(["rev-list", "--objects", "--missing=print", rev]);
-    let output = run_git(&mut verify, "verify snapshot object cache HEAD history").await?;
+    let output = run_git_within(
+        verify,
+        "verify snapshot object cache HEAD history",
+        GIT_WORK_TIMEOUT,
+    )
+    .await?;
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| line.starts_with('?'))
@@ -3637,7 +3642,7 @@ async fn deepen_object_cache_from_remote(
         //
         // Staged in the environment: the value is a live token, and command
         // lines are world-readable.
-        stage_git_auth_header(&mut fetch, key, &value);
+        stage_git_auth_header(&mut fetch, &key, &value);
     }
     fetch.args(["fetch", "--quiet", "--force", "--no-tags"]);
     if shallow_marker.is_file() {
