@@ -2,7 +2,7 @@
 
 Preloop gets every VM from a Sandbox Service: a generic service that hands out
 running machines from pluggable backends. The CI runner pool is one client;
-`preloop sandbox …` The contract is
+the `preloop sandbox …` CLI is another. The contract is
 `proto/preloop/sandbox/v1/sandbox.proto` (in the repository root);
 the implementation is `crates/preloop-sandbox`, which never depends on the CI
 control plane.
@@ -77,6 +77,20 @@ are the service's.
 
 ## Security model
 
+* Both APIs always require a bearer token, on loopback too. When
+  `PRELOOP_SANDBOX_TOKEN` / `PRELOOP_SANDBOX_PROVIDER_TOKEN` are unset, the
+  service generates a random token on first start into
+  `<state>/sandbox-client-token` and `<state>/sandbox-provider-token` (mode
+  0600) and reuses it on later starts; the local CLI and in-process agent read
+  the same files.
+* A listener bound to a loopback address rejects requests whose `Host` is not
+  `localhost`, an address in `127.0.0.0/8`, or `::1`, so a DNS-rebound browser
+  page cannot reach it by name. The port is ignored; the check covers the
+  RPC routes and the ticket data plane.
+* The service that binds publishes its actual address to
+  `<state>/sandbox-endpoint` (mode 0600) and removes it on shutdown. A CLI
+  without an explicit `--service` uses that file and refuses to send its token
+  anywhere else.
 * Data-plane tickets are single-use, scoped to one sandbox and direction, and
   short-lived; the URL carries its own token.
 * `Report`/`ReportExec`/`Reconcile` are fenced by the provider's registration
@@ -109,7 +123,7 @@ and debug-hold strategy; the machines under it are sandboxes.
 | Variable | Effect |
 |---|---|
 | `PRELOOP_SANDBOX_LISTEN` | API address, or `off` |
-| `PRELOOP_SANDBOX_TOKEN` / `PRELOOP_SANDBOX_PROVIDER_TOKEN` | bearer tokens; required off loopback |
+| `PRELOOP_SANDBOX_TOKEN` / `PRELOOP_SANDBOX_PROVIDER_TOKEN` | bearer tokens; generated into the state directory when unset |
 | `PRELOOP_SANDBOX_STORE_URL` | store URL |
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
 | `PRELOOP_SANDBOX_POOL_DRIVER` | driver the CI pool places on (default: first) |
@@ -131,6 +145,10 @@ preloop sandbox snapshot sbx-… --name golden
 preloop sandbox release lse-… [--preserve 600]
 preloop sandbox ls | providers
 ```
+
+Without `--service` (or `PRELOOP_SANDBOX_URL`), the CLI reads
+`<home>/state/sandbox-endpoint`, which the local service writes when it binds,
+and refuses to send its bearer token to any other address.
 
 ## Verification
 
