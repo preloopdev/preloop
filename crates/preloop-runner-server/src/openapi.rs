@@ -107,7 +107,8 @@ pub struct RunResponse {
     pub job_check_run_ids: std::collections::BTreeMap<String, u64>,
     /// Reusable workflow call metadata.
     pub reusable_calls: JsonValue,
-    /// Ordered list of job details.
+    /// Ordered job details: `job_id`, `name`, `conclusion`, `steps[]` in
+    /// execution order, `annotations[]`.
     pub jobs_list: Vec<JsonValue>,
     /// When the run was created (ISO 8601).
     pub created_at: String,
@@ -125,6 +126,36 @@ pub struct RunResponse {
     pub event: String,
     /// Final conclusion (success, failure, cancelled, skipped).
     pub conclusion: Option<String>,
+}
+
+/// One job's pool-dispatch state (`GET /api/v1/pool/bindings`).
+#[derive(Debug, ToSchema)]
+pub struct PoolBindingEntry {
+    /// Run UUID.
+    pub run_id: String,
+    /// Job id (YAML key, matrix leg expanded).
+    pub job_id: String,
+    /// `running` (a runner is executing it), `assigned` (a runner is picked
+    /// but has not started it), `ready` (no runner picked yet), or
+    /// `provisioning` (waiting on pool capacity).
+    pub state: String,
+    /// The bound or executing runner; absent for `ready`/`provisioning`.
+    pub runner_id: Option<i64>,
+    /// Name of `runner_id`.
+    pub runner_name: Option<String>,
+    /// Seconds since the job entered its current state.
+    pub since_seconds: u64,
+    /// 1-based rank among jobs with no runner bound yet
+    /// (`ready`/`provisioning`); absent for `running`/`assigned`.
+    pub waitlist_position: Option<u32>,
+}
+
+/// `GET /api/v1/pool/bindings` response.
+#[derive(Debug, ToSchema)]
+pub struct PoolBindingsResponse {
+    pub bindings: Vec<PoolBindingEntry>,
+    /// When this snapshot was read (RFC 3339).
+    pub observed_at: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +226,7 @@ pub struct RunResponse {
         github_setup_form,
         github_setup_callback,
         list_runners,
+        pool_bindings,
         readyz,
         status,
         metrics
@@ -204,7 +236,9 @@ pub struct RunResponse {
             ApiErrorResponse,
             RunAcceptedResponse,
             WorkflowSubmissionRequest,
-            RunResponse
+            RunResponse,
+            PoolBindingEntry,
+            PoolBindingsResponse
         )
     ),
     modifiers(&SecuritySchemes)
@@ -500,8 +534,11 @@ fn approve_fork() {}
 ///
 /// Returns a long-lived stream of newline-delimited JSON events.
 /// The stream closes when the run reaches a terminal status.
-/// Events include `run_accepted`, `job_status`, `run_status`, `log_line`,
-/// `annotation`, and `job_completed`.
+/// Events are the protocol crate's `NdjsonEvent` variants, tagged by
+/// `type`: `run_accepted`, `job_status`, `run_status`, `annotation`,
+/// `job_completed`, `check_run_created`, `step_status` and `log` (the
+/// `log_line` spelling was never a wire tag). A client must ignore tags it
+/// does not know.
 #[utoipa::path(
     get, path = "/api/v1/runs/{run_id}/events.ndjson", tag = "Runs",
     params(("run_id" = String, Path, description = "Run UUID")),
@@ -1070,3 +1107,14 @@ fn github_setup_callback() {}
     security(("native_bearer" = []))
 )]
 fn list_runners() {}
+
+/// Pool bindings: where each job stands between the ready queue and a
+/// runner actually running it (read-only; feeds the TUI's fleet view).
+#[utoipa::path(
+    get, path = "/api/v1/pool/bindings", tag = "Runners",
+    responses(
+        (status = 200, description = "Every job waiting in the ready queue or held by a runner", body = PoolBindingsResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn pool_bindings() {}

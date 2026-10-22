@@ -202,7 +202,7 @@ impl SandboxClient {
     pub fn new(base: impl Into<String>, token: Option<String>) -> Result<Self> {
         let base = base.into().trim_end_matches('/').to_owned();
         let tls = native_tls_config()?;
-        Ok(Self::build(base, token, tls, reqwest::Client::new()))
+        Self::build(base, token, tls, reqwest::Client::new(), false)
     }
 
     /// `base` like `https://127.0.0.1:9191`, trusting only `ca_pem`.
@@ -215,30 +215,37 @@ impl SandboxClient {
         let base = base.into().trim_end_matches('/').to_owned();
         let tls = crate::tls::client_config(ca_pem, identity_pem)?;
         let http = crate::tls::http_client(ca_pem, identity_pem)?;
-        Ok(Self::build(base, token, tls, http))
+        Self::build(base, token, tls, http, true)
     }
 
+    /// `ca_configured` is `true` when the caller supplied an explicit
+    /// service CA (`with_tls`), `false` when trusting the system store
+    /// (`new`): it gates the TLS failure's re-enroll hint (see
+    /// [`classify_transport`]), which only makes sense when a CA was ever
+    /// configured to go stale.
     fn build(
         base: String,
         token: Option<String>,
         tls: Arc<rustls::ClientConfig>,
         http: reqwest::Client,
-    ) -> Self {
+        ca_configured: bool,
+    ) -> Result<Self> {
         let uri: axum::http::Uri = base
             .parse()
-            .unwrap_or_else(|_| axum::http::Uri::from_static("https://127.0.0.1:9191"));
+            .map_err(|e| Error::invalid_argument(format!("sandbox service URL {base:?}: {e}")))?;
         let mut config = connectrpc::client::ClientConfig::new(uri).json();
-        if let Some(token) = token.as_deref()
-            && let Ok(value) = axum::http::HeaderValue::from_str(&format!("Bearer {token}"))
-        {
+        if let Some(token) = token.as_deref() {
+            let value = axum::http::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| Error::invalid_argument(format!("sandbox token: {e}")))?;
             config = config.with_default_header(axum::http::header::AUTHORIZATION, value);
         }
-        let transport = ClassifiedTransport(connectrpc::client::HttpClient::with_tls(tls));
-        Self {
+        let transport =
+            ClassifiedTransport(connectrpc::client::HttpClient::with_tls(tls), ca_configured);
+        Ok(Self {
             inner: rpc::SandboxesClient::new(transport, config),
             http,
             base,
-        }
+        })
     }
 
     /// Base URL.
@@ -267,14 +274,27 @@ impl SandboxClient {
 /// reporting `HTTPS request failed` forever). The built-in transport keeps
 /// the hyper/rustls failure as the `ConnectError` source, so the certificate
 /// cause is still reachable here.
-pub(crate) fn classify_transport(error: Error) -> Error {
+///
+/// `ca_configured` is `false` for [`SandboxClient::new`] (system trust store
+/// only): without an explicit CA there is nothing that could have gone
+/// stale, so the "re-enroll" hint would be actively misleading. The
+/// certificate is still untrusted either way (the code stays
+/// `Unauthenticated`); only the wording, and the client-certificate check
+/// (which never applies without a configured identity), change.
+pub(crate) fn classify_transport(error: Error, ca_configured: bool) -> Error {
     let Some(source) = error.source_arc() else {
         return error;
     };
     let hint = if crate::tls::is_untrusted_service_ca(source.as_ref()) {
-        "identity was issued by a different CA (the service certificate does not chain to the \
-         stored ca.pem); re-enroll with `--join <service-url> --token <join-token>`"
-    } else if crate::tls::is_client_certificate_rejected(source.as_ref()) {
+        if ca_configured {
+            "identity was issued by a different CA (the service certificate does not chain to \
+             the stored ca.pem); re-enroll with `--join <service-url> --token <join-token>`"
+        } else {
+            "the service certificate is not trusted by the system root store; if this is a \
+             private Sandbox Service, pass `--ca <ca.pem>` (or enroll one with `--join \
+             <service-url> --token <join-token>`)"
+        }
+    } else if ca_configured && crate::tls::is_client_certificate_rejected(source.as_ref()) {
         "the service rejected the client certificate (the identity is unknown or was issued by \
          a different CA); re-enroll with `--join <service-url> --token <join-token>`"
     } else {
@@ -285,8 +305,10 @@ pub(crate) fn classify_transport(error: Error) -> Error {
 }
 
 /// A generated transport that classifies TLS identity failures.
+///
+/// The second field is `ca_configured` (see [`classify_transport`]).
 #[derive(Clone)]
-pub(crate) struct ClassifiedTransport<T>(pub(crate) T);
+pub(crate) struct ClassifiedTransport<T>(pub(crate) T, pub(crate) bool);
 
 impl<T: connectrpc::client::ClientTransport<Error = Error>> connectrpc::client::ClientTransport
     for ClassifiedTransport<T>
@@ -302,19 +324,54 @@ impl<T: connectrpc::client::ClientTransport<Error = Error>> connectrpc::client::
         std::result::Result<axum::http::Response<Self::ResponseBody>, Self::Error>,
     > {
         let inner = self.0.clone();
-        Box::pin(async move { inner.send(request).await.map_err(classify_transport) })
+        let ca_configured = self.1;
+        Box::pin(async move {
+            inner
+                .send(request)
+                .await
+                .map_err(|e| classify_transport(e, ca_configured))
+        })
     }
 }
 
 /// A rustls configuration trusting the system roots.
 fn native_tls_config() -> Result<Arc<rustls::ClientConfig>> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    let loaded = rustls_native_certs::load_native_certs();
+    if !loaded.errors.is_empty() {
+        tracing::warn!(
+            errors = ?loaded.errors,
+            "failed to load some native root certificates"
+        );
+    }
+    if loaded.certs.is_empty() {
+        return Err(Error::internal(format!(
+            "no usable system root certificates: {:?}",
+            loaded.errors
+        )));
+    }
+    roots.add_parsable_certificates(loaded.certs);
     Ok(Arc::new(
         crate::tls::client_config_builder()?
             .with_root_certificates(roots)
             .with_no_client_auth(),
     ))
+}
+
+/// Map a ticketed data-plane HTTP failure (`upload`/`download`) to a
+/// Connect code. The data plane is plain HTTP, not a Connect RPC, so its
+/// errors used to all collapse to `unavailable` ("try again"); 401/403/404
+/// and 413 instead reflect the request itself, not transient unavailability
+/// (B10).
+fn data_plane_error(status: reqwest::StatusCode, body: &[u8]) -> Error {
+    let message = String::from_utf8_lossy(body).into_owned();
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED => Error::unauthenticated(message),
+        reqwest::StatusCode::FORBIDDEN => Error::permission_denied(message),
+        reqwest::StatusCode::NOT_FOUND => Error::not_found(message),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE => Error::resource_exhausted(message),
+        _ => Error::unavailable(message),
+    }
 }
 
 #[async_trait]
@@ -558,10 +615,9 @@ impl SandboxApi for SandboxClient {
             .await
             .map_err(|e| Error::unavailable(format!("upload: {e}")))?;
         if !response.status().is_success() {
+            let status = response.status();
             let body = response.bytes().await.unwrap_or_default();
-            return Err(Error::unavailable(
-                String::from_utf8_lossy(&body).into_owned(),
-            ));
+            return Err(data_plane_error(status, &body));
         }
         Ok(())
     }
@@ -593,24 +649,33 @@ impl SandboxApi for SandboxClient {
             .await
             .map_err(|e| Error::unavailable(format!("download: {e}")))?;
         if !response.status().is_success() {
+            let status = response.status();
             let body = response.bytes().await.unwrap_or_default();
-            return Err(Error::unavailable(
-                String::from_utf8_lossy(&body).into_owned(),
-            ));
+            return Err(data_plane_error(status, &body));
         }
         let mut file = tokio::fs::File::create(dest)
             .await
             .map_err(|e| Error::internal(format!("download: {e}")))?;
-        let mut body = response.bytes_stream();
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| Error::unavailable(format!("download: {e}")))?;
-            file.write_all(&chunk)
+        let result: Result<()> = async {
+            let mut body = response.bytes_stream();
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(|e| Error::unavailable(format!("download: {e}")))?;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| Error::internal(format!("download: {e}")))?;
+            }
+            file.flush()
                 .await
-                .map_err(|e| Error::internal(format!("download: {e}")))?;
+                .map_err(|e| Error::internal(format!("download: {e}")))
         }
-        file.flush()
-            .await
-            .map_err(|e| Error::internal(format!("download: {e}")))
+        .await;
+        if result.is_err() {
+            // Do not leave a truncated tar behind for the caller to mistake
+            // for a complete download (B10).
+            drop(file);
+            let _ = tokio::fs::remove_file(dest).await;
+        }
+        result
     }
 
     async fn snapshot(&self, request: SnapshotRequest) -> Result<Template> {

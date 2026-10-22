@@ -1,0 +1,45 @@
+{
+  "queue": {
+    "received": 1284,
+    "processing": 0,
+    "done": 1280,
+    "dead_letters": 2,
+    "oldest_pending_at": null,
+    "oldest_pending_age_seconds": null
+  },
+  "watchdog": {
+    "enabled": true,
+    "last_poll_at": "2026-10-22T12:19:50Z",
+    "last_success_at": "2026-10-22T12:19:50Z",
+    "last_success_age_seconds": 18.0,
+    "last_examined": 40,
+    "redeliveries_requested": 0,
+    "open_repairs": 0,
+    "last_error": null
+  },
+  "github_breaker": [
+    {
+      "bucket": "core",
+      "open": false,
+      "retry_in_seconds": null,
+      "consecutive_failures": 0,
+      "trips": 0,
+      "rate_limited": false,
+      "last_error": null
+    }
+  ],
+  "apps": [
+    {
+      "app_id": 123456,
+      "hook_url": "https://preloop.example/api/v1/github/webhooks",
+      "expected_url": "https://preloop.example/api/v1/github/webhooks",
+      "url_drifted": false,
+      "missing_events": [],
+      "missing_permissions": [],
+      "healthy": true,
+      "checked_at": "2026-10-22T12:19:00Z",
+      "error": null
+    }
+  ],
+  "app_config_checked_at": "2026-10-22T12:19:00Z"
+}

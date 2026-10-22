@@ -1,0 +1,32 @@
+ preloop  ctx cpane ● healthy  0.21.0 · up 3d04h              queue 2 ready · 0 claimable   pool 3/1   sbx ● 2 prov
+ ▌1 Overview   2 Runs   3 Fleet   4 Debug   5 Webhooks   6 Sandboxes   7 Stack
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+┌─ Queue ──────────────────────────────┐┌─ Pool & runners ─────────────────────┐┌─ VM fleet · Webhooks ────────────────┐
+│ jobs ready           2               ││ mode / desired       warm / 4        ││ runner / golden  5 / 1               │
+│ claimable            0               ││ idle / busy          3 / 1           ││ host cpu         9.2 cores           │
+│ dependency blocked   3               ││ building · provis.   0 · 0           ││ host mem         ██████░░░░ 41/64G   │
+│ concurrency blocked  1               ││ held for debug       1               ││ deliveries 24h   1 284               │
+│ oldest ready         42s             ││ released bindings    0               ││ dead letters     2                   │
+│ runs queued/active   1 / 3           ││ runners reg/stale    5 / 0           ││ github breaker   closed              │
+│                                      ││                                      ││                                      │
+│ ready 15m ▃▃▁▁▂▃▅▃▂▁▁▂▅▂             ││ slots ████████████ idle·busy·held    ││                                      │
+└──────────────────────────────────────┘└──────────────────────────────────────┘└──────────────────────────────────────┘
+┌─ Conditions · Detectors ─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ✗ webhook_dead_letters   2 deliveries dead-lettered (oldest 3h12m)                      → 5 Webhooks › replay        │
+│ ⚠ leaked_binding         detector: 2 ready ∧ 3 idle ∧ no assignment 4m12s               → 3 Fleet › bindings         │
+│ ⚠ debug_session_open     run 8f3a91c2 · test (sandbox) paused 14m                       → 4 Debug › attach           │
+│ ⚠ sbx_provider_cordoned  macstudio cordoned                                             → 6 Sandboxes                │
+│ ● ingress                last delivery 18s ago · last run 4m ago                                                     │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─ Recent runs ────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ RUN       #    STATUS       WORKFLOW           EVENT          REF / PR                          PUSH       AGE       │
+│ 8f3a91c2  412  ✗ failure    ci.yml             pull_request   #619 sandbox-service              synced     6m        │
+│ c01d77e4  411  ● running    ci.yml             pull_request   #751 sbx-observability            pending    4m        │
+│ 5be2a0f9  410  ✓ success    ci.yml             pull_request   #747 sbx-ops                      synced     21m       │
+│ a4400b13  409  ✓ success    supply-chain.yml   push           main                              —          1h        │
+│ 9e1c3d50  408  ◌ queued     nightly.yml        schedule       main                              —          1h        │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ tab/1-7 views · enter jump to source · : palette · ⇧C context · r refresh · ? help · q quit

@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 ### Added
+- **`preloop tui`** adds a ratatui operations cockpit for engine status,
+  live run/step/log inspection, runners and pool bindings, debug sessions,
+  webhook delivery health, Sandbox Service inventory, and the configured PR
+  stack. The setup wizard is driven through the same `Prompter` interface as
+  `preloop init`; engine bearer and Sandbox Service bearer/CA handling remain
+  unchanged.
+- **`preloop init` and `preloop setup github` write through a prompt
+  interface instead of the terminal.** Every question and every line of
+  output goes through a `Prompter` — the terminal's own prompts for the CLI, a
+  capturing host for `--json`, or a host program's widgets — so the setup
+  wizard can be driven by the TUI (`init::run_wizard`). The wizard never
+  starts the engine itself: it reports what the caller should start.
 
 - **`preloop init` and `preloop setup github` write through a prompt
   interface instead of the terminal.** Every question and every line of

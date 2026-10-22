@@ -49,13 +49,17 @@ pub async fn twirp_workflow_steps_update(
 
     // Resolve the callback identity and merge each reported step into
     // `job_steps` in one backend transaction — an indexed write, no working
-    // set. Unresolvable identities are acknowledged and dropped.
-    shared
+    // set. Unresolvable identities are acknowledged and dropped. The changed
+    // steps' events are persisted with the rows; broadcast them here.
+    let outcome = shared
         .state
         .backend
         .report_steps(&plan_uuid.to_string(), job_uuid, steps)
         .await
         .map_err(ApiError::from)?;
+    for event in outcome.events {
+        shared.state.emit_persisted(event).await;
+    }
     Ok(Json(json!({"ok": true})))
 }
 

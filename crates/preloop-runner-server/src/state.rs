@@ -1467,7 +1467,6 @@ impl AppState {
             artifact_v2_registry: registry,
             next_artifact_v2_id: next_id,
             oidc_keypair: Some(oidc_keypair),
-            session_last_seen: BTreeMap::new(),
             runner_liveness_timeout: std::time::Duration::from_secs(
                 env::var("PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS")
                     .ok()
@@ -2209,11 +2208,6 @@ pub struct InnerState {
     /// Entries prevent a replay from doing the same expensive work twice.
     pub webhook_run_reservations: BTreeSet<(String, String)>,
     pub check_run_mint_locks: BTreeMap<RunId, std::sync::Arc<tokio::sync::Mutex<()>>>,
-    /// When each runner session last polled. In-memory only: sessions are
-    /// ephemeral and re-created by runners, so nothing is persisted here.
-    /// Restored sessions from a restart have no entry and are left to the
-    /// job-lease reaper rather than being swept immediately.
-    pub session_last_seen: BTreeMap<String, std::time::Instant>,
     /// How long a session may go without polling before the liveness sweep
     /// purges its runner. Env: `PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS`
     /// (default 1800).

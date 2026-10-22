@@ -20,7 +20,7 @@ fn make_job() -> JobContext {
 #[test]
 fn write_chunk_caps_newline_free_output() {
     let mut job = make_job();
-    let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+    let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
     let blob = vec![b'A'; 2 * 1024 * 1024];
     ctx.write_chunk(&blob);
     ctx.flush_line_buffer();
@@ -42,7 +42,7 @@ fn write_chunk_caps_newline_free_output() {
 #[test]
 fn log_content_returns_whole_file_while_head_stays_bounded() {
     let mut job = make_job();
-    let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+    let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
     // ~100k lines x ~90B -> well over the old 8 MiB rematerialization cap
     // once timestamp prefixes are added.
     let mut chunk = Vec::with_capacity(10 * 1024 * 1024);

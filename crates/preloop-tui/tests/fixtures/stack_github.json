@@ -1,0 +1,41 @@
+{
+  "data": {
+    "repository": {
+      "nameWithOwner": "acme/widgets",
+      "defaultBranchRef": {"name": "main"},
+      "pullRequests": {"nodes": [
+        {
+          "number": 42,
+          "title": "stacked change",
+          "url": "https://github.com/acme/widgets/pull/42",
+          "isDraft": false,
+          "state": "OPEN",
+          "mergeable": "MERGEABLE",
+          "author": {"login": "octocat"},
+          "baseRefName": "main",
+          "headRefName": "stack/42",
+          "baseRefOid": "base42",
+          "headRefOid": "head42",
+          "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
+            {"__typename": "CheckRun", "name": "fmt", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"__typename": "CheckRun", "name": "test", "status": "IN_PROGRESS", "conclusion": null}
+          ]}}}}]}
+        },
+        {
+          "number": 43,
+          "title": "draft child",
+          "url": "https://github.com/acme/widgets/pull/43",
+          "isDraft": true,
+          "state": "OPEN",
+          "mergeable": "UNKNOWN",
+          "author": {"login": "octocat"},
+          "baseRefName": "stack/42",
+          "headRefName": "stack/43",
+          "baseRefOid": "head42",
+          "headRefOid": "head43",
+          "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]}
+        }
+      ]}
+    }
+  }
+}

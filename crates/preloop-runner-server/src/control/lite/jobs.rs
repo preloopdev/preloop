@@ -1230,11 +1230,15 @@ pub(super) fn run_record(
         }
         // Steps live in the attempt-scoped manifest (job_steps for live,
         // step_history once archived); jobs never dispatched show `[]`.
-        let steps = if archived {
+        let mut steps = if archived {
             super::steps::archived_attempt_steps(tx, &run, &job_id)?
         } else {
             super::steps::latest_attempt_steps(tx, &run, &job_id)?
         };
+        // One order on every surface: a manifest read is position order
+        // (synthetic rows last), while `GET /api/v1/runs/{id}` sorts into
+        // execution order. The list endpoint must agree with it.
+        crate::models::StepRecord::sort_execution_order(&mut steps);
         jobs_list.push(crate::models::JobDetail {
             job_id: job_id.clone(),
             name: display_name,

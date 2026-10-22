@@ -863,8 +863,11 @@ pub(crate) async fn archive_finished_runs_once(shared: &SharedState) -> usize {
 type SnapshotInputs = crate::control::types::StatusInputs;
 
 /// Read the durable status inputs; a failed read degrades to an empty
-/// snapshot rather than blocking the status publisher.
-async fn read_snapshot_inputs(state: &AppState) -> SnapshotInputs {
+/// snapshot rather than blocking the status publisher. The returned `bool`
+/// is `true` when the read failed and the snapshot had to fall back to
+/// defaults, so the caller can surface the gap instead of silently
+/// reporting whatever zeroed-out picture the default produces as healthy.
+async fn read_snapshot_inputs(state: &AppState) -> (SnapshotInputs, bool) {
     match state
         .backend
         // The runner tallies read "how many machines are dead", so the
@@ -876,10 +879,10 @@ async fn read_snapshot_inputs(state: &AppState) -> SnapshotInputs {
         ))
         .await
     {
-        Ok(inputs) => inputs,
+        Ok(inputs) => (inputs, false),
         Err(error) => {
             warn!(?error, "status input read failed");
-            SnapshotInputs::default()
+            (SnapshotInputs::default(), true)
         }
     }
 }
@@ -1071,6 +1074,7 @@ fn build_operational_snapshot_sync(
     webhook: WebhookConditionInputs,
     sandbox_stats: Option<preloop_sandbox::api::StatsResponse>,
     pool_provider_id: String,
+    status_inputs_unavailable: bool,
 ) -> preloop_observability::status::OperationalSnapshot {
     use chrono::Utc;
     use preloop_observability::status::*;
@@ -1165,6 +1169,16 @@ fn build_operational_snapshot_sync(
                 .collect(),
         });
     }
+    if status_inputs_unavailable {
+        conditions.push(Condition {
+            code: "status_inputs_unavailable".to_owned(),
+            severity: "error".to_owned(),
+            message: "durable status inputs could not be read; queue, runner, and run counts \
+                       below are stale defaults, not a healthy empty store"
+                .to_owned(),
+            exemplars: Vec::new(),
+        });
+    }
     pool_snapshot.released_bindings = inputs.released_bindings;
     pool_snapshot.busy = inputs.pool_busy;
 
@@ -1180,7 +1194,11 @@ fn build_operational_snapshot_sync(
         snapshot_age_seconds: 0.0,
         overall: if shutdown_requested {
             Overall::ShuttingDown
-        } else if queue_stalled || check_reporting_failed || runs_without_execution {
+        } else if queue_stalled
+            || check_reporting_failed
+            || runs_without_execution
+            || status_inputs_unavailable
+        {
             Overall::Degraded
         } else {
             Overall::Ok
@@ -1516,7 +1534,7 @@ async fn publish_snapshot(
         let inner = shared.state.inner.lock().await;
         debug_session_scalars(&inner)
     };
-    let inputs = read_snapshot_inputs(&shared.state).await;
+    let (inputs, status_inputs_unavailable) = read_snapshot_inputs(&shared.state).await;
     let pool_snapshot = shared.state.pool_status.snapshot();
     let github_snapshot = shared.state.status_snapshot.read().github.clone();
     // Live sandbox/host facts. Best-effort: an unset handle or a failing RPC
@@ -1554,6 +1572,7 @@ async fn publish_snapshot(
         webhook,
         sandbox_stats,
         pool_provider_id,
+        status_inputs_unavailable,
     );
     // The sandbox service's client API is aggregates-only, so host process
     // identity for the operator status page comes from this process's own
@@ -1881,7 +1900,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             let inner = state.inner.lock().await;
             debug_session_scalars(&inner)
         };
-        let inputs = read_snapshot_inputs(&state).await;
+        let (inputs, status_inputs_unavailable) = read_snapshot_inputs(&state).await;
         let mut init = build_operational_snapshot_sync(
             inputs,
             debug,
@@ -1903,6 +1922,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             // The pool starts after this seed; the first 5s tick fills it.
             None,
             String::new(),
+            status_inputs_unavailable,
         );
         // Host process identity is engine-local telemetry; sample it here
         // like every later tick, so the seed matches the steady-state shape.
@@ -2776,6 +2796,7 @@ mod tests {
             Default::default(),
             None,
             String::new(),
+            false,
         );
         assert_eq!(
             snapshot.overall,
@@ -2811,6 +2832,7 @@ mod tests {
             Default::default(),
             None,
             String::new(),
+            false,
         );
         assert_eq!(
             snapshot.overall,
@@ -2825,6 +2847,67 @@ mod tests {
             Some("run-orphan")
         );
     }
+    #[test]
+    fn status_degrades_when_status_inputs_could_not_be_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = build_operational_snapshot_sync(
+            Default::default(),
+            (0, None),
+            Default::default(),
+            &preloop_observability::Observability::noop(),
+            std::time::Instant::now(),
+            false,
+            true,
+            temp.path(),
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            None,
+            String::new(),
+            true,
+        );
+        assert_eq!(
+            snapshot.overall,
+            preloop_observability::status::Overall::Degraded
+        );
+        assert!(
+            snapshot
+                .conditions
+                .iter()
+                .any(|condition| condition.code == "status_inputs_unavailable"
+                    && condition.severity == "error"),
+            "missing status_inputs_unavailable in {:?}",
+            snapshot.conditions
+        );
+
+        // A successful read clears the condition and overall returns to Ok.
+        let healthy = build_operational_snapshot_sync(
+            Default::default(),
+            (0, None),
+            Default::default(),
+            &preloop_observability::Observability::noop(),
+            std::time::Instant::now(),
+            false,
+            true,
+            temp.path(),
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            None,
+            String::new(),
+            false,
+        );
+        assert_eq!(healthy.overall, preloop_observability::status::Overall::Ok);
+        assert!(
+            healthy
+                .conditions
+                .iter()
+                .all(|condition| condition.code != "status_inputs_unavailable")
+        );
+    }
+
     #[test]
     fn status_degrades_after_latest_github_check_update_fails() {
         let temp = tempfile::tempdir().unwrap();
@@ -2848,6 +2931,7 @@ mod tests {
             Default::default(),
             None,
             String::new(),
+            false,
         );
         assert_eq!(
             snapshot.overall,
@@ -2979,6 +3063,7 @@ mod tests {
                 Default::default(),
                 stats,
                 "pool".to_owned(),
+                false,
             )
         };
 
@@ -3050,6 +3135,7 @@ mod tests {
             Default::default(),
             Some(sandbox_stats_fixture(hot)),
             "pool".to_owned(),
+            false,
         );
         assert!(
             snapshot
@@ -3073,6 +3159,7 @@ mod tests {
             Default::default(),
             None,
             String::new(),
+            false,
         );
         assert!(
             snapshot

@@ -477,7 +477,7 @@ impl ControlBackend for PgBackend {
         &self,
         agent_job_id: uuid::Uuid,
         patches: Vec<StepPatch>,
-    ) -> Result<(), ControlError> {
+    ) -> Result<Vec<preloop_gha_protocol::NdjsonEvent>, ControlError> {
         self.patch_steps(agent_job_id, patches).await
     }
     async fn report_steps(
@@ -485,7 +485,7 @@ impl ControlBackend for PgBackend {
         plan_id: &str,
         agent_job_id: uuid::Uuid,
         steps: Vec<serde_json::Value>,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<StepReportOutcome, ControlError> {
         self.report_steps(plan_id, agent_job_id, steps).await
     }
     async fn attempt_repository(
@@ -887,6 +887,9 @@ impl ControlBackend for PgBackend {
     }
     async fn list_runners(&self, run_id: Option<RunId>) -> Result<RunnerListing, ControlError> {
         self.list_runners(run_id).await
+    }
+    async fn pool_bindings(&self) -> Result<Vec<PoolBindingRecord>, ControlError> {
+        self.pool_bindings().await
     }
     async fn runner_rsa_public_key(
         &self,

@@ -1,0 +1,59 @@
+{
+  "sessions": [
+    {
+      "session_id": "ds-7c1e",
+      "run_id": "8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01",
+      "job_id": "test (sandbox)",
+      "job_name": "test (sandbox)",
+      "state": "paused",
+      "version": 7,
+      "step": {
+        "index": 3,
+        "total": 6,
+        "context_name": "cargo_test",
+        "display_name": "cargo test",
+        "command": "cargo test -p preloop-sandbox reconcile",
+        "working_directory": "/home/runner/work/preloop",
+        "exit_code": 101
+      },
+      "machine": "plr-cpane-4",
+      "workspace": "/home/runner/work/preloop",
+      "controller": null,
+      "created_at_ms": 1792684520000,
+      "paused_seconds": 846
+    },
+    {
+      "session_id": "ds-21aa",
+      "run_id": "c01d77e4-2b7a-4c1e-8f30-5a9d0e6c2b11",
+      "job_id": "e2e",
+      "job_name": "e2e",
+      "state": "attached",
+      "version": 3,
+      "step": {
+        "index": 0,
+        "total": 4,
+        "display_name": "checkout"
+      },
+      "machine": "plr-cpane-2",
+      "controller": "agent:omp",
+      "created_at_ms": 1792684900000,
+      "paused_seconds": 180
+    },
+    {
+      "session_id": "ds-0f93",
+      "run_id": "9e1c3d50-7b44-4e21-9f0a-d2c8b6a10408",
+      "job_id": "nightly/build",
+      "job_name": "nightly/build",
+      "state": "abandoned",
+      "version": 2,
+      "step": {
+        "index": 1,
+        "total": 3,
+        "display_name": "build"
+      },
+      "machine": "plr-main-1",
+      "created_at_ms": 1792500000000,
+      "paused_seconds": 172800
+    }
+  ]
+}

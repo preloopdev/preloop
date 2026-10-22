@@ -16,7 +16,7 @@ use super::backend::*;
 use super::types::*;
 use crate::config::EnvironmentRulesMap;
 use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
-use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
+use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -906,6 +906,7 @@ pub(crate) mod suite {
                 )
                 .await
                 .unwrap()
+                .matched
         );
         // Terminal report on a second, undeclared step + a name-less update.
         assert!(
@@ -931,6 +932,7 @@ pub(crate) mod suite {
                 )
                 .await
                 .unwrap()
+                .matched
         );
         let manifests = backend.run_step_manifests(run_id).await.unwrap();
         let steps = manifests.get(&agent).expect("manifest for the attempt");
@@ -956,7 +958,390 @@ pub(crate) mod suite {
                 )
                 .await
                 .unwrap()
+                .matched
         );
+    }
+
+    /// Each stored step change persists exactly one `StepStatus` in the
+    /// outbox (so it is in the run's `events.ndjson` snapshot), carrying the
+    /// *wire's* timings; a repeat report, a late non-terminal update or a
+    /// regressing conclusion changes nothing and emits nothing.
+    pub(crate) async fn step_status_events_follow_the_stored_row(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job_full(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let poll = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = poll else {
+            panic!("expected a claim, got {poll:?}");
+        };
+        let agent = claimed.request.agent_job_id;
+        let plan = claimed.request.plan_id.clone();
+
+        let started = "2026-07-28T18:58:13.715Z";
+        let completed = "2026-07-28T18:58:19.000Z";
+        let started_us = chrono::DateTime::parse_from_rfc3339(started)
+            .unwrap()
+            .timestamp_micros();
+        let completed_us = chrono::DateTime::parse_from_rfc3339(completed)
+            .unwrap()
+            .timestamp_micros();
+
+        // Run it: the report's own clock, not the server's receipt time.
+        let first = backend
+            .report_steps(
+                &plan,
+                agent,
+                vec![serde_json::json!({
+                    "external_id": "step-1",
+                    "number": 2,
+                    "name": "Build",
+                    "status": 3,
+                    "started_at": started,
+                    "conclusion": 0
+                })],
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.events.len(), 1, "a new step emits once");
+        let NdjsonEvent::StepStatus {
+            run_id: event_run,
+            job_id,
+            step_id,
+            workflow_index,
+            runner_number,
+            conclusion,
+            started_at_us: event_start,
+            finished_at_us: event_finish,
+            ..
+        } = &first.events[0]
+        else {
+            panic!("expected a step_status event, got {:?}", first.events[0]);
+        };
+        assert_eq!(*event_run, run_id);
+        assert_eq!(job_id.0, "build");
+        assert_eq!(step_id, "step-1");
+        assert_eq!(*workflow_index, Some(0));
+        assert_eq!(*runner_number, Some(2));
+        assert_eq!(conclusion, "in_progress");
+        assert_eq!(*event_start, Some(started_us), "wire start wins");
+        assert_eq!(*event_finish, None);
+
+        // Same step again, still running: nothing changed, nothing emitted.
+        let repeat = backend
+            .report_steps(
+                &plan,
+                agent,
+                vec![serde_json::json!({
+                    "external_id": "step-1",
+                    "number": 2,
+                    "name": "Build",
+                    "status": 3,
+                    "started_at": started,
+                    "conclusion": 0
+                })],
+            )
+            .await
+            .unwrap();
+        assert!(
+            repeat.events.is_empty(),
+            "an unchanged report must not emit: {:?}",
+            repeat.events
+        );
+
+        // Finishing it uses the wire's `completed_at`.
+        let done = backend
+            .report_steps(
+                &plan,
+                agent,
+                vec![serde_json::json!({
+                    "external_id": "step-1",
+                    "number": 2,
+                    "name": "Build",
+                    "status": 6,
+                    "started_at": started,
+                    "completed_at": completed,
+                    "conclusion": 2
+                })],
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.events.len(), 1);
+        let NdjsonEvent::StepStatus {
+            conclusion,
+            started_at_us: event_start,
+            finished_at_us: event_finish,
+            ..
+        } = &done.events[0]
+        else {
+            panic!("expected a step_status event");
+        };
+        assert_eq!(conclusion, "success");
+        assert_eq!(*event_start, Some(started_us));
+        assert_eq!(*event_finish, Some(completed_us));
+
+        // A late in-progress report and a regressing failure must not reopen
+        // or rewrite a settled step.
+        for late in [
+            serde_json::json!({
+                "external_id": "step-1", "status": 3, "conclusion": 0
+            }),
+            serde_json::json!({
+                "external_id": "step-1", "status": 6, "conclusion": 3
+            }),
+        ] {
+            let outcome = backend
+                .report_steps(&plan, agent, vec![late])
+                .await
+                .unwrap();
+            assert!(outcome.events.is_empty(), "a settled step is final");
+        }
+        let manifests = backend.run_step_manifests(run_id).await.unwrap();
+        let step = manifests
+            .get(&agent)
+            .and_then(|steps| steps.iter().find(|step| step.id == "step-1"))
+            .expect("step-1");
+        assert_eq!(step.conclusion, "success");
+        assert_eq!(
+            step.finished_at.map(|at| at.timestamp_micros()),
+            Some(completed_us)
+        );
+
+        // Both changes are in the durable snapshot a fresh client reads.
+        let snapshot = backend.run_event_snapshot(run_id).await.unwrap();
+        let step_events: Vec<NdjsonEvent> = snapshot
+            .iter()
+            .filter_map(|value| serde_json::from_value(value.clone()).ok())
+            .filter(|event: &NdjsonEvent| matches!(event, NdjsonEvent::StepStatus { .. }))
+            .collect();
+        assert_eq!(
+            step_events.len(),
+            2,
+            "one event per stored change: {step_events:?}"
+        );
+        assert_eq!(
+            serde_json::to_string(&step_events[1]).unwrap(),
+            format!(
+                "{{\"type\":\"step_status\",\"run_id\":\"{}\",\"job_id\":\"build\",\
+                 \"step_id\":\"step-1\",\"workflow_index\":0,\"runner_number\":2,\
+                 \"name\":\"Build\",\"conclusion\":\"success\",\
+                 \"started_at_us\":{started_us},\"finished_at_us\":{completed_us}}}",
+                run_id.0
+            )
+        );
+    }
+
+    /// Settling closes `pending` steps as `skipped` and running ones with the
+    /// job's verdict; cancelling closes both as `cancelled`. Each closure is
+    /// persisted as a `StepStatus`, and none of them are left `pending`.
+    pub(crate) async fn settle_closes_unfinished_steps(backend: &dyn ControlBackend) {
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+
+        let claim = |run_id: RunId| {
+            let session_id = session.session_id.clone();
+            let runner_id = runner.runner.id;
+            async move {
+                let poll = backend
+                    .poll_session(poll(&session_id, runner_id))
+                    .await
+                    .unwrap();
+                let PollOutcome::Claimed(claimed) = poll else {
+                    panic!("expected a claim, got {poll:?}");
+                };
+                (run_id, claimed)
+            }
+        };
+
+        // 1. A failed completion while a step was running: the running step
+        //    takes the verdict, the never-reported one is skipped.
+        let failed_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                failed_run,
+                vec![submit_job_full(failed_run, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let (_, claimed) = claim(failed_run).await;
+        let events = backend
+            .report_steps(
+                &claimed.request.plan_id,
+                claimed.request.agent_job_id,
+                vec![serde_json::json!({
+                    "external_id": "half-run",
+                    "number": 3,
+                    "name": "Run tests",
+                    "status": 3,
+                    "conclusion": 0
+                })],
+            )
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), 1);
+        let done = backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id: failed_run,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Failure,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(done.effective_status, ExecutionStatus::Failure);
+        let manifests = backend.run_step_manifests(failed_run).await.unwrap();
+        let steps = manifests.get(&claimed.request.agent_job_id).unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .find(|step| step.id == "step-1")
+                .unwrap()
+                .conclusion,
+            "skipped",
+            "a declared step that never ran is skipped, not pending"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .find(|step| step.id == "half-run")
+                .unwrap()
+                .conclusion,
+            "failure",
+            "a running step takes the job's verdict"
+        );
+        for step in steps {
+            assert!(
+                step.finished_at.is_some(),
+                "{} must be stamped finished",
+                step.id
+            );
+            assert_ne!(step.conclusion, "pending");
+        }
+        let snapshot = backend.run_event_snapshot(failed_run).await.unwrap();
+        let closed = snapshot
+            .iter()
+            .filter_map(|value| serde_json::from_value::<NdjsonEvent>(value.clone()).ok())
+            .filter(|event| match event {
+                NdjsonEvent::StepStatus {
+                    step_id,
+                    conclusion,
+                    ..
+                } => {
+                    (step_id == "step-1" && conclusion == "skipped")
+                        || (step_id == "half-run" && conclusion == "failure")
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(closed, 2, "each closure is in the durable event snapshot");
+
+        // 2. Cancelling a run closes every attempt's unfinished steps.
+        let cancelled_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                cancelled_run,
+                vec![submit_job_full(cancelled_run, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        backend.cancel_run(cancelled_run, None).await.unwrap();
+        let manifests = backend.run_step_manifests(cancelled_run).await.unwrap();
+        let steps = manifests.values().flatten().collect::<Vec<_>>();
+        assert!(!steps.is_empty());
+        for step in &steps {
+            assert_eq!(
+                step.conclusion, "cancelled",
+                "a cancelled job's {} must not stay pending",
+                step.id
+            );
+        }
+    }
+
+    /// The list endpoint returns each job's steps in execution order, like
+    /// `get_run`: the synthetic step that ran first used to trail the declared
+    /// ones because the list read kept manifest order.
+    pub(crate) async fn listed_steps_are_in_execution_order(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job_full(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let poll = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = poll else {
+            panic!("expected a claim, got {poll:?}");
+        };
+        // "Set up job" runs first (number 1) although the manifest holds the
+        // declared step first; it is appended as synthetic.
+        backend
+            .report_steps(
+                &claimed.request.plan_id,
+                claimed.request.agent_job_id,
+                vec![serde_json::json!({
+                    "external_id": "setup-job",
+                    "number": 1,
+                    "name": "Set up job",
+                    "status": 6,
+                    "conclusion": 2
+                })],
+            )
+            .await
+            .unwrap();
+
+        let runs = backend
+            .list_runs(RunListFilter {
+                limit: 50,
+                ..RunListFilter::default()
+            })
+            .await
+            .unwrap();
+        let listed = runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .expect("the run is listed");
+        let ids: Vec<&str> = listed.jobs_list[0]
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect();
+        assert_eq!(ids, ["setup-job", "step-1"]);
     }
 
     pub(crate) async fn webhook_replay_is_idempotent(backend: &dyn ControlBackend) {
@@ -8785,6 +9170,149 @@ pub(crate) mod suite {
             other => panic!("a held terminal run must not dispatch: {other:?}"),
         }
     }
+
+    /// `pool_bindings` reports each job's dispatch state — `ready` (no
+    /// runner picked), `provisioning` (pool-pending, no free candidate),
+    /// `assigned` (a runner is picked but has not claimed it), `running` (a
+    /// runner claimed it) — and a 1-based waitlist position for jobs with no
+    /// runner bound yet (`ready`/`provisioning`), in dispatch queue order,
+    /// skipping jobs that already have one (`assigned`/`running`).
+    pub(crate) async fn pool_bindings_reports_dispatch_states_and_waitlist_order(
+        backend: &dyn ControlBackend,
+        set_pool_assignments: impl Fn(bool),
+    ) {
+        // A pool-proven runner with an open session: the enqueue-time
+        // pairing's only eligible candidate once pool assignments are on.
+        let mut proven = register_runner_with_labels("proven", &["self-hosted", "grp-a"]);
+        proven.pool_proven = true;
+        let proven = backend.register_runner(proven).await.unwrap();
+        backend
+            .create_session(create_session(proven.runner.id))
+            .await
+            .unwrap();
+        // A second, non-pool-proven runner used to claim a job outright —
+        // the `running` case — and ineligible for enqueue-time pairing.
+        let claimer = backend
+            .register_runner(register_runner_with_labels(
+                "claimer",
+                &["self-hosted", "grp-c"],
+            ))
+            .await
+            .unwrap();
+        let claimer_session = backend
+            .create_session(create_session(claimer.runner.id))
+            .await
+            .unwrap();
+
+        set_pool_assignments(false);
+        // Claimed outright by `claimer` — the `running` case. Submitted
+        // before `waits` so the generic `claim_next` (labels
+        // `["self-hosted"]`, which `waits` also satisfies) takes this
+        // older, equally-matching job first.
+        let running_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                running_run,
+                vec![submit_job_on(
+                    running_run,
+                    "runs",
+                    1,
+                    &["self-hosted", "grp-c"],
+                )],
+            ))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll_with_labels(
+                &claimer_session.session_id,
+                claimer.runner.id,
+                &["self-hosted", "grp-c"],
+            ))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("the `runs` job must be claimed, got {outcome:?}");
+        };
+        let (claimed_run, claimed_job) = (claimed.queued.run_id, claimed.queued.job_id);
+        assert_eq!(claimed_run, running_run);
+        assert_eq!(claimed_job, JobId("runs".to_owned()));
+        // Stays `ready`: pool assignments off at enqueue time, so no
+        // binding of any kind is ever recorded for it.
+        let ready_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                ready_run,
+                vec![submit_job_on(ready_run, "waits", 2, &["self-hosted"])],
+            ))
+            .await
+            .unwrap();
+
+        // `assigned`: pool assignments on, `proven` is the only eligible
+        // idle candidate and matches — bound before it ever claims.
+        set_pool_assignments(true);
+        let assigned_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                assigned_run,
+                vec![submit_job_on(
+                    assigned_run,
+                    "bound",
+                    3,
+                    &["self-hosted", "grp-a"],
+                )],
+            ))
+            .await
+            .unwrap();
+        // `provisioning`: still pool-on, but `proven` is now busy (bound
+        // above) and `claimer` is not pool-proven, so no candidate exists.
+        let provisioning_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                provisioning_run,
+                vec![submit_job_on(
+                    provisioning_run,
+                    "waiting-on-pool",
+                    4,
+                    &["self-hosted", "grp-a"],
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let bindings = backend.pool_bindings().await.unwrap();
+        assert_eq!(bindings.len(), 4, "{bindings:?}");
+        let by_job: std::collections::BTreeMap<&str, &PoolBindingRecord> = bindings
+            .iter()
+            .map(|binding| (binding.job_id.0.as_str(), binding))
+            .collect();
+
+        let waits = by_job["waits"];
+        assert_eq!(waits.state, PoolBindingState::Ready);
+        assert!(waits.runner_id.is_none());
+        assert_eq!(waits.waitlist_position, Some(1));
+
+        let runs = by_job["runs"];
+        assert_eq!(runs.state, PoolBindingState::Running);
+        assert_eq!(runs.runner_id, Some(claimer.runner.id));
+        assert_eq!(runs.runner_name.as_deref(), Some("claimer"));
+        assert_eq!(runs.waitlist_position, None);
+
+        let bound = by_job["bound"];
+        assert_eq!(bound.state, PoolBindingState::Assigned);
+        assert_eq!(bound.runner_id, Some(proven.runner.id));
+        assert_eq!(bound.runner_name.as_deref(), Some("proven"));
+        assert_eq!(bound.waitlist_position, None);
+
+        let waiting_on_pool = by_job["waiting-on-pool"];
+        assert_eq!(waiting_on_pool.state, PoolBindingState::Provisioning);
+        assert!(waiting_on_pool.runner_id.is_none());
+        assert_eq!(
+            waiting_on_pool.waitlist_position,
+            Some(2),
+            "waits behind `waits` in submit order; `bound` already has a \
+             runner and does not consume a waitlist slot"
+        );
+    }
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -9430,6 +9958,30 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn step_status_events_follow_the_stored_row() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::step_status_events_follow_the_stored_row(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn settle_closes_unfinished_steps() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::settle_closes_unfinished_steps(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn listed_steps_are_in_execution_order() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::listed_steps_are_in_execution_order(&backend).await;
+    }
+
+    #[tokio::test]
     async fn timeline_patch_is_bounded_and_keeps_the_patch() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -9769,6 +10321,17 @@ mod pg {
         };
         backend.set_config(true, false, std::time::Duration::from_secs(300));
         suite::pairing_marks_runner_pool_proven(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn pool_bindings_reports_dispatch_states_and_waitlist_order() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::pool_bindings_reports_dispatch_states_and_waitlist_order(&backend, |on| {
+            backend.set_config(on, false, std::time::Duration::from_secs(300));
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -11279,6 +11842,21 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn step_status_events_follow_the_stored_row() {
+        suite::step_status_events_follow_the_stored_row(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn settle_closes_unfinished_steps() {
+        suite::settle_closes_unfinished_steps(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn listed_steps_are_in_execution_order() {
+        suite::listed_steps_are_in_execution_order(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
     async fn timeline_patch_is_bounded_and_keeps_the_patch() {
         suite::timeline_patch_is_bounded_and_keeps_the_patch(&LiteBackend::in_memory().unwrap())
             .await;
@@ -11899,6 +12477,15 @@ mod lite {
         let backend = LiteBackend::in_memory().unwrap();
         backend.set_config(true, false, std::time::Duration::from_secs(300));
         suite::pairing_marks_runner_pool_proven(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn pool_bindings_reports_dispatch_states_and_waitlist_order() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::pool_bindings_reports_dispatch_states_and_waitlist_order(&backend, |on| {
+            backend.set_config(on, false, std::time::Duration::from_secs(300));
+        })
+        .await;
     }
 
     #[tokio::test]

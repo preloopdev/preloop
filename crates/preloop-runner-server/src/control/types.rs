@@ -10,7 +10,7 @@ use crate::models::{QueuedJob, RunRecord, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::azdo;
 use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 
-use preloop_gha_protocol::{ExecutionStatus, JobId, RegisteredRunner, RunId};
+use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RegisteredRunner, RunId};
 
 /// Default tenant boundary. Local mode runs entirely inside this namespace;
 /// hosted cells route namespaces to databases but the command contract is
@@ -542,6 +542,9 @@ pub(crate) struct CompleteOutcome {
     pub(crate) queue_nonempty: bool,
     /// Whether the completion was a replay of an already-terminal job.
     pub(crate) replayed: bool,
+    /// `StepStatus` events persisted inside the settle transaction; the
+    /// handler broadcasts them with `emit_persisted`.
+    pub(crate) events: Vec<NdjsonEvent>,
 }
 
 /// Result of `cancel_run` / `cancel_job`.
@@ -562,6 +565,9 @@ pub(crate) struct CancelOutcome {
     pub(crate) cancelled_jobs: Vec<JobId>,
     /// `runs-on` labels of the ready-queue front after the transition.
     pub(crate) next_runs_on: Vec<String>,
+    /// `StepStatus` events persisted inside the cancel transaction; the
+    /// handler broadcasts them with `emit_persisted`.
+    pub(crate) events: Vec<NdjsonEvent>,
 }
 
 /// A leased expansion node: the queue entry plus the immutable inputs the
@@ -908,19 +914,6 @@ pub(crate) struct CallbackJob {
     pub(crate) job_status: Option<ExecutionStatus>,
 }
 
-/// One runner-reported step update: upsert by `(attempt, step id)`. A new
-/// step is appended as synthetic; timestamps only ever fill in.
-#[derive(Debug, Clone)]
-pub(crate) struct StepPatch {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) conclusion: String,
-    pub(crate) started_at_us: Option<i64>,
-    pub(crate) finished_at_us: Option<i64>,
-    /// Server observation time: a new step's start when the runner sent none.
-    pub(crate) observed_us: i64,
-}
-
 /// An unfinished execution attempt, as the reaper sees it.
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveRequest {
@@ -962,35 +955,211 @@ pub(crate) struct ReapInputs {
     pub(crate) phantom_runners: std::collections::BTreeSet<i64>,
 }
 
-/// One reconciled step report, ready to upsert into `job_steps`.
+/// One step update, from either runner reporting path, ready to merge into
+/// `job_steps`.
 ///
-/// `report_steps` resolves conclusions against the job's current status and
-/// the report's wire shape (`WorkflowStepsUpdate` `status`/`conclusion`
-/// numbers); backends store the result verbatim.
-#[derive(Debug)]
-pub(crate) struct StepReport {
-    pub(crate) step_id: String,
-    pub(crate) runner_number: Option<i64>,
-    /// Reported display name; `None` keeps the stored name.
-    pub(crate) name: Option<String>,
+/// The Twirp path (`report_steps`) resolves conclusions against the job's
+/// current status and the report's wire shape (`WorkflowStepsUpdate`
+/// `status`/`conclusion` numbers) and always claims a conclusion; the AzDO
+/// timeline path (`patch_steps`) carries a `TimelineRecord`, whose `result`
+/// is optional, so it may claim none. Both land through
+/// [`merge_step_patch`], which owns the terminal guard and the change
+/// comparison in one place.
+#[derive(Debug, Clone)]
+pub(crate) struct StepPatch {
+    pub(crate) id: String,
+    /// Reported display name; empty keeps the stored name.
+    pub(crate) name: String,
+    /// Claimed conclusion, or `None` for an update that carries none
+    /// (an AzDO record with no `result`).
+    pub(crate) conclusion: Option<String>,
+    pub(crate) runner_number: Option<u32>,
+    pub(crate) started_at_us: Option<i64>,
+    pub(crate) finished_at_us: Option<i64>,
+    /// Server observation time used as a *new* step's start when the runner
+    /// sent none. `None` never invents one (a terminal-only Twirp report).
+    pub(crate) observed_us: Option<i64>,
+}
+
+/// One stored `job_steps` row, as the merge reads and writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredStep {
+    pub(crate) id: String,
+    pub(crate) workflow_index: Option<usize>,
+    pub(crate) runner_number: Option<u32>,
+    pub(crate) name: String,
     pub(crate) conclusion: String,
-    /// `Some` only when this report first observed the step running/finished.
-    /// A terminal-only report never invents `started_at == finished_at`.
     pub(crate) started_at_us: Option<i64>,
     pub(crate) finished_at_us: Option<i64>,
 }
 
-/// Fold one `steps[]` entry of `WorkflowStepsUpdate` into a `StepReport`.
+impl StoredStep {
+    pub(crate) fn from_record(record: &crate::models::StepRecord) -> Self {
+        Self {
+            id: record.id.clone(),
+            workflow_index: record.workflow_index,
+            runner_number: record.runner_number,
+            name: record.name.clone(),
+            conclusion: record.conclusion.clone(),
+            started_at_us: record.started_at.map(|at| at.timestamp_micros()),
+            finished_at_us: record.finished_at.map(|at| at.timestamp_micros()),
+        }
+    }
+
+    /// The `StepStatus` event describing this stored row.
+    pub(crate) fn event(&self, run_id: RunId, job_id: &JobId) -> NdjsonEvent {
+        NdjsonEvent::StepStatus {
+            run_id,
+            job_id: job_id.clone(),
+            step_id: self.id.clone(),
+            workflow_index: self.workflow_index,
+            runner_number: self.runner_number,
+            name: self.name.clone(),
+            conclusion: self.conclusion.clone(),
+            started_at_us: self.started_at_us,
+            finished_at_us: self.finished_at_us,
+        }
+    }
+}
+
+/// A merged step row plus whether it differs from what was stored.
+#[derive(Debug)]
+pub(crate) struct StepMerge {
+    /// The row to store. Every column is absolute — the merge already
+    /// resolved "fill in only when missing" and the terminal guard.
+    pub(crate) row: StoredStep,
+    /// `true` when this update changed the stored row (always true for a
+    /// step that did not exist). Only changed rows emit a `StepStatus`.
+    pub(crate) changed: bool,
+}
+
+/// Ordering of the conclusion vocabulary: a later report may move a step
+/// forward, never back.
+///
+/// `failed` is the pre-vocabulary word the AzDO path used to write; it is
+/// terminal so an old row is frozen rather than reopened. Everything else is
+/// unfinished — `pending`, a manifest row whose conclusion was never set, and
+/// any word this writer never produced. Treating an unknown word as settled
+/// would freeze a step beside a typo.
+fn conclusion_rank(conclusion: &str) -> u8 {
+    match conclusion {
+        "in_progress" => 1,
+        "success" | "failure" | "cancelled" | "skipped" | "failed" => 2,
+        _ => 0,
+    }
+}
+
+/// Whether `conclusion` is settled (success/failure/cancelled/skipped).
+pub(crate) fn step_conclusion_is_terminal(conclusion: &str) -> bool {
+    conclusion_rank(conclusion) == 2
+}
+
+/// The conclusion an unfinished step takes when its job settles.
+///
+/// A step the runner had started inherits the job's own terminal status (it
+/// was cut off mid-flight). A `pending` step never ran at all, so it is
+/// `skipped` — `cancelled` only when the job itself was cancelled. Nothing
+/// has to guess whether such a step was reached: GitHub's own timeline marks
+/// unexecuted steps skipped, and a cancelled job's are abandoned with it.
+pub(crate) fn settled_step_conclusion(stored: &str, outcome: ExecutionStatus) -> String {
+    if stored == "in_progress" {
+        return crate::runtime_scheduling::status_string(outcome);
+    }
+    if outcome == ExecutionStatus::Cancelled {
+        "cancelled".to_owned()
+    } else {
+        "skipped".to_owned()
+    }
+}
+
+/// Fold one update into the stored row.
+///
+/// Rules, all of them regressions this exists to prevent:
+/// - a settled conclusion is final: a late duplicate, a non-terminal update
+///   or a regressing one never rewrites it (or reopens its timings);
+/// - inside the unfinished range the conclusion only moves forward
+///   (`pending` → `in_progress`), never back;
+/// - the wire's own start/finish times win over the server's receipt stamp
+///   while the step is unfinished, and only ever fill in a missing value;
+/// - an update that claims no conclusion (AzDO `result: None`) leaves the
+///   stored conclusion alone; a step that does not exist yet is not created
+///   from such an update, because it has nothing to record.
+///
+/// `None` means "nothing to store".
+pub(crate) fn merge_step_patch(
+    current: Option<&StoredStep>,
+    patch: &StepPatch,
+) -> Option<StepMerge> {
+    let Some(current) = current else {
+        let conclusion = patch.conclusion.clone()?;
+        return Some(StepMerge {
+            row: StoredStep {
+                id: patch.id.clone(),
+                // AzDO carries no ordinal (`TimelineRecord` has no `order`),
+                // so only a later report can supply `workflow_index`, and it
+                // only ever matches a declared id.
+                workflow_index: None,
+                runner_number: patch.runner_number,
+                name: patch.name.clone(),
+                conclusion,
+                started_at_us: patch.started_at_us.or(patch.observed_us),
+                finished_at_us: patch.finished_at_us,
+            },
+            changed: true,
+        });
+    };
+    let settled = step_conclusion_is_terminal(&current.conclusion);
+    let conclusion = if settled {
+        current.conclusion.clone()
+    } else {
+        match patch.conclusion.as_deref() {
+            Some(next) if conclusion_rank(next) >= conclusion_rank(&current.conclusion) => {
+                next.to_owned()
+            }
+            _ => current.conclusion.clone(),
+        }
+    };
+    let (started_at_us, finished_at_us) = if settled {
+        (current.started_at_us, current.finished_at_us)
+    } else {
+        (
+            patch.started_at_us.or(current.started_at_us),
+            if step_conclusion_is_terminal(&conclusion) {
+                patch.finished_at_us.or(current.finished_at_us)
+            } else {
+                current.finished_at_us
+            },
+        )
+    };
+    let name = if patch.name.is_empty() {
+        current.name.clone()
+    } else {
+        patch.name.clone()
+    };
+    let row = StoredStep {
+        id: patch.id.clone(),
+        workflow_index: current.workflow_index,
+        runner_number: patch.runner_number.or(current.runner_number),
+        name,
+        conclusion,
+        started_at_us,
+        finished_at_us,
+    };
+    let changed = row != *current;
+    Some(StepMerge { row, changed })
+}
+
+/// Fold one `steps[]` entry of `WorkflowStepsUpdate` into a [`StepPatch`].
 ///
 /// `job_cancelled` selects the cancelled conclusion for numeric 3; `observed`
-/// is the server receive time. `None` means the step has no `external_id`
-/// and is dropped — guessing by display name merged distinct same-named
-/// steps before.
+/// is the server receive time, used only when the wire carries no timing.
+/// `None` means the step has no `external_id` and is dropped — guessing by
+/// display name merged distinct same-named steps before.
 pub(crate) fn step_report(
     step: &serde_json::Value,
     job_cancelled: bool,
     observed: chrono::DateTime<chrono::Utc>,
-) -> Option<StepReport> {
+) -> Option<StepPatch> {
     let external_id = step["external_id"].as_str().unwrap_or("");
     if external_id.is_empty() {
         return None;
@@ -1009,22 +1178,30 @@ pub(crate) fn step_report(
     } else {
         "in_progress"
     };
-    let runner_number = step["number"].as_u64().and_then(|n| i64::try_from(n).ok());
+    let runner_number = step["number"].as_u64().and_then(|n| u32::try_from(n).ok());
     // The runner reports the rendered display name ("Run actions/checkout@v4"),
     // the same string GitHub's UI shows, so it wins over the message's name:
     // the server leaves that empty for steps without an explicit `name:`.
-    let name = step["name"]
-        .as_str()
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned);
+    let name = step["name"].as_str().unwrap_or("");
+    let wire_us = |key: &str| {
+        step[key]
+            .as_str()
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+            .map(|at| at.timestamp_micros())
+    };
     let observed_us = observed.timestamp_micros();
-    Some(StepReport {
-        step_id: external_id.to_owned(),
+    Some(StepPatch {
+        id: external_id.to_owned(),
+        name: name.to_owned(),
+        conclusion: Some(conclusion.to_owned()),
         runner_number,
-        name,
-        conclusion: conclusion.to_owned(),
-        started_at_us: (!terminal).then_some(observed_us),
-        finished_at_us: terminal.then_some(observed_us),
+        // The official runner sends the step's own clock in `started_at` /
+        // `completed_at`; only the terminal report used to carry a time, and
+        // it was the server's receipt stamp. A terminal-only sighting with no
+        // wire start still never invents one.
+        started_at_us: wire_us("started_at").or((!terminal).then_some(observed_us)),
+        finished_at_us: terminal.then(|| wire_us("completed_at").unwrap_or(observed_us)),
+        observed_us: None,
     })
 }
 
@@ -1051,6 +1228,39 @@ pub(crate) struct RunQueueClaimability {
     /// (`crate::runtime_scheduling::job_matches_runner`) match at
     /// least one of those ready jobs. 0 when `queued` is 0.
     pub(crate) claimable: usize,
+}
+/// One job's dispatch state for `GET /api/v1/pool/bindings`
+/// (`pool_bindings`): where a ready-queue job stands between enqueue and a
+/// runner actually starting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolBindingState {
+    /// A runner has claimed the job and is executing it
+    /// (`job_requests.result IS NULL` with a runner bound).
+    Running,
+    /// A `job_assignments` row names a runner, but that runner has not
+    /// claimed the job yet.
+    Assigned,
+    /// `queue_state = 'ready'` with neither an assignment nor a pending
+    /// provision request: waiting for dispatch to consider it.
+    Ready,
+    /// A `provision_requests` row is waiting on the pool for capacity.
+    Provisioning,
+}
+
+/// One row of `pool_bindings`.
+#[derive(Debug, Clone)]
+pub(crate) struct PoolBindingRecord {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) state: PoolBindingState,
+    /// The bound or executing runner; `None` for `Ready`/`Provisioning`.
+    pub(crate) runner_id: Option<i64>,
+    pub(crate) runner_name: Option<String>,
+    /// Age of the current state, computed against the read's own clock.
+    pub(crate) since_seconds: u64,
+    /// 1-based rank in the dispatch queue order among jobs with no runner
+    /// bound yet (`Ready`/`Provisioning`); `None` for `Running`/`Assigned`.
+    pub(crate) waitlist_position: Option<u32>,
 }
 
 /// Insert a runner session row (`open_runner_session`).
@@ -1411,6 +1621,17 @@ pub(crate) struct JobSettled {
     pub(crate) live_log_key: String,
     /// `runs-on` of the ready-queue front job after the transition.
     pub(crate) next_runs_on: Vec<String>,
+    /// `StepStatus` events persisted inside the settle transaction; the
+    /// handler broadcasts them with `emit_persisted`.
+    pub(crate) events: Vec<NdjsonEvent>,
+}
+
+/// Result of `report_steps`: whether the report resolved to an attempt, plus
+/// the `StepStatus` events persisted for the steps it changed.
+#[derive(Debug, Default)]
+pub(crate) struct StepReportOutcome {
+    pub(crate) matched: bool,
+    pub(crate) events: Vec<NdjsonEvent>,
 }
 
 /// AzDO long-poll input (`poll_azdo_session`).

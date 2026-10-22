@@ -536,7 +536,12 @@ mod tests {
     fn make_ctx<'a>(
         job: &'a mut crate::worker::contexts::JobContext,
     ) -> crate::worker::execution_context::StepContext<'a> {
-        crate::worker::execution_context::StepContext::new(job, "s1".into(), "Step".into())
+        crate::worker::execution_context::StepContext::new(
+            job,
+            "s1".into(),
+            "s1".into(),
+            "Step".into(),
+        )
     }
 
     fn make_job() -> crate::worker::contexts::JobContext {

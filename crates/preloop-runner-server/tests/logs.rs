@@ -3383,6 +3383,18 @@ async fn test_get_scheduler_history_endpoint() {
 
     let app = app(state, CancellationToken::new());
 
+    assert_eq!(
+        request_status_without_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/scheduler/history",
+            serde_json::Value::Null,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "scheduler history must require the native bearer"
+    );
+
     let res = request_json(
         &app,
         Method::GET,

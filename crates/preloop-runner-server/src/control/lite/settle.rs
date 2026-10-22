@@ -35,6 +35,8 @@ pub(super) struct SettleEffects {
     pub(super) replayed: bool,
     pub(super) cancelled_siblings: Vec<JobId>,
     pub(super) newly_terminal_success: bool,
+    /// `StepStatus` events persisted for the step rows this settle closed.
+    pub(super) events: Vec<preloop_gha_protocol::NdjsonEvent>,
 }
 
 impl SettleEffects {
@@ -44,6 +46,7 @@ impl SettleEffects {
             replayed: true,
             cancelled_siblings: Vec::new(),
             newly_terminal_success: false,
+            events: Vec::new(),
         }
     }
 }
@@ -539,10 +542,14 @@ pub(super) fn cancel_holder(
 ) -> Result<(), ControlError> {
     match holder {
         Holder::Run(run_id) => {
+            // The `StepStatus` events are persisted with the rows; this
+            // displacement path has no client-facing fan-out of its own (its
+            // `JobStatus` events ride the caller's outbox rows).
             cancel_run_inner(tx, backend, *run_id)?;
         }
         Holder::Job { run_id, job_id } => {
-            cancel_job_inner(tx, backend, *run_id, job_id)?;
+            let mut events = Vec::new();
+            cancel_job_inner(tx, backend, *run_id, job_id, &mut events)?;
         }
         Holder::JobSet { run_id, job_ids } => {
             fail_jobset(tx, backend, *run_id, job_ids, ExecutionStatus::Cancelled)?;
@@ -559,7 +566,7 @@ pub(super) fn cancel_run_inner(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
     run_id: RunId,
-) -> Result<(usize, bool), ControlError> {
+) -> Result<(usize, bool, Vec<preloop_gha_protocol::NdjsonEvent>), ControlError> {
     let run = codec::run_key(run_id);
     let exists: bool = tx
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1)")
@@ -567,7 +574,7 @@ pub(super) fn cancel_run_inner(
         .query_row([&run], |row| row.get(0))
         .map_err(db)?;
     if !exists {
-        return Ok((0, false));
+        return Ok((0, false, Vec::new()));
     }
     // In-flight attempts get a cancellation message; the rest simply turn
     // terminal (their runners hold nothing).
@@ -634,6 +641,10 @@ pub(super) fn cancel_run_inner(
         .map_err(db)?
         .execute(params![run, now_us()])
         .map_err(db)?;
+    // No attempt of a cancelled run survives it: every step still pending or
+    // running is cancelled, so the run never reports work that cannot happen.
+    let events =
+        super::steps::close_unfinished_steps(tx, run_id, None, ExecutionStatus::Cancelled)?;
     release_concurrency_for_run(tx, backend, run_id)?;
     tx.prepare_cached("DELETE FROM jobsets WHERE run_id = ?1")
         .map_err(db)?
@@ -651,7 +662,7 @@ pub(super) fn cancel_run_inner(
             serde_json::json!({"status": "cancelled"}),
         )?;
     }
-    Ok((cancellations, finalized > 0))
+    Ok((cancellations, finalized > 0, events))
 }
 
 /// `cancel_job_inner`: cancel one job and its subtree, queueing a
@@ -661,6 +672,7 @@ pub(super) fn cancel_job_inner(
     backend: &LiteBackend,
     run_id: RunId,
     job_id: &JobId,
+    events: &mut Vec<preloop_gha_protocol::NdjsonEvent>,
 ) -> Result<usize, ControlError> {
     let Some(job) = jobs::job(tx, run_id, job_id)? else {
         return Ok(0);
@@ -692,6 +704,13 @@ pub(super) fn cancel_job_inner(
     .execute(params![codec::run_key(run_id), job_id.0])
     .map_err(db)?;
     finish_job_row(tx, run_id, job_id, ExecutionStatus::Cancelled)?;
+    // The cancelled job's unfinished steps cancel with it.
+    events.extend(super::steps::close_unfinished_steps(
+        tx,
+        run_id,
+        Some(job_id),
+        ExecutionStatus::Cancelled,
+    )?);
     // Reusable callers own their callee subtree; a cancelled caller cancels
     // it (matrix legs included — they carry `parent_job_id` too).
     let children: Vec<JobId> = {
@@ -709,7 +728,7 @@ pub(super) fn cancel_job_inner(
         rows.collect::<Result<Vec<_>, _>>().map_err(db)?
     };
     for child in children {
-        count += cancel_job_inner(tx, backend, run_id, &child)?;
+        count += cancel_job_inner(tx, backend, run_id, &child, events)?;
     }
     if expandable {
         retire_node_requests(tx, run_id, job_id, ExecutionStatus::Cancelled)?;
@@ -758,6 +777,11 @@ pub(super) fn settle_node(
         .optional()
         .map_err(db)?;
     finish_job_row(tx, run_id, job_id, effective)?;
+    // A settled job's unfinished steps settle with it: `in_progress` takes
+    // the job's verdict, `pending` never ran. Before this, only `in_progress`
+    // rows were closed, so a skipped or cancelled job kept showing work that
+    // was still "waiting".
+    let events = super::steps::close_unfinished_steps(tx, run_id, Some(job_id), effective)?;
     jobs::refresh_remaining_needs(tx, run_id, job_id, &job.base_id)?;
     let summary = jobs::summarize_run_row(tx, run_id)?;
     let newly_terminal_success =
@@ -799,6 +823,7 @@ pub(super) fn settle_node(
         replayed: decision.replayed,
         cancelled_siblings,
         newly_terminal_success,
+        events,
     })
 }
 

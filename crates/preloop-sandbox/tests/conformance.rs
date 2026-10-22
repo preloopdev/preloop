@@ -674,12 +674,7 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
             .state,
         SandboxState::Preserved
     );
-    wait_for(|| {
-        h.service
-            .get(&short.sandbox.id, &short.lease.id)
-            .is_err()
-    })
-    .await;
+    wait_for(|| h.service.get(&short.sandbox.id, &short.lease.id).is_err()).await;
     // The long window outlived it: the short sandbox ended by its TTL, not
     // by reconcile.
     assert_eq!(
@@ -2061,6 +2056,36 @@ async fn list_redacts_lease_ids() {
             .unwrap_err()
             .code,
         Code::PermissionDenied
+    );
+}
+
+/// `Stats` redacts lease ids the same way `List` does: any client-token
+/// holder can call `Stats`, so it must never leak which lease drives a
+/// sandbox it does not hold.
+#[tokio::test]
+async fn stats_redacts_lease_ids() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "stats-redact".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let stats = h.service.stats();
+    let sandbox = stats
+        .providers
+        .iter()
+        .flat_map(|provider| &provider.sandboxes)
+        .find(|s| s.sandbox.id == lease.sandbox.id)
+        .expect("the acquired sandbox is listed in stats");
+    assert!(
+        sandbox.sandbox.lease_id.is_empty(),
+        "Stats leaked a lease id: {:?}",
+        sandbox.sandbox
     );
 }
 

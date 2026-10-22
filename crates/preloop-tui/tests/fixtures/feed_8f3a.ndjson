@@ -1,0 +1,8 @@
+{"type":"run_status","run_id":"8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01","status":"in_progress"}
+{"type":"job_status","run_id":"8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01","job_id":"test (sandbox)","status":"in_progress"}
+{"type":"step_status","run_id":"8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01","job_id":"test (sandbox)","step_id":"c4e1a7d2-3f0b-4b8a-9d61-7e2a0c5b1f01","workflow_index":2,"runner_number":4,"name":"cargo test","conclusion":"in_progress","started_at_us":1792671273000000}
+{"type":"step_status","run_id":"8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01","job_id":"test (sandbox)","step_id":"c4e1a7d2-3f0b-4b8a-9d61-7e2a0c5b1f01","workflow_index":2,"runner_number":4,"name":"cargo test","conclusion":"failure","started_at_us":1792671273000000,"finished_at_us":1792671534000000}
+{"type":"annotation","run_id":"8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01","job_id":"test (sandbox)","level":"error","message":"orphan reported as Failed","file":"service.rs","line":812,"title":null,"step_id":"c4e1a7d2-3f0b-4b8a-9d61-7e2a0c5b1f01"}
+{"type":"job_completed","run_id":"8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01","job_id":"test (sandbox)","status":"failure"}
+{"type":"log","run_id":"8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01","job_id":"test (sandbox)","line":"   Compiling preloop-sandbox v0.21.0"}
+{"type":"future_event","x":1}

@@ -1,0 +1,82 @@
+{
+  "deliveries": [
+    {
+      "delivery_id": "8c1f0a2e-e02",
+      "event": "push",
+      "state": "failed",
+      "attempts": 5,
+      "received_at": "2026-10-22T09:08:00Z",
+      "age_seconds": 11520.0,
+      "lease_until": null,
+      "last_error": "github 502 creating check run"
+    },
+    {
+      "delivery_id": "7a90c3b1-11b",
+      "event": "pull_request",
+      "state": "failed",
+      "attempts": 5,
+      "received_at": "2026-10-22T09:09:00Z",
+      "age_seconds": 11460.0,
+      "lease_until": null,
+      "last_error": "github 502 creating check run"
+    },
+    {
+      "delivery_id": "f0e2d6a1-9a4",
+      "event": "push",
+      "state": "done",
+      "attempts": 1,
+      "received_at": "2026-10-22T12:19:42Z",
+      "age_seconds": 18.0,
+      "lease_until": null,
+      "last_error": null
+    },
+    {
+      "delivery_id": "e8d1b7c4-3c7",
+      "event": "check_run",
+      "state": "done",
+      "attempts": 1,
+      "received_at": "2026-10-22T12:19:19Z",
+      "age_seconds": 41.0,
+      "lease_until": null,
+      "last_error": null
+    },
+    {
+      "delivery_id": "d77cb2a9-a20",
+      "event": "pull_request",
+      "state": "done",
+      "attempts": 2,
+      "received_at": "2026-10-22T12:18:00Z",
+      "age_seconds": 120.0,
+      "lease_until": null,
+      "last_error": "retry: lease expired"
+    },
+    {
+      "delivery_id": "c3b56e8f-6e1",
+      "event": "workflow_job",
+      "state": "done",
+      "attempts": 1,
+      "received_at": "2026-10-22T12:18:00Z",
+      "age_seconds": 120.0,
+      "lease_until": null,
+      "last_error": null
+    },
+    {
+      "delivery_id": "b19a4f72-f88",
+      "event": "push",
+      "state": "done",
+      "attempts": 1,
+      "received_at": "2026-10-22T12:14:00Z",
+      "age_seconds": 360.0,
+      "lease_until": null,
+      "last_error": null
+    }
+  ],
+  "stats": {
+    "received": 1284,
+    "processing": 0,
+    "done": 1280,
+    "dead_letters": 2,
+    "oldest_pending_at": null,
+    "oldest_pending_age_seconds": null
+  }
+}
