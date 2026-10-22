@@ -89,6 +89,16 @@ Releases before v0.27.0 predate the changelog.
   never while a capture pin or an alternates reference protects it; clone
   hardlinks make the ceiling soft.
 
+- **Strict job assignments can no longer strand a ready job.** With
+  `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` on, a job is claimable only while it has a
+  `job_assignments` or `provision_requests` row. Every path that returns a job
+  to the ready queue now derives that intent exactly as enqueue does: requeue
+  after a runner purge (or boot reconcile), deferred matrix/reusable expansion
+  legs, and an enqueue with the pool off (which previously wrote no provision
+  mark at all under strict assignments). A 10 s reaper backstop repairs any
+  ready job that still has no row and logs the count at info, so a missed path
+  can no longer stall the queue until a restart.
+
 ## [0.35.5] - 2026-10-21
 
 ### Security
