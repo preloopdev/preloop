@@ -25,6 +25,9 @@ on:
         default: v0.29.5
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   reuse-previous-goldens:
     name: Reuse Previous Golden Artifacts
