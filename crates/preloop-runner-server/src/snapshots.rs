@@ -10699,12 +10699,20 @@ pub(crate) mod bounded_git_tests {
     async fn a_configured_credential_helper_never_runs_for_engine_git() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        fn helper_script(dir: &FsPath, name: &str) -> (PathBuf, PathBuf) {
+        /// The helper records that it ran, then optionally holds the credential
+        /// exchange open for `sleep_seconds` — the keychain dialog that never
+        /// answers. The control only needs the record, so it holds nothing.
+        fn helper_script(dir: &FsPath, name: &str, sleep_seconds: u32) -> (PathBuf, PathBuf) {
             let log = dir.join(format!("{name}-ran"));
             let helper = dir.join(name);
+            let hold = if sleep_seconds > 0 {
+                format!("sleep {sleep_seconds}\n")
+            } else {
+                String::new()
+            };
             std::fs::write(
                 &helper,
-                format!("#!/bin/sh\necho ran >> '{}'\nsleep 5\n", log.display()),
+                format!("#!/bin/sh\necho ran >> '{}'\n{hold}", log.display()),
             )
             .unwrap();
             std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -10733,8 +10741,13 @@ pub(crate) mod bounded_git_tests {
         let sha = "0123456789012345678901234567890123456789";
 
         // Control: plain Git does consult a configured helper. Without this the
-        // assertion below could pass for the wrong reason.
-        let (control_helper, control_log) = helper_script(temp.path(), "control-helper");
+        // assertion below could pass for the wrong reason. Prompting is off so
+        // the control terminates once the helper has answered, but that is the
+        // engine's *prompt* policy — it does not touch helper lookup. The
+        // record the helper leaves is the assertion; there is no latency
+        // budget, because a loaded runner can take seconds to reach the
+        // credential step and asserting on that pace made this test flaky.
+        let (control_helper, control_log) = helper_script(temp.path(), "control-helper", 0);
         let control_repository = mirror_with_helper(
             temp.path(),
             "control-mirror",
@@ -10748,16 +10761,23 @@ pub(crate) mod bounded_git_tests {
             .arg(&control_repository)
             .args(["fetch", "--quiet", "--no-tags"])
             .arg(&upstream)
-            .arg(sha);
-        control.kill_on_drop(true);
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_millis(1500), control.output()).await;
+            .arg(sha)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let control = tokio::time::timeout(std::time::Duration::from_secs(30), control.output())
+            .await
+            .expect("the control git must finish; only a hang is a failure here")
+            .expect("the control git must start");
         assert!(
             control_log.exists(),
-            "the fixture must make plain git consult a credential helper"
+            "the fixture must make plain git consult a credential helper; \
+             git exited with {} and stderr:\n{}",
+            control.status,
+            String::from_utf8_lossy(&control.stderr)
         );
 
-        let (engine_helper, engine_log) = helper_script(temp.path(), "engine-helper");
+        let (engine_helper, engine_log) = helper_script(temp.path(), "engine-helper", 5);
         let engine_repository = mirror_with_helper(
             temp.path(),
             "engine-mirror",
