@@ -21,6 +21,11 @@ pub const EXEC_TIMED_OUT: i32 = 124;
 /// Exit status reported when the caller of an exec went away and the driver
 /// cancelled the command.
 pub const EXEC_CANCELLED: i32 = 130;
+
+/// Version of the out-of-process driver protocol
+/// (`proto/preloop/sandbox/driver/v1/driver.proto`). The agent refuses a
+/// plugin whose version differs.
+pub const DRIVER_PROTOCOL_VERSION: u32 = 1;
 /// A sandbox backend on one host (or one remote endpoint, for connectors).
 #[async_trait]
 pub trait Driver: Send + Sync {

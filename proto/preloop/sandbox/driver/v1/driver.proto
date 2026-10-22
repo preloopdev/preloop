@@ -1,0 +1,133 @@
+// Out-of-process sandbox driver protocol.
+//
+// A driver plugin is a local process that turns generic sandbox operations
+// into one VM technology's API. The Preloop host agent talks to it over
+// Connect (HTTP/2 cleartext) on a Unix domain socket that only the agent can
+// reach. The plugin never talks to the Sandbox Service: enrollment, mTLS,
+// fencing, retries, acknowledgements and the mount allowlist stay in the
+// agent.
+//
+// This service mirrors the Rust `Driver` trait in
+// crates/preloop-sandbox/src/driver.rs one-to-one and reuses its messages, so
+// an in-process driver and a plugin see the same work.
+//
+// Errors use Connect codes with the trait's meaning: `failed_precondition`
+// for an operation the plugin does not support or a request it refuses,
+// `not_found` for an unknown native reference (Destroy treats that as
+// success), `unavailable` for a transient backend failure.
+syntax = "proto3";
+
+package preloop.sandbox.driver.v1;
+
+import "preloop/sandbox/v1/sandbox.proto";
+
+// Bumped on incompatible changes. The agent refuses a plugin whose major
+// version differs from its own.
+// Current: 1.
+
+service Driver {
+  // Identity, protocol version and capabilities. Called once at start and
+  // after every plugin restart.
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+
+  // Create and start a sandbox; returns its native reference. Must be
+  // idempotent on `work.sandbox_id`: a redelivered create for a sandbox the
+  // plugin already made returns the same reference.
+  rpc Create(CreateRequest) returns (CreateResponse);
+
+  // Destroy a sandbox. Destroying something already gone succeeds.
+  rpc Destroy(NativeRequest) returns (preloop.sandbox.v1.Empty);
+
+  // Run a command, streaming output, ending with exactly one exit event.
+  // `request.timeout_secs` is never zero; the plugin kills the command at
+  // the deadline and reports exit 124.
+  rpc Exec(ExecRequest) returns (stream preloop.sandbox.v1.ExecEvent);
+
+  // Kill a running exec (exit 130). May arrive before the exec starts; a
+  // plugin should then refuse to start that exec id. Cancelling a finished
+  // exec succeeds.
+  rpc CancelExec(CancelExecRequest) returns (preloop.sandbox.v1.Empty);
+
+  // Copy a tar archive the agent staged at `host_tar` into `guest_dir`.
+  // The plugin runs on the same host and reads the file directly.
+  rpc CopyIn(CopyInRequest) returns (preloop.sandbox.v1.Empty);
+
+  // Write a tar archive of `guest_path` to `host_tar` (created by the agent,
+  // writable by the plugin).
+  rpc CopyOut(CopyOutRequest) returns (preloop.sandbox.v1.Empty);
+
+  // Every sandbox this plugin owns on this host.
+  rpc Inventory(InventoryRequest) returns (InventoryResponse);
+
+  // Best-effort host and per-sandbox runtime facts. Never fails: return an
+  // empty report when nothing can be measured.
+  rpc HostReport(HostReportRequest) returns (preloop.sandbox.v1.HostReport);
+
+  // Optional operations: only called when `GetInfo.capabilities` declares
+  // them; otherwise answer `failed_precondition`.
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  rpc DropSnapshot(NativeRequest) returns (preloop.sandbox.v1.Empty);
+  rpc Stop(NativeRequest) returns (preloop.sandbox.v1.Empty);
+  rpc Start(StartRequest) returns (preloop.sandbox.v1.Empty);
+  rpc Pause(NativeRequest) returns (preloop.sandbox.v1.Empty);
+  rpc Resume(NativeRequest) returns (preloop.sandbox.v1.Empty);
+}
+
+message GetInfoRequest {
+  // The agent's driver protocol version.
+  uint32 agent_protocol_version = 1;
+}
+
+message GetInfoResponse {
+  // Stable driver name reported to the service (e.g. "acme").
+  string name = 1;
+  // The plugin's driver protocol version.
+  uint32 protocol_version = 2;
+  preloop.sandbox.v1.Capabilities capabilities = 3;
+  // Free-form plugin version, for logs.
+  string plugin_version = 4;
+}
+
+message CreateRequest { preloop.sandbox.v1.CreateWork work = 1; }
+message CreateResponse { string native_ref = 1; }
+
+message NativeRequest { string native_ref = 1; }
+
+message ExecRequest {
+  string native_ref = 1;
+  string exec_id = 2;
+  preloop.sandbox.v1.ExecRequest request = 3;
+}
+
+message CancelExecRequest {
+  string native_ref = 1;
+  string exec_id = 2;
+}
+
+message CopyInRequest {
+  string native_ref = 1;
+  string host_tar = 2;
+  string guest_dir = 3;
+}
+
+message CopyOutRequest {
+  string native_ref = 1;
+  string guest_path = 2;
+  string host_tar = 3;
+}
+
+message InventoryRequest {}
+message InventoryResponse { repeated preloop.sandbox.v1.Observed sandboxes = 1; }
+
+message HostReportRequest {}
+
+message SnapshotRequest {
+  string native_ref = 1;
+  string template = 2;
+}
+message SnapshotResponse { string native_ref = 1; }
+
+message StartRequest {
+  string native_ref = 1;
+  bool forkable = 2;
+}
