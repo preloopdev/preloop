@@ -875,7 +875,13 @@ pub fn build_app(
                     require_system_bearer,
                 )),
         )
-        .route("/api/v1/scheduler/history", get(get_scheduler_history))
+        .route(
+            "/api/v1/scheduler/history",
+            get(get_scheduler_history).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
         .route(
             "/api/v1/github/webhooks",
             post(github::handle_github_webhook)
