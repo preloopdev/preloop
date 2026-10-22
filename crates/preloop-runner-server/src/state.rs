@@ -977,6 +977,17 @@ pub struct AppState {
     /// checkouts before housekeeping deletes it. Zero discards immediately.
     /// Env: `PRELOOP_SNAPSHOT_RETENTION_SECONDS` (default 1800).
     pub snapshot_retention_seconds: u64,
+    /// Ceiling, in bytes, for the shared snapshot object cache under
+    /// `<state_dir>/snapshot-object-cache`. This cache is never garbage
+    /// collected in place (a live snapshot alternates to it), so the size
+    /// sweep is what keeps it bounded. Entries referenced by a snapshot or
+    /// locked by a capture are never evicted. `0` disables the sweep.
+    /// Env: `PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES` (default 100 GiB).
+    pub snapshot_object_cache_max_bytes: u64,
+    /// Single-flight ownership of the object-cache sweep, scoped to this
+    /// engine's state directory. Startup and post-capture sweeps share it; a
+    /// second engine (or test state) is not suppressed by this one.
+    pub snapshot_object_cache_sweep: Arc<crate::snapshots::SnapshotObjectCacheSweep>,
     /// Run/check/status retention, in days, mirroring GitHub's Actions
     /// retention setting. The retention sweep deletes terminal runs (plus
     /// their checks, statuses, artifacts, and logs) older than this.
@@ -1342,7 +1353,7 @@ impl AppState {
     /// whole life, and lets tests point at a temp file without mutating
     /// process-wide environment state that other tests race against.
     pub async fn new_with_config(state_dir: PathBuf, config_path: PathBuf) -> anyhow::Result<Self> {
-        Self::new_with_store(state_dir, config_path, None).await
+        Self::new_with_store(state_dir, config_path, None, None).await
     }
 
     /// [`AppState::new_with_config`] against an explicit store URL.
@@ -1356,6 +1367,7 @@ impl AppState {
         state_dir: PathBuf,
         config_path: PathBuf,
         store_url: Option<&str>,
+        github: Option<crate::github_breaker::GithubFunnel>,
     ) -> anyhow::Result<Self> {
         // Test binaries share one process env: a sibling test mutating
         // `PRELOOP_STORE_URL` must not silently retarget a state built for a
@@ -1501,8 +1513,13 @@ impl AppState {
         let max_jobs_per_run = crate::config::max_jobs_per_run(&config)?;
         let diag_staging_max_age_seconds =
             crate::config::diag_staging_max_age_hours(&config)?.saturating_mul(3600);
-        let github_breakers = Arc::new(crate::github_breaker::GithubBreakerRegistry::default());
-        let github_consumption = Arc::new(crate::github_breaker::GithubConsumption::default());
+        // The process's outbound-GitHub funnel. The embedding engine supplies
+        // its own (`ServerConfig::github`) so the runner pool's golden
+        // downloads resolve through the same breakers and accounting as the
+        // webhook path; the standalone server and tests get a private one.
+        let github = github.unwrap_or_default();
+        let github_breakers = Arc::clone(&github.breakers);
+        let github_consumption = Arc::clone(&github.consumption);
         // Attached before `github_app` is cloned from the registry, so the
         // legacy field reports through the same breaker and accounting.
         let github_apps = crate::github_app::load_from(&config)?
@@ -1736,6 +1753,11 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
+            snapshot_object_cache_max_bytes: env::var("PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100 * 1024 * 1024 * 1024),
+            snapshot_object_cache_sweep: crate::snapshots::SnapshotObjectCacheSweep::new(),
             retention_days,
             max_jobs_per_run,
             diag_staging_max_age_seconds,

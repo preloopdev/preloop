@@ -1719,6 +1719,28 @@ mod tests {
         );
     }
 
+    /// A tiny-frame upload that finishes must be admitted, not cut off at the
+    /// idle budget: the completion has to reach the middleware even though
+    /// thousands of `Progress` reports raced it.
+    #[tokio::test]
+    async fn a_tiny_frame_upload_finishes_without_waiting_out_the_idle_budget() {
+        let gate = gate_with(|gate| {
+            gate.idle_budget = Duration::from_millis(50);
+            gate.ingest_budget = Duration::from_secs(5);
+        });
+        let router = gate_router(gate.clone());
+
+        let body = Body::from_stream(stream::iter(
+            (0..50_000).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(b"x"))),
+        ));
+        assert_eq!(send(&router, body).await, StatusCode::OK);
+        assert_eq!(
+            gate.slots.available_permits(),
+            MAX_CONCURRENT_WEBHOOK_UPLOADS,
+            "the admitted upload must give its slot back"
+        );
+    }
+
     /// The hold-and-replace pattern the gate has to survive: every slot taken
     /// by an upload that sends nothing, replaced as each is cut off. Holding a
     /// slot now costs bytes and only lasts the idle budget, and a delivery

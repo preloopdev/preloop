@@ -1474,6 +1474,7 @@ async fn postgres_recovery_preserves_run_secrets() {
             temp.path().to_path_buf(),
             config_path.clone(),
             Some(&pg_url),
+            None,
         )
         .await
         .unwrap();
@@ -1497,9 +1498,10 @@ async fn postgres_recovery_preserves_run_secrets() {
             .unwrap()
     };
 
-    let recovered = AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url))
-        .await
-        .unwrap();
+    let recovered =
+        AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url), None)
+            .await
+            .unwrap();
     assert_run_secrets_outside_database(&recovered, run_id, "owner/pg-secrets").await;
 }
 
@@ -1827,6 +1829,7 @@ fn server_config_debug_redacts_store_url_password() {
         pending_registrations: None,
         pool_status: None,
         observability: None,
+        github: None,
         require_job_assignments: false,
     };
     let debug = format!("{config:?}");
@@ -1862,6 +1865,7 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
             temp.path().to_path_buf(),
             config_path.clone(),
             Some(&pg_url),
+            None,
         )
         .await
         .unwrap();
@@ -1911,9 +1915,10 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
         (claimed_job, other_job, request_id, session_id)
     };
 
-    let recovered = AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url))
-        .await
-        .unwrap();
+    let recovered =
+        AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url), None)
+            .await
+            .unwrap();
     let inner = recovered.test_tx().await;
     assert!(
         inner

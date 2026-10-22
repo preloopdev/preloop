@@ -16,8 +16,8 @@
 //! the named mirror with exactly the claimed parents and tree.
 
 use super::*;
+use crate::snapshots::{GIT_CONTROL_TIMEOUT, GIT_PROGRAM, GIT_TRANSFER_TIMEOUT, GIT_WORK_TIMEOUT};
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
 use tokio::process::Command;
 
 /// Fixed identity for self-built merge commits. A fixed name and date keep
@@ -218,40 +218,85 @@ fn is_object_id(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// A Git command with the engine's child policy applied.
+///
+/// The policy ([`crate::snapshots::git_command_for`]) resets Git's credential
+/// helper list on the command line and disables every interactive credential
+/// path in the environment, so an osxkeychain or GCM helper cannot block a
+/// merge build on a keychain dialog. Merge fetches authenticate with an
+/// `http.<url>.extraheader` token ([`auth_header_for_remote`]) or URL userinfo,
+/// neither of which involves a helper.
+fn git_command() -> Command {
+    crate::snapshots::git_command_for(GIT_PROGRAM)
+}
+
+/// Run `command` under `deadline` and return its output whatever the exit
+/// status was, through the engine-wide bounded runner
+/// ([`preloop_observability::deadline::run_command`]): the child is killed and
+/// reaped when the deadline expires, and it cannot look hung merely because it
+/// filled a pipe.
+///
+/// `command` must come from [`git_command`]; the policy is applied there, not
+/// here, so a call site that staged `GIT_CONFIG_*` after building it keeps what
+/// it staged.
+async fn git_output_within(
+    command: Command,
+    operation: &str,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, MergeError> {
+    // Boxed so the spawn/drain/timeout machinery is not inlined into every
+    // handler future that can reach a merge build.
+    Box::pin(preloop_observability::deadline::run_command(
+        command, deadline, operation,
+    ))
+    .await
+    .map_err(|error| MergeError::Git {
+        operation: operation.to_owned(),
+        message: error.to_string(),
+    })
+}
+
+/// [`git_output_within`] plus the usual "a non-zero exit is an error" check.
+async fn run_git_within(
+    command: Command,
+    operation: &str,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, MergeError> {
+    let output = git_output_within(command, operation, deadline).await?;
+    if !output.status.success() {
+        return Err(MergeError::Git {
+            operation: operation.to_owned(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    Ok(output)
+}
+
 /// Whether `repository` holds `sha` as a commit.
 async fn commit_present(repository: &Path, sha: &str) -> bool {
     if !is_object_id(sha) {
         return false;
     }
-    Command::new("git")
+    let mut command = git_command();
+    command
         .arg("--git-dir")
         .arg(repository)
-        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")]);
+    // Any failure — a non-zero exit, a spawn error, or the deadline — means
+    // "not present"; callers answer by fetching, which is the safe direction.
+    git_output_within(command, "check commit presence", GIT_CONTROL_TIMEOUT)
         .await
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|output| output.status.success())
 }
 
 /// `git rev-parse <rev>` in `repository`.
 async fn rev_parse(repository: &Path, rev: &str) -> Result<String, MergeError> {
-    let output = Command::new("git")
+    let mut command = git_command();
+    command
         .arg("--git-dir")
         .arg(repository)
-        .args(["rev-parse", rev])
-        .output()
-        .await
-        .map_err(|error| MergeError::Git {
-            operation: format!("rev-parse {rev}"),
-            message: error.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(MergeError::Git {
-            operation: format!("rev-parse {rev}"),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
-    }
+        .args(["rev-parse", rev]);
+    let output = run_git_within(command, &format!("rev-parse {rev}"), GIT_CONTROL_TIMEOUT).await?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
@@ -330,37 +375,32 @@ async fn ensure_mirror(mirror: &Path) -> Result<(), MergeError> {
                 message: error.to_string(),
             })?;
     }
-    let output = Command::new("git")
-        .args(["init", "--bare", "--quiet", "--template="])
-        .arg(mirror)
-        .output()
-        .await
-        .map_err(|error| MergeError::Io {
-            path: mirror.display().to_string(),
-            message: error.to_string(),
-        })?;
+    let output = {
+        let mut init = git_command();
+        init.args(["init", "--bare", "--quiet", "--template="])
+            .arg(mirror);
+        match git_output_within(init, "initialize merge mirror", GIT_CONTROL_TIMEOUT).await {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(MergeError::Io {
+                    path: mirror.display().to_string(),
+                    message: error.to_string(),
+                });
+            }
+        }
+    };
     if !output.status.success() && !mirror.join("HEAD").is_file() {
         return Err(MergeError::Io {
             path: mirror.display().to_string(),
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
-    let output = Command::new("git")
+    let mut disable_gc = git_command();
+    disable_gc
         .arg("--git-dir")
         .arg(mirror)
-        .args(["config", "gc.auto", "0"])
-        .output()
-        .await
-        .map_err(|error| MergeError::Io {
-            path: mirror.display().to_string(),
-            message: error.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(MergeError::Git {
-            operation: "config gc.auto".to_owned(),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
-    }
+        .args(["config", "gc.auto", "0"]);
+    run_git_within(disable_gc, "config gc.auto", GIT_CONTROL_TIMEOUT).await?;
     Ok(())
 }
 
@@ -374,25 +414,75 @@ async fn fetch_into_mirror(
     refspec: &str,
     resolve_ref: &str,
 ) -> Result<String, MergeError> {
-    let mut command = Command::new("git");
-    command
-        .arg("--git-dir")
-        .arg(&source.mirror)
-        .args(["fetch", "--quiet", "--no-tags"])
-        .arg(url)
-        .arg(refspec)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    fetch_into_mirror_within(
+        GIT_PROGRAM,
+        GIT_TRANSFER_TIMEOUT,
+        source,
+        url,
+        refspec,
+        resolve_ref,
+    )
+    .await
+}
+
+/// [`fetch_into_mirror`] with an explicit program and deadline.
+///
+/// Before this deadline a forge that accepted the connection and then stalled
+/// never returned: the webhook delivery building the pull-request merge hung
+/// forever, and every later delivery for that repository queued behind the
+/// same stuck task. The deadline bounds the whole fetch and expiry kills the
+/// child, so nothing keeps writing into the mirror after the caller moves on.
+///
+/// No engine-level lock is held across this fetch: a mirror has no lock file
+/// and the surrounding code relies only on Git's own per-ref locking, so a
+/// stalled fetch delays exactly the task that issued it — the deadline, not a
+/// lock, is the guarantee. See [`GIT_TRANSFER_TIMEOUT`] for why thirty
+/// minutes cannot cut a legitimate fetch short.
+///
+/// Expiry kills the child, which cannot unlink a lock file it held at the
+/// time, so dead locks are swept before each fetch. Without an engine lock the
+/// age rule is the only safe one: concurrent deliveries legitimately hold
+/// per-ref locks here, and only a lock that has outlived the longest possible
+/// fetch ([`GIT_TRANSFER_TIMEOUT`], every engine fetch into a mirror) is
+/// provably not a live child's.
+async fn fetch_into_mirror_within(
+    program: impl AsRef<std::ffi::OsStr>,
+    deadline: std::time::Duration,
+    source: &MergeSource,
+    url: &str,
+    refspec: &str,
+    resolve_ref: &str,
+) -> Result<String, MergeError> {
+    crate::snapshots::remove_stale_git_locks(
+        &source.mirror,
+        GIT_TRANSFER_TIMEOUT + std::time::Duration::from_secs(60),
+    );
+    let mut command = crate::snapshots::git_command_for(program);
     if let Some((key, value)) = source
         .token
         .as_deref()
         .and_then(|token| auth_header_for_remote(url, token, source.forge_host.as_deref()))
     {
-        command
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", key)
-            .env("GIT_CONFIG_VALUE_0", value);
+        // Staged in the environment: the value is a live token, and command
+        // lines are world-readable through process listings.
+        crate::snapshots::stage_git_auth_header(&mut command, &key, &value);
     }
-    let output = command.output().await.map_err(|error| MergeError::Fetch {
+    command
+        .arg("--git-dir")
+        .arg(&source.mirror)
+        .args(["fetch", "--quiet", "--no-tags"])
+        .arg(url)
+        .arg(refspec);
+    // `what` names the fetch and the deadline, the message an operator sees
+    // for a stalled forge: "git fetch timed out after 1800s: killed the hung
+    // git process".
+    let output = Box::pin(preloop_observability::deadline::run_command(
+        command,
+        deadline,
+        "git fetch",
+    ))
+    .await
+    .map_err(|error| MergeError::Fetch {
         refspec: refspec.to_owned(),
         url: crate::snapshots::sanitize_remote_url(url),
         message: error.to_string(),
@@ -576,18 +666,15 @@ pub async fn merge_in(served: &Path, parents: &MergeParents) -> Result<MergeOutc
         }
     }
 
-    let output = Command::new("git")
+    let mut command = git_command();
+    command
         .arg("--git-dir")
         .arg(served)
         .args(["merge-tree", "--write-tree", "--name-only", "-z"])
         .arg(&parents.base_sha)
-        .arg(&parents.head_sha)
-        .output()
-        .await
-        .map_err(|error| MergeError::Git {
-            operation: "merge-tree".to_owned(),
-            message: error.to_string(),
-        })?;
+        .arg(&parents.head_sha);
+    // Merging two large trees is real compute over local objects.
+    let output = git_output_within(command, "merge-tree", GIT_WORK_TIMEOUT).await?;
     let parsed = parse_merge_tree_output(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     match (output.status.success(), output.status.code(), parsed) {
@@ -642,16 +729,7 @@ async fn finish_merge(
         .env("GIT_COMMITTER_NAME", MERGE_IDENTITY_NAME)
         .env("GIT_COMMITTER_EMAIL", MERGE_IDENTITY_EMAIL)
         .env("GIT_COMMITTER_DATE", MERGE_IDENTITY_DATE);
-    let output = command.output().await.map_err(|error| MergeError::Git {
-        operation: "commit-tree".to_owned(),
-        message: error.to_string(),
-    })?;
-    if !output.status.success() {
-        return Err(MergeError::Git {
-            operation: "commit-tree".to_owned(),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
-    }
+    let output = run_git_within(command, "commit-tree", GIT_WORK_TIMEOUT).await?;
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !is_object_id(&sha) {
         return Err(MergeError::Git {
@@ -747,22 +825,12 @@ pub async fn publish_merge(
         refs.push((format!("refs/pull/{number}/merge"), merge.sha.clone()));
     }
     for (name, target) in refs {
-        let output = Command::new("git")
+        let mut command = git_command();
+        command
             .arg("--git-dir")
             .arg(served)
-            .args(["update-ref", &name, &target])
-            .output()
-            .await
-            .map_err(|error| MergeError::Git {
-                operation: format!("update-ref {name}"),
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(MergeError::Git {
-                operation: format!("update-ref {name}"),
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
+            .args(["update-ref", &name, &target]);
+        run_git_within(command, &format!("update-ref {name}"), GIT_CONTROL_TIMEOUT).await?;
     }
     for (operation, args) in [
         (
@@ -782,22 +850,9 @@ pub async fn publish_merge(
             vec!["config", "uploadpack.allowFilter", "true"],
         ),
     ] {
-        let output = Command::new("git")
-            .arg("--git-dir")
-            .arg(served)
-            .args(&args)
-            .output()
-            .await
-            .map_err(|error| MergeError::Git {
-                operation: operation.to_owned(),
-                message: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(MergeError::Git {
-                operation: operation.to_owned(),
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
+        let mut command = git_command();
+        command.arg("--git-dir").arg(served).args(&args);
+        run_git_within(command, operation, GIT_CONTROL_TIMEOUT).await?;
     }
     Ok(())
 }
@@ -928,15 +983,19 @@ async fn create_served_repository(state_dir: &Path, run_id: RunId) -> Result<Pat
                 message: error.to_string(),
             })?;
     }
-    let output = Command::new("git")
-        .args(["init", "--bare", "--quiet", "--template="])
-        .arg(&served)
-        .output()
-        .await
-        .map_err(|error| MergeError::Io {
-            path: served.display().to_string(),
-            message: error.to_string(),
-        })?;
+    let mut init = git_command();
+    init.args(["init", "--bare", "--quiet", "--template="])
+        .arg(&served);
+    let output =
+        match git_output_within(init, "initialize served repository", GIT_CONTROL_TIMEOUT).await {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(MergeError::Io {
+                    path: served.display().to_string(),
+                    message: error.to_string(),
+                });
+            }
+        };
     if !output.status.success() {
         return Err(MergeError::Io {
             path: served.display().to_string(),
@@ -969,16 +1028,14 @@ async fn protect_mirror_for_run(
     if !mirror.starts_with(state_dir.join("checkout-cache")) {
         return None;
     }
-    let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(&mirror)
-        .args([
-            "update-ref",
-            &format!("refs/preloop/runs/{run_id}"),
-            merge_sha,
-        ])
-        .output()
-        .await;
+    let mut command = git_command();
+    command.arg("--git-dir").arg(&mirror).args([
+        "update-ref",
+        &format!("refs/preloop/runs/{run_id}"),
+        merge_sha,
+    ]);
+    let output =
+        git_output_within(command, "publish merge-mirror run ref", GIT_CONTROL_TIMEOUT).await;
     match output {
         Ok(output) if output.status.success() => Some(relative.to_string_lossy().to_string()),
         Ok(output) => {
@@ -1184,6 +1241,118 @@ pub async fn attach_prebuilt_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The merge builder's forge fetch is the audit's second gap: a forge that
+    /// accepted the connection and then stalled kept the delivery task (and
+    /// `fetch_inputs`, `build_merge`, and the PR's test merge) alive forever.
+    ///
+    /// `fetch_into_mirror` is this same body with [`GIT_TRANSFER_TIMEOUT`]; the
+    /// deadline is a parameter here so the test can run in milliseconds.
+    #[tokio::test]
+    async fn a_hung_git_ends_the_mirror_fetch_at_the_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, pid_file) = crate::snapshots::bounded_git_tests::hanging_git(temp.path());
+        let mirror = temp.path().join("merge-mirror.git");
+        std::fs::create_dir_all(&mirror).unwrap();
+        let source = MergeSource {
+            mirror: mirror.clone(),
+            fetch_url: Some("https://github.com/owner/repo.git".to_owned()),
+            token: None,
+            forge_host: None,
+        };
+        let error = fetch_into_mirror_within(
+            program,
+            std::time::Duration::from_millis(750),
+            &source,
+            "https://github.com/owner/repo.git",
+            "refs/heads/main",
+            "refs/preloop/merge/base/main",
+        )
+        .await
+        .expect_err("a git that never exits must hit the deadline");
+        let message = format!("{error}");
+        assert!(
+            message.contains("git fetch timed out after 750ms"),
+            "the error must name the dependency and the deadline: {message}"
+        );
+        // A mirror has no engine-level lock (only Git's own per-ref locks, and
+        // a killed fetch leaves none): the next delivery may fetch into it
+        // immediately.
+        let leftovers: Vec<String> = std::fs::read_dir(&mirror)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".lock"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a bounded fetch must not leave locks behind: {leftovers:?}"
+        );
+        let pid = crate::snapshots::bounded_git_tests::wait_for_pid(&pid_file).await;
+        assert!(
+            crate::snapshots::bounded_git_tests::wait_until_finished(
+                &pid,
+                std::time::Duration::from_secs(10)
+            )
+            .await,
+            "the fake git child {pid} outlived the deadline"
+        );
+    }
+
+    /// A `git` killed at its deadline leaves the lock file it held behind —
+    /// `SIGKILL` is uncatchable — and every later fetch into that mirror would
+    /// fail with "Unable to create '…lock': File exists". The mirror has no
+    /// engine lock, so only a lock older than any possible fetch is provably
+    /// dead; that sweep must run before the fetch, while a young lock (which a
+    /// concurrent delivery may still hold) must survive.
+    #[tokio::test]
+    async fn a_dead_lock_from_a_killed_mirror_fetch_is_swept_before_the_next_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, _pid_file) = crate::snapshots::bounded_git_tests::hanging_git(temp.path());
+        let mirror = temp.path().join("merge-mirror.git");
+        std::fs::create_dir_all(mirror.join("refs/preloop/merge/base")).unwrap();
+        let dead = mirror.join("refs/preloop/merge/base/main.lock");
+        let live = mirror.join("refs/preloop/merge/base/other.lock");
+        std::fs::write(&dead, "").unwrap();
+        std::fs::write(&live, "").unwrap();
+        let age = GIT_TRANSFER_TIMEOUT + std::time::Duration::from_secs(60);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        filetime::set_file_mtime(
+            &dead,
+            filetime::FileTime::from_unix_time(now - (age.as_secs() as i64) - 60, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(&live, filetime::FileTime::from_unix_time(now, 0)).unwrap();
+
+        let source = MergeSource {
+            mirror: mirror.clone(),
+            fetch_url: Some("https://github.com/owner/repo.git".to_owned()),
+            token: None,
+            forge_host: None,
+        };
+        let _ = fetch_into_mirror_within(
+            program,
+            std::time::Duration::from_millis(750),
+            &source,
+            "https://github.com/owner/repo.git",
+            "refs/heads/main",
+            "refs/preloop/merge/base/main",
+        )
+        .await
+        .expect_err("a git that never exits must hit the deadline");
+
+        assert!(
+            !dead.exists(),
+            "a lock older than any possible fetch must be swept before the fetch"
+        );
+        assert!(
+            live.exists(),
+            "a young lock may belong to a concurrent delivery and must survive"
+        );
+    }
 
     #[test]
     fn remote_auth_is_scoped_to_the_origin_port() {

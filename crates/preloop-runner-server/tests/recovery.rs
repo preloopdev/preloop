@@ -350,6 +350,7 @@ async fn postgres_recovery_restores_post_restart_state() {
             temp.path().to_path_buf(),
             config_path.clone(),
             Some(&pg_url),
+            None,
         )
         .await
         .unwrap();
@@ -440,6 +441,7 @@ async fn postgres_recovery_restores_post_restart_state() {
         temp.path().to_path_buf(),
         config_path.clone(),
         Some(&pg_url),
+        None,
     )
     .await
     .unwrap();

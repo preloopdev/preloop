@@ -5,10 +5,23 @@
 use anyhow::Result;
 use clap::Parser;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use preloop_runner::cli::{Cli, Commands};
 
 const MAX_REUSABLE_WORKFLOW_DEPTH: usize = 4;
+
+/// Deadline for one GitHub contents call in the `lint` path.
+///
+/// Fetching a reusable workflow is a small metadata request: the engine's own
+/// GitHub client uses 30 s, and no legitimate answer takes longer. Without it
+/// a stalled api.github.com (or a GHES that accepts TCP and never answers)
+/// hangs `preloop-runner lint` forever.
+const REMOTE_WORKFLOW_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline for connecting in the `lint` path, matching the engine's GitHub
+/// client so a black-holed route fails fast instead of holding the CLI.
+const REMOTE_WORKFLOW_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -17,10 +30,20 @@ async fn main() -> Result<()> {
     // Runner gets structured local logging only — never OTLP export by default.
     // `PRELOOP_LOG_FORMAT` still controls pretty/json/auto for consistency.
     let obs_config = preloop_observability::ObservabilityConfig::from_env()
-        .with_service_version(env!("CARGO_PKG_VERSION"));
+        .with_service_version(env!("CARGO_PKG_VERSION"))
+        // Pin OTLP export TLS to the shared in-process roots when an operator
+        // enables export: reqwest's default platform verifier can block on a
+        // hung macOS trust daemon with no deadline.
+        .with_otel_client_builder(preloop_observability::tls::with_client_config_blocking);
     let (_observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();
+
+    // Resolve the process-wide TLS root set once, on a blocking thread. The
+    // first client build would otherwise read the OS certificate store on
+    // whichever async worker needs a client first; the read is bounded (5 s)
+    // but a hung store must not park a worker at all.
+    let _ = tokio::task::spawn_blocking(preloop_observability::tls::preload_roots).await;
 
     let result = match cli.command {
         Commands::Configure(args) => {
@@ -124,8 +147,15 @@ async fn resolve_remote_workflows(
     mut workflows: BTreeMap<String, String>,
     root_yaml: &str,
 ) -> Result<BTreeMap<String, String>> {
+    // Bounded like every other outbound client in the workspace: a total
+    // deadline, a connect deadline, and the shared in-process root set
+    // (bundled + OS store + `PRELOOP_GITHUB_CA_FILE`/`SSL_CERT_FILE`) instead
+    // of the platform TLS verifier that can block on a hung trust daemon.
     let client = reqwest::Client::builder()
+        .timeout(REMOTE_WORKFLOW_REQUEST_TIMEOUT)
+        .connect_timeout(REMOTE_WORKFLOW_CONNECT_TIMEOUT)
         .user_agent("preloop-runner")
+        .use_preconfigured_tls(preloop_observability::tls::client_config(None)?)
         .build()?;
     let token = env_or_test("PRELOOP_GITHUB_TOKEN");
     // Honour the engine's `PRELOOP_GITHUB_API_URL` override so `lint` against a

@@ -56,6 +56,14 @@ pub struct ServerConfig {
     /// Observability handle to clone into AppState (heartbeat, limits).
     /// `None` falls back to `Observability::noop()` (tests).
     pub observability: Option<preloop_observability::Observability>,
+    /// The engine's outbound-GitHub funnel (breaker registry + accounting).
+    ///
+    /// The embedding CLI supplies its own and hands the same one to the runner
+    /// pool, so the pool's golden downloads — which happen before any VM boots
+    /// — resolve through the breakers the webhook path already tripped;
+    /// `None` builds a private funnel (the standalone `preloop-server`
+    /// binary, tests).
+    pub github: Option<crate::github_breaker::GithubFunnel>,
     /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: refuse to dispatch any job without
     /// a recorded assignment, including to external runners.
     pub require_job_assignments: bool,
@@ -1488,6 +1496,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         config.state_dir.clone(),
         crate::config::config_path(),
         config.store_url.as_deref(),
+        config.github.clone(),
     )
     .await?;
     // Wire observability if supplied (CLI/server will pass its handle).
@@ -1508,7 +1517,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if state.github_app.is_none()
         && let Some(pat) = state.static_github_pat()
     {
-        crate::runs::warm_pat_scope_cache(&pat).await;
+        crate::runs::warm_pat_scope_cache(&state, &pat).await;
     }
     // Resolve the effective store URL exactly once, mirroring `open_store`
     // precedence: the explicit URL wins, then the environment, then SQLite at
@@ -1843,6 +1852,16 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::snapshots::sweep_workspace_snapshots(&snapshot_sweep_shared).await;
     });
+    // The shared object cache is never garbage-collected in place (a live
+    // snapshot alternates to it), so its ceiling is enforced here and after
+    // each successful capture. The single-flight permit is taken before the
+    // spawn, so this startup request coalesces with a concurrent post-capture
+    // one instead of walking the cache twice.
+    crate::snapshots::spawn_snapshot_object_cache_sweep(
+        &shared.state.snapshot_object_cache_sweep,
+        shared.state.state_dir.clone(),
+        shared.state.snapshot_object_cache_max_bytes,
+    );
     let archive_shared = shared.clone();
     tokio::spawn(async move { run_history_archiver(archive_shared).await });
     let flusher_shared = shared.clone();

@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 pub use preloop_gha_protocol::SecretString;
+use preloop_observability::deadline::{DeadlineGuard, GuardError, run_command_blocking};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -149,97 +149,70 @@ pub trait CredentialStore: Send + Sync {
 /// enough that a caller fails while someone is still watching.
 const OS_STORE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bounds every call into the host OS credential store, and gives up on the
-/// store for the rest of the process once it has proven unresponsive.
+/// The error text for a store that missed its deadline.
 ///
-/// Each operation runs on a dedicated `std::thread` (the store APIs are
-/// blocking and some, like macOS `SecKeychainAddGenericPassword`, cannot be
-/// cancelled) while the caller waits at most `timeout`. That thread is
-/// detached and leaks on expiry: joining a wedged call would re-instate the
-/// hang this bound exists to prevent. The first expiry marks the store
-/// unresponsive, so later calls return the same error immediately instead of
-/// stacking another blocked thread behind the same prompt, and `available()`
-/// reports the store unavailable so callers fall back to the file store.
-#[derive(Debug, Clone)]
-struct OsStoreGuard {
-    timeout: Duration,
-    unresponsive: Arc<AtomicBool>,
-}
-
-impl Default for OsStoreGuard {
-    fn default() -> Self {
-        Self::with_timeout(OS_STORE_TIMEOUT)
-    }
-}
-
-impl OsStoreGuard {
-    fn with_timeout(timeout: Duration) -> Self {
-        Self {
-            timeout,
-            unresponsive: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn run<T: Send + 'static>(&self, op: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-        if self.unresponsive.load(Ordering::SeqCst) {
-            return Err(self.unresponsive_error());
-        }
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let _worker = std::thread::Builder::new()
-            .name("os-credential-store".to_owned())
-            .spawn(move || {
-                let _ = sender.send(op());
-            })
-            .context("spawn a thread for an OS credential store call")?;
-        match receiver.recv_timeout(self.timeout) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                self.unresponsive.store(true, Ordering::SeqCst);
-                Err(self.unresponsive_error())
-            }
-            // The worker panicked before answering, which says nothing about
-            // the store, so the circuit stays closed.
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(anyhow::anyhow!("OS credential store call panicked"))
-            }
-        }
-    }
-
-    fn unresponsive_error(&self) -> anyhow::Error {
-        anyhow::anyhow!(
-            "the operating-system credential store did not answer within {}s and is probably \
-             waiting on an unlock prompt or a hung keychain or Secret Service daemon; later calls \
-             fail immediately. Use the default file store (`credential_store = \"file\"`) to keep \
-             secrets out of the OS store",
-            self.timeout.as_secs_f32()
-        )
-    }
+/// Shared by the production guard and the tests so the message an operator
+/// sees is the message the tests assert on.
+fn unresponsive_store_error(timeout: Duration) -> String {
+    format!(
+        "the operating-system credential store did not answer within {}s and is probably \
+         waiting on an unlock prompt or a hung keychain or Secret Service daemon; later calls \
+         fail immediately. Use the default file store (`credential_store = \"file\"`) to keep \
+         secrets out of the OS store",
+        timeout.as_secs_f32()
+    )
 }
 
 /// The host operating system's native credential store.
 ///
-/// Every call is bounded by [`OsStoreGuard`], and after one unanswered call
-/// the store is treated as unresponsive for the rest of the process.
-#[derive(Debug, Clone, Default)]
+/// Every call runs behind a [`DeadlineGuard`] (dedicated thread, hard
+/// deadline, fail-fast after the first expiry), and after one unanswered call
+/// the store is treated as unresponsive for the rest of the process. The guard
+/// is the shared implementation in `preloop_observability::deadline`, so the
+/// engine has exactly one bounded-wait policy.
+#[derive(Debug, Clone)]
 pub struct OsCredentialStore {
-    guard: OsStoreGuard,
+    guard: DeadlineGuard,
+}
+
+impl Default for OsCredentialStore {
+    fn default() -> Self {
+        Self {
+            guard: DeadlineGuard::new(
+                OS_STORE_TIMEOUT,
+                "os-credential-store",
+                unresponsive_store_error(OS_STORE_TIMEOUT),
+            ),
+        }
+    }
 }
 
 impl OsCredentialStore {
     fn entry(reference: &CredentialRef) -> Result<keyring::Entry> {
         keyring::Entry::new("preloop", reference.as_str()).context("create OS credential entry")
     }
+
+    /// Run a blocking store call behind the shared deadline guard, mapping the
+    /// guard's generic error back into this module's `anyhow` world.
+    fn guarded<T>(&self, operation: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T>
+    where
+        T: Send + 'static,
+    {
+        self.guard.run(operation).map_err(|error| match error {
+            GuardError::Operation(error) => error,
+            other => anyhow::Error::msg(other.to_string()),
+        })
+    }
 }
 
 impl CredentialStore for OsCredentialStore {
     fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
         let reference = reference.clone();
-        self.guard
-            .run(move || match Self::entry(&reference)?.get_password() {
-                Ok(value) => Ok(Some(SecretString::new(value))),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(deny_helpful_error(error, &reference, "read")),
-            })
+        self.guarded(move || match Self::entry(&reference)?.get_password() {
+            Ok(value) => Ok(Some(SecretString::new(value))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(deny_helpful_error(error, &reference, "read")),
+        })
     }
 
     fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
@@ -248,7 +221,7 @@ impl CredentialStore for OsCredentialStore {
         }
         let reference = reference.clone();
         let value = value.clone();
-        self.guard.run(move || {
+        self.guarded(move || {
             Self::entry(&reference)?
                 .set_password(value.expose())
                 .map_err(|error| deny_helpful_error(error, &reference, "write"))?;
@@ -258,12 +231,11 @@ impl CredentialStore for OsCredentialStore {
 
     fn delete(&self, reference: &CredentialRef) -> Result<()> {
         let reference = reference.clone();
-        self.guard
-            .run(move || match Self::entry(&reference)?.delete_credential() {
-                Ok(()) => Ok(()),
-                Err(keyring::Error::NoEntry) => Ok(()),
-                Err(error) => Err(error).context("delete credential from OS store"),
-            })
+        self.guarded(move || match Self::entry(&reference)?.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error).context("delete credential from OS store"),
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -283,7 +255,7 @@ impl CredentialStore for OsCredentialStore {
     /// "User interaction is not allowed" means writes would hang, so report
     /// the store unavailable so that callers fall back to the file store.
     fn available(&self) -> Result<()> {
-        self.guard.run(|| {
+        self.guarded(|| {
             match keyring::Entry::store_status() {
                 Ok(()) => {}
                 Err(error) => {
@@ -339,13 +311,17 @@ fn deny_helpful_error(error: keyring::Error, reference: &CredentialRef, op: &str
 /// probe is cheap and the fallback (the file store) is always safe.
 #[cfg(target_os = "macos")]
 fn macos_keychain_writable() -> Result<()> {
-    use std::io::Read;
-    use std::time::{Duration, Instant};
-
     /// Kept below `OS_STORE_TIMEOUT` so a wedged keychain fails the probe
     /// ("not writable", the store reports itself unavailable) before the
     /// enclosing call deadline would mark the whole store unresponsive.
     const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Budget for deleting the throwaway probe item. A healthy keychain
+    /// answers in milliseconds; the two-second bound keeps
+    /// `PROBE_TIMEOUT + PROBE_CLEANUP_TIMEOUT` below [`OS_STORE_TIMEOUT`] so a
+    /// wedged `securityd` still lets the guard report the store unavailable
+    /// (instead of the caller abandoning the thread mid-cleanup) and the
+    /// killed child cannot outlive it.
+    const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
     /// Throwaway item used to prove `SecItemAdd` completes in this session.
     /// Distinct service/account so it can never collide with a real entry.
     const PROBE_SERVICE: &str = "dev.preloop.writability-probe";
@@ -360,8 +336,13 @@ fn macos_keychain_writable() -> Result<()> {
     // One probe command: write a throwaway item, then delete it. Both go
     // through the same SecItemAdd/SecItemDelete path a real credential write
     // takes, so a locked keychain hangs or fails here exactly as it would on
-    // the engine-token migration.
-    let mut child = std::process::Command::new("security")
+    // the engine-token migration. Both run through the shared bounded child
+    // runner, which kills and reaps a `security` stuck in `securityd` IPC at
+    // the deadline — a plain `.status()` here would keep this guard thread
+    // (already abandoned by the caller at `OS_STORE_TIMEOUT`) and the child
+    // alive for the rest of the process.
+    let mut probe = std::process::Command::new("security");
+    probe
         .arg("add-generic-password")
         .arg("-s")
         .arg(PROBE_SERVICE)
@@ -369,44 +350,41 @@ fn macos_keychain_writable() -> Result<()> {
         .arg(PROBE_ACCOUNT)
         .arg("-w")
         .arg("probe")
-        .arg(&keychain)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("probing login keychain writability")?;
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    let status = loop {
-        match child.try_wait().context("waiting on keychain probe")? {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!(
-                    "login keychain write probe timed out after {}s (keychain locked or \
-                     securityd unreachable); using the file credential store",
-                    PROBE_TIMEOUT.as_secs()
-                );
+        .arg(&keychain);
+    let probe_output = run_command_blocking(probe, PROBE_TIMEOUT, "login keychain write probe")
+        .map_err(|error| {
+            if error.timed_out() {
+                anyhow::anyhow!(
+                    "{error} (keychain locked or securityd unreachable); using the file \
+                     credential store"
+                )
+            } else {
+                anyhow::Error::new(error).context("probing login keychain writability")
             }
-            None => std::thread::sleep(Duration::from_millis(25)),
-        }
-    };
+        })?;
+
     // Best-effort cleanup of the probe item regardless of outcome; a leftover
     // is harmless (distinct service name, no secret value).
-    let _ = std::process::Command::new("security")
+    let mut cleanup = std::process::Command::new("security");
+    cleanup
         .arg("delete-generic-password")
         .arg("-s")
         .arg(PROBE_SERVICE)
         .arg("-a")
         .arg(PROBE_ACCOUNT)
-        .arg(&keychain)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    if !status.success() {
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
+        .arg(&keychain);
+    if let Err(error) = run_command_blocking(
+        cleanup,
+        PROBE_CLEANUP_TIMEOUT,
+        "keychain probe item cleanup",
+    ) {
+        tracing::warn!(%error,
+            "keychain probe cleanup did not complete (the throwaway probe item may remain in \
+             the login keychain)");
+    }
+
+    if !probe_output.status.success() {
+        let stderr = String::from_utf8_lossy(&probe_output.stderr);
         anyhow::bail!(
             "login keychain is not writable in this session ({}); \
              using the file credential store",
@@ -1583,6 +1561,7 @@ impl CredentialStore for WriteOnlyCredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn references_reject_unsafe_values() {
@@ -1948,7 +1927,11 @@ mod tests {
     fn an_unresponsive_os_store_times_out_once_then_fails_fast() {
         // Test-only deadline: the production value is 10 s.
         let timeout = Duration::from_millis(500);
-        let guard = OsStoreGuard::with_timeout(timeout);
+        let guard = DeadlineGuard::new(
+            timeout,
+            "os-credential-store",
+            unresponsive_store_error(timeout),
+        );
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         // Held for the whole test: the worker blocks as a keychain call behind
@@ -1958,7 +1941,7 @@ mod tests {
         let first_attempts = attempts.clone();
         let started = std::time::Instant::now();
         let error = guard
-            .run(move || {
+            .run(move || -> Result<()> {
                 first_attempts.fetch_add(1, Ordering::SeqCst);
                 entered_tx.send(()).unwrap();
                 let _ = release_rx.recv();
@@ -1981,7 +1964,7 @@ mod tests {
         let second_attempts = attempts.clone();
         let started = std::time::Instant::now();
         let error = guard
-            .run(move || {
+            .run(move || -> Result<()> {
                 second_attempts.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })

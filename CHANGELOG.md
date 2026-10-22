@@ -47,6 +47,48 @@ Releases before v0.27.0 predate the changelog.
   main ruleset no longer allows direct pushes (admins may still merge a PR),
   and the release-tag ruleset restricts tag creation.
 
+### Fixed
+
+- **The runner pool's golden-release GitHub calls now go through the engine's
+  circuit breaker.** `resolve_latest_golden_tag` (the `/releases` listing), the
+  OCI manifest and token lookups, the `.sha256` sidecars and the golden
+  transfers were the last GitHub calls outside it: the pool had no handle on
+  the engine's `AppState` breaker registry. `RunnerPoolConfig` now carries the
+  engine's shared funnel (the registry and its per-subsystem accounting) from
+  the CLI through `bootstrap::serve` into `AppState` and the runner pool, so
+  golden traffic is admitted on the anonymous bucket and attributed to the new
+  `golden` subsystem. A one-shot CLI bake, with no engine to share a funnel
+  with, keeps a private one instead of leaving a call unobserved. Behaviour: an
+  open breaker refuses the metadata lookup before it opens a connection — none
+  of its 30-second deadline is spent, and the refusal is not cached as a
+  negative tag — while the transfers keep their one-hour budget and only their
+  admission decision changes. Breaker state is keyed by service origin as well
+  as credential, so the golden hosts an operator names (`PRELOOP_GOLDEN_URL`,
+  a non-GHCR `PRELOOP_GOLDEN_OCI_REF`, a token realm) keep their own breakers:
+  a mirror's outage cannot park GitHub traffic, an open GitHub breaker cannot
+  refuse a healthy mirror, and a GHES install's anonymous calls no longer share
+  a partition with the golden path's public-GitHub calls. A golden lookup also
+  inherits an outage another credential's traffic already discovered at the same
+  origin, and the `golden` subsystem now reports the bytes it moved rather than
+  zero.
+
+- **Snapshot capture is bounded end to end, and the shared object cache has a
+  ceiling.** One run's merge attach, local workspace capture, or remote
+  checkout fetch now runs under a single 90-minute backstop; on expiry only
+  that run's unaccepted staging and run-local repositories are removed, and
+  the submission fails with an operator message instead of queueing jobs.
+  Cancelling a capture kills the whole Git process group (a hung transport or
+  `index-pack` included); the per-cache refresh lock is released when
+  `ensure_object_cache` returns, a cache pin bridges the interval until the
+  snapshot publishes its alternates, and staging cleanup waits for in-flight
+  blocking copies before removing the tree. The shared snapshot object cache
+  (`<state>/snapshot-object-cache`) is pruned oldest-first at startup and
+  after each successful capture to
+  `PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES` (default 100 GiB, `0` disables).
+  An entry is retired only under the same per-entry lock a refresh takes, and
+  never while a capture pin or an alternates reference protects it; clone
+  hardlinks make the ceiling soft.
+
 ## [0.35.5] - 2026-10-21
 
 ### Security
@@ -581,6 +623,54 @@ Releases before v0.27.0 predate the changelog.
   effective public URL is resolved before the already-configured-App branch, so
   setting it in the environment (without `--public-url`) points the configured
   App's webhook at that address instead of printing only that it is configured.
+
+- **A hung Postgres no longer freezes the engine, and a stuck statement or
+  lock wait is cancelled instead of waiting forever.** Every engine Postgres
+  session now opens under a 10 s connect deadline covering resolution, TCP,
+  TLS, authentication and the session `SET`s — `tokio-postgres` bounds only
+  the TCP connect — so a database that accepts connections and then stops
+  answering fails engine startup, a pooled reconnect, and the wake listener
+  with an error that names the deadline, and the listener retries with
+  backoff instead of sitting silently dead. Sessions then carry
+  `statement_timeout` 30 s, `lock_timeout` 15 s and
+  `idle_in_transaction_session_timeout` 60 s, so a statement stuck behind a
+  lock held by another transaction (the shape of the engine freeze that
+  started with Postgres killing idle-in-transaction sessions) is cancelled
+  with an error naming the timeout, instead of holding a runtime worker, a
+  pooled connection and its row locks indefinitely. Migrations are not
+  affected: `preloop store migrate` opens its own connection without these
+  guards, and the one migration a serving process can run (test-support
+  schema creation) lifts them to migration-scoped values.
+- **The CLI can no longer hang on a wedged engine, daemon, or registry.**
+  The engine client every command uses had no timeouts at all, so the incident's
+  exact symptom — a process that accepts the TCP connection and never answers —
+  held `preloop status`, `preloop run`, `preloop logs`, `preloop push` and the
+  rest open indefinitely. It now has a 10 s connect deadline and a 10-minute
+  idle-read bound (above the engine's own 5-minute live-log liveness window, so
+  a quiet long job is never cut), with per-command totals on top: 30 s for
+  one-shot control calls, 5 minutes for a durable log fetch, and 15 minutes for
+  a git-bundle upload. The streaming paths (`logs --follow`, the run event feed)
+  keep no total on purpose and rely on the idle bound.
+  The same pass bounds the CLI's other external waits: `cosign` verification of
+  a base image (10 minutes, killed at the deadline), the AgentENV guest probes
+  behind `preloop debug` (30 s each, 2 minutes to become ready), the AgentENV
+  egress reconciliation's `sudo`/`systemctl` calls, `launchctl` during
+  `preloop server install`, `docker`/`podman` build, save and inspect during
+  `preloop init`, the release/GitHub clients in `preloop update` and
+  `preloop setup app-manifest`, and `git push` in `preloop push`, which is also
+  now run with every interactive credential path disabled
+  (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS`/`SSH_ASKPASS` neutralised,
+  `GCM_INTERACTIVE=never`) while the developer's own keychain/ssh-agent
+  credentials keep working. A push that expires its own deadline is retried on
+  the existing transient schedule instead of failing the run.
+  `preloop store migrate` bounds its Postgres connect
+  (10 s, covering the handshake *and* session setup, not the handshake alone)
+  and replaces the indefinite `pg_advisory_lock` wait with a 10-minute
+  `pg_try_advisory_lock` retry — each probe itself bounded by what is left of
+  that wait, so a connection that stops answering mid-query cannot outlive it —
+  that names the other holder instead of hanging.
+  Every deadline is a named constant, and every timeout error names the
+  dependency and the deadline, so a hang is distinguishable from a failure.
 - **A hung OS keychain or trust daemon no longer freezes the engine.** On
   macOS, outbound TLS verified every new connection through
   `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked
@@ -593,6 +683,54 @@ Releases before v0.27.0 predate the changelog.
   gets a 10 s deadline, and after one unanswered call the store is treated as
   unavailable for the rest of the process. Platform revocation checks no longer
   apply; a CA added to the OS store is picked up on restart.
+
+- **A hung Git fetch can no longer freeze the engine.** Snapshot creation and
+  pull-request test merges ran `git fetch` — and every other Git command — from
+  the engine with no deadline. A forge that accepted the connection and then
+  stalled, or a credential helper such as osxkeychain or Git Credential
+  Manager waiting behind a keychain dialog, never returned; because the
+  checkout-cache fetch runs under that repository's cache lock, every later
+  submission for the same repository queued behind it until the engine
+  restarted. Every engine Git child now runs under a deadline — 60 s for ref,
+  config, and index plumbing, 15 min for whole-repository work (`add`,
+  `write-tree`, `merge-tree`, `commit-tree`, `fsck`, `archive`), 30 min for
+  anything that reaches a remote — and is killed when the deadline expires,
+  which releases the cache lock with it. Git's own terminal prompt was already
+  disabled; both askpass programs are now neutralised and
+  `GCM_INTERACTIVE=never` set as well, because `GIT_TERMINAL_PROMPT=0` alone
+  does not stop a configured helper, and the helper list is cleared wherever
+  the engine stages its own GitHub header. A workspace's own remote keeps the
+  operator's helper — that credential is the only one the engine has for a
+  GitLab, enterprise, or PAT-less GitHub origin, and resetting it made the
+  deepen fail, after which the snapshot rewrote history and submitted SHAs the
+  forge had never seen; the deadline and the non-interactive policy still
+  bound it. Staged tokens now ride in `GIT_CONFIG_*` in the child's environment
+  instead of `-c` on its argv, which a process listing exposes. A child killed
+  at its deadline cannot unlink the `*.lock` it held, so locks left by a
+  killed fetch are swept before the next one: those in a repository the engine
+  holds exclusively right away, and any older than the longest possible fetch
+  elsewhere. The error names the operation and the deadline (`git fetch timed
+  out after 1800s: killed the hung git process`) so a hang reads differently
+  from a failure.
+- **Every remaining outbound client uses the in-process TLS roots, and the
+  macOS keychain probe is killed at its deadline.** The OTLP exporter's
+  blocking client (including the engine hosted by `preloop serve`, whose CLI
+  installs the same builder), the runner's engine/GitHub clients, and
+  `preloop-runner lint`'s remote-workflow fetch now verify against the same
+  process-wide roots as the engine (bundled Mozilla, the OS store read with a
+  5 s deadline, and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`) instead of
+  reqwest's platform verifier, so a hung `trustd`/`securityd` can no longer
+  stall them. `preloop-runner lint` also gains a 30 s request / 10 s connect
+  deadline. A bundle certificate the anchor parser cannot read is dropped
+  instead of failing the set, so one malformed entry in
+  `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE` no longer takes Postgres TLS
+  (which adds the list strictly) down with it. The login-keychain writability
+  probe's cleanup delete (`security
+  delete-generic-password`) is now killed after 2 s instead of leaking its
+  child and guard thread forever, and the secrets/policy API config
+  load-and-write (which can reach the keychain for the sealing key) runs on
+  the blocking pool, so a 10 s store wait no longer parks an async worker
+  while the mutation lock is held.
 
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
@@ -642,6 +780,23 @@ Releases before v0.27.0 predate the changelog.
   file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. (The background
   engine start that logged its last lines on failure was removed with #658; see
   the entry under *Changed*.)
+
+- **Every engine GitHub call now goes through the credential's circuit
+  breaker.** Thirteen call sites still sent straight through the shared HTTP
+  client: dispatch auth's installation-token round-trip and actor lookups,
+  push-back and auto-PR REST calls, dispatch's default-branch lookup, the
+  startup PAT scope probe, the App-manifest code exchange, the startup
+  schedule scan, snapshot repository-metadata lookups, and the anonymous
+  forge Git/tarball relay. A GitHub outage therefore cost one round trip per
+  caller for its whole duration instead of one probe per credential. They now
+  all funnel through `send_github` / `send_github_json`, so the breaker sees
+  the dependency on the budget each call actually spends — partitioning an
+  installation token that cannot be named yet, and a third-party token, away
+  from the operator's PAT. Callers keep their own error mapping: dispatch auth
+  still fails closed on a refusal while the breaker is open, push-back still
+  answers 502 for it, and the best-effort relay, schedule-scan, and
+  metadata lookups still degrade quietly. Presigned cross-host LFS downloads
+  stay outside the breaker by design: they spend no GitHub API budget.
 
 - **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
   RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
@@ -713,6 +868,28 @@ Releases before v0.27.0 predate the changelog.
   representation when one exists. This preserves mutation and other
   heavy-step output after guest temporary-storage pressure.
 
+- **Pool start and golden lookups no longer hang on a stalled dependency.** The
+  host Node externals install is killed after 30 minutes — as a whole process
+  group, so the `curl`, `tar`, or `node --version` step it is stuck on dies with
+  the shell that started it, and a shutdown that arrives mid-install cancels it
+  the same way instead of waiting out the deadline. Each of its curl transfers
+  gives up after 30 seconds to connect and 10 minutes in total (2 minutes for
+  the checksum file), and the externals copies are killed after 5 minutes, so a
+  stalled nodejs.org fails with an error that names the dependency and the
+  deadline. Golden release, OCI manifest, and checksum lookups give up after 30
+  seconds instead of sharing the 60-minute download budget — the manifest lookup
+  as one budget for the whole resolution, its bearer-token exchange included,
+  and a blob's token exchange runs on that same short-lived client while the
+  transfer keeps its hour. The orphaned-VM cleanup at startup and on the
+  reconcile interval stops waiting after 10 minutes, and each `ps`, `kill`,
+  `hdiutil`, and `/sbin/mount` child it runs is killed after 30 seconds; a
+  startup sweep that outlives its own deadline now fails pool start rather than
+  serving while it could still kill a runner booted after the wait. The orphaned
+  data-directory sweeps carry the same 10-minute bound. The host memory probe
+  gives up after 10 seconds, and a `node --version` check of an externals
+  directory after 10 seconds, which counts that directory as invalid — a
+  non-native manifest whose binary hangs is no longer taken for a foreign binary
+  the host cannot execute.
 - **Post hooks of skipped actions no longer run**: a workflow step that did
   not run, because its `if:` was false or an earlier step failed, no longer
   runs its action's `post` hook. The official runner registers a post hook

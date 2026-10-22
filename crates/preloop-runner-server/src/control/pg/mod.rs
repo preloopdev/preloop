@@ -39,7 +39,7 @@ mod webhooks;
 
 use super::types::ControlError;
 use std::sync::Arc;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
 /// Writer connections per node (`PRELOOP_PG_WRITERS`, default 16).
 const WRITERS_ENV: &str = "PRELOOP_PG_WRITERS";
@@ -90,6 +90,12 @@ impl Pool {
         // retries or reports) instead of parking it forever. A caller must
         // never hold one pooled connection while waiting for another — that
         // is how an exhausted pool becomes a deadlock.
+        //
+        // A connection whose socket died is replaced here, and that reconnect
+        // carries its own `store_pg::CONNECT_TIMEOUT`, so the worst case for
+        // one checkout is CHECKOUT_TIMEOUT for the hand-off plus that connect
+        // deadline — both finite, and only reached when the database is
+        // already failing.
         let client = tokio::time::timeout(CHECKOUT_TIMEOUT, async {
             self.rx.lock().await.recv().await
         })
@@ -315,8 +321,36 @@ pub(super) fn db(error: tokio_postgres::Error) -> ControlError {
 /// one transaction), so two booting test-support nodes serialize instead of
 /// racing. Production creation goes through `preloop store migrate`, never
 /// through a server.
+///
+/// This is the one long-running admin statement a serving process can run, so
+/// it lifts the serving session guards [`connect_one`] sets — sized for
+/// millisecond-scale control commands — to migration-scoped ones first.
+/// Production migrations need no such thing: `store_admin` opens its own
+/// connection, which never carries the serving guards.
 #[cfg(any(test, feature = "test-support"))]
 async fn create_control_schema(client: &mut Client) -> Result<(), ControlError> {
+    // Statement deadline for a baseline batch (schema, tables, indexes,
+    // ledger) in one transaction. 10 min is far beyond a baseline on an empty
+    // database, and still a deadline: an unbounded migration is exactly what
+    // [`crate::store_pg::STATEMENT_TIMEOUT`] exists to prevent everywhere else.
+    const MIGRATION_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+    // Lock deadline for the same batch. It takes the setup advisory lock and,
+    // when another test-support node is already migrating, waits for it: the
+    // serving lock timeout (15 s, sized for control commands) would cut that
+    // legitimate wait short. 5 min covers a slow baseline and still fails a
+    // waiter whose holder is wedged.
+    const MIGRATION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    client
+        .batch_execute(&crate::store_pg::session_timeouts_sql_with(
+            MIGRATION_STATEMENT_TIMEOUT,
+            MIGRATION_LOCK_TIMEOUT,
+            // `idle_in_transaction_session_timeout`: a migration batch may
+            // pause between statements for longer than a control command
+            // does, but not forever.
+            MIGRATION_STATEMENT_TIMEOUT,
+        ))
+        .await
+        .map_err(db)?;
     super::migrate_runner::initialize_empty_postgres(client)
         .await
         .map_err(ControlError::backend)
@@ -353,40 +387,37 @@ async fn ensure_schema(client: &mut Client) -> Result<(), ControlError> {
 }
 
 /// Open one connection, spawn its driver task, resolve unqualified names to
-/// `control.*` and stamp the node's `preloop.origin` (read by the outbox
-/// writers as the row's `origin`). `origin` is a process-generated uuid, so
-/// it needs no quoting.
+/// `control.*`, stamp the node's `preloop.origin` (read by the outbox
+/// writers as the row's `origin`) and set the session guards.
+///
+/// `origin` is a process-generated uuid, so it needs no quoting. The whole
+/// open — resolution, TCP connect, TLS, authentication and the `SET`s —
+/// runs under [`crate::store_pg::CONNECT_TIMEOUT`]: a database that accepts TCP and
+/// then never answers used to park engine startup, every pooled reconnect
+/// and (see [`super::wake`]) the wake listener with no bound at all.
 async fn connect_one(url: &str, origin: &str) -> Result<Client, ControlError> {
-    let connect_url = crate::store_pg::connect_url(url);
-    let client = match crate::store_pg::tls_connector(url).map_err(ControlError::backend)? {
-        Some(tls) => {
-            let (client, connection) = tokio_postgres::connect(&connect_url, tls)
-                .await
-                .map_err(db)?;
-            tokio::spawn(async move {
-                if let Err(error) = connection.await {
-                    tracing::warn!(%error, "postgres control connection closed");
-                }
-            });
-            client
-        }
-        None => {
-            let (client, connection) = tokio_postgres::connect(&connect_url, NoTls)
-                .await
-                .map_err(db)?;
-            tokio::spawn(async move {
-                if let Err(error) = connection.await {
-                    tracing::warn!(%error, "postgres control connection closed");
-                }
-            });
-            client
-        }
-    };
-    client
-        .batch_execute(&format!(
-            "SET search_path TO control; SET preloop.origin = '{origin}'"
-        ))
+    connect_one_within(url, origin, crate::store_pg::CONNECT_TIMEOUT).await
+}
+
+/// [`connect_one`] with the session deadline given, so a test can prove that
+/// a stalled database ends the attempt at the deadline without waiting the
+/// production one.
+async fn connect_one_within(
+    url: &str,
+    origin: &str,
+    deadline: std::time::Duration,
+) -> Result<Client, ControlError> {
+    // The session `SET`s carry the server-side guards, so a statement that
+    // gets past the connect deadline cannot then hold a runtime worker, a
+    // pooled connection and its row locks forever: a stuck statement is
+    // cancelled, a stuck lock wait is cancelled sooner and named as a lock
+    // wait, and a session left idle inside a transaction is killed instead of
+    // keeping those locks.
+    let setup = format!(
+        "SET search_path TO control; SET preloop.origin = '{origin}'; {}",
+        crate::store_pg::session_timeouts_sql()
+    );
+    crate::store_pg::open_session(deadline, url, &setup, |driver| driver.run())
         .await
-        .map_err(db)?;
-    Ok(client)
+        .map_err(ControlError::backend)
 }

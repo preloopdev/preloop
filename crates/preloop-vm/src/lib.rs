@@ -1,6 +1,7 @@
 //! Typed SmolVM lifecycle primitives for Preloop CI.
 
 use async_trait::async_trait;
+use preloop_observability::deadline;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -3242,12 +3243,10 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
             return Ok(0);
         }
         // launchd's PATH has no /sbin, so the mount table tool is named absolutely.
-        let mounts = std::process::Command::new("/sbin/mount")
-            .output()
-            .map_err(|source| VmError::Launch {
-                program: "/sbin/mount".to_owned(),
-                source,
-            })?;
+        let mounts = bounded_orphan_child(
+            std::process::Command::new("/sbin/mount"),
+            "orphaned layer-mount table (/sbin/mount)",
+        )?;
         detach_orphaned_layer_mounts_in(&roots, &String::from_utf8_lossy(&mounts.stdout))
     }
 }
@@ -3256,38 +3255,72 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
 /// shell-out above so a test can drive it with a fixture table.
 #[cfg(target_os = "macos")]
 fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Result<usize, VmError> {
-    let ps = std::process::Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "ps".to_owned(),
-            source,
-        })?;
+    let ps = bounded_orphan_child(
+        {
+            let mut scan = std::process::Command::new("ps");
+            scan.args(["ax", "-o", "pid=,command="]);
+            scan
+        },
+        "orphaned layer-mount scan (ps)",
+    )?;
     let mut detached = 0usize;
     for mount in orphan_layer_store_mounts(roots, &String::from_utf8_lossy(&ps.stdout), mount_table)
     {
-        match std::process::Command::new("hdiutil")
-            .args(["detach", "-quiet"])
-            .arg(&mount)
-            .status()
-        {
-            Ok(status) if status.success() => {
+        let mut detach = std::process::Command::new("hdiutil");
+        detach.args(["detach", "-quiet"]).arg(&mount);
+        match deadline::run_command_blocking(
+            detach,
+            ORPHAN_CHILD_TIMEOUT,
+            "orphaned layer-mount detach (hdiutil)",
+        ) {
+            Ok(output) if output.status.success() => {
                 detached += 1;
                 info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
             }
-            Ok(status) => warn!(
+            Ok(output) => warn!(
                 mount = %mount.display(),
-                %status,
+                status = %output.status,
                 "hdiutil detach refused; leaving the layer mount in place"
             ),
             Err(error) => warn!(
                 mount = %mount.display(),
                 %error,
-                "hdiutil detach failed to start"
+                "hdiutil detach failed or hit its deadline; leaving the layer mount in place"
             ),
         }
     }
     Ok(detached)
+}
+
+/// Deadline for one host child of the orphan sweeps: `ps`, `kill`,
+/// `/sbin/mount`, and `hdiutil`. Every one of them answers in milliseconds, so
+/// this only has to survive a badly loaded host.
+///
+/// The bound lives here, not at the sweeps' callers, because a caller's
+/// deadline cannot cancel a blocking sweep — it only stops waiting for it. A
+/// sweep whose children are unbounded therefore keeps running after its caller
+/// gave up, and the startup `OrphanPurge::All` pass would then kill the
+/// machines the pool boots in the meantime.
+const ORPHAN_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run one orphan-sweep child under [`ORPHAN_CHILD_TIMEOUT`], its output
+/// captured.
+///
+/// Called for the children whose failure the sweep reports (`ps`, `/sbin/mount`).
+/// The best-effort ones (`kill`, `hdiutil`) go through
+/// [`deadline::run_command_blocking`] directly, since a child that could not be
+/// run is not itself an error for them.
+fn bounded_orphan_child(
+    command: std::process::Command,
+    what: &str,
+) -> Result<std::process::Output, VmError> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    deadline::run_command_blocking(command, ORPHAN_CHILD_TIMEOUT, what).map_err(|source| {
+        VmError::Launch {
+            program,
+            source: std::io::Error::other(source),
+        }
+    })
 }
 
 /// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
@@ -3336,13 +3369,14 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
     if roots.is_empty() {
         return Ok(0);
     }
-    let output = std::process::Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "ps".to_owned(),
-            source,
-        })?;
+    let output = bounded_orphan_child(
+        {
+            let mut scan = std::process::Command::new("ps");
+            scan.args(["ax", "-o", "pid=,command="]);
+            scan
+        },
+        "orphaned hypervisor scan (ps)",
+    )?;
     let text = String::from_utf8_lossy(&output.stdout);
     let mut killed = 0usize;
     for line in text.lines() {
@@ -3370,10 +3404,14 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
         // SIGKILL: the machine is unreachable through smolvm (no record, or
         // an unresponsive agent) — the hypervisor process must die to
         // release the storage fds.
-        let status = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-        if matches!(status, Ok(status) if status.success()) {
+        let mut signal = std::process::Command::new("kill");
+        signal.args(["-9", &pid.to_string()]);
+        let killed_ok = deadline::run_command_blocking(
+            signal,
+            ORPHAN_CHILD_TIMEOUT,
+            "orphaned hypervisor kill (kill)",
+        );
+        if matches!(killed_ok, Ok(output) if output.status.success()) {
             killed += 1;
         }
     }
@@ -3397,13 +3435,14 @@ fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
         return Ok(0);
     }
     let target = canonical_path(data_dir);
-    let output = std::process::Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "ps".to_owned(),
-            source,
-        })?;
+    let output = bounded_orphan_child(
+        {
+            let mut scan = std::process::Command::new("ps");
+            scan.args(["ax", "-o", "pid=,command="]);
+            scan
+        },
+        "machine hypervisor scan (ps)",
+    )?;
     let text = String::from_utf8_lossy(&output.stdout);
     // Attribute by the boot-config path as written in argv, not by splitting
     // argv on whitespace: `ps` prints the command verbatim, so a data root
@@ -3440,10 +3479,14 @@ fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
         if pid <= 0 {
             continue;
         }
-        let status = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-        if matches!(status, Ok(status) if status.success()) {
+        let mut signal = std::process::Command::new("kill");
+        signal.args(["-9", &pid.to_string()]);
+        let killed_ok = deadline::run_command_blocking(
+            signal,
+            ORPHAN_CHILD_TIMEOUT,
+            "orphaned hypervisor kill (kill)",
+        );
+        if matches!(killed_ok, Ok(output) if output.status.success()) {
             killed += 1;
         }
     }

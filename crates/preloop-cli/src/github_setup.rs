@@ -1124,6 +1124,10 @@ fn scope_suffix(repo: Option<&str>, env: Option<&str>) -> String {
 async fn api_request(
     request: reqwest::RequestBuilder,
 ) -> Result<ApiOutcome<reqwest::Response>, anyhow::Error> {
+    // Every secrets call is one-shot and in-memory on the engine, so it carries
+    // the control total. A stalled engine is reported as `Unavailable`, which
+    // is what the callers' config-file fallback is for — not a ten-minute wait.
+    let request = request.timeout(crate::ENGINE_CONTROL_TIMEOUT);
     let request = match crate::api_token() {
         Some(token) => request.bearer_auth(token),
         None => request,

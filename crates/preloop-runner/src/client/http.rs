@@ -78,18 +78,36 @@ struct ControlTransport {
     client: reqwest::Client,
 }
 
+/// Deadline for one runner HTTP request.
+///
+/// Sized for the longest legitimate call: the message-poll endpoints hold the
+/// connection open for up to 100 s (`MESSAGE_POLL_TIMEOUT` in
+/// `client/broker.rs`, and the upstream runner's own poll window), so a
+/// shorter deadline would cut a healthy long-poll short. Per-request
+/// overrides (`get_long_poll`) still apply on top.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(100);
+
+/// Deadline for establishing one connection, so an engine or forge that
+/// accepts no TCP connection fails the call instead of parking the runner.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn build_reqwest_client(ca_pem: Option<&[u8]>, socket: Option<&Path>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(100))
-        .connect_timeout(Duration::from_secs(30))
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .user_agent(format!(
             "preloop-runner/{} (protocol-compat {})",
             crate::VERSION,
             crate::PROTOCOL_COMPAT_VERSION
         ));
-    if let Some(pem) = ca_pem {
-        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(pem)?);
-    }
+    // Verify against the workspace's in-process root set (bundled Mozilla
+    // anchors, the OS store read once with a deadline, plus the
+    // `PRELOOP_GITHUB_CA_FILE`/`SSL_CERT_FILE` bundles), with the caller's
+    // explicit `ca_bundle` merged in, instead of reqwest's default platform
+    // verifier: on macOS that verifier calls `SecTrustEvaluateWithError`
+    // inside the handshake, which asks `trustd`/`securityd` with no deadline,
+    // so a hung trust daemon would hang every runner request.
+    builder = builder.use_preconfigured_tls(preloop_observability::tls::client_config(ca_pem)?);
     if let Some(socket) = socket {
         #[cfg(unix)]
         {
