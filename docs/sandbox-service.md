@@ -459,8 +459,10 @@ crash backstop. The service's own delete path escalates to a targeted kill when
 | Variable | Effect |
 |---|---|
 | `PRELOOP_SANDBOX_LISTEN` | API address, or `off` |
+| `PRELOOP_SANDBOX_URL` | CLI client's `--service` default (default `https://127.0.0.1:9191`) |
 | `PRELOOP_SANDBOX_TOKEN` | caller bearer token; generated into `<state>/sandbox-client-token` when unset |
 | `PRELOOP_SANDBOX_CA` | CA bundle the CLI verifies the service with |
+| `PRELOOP_SANDBOX_LEASE` | CLI client's `--lease` default; required by sandbox-scoped commands |
 | `PRELOOP_SANDBOX_JOIN_TOKEN` | join token for `sandbox agent` on its first run |
 | `PRELOOP_SANDBOX_TLS_SANS` | server certificate SANs (comma list) |
 | `PRELOOP_SANDBOX_TLS_CERT` / `PRELOOP_SANDBOX_TLS_KEY` | replace the generated server certificate |
@@ -501,7 +503,7 @@ preloop sandbox stop sbx-… --lease lse-…               # power off, keep the
 preloop sandbox start sbx-… --lease lse-… [--forkable] # boot it again (bakes)
 preloop sandbox snapshot sbx-… --lease lse-… --name golden
 preloop sandbox release lse-… [--preserve 600]
-preloop sandbox ls | providers                        # lease ids are redacted
+preloop sandbox ls                                     # lease ids are redacted
 preloop sandbox stats                                   # per-provider host + sandbox inventory
 preloop sandbox provider ls
 preloop sandbox provider cordon host-a               # no new placements
