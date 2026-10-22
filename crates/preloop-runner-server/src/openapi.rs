@@ -107,7 +107,8 @@ pub struct RunResponse {
     pub job_check_run_ids: std::collections::BTreeMap<String, u64>,
     /// Reusable workflow call metadata.
     pub reusable_calls: JsonValue,
-    /// Ordered list of job details.
+    /// Ordered job details: `job_id`, `name`, `conclusion`, `steps[]` in
+    /// execution order, `annotations[]`.
     pub jobs_list: Vec<JsonValue>,
     /// When the run was created (ISO 8601).
     pub created_at: String,
@@ -500,8 +501,11 @@ fn approve_fork() {}
 ///
 /// Returns a long-lived stream of newline-delimited JSON events.
 /// The stream closes when the run reaches a terminal status.
-/// Events include `run_accepted`, `job_status`, `run_status`, `log_line`,
-/// `annotation`, and `job_completed`.
+/// Events are the protocol crate's `NdjsonEvent` variants, tagged by
+/// `type`: `run_accepted`, `job_status`, `run_status`, `annotation`,
+/// `job_completed`, `check_run_created`, `step_status` and `log` (the
+/// `log_line` spelling was never a wire tag). A client must ignore tags it
+/// does not know.
 #[utoipa::path(
     get, path = "/api/v1/runs/{run_id}/events.ndjson", tag = "Runs",
     params(("run_id" = String, Path, description = "Run UUID")),

@@ -750,7 +750,7 @@ mod tests {
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "step".into(), "step".into(), "Step".into());
         ctx.env
             .insert("MDBOOK_VERSION".to_owned(), "0.5.2".to_owned());
         let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -815,7 +815,12 @@ mod tests {
             "owner/child@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             child_dir.to_string_lossy().into_owned(),
         );
-        let mut ctx = StepContext::new(&mut job, "outer-step".into(), "Outer".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "outer-step".into(),
+            "outer-step".into(),
+            "Outer".into(),
+        );
         crate::worker::handlers::action::set_action_repository_context(
             &mut ctx,
             "$/.github/actions/outer",
@@ -928,7 +933,12 @@ mod tests {
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         run_composite_action(
@@ -971,7 +981,12 @@ mod tests {
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         run_composite_action(
@@ -1011,7 +1026,12 @@ mod tests {
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         ctx.env.insert(
             "GITHUB_OUTPUT".to_string(),
             parent_output.to_string_lossy().to_string(),
@@ -1055,7 +1075,12 @@ mod tests {
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let result = run_composite_action(
@@ -1095,7 +1120,12 @@ mod tests {
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let result = run_composite_action(
@@ -1136,7 +1166,12 @@ mod tests {
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let result = run_composite_action(
@@ -1165,7 +1200,12 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let err = run_composite_action_inner(
@@ -1209,7 +1249,7 @@ runs:
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "step".into(), "step".into(), "Step".into());
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let err = crate::worker::handlers::action::run_action(
@@ -1261,7 +1301,12 @@ runs:
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         run_composite_action(
@@ -1321,7 +1366,12 @@ runs:
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         run_composite_action(
@@ -1368,7 +1418,12 @@ runs:
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         ctx.env.insert(
             "GITHUB_OUTPUT".to_string(),
             parent_output.to_string_lossy().to_string(),
@@ -1404,7 +1459,12 @@ runs:
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         ctx.env
             .insert("PRE_EXISTING".to_string(), "original".to_string());
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -1453,7 +1513,12 @@ runs:
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         ctx.env.insert(
             "GITHUB_OUTPUT".to_string(),
             parent_output.to_string_lossy().to_string(),
@@ -1538,7 +1603,12 @@ mod scope_tests {
             serde_json::json!({"github": {"workspace": ws}}),
         );
         job.workspace = Some(ws.clone());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         // Simulate the parent scope, then run the child as a nested action.
         ctx.env
@@ -1610,7 +1680,12 @@ mod working_dir_tests {
             serde_json::json!({"github": {"workspace": ws}}),
         );
         job.workspace = Some(ws.clone());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         run_composite_action(
             &manifest,
@@ -1671,7 +1746,12 @@ mod action_path_tests {
             serde_json::json!({"github": {"workspace": ws}}),
         );
         job.workspace = Some(ws.clone());
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         run_composite_action(
             &manifest,
@@ -1725,7 +1805,12 @@ mod action_path_tests {
         );
         job.workspace = Some(ws.clone());
         job.set_github_context_value("action_path", Some(serde_json::json!("/outer/action")));
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let err = run_composite_action(
             &manifest,

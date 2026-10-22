@@ -1037,6 +1037,39 @@ pub enum NdjsonEvent {
         /// Run the check runs belong to.
         run_id: RunId,
     },
+    /// A stored step's conclusion or timing changed.
+    ///
+    /// Emitted by the control plane — never by a runner — once per stored
+    /// change of one manifest step, so a client can update a step in place
+    /// instead of re-reading the run. `step_id` is the step GUID
+    /// (`StepRecord.id` on the server) that the runner reports as
+    /// `external_id` and sends as the live-log feed's `stepId`, so a consumer
+    /// can join the three.
+    StepStatus {
+        /// Run the step belongs to.
+        run_id: RunId,
+        /// Job the step belongs to.
+        job_id: JobId,
+        /// Step GUID, matching `StepRecord.id`.
+        step_id: String,
+        /// 0-based declared workflow position, when the step is declared.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_index: Option<usize>,
+        /// The runner's 1-based timeline position, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runner_number: Option<u32>,
+        /// Step display name as stored.
+        name: String,
+        /// Stored conclusion: `pending`, `in_progress`, `success`, `failure`,
+        /// `cancelled` or `skipped`.
+        conclusion: String,
+        /// Microseconds since the Unix epoch of the stored start time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_us: Option<i64>,
+        /// Microseconds since the Unix epoch of the stored finish time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finished_at_us: Option<i64>,
+    },
 }
 
 impl NdjsonEvent {
@@ -1049,7 +1082,8 @@ impl NdjsonEvent {
             | Self::Annotation { run_id, .. }
             | Self::RunStatus { run_id, .. }
             | Self::JobCompleted { run_id, .. }
-            | Self::CheckRunCreated { run_id } => *run_id,
+            | Self::CheckRunCreated { run_id }
+            | Self::StepStatus { run_id, .. } => *run_id,
         }
     }
 

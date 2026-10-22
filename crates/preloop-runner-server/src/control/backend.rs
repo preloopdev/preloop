@@ -65,6 +65,11 @@ pub(crate) struct EnvironmentGateRead {
 }
 
 /// Extract the optional run identity carried by a durable event.
+///
+/// Exhaustive on purpose: the outbox row's `run_id` is what keeps an event in
+/// the run's snapshot, so a new variant must decide here rather than fall into
+/// a wildcard that silently drops its run identity (and with it the event,
+/// from `events.ndjson` history).
 pub(crate) fn event_run_id(event: &NdjsonEvent) -> Option<RunId> {
     match event {
         NdjsonEvent::RunAccepted { run_id, .. }
@@ -72,8 +77,9 @@ pub(crate) fn event_run_id(event: &NdjsonEvent) -> Option<RunId> {
         | NdjsonEvent::RunStatus { run_id, .. }
         | NdjsonEvent::JobCompleted { run_id, .. }
         | NdjsonEvent::Annotation { run_id, .. }
-        | NdjsonEvent::CheckRunCreated { run_id } => Some(*run_id),
-        _ => None,
+        | NdjsonEvent::CheckRunCreated { run_id }
+        | NdjsonEvent::Log { run_id, .. }
+        | NdjsonEvent::StepStatus { run_id, .. } => Some(*run_id),
     }
 }
 
@@ -120,6 +126,10 @@ pub(crate) fn project_run_rows(
         if let Some(steps) = steps {
             detail.steps = steps;
         }
+        // One order on every surface: the list endpoint used to return steps
+        // in manifest order (synthetic steps last), while `get_run` sorted
+        // them into execution order.
+        crate::models::StepRecord::sort_execution_order(&mut detail.steps);
         run.jobs_list.push(detail);
     }
     if run.status == ExecutionStatus::InProgress
@@ -793,22 +803,26 @@ pub(crate) trait ControlBackend: Send + Sync {
     ) -> Result<Option<(RunId, JobId)>, ControlError>;
 
     /// Upsert an attempt's runner-reported steps directly (no run lock).
+    /// Returns the `StepStatus` events persisted for the steps that actually
+    /// changed, appended to the outbox inside the same transaction; the
+    /// caller broadcasts them with `emit_persisted`.
     async fn patch_steps(
         &self,
         agent_job_id: uuid::Uuid,
         patches: Vec<StepPatch>,
-    ) -> Result<(), ControlError>;
+    ) -> Result<Vec<NdjsonEvent>, ControlError>;
 
     /// Reconcile a `WorkflowStepsUpdate` report against `job_steps` rows.
     /// Resolves the callback identity (`plan_id` then `agent_job_id`, like
     /// [`resolve_callback_job`]), merges each reported step in one
-    /// transaction, and returns `false` when no request matches.
+    /// transaction, and returns `matched: false` when no request matches. The
+    /// outcome carries the `StepStatus` events persisted for changed steps.
     async fn report_steps(
         &self,
         plan_id: &str,
         agent_job_id: uuid::Uuid,
         steps: Vec<serde_json::Value>,
-    ) -> Result<bool, ControlError>;
+    ) -> Result<StepReportOutcome, ControlError>;
 
     /// Repository of the live run owning `agent_job_id` (job_requests →
     /// run_submissions, only while the run row exists). `None` when the
@@ -2594,7 +2608,7 @@ impl ControlBackend for Backend {
         &self,
         agent_job_id: uuid::Uuid,
         patches: Vec<StepPatch>,
-    ) -> Result<(), ControlError> {
+    ) -> Result<Vec<preloop_gha_protocol::NdjsonEvent>, ControlError> {
         match self {
             Self::Sqlite(b) => b.patch_steps(agent_job_id, patches).await,
             Self::Postgres(b) => b.patch_steps(agent_job_id, patches).await,
@@ -2606,7 +2620,7 @@ impl ControlBackend for Backend {
         plan_id: &str,
         agent_job_id: uuid::Uuid,
         steps: Vec<serde_json::Value>,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<StepReportOutcome, ControlError> {
         match self {
             Self::Sqlite(b) => b.report_steps(plan_id, agent_job_id, steps).await,
             Self::Postgres(b) => b.report_steps(plan_id, agent_job_id, steps).await,
