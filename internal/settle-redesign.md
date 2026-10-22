@@ -48,9 +48,10 @@ conditional writes, but each reads only the promoted job's own rows
 (`jobs`, `job_specs`, `job_messages`, `job_needs`), the run's submission when a
 gate or environment needs it, and, for the job's `needs`, a `NeedsView`: the
 rows its declared needs reach. `Sweep::promote` stays the implementation for
-submit, rerun, cancel and expansion, which do build the whole run; the
+submit, rerun and cancel, which do build the whole run; the
 completion path shares its pure decisions (environment name and verdict, gate
 evaluation, `dependency_decision`) through `promote.rs` and `runtime_scheduling`.
+Deferred expansion is job-scoped too (see Deferred Expansion).
 
 A dependent is handled by a work queue inside the completion's transaction:
 its `if:` decides `Run`, `Skip` or `Error`. A skip or error settles the
@@ -192,6 +193,38 @@ and a deferred matrix parent named in a caller's list is replaced by its legs
 when it expands. These are lite's `write_reusable_meta` and
 `splice_matrix_parents`. Without them a deferred caller never folds on PG.
 
+The fold runs for every settle that turns an inner job terminal, not only a
+completion: `settle_unrun` (a skip or error cascade, a job that fails its label,
+environment or gate check at promotion, a failed or empty expansion, an
+unhostable job) walks up the callers right after the job's own terminal write
+(`Sweep::settle_folded_callers`), refreshes the folded callers' dependents and
+emits their `job.completed.v1`, so a caller whose last open inner job settled
+that way folds in the same transaction, and the dependents it unblocks join the
+promotion queue. An expansion registers its unhostable jobs only after the
+caller's `inner_job_ids` / the matrix splice name the subtree, so their settles
+can fold it. The fold stays idempotent: resolved `outputs` mark a folded caller.
+Lite folds after each promotion pass and after an expansion apply
+(`fold_settled_callers`).
+
+An expansion that registers several unhostable jobs in one subtree settles
+every row first (terminal write + its own `job.completed.v1`, no fold), then
+folds each settled id in order, then concludes the run once — so every inner
+job's own event precedes the caller it completes, which precedes
+`run.completed.v1`. Folding mid-batch (settle, fold, settle, fold, …) would
+let the first settle's fold see a sibling's row already written terminal
+(by registration, ahead of that sibling's own settle) and fold early, before
+that sibling's own event ever landed.
+
+`Sweep::settle_node`, the in-memory-graph settle behind `promote_ready_jobs`
+(a parked environment gate's release — a timeout or a denial — and the
+reaper's wall-clock starvation sweep) and `resume_held_run` (jobs a
+`concurrency:` waiter parked behind its own gate), now folds too: it flushes
+the settling job's row ahead of the fold (the fold reads rows, not the
+graph), then mirrors a folded caller and the dependents it unblocks back
+into the graph so the same sweep's fixpoint loop keeps going. Rerun/reset —
+which settle rows while rebuilding a run, not as a live run's own outcome —
+still do not fold; proving that safe is open work.
+
 ## If: Condition Evaluation (Per Newly-Unblocked Job)
 
 When the conditional UPDATE unblocks a dependent, evaluate its `if:` before
@@ -282,8 +315,53 @@ leg that settles at its `if:`/label/environment/gate check frees the slot and
 admission continues), dependents go through the work queue in
 `pg/dependents.rs`, and `promote::promote_one` is the shared job-scoped
 hydrate → environment → gate → enqueue routine. Nothing on the completion path
-calls `Sweep` or `load_graph`; `Sweep` remains for submit, rerun, cancel,
-expansion and the reaper.
+calls `Sweep` or `load_graph`; `Sweep` remains for submit, rerun, cancel and
+the reaper.
+
+## Deferred Expansion
+
+A reusable caller or a `fromJSON` matrix whose `if:` passed waits in the
+expansion queue (`pending_expansion`); `pg/expansion.rs` runs both halves of its
+expansion without the run graph.
+
+`claim_expansion` leases the oldest node (`expanding`, `expand_generation + 1`)
+and snapshots the build inputs from the node's own rows (`jobs`, `job_specs`,
+`job_messages`, `job_needs`), a `NeedsView` of the jobs its declared needs reach
+(their outputs, merged per base id by `NeedsView::outputs_by_base`) and the run's
+planning inputs (submission, GitHub context, workspace snapshot, workflow
+identity).
+
+`apply_expansion` runs under the run lock and the generation fence (a node
+cancelled or re-leased mid-build discards the subtree). Per build:
+
+- **failed build / empty matrix**: the node settles through `settle_unrun`
+  (`failure` / `skipped`) and its dependents are decided by
+  `promote_dependents`, so a skip cascade finishes in the apply;
+- **matrix subtree**: the legs' rows are written, the caller metadata
+  `inner_job_ids` naming the parent are spliced (found with one JSONB
+  containment query, not a scan of every spec), the parent leaves the run's
+  status map (its legs name it as `parent_job_id`) and its placeholder request
+  is purged;
+- **reusable subtree**: the callee rows and metadata are written, the caller's
+  `inner_job_ids` become the subtree, the caller turns `in_progress` and the run
+  gets its `started_at`.
+
+Registration inserts every row of the subtree first, then counts
+`remaining_needs` for the new jobs from the rows
+(`Sweep::recount_remaining_needs`, the count `refresh_remaining_needs` keeps for
+dependents). A leg inherits its node's `needs:`, which settled before the node
+expanded, and a need may name several legs, so the count at insert time
+(`needs.len()`) is not the outstanding count. Jobs no runner can host settle
+`failure` after that — once the caller's `inner_job_ids` or the matrix splice
+name the subtree, so a later job of the subtree sees them as terminal and a
+subtree that is entirely unhostable folds its caller.
+
+The jobs the subtree can start — those with no outstanding needs, plus the
+dependents the unhostable settles unblocked — go through `promote_dependents`
+in job-id order: the same decide-and-admit queue a completion uses (`if:`,
+JobSet gates and expansion for nested callers and matrices, `promote_one` for
+the rest). The run's status is stamped by `conclude_run` (`summarize_run_tx`,
+then the workflow-hold release and `run.completed.v1` when it just completed).
 
 ## What Stays Unchanged
 

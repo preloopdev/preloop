@@ -11,7 +11,7 @@
 
 use super::codec::{self, now_us, ts, us};
 use super::dispatch::{
-    Retirement, clear_assignment, emit_outbox, enqueue_cancellation_job,
+    Retirement, Sweep, clear_assignment, emit_outbox, enqueue_cancellation_job,
     release_concurrency_for_job, release_concurrency_for_run, retire_node_requests,
     summarize_run_tx,
 };
@@ -142,7 +142,6 @@ impl PgBackend {
                 .await?;
                 clear_assignment(&tx, job.run_id, &job.job_id).await?;
                 release_concurrency_for_job(self, &tx, job.run_id, &job.job_id).await?;
-                summarize_run_tx(&tx, job.run_id).await?;
                 emit_outbox(
                     &tx,
                     Some(job.run_id),
@@ -150,6 +149,13 @@ impl PgBackend {
                     serde_json::json!({"job_id": job.job_id.0, "status": "failure"}),
                 )
                 .await?;
+                // A starved job may be the last open inner job of a reusable
+                // caller: fold it the same way every other settle path does
+                // (emits the caller's own `job.completed.v1`), then
+                // re-summarize so the terminal check below sees the caller's
+                // contribution, not just this job's.
+                Sweep::settle_folded_callers(self, &tx, job.run_id, &job.job_id).await?;
+                summarize_run_tx(&tx, job.run_id).await?;
                 let terminal: bool = tx
                     .query_one(
                         "SELECT status = 'completed' FROM runs WHERE run_id = $1::text::uuid",

@@ -635,6 +635,7 @@ fn release_parked_jobs(
                     run_id,
                     &job.job_id,
                     ExecutionStatus::Failure,
+                    true,
                 )?;
                 outcome.failed += 1;
                 outcome.failed_jobs.push(job.job_id.clone());

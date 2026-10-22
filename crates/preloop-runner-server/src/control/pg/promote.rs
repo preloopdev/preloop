@@ -14,15 +14,15 @@
 //!
 //! Callers hold the run lock. A job that settles without running goes through
 //! [`settle_unrun`], which writes the job's terminal row, releases what it
-//! held, refreshes its dependents' counters and stamps the run through
-//! `summarize_run_tx`.
+//! held, folds the reusable callers it completes, refreshes its dependents'
+//! counters and stamps the run through `summarize_run_tx`.
 
 use super::codec::now_us;
 use super::dispatch::{
-    EnqueueTarget, GateHolder, GateOutcome, Retirement, Sweep, acquire_gate,
-    apply_resolved_runs_on, clear_assignment, emit_outbox, flush_node, mark_ready, mark_terminal,
-    notify_wake, on_job_enqueued, promotion_label_reason, release_concurrency_for_job,
-    release_concurrency_for_run, retire_node_requests, summarize_run_tx,
+    EnqueueTarget, FoldedSettle, GateHolder, GateOutcome, Sweep, acquire_gate,
+    apply_resolved_runs_on, emit_outbox, flush_node, mark_ready, mark_terminal, notify_wake,
+    on_job_enqueued, promotion_label_reason, release_concurrency_for_run, release_job_hold,
+    summarize_run_tx,
 };
 use super::graph::{self, Node, RunScope};
 use super::needs::NeedsView;
@@ -191,14 +191,50 @@ pub(super) async fn acquire_job_gate(
     .await
 }
 
-/// Settle a job that never ran: its terminal row (with whatever the caller
-/// changed on `node` — hydrated placement, an environment gate's progress),
-/// the concurrency it held, its requests and assignment, its dependents'
-/// `remaining_needs`, the run's status and the `job.completed.v1` /
-/// `run.completed.v1` outbox rows.
+/// The row-level half of [`settle_unrun`]: the job's terminal row (with
+/// whatever the caller changed on `node` — hydrated placement, an
+/// environment gate's progress), the concurrency it held, its requests and
+/// assignment, and its dependents' `remaining_needs`. No fold, no run
+/// conclusion — a caller settling several sibling rows in one batch (e.g.
+/// expansion's unhostable jobs) runs this for every row first, then folds
+/// each settled id and concludes the run once, so every settled sibling's
+/// own `job.completed.v1` precedes any caller it completes.
 ///
-/// Returns the dependents now `blocked` with no needs remaining, sorted by job
-/// id; the caller decides them (they may skip or fail in turn).
+/// Returns the dependents this row left `blocked` with no needs remaining,
+/// sorted by job id.
+pub(super) async fn settle_unrun_row(
+    backend: &PgBackend,
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+    node: &mut Node,
+    status: ExecutionStatus,
+    out: &mut SchedulingOutcome,
+) -> Result<Vec<JobId>, ControlError> {
+    let expandable = node.expandable();
+    mark_terminal(node, status, now_us());
+    flush_node(tx, run_id, job_id, node).await?;
+    release_job_hold(backend, tx, run_id, job_id, status, expandable).await?;
+    let unblocked = Sweep::refresh_remaining_needs(tx, run_id, job_id, &node.base_id).await?;
+    out.push(status, run_id, job_id.clone());
+    emit_outbox(
+        tx,
+        Some(run_id),
+        "job.completed.v1",
+        serde_json::json!({"job_id": job_id.0, "status": status_str(status)}),
+    )
+    .await?;
+    Ok(unblocked)
+}
+
+/// Settle a job that never ran: [`settle_unrun_row`]'s terminal write, then
+/// the reusable callers it was the last open inner job of (folded like a
+/// completion folds them), the run's status and the `run.completed.v1`
+/// outbox row.
+///
+/// Returns the dependents now `blocked` with no needs remaining (the job's and
+/// the folded callers'), sorted by job id; the caller decides them (they may
+/// skip or fail in turn).
 pub(super) async fn settle_unrun(
     backend: &PgBackend,
     tx: &Transaction<'_>,
@@ -208,8 +244,43 @@ pub(super) async fn settle_unrun(
     status: ExecutionStatus,
     out: &mut SchedulingOutcome,
 ) -> Result<Vec<JobId>, ControlError> {
+    let mut unblocked = settle_unrun_row(backend, tx, run_id, job_id, node, status, out).await?;
+    // The fold reads the job's row, so it follows the terminal write above and
+    // precedes the run's status.
+    let FoldedSettle {
+        unblocked: folded_unblocked,
+        ..
+    } = Sweep::settle_folded_callers(backend, tx, run_id, job_id).await?;
+    unblocked.extend(folded_unblocked);
+    unblocked.sort();
+    unblocked.dedup();
+    conclude_run(backend, tx, run_id, status_str(status)).await?;
+    Ok(unblocked)
+}
+
+/// The result of [`conclude_run`]: whether the run just became `completed`
+/// (so the caller must act on that transition) and its resolved conclusion,
+/// regardless.
+pub(super) struct ConcludeOutcome {
+    pub(super) newly_completed: bool,
+    pub(super) conclusion: Option<String>,
+}
+
+/// Stamp the run's status from its job rows ([`summarize_run_tx`]) and, when
+/// that completed it, finish the run: release its workflow-level concurrency
+/// hold (promoting the group's next waiter) and emit `run.completed.v1`.
+/// `fallback_conclusion` names the conclusion when the run row carries none.
+///
+/// A run that was already `completed` is left alone, so a command that settles
+/// several jobs concludes the run once. The caller holds the run lock.
+pub(super) async fn conclude_run(
+    backend: &PgBackend,
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    fallback_conclusion: &str,
+) -> Result<ConcludeOutcome, ControlError> {
     let run = run_id.0.to_string();
-    let run_status_before: Option<String> = tx
+    let status_before: Option<String> = tx
         .query_opt(
             "SELECT status FROM runs WHERE run_id=$1::text::uuid",
             &[&run],
@@ -217,34 +288,17 @@ pub(super) async fn settle_unrun(
         .await
         .map_err(db)?
         .map(|row| row.get(0));
-    mark_terminal(node, status, now_us());
-    flush_node(tx, run_id, job_id, node).await?;
-    release_concurrency_for_job(backend, tx, run_id, job_id).await?;
-    if node.expandable() {
-        retire_node_requests(tx, run_id, job_id, Retirement::Settle(status)).await?;
-    }
-    clear_assignment(tx, run_id, job_id).await?;
-    let unblocked = Sweep::refresh_remaining_needs(tx, run_id, job_id, &node.base_id).await?;
-    out.push(status, run_id, job_id.clone());
     summarize_run_tx(tx, run_id).await?;
-    emit_outbox(
-        tx,
-        Some(run_id),
-        "job.completed.v1",
-        serde_json::json!({"job_id": job_id.0, "status": status_str(status)}),
-    )
-    .await?;
-    let (run_status, conclusion): (String, Option<String>) = {
-        let row = tx
-            .query_one(
-                "SELECT status, conclusion FROM runs WHERE run_id=$1::text::uuid",
-                &[&run],
-            )
-            .await
-            .map_err(db)?;
-        (row.get(0), row.get(1))
-    };
-    if run_status == "completed" && run_status_before.as_deref() != Some("completed") {
+    let row = tx
+        .query_one(
+            "SELECT status, conclusion FROM runs WHERE run_id=$1::text::uuid",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+    let (status, conclusion): (String, Option<String>) = (row.get(0), row.get(1));
+    let newly_completed = status == "completed" && status_before.as_deref() != Some("completed");
+    if newly_completed {
         // A terminal run must not hold a workflow-level slot: release the
         // group and promote its next waiter.
         release_concurrency_for_run(backend, tx, run_id).await?;
@@ -253,12 +307,15 @@ pub(super) async fn settle_unrun(
             Some(run_id),
             "run.completed.v1",
             serde_json::json!({
-                "conclusion": conclusion.unwrap_or_else(|| status_str(status).to_owned())
+                "conclusion": conclusion.clone().unwrap_or_else(|| fallback_conclusion.to_owned())
             }),
         )
         .await?;
     }
-    Ok(unblocked)
+    Ok(ConcludeOutcome {
+        newly_completed,
+        conclusion,
+    })
 }
 
 /// How many legs of a cohort occupy a `max-parallel` slot: running, claimed or

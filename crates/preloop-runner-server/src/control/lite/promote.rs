@@ -545,7 +545,7 @@ fn settle_job_row(
     job: &JobRow,
     status: ExecutionStatus,
 ) -> Result<(), ControlError> {
-    super::settle::settle_node(tx, backend, job.run_id, &job.job_id, status).map(|_| ())
+    super::settle::settle_node(tx, backend, job.run_id, &job.job_id, status, true).map(|_| ())
 }
 
 /// The caller's JobSet gate declarations (`caller_jobset_gates`): caller +
@@ -1092,6 +1092,10 @@ pub(super) fn promote_run(
         if !settled {
             return Ok(());
         }
+        // A job this pass settled may have been the last open job of a reusable
+        // caller's subtree; the fold unblocks the caller's dependents, which
+        // the next pass decides.
+        super::dispatch::fold_settled_callers(tx, backend, run_id)?;
     }
 }
 
