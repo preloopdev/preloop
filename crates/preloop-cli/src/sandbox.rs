@@ -20,6 +20,9 @@ use preloop_orchestrator::RunnerPoolConfig;
 use preloop_orchestrator::fleet::SandboxMachines;
 use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
+use preloop_sandbox::driver_conformance::ConformanceOptions;
+use preloop_sandbox::drivers::external::{ExternalDriver, ExternalSpec};
+use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
 use preloop_sandbox::drivers::smolvm::pack::ArtifactCache;
@@ -96,22 +99,34 @@ fn sandbox_agent_config(name: impl Into<String>, scratch: PathBuf) -> AgentConfi
 }
 
 /// Drivers attached to this host: `PRELOOP_SANDBOX_DRIVERS`, comma-separated
-/// (default `smolvm`). `named_prefix` lets the SmolVM inventory adopt the CI
-/// pool's caller-named machines; `cache` holds the packed artifacts drivers
-/// materialize.
-pub(crate) fn host_drivers(
+/// (default `smolvm`). An `external:<spec>` entry starts a driver plugin (see
+/// [`ExternalSpec`]); `runtime_dir` holds their sockets. `named_prefix` lets
+/// the SmolVM inventory adopt the CI pool's caller-named machines; `cache`
+/// holds the packed artifacts drivers materialize.
+pub(crate) async fn host_drivers(
     named_prefix: Option<&str>,
     slots: u32,
     cache: &ArtifactCache,
+    runtime_dir: &Path,
 ) -> anyhow::Result<Vec<Arc<dyn Driver>>> {
     let names = env_nonempty("PRELOOP_SANDBOX_DRIVERS").unwrap_or_else(|| "smolvm".into());
     let mut drivers: Vec<Arc<dyn Driver>> = Vec::new();
-    for name in names
+    for entry in names
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
     {
-        drivers.push(match name {
+        if let Some(spec) = entry.strip_prefix("external:") {
+            let spec = ExternalSpec::parse(spec)
+                .with_context(|| format!("PRELOOP_SANDBOX_DRIVERS entry `{entry}`"))?;
+            drivers.push(
+                ExternalDriver::start(spec, runtime_dir)
+                    .await
+                    .with_context(|| format!("starting external driver from `{entry}`"))?,
+            );
+            continue;
+        }
+        drivers.push(match entry {
             "smolvm" => {
                 let mut driver =
                     SmolvmDriver::new(SmolVmProvider::default(), slots).with_cache(cache.clone());
@@ -184,7 +199,9 @@ impl LocalSandboxes {
             Some(&prefix),
             smolvm_slots(),
             &ArtifactCache::from_env(state.join("sandbox-cache")),
-        )?;
+            &state.join("driver-sockets"),
+        )
+        .await?;
         let pool_driver = env_nonempty("PRELOOP_SANDBOX_POOL_DRIVER").unwrap_or_else(|| {
             drivers
                 .first()
@@ -416,6 +433,9 @@ enum SandboxCommand {
     Serve(ServeSandboxArgs),
     /// Join a Sandbox Service as a provider with this host's drivers.
     Agent(AgentArgs),
+    /// Driver plugins: serve one over a Unix socket, or run conformance.
+    #[command(subcommand)]
+    Driver(DriverCommand),
     /// Templates.
     #[command(subcommand)]
     Template(TemplateCommand),
@@ -491,6 +511,38 @@ enum ProviderCommand {
         /// Provider name.
         name: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DriverCommand {
+    /// Serve an in-process driver as a plugin on a Unix socket.
+    Serve(DriverServeArgs),
+    /// Run the driver conformance suite against a driver.
+    Conformance(DriverConformanceArgs),
+}
+
+#[derive(Debug, Args)]
+struct DriverServeArgs {
+    /// In-process driver to serve: `smolvm` or `fake`.
+    #[arg(long, default_value = "smolvm")]
+    driver: String,
+    /// Unix socket to serve on.
+    #[arg(long)]
+    socket: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct DriverConformanceArgs {
+    /// Driver to test: `smolvm`, `fake`, or an external spec
+    /// (`name=/path/to/plugin [args…]` or `name=unix:///path.sock`).
+    #[arg(long)]
+    driver: String,
+    /// Artifact as comma-separated `key=value` pairs:
+    /// `format=oci-image|smolmachine,arch=…,ref=…,digest=sha256:…[,size=…]`.
+    /// Repeat for several formats or architectures. Without it the driver
+    /// applies its own default template.
+    #[arg(long = "artifact", value_name = "KEY=VALUE,…")]
+    artifact: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -746,6 +798,7 @@ pub(crate) async fn run(
     match command {
         SandboxCommand::Serve(serve) => serve_standalone(serve, observability).await,
         SandboxCommand::Agent(agent) => run_agent(token, agent, observability).await,
+        SandboxCommand::Driver(driver) => run_driver(driver).await,
         command => {
             let client = sandbox_client(&service, token, ca)?;
             run_client(client, command, lease_id.unwrap_or_default()).await
@@ -768,8 +821,8 @@ async fn run_client(
         Ok(lease.clone())
     };
     match command {
-        SandboxCommand::Serve(_) | SandboxCommand::Agent(_) => {
-            unreachable!("serve and agent run without a caller client")
+        SandboxCommand::Serve(_) | SandboxCommand::Agent(_) | SandboxCommand::Driver(_) => {
+            unreachable!("serve, agent and driver run without a caller client")
         }
         SandboxCommand::Template(TemplateCommand::Put {
             name,
@@ -1105,7 +1158,9 @@ async fn serve_standalone(
                 None,
                 smolvm_slots(),
                 &ArtifactCache::from_env(state.join("sandbox-cache")),
-            )?,
+                &state.join("driver-sockets"),
+            )
+            .await?,
             agent_config.with_access(HostAccess::from_env()),
         );
         tokio::spawn(agent.run(shutdown.clone()));
@@ -1169,7 +1224,9 @@ async fn run_agent(
             None,
             args.slots,
             &ArtifactCache::from_env(state.join("sandbox-cache")),
-        )?,
+            &state.join("driver-sockets"),
+        )
+        .await?,
         agent_config,
     );
     let shutdown = CancellationToken::new();
@@ -1183,9 +1240,167 @@ async fn run_agent(
     Ok(())
 }
 
+/// An in-process backend for the driver commands.
+fn in_process_driver(name: &str, state: &Path) -> anyhow::Result<Arc<dyn Driver>> {
+    match name {
+        "smolvm" => Ok(Arc::new(
+            SmolvmDriver::new(SmolVmProvider::default(), smolvm_slots())
+                .with_cache(ArtifactCache::from_env(state.join("sandbox-cache"))),
+        )),
+        "fake" => {
+            let root = state.join("driver-fake");
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("creating {}", root.display()))?;
+            Ok(Arc::new(FakeDriver::new(
+                "fake",
+                root,
+                FakeDriver::full_capabilities(),
+            )))
+        }
+        other => anyhow::bail!("`{other}` is not an in-process driver; use `smolvm` or `fake`"),
+    }
+}
+
+/// Conformance options for the `driver conformance` command.
+///
+/// Without `--artifact`, the driver applies its own default template. With
+/// artifacts, they form a `conformance` template so a real VM driver boots a
+/// digest-pinned image instead of whatever happens to be the default.
+fn conformance_options(artifact: &[String]) -> anyhow::Result<ConformanceOptions> {
+    if artifact.is_empty() {
+        return Ok(ConformanceOptions::default());
+    }
+    let artifacts = artifact
+        .iter()
+        .map(|raw| parse_artifact(raw))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ConformanceOptions::new(Template {
+        spec: TemplateSpec {
+            name: "conformance".to_owned(),
+            os: "linux".to_owned(),
+            artifacts,
+            ..TemplateSpec::default()
+        }
+        .into(),
+        ..Template::default()
+    }))
+}
+
+/// `preloop sandbox driver …`.
+async fn run_driver(command: DriverCommand) -> anyhow::Result<()> {
+    let state = crate::preloop_home().join("state");
+    match command {
+        DriverCommand::Serve(args) => {
+            let driver = in_process_driver(&args.driver, &state)?;
+            let shutdown = CancellationToken::new();
+            let stop = shutdown.clone();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                stop.cancel();
+            });
+            eprintln!(
+                "[preloop] serving driver `{}` on unix://{}",
+                driver.name(),
+                args.socket.display()
+            );
+            preloop_sandbox::driver_plugin::serve(driver, &args.socket, shutdown).await?;
+            Ok(())
+        }
+        DriverCommand::Conformance(args) => {
+            let driver = match args.driver.as_str() {
+                "smolvm" | "fake" => in_process_driver(&args.driver, &state)?,
+                spec => {
+                    ExternalDriver::start(ExternalSpec::parse(spec)?, &state.join("driver-sockets"))
+                        .await?
+                }
+            };
+            eprintln!("[preloop] driver conformance: {}", driver.name());
+            let options = conformance_options(&args.artifact)?;
+            let results = preloop_sandbox::driver_conformance::run(driver, &options).await;
+            let mut failed: Vec<&str> = Vec::new();
+            let mut skipped = 0usize;
+            println!("{:<28} {:<6} detail", "case", "result");
+            for case in &results {
+                if case.skipped {
+                    skipped += 1;
+                    println!("{:<28} {:<6}", case.name, "skip");
+                    continue;
+                }
+                match &case.outcome {
+                    Ok(()) => println!("{:<28} {:<6}", case.name, "pass"),
+                    Err(error) => {
+                        println!(
+                            "{:<28} {:<6} {}",
+                            case.name,
+                            "fail",
+                            error.replace('\n', " ")
+                        );
+                        failed.push(case.name);
+                    }
+                }
+            }
+            println!(
+                "\n{} passed, {} failed, {} skipped",
+                results.len() - failed.len() - skipped,
+                failed.len(),
+                skipped
+            );
+            if !failed.is_empty() {
+                anyhow::bail!("driver conformance failed: {}", failed.join(", "));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn driver_conformance_parses_repeated_artifacts() {
+        use clap::Parser as _;
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let oci = format!(
+            "format=oci-image,arch=aarch64,ref=ghcr.io/acme/image@{digest},digest={digest}"
+        );
+        let pack = format!("format=smolmachine,arch=aarch64,ref=file:///tmp/pack,digest={digest}");
+        let cli = crate::Cli::try_parse_from([
+            "preloop",
+            "sandbox",
+            "driver",
+            "conformance",
+            "--driver",
+            "smolvm",
+            "--artifact",
+            &oci,
+            "--artifact",
+            &pack,
+        ])
+        .unwrap();
+        let crate::Command::Sandbox(args) = cli.command else {
+            panic!("expected the sandbox command");
+        };
+        let SandboxCommand::Driver(DriverCommand::Conformance(args)) = args.command else {
+            panic!("expected driver conformance");
+        };
+        assert_eq!(args.driver, "smolvm");
+        assert_eq!(args.artifact, vec![oci, pack]);
+
+        let options = conformance_options(&args.artifact).unwrap();
+        let spec = options
+            .template
+            .spec
+            .into_option()
+            .expect("artifacts build a template");
+        assert_eq!(spec.name, "conformance");
+        assert_eq!(spec.artifacts.len(), 2);
+        assert_eq!(spec.artifacts[0].format, Artifact::OCI_IMAGE);
+        assert_eq!(spec.artifacts[1].format, Artifact::SMOLMACHINE);
+
+        let default = conformance_options(&[]).unwrap();
+        assert!(default.template.spec.into_option().is_none());
+    }
 
     #[tokio::test]
     async fn pump_exec_forwards_output_and_returns_the_exit_code() {

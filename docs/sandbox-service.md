@@ -170,17 +170,24 @@ the engine, and an unknown name is a startup error naming the valid values.
 
 ## Drivers
 
-A driver is the host-side, in-process interface a host agent drives
-(`crates/preloop-sandbox/src/driver.rs`). It is not a public plugin ABI: third
-parties integrate by implementing the Providers protocol. `exec` carries the
-exec id and a non-zero deadline the driver enforces, and the optional
-`cancel_exec` kills a running command when the caller goes away (it may arrive
-before `exec` starts; drivers remember it and refuse to start that exec).
+A driver is the host-side interface a host agent drives
+(`crates/preloop-sandbox/src/driver.rs`). It runs in-process, or as an
+out-of-process plugin that speaks the same operations over a Unix socket. See
+[Sandbox drivers](sandbox-drivers.md) for the plugin protocol, the
+`PRELOOP_SANDBOX_DRIVERS=external:…` configuration, stub generation, the Go
+skeleton and the conformance suite. Third parties can integrate by
+implementing the Providers protocol directly or by shipping a driver plugin.
+
+`exec` carries the exec id and a non-zero deadline the driver enforces, and
+the optional `cancel_exec` kills a running command when the caller goes away
+(it may arrive before `exec` starts; drivers remember it and refuse to start
+that exec).
 
 | Driver | Where | Model |
 |---|---|---|
 | `smolvm` | public | CLI. Golden-fork: a build sandbox starts `--branchable`; `Snapshot` keeps it as the fork base; sandboxes from the snapshot template are `machine branch` clones. |
 | `fake` | public | Process-backed, for tests and conformance. |
+| `external` | public | A plugin process speaking `preloop.sandbox.driver.v1.Driver` over a Unix socket, in any language. |
 | Private drivers | private build | See the private repository for driver-specific implementations. |
 
 A clone inherits the fork base's full configuration, so a fork request is a
@@ -519,6 +526,12 @@ preloop sandbox provider rm host-a                     # revoke its certificates
   plus enrollment: single-use and expired join tokens, CA pinning, name
   binding, mTLS denial without a certificate, renewal, and revocation. Set
   `PRELOOP_SANDBOX_TEST_PG` to also run the Postgres store test.
+* `cargo test -p preloop-sandbox --test external_driver` — the out-of-process
+  driver protocol end to end: `driver_plugin::serve` on a Unix socket,
+  `ExternalDriver` conformance, a service/agent acquire → exec → release
+  through the plugin, and spawn-mode startup. See
+  [Sandbox drivers](sandbox-drivers.md) for the protocol and conformance
+  cases.
 * `PRELOOP_SANDBOX_E2E_SMOLVM=1 cargo test -p preloop-sandbox --test smolvm_e2e`
   — real SmolVM: bake, snapshot, warm pool of branches, socket mount, files,
   streaming, cleanup.

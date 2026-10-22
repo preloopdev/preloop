@@ -3008,6 +3008,7 @@ dependencies = [
 name = "preloop-sandbox"
 version = "0.35.5"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -3017,6 +3018,7 @@ dependencies = [
  "futures",
  "hex",
  "hostname",
+ "hyper-util",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
