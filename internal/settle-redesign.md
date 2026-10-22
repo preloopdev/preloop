@@ -206,6 +206,25 @@ can fold it. The fold stays idempotent: resolved `outputs` mark a folded caller.
 Lite folds after each promotion pass and after an expansion apply
 (`fold_settled_callers`).
 
+An expansion that registers several unhostable jobs in one subtree settles
+every row first (terminal write + its own `job.completed.v1`, no fold), then
+folds each settled id in order, then concludes the run once — so every inner
+job's own event precedes the caller it completes, which precedes
+`run.completed.v1`. Folding mid-batch (settle, fold, settle, fold, …) would
+let the first settle's fold see a sibling's row already written terminal
+(by registration, ahead of that sibling's own settle) and fold early, before
+that sibling's own event ever landed.
+
+`Sweep::settle_node`, the in-memory-graph settle behind `promote_ready_jobs`
+(a parked environment gate's release — a timeout or a denial — and the
+reaper's wall-clock starvation sweep) and `resume_held_run` (jobs a
+`concurrency:` waiter parked behind its own gate), now folds too: it flushes
+the settling job's row ahead of the fold (the fold reads rows, not the
+graph), then mirrors a folded caller and the dependents it unblocks back
+into the graph so the same sweep's fixpoint loop keeps going. Rerun/reset —
+which settle rows while rebuilding a run, not as a live run's own outcome —
+still do not fold; proving that safe is open work.
+
 ## If: Condition Evaluation (Per Newly-Unblocked Job)
 
 When the conditional UPDATE unblocks a dependent, evaluate its `if:` before

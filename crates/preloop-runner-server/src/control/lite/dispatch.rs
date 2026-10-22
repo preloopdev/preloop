@@ -141,6 +141,20 @@ fn finalize_reusable_callers(
     backend: &LiteBackend,
     run_id: RunId,
 ) -> Result<Vec<JobId>, ControlError> {
+    // Cheap indexed guard: an ordinary run with no reusable caller never
+    // needs the whole-run record this fold reads, and `fold_settled_callers`
+    // runs this every settling promotion pass regardless.
+    let has_reusable_caller: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM job_specs WHERE run_id = ?1 \
+             AND reusable_call IS NOT NULL)",
+        )
+        .map_err(db)?
+        .query_row([codec::run_key(run_id)], |row| row.get(0))
+        .map_err(db)?;
+    if !has_reusable_caller {
+        return Ok(Vec::new());
+    }
     let Some(mut record) = jobs::run_record(tx, run_id)? else {
         return Ok(Vec::new());
     };

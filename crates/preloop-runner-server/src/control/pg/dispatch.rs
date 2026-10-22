@@ -1942,7 +1942,10 @@ async fn resume_held_run(
     // Only the jobs parked behind this run's workflow gate: a job with its
     // own wait row stays with that gate.
     let parked = held_jobs_of_run(tx, run_id).await?;
-    let mut sweep = Sweep::new(backend, tx).await?;
+    // A job that settles here (skip/error cascade, unsatisfiable need) is a
+    // real terminal outcome of this already-live run, not a rebuild: fold
+    // its reusable callers, same as every other live-run settle path.
+    let mut sweep = Sweep::new(backend, tx).await?.with_fold_callers();
     sweep.graphs.insert(run_id, graph);
     let now = sweep.now;
     let jobs_status = sweep
@@ -2317,6 +2320,30 @@ pub(super) async fn clear_assignment(
     )
     .await
     .map_err(db)?;
+    Ok(())
+}
+
+/// The row-level release a job no longer needs once it is terminal: its
+/// `concurrency:` hold, its open requests (expandable nodes only — a plain
+/// job or matrix leg never mints a placeholder request ahead of its own
+/// run), and its runner assignment. Shared, in this exact order, by every
+/// settle path that turns a job terminal without a completion
+/// (`settle_unrun_row`, [`Sweep::settle_node`]); a completion
+/// (`settle_job_targeted`) retires unconditionally and in a different order
+/// (it always minted a real attempt), so it keeps its own sequence.
+pub(super) async fn release_job_hold(
+    backend: &PgBackend,
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+    status: ExecutionStatus,
+    expandable: bool,
+) -> Result<(), ControlError> {
+    release_concurrency_for_job(backend, tx, run_id, job_id).await?;
+    if expandable {
+        retire_node_requests(tx, run_id, job_id, Retirement::Settle(status)).await?;
+    }
+    clear_assignment(tx, run_id, job_id).await?;
     Ok(())
 }
 
@@ -2698,6 +2725,14 @@ async fn cancel_outcome_gauges(
 // Promotion sweep
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Outcome of [`Sweep::settle_folded_callers`]: the reusable callers folded
+/// (innermost first) and the dependents the folds left `blocked` with no
+/// needs remaining, in job-id order.
+pub(super) struct FoldedSettle {
+    pub(super) folded: Vec<JobId>,
+    pub(super) unblocked: Vec<JobId>,
+}
+
 /// One command's mutable run graphs and the scheduling state that crosses
 /// their borders (gates can cancel/promote foreign runs).
 pub(super) struct Sweep<'a> {
@@ -2716,6 +2751,12 @@ pub(super) struct Sweep<'a> {
     /// Cancellation messages queued (holder displacement, cancels).
     pub(crate) cancellations: usize,
     now: i64,
+    /// Whether [`Sweep::settle_node`] folds reusable callers. Off by default:
+    /// a sweep that rebuilds a run (rerun/reset) must not fold a caller
+    /// behind the run's back. Callers that settle a row as the real terminal
+    /// outcome of a *live* run (a parked environment gate's failure) opt in
+    /// with [`Sweep::with_fold_callers`].
+    fold_callers: bool,
 }
 
 impl<'a> Sweep<'a> {
@@ -2734,7 +2775,15 @@ impl<'a> Sweep<'a> {
             concluded: Vec::new(),
             cancellations: 0,
             now: now_us(),
+            fold_callers: false,
         })
+    }
+
+    /// Opt this sweep into folding reusable callers as their last open inner
+    /// job settles (see [`Sweep::fold_callers`]'s doc).
+    pub(super) fn with_fold_callers(mut self) -> Self {
+        self.fold_callers = true;
+        self
     }
 
     /// The graph for `run_id`, loading (and marking dirty on flush) on miss.
@@ -3325,13 +3374,19 @@ impl<'a> Sweep<'a> {
         // Candidate callers: every spec row whose reusable metadata lists the
         // completed job as an inner job. The metadata (`inner_job_ids`) is the
         // authoritative edge — a callee's job id carries no `parent_job_id`
-        // (only matrix legs do), and lite's fold reads the same list.
+        // (only matrix legs do), and lite's fold reads the same list. The
+        // containment check is pushed into SQL (`@>` against a scalar is a
+        // documented jsonb exception: it tests array membership) so this run's
+        // other reusable callers are filtered by Postgres instead of being
+        // pulled over the wire and deserialized one at a time — ordinarily
+        // zero or one row, since only one caller lists any given job id.
         let candidates = tx
             .query(
                 "SELECT job_id, reusable_call::text FROM job_specs \
                  WHERE run_id=$1::text::uuid AND reusable_call IS NOT NULL \
-                   AND reusable_call <> 'null'::jsonb",
-                &[&run],
+                   AND reusable_call <> 'null'::jsonb \
+                   AND reusable_call->'meta'->'inner_job_ids' @> to_jsonb($2::text)",
+                &[&run, &inner_job_id.0],
             )
             .await
             .map_err(db)?;
@@ -3511,18 +3566,17 @@ impl<'a> Sweep<'a> {
     /// [`Self::fold_reusable_callers`] for a settle that has no completion
     /// bookkeeping of its own to extend (see `settle_job_targeted`): hand on
     /// the cohort slot each folded caller frees, refresh its dependents'
-    /// counters and emit its `job.completed.v1`. Returns the dependents the
-    /// folds left `blocked` with no needs remaining, in job-id order; the
-    /// caller decides them (they may skip or fail in turn). The caller stamps
-    /// the run afterwards.
+    /// counters and emit its `job.completed.v1`. The caller stamps the run
+    /// afterwards.
     pub(super) async fn settle_folded_callers(
         backend: &PgBackend,
         tx: &Transaction<'_>,
         run_id: RunId,
         settled: &JobId,
-    ) -> Result<Vec<JobId>, ControlError> {
+    ) -> Result<FoldedSettle, ControlError> {
+        let folded = Self::fold_reusable_callers(backend, tx, run_id, settled).await?;
         let mut unblocked = Vec::new();
-        for caller in Self::fold_reusable_callers(backend, tx, run_id, settled).await? {
+        for caller in &folded {
             let row = tx
                 .query_one(
                     "SELECT base_id, status FROM jobs WHERE run_id=$1::text::uuid AND job_id=$2",
@@ -3532,8 +3586,8 @@ impl<'a> Sweep<'a> {
                 .map_err(db)?;
             let base_id: String = row.get(0);
             let status = crate::control::types::status_parse(row.get::<_, String>(1).as_str());
-            retry_cohort_waiters(backend, tx, run_id, &caller, &base_id).await?;
-            unblocked.extend(Self::refresh_remaining_needs(tx, run_id, &caller, &base_id).await?);
+            retry_cohort_waiters(backend, tx, run_id, caller, &base_id).await?;
+            unblocked.extend(Self::refresh_remaining_needs(tx, run_id, caller, &base_id).await?);
             emit_outbox(
                 tx,
                 Some(run_id),
@@ -3544,7 +3598,7 @@ impl<'a> Sweep<'a> {
         }
         unblocked.sort();
         unblocked.dedup();
-        Ok(unblocked)
+        Ok(FoldedSettle { folded, unblocked })
     }
 
     /// Cancel a failed leg's matrix siblings (fail-fast). Returns the IDs of
@@ -3627,6 +3681,9 @@ impl<'a> Sweep<'a> {
         Ok(cancelled)
     }
 
+    /// Settle one node's row tail. Folds reusable callers only when this
+    /// sweep opted in with [`Sweep::with_fold_callers`] — see that field's
+    /// doc for which call sites may.
     pub(super) async fn settle_node(
         &mut self,
         run_id: RunId,
@@ -3641,18 +3698,24 @@ impl<'a> Sweep<'a> {
             };
             mark_terminal(node, status, now);
         }
+        if self.fold_callers {
+            // The fold reads this job's row straight from the DB (it walks
+            // caller metadata no in-memory graph carries); flush it now
+            // instead of waiting for this command's batched `flush()`, so a
+            // caller whose last open inner job this is sees it terminal.
+            if let Some(node) = self.graphs.get(&run_id).and_then(|g| g.nodes.get(job_id)) {
+                let node = node.clone();
+                flush_node(self.tx, run_id, job_id, &node).await?;
+            }
+        }
         set_status_in(self.graphs.get_mut(&run_id), job_id, status);
         self.mark(run_id, job_id);
-        release_concurrency_for_job(self.backend, self.tx, run_id, job_id).await?;
         let expandable = self
             .graphs
             .get(&run_id)
             .and_then(|g| g.nodes.get(job_id))
             .is_some_and(|node| node.expandable());
-        if expandable {
-            retire_node_requests(self.tx, run_id, job_id, Retirement::Settle(status)).await?;
-        }
-        clear_assignment(self.tx, run_id, job_id).await?;
+        release_job_hold(self.backend, self.tx, run_id, job_id, status, expandable).await?;
         // Dependents' `remaining_needs` recompute. A declared need matches a
         // job id or its matrix base, and an expanded matrix parent is replaced
         // by its legs — so the fast-path counter cannot be decremented per
@@ -3732,6 +3795,38 @@ impl<'a> Sweep<'a> {
             serde_json::json!({"job_id": job_id.0, "status": status_str(status)}),
         )
         .await?;
+        if self.fold_callers {
+            let FoldedSettle { folded, unblocked } =
+                Self::settle_folded_callers(self.backend, self.tx, run_id, job_id).await?;
+            if !folded.is_empty() {
+                // The fold wrote the callers' (and their dependents') rows
+                // directly over SQL, bypassing the graph; mirror them in so
+                // this sweep's own fixpoint loop sees a folded caller
+                // terminal and its dependents' fresh `remaining_needs`,
+                // rather than stalling here until a later command reloads
+                // the graph.
+                for caller in &folded {
+                    if let Some(node) = PgBackend::load_node(self.tx, run_id, caller).await? {
+                        let caller_status = node.status;
+                        if let Some(graph) = self.graphs.get_mut(&run_id) {
+                            graph.nodes.insert(caller.clone(), node);
+                        }
+                        set_status_in(self.graphs.get_mut(&run_id), caller, caller_status);
+                    }
+                }
+                for dependent in &unblocked {
+                    if let Some(node) = PgBackend::load_node(self.tx, run_id, dependent).await?
+                        && let Some(graph) = self.graphs.get_mut(&run_id)
+                    {
+                        graph.nodes.insert(dependent.clone(), node);
+                    }
+                }
+                if let Some(graph) = self.graphs.get_mut(&run_id) {
+                    graph.resummarize();
+                    graph.touched = true;
+                }
+            }
+        }
         let now_completed = self
             .graphs
             .get(&run_id)
@@ -6591,16 +6686,6 @@ impl PgBackend {
             // A terminal (non-cancelled) verdict sticks; nothing to write.
             return Ok(outcome);
         }
-        // The run's own transition decides the workflow-hold release and
-        // `run.completed.v1`, so remember where it started.
-        let run_status_before: Option<String> = tx
-            .query_opt(
-                "SELECT status FROM runs WHERE run_id=$1::text::uuid",
-                &[&run],
-            )
-            .await
-            .map_err(db)?
-            .map(|row| row.get(0));
         // 2. The job's terminal write. Outputs/annotations only land when the
         // runner reported any — an empty map is not a result.
         let outputs_json = (!outputs.is_empty())
@@ -6703,37 +6788,11 @@ impl PgBackend {
         outcome.admit_cohorts.sort_unstable();
         outcome.admit_cohorts.dedup();
         // 6. Run status via the DB aggregate; the caller holds the run lock.
-        summarize_run_tx(tx, run_id).await?;
-        let (run_status, conclusion): (String, Option<String>) = {
-            let row = tx
-                .query_one(
-                    "SELECT status, conclusion FROM runs WHERE run_id=$1::text::uuid",
-                    &[&run],
-                )
-                .await
-                .map_err(db)?;
-            (row.get(0), row.get(1))
-        };
-        let newly_completed =
-            run_status == "completed" && run_status_before.as_deref() != Some("completed");
-        outcome.run_completed = newly_completed;
+        let concluded_run = promote::conclude_run(self, tx, run_id, "success").await?;
+        outcome.run_completed = concluded_run.newly_completed;
         outcome.newly_terminal_success =
-            newly_completed && conclusion.as_deref() == Some("success");
-        outcome.conclusion = conclusion.clone();
-        if newly_completed {
-            // A terminal run must not hold a workflow-level slot: release the
-            // group and promote its next waiter.
-            release_concurrency_for_run(self, tx, run_id).await?;
-            emit_outbox(
-                tx,
-                Some(run_id),
-                "run.completed.v1",
-                serde_json::json!({
-                    "conclusion": conclusion.unwrap_or_else(|| "success".to_owned())
-                }),
-            )
-            .await?;
-        }
+            concluded_run.newly_completed && concluded_run.conclusion.as_deref() == Some("success");
+        outcome.conclusion = concluded_run.conclusion;
         // 7. Outbox: every job this completion turned terminal — the job, its
         // fail-fast siblings and the folded callers — so the check-run
         // projection concludes each one.
@@ -7089,7 +7148,11 @@ impl PgBackend {
             let Some(graph) = PgBackend::load_graph(self, &tx, run_id).await? else {
                 continue;
             };
-            let mut sweep = Sweep::new(self, &tx).await?;
+            // A parked gate's release settles a job as the real terminal
+            // outcome of this live run (environment-gate failure, or the
+            // reaper's starvation sweep over gate-armed jobs): fold its
+            // reusable callers.
+            let mut sweep = Sweep::new(self, &tx).await?.with_fold_callers();
             sweep.graphs.insert(run_id, graph);
             release_parked_nodes(&tx, &mut sweep, run_id).await?;
             sweep.sweep().await?;
