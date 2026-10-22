@@ -545,7 +545,7 @@ fn settle_job_row(
     job: &JobRow,
     status: ExecutionStatus,
 ) -> Result<(), ControlError> {
-    super::settle::settle_node(tx, backend, job.run_id, &job.job_id, status).map(|_| ())
+    super::settle::settle_node(tx, backend, job.run_id, &job.job_id, status, true).map(|_| ())
 }
 
 /// The caller's JobSet gate declarations (`caller_jobset_gates`): caller +

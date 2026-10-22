@@ -338,7 +338,18 @@ fn register_built_jobs(
                 job = %job_id.0,
                 "materialized callee job is unhostable: no {platform} runner"
             );
-            settle::settle_node(tx, backend, run_id, &job_id, ExecutionStatus::Failure)?;
+            // No fail-fast: the subtree's other legs are still being
+            // registered one at a time and have not had a chance to
+            // dispatch, so cancelling them here would settle jobs that
+            // never ran, matching PG's `settle_unrun` (never fail-fasts).
+            settle::settle_node(
+                tx,
+                backend,
+                run_id,
+                &job_id,
+                ExecutionStatus::Failure,
+                false,
+            )?;
             continue;
         }
         // Strip secret values before persistence; the acquire path rebuilds
@@ -569,7 +580,7 @@ impl LiteBackend {
             let built = match claim.built {
                 Ok(built) => built,
                 Err(status) => {
-                    settle::settle_node(tx, self, run_id, &node_id, status)?;
+                    settle::settle_node(tx, self, run_id, &node_id, status, true)?;
                     outcome.failed.push((run_id, node_id));
                     // The settled node may have been its caller's last open
                     // inner job.
@@ -585,7 +596,14 @@ impl LiteBackend {
             match built {
                 BuiltExpansion::Matrix { jobs } if jobs.is_empty() => {
                     // An empty matrix concludes the node as skipped.
-                    settle::settle_node(tx, self, run_id, &node_id, ExecutionStatus::Skipped)?;
+                    settle::settle_node(
+                        tx,
+                        self,
+                        run_id,
+                        &node_id,
+                        ExecutionStatus::Skipped,
+                        true,
+                    )?;
                     outcome.skipped.push((run_id, node_id));
                 }
                 BuiltExpansion::Matrix { jobs } => {

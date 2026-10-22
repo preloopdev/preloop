@@ -304,7 +304,7 @@ fn complete_node(
     // Terminal transition + gate release + dependents' needs (settle_node
     // internally applies fail-fast, settles every request of the job,
     // re-summarizes the run and emits job.completed.v1 / run.completed.v1).
-    let effects = settle::settle_node(tx, backend, run_id, job_id, reported)?;
+    let effects = settle::settle_node(tx, backend, run_id, job_id, reported, true)?;
     // Reusable callers fold their callee outputs into terminal statuses.
     let finalized = finalize_reusable_callers(tx, backend, run_id)?;
     let _ = finalized;

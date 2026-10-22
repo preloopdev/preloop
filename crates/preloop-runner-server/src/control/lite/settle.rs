@@ -722,13 +722,21 @@ pub(super) fn cancel_job_inner(
 
 /// Settle one job to a terminal status (first result wins; `continue-on-
 /// error` tolerated; a cancelled job stays cancelled), then release its
-/// concurrency and run the fail-fast sweep. Returns what changed.
+/// concurrency and, when `fail_fast` is set, run the fail-fast sweep.
+/// Returns what changed.
+///
+/// `fail_fast` is false only for a job settled unhostable at expansion
+/// registration: the subtree's other legs are still being registered one at
+/// a time and have not had a chance to dispatch, so cancelling them as
+/// matrix fail-fast siblings would settle jobs that never got to run,
+/// matching Postgres's `settle_unrun`, which never fail-fasts.
 pub(super) fn settle_node(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
     run_id: RunId,
     job_id: &JobId,
     reported: ExecutionStatus,
+    fail_fast: bool,
 ) -> Result<SettleEffects, ControlError> {
     let Some(job) = jobs::job(tx, run_id, job_id)? else {
         return Ok(SettleEffects::unchanged(reported));
@@ -761,7 +769,7 @@ pub(super) fn settle_node(
     let summary = jobs::summarize_run_row(tx, run_id)?;
     let newly_terminal_success =
         summary == ExecutionStatus::Success && run_status_before.as_deref() != Some("completed");
-    let cancelled_siblings = if effective == ExecutionStatus::Failure {
+    let cancelled_siblings = if fail_fast && effective == ExecutionStatus::Failure {
         apply_fail_fast(tx, backend, run_id, job_id)?
     } else {
         Vec::new()

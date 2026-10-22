@@ -1822,6 +1822,54 @@ pub(crate) mod suite {
         assert_eq!(record.status, ExecutionStatus::Failure);
     }
 
+    /// `fail_fast` left at its GitHub default (true), the hostable leg
+    /// registered before the unhostable one: the unhostable leg's own
+    /// settle must not fail-fast cancel its already-registered,
+    /// not-yet-dispatched sibling. Matches Postgres's `settle_unrun`, which
+    /// never fail-fasts; SQLite's unhostable-at-registration settle used to
+    /// run the matrix fail-fast sweep too, cancelling an earlier hostable
+    /// leg that never got a chance to dispatch.
+    pub(crate) async fn unhostable_leg_leaves_an_earlier_hostable_sibling_undisturbed(
+        backend: &dyn ControlBackend,
+    ) {
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let run_id = submit_fan_run_with_generated_matrix(backend).await;
+        let hostable = built_matrix_leg(run_id, "fan-1", "fan", 1, 2);
+        let mut windows = built_matrix_leg(run_id, "fan-2", "fan", 2, 2);
+        windows.plan.runs_on = vec!["windows-latest".to_owned()];
+        expand_deferred_matrix(backend, "fan", vec![hostable, windows]).await;
+
+        assert_eq!(
+            backend
+                .job_queue_state(run_id, &JobId("fan-2".to_owned()))
+                .await
+                .unwrap(),
+            Some(("none".to_owned(), "failure".to_owned())),
+            "the unhostable leg fails at registration"
+        );
+        let dispatched =
+            drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
+        assert_eq!(
+            dispatched,
+            vec![JobId("fan-1".to_owned())],
+            "the earlier hostable leg must still dispatch, not be fail-fast cancelled \
+             by its unhostable sibling"
+        );
+        let statuses = job_completed_statuses(backend, "fan-2").await;
+        assert_eq!(
+            statuses,
+            vec!["failure".to_owned()],
+            "exactly one job.completed.v1 for the unhostable leg, got {statuses:?}"
+        );
+    }
+
     /// A deferred matrix node fans out with its own scoped `inputs`: the
     /// caller's `with:` values when the node was materialized inside a
     /// reusable callee (its stored plan carries them), else the run's dispatch
@@ -9914,6 +9962,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn unhostable_leg_leaves_an_earlier_hostable_sibling_undisturbed() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::unhostable_leg_leaves_an_earlier_hostable_sibling_undisturbed(&backend).await;
+    }
+
+    #[tokio::test]
     async fn deferred_matrix_expansion_scopes_its_inputs() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -11808,6 +11864,14 @@ mod lite {
     #[tokio::test]
     async fn unhostable_leg_fails_alone_at_expansion() {
         suite::unhostable_leg_fails_alone_at_expansion(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn unhostable_leg_leaves_an_earlier_hostable_sibling_undisturbed() {
+        suite::unhostable_leg_leaves_an_earlier_hostable_sibling_undisturbed(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]
