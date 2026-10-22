@@ -73,6 +73,8 @@ use debug::*;
 pub mod debug_sessions;
 pub mod runner_lifecycle;
 use runner_lifecycle::*;
+pub mod pool_bindings;
+use pool_bindings::*;
 pub mod broker;
 use broker::*;
 pub mod distributed_task;

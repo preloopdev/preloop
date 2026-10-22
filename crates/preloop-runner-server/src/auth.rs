@@ -255,7 +255,9 @@ async fn authorize_blob_request(
     }
 
     match bearer_from_headers(request.headers()) {
-        Some(bearer) if bearer == state.system_token => Ok(next.run(request).await),
+        Some(bearer) if crate::dispatch_auth::constant_time_eq(bearer, &state.system_token) => {
+            Ok(next.run(request).await)
+        }
         Some(bearer) => {
             let job_id = match results_identity(state, bearer) {
                 Ok(ResultsIdentity::Job(identity)) => identity.job_id.to_string(),
@@ -362,11 +364,14 @@ pub async fn require_test_api_token(
 }
 
 pub fn system_bearer_authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    bearer_from_headers(headers).is_some_and(|token| token == state.system_token)
+    bearer_from_headers(headers)
+        .is_some_and(|token| crate::dispatch_auth::constant_time_eq(token, &state.system_token))
 }
 
 fn request_system_bearer_authorized(shared: &Arc<SharedState>, request: &Request) -> bool {
-    bearer_token(request).is_some_and(|token| token == shared.state.system_token)
+    bearer_token(request).is_some_and(|token| {
+        crate::dispatch_auth::constant_time_eq(token, &shared.state.system_token)
+    })
 }
 
 pub async fn require_system_bearer(
