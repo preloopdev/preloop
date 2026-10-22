@@ -1229,6 +1229,39 @@ pub(crate) struct RunQueueClaimability {
     /// least one of those ready jobs. 0 when `queued` is 0.
     pub(crate) claimable: usize,
 }
+/// One job's dispatch state for `GET /api/v1/pool/bindings`
+/// (`pool_bindings`): where a ready-queue job stands between enqueue and a
+/// runner actually starting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolBindingState {
+    /// A runner has claimed the job and is executing it
+    /// (`job_requests.result IS NULL` with a runner bound).
+    Running,
+    /// A `job_assignments` row names a runner, but that runner has not
+    /// claimed the job yet.
+    Assigned,
+    /// `queue_state = 'ready'` with neither an assignment nor a pending
+    /// provision request: waiting for dispatch to consider it.
+    Ready,
+    /// A `provision_requests` row is waiting on the pool for capacity.
+    Provisioning,
+}
+
+/// One row of `pool_bindings`.
+#[derive(Debug, Clone)]
+pub(crate) struct PoolBindingRecord {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) state: PoolBindingState,
+    /// The bound or executing runner; `None` for `Ready`/`Provisioning`.
+    pub(crate) runner_id: Option<i64>,
+    pub(crate) runner_name: Option<String>,
+    /// Age of the current state, computed against the read's own clock.
+    pub(crate) since_seconds: u64,
+    /// 1-based rank in the dispatch queue order among jobs with no runner
+    /// bound yet (`Ready`/`Provisioning`); `None` for `Running`/`Assigned`.
+    pub(crate) waitlist_position: Option<u32>,
+}
 
 /// Insert a runner session row (`open_runner_session`).
 #[derive(Debug, Clone)]

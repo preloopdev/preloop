@@ -24,6 +24,7 @@ mod jobs;
 pub mod legacy_import;
 mod lifecycle;
 mod poll;
+mod pool_bindings;
 mod promote;
 mod queries;
 mod reaper;

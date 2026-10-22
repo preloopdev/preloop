@@ -1282,6 +1282,10 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// run's ready-job count and the number of registered runners whose
     /// capabilities match at least one of those ready jobs. Read-only.
     async fn list_runners(&self, run_id: Option<RunId>) -> Result<RunnerListing, ControlError>;
+    /// Every job's pool-dispatch state, for `GET /api/v1/pool/bindings`:
+    /// jobs in the ready queue (ready/assigned/provisioning) and jobs a
+    /// runner currently holds (running). Read-only.
+    async fn pool_bindings(&self) -> Result<Vec<PoolBindingRecord>, ControlError>;
 
     /// The parsed RSA public key registered for `runner_id`; `None` when the
     /// runner is unknown or registered without one.
@@ -3266,6 +3270,13 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.list_runners(run_id).await,
         }
     }
+    async fn pool_bindings(&self) -> Result<Vec<PoolBindingRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.pool_bindings().await,
+            Self::Postgres(b) => b.pool_bindings().await,
+        }
+    }
+
     async fn runner_rsa_public_key(
         &self,
         runner_id: i64,

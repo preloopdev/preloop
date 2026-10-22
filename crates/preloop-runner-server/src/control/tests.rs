@@ -9170,6 +9170,149 @@ pub(crate) mod suite {
             other => panic!("a held terminal run must not dispatch: {other:?}"),
         }
     }
+
+    /// `pool_bindings` reports each job's dispatch state — `ready` (no
+    /// runner picked), `provisioning` (pool-pending, no free candidate),
+    /// `assigned` (a runner is picked but has not claimed it), `running` (a
+    /// runner claimed it) — and a 1-based waitlist position for jobs with no
+    /// runner bound yet (`ready`/`provisioning`), in dispatch queue order,
+    /// skipping jobs that already have one (`assigned`/`running`).
+    pub(crate) async fn pool_bindings_reports_dispatch_states_and_waitlist_order(
+        backend: &dyn ControlBackend,
+        set_pool_assignments: impl Fn(bool),
+    ) {
+        // A pool-proven runner with an open session: the enqueue-time
+        // pairing's only eligible candidate once pool assignments are on.
+        let mut proven = register_runner_with_labels("proven", &["self-hosted", "grp-a"]);
+        proven.pool_proven = true;
+        let proven = backend.register_runner(proven).await.unwrap();
+        backend
+            .create_session(create_session(proven.runner.id))
+            .await
+            .unwrap();
+        // A second, non-pool-proven runner used to claim a job outright —
+        // the `running` case — and ineligible for enqueue-time pairing.
+        let claimer = backend
+            .register_runner(register_runner_with_labels(
+                "claimer",
+                &["self-hosted", "grp-c"],
+            ))
+            .await
+            .unwrap();
+        let claimer_session = backend
+            .create_session(create_session(claimer.runner.id))
+            .await
+            .unwrap();
+
+        set_pool_assignments(false);
+        // Claimed outright by `claimer` — the `running` case. Submitted
+        // before `waits` so the generic `claim_next` (labels
+        // `["self-hosted"]`, which `waits` also satisfies) takes this
+        // older, equally-matching job first.
+        let running_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                running_run,
+                vec![submit_job_on(
+                    running_run,
+                    "runs",
+                    1,
+                    &["self-hosted", "grp-c"],
+                )],
+            ))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll_with_labels(
+                &claimer_session.session_id,
+                claimer.runner.id,
+                &["self-hosted", "grp-c"],
+            ))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("the `runs` job must be claimed, got {outcome:?}");
+        };
+        let (claimed_run, claimed_job) = (claimed.queued.run_id, claimed.queued.job_id);
+        assert_eq!(claimed_run, running_run);
+        assert_eq!(claimed_job, JobId("runs".to_owned()));
+        // Stays `ready`: pool assignments off at enqueue time, so no
+        // binding of any kind is ever recorded for it.
+        let ready_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                ready_run,
+                vec![submit_job_on(ready_run, "waits", 2, &["self-hosted"])],
+            ))
+            .await
+            .unwrap();
+
+        // `assigned`: pool assignments on, `proven` is the only eligible
+        // idle candidate and matches — bound before it ever claims.
+        set_pool_assignments(true);
+        let assigned_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                assigned_run,
+                vec![submit_job_on(
+                    assigned_run,
+                    "bound",
+                    3,
+                    &["self-hosted", "grp-a"],
+                )],
+            ))
+            .await
+            .unwrap();
+        // `provisioning`: still pool-on, but `proven` is now busy (bound
+        // above) and `claimer` is not pool-proven, so no candidate exists.
+        let provisioning_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                provisioning_run,
+                vec![submit_job_on(
+                    provisioning_run,
+                    "waiting-on-pool",
+                    4,
+                    &["self-hosted", "grp-a"],
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let bindings = backend.pool_bindings().await.unwrap();
+        assert_eq!(bindings.len(), 4, "{bindings:?}");
+        let by_job: std::collections::BTreeMap<&str, &PoolBindingRecord> = bindings
+            .iter()
+            .map(|binding| (binding.job_id.0.as_str(), binding))
+            .collect();
+
+        let waits = by_job["waits"];
+        assert_eq!(waits.state, PoolBindingState::Ready);
+        assert!(waits.runner_id.is_none());
+        assert_eq!(waits.waitlist_position, Some(1));
+
+        let runs = by_job["runs"];
+        assert_eq!(runs.state, PoolBindingState::Running);
+        assert_eq!(runs.runner_id, Some(claimer.runner.id));
+        assert_eq!(runs.runner_name.as_deref(), Some("claimer"));
+        assert_eq!(runs.waitlist_position, None);
+
+        let bound = by_job["bound"];
+        assert_eq!(bound.state, PoolBindingState::Assigned);
+        assert_eq!(bound.runner_id, Some(proven.runner.id));
+        assert_eq!(bound.runner_name.as_deref(), Some("proven"));
+        assert_eq!(bound.waitlist_position, None);
+
+        let waiting_on_pool = by_job["waiting-on-pool"];
+        assert_eq!(waiting_on_pool.state, PoolBindingState::Provisioning);
+        assert!(waiting_on_pool.runner_id.is_none());
+        assert_eq!(
+            waiting_on_pool.waitlist_position,
+            Some(2),
+            "waits behind `waits` in submit order; `bound` already has a \
+             runner and does not consume a waitlist slot"
+        );
+    }
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -10178,6 +10321,17 @@ mod pg {
         };
         backend.set_config(true, false, std::time::Duration::from_secs(300));
         suite::pairing_marks_runner_pool_proven(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn pool_bindings_reports_dispatch_states_and_waitlist_order() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::pool_bindings_reports_dispatch_states_and_waitlist_order(&backend, |on| {
+            backend.set_config(on, false, std::time::Duration::from_secs(300));
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -12323,6 +12477,15 @@ mod lite {
         let backend = LiteBackend::in_memory().unwrap();
         backend.set_config(true, false, std::time::Duration::from_secs(300));
         suite::pairing_marks_runner_pool_proven(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn pool_bindings_reports_dispatch_states_and_waitlist_order() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::pool_bindings_reports_dispatch_states_and_waitlist_order(&backend, |on| {
+            backend.set_config(on, false, std::time::Duration::from_secs(300));
+        })
+        .await;
     }
 
     #[tokio::test]

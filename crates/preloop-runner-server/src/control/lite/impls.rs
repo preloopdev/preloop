@@ -886,6 +886,9 @@ impl ControlBackend for LiteBackend {
     async fn list_runners(&self, run_id: Option<RunId>) -> Result<RunnerListing, ControlError> {
         self.list_runners(run_id).await
     }
+    async fn pool_bindings(&self) -> Result<Vec<PoolBindingRecord>, ControlError> {
+        self.pool_bindings().await
+    }
     async fn runner_rsa_public_key(
         &self,
         runner_id: i64,
