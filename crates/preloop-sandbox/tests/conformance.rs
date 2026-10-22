@@ -116,6 +116,10 @@ async fn harness_with_host_config_access(
     let fake = Arc::new(FakeDriver::new("fake", host, caps));
     let mut agent_config = AgentConfig::new("host-a", dir.path().join("scratch"));
     agent_config.reconcile = Duration::from_millis(300);
+    // Placement reads a provider silent past `provider_timeout` as offline.
+    // The default heartbeat (10 s) leaves little room on a loaded runner;
+    // one second keeps the harness provider online through a stall.
+    agent_config.heartbeat = Duration::from_secs(1);
     let shutdown = CancellationToken::new();
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
