@@ -324,24 +324,50 @@ async fn external_driver_carries_the_agent_flow() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn spawn_mode_starts_the_plugin() {
-    let dir = tempfile::tempdir().unwrap();
-    let wrapper = dir.path().join("plugin.sh");
+/// A wrapper the agent can spawn as a plugin: it records its pid (which
+/// `exec` preserves) and re-executes this test binary as the plugin child.
+///
+/// The agent appends `--socket <path>`. libtest does not accept unknown
+/// flags, so the wrapper reads them and passes the path through the
+/// environment, then re-executes this binary filtered to the one child test.
+fn plugin_wrapper(dir: &Path) -> PathBuf {
+    let wrapper = dir.join("plugin.sh");
+    let pidfile = dir.join("plugin.pid");
     let exe = std::env::current_exe().unwrap();
     let quoted = preloop_sandbox::driver::shell_quote(&exe.to_string_lossy());
-    // The agent appends `--socket <path>`. libtest does not accept unknown
-    // flags, so the wrapper reads them and passes the path through the
-    // environment, then re-executes this binary filtered to the one child
-    // test.
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nset -eu\n[ \"$1\" = \"--socket\" ]\nexport {PLUGIN_CHILD_ENV}=1\nexport {PLUGIN_SOCKET_ENV}=\"$2\"\nexec {quoted} --exact plugin_child_process\n"
+            "#!/bin/sh\nset -eu\necho $$ > {pidfile}\n[ \"$1\" = \"--socket\" ]\nexport {PLUGIN_CHILD_ENV}=1\nexport {PLUGIN_SOCKET_ENV}=\"$2\"\nexec {quoted} --exact plugin_child_process\n",
+            pidfile = preloop_sandbox::driver::shell_quote(&pidfile.to_string_lossy()),
         ),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wrapper
+}
+
+/// Whether `pid` is a live process (a zombie counts: the kill only delivered).
+fn process_alive(pid: i32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn recorded_pid(dir: &Path) -> i32 {
+    std::fs::read_to_string(dir.join("plugin.pid"))
+        .expect("the wrapper records its pid")
+        .trim()
+        .parse()
+        .expect("the pid is a number")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_mode_starts_the_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = plugin_wrapper(dir.path());
 
     let spec = ExternalSpec::parse(&format!("spawn-test={}", wrapper.display())).unwrap();
     let driver = ExternalDriver::start(spec, &dir.path().join("runtime"))
@@ -385,7 +411,54 @@ async fn spawn_mode_starts_the_plugin() {
 
     driver.destroy(&native_ref).await.unwrap();
     // Dropping the driver stops the supervised child process.
+    let pid = recorded_pid(dir.path());
     drop(driver);
+    wait_for(|| !process_alive(pid)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_mode_refuses_a_socket_a_live_process_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let socket = runtime.join("live.sock");
+    // Stand in for a plugin an earlier agent left behind: a live listener on
+    // the path the new spawn would use.
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let wrapper = plugin_wrapper(dir.path());
+    let spec = ExternalSpec::parse(&format!("live={}", wrapper.display())).unwrap();
+
+    let error = ExternalDriver::start(spec, &runtime)
+        .await
+        .err()
+        .expect("starting a second plugin on a served socket must fail");
+    assert_eq!(error.code, preloop_sandbox::error::Code::FailedPrecondition);
+    let message = preloop_sandbox::error::message(&error);
+    assert!(
+        message.contains("already served by a live process"),
+        "{message}"
+    );
+    drop(listener);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_mode_replaces_a_stale_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let socket = runtime.join("stale.sock");
+    // A socket file whose listener died: connect refuses, so it is stale.
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    assert!(socket.exists(), "the dead listener left its socket behind");
+    let wrapper = plugin_wrapper(dir.path());
+    let spec = ExternalSpec::parse(&format!("stale={}", wrapper.display())).unwrap();
+
+    let driver = ExternalDriver::start(spec, &runtime)
+        .await
+        .expect("a stale socket must be replaced, not block the start");
+    let pid = recorded_pid(dir.path());
+    drop(driver);
+    wait_for(|| !process_alive(pid)).await;
 }
 
 /// The spawn-mode child: when re-executed with the marker environment, serve

@@ -113,6 +113,7 @@ pub fn irq_exhaustion_message(
     smolvm_version: Option<&str>,
     stderr: &str,
 ) -> String {
+    let stderr = crate::driver::strip_ansi(stderr);
     let version = match smolvm_version {
         Some(version) => format!("`smolvm --version` on this host reports {version}"),
         None => {
@@ -1733,7 +1734,7 @@ impl SmolVmProvider {
         )
         .await?;
         if result.exit_code != 0 {
-            let message = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+            let message = crate::driver::strip_ansi(String::from_utf8_lossy(&result.stderr).trim());
             return Err(VmError::Command {
                 operation,
                 exit_code: result.exit_code,
@@ -1961,7 +1962,7 @@ impl SmolVmProvider {
         )
         .await?;
         if result.exit_code != 0 {
-            let message = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+            let message = crate::driver::strip_ansi(String::from_utf8_lossy(&result.stderr).trim());
             return Err(VmError::Command {
                 operation,
                 exit_code: result.exit_code,

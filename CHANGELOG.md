@@ -92,6 +92,21 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Out-of-process sandbox drivers are hardened.** A plugin's own
+  `unavailable` (a backend failure returned by a healthy RPC) fails only that
+  work item instead of taking the plugin out of service; only transport loss
+  marks it down. A spawned plugin runs in its own process group and is killed
+  when the agent stops (SIGINT or SIGTERM) or the driver is dropped, and a
+  live socket from an earlier agent is refused instead of double-spawning
+  (a stale one is replaced). The registered driver name is the configured
+  spec name (a mismatched `GetInfo.name` only warns), and duplicate names are
+  a startup error naming both entries. SmolVM `create` now adopts an existing
+  machine that carries the service's ownership marker for a redelivered
+  sandbox id and makes sure it is running; a machine without the marker is
+  never adopted. `driver conformance --driver` accepts the `external:` prefix,
+  reports a failed `cleanup` case when inventory is unavailable or a sandbox
+  cannot be destroyed, and error text no longer repeats the code or carries
+  the backend's ANSI escapes.
 - **Sandbox telemetry is shareable and bounded.** `Stats` carries aggregates
   only — host process names, PIDs and data-directory paths stay on the
   provider that measured them — the live-sandbox gauge records zero when a

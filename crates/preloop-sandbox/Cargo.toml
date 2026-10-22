@@ -22,6 +22,7 @@ futures.workspace = true
 hex.workspace = true
 hostname.workspace = true
 hyper-util.workspace = true
+nix = { version = "0.31", features = ["signal"] }
 opentelemetry.workspace = true
 parking_lot.workspace = true
 postgres_rustls.workspace = true

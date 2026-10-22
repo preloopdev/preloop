@@ -481,7 +481,9 @@ fn close_execs(state: &mut State, sandbox_id: &str, reason: &str) {
     for exec_id in stale {
         if let Some(exec) = state.execs.remove(&exec_id) {
             exec.finished.cancel();
-            let _ = exec.tx.try_send(Err(Error::unavailable(reason.to_owned())));
+            let _ = exec
+                .tx
+                .try_send(Err(crate::error::from_reported(reason.to_owned())));
         }
     }
 }
@@ -1944,7 +1946,7 @@ impl Service {
                         sandbox.error.clone()
                     };
                     self.release_locked(state, &lease_id, ReleaseMode::Destroy, 0, ops);
-                    Err(Error::unavailable(error))
+                    Err(crate::error::from_reported(error))
                 }
             };
         }
@@ -3593,7 +3595,7 @@ impl Service {
             let result = if request.ok {
                 Ok(request.native_ref)
             } else {
-                Err(Error::unavailable(request.error))
+                Err(crate::error::from_reported(request.error))
             };
             let mut ops = Vec::new();
             self.complete_locked(&mut state, &request.work_id, result, &mut ops);

@@ -633,23 +633,54 @@ pub struct Agent {
 
 impl Agent {
     /// Build an agent over drivers.
+    ///
+    /// # Panics
+    ///
+    /// Panics on duplicate driver names. Configuration-driven callers use
+    /// [`Agent::try_new`], which reports the duplicate as an error.
     pub fn new(
         link: Arc<dyn ProviderLink>,
         drivers: Vec<Arc<dyn Driver>>,
         config: AgentConfig,
     ) -> Arc<Self> {
+        Self::try_new(link, drivers, config).expect("duplicate sandbox driver names")
+    }
+
+    /// Build an agent over drivers, rejecting duplicate names.
+    ///
+    /// Drivers are addressed by name — placement, pools and every work item
+    /// carry one — so two drivers sharing a name would leave one of them
+    /// unreachable. That is a configuration error at startup, not something
+    /// to resolve by silently keeping whichever entry came last.
+    pub fn try_new(
+        link: Arc<dyn ProviderLink>,
+        drivers: Vec<Arc<dyn Driver>>,
+        config: AgentConfig,
+    ) -> Result<Arc<Self>> {
         let permits = Arc::new(Semaphore::new(config.concurrency.max(1)));
-        Arc::new(Self {
+        let mut by_name: HashMap<String, Arc<dyn Driver>> = HashMap::with_capacity(drivers.len());
+        let mut first_seen: HashMap<String, usize> = HashMap::new();
+        for (index, driver) in drivers.into_iter().enumerate() {
+            let name = driver.name().to_owned();
+            if let Some(previous) = first_seen.get(&name) {
+                return Err(Error::invalid_argument(format!(
+                    "duplicate sandbox driver name `{name}`: configured driver #{} and #{} both \
+                     register it; give each driver a unique name",
+                    previous + 1,
+                    index + 1
+                )));
+            }
+            first_seen.insert(name.clone(), index);
+            by_name.insert(name, driver);
+        }
+        Ok(Arc::new(Self {
             link,
-            drivers: drivers
-                .into_iter()
-                .map(|driver| (driver.name().to_owned(), driver))
-                .collect(),
+            drivers: by_name,
             config,
             active: Mutex::new(HashMap::new()),
             permits,
             work: tokio::sync::Mutex::new(HashMap::new()),
-        })
+        }))
     }
 
     /// Register once (tests use this to wait for registration).
@@ -1336,6 +1367,70 @@ mod tests {
                 assert!(delay <= base, "{delay:?} > {base:?}");
             }
         }
+    }
+
+    struct NoLink;
+
+    #[async_trait]
+    impl ProviderLink for NoLink {
+        async fn register(&self, _: RegisterRequest) -> Result<RegisterResponse> {
+            unreachable!("a configuration error is reported before any RPC")
+        }
+        async fn heartbeat(&self, _: HeartbeatRequest) -> Result<()> {
+            unreachable!()
+        }
+        async fn poll(&self, _: PollRequest) -> Result<PollResponse> {
+            unreachable!()
+        }
+        async fn report(&self, _: ReportRequest) -> Result<()> {
+            unreachable!()
+        }
+        async fn report_exec(&self, _: ReportExecRequest) -> Result<()> {
+            unreachable!()
+        }
+        async fn reconcile(&self, _: ReconcileRequest) -> Result<ReconcileResponse> {
+            unreachable!()
+        }
+        async fn fetch_blob(&self, _: &Session, _: &str, _: &Path) -> Result<()> {
+            unreachable!()
+        }
+        async fn put_blob(&self, _: &Session, _: &str, _: &Path) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn duplicate_driver_names_are_a_startup_error() {
+        use crate::drivers::fake::FakeDriver;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = Arc::new(FakeDriver::new(
+            "duplicate",
+            dir.path().join("first"),
+            Capabilities::default(),
+        )) as Arc<dyn Driver>;
+        let second = Arc::new(FakeDriver::new(
+            "duplicate",
+            dir.path().join("second"),
+            Capabilities::default(),
+        )) as Arc<dyn Driver>;
+        let error = Agent::try_new(
+            Arc::new(NoLink),
+            vec![first, second],
+            AgentConfig::new("host", dir.path().join("scratch")),
+        )
+        .err()
+        .expect("two drivers with one name must be refused");
+        assert_eq!(error.code, Code::InvalidArgument);
+        let message = text(&error);
+        assert!(
+            message.contains("duplicate sandbox driver name `duplicate`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("#1") && message.contains("#2"),
+            "{message}"
+        );
     }
 
     #[test]

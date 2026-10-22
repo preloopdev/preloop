@@ -17,7 +17,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,7 +29,7 @@ use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{Capabilities, CreateWork, ExecEvent, ExecRequest, HostReport, Observed};
-use crate::driver::{DRIVER_PROTOCOL_VERSION, Driver};
+use crate::driver::{DRIVER_PROTOCOL_VERSION, Driver, strip_ansi};
 use crate::error::{Code, Error, Result};
 use crate::generated::preloop::sandbox::driver::v1 as proto;
 
@@ -75,13 +75,19 @@ pub enum ExternalTarget {
 
 impl ExternalSpec {
     /// Parse `name=/path/to/binary [args…]` or `name=unix:///path/to.sock`.
+    ///
+    /// The spec may carry the `external:` prefix the configuration uses
+    /// (`external:name=…`), so a value copied from
+    /// `PRELOOP_SANDBOX_DRIVERS` works in `--driver` too.
     pub fn parse(spec: &str) -> Result<Self> {
         let invalid = |detail: &str| {
             Error::invalid_argument(format!(
                 "external driver spec `{spec}` {detail}; expected \
-                 `name=/path/to/plugin [args...]` or `name=unix:///path/to.sock`"
+                 `name=/path/to/plugin [args...]` or `name=unix:///path/to.sock` \
+                 (optionally prefixed with `external:`)"
             ))
         };
+        let spec = spec.strip_prefix("external:").unwrap_or(spec);
         let (name, target) = spec.split_once('=').ok_or_else(|| invalid("has no `=`"))?;
         let name = name.trim();
         if !valid_name(name) {
@@ -156,6 +162,7 @@ impl ExternalDriver {
             capabilities: parking_lot::RwLock::new(Capabilities::default()),
             shutdown: CancellationToken::new(),
             reconnecting: AtomicBool::new(false),
+            child_pid: AtomicI32::new(0),
         });
         let mut spawned = None;
         let (client, info) = match &shared.target {
@@ -168,7 +175,9 @@ impl ExternalDriver {
                     }
                     Err(error) => {
                         // Reap the process instead of leaving a zombie behind a
-                        // refused start.
+                        // refused start. The group goes too: a wrapper plugin
+                        // may have launched its backend.
+                        shared.terminate_child();
                         let _ = child.kill().await;
                         return Err(error);
                     }
@@ -182,6 +191,18 @@ impl ExternalDriver {
         if let Some(child) = spawned {
             tokio::spawn(supervise(shared.clone(), child));
         }
+        // The spec name is the identity the operator configured (placement,
+        // pools and `PRELOOP_SANDBOX_POOL_DRIVER` address it), so it is what
+        // the service registers. A plugin's self-reported name is display
+        // metadata and may legitimately describe the backend (`smolvm`)
+        // rather than this deployment's alias for it.
+        if !info.name.is_empty() && info.name != shared.spec_name {
+            tracing::warn!(
+                driver = %shared.spec_name,
+                reported = %info.name,
+                "external driver reports a different name; registering the configured spec name"
+            );
+        }
         tracing::info!(
             driver = %shared.spec_name,
             socket = %shared.socket.display(),
@@ -189,11 +210,7 @@ impl ExternalDriver {
             "external driver ready"
         );
         Ok(Arc::new(Self {
-            name: if info.name.is_empty() {
-                shared.spec_name.clone()
-            } else {
-                info.name
-            },
+            name: shared.spec_name.clone(),
             shared,
         }))
     }
@@ -233,13 +250,26 @@ impl ExternalDriver {
         }
     }
 
-    /// A transport failure in socket mode means the plugin restarted (or is
-    /// gone); reconnect in the background while calls fail fast.
+    /// Take the plugin out of service only when the connection itself failed.
+    ///
+    /// An error the plugin returned (a backend failure carried in a
+    /// successful RPC exchange, including its own `unavailable`) belongs to
+    /// that one work item: it passes through to the caller and the plugin
+    /// stays usable. A transport failure means the process or its socket is
+    /// gone: socket mode reconnects in the background, and the supervisor
+    /// restarts a spawned process.
     async fn note_failure(&self, error: &Error) {
-        if error.code != Code::Unavailable {
+        if !is_transport_failure(error) {
             return;
         }
-        let message = error.message.as_deref().unwrap_or("transport failure");
+        // connectrpc's transport errors embed the wrapped cause, which may
+        // carry its own `unavailable:` label. This error is already being
+        // reported as unavailable; do not repeat the code in the message.
+        let message = error
+            .message
+            .as_deref()
+            .unwrap_or("transport failure")
+            .replace("unavailable: ", "");
         self.shared
             .mark_down_and_reconnect(format!(
                 "external driver `{}` unavailable: {message}",
@@ -247,6 +277,46 @@ impl ExternalDriver {
             ))
             .await;
     }
+}
+
+/// Whether `error` is the connection dying rather than a plugin response.
+///
+/// Connect errors decoded from a plugin's response never carry a local
+/// source, and the client attaches that response's headers to them. Errors
+/// built locally by the transport carry the underlying cause as their
+/// source and have no response headers.
+fn is_transport_failure(error: &Error) -> bool {
+    if error.code != Code::Unavailable {
+        return false;
+    }
+    if !error.response_headers().is_empty() {
+        return false;
+    }
+    if error.source_arc().is_some() {
+        return true;
+    }
+    // A few locally built transport errors have no source (an ALPN
+    // mismatch, for one). Recognise the transport vocabulary they use, and
+    // keep matching narrow: a plugin's own message may mention a connection
+    // too, but that error arrives with response headers and returned above.
+    let message = error
+        .message
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    [
+        "h2 send failed",
+        "unix socket connect",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "broken pipe",
+        "http/2",
+        "failed to read response body",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 #[async_trait]
@@ -469,6 +539,11 @@ impl Driver for ExternalDriver {
 impl Drop for ExternalDriver {
     fn drop(&mut self) {
         self.shared.shutdown.cancel();
+        // The supervisor also observes `shutdown`, but a runtime that is
+        // being torn down never polls it again. Kill the process group here,
+        // synchronously, so dropping the driver (or exiting on SIGTERM)
+        // cannot leave the plugin behind.
+        self.shared.terminate_child();
     }
 }
 
@@ -486,6 +561,10 @@ struct Shared {
     shutdown: CancellationToken,
     /// Guards against starting a second socket-mode reconnect loop.
     reconnecting: AtomicBool,
+    /// Process-group id of the spawned plugin, or 0. Spawn mode puts the
+    /// child in its own group so a shutdown can take the plugin and anything
+    /// it launched with it.
+    child_pid: AtomicI32,
 }
 
 #[derive(Default)]
@@ -509,6 +588,27 @@ impl Shared {
 
     async fn down_reason(&self) -> Option<String> {
         self.state.read().await.down.clone()
+    }
+
+    /// Kill the spawned plugin's process group, if this driver owns one.
+    ///
+    /// Idempotent: the supervisor clears the recorded pid when the child
+    /// exits, and a second call is a no-op. Socket-mode plugins belong to an
+    /// outside supervisor and are never signalled.
+    fn terminate_child(&self) {
+        if !matches!(self.target, ExternalTarget::Spawn(..)) {
+            return;
+        }
+        let pid = self.child_pid.swap(0, Ordering::SeqCst);
+        if pid <= 0 {
+            return;
+        }
+        // `pid` is the process group this driver created with
+        // `process_group(0)`; ESRCH (already exited) is the expected failure.
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
     }
 
     /// Publish a connected, version-checked client.
@@ -593,17 +693,31 @@ fn prepare_runtime_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Start a spawn-mode plugin and forward its stderr through [`tracing`].
-fn spawn_child(shared: &Shared) -> Result<Child> {
-    let ExternalTarget::Spawn(binary, args) = &shared.target else {
-        return Err(Error::internal(
-            "spawn_child called for a socket-mode external driver",
-        ));
-    };
-    // A previous process may have left its socket behind; a connect must not
-    // reach a dead listener while the replacement binds.
+/// Make `shared.socket` available to a fresh spawn.
+///
+/// A socket that still accepts connections belongs to a live plugin — a
+/// process an earlier agent left behind, or one another agent started. Two
+/// plugins on one socket would both believe they own the backend's machines,
+/// so refuse instead of spawning over it. A socket nobody serves is stale
+/// (the previous process was killed) and is replaced; `remove_file` followed
+/// by a bind in the child is exactly what a crashed plugin needs.
+fn prepare_socket_for_spawn(shared: &Shared) -> Result<()> {
+    if std::os::unix::net::UnixStream::connect(&shared.socket).is_ok() {
+        return Err(Error::failed_precondition(format!(
+            "external driver `{}` socket {} is already served by a live process; \
+             refusing to start a second plugin (stop the process using it, then restart)",
+            shared.spec_name,
+            shared.socket.display()
+        )));
+    }
     match std::fs::remove_file(&shared.socket) {
-        Ok(()) => {}
+        Ok(()) => {
+            tracing::info!(
+                driver = %shared.spec_name,
+                socket = %shared.socket.display(),
+                "replaced a stale external driver socket"
+            );
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(Error::internal(format!(
@@ -612,22 +726,47 @@ fn spawn_child(shared: &Shared) -> Result<Child> {
             )));
         }
     }
-    let mut child = Command::new(binary)
+    Ok(())
+}
+
+/// Start a spawn-mode plugin and forward its stderr through [`tracing`].
+fn spawn_child(shared: &Shared) -> Result<Child> {
+    let ExternalTarget::Spawn(binary, args) = &shared.target else {
+        return Err(Error::internal(
+            "spawn_child called for a socket-mode external driver",
+        ));
+    };
+    prepare_socket_for_spawn(shared)?;
+    let mut command = Command::new(binary);
+    command
         .args(args)
         .arg("--socket")
         .arg(&shared.socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| {
-            Error::unavailable(format!(
-                "starting external driver `{}` ({}): {error}",
-                shared.spec_name,
-                binary.display()
-            ))
-        })?;
+        .stderr(Stdio::piped());
+    // Own process group: a SIGKILL to the group also stops anything the
+    // plugin spawned (a backend daemon or a shell wrapper), which a plain
+    // `Child::kill` leaves running.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.kill_on_drop(true).spawn().map_err(|error| {
+        Error::unavailable(format!(
+            "starting external driver `{}` ({}): {error}",
+            shared.spec_name,
+            binary.display()
+        ))
+    })?;
+    if let Some(pid) = child.id() {
+        shared.child_pid.store(pid as i32, Ordering::SeqCst);
+    }
+    if shared.shutdown.is_cancelled() {
+        shared.terminate_child();
+        return Err(Error::unavailable(format!(
+            "external driver `{}` start cancelled",
+            shared.spec_name
+        )));
+    }
     if let Some(stderr) = child.stderr.take() {
         let spec_name = shared.spec_name.clone();
         tokio::spawn(async move {
@@ -635,6 +774,9 @@ fn spawn_child(shared: &Shared) -> Result<Child> {
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
+                        // A plugin that colourises its logging must not leak
+                        // escape codes into the agent's log stream.
+                        let line = strip_ansi(&line);
                         tracing::info!(driver = %spec_name, "driver plugin: {line}");
                     }
                     Ok(None) => break,
@@ -729,11 +871,15 @@ async fn supervise(shared: Arc<Shared>, mut child: Child) {
     loop {
         let status = tokio::select! {
             _ = shared.shutdown.cancelled() => {
+                shared.terminate_child();
                 let _ = child.kill().await;
                 return;
             }
             status = child.wait() => status,
         };
+        // The group leader is gone; a later Drop must not signal a pid the
+        // system may have recycled.
+        shared.child_pid.store(0, Ordering::SeqCst);
         let reason = match status {
             Ok(status) => format!("external driver `{}` exited ({status})", shared.spec_name),
             Err(error) => format!(
@@ -765,6 +911,7 @@ async fn supervise(shared: Arc<Shared>, mut child: Child) {
                     break;
                 }
                 Err(error) => {
+                    shared.terminate_child();
                     let _ = restarted.kill().await;
                     tracing::warn!(driver = %shared.spec_name, %error, "external driver restart failed");
                     backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
@@ -815,6 +962,25 @@ mod tests {
         assert_eq!(
             spec.target,
             ExternalTarget::Socket(PathBuf::from("/run/acme.sock"))
+        );
+    }
+
+    #[test]
+    fn accepts_the_external_prefix_used_in_configuration() {
+        let spec = ExternalSpec::parse("external:acme=unix:///run/acme.sock").unwrap();
+        assert_eq!(spec.name, "acme");
+        assert_eq!(
+            spec.target,
+            ExternalTarget::Socket(PathBuf::from("/run/acme.sock"))
+        );
+        let spec = ExternalSpec::parse("external:acme=/usr/libexec/acme-driver --flag").unwrap();
+        assert_eq!(spec.name, "acme");
+        assert_eq!(
+            spec.target,
+            ExternalTarget::Spawn(
+                PathBuf::from("/usr/libexec/acme-driver"),
+                vec!["--flag".to_owned()]
+            )
         );
     }
 
@@ -930,6 +1096,131 @@ mod tests {
         assert_eq!(driver.inventory().await.unwrap().len(), 1);
         driver.destroy(&native).await.unwrap();
         assert!(driver.inventory().await.unwrap().is_empty());
+
+        shutdown.cancel();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn registers_the_configured_spec_name_not_the_plugins_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("advertised.sock");
+        let shutdown = CancellationToken::new();
+        let serve_socket = socket.clone();
+        let server_shutdown = shutdown.clone();
+        let root = dir.path().join("root");
+        let server = tokio::spawn(async move {
+            let driver: Arc<dyn Driver> =
+                Arc::new(FakeDriver::new("smolvm", root, Capabilities::default()));
+            crate::driver_plugin::serve(driver, &serve_socket, server_shutdown).await
+        });
+        let spec = ExternalSpec::parse(&format!("configured=unix://{}", socket.display())).unwrap();
+        let driver = ExternalDriver::start(spec, dir.path()).await.unwrap();
+        assert_eq!(
+            driver.name(),
+            "configured",
+            "the spec name is the identity placement and pools address"
+        );
+
+        shutdown.cancel();
+        server.await.unwrap().unwrap();
+    }
+
+    /// A plugin that reports a backend failure as its own `unavailable`.
+    struct BackendFailure;
+
+    #[async_trait]
+    impl Driver for BackendFailure {
+        fn name(&self) -> &str {
+            "backend-failure"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                os: "linux".into(),
+                arch: vec![crate::api::host_arch().into()],
+                ..Capabilities::default()
+            }
+        }
+
+        async fn create(&self, _work: &CreateWork) -> Result<String> {
+            // The message deliberately uses transport vocabulary: a backend
+            // failure can mention a refused connection without the agent
+            // losing its own connection to the plugin.
+            Err(Error::unavailable(
+                "pull failed: registry connection refused",
+            ))
+        }
+
+        async fn destroy(&self, _native_ref: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn exec(
+            &self,
+            _native_ref: &str,
+            _exec_id: &str,
+            _request: &ExecRequest,
+            _output: mpsc::Sender<ExecEvent>,
+        ) -> Result<i32> {
+            unreachable!("the test only calls create and inventory")
+        }
+
+        async fn copy_in(&self, _native_ref: &str, _tar: &Path, _guest_dir: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn copy_out(&self, _native_ref: &str, _guest_path: &str, _tar: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        async fn inventory(&self) -> Result<Vec<Observed>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plugins_own_unavailable_does_not_take_it_out_of_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("backend-failure.sock");
+        let shutdown = CancellationToken::new();
+        let serve_socket = socket.clone();
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            crate::driver_plugin::serve(Arc::new(BackendFailure), &serve_socket, server_shutdown)
+                .await
+        });
+        let spec =
+            ExternalSpec::parse(&format!("backend-failure=unix://{}", socket.display())).unwrap();
+        let driver = ExternalDriver::start(spec, dir.path()).await.unwrap();
+
+        let error = driver
+            .create(&CreateWork {
+                sandbox_id: "sbx-backend-failure".into(),
+                ..CreateWork::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Unavailable);
+        assert!(
+            crate::error::message(&error).contains("pull failed"),
+            "{}",
+            crate::error::message(&error)
+        );
+
+        // The plugin answered the failed RPC in a healthy exchange: it is
+        // still in service, so the next call goes to it instead of failing
+        // with a stale down reason. Checked directly so the assertion does
+        // not race a socket-mode reconnect.
+        assert_eq!(
+            driver.shared.down_reason().await,
+            None,
+            "a plugin-reported error must not mark the driver down"
+        );
+        assert!(
+            driver.inventory().await.is_ok(),
+            "the plugin must still answer after its own error"
+        );
 
         shutdown.cancel();
         server.await.unwrap().unwrap();

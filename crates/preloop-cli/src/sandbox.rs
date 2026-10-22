@@ -110,12 +110,14 @@ pub(crate) async fn host_drivers(
     runtime_dir: &Path,
 ) -> anyhow::Result<Vec<Arc<dyn Driver>>> {
     let names = env_nonempty("PRELOOP_SANDBOX_DRIVERS").unwrap_or_else(|| "smolvm".into());
-    let mut drivers: Vec<Arc<dyn Driver>> = Vec::new();
-    for entry in names
+    let entries: Vec<&str> = names
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
-    {
+        .collect();
+    configured_driver_names(&entries)?;
+    let mut drivers: Vec<Arc<dyn Driver>> = Vec::new();
+    for entry in entries {
         if let Some(spec) = entry.strip_prefix("external:") {
             let spec = ExternalSpec::parse(spec)
                 .with_context(|| format!("PRELOOP_SANDBOX_DRIVERS entry `{entry}`"))?;
@@ -140,6 +142,35 @@ pub(crate) async fn host_drivers(
         });
     }
     Ok(drivers)
+}
+
+/// Registration names of the configured entries, validated before any plugin
+/// is started.
+///
+/// Drivers are addressed by name, so two entries that register the same one
+/// would leave a driver unreachable. Name both raw entries — that is what the
+/// operator has to edit — rather than only the resulting driver.
+fn configured_driver_names(entries: &[&str]) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::with_capacity(entries.len());
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for entry in entries {
+        let driver_name = match entry.strip_prefix("external:") {
+            Some(spec) => {
+                ExternalSpec::parse(spec)
+                    .with_context(|| format!("PRELOOP_SANDBOX_DRIVERS entry `{entry}`"))?
+                    .name
+            }
+            None => (*entry).to_owned(),
+        };
+        if let Some(previous) = seen.insert(driver_name.clone(), entry) {
+            anyhow::bail!(
+                "duplicate sandbox driver name `{driver_name}` in PRELOOP_SANDBOX_DRIVERS: \
+                 `{previous}` and `{entry}` both register it; give each entry a unique name"
+            );
+        }
+        names.push(driver_name);
+    }
+    Ok(names)
 }
 
 /// The engine's in-process Sandbox Service plus its local agent.
@@ -221,11 +252,12 @@ impl LocalSandboxes {
             sandbox_agent_config(local_provider_name(), state.join("sandbox-agent"))
                 .with_access(access);
         agent_config.metrics = metrics;
-        let agent = Agent::new(
+        let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             drivers,
             agent_config,
-        );
+        )
+        .context("configuring this host's sandbox drivers")?;
         let session = agent.register().await.ok();
         let provider_id = session
             .as_ref()
@@ -329,6 +361,48 @@ impl LocalSandboxes {
 impl Drop for LocalSandboxes {
     fn drop(&mut self) {
         self.shutdown.cancel();
+    }
+}
+
+/// SIGINT and SIGTERM handlers, installed up front.
+///
+/// The service manager that stops this process (launchd, systemd, a
+/// container runtime) sends SIGTERM; Ctrl-C sends SIGINT. Both must run the
+/// same graceful shutdown, or a SIGTERM kills the process before spawned
+/// driver plugins are terminated and leaves them orphaned.
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn install() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        Self {
+            interrupt: signal(SignalKind::interrupt()).expect("install SIGINT handler"),
+            terminate: signal(SignalKind::terminate()).expect("install SIGTERM handler"),
+        }
+    }
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
+/// Wait until the process is asked to stop (SIGINT or SIGTERM).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        ShutdownSignals::install().wait().await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -534,7 +608,9 @@ struct DriverServeArgs {
 #[derive(Debug, Args)]
 struct DriverConformanceArgs {
     /// Driver to test: `smolvm`, `fake`, or an external spec
-    /// (`name=/path/to/plugin [args…]` or `name=unix:///path.sock`).
+    /// (`external:name=/path/to/plugin [args…]` or
+    /// `external:name=unix:///path.sock`). The `external:` prefix may be
+    /// omitted.
     #[arg(long)]
     driver: String,
     /// Artifact as comma-separated `key=value` pairs:
@@ -1152,7 +1228,7 @@ async fn serve_standalone(
         let mut agent_config =
             sandbox_agent_config(local_provider_name(), state.join("sandbox-agent"));
         agent_config.metrics = metrics;
-        let agent = Agent::new(
+        let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             host_drivers(
                 None,
@@ -1162,7 +1238,8 @@ async fn serve_standalone(
             )
             .await?,
             agent_config.with_access(HostAccess::from_env()),
-        );
+        )
+        .context("configuring this host's sandbox drivers")?;
         tokio::spawn(agent.run(shutdown.clone()));
     }
     let auth = Auth::new(resolve_client_token(&state)?);
@@ -1170,7 +1247,7 @@ async fn serve_standalone(
     eprintln!("[preloop] sandbox service on https://{}", args.listen);
     let stop = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        shutdown_signal().await;
         stop.cancel();
     });
     serve_api(listener, service, auth, tls, shutdown.clone()).await?;
@@ -1218,7 +1295,7 @@ async fn run_agent(
         sandbox_agent_config(name, state.join("sandbox-agent")).with_access(HostAccess::from_env());
     agent_config.metrics =
         preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
-    let agent = Agent::new(
+    let agent = Agent::try_new(
         Arc::new(link),
         host_drivers(
             None,
@@ -1228,15 +1305,17 @@ async fn run_agent(
         )
         .await?,
         agent_config,
-    );
+    )
+    .context("configuring this host's sandbox drivers")?;
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        shutdown_signal().await;
         stop.cancel();
     });
     eprintln!("[preloop] sandbox agent joining {base}");
-    agent.run(shutdown).await;
+    agent.run(shutdown.clone()).await;
+    shutdown.cancel();
     Ok(())
 }
 
@@ -1295,7 +1374,7 @@ async fn run_driver(command: DriverCommand) -> anyhow::Result<()> {
             let shutdown = CancellationToken::new();
             let stop = shutdown.clone();
             tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
+                shutdown_signal().await;
                 stop.cancel();
             });
             eprintln!(
@@ -1309,9 +1388,14 @@ async fn run_driver(command: DriverCommand) -> anyhow::Result<()> {
         DriverCommand::Conformance(args) => {
             let driver = match args.driver.as_str() {
                 "smolvm" | "fake" => in_process_driver(&args.driver, &state)?,
-                spec => {
-                    ExternalDriver::start(ExternalSpec::parse(spec)?, &state.join("driver-sockets"))
-                        .await?
+                raw => {
+                    let spec = ExternalSpec::parse(raw).with_context(|| {
+                        format!(
+                            "`{raw}` is not an in-process driver (`smolvm`, `fake`) and not a \
+                             valid external spec"
+                        )
+                    })?;
+                    ExternalDriver::start(spec, &state.join("driver-sockets")).await?
                 }
             };
             eprintln!("[preloop] driver conformance: {}", driver.name());
@@ -1481,5 +1565,105 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("--join"), "{error}");
+    }
+
+    /// Set for the re-executed test binary that waits on [`ShutdownSignals`].
+    const SIGTERM_CHILD_ENV: &str = "PRELOOP_TEST_SANDBOX_SIGTERM_CHILD";
+
+    #[test]
+    fn duplicate_driver_entries_name_both_entries() {
+        let names = configured_driver_names(&["smolvm"]).unwrap();
+        assert_eq!(names, ["smolvm"]);
+
+        let names =
+            configured_driver_names(&["smolvm", "external:smolvm-ext=/usr/bin/plugin"]).unwrap();
+        assert_eq!(names, ["smolvm", "smolvm-ext"]);
+
+        let error =
+            configured_driver_names(&["smolvm", "external:smolvm=/usr/local/bin/other-smolvm"])
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("duplicate sandbox driver name `smolvm`"),
+            "{error}"
+        );
+        assert!(error.contains("`smolvm` and `external:smolvm="), "{error}");
+    }
+
+    /// The child half of [`sigterm_resolves_the_shutdown_future`]: install the
+    /// handlers, report readiness, then wait. A SIGTERM with the default
+    /// disposition would kill this process instead of letting it return.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_child_waits_for_shutdown() {
+        if std::env::var_os(SIGTERM_CHILD_ENV).is_none() {
+            return;
+        }
+        use std::io::Write as _;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Signal streams need the runtime's reactor.
+            let mut signals = ShutdownSignals::install();
+            println!("ready");
+            std::io::stdout().flush().unwrap();
+            tokio::time::timeout(Duration::from_secs(30), signals.wait())
+                .await
+                .expect("SIGTERM must resolve the shutdown future");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_resolves_the_shutdown_future() {
+        use std::io::{BufRead as _, BufReader};
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "sandbox::tests::sigterm_child_waits_for_shutdown",
+                "--nocapture",
+            ])
+            .env(SIGTERM_CHILD_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            // Keep draining after readiness: closing the read end would make
+            // the child's own test harness exit on EPIPE instead of reporting
+            // the result we assert on.
+            let mut announced = false;
+            for line in BufReader::new(stdout).lines() {
+                if !announced && line.unwrap_or_default().contains("ready") {
+                    announced = true;
+                    let _ = ready_tx.send(());
+                }
+            }
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the child installs its handlers and reports readiness");
+
+        // SAFETY: the child is alive and waiting; SIGTERM is the signal a
+        // service manager sends on stop.
+        let killed = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        assert_eq!(killed, 0, "SIGTERM delivery");
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read as _;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        assert!(
+            status.success(),
+            "the child must exit cleanly on SIGTERM, not die from it: {status}\n{stderr}"
+        );
     }
 }

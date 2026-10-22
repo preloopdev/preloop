@@ -141,6 +141,11 @@ Connect error codes carry the trait's meaning:
 | `resource_exhausted` | Host capacity is exhausted. |
 | `internal` | A plugin bug. Include a message that identifies the operation. |
 
+An error a plugin returns — including its own `unavailable` — fails that work
+item and passes through to the caller; it never takes the plugin out of
+service. Only a transport failure (the connection refused, reset, or gone)
+makes the agent mark the plugin down and reconnect or restart it.
+
 Exit codes are part of the contract: `124` for a command killed at its
 deadline, `130` for a cancelled command. `Exec` must still send one terminal
 exit event for those cases; if the RPC itself fails, return a Connect error and
@@ -171,19 +176,31 @@ The spec is `name=target`:
 
 * `name` is the driver name reported to the service and used for the socket
   file. It may contain letters, digits, `-`, `_` and `.`, and is at most 64
-  bytes.
+  bytes. This is the identity placement, pools and
+  `PRELOOP_SANDBOX_POOL_DRIVER` address, so it wins even when
+  `GetInfoResponse.name` differs (the agent logs a warning in that case;
+  `GetInfo.name` is display metadata, not the registration key). Two entries
+  that register the same name are a startup error naming both of them.
 * `target` is either a binary path (optionally followed by whitespace-split
   arguments) or `unix:///absolute/path.sock`.
 * Commas separate entries, so an argument containing a comma needs a wrapper
   script.
 
 **Spawn mode.** The agent creates a private runtime directory (mode `0700`,
-`<home>/state/driver-sockets` in the engine), removes a stale
-`<runtime>/<name>.sock`, starts the binary with its configured arguments plus
-`--socket <runtime>/<name>.sock`, and polls `GetInfo` for up to 30 seconds. The
-plugin must create the socket and serve in the foreground; the agent owns the
-process and restarts it with exponential backoff (1–30 s) if it exits. RPCs
-return `unavailable` while it is down. Do not daemonize in spawn mode.
+`<home>/state/driver-sockets` in the engine), checks `<runtime>/<name>.sock`,
+starts the binary with its configured arguments plus
+`--socket <runtime>/<name>.sock`, and polls `GetInfo` for up to 30 seconds. A
+socket that still accepts connections belongs to a live plugin (for example
+one an earlier agent left behind): the agent refuses to start a second plugin
+on it instead of giving two processes the same backend. A socket nobody
+serves is stale and is replaced. The plugin must create the socket and serve
+in the foreground; the agent owns the process and restarts it with exponential
+backoff (1–30 s) if it exits. RPCs return `unavailable` while it is down. Do
+not daemonize in spawn mode.
+
+The spawned plugin runs in its own process group. Stopping the agent (SIGINT
+or SIGTERM) and dropping the driver both kill that group, so a plugin's own
+children do not outlive it.
 
 **Socket mode.** The plugin creates the socket itself and must set mode
 `0600`; the agent only dials it. The agent reconnects in the background after a
@@ -408,9 +425,14 @@ exec deadline, 180 s per case):
 
 ```sh
 preloop sandbox driver conformance --driver fake
-preloop sandbox driver conformance --driver 'acme=/usr/local/bin/acme-driver'
-preloop sandbox driver conformance --driver 'acme=unix:///run/acme/driver.sock'
+preloop sandbox driver conformance --driver 'external:acme=/usr/local/bin/acme-driver'
+preloop sandbox driver conformance --driver 'external:acme=unix:///run/acme/driver.sock'
 ```
+
+`--driver` accepts the same `external:`-prefixed spec
+`PRELOOP_SANDBOX_DRIVERS` uses; the prefix may be omitted. A spec that
+neither names an in-tree driver nor parses is rejected with the accepted
+forms in the message.
 
 It prints one line per case, then `N passed, M failed, K skipped`, and exits
 non-zero when any case failed (skips do not fail the run).

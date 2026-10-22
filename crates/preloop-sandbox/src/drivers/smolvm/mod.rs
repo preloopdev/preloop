@@ -20,9 +20,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use self::cli::{
-    ForkLaunch, MachineName, MachineRole, MachineSpec, MachineUpdate, NetworkPolicy as VmNetwork,
-    OutputChunk, SmolVmProvider, SocketMount as VmSocket, VmError, VmProvider, VolumeMount,
-    mark_sandbox_owned,
+    ForkLaunch, MachineName, MachineRole, MachineSpec, MachineState, MachineUpdate,
+    NetworkPolicy as VmNetwork, OutputChunk, SANDBOX_OWNER_MARKER, SmolVmProvider,
+    SocketMount as VmSocket, VmError, VmProvider, VolumeMount, mark_sandbox_owned,
 };
 use self::pack::{ArtifactCache, ArtifactPin, LocalImage, PackFormat, select_artifact};
 use crate::api::*;
@@ -153,6 +153,74 @@ impl SmolvmDriver {
                 Err(error)
             }
         }
+    }
+
+    /// The existing machine `name` when this driver may adopt it.
+    ///
+    /// Ownership is proved, never assumed: a pool machine (`named_prefix`)
+    /// is ours by name and deliberately unmarked, and every other machine
+    /// must carry [`SANDBOX_OWNER_MARKER`] naming this exact native ref. A
+    /// machine that cannot be proved ours is an error, not something to
+    /// overwrite: it may belong to another tool or another Preloop home.
+    /// A state the provider does not report as running or stopped is not
+    /// treated as an existing machine, preserving the create path's
+    /// behaviour on backends whose `status` output is only best-effort.
+    async fn existing_owned(&self, name: &MachineName) -> Result<Option<MachineState>> {
+        let state = self.provider.status(name).await.map_err(vm_error)?;
+        if !matches!(state, MachineState::Running | MachineState::Stopped) {
+            return Ok(None);
+        }
+        if self.adopts(name.as_str()) {
+            return Ok(Some(state));
+        }
+        let data_dir = self
+            .provider
+            .machine_data_dir(name)
+            .await
+            .map_err(vm_error)?;
+        let marker = data_dir.join(SANDBOX_OWNER_MARKER);
+        let owner = match std::fs::read_to_string(&marker) {
+            Ok(owner) => owner,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::failed_precondition(format!(
+                    "smolvm machine `{}` already exists and does not carry the sandbox owner \
+                     marker ({}); refusing to adopt a machine this driver did not create",
+                    name.as_str(),
+                    marker.display()
+                )));
+            }
+            Err(error) => {
+                return Err(Error::internal(format!(
+                    "reading the sandbox owner marker {}: {error}",
+                    marker.display()
+                )));
+            }
+        };
+        if owner.trim() != name.as_str() {
+            return Err(Error::failed_precondition(format!(
+                "smolvm machine `{}` is marked as `{}`; refusing to adopt it",
+                name.as_str(),
+                owner.trim()
+            )));
+        }
+        Ok(Some(state))
+    }
+
+    /// Adopt an existing machine for a redelivered create, making sure it is
+    /// running. Returns `false` when no machine exists yet.
+    async fn adopt_existing(&self, name: &MachineName, work: &CreateWork) -> Result<bool> {
+        let Some(state) = self.existing_owned(name).await? else {
+            return Ok(false);
+        };
+        if state != MachineState::Running {
+            let started = if work.snapshot_capable {
+                self.provider.start_forkable(name).await
+            } else {
+                self.provider.start(name).await
+            };
+            started.map_err(vm_error)?;
+        }
+        Ok(true)
     }
 
     /// The underlying CLI provider.
@@ -649,12 +717,18 @@ impl Driver for SmolvmDriver {
             work.name.clone()
         };
         let clone = machine(&name)?;
-        // One native name is one machine: a pin from an earlier incarnation
-        // must not outlive it.
-        self.pins.lock().remove(&name);
         if !work.template.native_ref.is_empty() {
             let golden = machine(&work.template.native_ref)?;
+            // Validate the fork before touching the provider (and before an
+            // idempotent short-circuit), so a request this backend cannot
+            // honour reaches no SmolVM command at all.
             let (launch, update) = fork_request(work)?;
+            if self.adopt_existing(&clone, work).await? {
+                return Ok(name);
+            }
+            // One native name is one machine: a pin from an earlier
+            // incarnation must not outlive it.
+            self.pins.lock().remove(&name);
             let forked = match self.provider.fork_with(&golden, &clone, &launch).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -691,6 +765,17 @@ impl Driver for SmolvmDriver {
             self.mark_owned_or_destroy(&clone).await?;
             return Ok(name);
         }
+        // Work delivery is at least once: a redelivered create for a machine
+        // that already exists (and is ours) returns the same native ref and
+        // converges its power state instead of failing with `already exists`.
+        // Checked before resolving the image so a redelivery does not pull
+        // an artifact the running machine no longer needs.
+        if self.adopt_existing(&clone, work).await? {
+            return Ok(name);
+        }
+        // One native name is one machine: a pin from an earlier incarnation
+        // must not outlive it.
+        self.pins.lock().remove(&name);
         let (image, pin) = self.image_for(&work.template).await?;
         let option = |key: &str| work.options.get(key).map(String::as_str);
         let shape = effective_shape(&work.shape);
@@ -1300,6 +1385,166 @@ exit 0
         assert!(
             !std::path::Path::new(&pidfile).exists(),
             "pid file left behind"
+        );
+    }
+
+    /// A smolvm that remembers the machines it created, so `create` fails
+    /// with smolvm's real `already exists` error and `status` reports their
+    /// state. `$0.machines` lists live names, `$0.stopped` the stopped ones.
+    fn fake_stateful_smolvm() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("smolvm");
+        write_executable(
+            &executable,
+            r##"#!/bin/sh
+set -eu
+printf 'CALL\n' >> "$0.log"
+for arg in "$@"; do
+  printf 'ARG:%s\n' "$arg" >> "$0.log"
+done
+op="$1:$2"
+name=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--name" ]; then name="$arg"; fi
+  prev="$arg"
+done
+case "$op" in
+  machine:data-dir)
+    mkdir -p "$0.data/$name"
+    printf '%s\n' "$0.data/$name"
+    ;;
+  machine:status)
+    if ! grep -qx "$name" "$0.machines" 2>/dev/null; then
+      printf "machine '%s' not found\n" "$name" >&2
+      exit 1
+    fi
+    if grep -qx "$name" "$0.stopped" 2>/dev/null; then
+      printf 'stopped\n'
+    else
+      printf 'running\n'
+    fi
+    ;;
+  machine:create)
+    if grep -qx "$name" "$0.machines" 2>/dev/null; then
+      printf "machine '%s' already exists or is being created\n" "$name" >&2
+      exit 1
+    fi
+    printf '%s\n' "$name" >> "$0.machines"
+    ;;
+  machine:start)
+    if [ -f "$0.stopped" ]; then
+      grep -vx "$name" "$0.stopped" > "$0.stopped.tmp" || true
+      mv "$0.stopped.tmp" "$0.stopped"
+    fi
+    ;;
+esac
+exit 0
+"##,
+        );
+        (directory, executable)
+    }
+
+    fn count_of(calls: &[(String, Vec<String>)], command: &str) -> usize {
+        calls
+            .iter()
+            .filter(|(_, argv)| {
+                argv.first().is_some_and(|first| first == "machine")
+                    && argv.get(1).is_some_and(|second| second == command)
+            })
+            .count()
+    }
+
+    fn image_work(sandbox_id: &str) -> CreateWork {
+        CreateWork {
+            sandbox_id: sandbox_id.into(),
+            driver: NAME.into(),
+            template: Template {
+                spec: TemplateSpec {
+                    name: "alpine".into(),
+                    os: "linux".into(),
+                    artifacts: vec![crate::api::Artifact {
+                        format: crate::api::Artifact::OCI_IMAGE.into(),
+                        arch: crate::api::host_arch().into(),
+                        r#ref: format!("alpine@sha256:{}", "0".repeat(64)),
+                        digest: format!("sha256:{}", "0".repeat(64)),
+                        size_bytes: 0,
+                        ..crate::api::Artifact::default()
+                    }],
+                    ..TemplateSpec::default()
+                }
+                .into(),
+                ..Template::default()
+            }
+            .into(),
+            ..CreateWork::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_create_returns_the_existing_machine() {
+        let (directory, _executable) = fake_stateful_smolvm();
+        let driver = driver(&directory);
+        let work = image_work("sbx-idem");
+
+        let first = driver.create(&work).await.unwrap();
+        let second = driver.create(&work).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, "psbx-idem");
+
+        let calls = calls(&directory.path().join("smolvm"));
+        assert_eq!(count_of(&calls, "create"), 1, "create must not repeat");
+        assert_eq!(count_of(&calls, "start"), 1, "a running machine is left up");
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_create_starts_a_stopped_owned_machine() {
+        let (directory, _executable) = fake_stateful_smolvm();
+        let driver = driver(&directory);
+        let work = image_work("sbx-idem-stopped");
+        let native = driver.create(&work).await.unwrap();
+        std::fs::write(
+            directory.path().join("smolvm.stopped"),
+            format!("{native}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(driver.create(&work).await.unwrap(), native);
+        let calls = calls(&directory.path().join("smolvm"));
+        assert_eq!(count_of(&calls, "create"), 1, "create must not repeat");
+        assert_eq!(
+            count_of(&calls, "start"),
+            2,
+            "the stopped machine is started"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_machine_is_never_adopted() {
+        let (directory, _executable) = fake_stateful_smolvm();
+        let driver = driver(&directory);
+        let work = image_work("sbx-foreign");
+        // A machine with our name but without the service's ownership marker
+        // belongs to something else (another tool, another home).
+        std::fs::write(directory.path().join("smolvm.machines"), "psbx-foreign\n").unwrap();
+
+        let error = driver.create(&work).await.unwrap_err();
+        assert_eq!(error.code, Code::FailedPrecondition);
+        assert!(
+            crate::error::message(&error).contains("refusing to adopt"),
+            "{}",
+            crate::error::message(&error)
+        );
+        let calls = calls(&directory.path().join("smolvm"));
+        assert_eq!(
+            count_of(&calls, "create"),
+            0,
+            "a foreign machine is not recreated"
+        );
+        assert_eq!(
+            count_of(&calls, "start"),
+            0,
+            "a foreign machine is not started"
         );
     }
 }

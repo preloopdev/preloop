@@ -318,13 +318,22 @@ pub async fn run(driver: Arc<dyn Driver>, options: &ConformanceOptions) -> Vec<C
 
     // A timed-out create can finish after its case future was dropped and
     // after the per-timeout sweep ran. Sweep once more at the end so no
-    // conformance sandbox is left behind.
-    let leftovers = sweep(&driver, &prefix).await;
-    if !leftovers.is_empty() {
-        results.push(CaseResult::failed(
+    // conformance sandbox is left behind. A sweep that cannot even list the
+    // driver's inventory is a cleanup failure too: reporting nothing would
+    // claim a clean run while sandboxes may still be running.
+    match sweep(&driver, &prefix).await {
+        Ok(leftovers) if leftovers.is_empty() => {}
+        Ok(leftovers) => results.push(CaseResult::failed(
             "cleanup",
             format!("sandboxes left behind: {}", leftovers.join("; ")),
-        ));
+        )),
+        Err(error) => results.push(CaseResult::failed(
+            "cleanup",
+            format!(
+                "cannot verify cleanup: inventory failed: {error}; \
+                 sandboxes named `{prefix}*` may remain"
+            ),
+        )),
     }
     results
 }
@@ -344,11 +353,10 @@ async fn record<F>(
         Ok(Ok(())) => results.push(CaseResult::pass(name)),
         Ok(Err(reason)) => results.push(CaseResult::failed(name, reason)),
         Err(_) => {
-            let leftovers = sweep(driver, prefix).await;
-            let detail = if leftovers.is_empty() {
-                String::new()
-            } else {
-                format!("; cleanup failed for {}", leftovers.join("; "))
+            let detail = match sweep(driver, prefix).await {
+                Ok(leftovers) if leftovers.is_empty() => String::new(),
+                Ok(leftovers) => format!("; cleanup failed for {}", leftovers.join("; ")),
+                Err(error) => format!("; cleanup could not be verified: {error}"),
             };
             results.push(CaseResult::failed(
                 name,
@@ -359,10 +367,15 @@ async fn record<F>(
 }
 
 /// Destroy every sandbox this run created but a lost future did not unpin.
-async fn sweep(driver: &Arc<dyn Driver>, prefix: &str) -> Vec<String> {
-    let Ok(inventory) = driver.inventory().await else {
-        return Vec::new();
-    };
+///
+/// Returns the refs that could not be destroyed, or the inventory error when
+/// the driver cannot say what it owns. An empty `Ok` is the only outcome
+/// that proves nothing was left behind.
+async fn sweep(driver: &Arc<dyn Driver>, prefix: &str) -> Result<Vec<String>, String> {
+    let inventory = driver
+        .inventory()
+        .await
+        .map_err(|error| error.to_string())?;
     let mut errors = Vec::new();
     for observed in inventory {
         let sandbox_id =
@@ -373,7 +386,7 @@ async fn sweep(driver: &Arc<dyn Driver>, prefix: &str) -> Vec<String> {
             errors.push(format!("{}: {error}", observed.native_ref));
         }
     }
-    errors
+    Ok(errors)
 }
 
 /// A sandbox created for one case.
@@ -1404,4 +1417,175 @@ fn read_tar(tar: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
         entries.insert(path, data);
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{Capabilities, HostReport};
+    use crate::error::{Error, Result as DriverResult};
+    use async_trait::async_trait;
+
+    /// A driver whose inventory cannot be read: the state the old sweep
+    /// mistook for "nothing left behind".
+    struct BrokenInventory;
+
+    #[async_trait]
+    impl Driver for BrokenInventory {
+        fn name(&self) -> &str {
+            "broken-inventory"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                os: "linux".into(),
+                arch: vec![crate::api::host_arch().into()],
+                ..Capabilities::default()
+            }
+        }
+
+        async fn create(&self, _work: &CreateWork) -> DriverResult<String> {
+            Err(Error::unavailable("backend is down"))
+        }
+
+        async fn destroy(&self, _native_ref: &str) -> DriverResult<()> {
+            Ok(())
+        }
+
+        async fn exec(
+            &self,
+            _native_ref: &str,
+            _exec_id: &str,
+            _request: &ExecRequest,
+            _output: mpsc::Sender<ExecEvent>,
+        ) -> DriverResult<i32> {
+            Ok(0)
+        }
+
+        async fn copy_in(
+            &self,
+            _native_ref: &str,
+            _tar: &Path,
+            _guest_dir: &str,
+        ) -> DriverResult<()> {
+            Ok(())
+        }
+
+        async fn copy_out(
+            &self,
+            _native_ref: &str,
+            _guest_path: &str,
+            _tar: &Path,
+        ) -> DriverResult<()> {
+            Ok(())
+        }
+
+        async fn inventory(&self) -> DriverResult<Vec<Observed>> {
+            Err(Error::unavailable("inventory offline"))
+        }
+
+        async fn host_report(&self) -> HostReport {
+            HostReport::default()
+        }
+    }
+
+    /// A driver that lists one of the run's sandboxes and refuses to destroy
+    /// it, so the cleanup case must name the ref.
+    struct Undestroyable;
+
+    #[async_trait]
+    impl Driver for Undestroyable {
+        fn name(&self) -> &str {
+            "undestroyable"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                os: "linux".into(),
+                arch: vec![crate::api::host_arch().into()],
+                ..Capabilities::default()
+            }
+        }
+
+        async fn create(&self, _work: &CreateWork) -> DriverResult<String> {
+            Ok(String::new())
+        }
+
+        async fn destroy(&self, _native_ref: &str) -> DriverResult<()> {
+            Err(Error::internal("delete refused"))
+        }
+
+        async fn exec(
+            &self,
+            _native_ref: &str,
+            _exec_id: &str,
+            _request: &ExecRequest,
+            _output: mpsc::Sender<ExecEvent>,
+        ) -> DriverResult<i32> {
+            Ok(0)
+        }
+
+        async fn copy_in(
+            &self,
+            _native_ref: &str,
+            _tar: &Path,
+            _guest_dir: &str,
+        ) -> DriverResult<()> {
+            Ok(())
+        }
+
+        async fn copy_out(
+            &self,
+            _native_ref: &str,
+            _guest_path: &str,
+            _tar: &Path,
+        ) -> DriverResult<()> {
+            Ok(())
+        }
+
+        async fn inventory(&self) -> DriverResult<Vec<Observed>> {
+            Ok(vec![Observed {
+                driver: "undestroyable".into(),
+                native_ref: "psbx-conf-run-leak".into(),
+                sandbox_id: "sbx-conf-run-leak".into(),
+                ..Observed::default()
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sweep_that_cannot_list_inventory_is_an_error() {
+        let driver = Arc::new(BrokenInventory) as Arc<dyn Driver>;
+        let error = sweep(&driver, "sbx-conf-run-")
+            .await
+            .expect_err("an unavailable inventory cannot prove a clean run");
+        assert!(error.contains("inventory offline"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_sweep_that_cannot_destroy_reports_the_ref() {
+        let driver = Arc::new(Undestroyable) as Arc<dyn Driver>;
+        let leftovers = sweep(&driver, "sbx-conf-run-")
+            .await
+            .expect("inventory answers");
+        assert_eq!(leftovers.len(), 1);
+        assert!(leftovers[0].contains("psbx-conf-run-leak"), "{leftovers:?}");
+        assert!(leftovers[0].contains("delete refused"), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn run_reports_an_unavailable_inventory_as_a_failed_cleanup_case() {
+        let options = ConformanceOptions::default().with_shell(false);
+        let results = run(Arc::new(BrokenInventory), &options).await;
+        let cleanup = results
+            .iter()
+            .find(|result| result.name == "cleanup")
+            .expect("cleanup must be reported even when inventory is down");
+        let reason = cleanup
+            .outcome
+            .as_ref()
+            .expect_err("an unverifiable cleanup is a failure");
+        assert!(reason.contains("inventory failed"), "{reason}");
+        assert!(reason.contains("sbx-conf-"), "{reason}");
+    }
 }

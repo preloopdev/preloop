@@ -3019,6 +3019,7 @@ dependencies = [
  "hex",
  "hostname",
  "hyper-util",
+ "nix 0.31.3",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",

@@ -124,6 +124,53 @@ pub fn unsupported(driver: &str, operation: &str) -> Error {
     Error::failed_precondition(format!("{driver}: {operation} unsupported"))
 }
 
+/// Strip ANSI escape sequences from captured subprocess output.
+///
+/// Backends embed a child's stderr in their errors, and tools that detect a
+/// terminal (or format for one unconditionally) emit colour and cursor codes.
+/// Those bytes are useless in a log line or an API error, and a caller that
+/// renders the message shows literal `\u{1b}[2m…` instead of plain text.
+pub fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            plain.push(ch);
+            continue;
+        }
+        match chars.peek() {
+            // Control sequence: ESC `[` … one final byte in 0x40..=0x7e.
+            Some('[') => {
+                chars.next();
+                for byte in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            // Operating system command: ESC `]` … BEL or ESC `\`.
+            Some(']') => {
+                chars.next();
+                while let Some(byte) = chars.next() {
+                    if byte == '\u{07}' {
+                        break;
+                    }
+                    if byte == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Any other two-character escape.
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    plain
+}
+
 /// Prefix of every native machine name the sandbox layer creates.
 pub const NATIVE_PREFIX: &str = "psbx";
 
@@ -298,5 +345,19 @@ mod tests {
         cancels.finish("exe-running");
         // A cancel after it finished is harmless.
         cancels.cancel("exe-late");
+    }
+
+    #[test]
+    fn strip_ansi_removes_colour_codes_and_keeps_text() {
+        assert_eq!(
+            strip_ansi("\u{1b}[2mError:\u{1b}[0m pull failed\n"),
+            "Error: pull failed\n"
+        );
+        assert_eq!(strip_ansi("plain text"), "plain text");
+        // OSC sequences (terminal hyperlinks) end with BEL or ESC `\`.
+        assert_eq!(
+            strip_ansi("\u{1b}]8;;https://example.invalid\u{07}link\u{1b}]8;;\u{1b}\\ok"),
+            "linkok"
+        );
     }
 }
