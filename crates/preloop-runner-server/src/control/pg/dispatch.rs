@@ -4024,7 +4024,7 @@ pub(super) async fn requeue_claimed_tx(
     tx.execute(
         "UPDATE jobs SET status = 'queued', queue_state = 'ready', \
          claimed_by_runner_id = NULL, claimed_at = NULL, \
-         enqueued_at = COALESCE(enqueued_at, now()) \
+         enqueued_at = now() \
          WHERE run_id = $1::text::uuid AND job_id = $2",
         &[&run, &job_id.0],
     )

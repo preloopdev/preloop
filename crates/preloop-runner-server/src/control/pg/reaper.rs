@@ -87,6 +87,7 @@ impl PgBackend {
                 any_runner_matches: runner_labels.iter().any(|labels| {
                     crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                 }),
+                capacity_blocked: crate::control::logic::capacity_blocked_by(&job.runs_on, &active),
             };
             let verdict =
                 starvation_verdict(&candidate, now, pool_preparing, booted_at, &pool_labels);

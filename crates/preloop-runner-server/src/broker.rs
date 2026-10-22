@@ -358,6 +358,7 @@ pub async fn next_message_broker_ref(
             crate::control::types::PollOutcome::ActiveRequest { request, runner_id }
                 if !runner_busy =>
             {
+                crate::distributed_task::notify_runner_claim(&shared, runner_id).await;
                 return Ok(Json(broker_job_ref(&request, runner_id)).into_response());
             }
             crate::control::types::PollOutcome::Claimed(claimed) => {
@@ -367,6 +368,11 @@ pub async fn next_message_broker_ref(
                     runner_id,
                     next_runs_on,
                 } = *claimed;
+                // The claim is committed in the control store before this
+                // response exists. Publish it now: the pool's idle grace must
+                // end on the server's record, not on guest stdout, which may
+                // stay silent through a long first step.
+                crate::distributed_task::notify_runner_claim(&shared, runner_id).await;
                 *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
                 record_claim_queue_wait(&shared, &Some(queued.clone()));
                 let run_id = queued.run_id;
@@ -765,6 +771,9 @@ pub async fn next_message_broker_ref_root(
                     runner_id,
                     next_runs_on,
                 } = *claimed;
+                // The root broker path is the one the current runner uses:
+                // publish the committed claim before the ref is returned.
+                crate::distributed_task::notify_runner_claim(&shared, runner_id).await;
                 *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
                 record_claim_queue_wait(&shared, &Some(queued));
                 Some(broker_job_ref_root(&request, runner_id))
@@ -846,6 +855,10 @@ pub async fn broker_acquire_job(
         .acquire_for_runner(request_id, runner_id)
         .await
         .map_err(ApiError::from)?;
+    // The acquire response binds the full job message to this runner; this is
+    // the authoritative moment the machine is no longer idle. Publish it
+    // before any step output can exist.
+    crate::distributed_task::notify_runner_claim(&shared, runner_id).await;
     let mut message = ctx.message;
     let github_token_request = ctx.token_request;
     let id_token_granted = ctx.id_token_granted;

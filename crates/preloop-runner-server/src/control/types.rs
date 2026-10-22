@@ -936,6 +936,10 @@ pub(crate) struct ActiveRequest {
     pub(crate) session_live: bool,
     /// The job's `timeout-minutes` in seconds, when its message set one.
     pub(crate) job_timeout_s: Option<i64>,
+    /// The job's `runs-on` labels. A ready job is capacity-blocked only by an
+    /// attempt that shares this job's runner class, so the reaper needs the
+    /// running job's labels to scope the starvation clock.
+    pub(crate) runs_on: Vec<String>,
 }
 
 /// A ready-queue job, as the starvation sweep sees it.

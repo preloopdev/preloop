@@ -81,7 +81,7 @@ pub(super) fn requeue_claimed(
     tx.prepare_cached(
         "UPDATE jobs SET status = 'queued', queue_state = 'ready', \
          claimed_by_runner_id = NULL, claimed_at = NULL, \
-         enqueued_at = COALESCE(enqueued_at, ?3) \
+         enqueued_at = ?3 \
          WHERE run_id = ?1 AND job_id = ?2",
     )
     .map_err(db)?

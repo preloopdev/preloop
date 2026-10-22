@@ -287,6 +287,19 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     let booted_at = now
         .checked_sub(shared.state.started_at.elapsed())
         .unwrap_or(std::time::UNIX_EPOCH);
+    // A pool runner is already executing an earlier job. A ready job whose
+    // runner class that attempt occupies is waiting for that permit to free,
+    // not starving: the sweeps below reset its observation clock instead of
+    // failing it. This is also the window where the executing runner has
+    // gone away (a wedged guest is abandoned before its attempt is requeued):
+    // the queue is still capacity-blocked by the unfinished attempt.
+    //
+    // The block is scoped per job: an attempt on another runner class (a
+    // `self-hosted` job while a `gpu` job waits on a deployment with no
+    // co-hosted pool) never shares a runner with the waiting job, so it must
+    // not keep refreshing that job's starvation mark forever.
+    let capacity_blocked =
+        |runs_on: &[String]| crate::control::logic::capacity_blocked_by(runs_on, &inputs.active);
 
     // ── Active attempts + the ready queue (from `inputs`) ────────────────
     let queued_jobs = inputs.ready.clone();
@@ -337,6 +350,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 .runner_labels
                 .iter()
                 .any(|labels| crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels));
+            let capacity_blocked = capacity_blocked(&job.runs_on);
             // An unmarked job measures from its enqueue instant or this
             // node's boot, whichever is later (an unknown age — `enqueued_at`
             // 0 after a restore — measures from boot); the verdict's `Mark`
@@ -347,6 +361,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                     + Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
                 first_seen: marks.get(&key).copied(),
                 any_runner_matches,
+                capacity_blocked,
             };
             match crate::control::logic::starvation_verdict(
                 &candidate,
@@ -358,10 +373,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 crate::control::logic::StarvationVerdict::ClearMark => {
                     marks.remove(&key);
                 }
-                // Provisioning protection re-stamps the observation clock;
-                // ordinary unmatched jobs keep the first observation.
+                // Provisioning protection and an occupied permit re-stamp
+                // the observation clock; ordinary unmatched jobs keep the
+                // first observation.
                 crate::control::logic::StarvationVerdict::Mark { first_seen } => {
-                    if pool_preparing {
+                    if pool_preparing || capacity_blocked {
                         marks.insert(key, first_seen);
                     } else {
                         marks.entry(key).or_insert(first_seen);

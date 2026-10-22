@@ -118,6 +118,17 @@ pub struct RunArgs {
     /// Protocol path to use.
     #[arg(long, default_value = "broker")]
     pub via: ProtocolPath,
+
+    /// Per-attempt secret echoed in this runner's exit announcement.
+    ///
+    /// The orchestrator supervising a single-use runner watches stdout for
+    /// [`preloop_gha_protocol::RUNNER_EXIT_SENTINEL`]. Job steps share this
+    /// process's stdout, so without a secret they could forge the
+    /// announcement and force the supervising VM to tear down mid-job. The
+    /// token is minted per attempt by the pool and never printed anywhere
+    /// else.
+    #[arg(long, env = "PRELOOP_RUNNER_EXIT_TOKEN")]
+    pub exit_token: Option<String>,
 }
 
 /// Arguments for `lint`.
@@ -208,6 +219,31 @@ mod tests {
                 assert!(args.once);
                 assert_eq!(args.via, ProtocolPath::Azdo);
             }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn parse_run_exit_token() {
+        let cli = Cli::try_parse_from([
+            "preloop-runner",
+            "run",
+            "--once",
+            "--exit-token",
+            "0123456789abcdef",
+        ])
+        .unwrap();
+        match &cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.exit_token.as_deref(), Some("0123456789abcdef"));
+            }
+            _ => panic!("expected Run"),
+        }
+        // A plain `run` announces nothing: only the pool-issued token makes
+        // the runner print an exit line.
+        let cli = Cli::try_parse_from(["preloop-runner", "run"]).unwrap();
+        match &cli.command {
+            Commands::Run(args) => assert!(args.exit_token.is_none()),
             _ => panic!("expected Run"),
         }
     }

@@ -10,7 +10,7 @@ pub mod oci;
 use crate::environment::{EnvironmentSpec, is_official_golden};
 use crate::keys::{KeyPool, StagedKey};
 use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
-use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
+use preloop_gha_protocol::{RUNNER_BUSY_SENTINEL, RUNNER_EXIT_SENTINEL};
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
 /// `VmProvider` implementation can model the handshake this pool relies on.
@@ -72,6 +72,15 @@ const GOLDEN_RETRY_MAX: Duration = Duration::from_secs(60);
 const TEARDOWN_RETRY_MIN: Duration = Duration::from_secs(1);
 const TEARDOWN_RETRY_MAX: Duration = Duration::from_secs(30);
 const TEARDOWN_RETRY_ATTEMPTS: u32 = 3;
+/// How long a registered single-use runner may wait without accepting a job.
+///
+/// On-demand provisioning can race a queue-depth sample and create a spare.
+/// The spare must not pin a VM and semaphore permit forever while its
+/// `run --once` broker poll waits for work that has already been claimed.
+const UNCLAIMED_RUNNER_IDLE_GRACE: Duration = Duration::from_secs(30);
+/// Give the control plane a short window to finish log/result fan-out after
+/// recording the runner's terminal completion before closing its exec stream.
+const RUNNER_COMPLETION_GRACE: Duration = Duration::from_secs(2);
 
 /// Debug marker contents written by the orchestrator when it parks a failed VM.
 pub const DEBUG_MARKER_IDLE: &str = "preserved";
@@ -5659,17 +5668,31 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // the host has left may hold a non-default environment golden.
         let golden_budget = self.golden_budget(max_concurrent, &golden_cache).await;
         let mut slots = JoinSet::new();
+        // Reserve a slot before provisioning starts. `queue_depth` is sampled
+        // asynchronously; without this local reservation the same queued job
+        // can be observed repeatedly while the first VM is still booting.
+        // Only unclaimed slots count: a claimed runner's job has left the
+        // ready queue, so keeping it reserved would gate a newly queued job
+        // behind the running one even when a permit is free. A sample that
+        // still lists a just-claimed job can therefore start one spare; it
+        // picks up the next queued job, and the unclaimed-runner idle grace
+        // reclaims it if none arrives.
+        let reservations = Arc::new(AtomicUsize::new(0));
         let mut next_slot: usize = 0;
 
         loop {
-            // Wait until the server has queued at least one job.
+            // Wait until queued work exceeds the slots that have not claimed
+            // a job yet. The server's queue sample may remain stale while a
+            // claim is being provisioned, so checking only `queued > 0`
+            // over-provisions.
             let pending = self.config.pending_jobs.as_deref();
             loop {
                 if shutdown.is_cancelled() {
                     break;
                 }
                 let queued = pending.map_or(0, |p| p.load(Ordering::Acquire));
-                if queued > 0 {
+                let reserved = reservations.load(Ordering::Acquire);
+                if queued > reserved {
                     break;
                 }
                 tokio::select! {
@@ -5690,6 +5713,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     permit.expect("semaphore is never closed")
                 }
             };
+            let reservation = SlotReservation::reserve(reservations.clone());
 
             let slot = next_slot;
             next_slot = next_slot.wrapping_add(1);
@@ -5723,6 +5747,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_handles,
                     slot_semaphore,
                     permit_slot,
+                    reservation,
                 )
                 .await;
                 if let Err(error) = &result {
@@ -6093,12 +6118,63 @@ impl Drop for StagingLockGuard {
     }
 }
 
+/// One on-demand slot's claim on the server's queue sample.
+///
+/// The loop starts a slot only while queued work outnumbers the slots that
+/// have not claimed a job yet. A slot stops counting the moment its runner is
+/// claimed: the job it runs has left the ready queue, so the slot no longer
+/// reserves a queue entry and must not hold back the next job (a running job
+/// would otherwise compare against a queue that no longer contains it,
+/// serializing the pool whenever one job runs and one waits). Released
+/// exactly once, whether the slot claims, fails, or returns unclaimed.
+struct SlotReservation {
+    reservations: Arc<AtomicUsize>,
+    active: bool,
+}
+
+impl SlotReservation {
+    fn reserve(reservations: Arc<AtomicUsize>) -> Self {
+        reservations.fetch_add(1, Ordering::AcqRel);
+        Self {
+            reservations,
+            active: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        self.reservations.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for SlotReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// A provisioned, registered runner waiting to be handed a job.
 #[derive(Debug)]
 struct ReadyRunner {
     name: MachineName,
     run: Vec<String>,
+    /// Per-attempt secret the guest runner echoes in its exit announcement.
+    ///
+    /// Guest stdout is not a trusted channel: a workflow step shares the
+    /// exec user and can write into the runner's stdout, so a bare sentinel
+    /// would let job output forge an exit and tear the VM down mid-job. Only
+    /// a line carrying this attempt's token ends the wait (`run_until_exit`).
+    exit_token: String,
     environment: RunnerEnvironment,
+}
+
+/// One random per-attempt sentinel token, minted when the runner is
+/// provisioned and passed to the guest on its own command line.
+fn new_exit_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Tell the control plane a machine's runner is gone, BEFORE the VM goes
@@ -6677,6 +6753,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     handles: PoolHandles,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    reservation: SlotReservation,
 ) -> Result<(), OrchestratorError> {
     // Mirror `run_slot`: once the packed golden is known-unusable, on-demand
     // slots must not attempt another environment-golden bake either — fall
@@ -6771,6 +6848,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         runner,
         shutdown.clone(),
         idle.clone(),
+        Some(reservation),
     )
     .await;
     if let Some(watch) = pause_watch {
@@ -6926,6 +7004,7 @@ async fn run_slot<P: VmProvider + 'static>(
             runner,
             shutdown.clone(),
             idle.clone(),
+            None,
         )
         .await;
         if let Err(error) = &job {
@@ -7042,7 +7121,21 @@ async fn provision_slot<P: VmProvider + 'static>(
         fingerprint = environment.fingerprint.as_deref().unwrap_or("-"),
         "provisioning runner"
     );
-    match provision_runner(provider, config, &name, golden, keys, &environment).await {
+    // The exit announcement is a private channel, so it carries a per-attempt
+    // secret the guest runner echoes back. Minted once per runner, before the
+    // guest command line is built, and never written to job output.
+    let exit_token = new_exit_token();
+    match provision_runner(
+        provider,
+        config,
+        &name,
+        golden,
+        keys,
+        &environment,
+        &exit_token,
+    )
+    .await
+    {
         Ok(run) => {
             // A provision that made it (fork or direct create, configure,
             // registration) resets the consecutive-failure streak. The
@@ -7054,6 +7147,7 @@ async fn provision_slot<P: VmProvider + 'static>(
             Ok(Some(ReadyRunner {
                 name,
                 run,
+                exit_token,
                 environment,
             }))
         }
@@ -7155,10 +7249,12 @@ async fn run_one_runner<P: VmProvider + 'static>(
     runner: ReadyRunner,
     shutdown: CancellationToken,
     idle: Arc<std::sync::Mutex<usize>>,
+    mut reservation: Option<SlotReservation>,
 ) -> Result<(), OrchestratorError> {
     let ReadyRunner {
         name,
         run,
+        exit_token,
         environment,
     } = runner;
     let name = &name;
@@ -7168,6 +7264,18 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // re-polling the JoinHandle: a completed `&mut JoinHandle` cannot be
     // polled again, and `select!` re-polls its branches.
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let completion = config
+        .pool_status
+        .as_ref()
+        .map(|status| status.subscribe_runner_completion());
+    // The server commits the claim in the control store and publishes it
+    // before the guest is expected to print anything. Subscribe before the
+    // claim-set probe so a claim landing in between is seen by one or the
+    // other, never by neither.
+    let mut server_claim = config
+        .pool_status
+        .as_ref()
+        .map(|status| status.subscribe_runner_claim());
     let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_provider = provider.clone();
     let run_name = name.clone();
@@ -7175,22 +7283,121 @@ async fn run_one_runner<P: VmProvider + 'static>(
     // function; the guard publishes it in the pool-wide idle gauge until a job
     // claims it or it is torn down.
     let mut idle = IdleGuard::register(idle, config.pool_status.clone());
+    // Provisioning and registration can complete before this function runs,
+    // and the server may already have handed this machine a job. The claim
+    // set is authoritative and closes that window.
+    if config
+        .pool_status
+        .as_ref()
+        .is_some_and(|status| status.runner_is_claimed(name.as_str()))
+    {
+        info!(
+            machine = name.as_str(),
+            "runner already has a committed claim before its idle grace started"
+        );
+        claimed.store(true, Ordering::Release);
+        idle.release();
+        if let Some(reservation) = reservation.as_mut() {
+            reservation.release();
+        }
+    }
     let run_task = tokio::spawn(async move {
-        let result = run_until_exit(&run_provider, &run_name, &run, busy_tx, GUEST_LIVENESS).await;
+        let result = run_until_exit(
+            &run_provider,
+            &run_name,
+            &run,
+            &exit_token,
+            busy_tx,
+            completion,
+            GUEST_LIVENESS,
+        )
+        .await;
         let _ = done_tx.send(result);
     });
 
-    // The guest announces the job it accepted on stdout. From that moment the
-    // runner is busy, not idle; a runner that exits without taking one leaves
-    // the guard to this function's teardown.
+    // Busy has two authoritative-in-practice sources: the guest's stdout
+    // sentinel (fast when it arrives) and the server's committed claim
+    // (always, even when the guest is silent or its output is buffered). The
+    // claim is the one the idle grace must trust; the sentinel only lets the
+    // pool report busy a little earlier.
     let claim_claimed = claimed.clone();
     let claim = async {
-        if busy_rx.await.is_err() {
+        if claim_claimed.load(Ordering::Acquire) {
             return;
         }
-        claim_claimed.store(true, Ordering::Release);
-        idle.release();
+        let stdout = async { busy_rx.await.is_ok() };
+        let server = async {
+            let Some(events) = server_claim.as_mut() else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            loop {
+                match events.recv().await {
+                    Ok(event) if event.runner_name == name.as_str() => {
+                        info!(
+                            machine = name.as_str(),
+                            runner_id = event.runner_id,
+                            "server claim event marks runner busy"
+                        );
+                        return;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        std::future::pending::<()>().await
+                    }
+                }
+            }
+        };
+        if tokio::select! {
+            acquired = stdout => acquired,
+            _ = server => true,
+        } {
+            claim_claimed.store(true, Ordering::Release);
+            idle.release();
+            if let Some(reservation) = reservation.as_mut() {
+                reservation.release();
+            }
+        }
     };
+
+    // The grace expires only when the control store has no claim for this
+    // machine. Re-read the authoritative set at the instant the timer fires:
+    // an event that is queued but not yet polled must not lose to the timer.
+    //
+    // Warm mode (size > 0) is exempt: a warm spare is supposed to wait for
+    // the next job indefinitely, and recycling it every grace period would
+    // fork a new VM forever on an idle pool. The bounded spare this guard
+    // exists for is the on-demand slot created when a queue sample races a
+    // claim.
+    let idle_claimed = claimed.clone();
+    let idle_grace = async {
+        if config.size > 0 {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(UNCLAIMED_RUNNER_IDLE_GRACE).await;
+        // The `select!` guard on this branch was evaluated once, when the
+        // select started, so a claim that lands later still leaves the timer
+        // armed. Re-read the local atomic — set by the stdout sentinel as
+        // well as by the server event — at the instant it fires: a legacy
+        // on-demand caller publishes no pool status, and a transient lookup
+        // failure must not tear down a runner that already announced a job.
+        let claimed_now = idle_claimed.load(Ordering::Acquire)
+            || config
+                .pool_status
+                .as_ref()
+                .is_some_and(|status| status.runner_is_claimed(name.as_str()));
+        if claimed_now {
+            idle_claimed.store(true, Ordering::Release);
+            std::future::pending::<()>().await;
+        } else {
+            info!(
+                machine = name.as_str(),
+                idle_secs = UNCLAIMED_RUNNER_IDLE_GRACE.as_secs(),
+                "unclaimed-runner grace expired; releasing idle VM"
+            );
+        }
+    };
+    tokio::pin!(idle_grace);
 
     let result = tokio::select! {
         _ = shutdown.cancelled() => {
@@ -7205,6 +7412,16 @@ async fn run_one_runner<P: VmProvider + 'static>(
             run_task.abort();
             let _ = run_task.await;
             info!(machine = name.as_str(), environment = %environment.base, "replacing idle runner for queued environment");
+            provider.stop(name).await.map_err(OrchestratorError::from)
+        },
+        _ = &mut idle_grace, if !claimed.load(Ordering::Acquire) => {
+            info!(
+                machine = name.as_str(),
+                idle_secs = UNCLAIMED_RUNNER_IDLE_GRACE.as_secs(),
+                "single-use runner accepted no job; releasing idle VM"
+            );
+            run_task.abort();
+            let _ = run_task.await;
             provider.stop(name).await.map_err(OrchestratorError::from)
         },
         done = async {
@@ -7269,6 +7486,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         if let Err(error) = delete_machine(provider.as_ref(), name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
+        forget_runner_claim(config, name);
         return result;
     }
 
@@ -7278,7 +7496,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
     let delete_result = delete_machine(provider.as_ref(), name)
         .await
         .map_err(OrchestratorError::from);
+    // Machine names are never reused, but a claim with no completion must not
+    // survive its VM. Completion normally clears this already.
+    forget_runner_claim(config, name);
     result.and(delete_result)
+}
+
+/// Drop the server-claim marker for a machine that is being torn down.
+fn forget_runner_claim(config: &RunnerPoolConfig, name: &MachineName) {
+    if let Some(status) = &config.pool_status {
+        status.clear_runner_claim(name.as_str());
+    }
 }
 
 /// Delete a machine, retrying the transient provider failures.
@@ -7313,6 +7541,44 @@ async fn delete_machine<P: VmProvider + 'static>(
     }
 }
 
+/// What the liveness probe knows about the runner's guest besides `exec`.
+#[derive(Clone, Debug)]
+struct RunnerActivity {
+    /// When the guest last produced a chunk of output on its exec stream.
+    ///
+    /// The stream is the engine's only live view into the guest. A heavy
+    /// in-VM step — a Rust build, a nested sandbox boot — can leave the guest
+    /// silent for minutes while it is provably working, and under that load
+    /// the AgentENV gateway returns `502 client error (Connect)` for
+    /// `aenv exec` because the guest cannot accept a new connection. Probe
+    /// failures alone therefore say nothing about a guest that is still
+    /// writing job output.
+    last_output: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+impl RunnerActivity {
+    fn new() -> Self {
+        Self {
+            last_output: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        }
+    }
+
+    /// Record output from the guest; called from the stream watcher.
+    fn note_output(&self) {
+        if let Ok(mut last) = self.last_output.lock() {
+            *last = std::time::Instant::now();
+        }
+    }
+
+    /// How long the guest has been silent.
+    fn silent_for(&self) -> std::time::Duration {
+        self.last_output
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or_default()
+    }
+}
+
 /// How the runner stream checks that its guest is still alive.
 #[derive(Clone, Copy, Debug)]
 struct GuestLiveness {
@@ -7320,39 +7586,133 @@ struct GuestLiveness {
     interval: std::time::Duration,
     /// A probe that takes longer than this counts as failed.
     timeout: std::time::Duration,
-    /// Consecutive failed probes that mark the guest as wedged.
+    /// Consecutive failed probes that make the guest a wedge *candidate*.
     failures: u32,
+    /// How long the guest must also have been silent before it is wedged.
+    ///
+    /// A guest that keeps emitting job output is working, even when `exec`
+    /// probes cannot reach it; only a guest that has gone both unreachable
+    /// and quiet is safe to tear down.
+    silence: std::time::Duration,
 }
 
-/// Three failed probes a minute apart: at least three minutes of silence,
-/// matching the server's 180-second hung-worker cutoff, so a busy guest that
-/// is merely slow to answer one probe is not torn down mid-job.
+/// Three failed probes a minute apart, plus ten minutes without a single
+/// chunk of guest output. The AgentENV single-node e2e job compiles inside
+/// its sandbox for minutes at a time: its step output goes quiet for 5m23s
+/// while `aenv exec` returns 502, and the job then continues normally. A
+/// policy that only counted probes killed that healthy guest every ~11
+/// minutes. Ten minutes of silence still bounds a genuinely dead guest to
+/// ten minutes; a VM that actually dies usually ends its exec stream too,
+/// releasing the slot sooner.
 const GUEST_LIVENESS: GuestLiveness = GuestLiveness {
     interval: std::time::Duration::from_secs(60),
     timeout: std::time::Duration::from_secs(30),
     failures: 3,
+    silence: std::time::Duration::from_secs(600),
 };
 
-/// Resolve once the guest has failed `liveness.failures` probes in a row.
+/// Resolve once the guest has failed `liveness.failures` probes in a row and
+/// has been silent for `liveness.silence`.
 async fn guest_unresponsive<P: VmProvider + 'static>(
     provider: &Arc<P>,
     name: &MachineName,
     liveness: GuestLiveness,
+    activity: &RunnerActivity,
 ) -> VmError {
     let probe = ["true".to_owned()];
     let mut failures = 0;
     loop {
         tokio::time::sleep(liveness.interval).await;
         match tokio::time::timeout(liveness.timeout, provider.exec(name, &probe)).await {
-            Ok(Ok(_)) => failures = 0,
-            Ok(Err(_)) | Err(_) => failures += 1,
+            Ok(Ok(_)) => {
+                failures = 0;
+                continue;
+            }
+            Ok(Err(error)) => {
+                failures += 1;
+                debug!(
+                    machine = name.as_str(),
+                    failures, %error, "guest liveness probe failed"
+                );
+            }
+            Err(_) => {
+                failures += 1;
+                debug!(
+                    machine = name.as_str(),
+                    failures,
+                    timeout_ms = liveness.timeout.as_millis(),
+                    "guest liveness probe timed out"
+                );
+            }
         }
-        if failures >= liveness.failures {
+        if failures < liveness.failures {
+            continue;
+        }
+        let silent = activity.silent_for();
+        if silent >= liveness.silence {
             return VmError::GuestUnresponsive {
                 machine: name.as_str().to_owned(),
                 probes: failures,
             };
         }
+        // Fresh output is proof of life: the guest is busy, not wedged, and
+        // the next streak starts from zero.
+        info!(
+            machine = name.as_str(),
+            probes = failures,
+            silent_ms = silent.as_millis(),
+            silence_ms = liveness.silence.as_millis(),
+            "guest output is live; failed liveness probes do not make it wedged"
+        );
+        failures = 0;
+    }
+}
+
+/// Parse a runner's exit announcement: `<RUNNER_EXIT_SENTINEL> <token> <code>`.
+///
+/// The token is the per-attempt secret from the runner's command line. Guest
+/// stdout is shared with the job's steps, so anything that can write a line
+/// there could otherwise end the attempt and tear the VM down; only the
+/// runner knows which token this attempt was started with.
+fn runner_exit_code(line: &str, token: &str) -> Option<i32> {
+    let mut fields = line
+        .trim()
+        .strip_prefix(RUNNER_EXIT_SENTINEL)?
+        .split_whitespace();
+    if fields.next()? != token || token.is_empty() {
+        return None;
+    }
+    fields.next()?.parse().ok()
+}
+
+/// Append one chunk to its stream's line buffer and emit every complete line.
+///
+/// Each stream keeps its own buffer. The exit announcement is only valid on
+/// stdout, so completing a partial stdout line with a stderr chunk (and
+/// classifying the joined line by the chunk that happened to arrive second)
+/// could drain the announcement without recognising it.
+fn drain_stream_lines(
+    buffer: &mut String,
+    bytes: &[u8],
+    is_stdout: bool,
+    mut on_line: impl FnMut(&str, bool),
+) {
+    buffer.push_str(&String::from_utf8_lossy(bytes));
+    // Cap retained tail to prevent unbounded growth from a guest that never
+    // emits newlines (e.g. progress bar, binary output).
+    const LINE_BUFFER_CAP: usize = 64 * 1024;
+    if buffer.len() > LINE_BUFFER_CAP {
+        // Round forward to a char boundary: `String::drain` panics
+        // mid-codepoint, and a multi-byte char can straddle the cut.
+        let mut drain = buffer.len() - LINE_BUFFER_CAP;
+        while drain < buffer.len() && !buffer.is_char_boundary(drain) {
+            drain += 1;
+        }
+        buffer.drain(..drain);
+    }
+    while let Some(newline) = buffer.find('\n') {
+        let line: String = buffer.drain(..=newline).collect();
+        on_line(line.trim_end(), is_stdout);
     }
 }
 
@@ -7363,71 +7723,185 @@ async fn guest_unresponsive<P: VmProvider + 'static>(
 /// 30-second buffered-exec read timeout. A guest that wedges never closes the
 /// stream, so the stream races a liveness probe: without it one wedged VM
 /// pinned its pool slot for good.
+///
+/// A healthy guest can still leave the stream open: the runner exits after its
+/// single job, but a descendant it spawned holds the exec channel's write end,
+/// and providers that report end-of-stream only when every writer closes (the
+/// AgentENV `envd` exec channel is one) never deliver it. The runner therefore
+/// announces its exit on stdout ([`RUNNER_EXIT_SENTINEL`], tagged with this
+/// attempt's `exit_token`); that line ends the wait even while the stream stays
+/// open, and dropping the provider future kills the host-side exec client
+/// before the caller deletes the VM.
 async fn run_until_exit<P: VmProvider + 'static>(
     provider: &Arc<P>,
     name: &MachineName,
     run: &[String],
+    exit_token: &str,
     busy: tokio::sync::oneshot::Sender<()>,
+    completion: Option<
+        tokio::sync::broadcast::Receiver<preloop_observability::status::RunnerJobCompleted>,
+    >,
     liveness: GuestLiveness,
 ) -> Result<(), VmError> {
     let (chunks, mut receiver) = mpsc::channel(64);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     let machine = name.as_str().to_owned();
+    let token = exit_token.to_owned();
+    let activity = RunnerActivity::new();
+    let stream_activity = activity.clone();
     let watcher = tokio::spawn(async move {
         let mut busy = Some(busy);
+        let mut completion = completion;
+        let mut exit = Some(exit_tx);
         let mut pending = String::new();
         // Guest output is the only window into the worker. Forwarding it to
         // tracing is what makes an in-VM failure diagnosable from the host;
         // consuming it purely to sniff for the busy sentinel meant every
         // worker-side decision was invisible.
-        let mut line_buffer = String::new();
-        while let Some(chunk) = receiver.recv().await {
+        //
+        // stdout and stderr keep separate line buffers: the exit announcement
+        // is only valid on stdout, and a single buffer completed a partial
+        // stdout line with an interleaved stderr chunk — draining it as stderr
+        // without ever seeing the announcement.
+        let mut stdout_lines = String::new();
+        let mut stderr_lines = String::new();
+        // Set when the control plane records the job's terminal result. The
+        // guest's own announcement ends the wait sooner; this deadline only
+        // bounds a runner that died after reporting.
+        let mut completion_deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let chunk = tokio::select! {
+                chunk = receiver.recv() => chunk,
+                event = async {
+                    completion
+                        .as_mut()
+                        .expect("completion branch is enabled only when subscribed")
+                        .recv()
+                        .await
+                }, if completion.is_some() => {
+                    match event {
+                        Ok(event) if event.runner_name == machine => {
+                            if let Some(busy) = busy.take() {
+                                let _ = busy.send(());
+                            }
+                            // The server has recorded the terminal result, but
+                            // the guest worker's cleanup is not finished: it
+                            // writes the failure marker that debug-VM
+                            // preservation reads only after `report_completion`
+                            // returns, and announces its exit after that. Stop
+                            // watching for events and keep forwarding output
+                            // until the announcement arrives; the deadline is
+                            // the backstop for a guest that never sends one.
+                            completion = None;
+                            completion_deadline = Some(
+                                tokio::time::Instant::now() + RUNNER_COMPLETION_GRACE,
+                            );
+                            continue;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            completion = None;
+                            continue;
+                        }
+                    }
+                }
+                // `select!` builds every branch's future before checking its
+                // precondition, so the deadline must not be unwrapped here:
+                // `None` disables the branch and the placeholder future is
+                // dropped un-polled.
+                _ = tokio::time::sleep_until(
+                    completion_deadline.unwrap_or_else(tokio::time::Instant::now),
+                ), if completion_deadline.is_some() => {
+                    // The completion backstop expired without an exit
+                    // announcement: the runner died after reporting (or could
+                    // not print). Release the slot as a clean completion.
+                    debug!(
+                        machine = machine.as_str(),
+                        grace_ms = RUNNER_COMPLETION_GRACE.as_millis(),
+                        "no runner exit announcement after completion; closing the exec stream"
+                    );
+                    if let Some(exit) = exit.take() {
+                        let _ = exit.send(0);
+                    }
+                    return;
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+            // Every chunk is proof the guest is still running. The liveness
+            // probe treats fresh output as authoritative over its own
+            // timeouts: a guest that is compiling for ten minutes cannot
+            // answer `aenv exec` between compiler invocations.
+            stream_activity.note_output();
             let (bytes, is_stdout) = match chunk {
                 OutputChunk::Stdout(bytes) => (bytes, true),
                 OutputChunk::Stderr(bytes) => (bytes, false),
             };
-            line_buffer.push_str(&String::from_utf8_lossy(&bytes));
-            // Cap retained tail to prevent unbounded growth from a guest
-            // that never emits newlines (e.g. progress bar, binary output).
-            const LINE_BUFFER_CAP: usize = 64 * 1024;
-            if line_buffer.len() > LINE_BUFFER_CAP {
-                // Round forward to a char boundary: `String::drain` panics
-                // mid-codepoint, and a multi-byte char can straddle the cut.
-                let mut drain = line_buffer.len() - LINE_BUFFER_CAP;
-                while drain < line_buffer.len() && !line_buffer.is_char_boundary(drain) {
-                    drain += 1;
+            // The busy announcement is read before the line scan: a runner
+            // that accepts and finishes a job in one read still tells the
+            // pool it was busy before it reports the exit.
+            if is_stdout && busy.is_some() {
+                pending.push_str(&String::from_utf8_lossy(&bytes));
+                if pending.contains(RUNNER_BUSY_SENTINEL) {
+                    if let Some(busy) = busy.take() {
+                        let _ = busy.send(());
+                    }
+                    pending.clear();
+                } else if pending.len() > 2 * RUNNER_BUSY_SENTINEL.len() {
+                    // Keep only enough tail to rejoin a sentinel split across reads.
+                    let keep = pending.len() - RUNNER_BUSY_SENTINEL.len();
+                    pending.drain(..keep);
                 }
-                line_buffer.drain(..drain);
             }
-            while let Some(newline) = line_buffer.find('\n') {
-                let line: String = line_buffer.drain(..=newline).collect();
-                let line = line.trim_end();
+            let buffer = if is_stdout {
+                &mut stdout_lines
+            } else {
+                &mut stderr_lines
+            };
+            drain_stream_lines(buffer, &bytes, is_stdout, |line, is_stdout| {
                 if !line.is_empty() {
                     debug!(machine = machine.as_str(), stdout = is_stdout, "{line}");
                 }
-            }
-            if !is_stdout {
-                continue;
-            }
-            if busy.is_none() {
-                continue;
-            }
-            pending.push_str(&String::from_utf8_lossy(&bytes));
-            if pending.contains(RUNNER_BUSY_SENTINEL) {
-                if let Some(busy) = busy.take() {
-                    let _ = busy.send(());
+                // The runner announces its own exit because the exec channel
+                // may stay open for as long as a descendant holds stdout.
+                if is_stdout
+                    && let Some(code) = runner_exit_code(line, &token)
+                    && let Some(exit) = exit.take()
+                {
+                    let _ = exit.send(code);
                 }
-                pending.clear();
-            } else if pending.len() > 2 * RUNNER_BUSY_SENTINEL.len() {
-                // Keep only enough tail to rejoin a sentinel split across reads.
-                let keep = pending.len() - RUNNER_BUSY_SENTINEL.len();
-                pending.drain(..keep);
-            }
+            });
         }
     });
 
     let code = tokio::select! {
         code = provider.exec_stream(name, run, chunks) => code,
-        error = guest_unresponsive(provider, name, liveness) => {
+        // A runner that announced its exit has finished its single job even
+        // when a process it spawned (a container shim, a daemonizing helper)
+        // still holds the exec channel's write end. Dropping the provider
+        // future kills the host-side `aenv exec` client; the caller then
+        // deletes the VM, which also kills the descendant. Without this the
+        // slot stayed pinned for as long as that descendant lived.
+        exit = async {
+            match exit_rx.await {
+                Ok(code) => code,
+                // The watcher only ends without announcing when the stream
+                // itself ended; the provider branch is then ready as well.
+                Err(_) => std::future::pending::<i32>().await,
+            }
+        } => {
+            debug!(
+                machine = name.as_str(),
+                exit_code = exit,
+                "guest runner announced its exit; closing the exec stream"
+            );
+            watcher.abort();
+            Ok::<i32, VmError>(exit)
+        },
+        error = guest_unresponsive(provider, name, liveness, &activity) => {
             warn!(machine = name.as_str(), %error, "runner guest is wedged; abandoning its stream");
             watcher.abort();
             return Err(error);
@@ -7664,6 +8138,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
     environment: &RunnerEnvironment,
+    exit_token: &str,
 ) -> Result<Vec<String>, OrchestratorError> {
     // The environment the slot actually serves, not the pool's configured
     // default: a queued job's `runs-on` labels can select a different golden.
@@ -8167,6 +8642,12 @@ async fn provision_runner<P: VmProvider + 'static>(
         runner,
         "run".into(),
         "--once".into(),
+        // The exit announcement is a private channel, so it carries a
+        // per-attempt secret the guest echoes back. It must join the guest
+        // argv before the launcher wraps it, or the wrapper would swallow it
+        // as a positional parameter.
+        "--exit-token".into(),
+        exit_token.to_owned(),
         "--runner-root".into(),
         RUNNER_ROOT.into(),
     ]);
@@ -8514,6 +8995,45 @@ mod lifecycle_tests {
     use std::process::Command;
     use tokio::sync::Mutex;
 
+    /// The per-attempt secret the lifecycle tests hand the guest runner.
+    const TEST_EXIT_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The guest command line the production pool builds for a runner: the
+    /// single-use `run` plus the attempt's exit token.
+    fn exit_argv() -> Vec<String> {
+        [
+            "run".to_owned(),
+            "--exit-token".to_owned(),
+            TEST_EXIT_TOKEN.to_owned(),
+        ]
+        .to_vec()
+    }
+
+    /// A claimed slot must stop reserving a queue entry, and the release must
+    /// be idempotent: the loop's admission (`queued > reservations`) only
+    /// frees a permit if each slot decrements exactly once.
+    #[test]
+    fn slot_reservation_counts_only_until_released() {
+        let reservations = Arc::new(AtomicUsize::new(0));
+        let mut claimed = SlotReservation::reserve(reservations.clone());
+        let unclaimed = SlotReservation::reserve(reservations.clone());
+        assert_eq!(reservations.load(Ordering::Acquire), 2);
+
+        // The claim wins: the running slot no longer counts against the
+        // ready queue, so a newly queued job may take the free permit.
+        claimed.release();
+        claimed.release();
+        assert_eq!(
+            reservations.load(Ordering::Acquire),
+            1,
+            "a claimed slot releases its reservation exactly once"
+        );
+
+        // A slot that ends without claiming still releases on drop.
+        drop(unclaimed);
+        assert_eq!(reservations.load(Ordering::Acquire), 0);
+    }
+
     /// The production scenario that OOMed: 22 GiB host, 8 GiB runners.
     /// Golden (8 GiB) + 2 GiB reserve leaves 12 GiB → at most 1 concurrent
     /// on-demand fork. CPU-only sizing allowed several and the host died.
@@ -8559,6 +9079,14 @@ mod lifecycle_tests {
         /// Model a guest whose agent stopped answering: the runner stream
         /// never closes and liveness probes never return.
         wedged_guest: bool,
+        /// Hang only the liveness probe (`exec true`), while the runner
+        /// stream keeps running — a guest too busy to accept `aenv exec`
+        /// but still producing job output.
+        probe_hangs: bool,
+        /// When set, the runner stream emits a chunk every interval until
+        /// the gate fires. Combined with `probe_hangs`, models a guest that
+        /// cannot answer exec probes while its job is visibly progressing.
+        live_output: Option<(std::time::Duration, Arc<tokio::sync::Notify>)>,
         /// Report live clones to `rearm_fork_base`; true by default so a spent
         /// base with dependents is never re-armed in tests either.
         live_forks: Mutex<bool>,
@@ -8576,6 +9104,10 @@ mod lifecycle_tests {
         /// resident.
         fail_deletes_remaining: Mutex<u32>,
         announce_busy: bool,
+        /// When set, the guest runner announces this exit code and then the
+        /// exec channel stays open forever: a descendant inherited stdout and
+        /// outlived the runner, which is what envd's end-of-stream waits on.
+        exit_without_end: Option<i32>,
         /// When set, `exec_with_secret_env` (the configure step) blocks until
         /// notified, so a test can observe the pool mid-provision.
         configure_gate: Option<Arc<tokio::sync::Notify>>,
@@ -8631,6 +9163,8 @@ mod lifecycle_tests {
                 fail_fork_once_spent: Mutex::new(false),
                 fail_fork_once: Mutex::new(false),
                 wedged_guest: false,
+                probe_hangs: false,
+                live_output: None,
                 live_forks: Mutex::new(true),
                 drain_live_forks_after: Mutex::new(0),
                 fail_start,
@@ -8640,6 +9174,7 @@ mod lifecycle_tests {
                 fail_delete,
                 fail_deletes_remaining: Mutex::new(0),
                 announce_busy: false,
+                exit_without_end: None,
                 configure_gate: None,
                 run_gate: None,
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
@@ -8702,6 +9237,13 @@ mod lifecycle_tests {
             self
         }
 
+        /// Announce this runner exit, then keep the exec channel open forever
+        /// — a descendant inherited stdout and outlived the runner.
+        fn exiting_without_closing_stream(mut self, code: i32) -> Self {
+            self.exit_without_end = Some(code);
+            self
+        }
+
         /// Fail the next `count` deletes, then succeed.
         fn with_failing_deletes(mut self, count: u32) -> Self {
             *self.fail_deletes_remaining.get_mut() = count;
@@ -8733,6 +9275,19 @@ mod lifecycle_tests {
         /// Model a guest whose agent stopped answering.
         fn with_wedged_guest(mut self) -> Self {
             self.wedged_guest = true;
+            self
+        }
+
+        /// Model a guest that cannot answer `exec` probes (`aenv exec` 502s
+        /// under load) while its runner keeps emitting job output until the
+        /// gate fires.
+        fn with_live_output_and_dead_probes(
+            mut self,
+            every: std::time::Duration,
+            gate: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            self.probe_hangs = true;
+            self.live_output = Some((every, gate));
             self
         }
 
@@ -14066,7 +14621,7 @@ fi"#,
                     ..test_output()
                 });
             }
-            if self.wedged_guest && argv == ["true"] {
+            if (self.wedged_guest || self.probe_hangs) && argv == ["true"] {
                 std::future::pending::<()>().await;
             }
             if argv.len() == 3
@@ -14146,6 +14701,22 @@ fi"#,
                     .await
                     .unwrap();
             }
+            if let Some((every, gate)) = &self.live_output {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(*every) => {
+                            if output
+                                .send(OutputChunk::Stdout(b"still building\n".to_vec()))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(0);
+                            }
+                        }
+                        _ = gate.notified() => break,
+                    }
+                }
+            }
             if let Some(gate) = &self.run_gate {
                 gate.notified().await;
             }
@@ -14153,6 +14724,26 @@ fi"#,
                 // `exec_stream` returns the guest process exit code; transport
                 // failures are represented by `Err(VmError)` instead.
                 return Ok(1);
+            }
+            if let Some(code) = self.exit_without_end {
+                // Echo the token the pool passed on the command line, exactly
+                // as the real runner does.
+                let token = argv
+                    .windows(2)
+                    .find(|window| window[0] == "--exit-token")
+                    .map(|window| window[1].as_str())
+                    .unwrap_or_default();
+                output
+                    .send(OutputChunk::Stdout(
+                        format!("{RUNNER_EXIT_SENTINEL} {token} {code}\n").into_bytes(),
+                    ))
+                    .await
+                    .unwrap();
+                // The runner is gone but a descendant still holds stdout, so
+                // the channel never reports end-of-stream. A provider that
+                // honours `kill_on_drop` stops waiting when its future drops;
+                // the test asserts the caller does drop it on the exit line.
+                std::future::pending::<()>().await;
             }
             Ok(0)
         }
@@ -14656,6 +15247,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("an unrecoverable fork base must fail the provision");
@@ -14687,6 +15279,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect("a transient fork failure recovers by forking again");
@@ -14714,11 +15307,20 @@ fi"#,
             interval: std::time::Duration::from_millis(5),
             timeout: std::time::Duration::from_millis(5),
             failures: 3,
+            silence: std::time::Duration::ZERO,
         };
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_until_exit(&provider, &name, &["run".to_owned()], busy, liveness),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
         )
         .await
         .expect("a wedged guest must not pin the runner stream");
@@ -14727,6 +15329,380 @@ fi"#,
             matches!(result, Err(VmError::GuestUnresponsive { probes: 3, .. })),
             "{result:?}"
         );
+    }
+
+    /// A guest that cannot answer `exec` probes but keeps producing job
+    /// output is working, not wedged. This is the AgentENV e2e shape: under a
+    /// nested Rust build `aenv exec` returns `502 client error (Connect)`
+    /// every probe while the job's log stream stays alive.
+    #[tokio::test]
+    async fn a_guest_with_live_output_is_not_wedged_by_failed_probes() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).with_live_output_and_dead_probes(
+                std::time::Duration::from_millis(10),
+                gate.clone(),
+            ),
+        );
+        let name = MachineName::new("lifecycle-test-0-6b").unwrap();
+        let (busy, _busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_millis(5),
+            timeout: std::time::Duration::from_millis(5),
+            failures: 2,
+            silence: std::time::Duration::from_millis(150),
+        };
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            let name = name.clone();
+            async move {
+                run_until_exit(
+                    &provider,
+                    &name,
+                    &exit_argv(),
+                    TEST_EXIT_TOKEN,
+                    busy,
+                    None,
+                    liveness,
+                )
+                .await
+            }
+        });
+
+        // Several failure streaks fit here; only fresh output keeps the
+        // guest alive past them.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "failed probes with fresh output must not release the slot"
+        );
+        let events = provider.events().await;
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("exec:") && event.ends_with("[\"true\"]"))
+                .count()
+                >= 2,
+            "the probe must have failed more than once: {events:?}"
+        );
+
+        gate.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the runner stream ends when the job finishes")
+            .expect("runner task must not panic");
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// The same failed probes with no output for the silence window are a
+    /// real wedge: the guest is unreachable and quiet.
+    #[tokio::test]
+    async fn a_silent_guest_is_wedged_after_the_silence_window() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).with_wedged_guest());
+        let name = MachineName::new("lifecycle-test-0-6c").unwrap();
+        let (busy, _busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_millis(5),
+            timeout: std::time::Duration::from_millis(5),
+            failures: 2,
+            silence: std::time::Duration::from_millis(50),
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
+        )
+        .await
+        .expect("a silent, unreachable guest must not pin the runner stream");
+
+        assert!(
+            matches!(result, Err(VmError::GuestUnresponsive { ref probes, .. }) if *probes >= 2),
+            "{result:?}"
+        );
+    }
+
+    /// The runner exits and announces it, but a descendant it spawned still
+    /// holds the exec channel's write end, so the provider never reports
+    /// end-of-stream. The slot must be released on the runner's own line
+    /// rather than on the channel closing.
+    #[tokio::test]
+    async fn a_runner_exit_line_releases_a_stream_held_open_by_a_descendant() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .announcing_busy()
+                .exiting_without_closing_stream(0),
+        );
+        let name = MachineName::new("lifecycle-test-0-7").unwrap();
+        let (busy, busy_rx) = tokio::sync::oneshot::channel();
+        // Long enough that only the exit line can end the wait.
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(30),
+            failures: 3,
+            silence: std::time::Duration::ZERO,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
+        )
+        .await
+        .expect("a runner exit line must not wait for its descendants to close stdout");
+
+        assert!(result.is_ok(), "{result:?}");
+        busy_rx
+            .await
+            .expect("the busy sentinel still reaches the pool before the exit");
+    }
+
+    /// The announced exit code keeps the same non-zero contract as a stream
+    /// that closed normally: the pool records a guest exit, not success.
+    #[tokio::test]
+    async fn a_runner_exit_line_propagates_a_nonzero_code() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).exiting_without_closing_stream(7),
+        );
+        let name = MachineName::new("lifecycle-test-0-8").unwrap();
+        let (busy, _busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(30),
+            failures: 3,
+            silence: std::time::Duration::ZERO,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
+        )
+        .await
+        .expect("a runner exit line must not wait for its descendants to close stdout");
+
+        assert!(
+            matches!(
+                result,
+                Err(VmError::Command {
+                    operation: "run",
+                    exit_code: 7,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// A broker completion releases a healthy runner even if its `run --once`
+    /// process and the exec stream never emit the runner-exit sentinel.
+    #[tokio::test]
+    async fn broker_completion_releases_a_stream_without_runner_exit() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .announcing_busy()
+                .with_run_gate(gate),
+        );
+        let name = MachineName::new("lifecycle-test-completion").unwrap();
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        let completion = Some(pool_status.subscribe_runner_completion());
+        let (busy, busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(30),
+            failures: 3,
+            silence: std::time::Duration::ZERO,
+        };
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            let name = name.clone();
+            async move {
+                run_until_exit(
+                    &provider,
+                    &name,
+                    &exit_argv(),
+                    TEST_EXIT_TOKEN,
+                    busy,
+                    completion,
+                    liveness,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        pool_status.notify_runner_completion(7, name.as_str().to_owned());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("completion event must release the stream")
+            .expect("runner task must not panic");
+        assert!(result.is_ok(), "{result:?}");
+        busy_rx
+            .await
+            .expect("completion release still marks the runner busy");
+    }
+
+    /// Only the exact exit line is an announcement; runner output that
+    /// merely mentions it, a truncated line, or another attempt's token must
+    /// not release the slot.
+    #[test]
+    fn runner_exit_line_parsing_is_strict() {
+        let token = TEST_EXIT_TOKEN;
+        assert_eq!(
+            runner_exit_code(&format!("::preloop-runner::exit {token} 0"), token),
+            Some(0)
+        );
+        assert_eq!(
+            runner_exit_code(&format!("::preloop-runner::exit {token} 17\r"), token),
+            Some(17)
+        );
+        assert_eq!(
+            runner_exit_code(&format!("::preloop-runner::exiting {token} 0"), token),
+            None
+        );
+        assert_eq!(runner_exit_code("::preloop-runner::exit 0", token), None);
+        // A forged line without the attempt's secret is not an announcement.
+        assert_eq!(
+            runner_exit_code("::preloop-runner::exit deadbeef 0", token),
+            None
+        );
+        assert_eq!(
+            runner_exit_code("echo ::preloop-runner::exit 0", token),
+            None
+        );
+        assert_eq!(runner_exit_code("::preloop-runner::exit", token), None);
+        assert_eq!(
+            runner_exit_code(&format!("::preloop-runner::exit {token} nope"), token),
+            None
+        );
+        // An empty attempt token can never match: no runner is started
+        // without one, so a line that omits it must not end the attempt.
+        assert_eq!(runner_exit_code("::preloop-runner::exit  0", ""), None);
+    }
+
+    /// The AgentENV shape end to end: a fake `aenv` announces the runner's
+    /// exit, then leaves a background child holding the exec channel's stdout
+    /// — exactly what `envd` waits for before it sends `End`, so the CLI never
+    /// exits. The stream wait must end on the announcement and drop the exec
+    /// client; otherwise the slot stays pinned on a healthy guest.
+    #[tokio::test]
+    async fn agentenv_stream_held_open_by_a_descendant_releases_the_slot() {
+        use preloop_vm::agentenv::AgentEnvProvider;
+
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let binary = dir.path().join("aenv");
+        let holder = dir.path().join("holder.pid");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 start) echo s1 ;;\n\
+                 exec)\n\
+                   if [ \"$4\" = \"run\" ]; then\n\
+                     token=\"\"\n\
+                     prev=\"\"\n\
+                     for arg in \"$@\"; do\n\
+                       if [ \"$prev\" = \"--exit-token\" ]; then token=\"$arg\"; fi\n\
+                       prev=\"$arg\"\n\
+                     done\n\
+                     printf '%s\\n%s %s 0\\n' \
+                       '::preloop-runner::job-acquired' \
+                       '::preloop-runner::exit' \"$token\"\n\
+                     sleep 30 &\n\
+                     echo $! > '{holder}';\n\
+                   fi\n\
+                   ;;\n\
+                 delete) ;;\n\
+                 ls) echo '[]' ;;\n\
+                 esac\n\
+                 exit 0\n",
+                holder = holder.display()
+            ),
+        )
+        .expect("write fake aenv");
+        std::fs::set_permissions(
+            &binary,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod fake aenv");
+
+        let provider = Arc::new(AgentEnvProvider::new(&binary));
+        let name = MachineName::new("lifecycle-test-aenv-stream").unwrap();
+        provider
+            .create(&MachineSpec {
+                name: name.clone(),
+                image: "ubuntu:24.04".to_owned(),
+                cpus: 2,
+                memory_mib: 2048,
+                storage_gib: 8,
+                overlay_gib: None,
+                network: NetworkPolicy::PublicOnly,
+                volumes: Vec::new(),
+                sockets: Vec::new(),
+                dns: None,
+                rosetta: false,
+            })
+            .await
+            .expect("create test machine");
+        provider.start(&name).await.expect("fake aenv start");
+
+        let (busy, busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(30),
+            failures: 3,
+            silence: std::time::Duration::ZERO,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_until_exit(
+                &provider,
+                &name,
+                &exit_argv(),
+                TEST_EXIT_TOKEN,
+                busy,
+                None,
+                liveness,
+            ),
+        )
+        .await;
+        // The fake's descendant outlives the wait by design; never leave it
+        // behind, especially when the fix regressed and the timeout fired.
+        if let Ok(pid) = std::fs::read_to_string(&holder) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid.trim()])
+                .status();
+        }
+        let result = outcome.expect("the runner exit line must release the stream");
+        assert!(result.is_ok(), "{result:?}");
+        busy_rx
+            .await
+            .expect("the busy sentinel reaches the pool first");
     }
 
     /// Issue #295: once the packed golden is forkable, the pool must ask the
@@ -15063,6 +16039,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect("the re-armed golden serves the fork");
@@ -15113,6 +16090,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect("the re-armed fingerprint-suffixed golden serves the fork");
@@ -15160,6 +16138,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &env,
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("an unrecoverable fork failure must propagate");
@@ -15195,6 +16174,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("a base that cannot be re-armed within the drain budget fails the provision");
@@ -15233,6 +16213,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect("the re-armed golden serves the fork after the clone drains");
@@ -15281,6 +16262,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(environment_base),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("a busy plain-fork base fails the provision");
@@ -15316,6 +16298,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment(config.base_image.clone()),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("a base that cannot even be cleaned up fails the provision");
@@ -15345,6 +16328,7 @@ fi"#,
             Some(&golden),
             &Arc::new(KeyPool::new()),
             &test_runner_environment("mirror.gcr.io/library/ubuntu:22.04"),
+            TEST_EXIT_TOKEN,
         )
         .await
         .expect_err("an environment-golden fork failure must propagate");
@@ -15772,6 +16756,225 @@ fi"#,
         assert!(!stale_tmp.exists(), "lockless staging file is swept");
     }
 
+    /// A server-committed claim, not a guest stdout sentinel, keeps a silent
+    /// runner alive. The fake runner never prints the busy marker and holds
+    /// its run gate for the whole 90-second window; advancing past the 30s
+    /// idle grace must not tear the slot down. Completion still releases it.
+    #[tokio::test(start_paused = true)]
+    async fn server_claim_keeps_a_silent_runner_past_the_idle_grace() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).with_run_gate(gate.clone()),
+        );
+        let mut config = test_config(false);
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        let runner = provision_slot(
+            &provider,
+            &config,
+            0,
+            1,
+            None,
+            &Arc::new(KeyPool::new()),
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                boot_from_pack: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("provisioning succeeds")
+        .expect("a runner is provisioned");
+        let name = runner.name.clone();
+        let idle = Arc::new(std::sync::Mutex::new(0));
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            let config = config.clone();
+            let name = name.clone();
+            async move {
+                run_one_runner(
+                    provider,
+                    &config,
+                    runner,
+                    CancellationToken::new(),
+                    idle,
+                    None,
+                )
+                .await
+                .inspect_err(|error| panic!("{name:?}: {error}"))
+            }
+        });
+
+        // The control plane commits the claim at delivery time; the guest is
+        // deliberately silent. Give the spawned slot a turn to subscribe and
+        // start the run first.
+        tokio::task::yield_now().await;
+        pool_status.notify_runner_claim(1, name.as_str().to_owned());
+        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "the server claim must cancel the 30s idle grace even with silent stdout"
+        );
+        assert!(
+            !provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event == &format!("delete:{}", name.as_str())),
+            "the claimed machine must not be deleted by the idle grace"
+        );
+
+        // Completion is authoritative and releases the single-use slot.
+        pool_status.notify_runner_completion(1, name.as_str().to_owned());
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("completion releases the runner")
+            .expect("runner task must not panic");
+        result.expect("the completed runner tears down cleanly");
+        assert!(
+            provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event == &format!("delete:{}", name.as_str())),
+            "completion must still delete the machine"
+        );
+        gate.notify_waiters();
+    }
+
+    /// Warm mode keeps a registered spare waiting past the on-demand idle
+    /// grace: recycling it would fork a fresh VM forever on an idle pool.
+    /// Completion still releases the single-use runner.
+    #[tokio::test(start_paused = true)]
+    async fn warm_spare_is_not_recycled_by_the_on_demand_idle_grace() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).with_run_gate(gate.clone()),
+        );
+        let mut config = test_config(false);
+        config.size = 1;
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        let runner = provision_slot(
+            &provider,
+            &config,
+            0,
+            1,
+            None,
+            &Arc::new(KeyPool::new()),
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                boot_from_pack: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("provisioning succeeds")
+        .expect("a runner is provisioned");
+        let name = runner.name.clone();
+        let idle = Arc::new(std::sync::Mutex::new(0));
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            let config = config.clone();
+            let name = name.clone();
+            async move {
+                run_one_runner(
+                    provider,
+                    &config,
+                    runner,
+                    CancellationToken::new(),
+                    idle,
+                    None,
+                )
+                .await
+                .inspect_err(|error| panic!("{name:?}: {error}"))
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "a warm spare must wait for the next job past the on-demand grace"
+        );
+        assert!(
+            !provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event == &format!("delete:{}", name.as_str())),
+            "the warm spare must not be deleted by the on-demand idle grace"
+        );
+
+        pool_status.notify_runner_completion(1, name.as_str().to_owned());
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("completion releases the runner")
+            .expect("runner task must not panic");
+        result.expect("the completed runner tears down cleanly");
+        gate.notify_waiters();
+    }
+
+    /// A runner that announced its exit while a descendant kept the exec
+    /// channel open must still take the whole slot down: `run_one_runner`
+    /// returns after the announcement, then deletes the machine (which kills
+    /// the holder in the guest) instead of pinning the permit.
+    #[tokio::test]
+    async fn held_stream_after_runner_exit_tears_down_the_machine() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .announcing_busy()
+                .exiting_without_closing_stream(0),
+        );
+        let config = test_config(false);
+        let runner = provision_slot(
+            &provider,
+            &config,
+            0,
+            1,
+            None,
+            &Arc::new(KeyPool::new()),
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                boot_from_pack: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("provisioning succeeds")
+        .expect("a runner is provisioned");
+        let name = runner.name.clone();
+        let idle = Arc::new(std::sync::Mutex::new(0));
+        run_one_runner(
+            provider.clone(),
+            &config,
+            runner,
+            CancellationToken::new(),
+            idle,
+            None,
+        )
+        .await
+        .expect("the announced exit releases the slot");
+        let events = provider.events().await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event == &format!("delete:{}", name.as_str())),
+            "the slot must delete the machine and its descendant: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn runner_error_wins_when_delete_also_fails() {
         let provider = Arc::new(TestProvider::new(false, false, false, true, true));
@@ -15794,9 +16997,16 @@ fi"#,
         .expect("provisioning succeeds")
         .expect("a runner is provisioned");
         let idle = Arc::new(std::sync::Mutex::new(0));
-        let error = run_one_runner(provider, &config, runner, CancellationToken::new(), idle)
-            .await
-            .expect_err("runner failure must propagate");
+        let error = run_one_runner(
+            provider,
+            &config,
+            runner,
+            CancellationToken::new(),
+            idle,
+            None,
+        )
+        .await
+        .expect_err("runner failure must propagate");
         assert!(
             error
                 .to_string()
@@ -15828,6 +17038,7 @@ fi"#,
             handles,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
+            SlotReservation::reserve(Arc::new(AtomicUsize::new(0))),
         )
         .await
         .unwrap();
@@ -16232,6 +17443,7 @@ fi"#,
             handles,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
+            SlotReservation::reserve(Arc::new(AtomicUsize::new(0))),
         ));
 
         let booting = wait_for_pool_status("the on-demand boot", &pool_status, |snapshot| {

@@ -105,6 +105,9 @@ pub(crate) struct StarvationCandidate<'a> {
     pub(crate) enqueued_at: SystemTime,
     pub(crate) first_seen: Option<SystemTime>,
     pub(crate) any_runner_matches: bool,
+    /// An attempt that shares this job's runner class is already running, so
+    /// the job's turn cannot come until that attempt finishes.
+    pub(crate) capacity_blocked: bool,
 }
 
 /// Starvation outcome: clear, mark, or fail the ready job.
@@ -150,6 +153,38 @@ pub(crate) fn pool_unsatisfiable_reason(
             runs_on.join(", "),
             pool_labels.join(", ")
         )
+    })
+}
+
+/// Whether two `runs-on` label sets name the same runner capacity.
+///
+/// A runner satisfies the superset of two comparable label sets. When one set
+/// contains the other, every runner that can serve the superset can also serve
+/// the subset, so an attempt on either set occupies capacity the other job
+/// could have used. Disjoint classes (a `self-hosted` job and a `gpu` job) can
+/// never be served by the same runner, so one running cannot be why the other
+/// waits — treating it as blocking would let continuous unrelated work keep
+/// an unschedulable job queued forever.
+pub(crate) fn runs_on_shares_capacity(active: &[String], queued: &[String]) -> bool {
+    let labels = |set: &[String]| -> std::collections::BTreeSet<String> {
+        set.iter()
+            .map(|label| label.trim().to_ascii_lowercase())
+            .filter(|label| !label.is_empty())
+            .collect()
+    };
+    let active = labels(active);
+    let queued = labels(queued);
+    active.is_subset(&queued) || queued.is_subset(&active)
+}
+
+/// Whether some started attempt is occupying a runner class `runs_on` could
+/// use (see [`runs_on_shares_capacity`]).
+pub(crate) fn capacity_blocked_by<'a>(
+    runs_on: &[String],
+    active: impl IntoIterator<Item = &'a crate::control::types::ActiveRequest>,
+) -> bool {
+    active.into_iter().any(|request| {
+        request.started_at.is_some() && runs_on_shares_capacity(&request.runs_on, runs_on)
     })
 }
 
@@ -226,6 +261,10 @@ pub(crate) fn concludes_at_submit(
 /// from boot. Ages are measured on this node's clock; an instant another
 /// node stamped slightly in the future counts as age zero rather than as
 /// expired.
+///
+/// A candidate whose pool is still executing an earlier job is
+/// `capacity_blocked`: the job is waiting for a turn, so its observation
+/// clock is reset instead of being measured against either grace window.
 pub(crate) fn starvation_verdict(
     job: &StarvationCandidate<'_>,
     now: SystemTime,
@@ -247,9 +286,18 @@ pub(crate) fn starvation_verdict(
         if let Some(reason) = pool_unsatisfiable_reason(job.runs_on, pool_labels) {
             return StarvationVerdict::Unschedulable { reason };
         }
-        if within_ceiling {
-            return StarvationVerdict::ClearMark;
-        }
+    }
+    // A pool that is still executing an earlier job occupies the permit this
+    // job needs. Waiting behind an occupied permit is queueing, not
+    // starvation: reset the observation clock every tick so neither the
+    // short grace nor the absolute ceiling can fail this job while capacity
+    // is genuinely in use. When the running job finishes, this job is
+    // claimable, or it starts a fresh grace window if no runner appears.
+    if job.capacity_blocked {
+        return StarvationVerdict::Mark { first_seen: now };
+    }
+    if !pool_labels.is_empty() && within_ceiling {
+        return StarvationVerdict::ClearMark;
     }
     let grace = if pool_preparing {
         if within_ceiling {
@@ -1251,6 +1299,7 @@ mod decision_tests {
             enqueued_at: now - enqueued_ago,
             first_seen: first_seen_ago.map(|ago| now - ago),
             any_runner_matches: false,
+            capacity_blocked: false,
         }
     }
 
@@ -1288,6 +1337,16 @@ mod decision_tests {
                 first_seen: now - Duration::from_secs(30)
             }
         );
+        // A requeued job receives a fresh ready-enqueue timestamp, so the
+        // first sweep starts a new short grace window instead of measuring
+        // time spent on its abandoned runner.
+        let fresh = starvation_candidate(&linux, Duration::from_secs(1), None, now);
+        assert_eq!(
+            starvation_verdict(&fresh, now, false, LONG_UP, &[]),
+            StarvationVerdict::Mark {
+                first_seen: now - Duration::from_secs(1)
+            }
+        );
         let job = starvation_candidate(&linux, Duration::from_secs(121), None, now);
         let StarvationVerdict::Starve { reason, grace } =
             starvation_verdict(&job, now, false, LONG_UP, &[])
@@ -1296,6 +1355,81 @@ mod decision_tests {
         };
         assert_eq!(grace, QUEUED_JOB_GRACE);
         assert!(reason.contains("within 120s"));
+    }
+
+    #[test]
+    fn capacity_blocking_is_scoped_to_the_runner_class() {
+        let self_hosted = labels(&["self-hosted"]);
+        let gpu = labels(&["gpu"]);
+        let ubuntu = labels(&["ubuntu-latest"]);
+        let ubuntu_arm = labels(&["ubuntu-latest", "arm64"]);
+        // The same class (or one whose superset covers the other) shares the
+        // runner that occupies the permit.
+        assert!(runs_on_shares_capacity(&self_hosted, &self_hosted));
+        assert!(runs_on_shares_capacity(&ubuntu, &ubuntu_arm));
+        assert!(runs_on_shares_capacity(&ubuntu_arm, &ubuntu));
+        assert!(runs_on_shares_capacity(
+            &labels(&["UBUNTU-latest"]),
+            &ubuntu
+        ));
+        // Disjoint classes can never be served by the same runner: unrelated
+        // work must not keep this job's starvation clock refreshed.
+        assert!(!runs_on_shares_capacity(&self_hosted, &gpu));
+        assert!(!runs_on_shares_capacity(&gpu, &ubuntu));
+        // An unlabelled job is served by any runner, so it shares every
+        // class.
+        assert!(runs_on_shares_capacity(&[], &gpu));
+        assert!(runs_on_shares_capacity(&gpu, &[]));
+    }
+
+    #[test]
+    fn capacity_blocked_queue_resets_every_grace_window() {
+        let now = SystemTime::now();
+        let linux = labels(&["ubuntu-latest"]);
+        // Job B has waited behind a running job for longer than both the
+        // short grace and the absolute ceiling. Time spent behind an
+        // occupied permit is queueing, not starvation: the verdict must
+        // reset the observation clock instead of failing the job.
+        let waiting = starvation_candidate(
+            &linux,
+            Duration::from_secs(7_200),
+            Some(Duration::from_secs(7_200)),
+            now,
+        );
+        let mut job = waiting.clone();
+        job.capacity_blocked = true;
+        assert_eq!(
+            starvation_verdict(&job, now, false, LONG_UP, &[]),
+            StarvationVerdict::Mark { first_seen: now }
+        );
+        // Pool labels the job can satisfy do not change that: the permit is
+        // still occupied.
+        let pool = labels(&["self-hosted", "ubuntu-latest"]);
+        assert_eq!(
+            starvation_verdict(&job, now, false, LONG_UP, &pool),
+            StarvationVerdict::Mark { first_seen: now }
+        );
+        // A job the pool can never satisfy still fails fast while capacity
+        // is blocked.
+        let gpu = labels(&["gpu"]);
+        let mut unschedulable = starvation_candidate(&gpu, Duration::from_secs(1), None, now);
+        unschedulable.capacity_blocked = true;
+        assert!(matches!(
+            starvation_verdict(&unschedulable, now, false, LONG_UP, &pool),
+            StarvationVerdict::Unschedulable { .. }
+        ));
+        // The permit frees: the job keeps the fresh mark instead of starving
+        // on the clock it accumulated while the earlier job was running.
+        let freed = starvation_candidate(
+            &linux,
+            Duration::from_secs(7_200),
+            Some(Duration::ZERO),
+            now,
+        );
+        assert_eq!(
+            starvation_verdict(&freed, now, false, LONG_UP, &[]),
+            StarvationVerdict::Mark { first_seen: now }
+        );
     }
 
     #[test]

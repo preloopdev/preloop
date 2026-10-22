@@ -188,11 +188,48 @@ impl Default for PoolSnapshot {
 ///
 /// Consolidates the four ad-hoc `Option<Arc<…>>` handles. Single writer (pool)
 /// + multiple readers (sampler, status) — cheap `RwLock`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PoolStatus {
     inner: Arc<RwLock<PoolSnapshot>>,
     /// One-time provision tokens (separate from snapshot to avoid cloning large map on every snapshot).
     pending_tokens: Arc<RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>>,
+    /// Live completion notifications from the runner server to the co-hosted pool.
+    completion_events: tokio::sync::broadcast::Sender<RunnerJobCompleted>,
+    /// Live claim notifications from the runner server to the co-hosted pool.
+    claim_events: tokio::sync::broadcast::Sender<RunnerJobClaimed>,
+    /// Runners the server has recorded as executing a job. Kept independently
+    /// of the broadcast so a pool that subscribes after the claim still sees
+    /// the authoritative state instead of waiting for a stdout sentinel.
+    claimed_runners: Arc<RwLock<std::collections::HashSet<String>>>,
+}
+
+/// A job was claimed for a specific registered runner.
+///
+/// The runner pool treats this as the authoritative busy signal. It does not
+/// depend on the guest's stdout: a runner that is already executing a long
+/// step may be silent or its output may be buffered, and a single-use VM must
+/// not be torn down in that window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobClaimed {
+    pub runner_id: i64,
+    pub runner_name: String,
+}
+
+/// Completion of a job reported by a specific registered runner.
+///
+/// The runner pool uses this advisory event to release a single-use VM even
+/// when the guest's exec stream remains open after the broker completed the
+/// job. The persisted control-plane completion remains authoritative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobCompleted {
+    pub runner_id: i64,
+    pub runner_name: String,
+}
+
+impl Default for PoolStatus {
+    fn default() -> Self {
+        Self::new(PoolSnapshot::default())
+    }
 }
 
 impl std::fmt::Debug for PoolStatus {
@@ -211,10 +248,64 @@ impl std::fmt::Debug for PoolStatus {
 
 impl PoolStatus {
     pub fn new(snapshot: PoolSnapshot) -> Self {
+        let (completion_events, _) = tokio::sync::broadcast::channel(64);
+        let (claim_events, _) = tokio::sync::broadcast::channel(64);
         Self {
             inner: Arc::new(RwLock::new(snapshot)),
             pending_tokens: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            completion_events,
+            claim_events,
+            claimed_runners: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Subscribe to the server's authoritative claim reports.
+    pub fn subscribe_runner_claim(&self) -> tokio::sync::broadcast::Receiver<RunnerJobClaimed> {
+        self.claim_events.subscribe()
+    }
+
+    /// Publish the server's commit of a job claim for `runner_name`.
+    ///
+    /// Called from the request path that hands the job to the runner, before
+    /// any guest output is expected. The pool uses it, not a stdout sentinel,
+    /// to cancel its unclaimed-runner grace.
+    pub fn notify_runner_claim(&self, runner_id: i64, runner_name: String) {
+        self.claimed_runners.write().insert(runner_name.clone());
+        let _ = self.claim_events.send(RunnerJobClaimed {
+            runner_id,
+            runner_name,
+        });
+    }
+
+    /// Whether the server currently records a claim for `runner_name`.
+    ///
+    /// Authoritative and race-free with [`Self::subscribe_runner_claim`]:
+    /// subscribe first, then read this, and a claim landing in between is
+    /// seen by exactly one of the two.
+    pub fn runner_is_claimed(&self, runner_name: &str) -> bool {
+        self.claimed_runners.read().contains(runner_name)
+    }
+
+    /// Drop a claim once the runner's VM is gone, so a name that is never
+    /// reused cannot leave a stale busy entry behind.
+    pub fn clear_runner_claim(&self, runner_name: &str) {
+        self.claimed_runners.write().remove(runner_name);
+    }
+
+    /// Subscribe to terminal job reports from the co-hosted runner server.
+    pub fn subscribe_runner_completion(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<RunnerJobCompleted> {
+        self.completion_events.subscribe()
+    }
+
+    /// Publish a terminal job report for the runner that owned it.
+    pub fn notify_runner_completion(&self, runner_id: i64, runner_name: String) {
+        self.claimed_runners.write().remove(&runner_name);
+        let _ = self.completion_events.send(RunnerJobCompleted {
+            runner_id,
+            runner_name,
+        });
     }
 
     pub fn snapshot(&self) -> PoolSnapshot {
@@ -584,5 +675,45 @@ impl Default for OperationalSnapshot {
             telemetry: TelemetrySnapshot::default(),
             conditions: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runner_completion_notifies_subscribers() {
+        let status = PoolStatus::default();
+        let mut events = status.subscribe_runner_completion();
+        status.notify_runner_completion(17, "runner-17".to_owned());
+        assert_eq!(
+            events.recv().await.expect("completion event"),
+            RunnerJobCompleted {
+                runner_id: 17,
+                runner_name: "runner-17".to_owned(),
+            }
+        );
+    }
+
+    /// The server's claim is authoritative: it is exposed before any guest
+    /// output exists, and a completion clears it. A pool that subscribes
+    /// after the claim still reads `runner_is_claimed`.
+    #[tokio::test]
+    async fn runner_claim_is_authoritative_and_completion_clears_it() {
+        let status = PoolStatus::default();
+        let mut events = status.subscribe_runner_claim();
+        status.notify_runner_claim(17, "runner-17".to_owned());
+        assert!(status.runner_is_claimed("runner-17"));
+        assert!(!status.runner_is_claimed("runner-18"));
+        assert_eq!(
+            events.recv().await.expect("claim event"),
+            RunnerJobClaimed {
+                runner_id: 17,
+                runner_name: "runner-17".to_owned(),
+            }
+        );
+        status.notify_runner_completion(17, "runner-17".to_owned());
+        assert!(!status.runner_is_claimed("runner-17"));
     }
 }

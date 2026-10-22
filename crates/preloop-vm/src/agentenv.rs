@@ -59,6 +59,16 @@
 //!   root-only steps (the secret directory, the populate step's unpack, secret-file reads
 //!   and removal) run through [`crate::guest_privilege`], which uses `sudo -n` when the
 //!   exec user is not root. Payloads keep the exec user, as a plain `exec` does.
+//! * **End-of-stream needs every writer to close.** `envd` (the upstream daemon
+//!   inside the guest) sends a command's `End` event only after every holder of its
+//!   stdout/stderr closes: `Handler.Wait` waits for the output readers to reach EOF
+//!   before it reaps the process. A descendant that inherited the pipes (a container
+//!   shim, a daemonizing helper) therefore keeps `aenv exec` alive long after the
+//!   command exited, and on a healthy guest no liveness probe can tell. The
+//!   orchestrator does not wait for that closure: the runner announces its own exit
+//!   on stdout (`preloop_gha_protocol::RUNNER_EXIT_SENTINEL`, tagged with the
+//!   per-attempt token it was started with) and the stream future is dropped there,
+//!   which kills the `aenv exec` client; deleting the machine kills the descendant.
 
 pub mod gc;
 pub mod volume;
