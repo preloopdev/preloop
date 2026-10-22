@@ -1455,6 +1455,7 @@ impl Service {
         ops: &mut Vec<Op>,
     ) -> Result<String> {
         let id = new_id("sbx");
+        let shape = effective_shape(state, &provider_id, &driver, placement.shape);
         let sandbox = Sandbox {
             id: id.clone(),
             name: name.to_owned(),
@@ -1465,6 +1466,7 @@ impl Service {
             state: SandboxState::Provisioning,
             purpose,
             created_at: now(),
+            shape,
             ..Sandbox::default()
         };
         let sandbox_driver = driver.clone();
@@ -3906,6 +3908,30 @@ fn sandbox_meets(state: &State, sandbox: &Sandbox, requires: &Requirements) -> b
                 && requires.capabilities.iter().all(|c| caps.has(c))
                 && (requires.driver.is_empty() || requires.driver == driver.driver)
         })
+}
+
+/// A new sandbox's effective size: the request's fields, with the driver's
+/// advertised defaults filling the zeros.
+fn effective_shape(state: &State, provider_id: &str, driver: &str, requested: Shape) -> Shape {
+    let defaults = state
+        .providers
+        .get(provider_id)
+        .and_then(|rec| {
+            rec.provider
+                .drivers
+                .iter()
+                .find(|info| info.driver == driver)
+        })
+        .map(|info| info.capabilities.default_shape)
+        .unwrap_or_default();
+    let pick = |requested: u32, default: u32| {
+        if requested == 0 { default } else { requested }
+    };
+    Shape {
+        cpus: pick(requested.cpus, defaults.cpus),
+        memory_mib: pick(requested.memory_mib, defaults.memory_mib),
+        disk_gib: pick(requested.disk_gib, defaults.disk_gib),
+    }
 }
 
 async fn load<T: DeserializeOwned>(store: &dyn Store, kind: Kind) -> Result<Vec<T>> {

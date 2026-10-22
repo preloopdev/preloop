@@ -42,6 +42,35 @@ pub const SMOLMACHINE_RECIPE: &str = "smolmachine:";
 /// Docker-save `.tar` archive or a bare rootfs directory.
 pub const IMAGE_RECIPE: &str = "image:";
 
+/// SmolVM's vCPU default for a machine created without a shape.
+const DEFAULT_CPUS: u32 = 2;
+/// SmolVM's memory default for a machine created without a shape, in MiB.
+const DEFAULT_MEMORY_MIB: u32 = 4096;
+/// SmolVM's persistent-storage default for a machine created without a shape.
+const DEFAULT_STORAGE_GIB: u32 = 20;
+
+/// The size a create request actually gets: its own fields, with SmolVM's
+/// defaults filling the zeros.
+fn effective_shape(requested: Shape) -> Shape {
+    Shape {
+        cpus: if requested.cpus == 0 {
+            DEFAULT_CPUS
+        } else {
+            requested.cpus
+        },
+        memory_mib: if requested.memory_mib == 0 {
+            DEFAULT_MEMORY_MIB
+        } else {
+            requested.memory_mib
+        },
+        disk_gib: if requested.disk_gib == 0 {
+            DEFAULT_STORAGE_GIB
+        } else {
+            requested.disk_gib
+        },
+    }
+}
+
 /// SmolVM driver.
 pub struct SmolvmDriver {
     provider: SmolVmProvider,
@@ -602,6 +631,7 @@ impl Driver for SmolvmDriver {
             one_shot: false,
             max_vcpus,
             max_memory_mib,
+            default_shape: effective_shape(Shape::default()),
         }
     }
 
@@ -658,24 +688,13 @@ impl Driver for SmolvmDriver {
         }
         let (image, pin) = self.image_for(&work.template).await?;
         let option = |key: &str| work.options.get(key).map(String::as_str);
+        let shape = effective_shape(work.shape);
         let spec = MachineSpec {
             name: clone.clone(),
             image,
-            cpus: if work.shape.cpus == 0 {
-                2
-            } else {
-                work.shape.cpus as u16
-            },
-            memory_mib: if work.shape.memory_mib == 0 {
-                4096
-            } else {
-                work.shape.memory_mib
-            },
-            storage_gib: if work.shape.disk_gib == 0 {
-                20
-            } else {
-                work.shape.disk_gib
-            },
+            cpus: shape.cpus as u16,
+            memory_mib: shape.memory_mib,
+            storage_gib: shape.disk_gib,
             overlay_gib: option("overlay_gib").and_then(|v| v.parse().ok()),
             network: network(&work.network),
             // The host agent admitted these paths against its allowlist
@@ -1022,6 +1041,52 @@ exit 0
 
     fn driver(directory: &tempfile::TempDir) -> SmolvmDriver {
         SmolvmDriver::new(SmolVmProvider::new(directory.path().join("smolvm")), 0)
+    }
+
+    #[tokio::test]
+    async fn a_cold_create_without_a_shape_uses_the_advertised_defaults() {
+        let (directory, _executable) = fake_smolvm();
+        let driver = driver(&directory);
+        let defaults = driver.capabilities().default_shape;
+        assert_eq!(
+            defaults,
+            Shape {
+                cpus: 2,
+                memory_mib: 4096,
+                disk_gib: 20,
+            }
+        );
+        let work = CreateWork {
+            sandbox_id: "sbx-default".into(),
+            driver: NAME.into(),
+            template: Template {
+                spec: TemplateSpec {
+                    name: "alpine".into(),
+                    os: "linux".into(),
+                    image: Some("alpine:3.20".into()),
+                    ..TemplateSpec::default()
+                },
+                ..Template::default()
+            },
+            ..CreateWork::default()
+        };
+
+        driver.create(&work).await.unwrap();
+
+        let calls = calls(&directory.path().join("smolvm"));
+        let create = index_of(&calls, "create").expect("machine create");
+        let args = &calls[create].1;
+        for (flag, value) in [
+            ("--cpus", defaults.cpus.to_string()),
+            ("--mem", defaults.memory_mib.to_string()),
+            ("--storage", defaults.disk_gib.to_string()),
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == flag && pair[1] == value),
+                "create must pass {flag} {value}: {args:?}"
+            );
+        }
     }
 
     #[tokio::test]
