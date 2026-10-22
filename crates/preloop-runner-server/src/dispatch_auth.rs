@@ -691,7 +691,7 @@ fn looks_like_app_jwt(token: &str) -> bool {
 /// XOR accumulation over the fixed-size digests): never short-circuits on
 /// the first differing byte, and the digest step means a length difference
 /// cannot leak early either.
-fn constant_time_eq(left: &str, right: &str) -> bool {
+pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<sha2::Sha256>;
     let digest = |value: &str| {
