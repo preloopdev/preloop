@@ -1516,3 +1516,133 @@ pub(crate) struct NewArtifactRow {
     pub(crate) storage_key: String,
     pub(crate) size_bytes: i64,
 }
+
+// ── Code-scanning SARIF ─────────────────────────────────────────────────
+
+/// Where a SARIF analysis came from: the GitHub code-scanning shim
+/// (`/repos/{owner}/{repo}/code-scanning/…`) or the native run API
+/// (`/api/v1/runs/{run_id}/sarif`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SarifAnalysisSource {
+    Github,
+    Api,
+}
+
+impl SarifAnalysisSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+            Self::Api => "api",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "github" => Some(Self::Github),
+            "api" => Some(Self::Api),
+            _ => None,
+        }
+    }
+}
+
+/// Processing state of one analysis. Uploads are parsed synchronously, so a
+/// stored analysis is `complete` or `failed`; `pending` is reserved for an
+/// asynchronous processor that this build does not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SarifAnalysisStatus {
+    Pending,
+    Complete,
+    Failed,
+}
+
+impl SarifAnalysisStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "complete" => Some(Self::Complete),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One stored SARIF analysis. `storage_key` addresses the raw document in the
+/// run-scoped file store; `dedupe_key` is the content fingerprint that makes
+/// a re-upload of the same tool/commit/ref/findings set idempotent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SarifAnalysisRecord {
+    pub(crate) analysis_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) repository: String,
+    pub(crate) commit_sha: String,
+    pub(crate) git_ref: String,
+    pub(crate) tool_name: String,
+    pub(crate) source: SarifAnalysisSource,
+    pub(crate) status: SarifAnalysisStatus,
+    /// Job UUID that uploaded it, or `system`.
+    pub(crate) uploader: String,
+    pub(crate) dedupe_key: String,
+    pub(crate) storage_key: String,
+    /// Compressed (base64-decoded gzip) upload size.
+    pub(crate) size_bytes: i64,
+    /// Decompressed SARIF document size.
+    pub(crate) raw_size_bytes: i64,
+    pub(crate) finding_count: i64,
+    pub(crate) errors: Option<String>,
+    pub(crate) checkout_uri: Option<String>,
+    pub(crate) analysis_key: Option<String>,
+    pub(crate) environment: Option<String>,
+    pub(crate) started_at: Option<String>,
+    pub(crate) created_at_us: i64,
+    pub(crate) completed_at_us: Option<i64>,
+}
+
+/// An analysis to persist. `status` is always `complete` for a synchronous
+/// parse; the row's `completed_at` is stamped from the write's clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewSarifAnalysis {
+    pub(crate) analysis_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) repository: String,
+    pub(crate) commit_sha: String,
+    pub(crate) git_ref: String,
+    pub(crate) tool_name: String,
+    pub(crate) source: SarifAnalysisSource,
+    pub(crate) uploader: String,
+    pub(crate) dedupe_key: String,
+    pub(crate) storage_key: String,
+    pub(crate) size_bytes: i64,
+    pub(crate) raw_size_bytes: i64,
+    pub(crate) finding_count: i64,
+    pub(crate) errors: Option<String>,
+    pub(crate) checkout_uri: Option<String>,
+    pub(crate) analysis_key: Option<String>,
+    pub(crate) environment: Option<String>,
+    pub(crate) started_at: Option<String>,
+}
+
+/// One normalized SARIF result: what a UI or check annotation renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SarifFinding {
+    pub(crate) fingerprint: String,
+    pub(crate) tool_name: String,
+    pub(crate) rule_id: Option<String>,
+    pub(crate) rule_name: Option<String>,
+    pub(crate) level: String,
+    pub(crate) message: String,
+    pub(crate) path: Option<String>,
+    pub(crate) start_line: Option<i64>,
+    pub(crate) end_line: Option<i64>,
+    pub(crate) start_column: Option<i64>,
+    pub(crate) end_column: Option<i64>,
+    pub(crate) partial_fingerprint: Option<String>,
+    pub(crate) suppression: Option<String>,
+}

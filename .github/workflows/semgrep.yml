@@ -1,0 +1,62 @@
+name: semgrep
+
+# PR-time rule scanning. CodeQL runs on main (see codeql.yml); Semgrep is the
+# fast, self-contained gate because it needs no GitHub code-scanning backend.
+# Findings are reported through the step exit (--error) and the SARIF artifact;
+# Preloop does not ingest SARIF into a dashboard yet.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semgrep-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: Semgrep
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned Semgrep
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input semgrep==1.182.0
+
+      - name: Scan
+        run: |
+          set -euo pipefail
+          semgrep scan \
+            --config=p/github-actions \
+            --config=p/secrets \
+            --exclude=benchmarks \
+            --exclude=docs \
+            --exclude=fixtures \
+            --exclude=experiments \
+            --exclude=.runner-watch \
+            --exclude-rule=yaml.github-actions.security.audit.unsafe-add-mask-workflow-command.unsafe-add-mask-workflow-command \
+            --sarif --output=semgrep.sarif \
+            --metrics=off --disable-version-check \
+            --error
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: ignore
+          retention-days: 14
