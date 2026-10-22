@@ -43,7 +43,6 @@ Releases before v0.27.0 predate the changelog.
   removed; the runner pool no longer pushes VM identities into telemetry.
 
 ### Added
-
 - **Code-scanning SARIF ingestion.** `github/codeql-action/upload-sarif` now
   completes on an engine-hosted run: the GitHub shim serves the legacy
   `POST /api/v3/repos/{owner}/{repo}/code-scanning/sarifs` upload, the
@@ -68,6 +67,16 @@ Releases before v0.27.0 predate the changelog.
   `2026102101`). Re-uploads dedupe on a content fingerprint over the
   repository, commit, ref, tool and sorted finding fingerprints — not on raw
   bytes — so the same analysis is returned instead of stored twice.
+
+### Changed
+
+- **CI's `/api/v1/status` `vms` section and host-memory-pressure conditions
+  now come from the Sandbox Service.** They are built from the service's
+  `Stats` inventory — sandboxes across registered providers, plus the pool
+  provider's latest host sample and sample age — instead of sampling the
+  engine process and reading a pool-fed VM telemetry registry.
+  `VmTelemetryRegistry`, `VmRuntimeInfo`, and `build_fleet_snapshot` are
+  removed; the runner pool no longer pushes VM identities into telemetry.
 
 ### Security
 
