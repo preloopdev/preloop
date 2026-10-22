@@ -224,14 +224,11 @@ fn pg_tls(url: &str) -> Result<Option<postgres_rustls::MakeTlsConnector>> {
     if !secure {
         return Ok(None);
     }
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().certs {
         roots.add(cert).map_err(db_error)?;
     }
-    let mut config = rustls::ClientConfig::builder()
+    let mut config = crate::tls::client_config_builder()?
         .with_root_certificates(roots)
         .with_no_client_auth();
     postgres_rustls::set_postgresql_alpn(&mut config);
