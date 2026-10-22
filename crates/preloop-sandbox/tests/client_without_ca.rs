@@ -54,5 +54,34 @@ async fn a_client_without_a_ca_reports_an_untrusted_certificate() {
         "{}",
         preloop_sandbox::error::message(&error)
     );
+    // B4: without a configured CA, nothing could have gone stale, so the
+    // message must not send the caller to re-enroll.
+    assert!(
+        !preloop_sandbox::error::message(&error).contains("re-enroll"),
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
     handshake.await.unwrap();
+}
+
+/// B2: an unparseable base URL must fail the constructor, not silently dial
+/// a hardcoded default.
+#[test]
+fn an_unparseable_base_url_is_rejected() {
+    let error = match SandboxClient::new("not a url", Some("token".to_owned())) {
+        Ok(_) => panic!("an unparseable base URL must not build a client"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, Code::InvalidArgument);
+}
+
+/// B3: a token with bytes that cannot be an HTTP header value must fail the
+/// constructor rather than silently drop the Authorization header.
+#[test]
+fn a_token_with_invalid_header_bytes_is_rejected() {
+    let error = match SandboxClient::new("https://127.0.0.1:9191", Some("bad\ntoken".to_owned())) {
+        Ok(_) => panic!("a token that cannot be a header value must not build a client"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, Code::InvalidArgument);
 }
