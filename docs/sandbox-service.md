@@ -63,7 +63,10 @@ Capabilities decide placement; nothing branches on driver names. A request no
 registered provider can satisfy fails with the unmet requirement named
 (`no provider satisfies template "mac": host/smolvm: os=macos`), and an
 operation a backend does not declare (`Pause`, `Snapshot`) fails with
-`failed_precondition` instead of being emulated. `one_shot` backends run one
+`failed_precondition` instead of being emulated. A cordon is an operator
+choice, not a lost provider: an acquire only a cordoned provider could serve
+fails at once with `failed_precondition` naming the cordon rather than waiting
+and reporting "no provider is online". `one_shot` backends run one
 command per sandbox; callers needing several execs require `multi_exec`.
 
 ## Drivers
@@ -107,8 +110,10 @@ directory: tickets live only in memory, so no restart can claim them.
 `List`, `ListTemplates`, `ListPools` and `ListProviders` are paginated.
 `pageSize` defaults to 100 and is capped at 1000; `nextPageToken` from a
 response is passed back as `pageToken`. Items are ordered by id, and the token
-is an opaque encoding of the last id. `SandboxClient` follows the tokens, so
-the in-process and network APIs still return complete lists.
+is an opaque encoding of the last id. A token this service did not mint (or
+one minted for a different listing) is `invalid_argument`, never a silent
+restart from the first page. `SandboxClient` follows the tokens, so the
+in-process and network APIs still return complete lists.
 
 ## State
 

@@ -138,14 +138,18 @@ pub fn template_digest(spec: &TemplateSpec) -> String {
 
 /// Page `items` (already ordered by id) as the request asks.
 ///
-/// The token is the base64url encoding of the last returned id: callers pass
-/// it back untouched, and an id that has since disappeared still resumes at
-/// the right position.
+/// The token is the base64url encoding of `v1:<kind>:<last returned id>`:
+/// callers pass it back untouched, an id that has since disappeared still
+/// resumes at the right position, and anything else (garbage, or a token
+/// minted for another listing) is rejected rather than silently rewinding to
+/// the first page.
 fn paginate<T>(
+    kind: &str,
     items: impl IntoIterator<Item = (String, T)>,
     request: &ListRequest,
 ) -> Result<(Vec<T>, String)> {
     use base64::Engine as _;
+    const PREFIX: &str = "v1";
     let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let limit = match request.page_size {
         0 => DEFAULT_PAGE_SIZE,
@@ -157,7 +161,17 @@ fn paginate<T>(
         let decoded = engine
             .decode(request.page_token.as_bytes())
             .map_err(|_| Error::invalid("invalid page token"))?;
-        Some(String::from_utf8(decoded).map_err(|_| Error::invalid("invalid page token"))?)
+        let decoded =
+            String::from_utf8(decoded).map_err(|_| Error::invalid("invalid page token"))?;
+        let (token_kind, id) = decoded
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .and_then(|rest| rest.split_once(':'))
+            .ok_or_else(|| Error::invalid("invalid page token"))?;
+        if token_kind != kind || id.is_empty() {
+            return Err(Error::invalid("invalid page token"));
+        }
+        Some(id.to_owned())
     };
     let items: Vec<(String, T)> = items.into_iter().collect();
     let start = after
@@ -168,7 +182,7 @@ fn paginate<T>(
     for (id, item) in items.into_iter().skip(start) {
         if page.len() == limit {
             let token = last.expect("a full page has a last id");
-            return Ok((page, engine.encode(token)));
+            return Ok((page, engine.encode(format!("{PREFIX}:{kind}:{token}"))));
         }
         last = Some(id);
         page.push(item);
@@ -684,6 +698,7 @@ impl Service {
     pub fn list_templates_page(&self, request: &ListRequest) -> Result<ListTemplatesResponse> {
         let state = self.state.lock();
         let (templates, next_page_token) = paginate(
+            "template",
             state
                 .templates
                 .iter()
@@ -726,6 +741,7 @@ impl Service {
     pub fn list_pools_page(&self, request: &ListRequest) -> Result<ListPoolsResponse> {
         let state = self.state.lock();
         let (pools, next_page_token) = paginate(
+            "pool",
             state
                 .pools
                 .iter()
@@ -808,7 +824,7 @@ impl Service {
                 if state.providers.is_empty() {
                     return Ok(());
                 }
-                self.place(state, &placement, false).map(|_| ())
+                self.place_with(state, &placement, false, false).map(|_| ())
             }
             Err(_) => Ok(()),
         }
@@ -822,6 +838,21 @@ impl Service {
         placement: &Placement,
         require_online: bool,
     ) -> Result<(String, String)> {
+        self.place_with(state, placement, require_online, true)
+    }
+
+    /// `place`, optionally honouring cordons.
+    ///
+    /// `PutPool` validates with cordons ignored: a cordon is transient, so a
+    /// pool whose only capable provider is cordoned is still valid
+    /// configuration once that provider is uncordoned.
+    fn place_with(
+        &self,
+        state: &State,
+        placement: &Placement,
+        require_online: bool,
+        respect_cordon: bool,
+    ) -> Result<(String, String)> {
         let template = &placement.template;
         let requires = &placement.requires;
         let os = if requires.os.is_empty() {
@@ -831,11 +862,9 @@ impl Service {
         };
         let mut unmet = Vec::new();
         let mut full = false;
+        let mut cordoned: Vec<&str> = Vec::new();
         let mut best: Option<(usize, String, String)> = None;
         for (provider_id, rec) in &state.providers {
-            if rec.provider.cordoned {
-                continue;
-            }
             if require_online && rec.seen.elapsed() > self.config.provider_timeout {
                 continue;
             }
@@ -843,6 +872,8 @@ impl Service {
             if !template.native_ref.is_empty() && template.provider_id != *provider_id {
                 continue;
             }
+            let is_cordoned = respect_cordon && rec.provider.cordoned;
+            let mut capable = false;
             for driver in &rec.provider.drivers {
                 let caps = &driver.capabilities;
                 let mut reasons = Vec::new();
@@ -891,12 +922,20 @@ impl Service {
                     }
                 }
                 if !reasons.is_empty() {
-                    unmet.push(format!(
-                        "{}/{}: {}",
-                        rec.provider.name,
-                        driver.driver,
-                        reasons.join(", ")
-                    ));
+                    // A cordoned provider's gaps did not decide the
+                    // placement, so keep them out of the unmet list.
+                    if !is_cordoned {
+                        unmet.push(format!(
+                            "{}/{}: {}",
+                            rec.provider.name,
+                            driver.driver,
+                            reasons.join(", ")
+                        ));
+                    }
+                    continue;
+                }
+                capable = true;
+                if is_cordoned {
                     continue;
                 }
                 let live = state
@@ -916,6 +955,9 @@ impl Service {
                     best = Some((live, provider_id.clone(), driver.driver.clone()));
                 }
             }
+            if is_cordoned && capable {
+                cordoned.push(rec.provider.name.as_str());
+            }
         }
         match best {
             Some((_, provider, driver)) => Ok((provider, driver)),
@@ -923,6 +965,12 @@ impl Service {
                 Code::ResourceExhausted,
                 "every matching provider is at capacity",
             )),
+            // Every provider that could have taken this placement is
+            // cordoned: waiting cannot help, and "not online" is wrong.
+            None if !cordoned.is_empty() => Err(Error::precondition(match cordoned.as_slice() {
+                [name] => format!("provider {name} is cordoned"),
+                names => format!("providers {} are cordoned", names.join(", ")),
+            })),
             None if unmet.is_empty() => Err(Error::unavailable(
                 "no provider is online for this template",
             )),
@@ -1450,6 +1498,7 @@ impl Service {
     pub fn list_page(&self, request: &ListRequest) -> Result<ListSandboxesResponse> {
         let state = self.state.lock();
         let (sandboxes, next_page_token) = paginate(
+            "sandbox",
             state
                 .sandboxes
                 .iter()
@@ -1476,6 +1525,7 @@ impl Service {
     pub fn list_providers_page(&self, request: &ListRequest) -> Result<ListProvidersResponse> {
         let state = self.state.lock();
         let (providers, next_page_token) = paginate(
+            "provider",
             state
                 .providers
                 .iter()
@@ -2620,18 +2670,23 @@ mod tests {
             .collect()
     }
 
+    fn encode_token(token: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token)
+    }
+
     #[test]
     fn pages_are_ordered_and_carry_a_token_until_exhausted() {
         let mut request = ListRequest::default();
-        let (page, token) = paginate(items(250), &request).unwrap();
+        let (page, token) = paginate("widget", items(250), &request).unwrap();
         assert_eq!(page, (0..100usize).collect::<Vec<_>>());
         assert!(!token.is_empty());
         request.page_token = token;
-        let (page, token) = paginate(items(250), &request).unwrap();
+        let (page, token) = paginate("widget", items(250), &request).unwrap();
         assert_eq!(page, (100..200usize).collect::<Vec<_>>());
         assert!(!token.is_empty());
         request.page_token = token;
-        let (page, token) = paginate(items(250), &request).unwrap();
+        let (page, token) = paginate("widget", items(250), &request).unwrap();
         assert_eq!(page, (200..250usize).collect::<Vec<_>>());
         assert!(token.is_empty());
     }
@@ -2642,14 +2697,68 @@ mod tests {
             page_size: 5000,
             page_token: String::new(),
         };
-        let (page, _) = paginate(items(1500), &request).unwrap();
+        let (page, _) = paginate("widget", items(1500), &request).unwrap();
         assert_eq!(page.len(), MAX_PAGE_SIZE as usize);
 
         let request = ListRequest {
             page_token: "not base64!".into(),
             ..ListRequest::default()
         };
-        let error = paginate(items(3), &request).unwrap_err();
+        let error = paginate("widget", items(3), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument);
+    }
+
+    #[test]
+    fn a_bogus_page_token_is_rejected_instead_of_restarting_at_page_one() {
+        // `base64url("not-a-sandbox")`, the token the end-to-end run used.
+        let request = ListRequest {
+            page_size: 2,
+            page_token: "bm90LWEtc2FuZGJveA".into(),
+        };
+        let error = paginate("sandbox", items(4), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+
+        // A cursor minted for another listing is not a cursor for this one.
+        let first = ListRequest {
+            page_size: 2,
+            page_token: String::new(),
+        };
+        let (_, token) = paginate("template", items(4), &first).unwrap();
+        let request = ListRequest {
+            page_size: 2,
+            page_token: token,
+        };
+        let error = paginate("sandbox", items(4), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+    }
+
+    #[test]
+    fn a_token_whose_id_disappeared_still_resumes_after_it() {
+        let request = ListRequest {
+            page_size: 2,
+            page_token: String::new(),
+        };
+        let (_, token) = paginate("widget", items(4), &request).unwrap();
+        // The token names `id-0001`, which is gone by the second page.
+        let remaining: Vec<_> = items(4)
+            .into_iter()
+            .filter(|(id, _)| id != "id-0001")
+            .collect();
+        let request = ListRequest {
+            page_size: 2,
+            page_token: token,
+        };
+        let (page, _) = paginate("widget", remaining, &request).unwrap();
+        assert_eq!(page, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_page_token_with_a_missing_value_is_rejected() {
+        let request = ListRequest {
+            page_token: encode_token("v1:sandbox:"),
+            ..ListRequest::default()
+        };
+        let error = paginate("sandbox", items(3), &request).unwrap_err();
         assert_eq!(error.code, Code::InvalidArgument);
     }
 }

@@ -1074,17 +1074,23 @@ async fn cordoned_provider_receives_no_placements() {
     let records = store.load(Kind::Providers).await.unwrap();
     assert!(records[0]["cordoned"].as_bool().unwrap_or(false));
 
-    let error = h
-        .service
-        .acquire(AcquireRequest {
+    // A cordon is not transient: fail at once, naming it, rather than
+    // waiting out the window and claiming the provider is offline.
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        h.service.acquire(AcquireRequest {
             idempotency_key: "cordoned".into(),
             template: "alpine".into(),
-            wait_secs: Some(0),
+            wait_secs: Some(30),
             ..AcquireRequest::default()
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, Code::Unavailable, "{}", error.message);
+        }),
+    )
+    .await
+    .expect("a cordoned provider must not be waited for")
+    .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", error.message);
+    assert!(error.message.contains(&name), "{}", error.message);
+    assert!(error.message.contains("cordoned"), "{}", error.message);
     assert!(h.fake.inventory().await.unwrap().is_empty());
 
     let provider = h.service.set_provider_cordon(&name, false).await.unwrap();
@@ -1099,6 +1105,31 @@ async fn cordoned_provider_receives_no_placements() {
         .await
         .unwrap();
     assert_eq!(lease.sandbox.state, SandboxState::Leased);
+}
+
+#[tokio::test]
+async fn a_pool_whose_only_capable_provider_is_cordoned_still_validates() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let name = h.service.list_providers()[0].name.clone();
+    h.service.set_provider_cordon(&name, true).await.unwrap();
+
+    // A cordon is transient, so it must not reject the pool as impossible.
+    h.service
+        .put_pool(PoolSpec {
+            name: "linux".into(),
+            template: "alpine".into(),
+            warm: 1,
+            max: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .expect("a cordoned provider is still a valid pool target");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(h.service.list().is_empty(), "no fill while cordoned");
+
+    h.service.set_provider_cordon(&name, false).await.unwrap();
+    wait_for(|| h.service.list().len() == 1).await;
 }
 
 #[tokio::test]
@@ -1277,6 +1308,31 @@ async fn list_pagination_round_trips_across_250_items() {
     let mut sorted = names.clone();
     sorted.sort();
     assert_eq!(names, sorted);
+
+    // A bogus token is rejected instead of silently restarting at page one.
+    let error = service
+        .list_templates_page(&ListRequest {
+            page_size: 100,
+            page_token: "bm90LWEtc2FuZGJveA".into(),
+        })
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+
+    // A token minted for another listing is not a cursor for this one.
+    let foreign = service
+        .list_templates_page(&ListRequest {
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .unwrap()
+        .next_page_token;
+    let error = service
+        .list_pools_page(&ListRequest {
+            page_size: 100,
+            page_token: foreign,
+        })
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
 
     // The network client follows the same tokens.
     let base = serve(service).await;
