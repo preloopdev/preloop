@@ -823,6 +823,13 @@ pub(super) fn promote_run(
     let resolver = backend.environment_resolver();
     loop {
         let mut settled = false;
+        // Folding is normally triggered by completion, but promotion can be
+        // the terminal path too: an expanded callee may be rejected before
+        // it ever reaches a runner. The first pass also catches failures
+        // recorded while expansion was being registered.
+        if !super::dispatch::finalize_reusable_callers(tx, backend, run_id)?.is_empty() {
+            settled = true;
+        }
         // Candidates in job_order: declared needs drained (remaining_needs
         // is the fast-path bound; the decision recomputes from statuses).
         let candidates: Vec<JobRow> = {
@@ -840,7 +847,10 @@ pub(super) fn promote_run(
             rows.collect::<Result<Vec<_>, _>>().map_err(db)?
         };
         if candidates.is_empty() {
-            return Ok(());
+            if !settled {
+                return Ok(());
+            }
+            continue;
         }
         let platforms = jobs::registered_platforms(tx)?;
         let pool_labels = backend.pool_labels();
@@ -1088,6 +1098,9 @@ pub(super) fn promote_run(
                 // Wait, or Run-but-over-max-parallel: stays blocked.
                 _ => {}
             }
+        }
+        if !super::dispatch::finalize_reusable_callers(tx, backend, run_id)?.is_empty() {
+            settled = true;
         }
         if !settled {
             return Ok(());

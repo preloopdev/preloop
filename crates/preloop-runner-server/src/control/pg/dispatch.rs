@@ -2764,7 +2764,11 @@ impl<'a> Sweep<'a> {
     /// dependencies.
     pub(super) async fn sweep(&mut self) -> Result<(), ControlError> {
         loop {
-            let mut settled = false;
+            // `concluded` grows on every terminal transition — decide-driven
+            // skips AND settles buried inside `promote` (label rejection,
+            // failed jobset advance, a folded reusable caller). Any of them
+            // can free downstream needs, so growth means re-scan.
+            let concluded_before = self.concluded.len();
             let candidates: Vec<(RunId, JobId)> = self
                 .graphs
                 .iter()
@@ -2793,12 +2797,11 @@ impl<'a> Sweep<'a> {
                             ExecutionStatus::Failure
                         };
                         self.settle_node(run_id, &job_id, status).await?;
-                        settled = true;
                     }
                     DependencyDecision::Wait => {}
                 }
             }
-            if !settled {
+            if self.concluded.len() == concluded_before {
                 return Ok(());
             }
         }
@@ -3222,6 +3225,7 @@ impl<'a> Sweep<'a> {
         tx: &Transaction<'_>,
         run_id: RunId,
         inner_job_id: &JobId,
+        graph: Option<&RunGraph>,
     ) -> Result<Option<JobId>, ControlError> {
         let run = run_id.0.to_string();
         // Candidate callers: every spec row whose reusable metadata lists the
@@ -3254,16 +3258,22 @@ impl<'a> Sweep<'a> {
             if !meta.inner_job_ids.iter().any(|id| id == &inner_job_id.0) {
                 continue;
             }
-            // Already folded (the resolved outputs are the fold's marker).
-            let folded: bool = tx
-                .query_one(
-                    "SELECT outputs IS NOT NULL FROM jobs \
-                     WHERE run_id=$1::text::uuid AND job_id=$2",
-                    &[&run, &caller_id],
-                )
-                .await
-                .map_err(db)?
-                .get(0);
+            // Already folded (the resolved outputs are the fold's marker). A
+            // sweep in flight has the fresher answer: it marks the node
+            // before the graph flushes to SQL.
+            let caller_job = JobId(caller_id.clone());
+            let folded: bool = match graph.and_then(|g| g.nodes.get(&caller_job)) {
+                Some(node) => node.outputs.is_some(),
+                None => tx
+                    .query_one(
+                        "SELECT outputs IS NOT NULL FROM jobs \
+                         WHERE run_id=$1::text::uuid AND job_id=$2",
+                        &[&run, &caller_id],
+                    )
+                    .await
+                    .map_err(db)?
+                    .get(0),
+            };
             if folded {
                 continue;
             }
@@ -3285,6 +3295,19 @@ impl<'a> Sweep<'a> {
                     row.get::<_, String>(0),
                     (status, row.get::<_, Option<String>>(2)),
                 );
+            }
+            // Inside a sweep the loaded graph is ahead of SQL: settled nodes
+            // carry terminal status/outputs in memory until flush. Override
+            // the SQL rows so a callee settled moments ago still folds.
+            if let Some(graph) = graph {
+                for inner_id in &meta.inner_job_ids {
+                    if let Some(node) = graph.nodes.get(&JobId(inner_id.clone())) {
+                        by_id.insert(
+                            inner_id.clone(),
+                            (node.status, node.outputs.as_ref().map(|v| v.to_string())),
+                        );
+                    }
+                }
             }
             let all_complete = !meta.inner_job_ids.is_empty()
                 && meta.inner_job_ids.iter().all(|id| {
@@ -3381,6 +3404,102 @@ impl<'a> Sweep<'a> {
             return Ok(Some(JobId(caller_id)));
         }
         Ok(None)
+    }
+    /// Fold a terminal callee through every reusable caller above it and
+    /// mirror the SQL fold into the loaded graph used by the promotion sweep.
+    async fn fold_reusable_callers(
+        &mut self,
+        run_id: RunId,
+        seed: &JobId,
+    ) -> Result<Vec<JobId>, ControlError> {
+        let mut current = seed.clone();
+        let mut folded = Vec::new();
+        while let Some(caller) = Self::try_fold_reusable_caller(
+            self.backend,
+            self.tx,
+            run_id,
+            &current,
+            self.graphs.get(&run_id),
+        )
+        .await?
+        {
+            let row = self
+                .tx
+                .query_one(
+                    "SELECT status, outputs::text, base_id FROM jobs \
+                     WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run_id.0.to_string(), &caller.0],
+                )
+                .await
+                .map_err(db)?;
+            let status = crate::control::types::status_parse(row.get::<_, String>(0).as_str());
+            let now = self.now;
+            let output_map = row.get::<_, Option<String>>(1).and_then(|text| {
+                serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&text).ok()
+            });
+            if let Some(graph) = self.graphs.get_mut(&run_id) {
+                if let Some(node) = graph.nodes.get_mut(&caller) {
+                    node.status = status;
+                    node.queue_state = logic::QueueState::None;
+                    node.outputs = output_map
+                        .clone()
+                        .map(|outputs| serde_json::to_value(outputs).unwrap_or_default());
+                    node.completed_at_us.get_or_insert(now);
+                }
+                if let Some(outputs) = output_map {
+                    graph.record.job_outputs.insert(caller.clone(), outputs);
+                }
+                rebuild_jobs(graph);
+                let status_by_id: BTreeMap<JobId, (ExecutionStatus, String, bool)> = graph
+                    .nodes
+                    .iter()
+                    .map(|(id, node)| {
+                        (
+                            id.clone(),
+                            (
+                                node.status,
+                                node.base_id.clone(),
+                                node.kind == NodeKind::MatrixParent && node.has_children,
+                            ),
+                        )
+                    })
+                    .collect();
+                for node in graph.nodes.values_mut() {
+                    if node.status.is_terminal() || node.queue_state == logic::QueueState::None {
+                        continue;
+                    }
+                    node.remaining_needs = node
+                        .needs
+                        .iter()
+                        .map(|need| {
+                            status_by_id
+                                .values()
+                                .filter(|(status, base, expanded)| {
+                                    !*expanded && !status.is_terminal() && (base == &need.0)
+                                })
+                                .count() as i32
+                        })
+                        .sum();
+                    if node.remaining_needs <= 0 {
+                        node.deps_ready_at_us = Some(now);
+                    }
+                }
+                graph.touched = true;
+            }
+            self.mark(run_id, &caller);
+            self.outcome.push(status, run_id, caller.clone());
+            self.concluded.push((caller.clone(), status));
+            emit_outbox(
+                self.tx,
+                Some(run_id),
+                "job.completed.v1",
+                serde_json::json!({"job_id": caller.0, "status": status_str(status)}),
+            )
+            .await?;
+            folded.push(caller.clone());
+            current = caller;
+        }
+        Ok(folded)
     }
 
     /// Cancel a failed leg's matrix siblings (fail-fast). Returns the IDs of
@@ -3489,6 +3608,9 @@ impl<'a> Sweep<'a> {
             retire_node_requests(self.tx, run_id, job_id, Retirement::Settle(status)).await?;
         }
         clear_assignment(self.tx, run_id, job_id).await?;
+        // Promotion/expansion failures settle through this path too; fold
+        // any reusable caller before scanning its downstream dependents.
+        self.fold_reusable_callers(run_id, job_id).await?;
         // Dependents' `remaining_needs` recompute. A declared need matches a
         // job id or its matrix base, and an expanded matrix parent is replaced
         // by its legs — so the fast-path counter cannot be decremented per
@@ -6746,7 +6868,8 @@ impl PgBackend {
         }
         // 4. Reusable caller fold, walking up nested callers.
         let mut current = job_id.clone();
-        while let Some(caller) = Sweep::try_fold_reusable_caller(self, tx, run_id, &current).await?
+        while let Some(caller) =
+            Sweep::try_fold_reusable_caller(self, tx, run_id, &current, None).await?
         {
             current = caller.clone();
             outcome.folded_callers.push(caller);
@@ -7351,6 +7474,41 @@ impl PgBackend {
                 let registered = self
                     .register_expansion_jobs(&tx, &mut sweep, run_id, &caller_id, jobs)
                     .await?;
+                // Persist the metadata envelope before folding. Expanded
+                // callee rows are inserted with only their call plan; SQL
+                // reloads otherwise cannot discover the caller/inner edge.
+                let fold_seeds: Vec<JobId> = reusable_calls
+                    .values()
+                    .flat_map(|meta| meta.inner_job_ids.iter().cloned().map(JobId))
+                    .collect();
+                for (job_id, meta) in &reusable_calls {
+                    let Some(row) = tx
+                        .query_opt(
+                            "SELECT reusable_call::text FROM job_specs \
+                             WHERE run_id=$1::text::uuid AND job_id=$2",
+                            &[&run_id.0.to_string(), job_id],
+                        )
+                        .await
+                        .map_err(db)?
+                    else {
+                        continue;
+                    };
+                    let Some(mut spec) = serde_json::from_str::<super::graph::ReusableNodeSpec>(
+                        row.get::<_, String>(0).as_str(),
+                    )
+                    .ok() else {
+                        continue;
+                    };
+                    spec.meta = Some(meta.clone());
+                    let encoded = serde_json::to_string(&spec).map_err(ControlError::backend)?;
+                    tx.execute(
+                        "UPDATE job_specs SET reusable_call=$3::text::jsonb \
+                         WHERE run_id=$1::text::uuid AND job_id=$2",
+                        &[&run_id.0.to_string(), job_id, &encoded],
+                    )
+                    .await
+                    .map_err(db)?;
+                }
                 if let Some(node) = sweep.node_mut(run_id, &caller_id) {
                     node.status = ExecutionStatus::InProgress;
                     node.queue_state = logic::QueueState::None;
@@ -7370,6 +7528,9 @@ impl PgBackend {
                 if let Some(graph) = sweep.graphs.get_mut(&run_id) {
                     rebuild_jobs(graph);
                     graph.touched = true;
+                }
+                for seed in fold_seeds {
+                    sweep.fold_reusable_callers(run_id, &seed).await?;
                 }
                 sweep.mark(run_id, &caller_id);
                 debug_assert_eq!(registered, job_count);
@@ -7524,9 +7685,17 @@ impl PgBackend {
             insert_spec_rows(tx, graph, &node, &job_id, None).await?;
             if node.queue_state == logic::QueueState::None {
                 // Unhostable: the placeholder request is retired, none minted.
+                // The node still joins the graph so `settle_node` can record
+                // its conclusion, fold a reusable caller, and leave the leg
+                // visible in `record.jobs`.
+                let graph = sweep.graphs.get_mut(&run_id).expect("loaded");
+                graph.nodes.insert(job_id.clone(), node);
+                graph.touched = true;
+                sweep.mark(run_id, &job_id);
                 sweep
                     .settle_node(run_id, &job_id, ExecutionStatus::Failure)
                     .await?;
+                registered += 1;
                 continue;
             }
             let (message, secret_names) = {

@@ -5783,6 +5783,185 @@ pub(crate) mod suite {
         );
     }
 
+    /// A callee rejected during promotion must still fold its reusable caller:
+    /// the caller fails, its ordinary `needs` dependent skips, and the run
+    /// reaches a terminal conclusion on both control backends.
+    pub(crate) async fn reusable_caller_folds_after_promotion_failure(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut child = submit_job(run_id, "caller/inner", 2);
+        child.queued.needs = vec![JobId("gen".to_owned())];
+        child.queued.runs_on = vec!["windows-latest".to_owned()];
+        let mut caller = submit_job(run_id, "caller", 3);
+        caller.queued.reusable_call = Some(preloop_gha_protocol::ReusableCallPlan {
+            uses: "./.github/workflows/callee.yml".to_owned(),
+            workflow_file: "callee.yml".to_owned(),
+            workflow_sha: None,
+            workflow_repository: None,
+            depth: 1,
+        });
+        let mut dependent = submit_job(run_id, "dependent", 4);
+        dependent.queued.needs = vec![JobId("caller".to_owned())];
+        let mut submit = submit_run(
+            run_id,
+            vec![submit_job(run_id, "gen", 1), child, caller, dependent],
+        );
+        submit.record.caller_plans.insert(
+            JobId("caller".to_owned()),
+            serde_json::from_value(serde_json::json!({
+                "id": "caller",
+                "base_id": "caller",
+                "name": "caller",
+                "runs_on": ["self-hosted"],
+            }))
+            .expect("caller plan"),
+        );
+        submit.record.reusable_calls.insert(
+            "caller".to_owned(),
+            preloop_gha_parser::ReusableCallMetadata {
+                caller_job_id: "caller".to_owned(),
+                output_definitions: BTreeMap::new(),
+                inner_job_ids: vec!["caller/inner".to_owned()],
+                inputs: BTreeMap::new(),
+                caller_concurrency: None,
+                embedded_concurrency: None,
+                matrix: BTreeMap::new(),
+                if_condition: None,
+                workflow_sha: None,
+                workflow_repository: None,
+            },
+        );
+        backend.submit_run(submit).await.unwrap();
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("caller/inner".to_owned())),
+            Some(&ExecutionStatus::Failure),
+            "the unsupported promotion label fails the callee"
+        );
+        assert_eq!(
+            record.jobs.get(&JobId("caller".to_owned())),
+            Some(&ExecutionStatus::Failure),
+            "the failed callee folds its caller"
+        );
+        assert_eq!(
+            record.jobs.get(&JobId("dependent".to_owned())),
+            Some(&ExecutionStatus::Skipped),
+            "a default needs dependent skips after caller failure"
+        );
+        assert!(
+            record.status.is_terminal(),
+            "the run must complete after the fold: {:?}",
+            record.status
+        );
+    }
+
+    /// The same fold must run when expansion materializes a callee that is
+    /// immediately unhostable, before any runner request is minted.
+    pub(crate) async fn reusable_caller_folds_after_expansion_failure(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut caller = submit_job(run_id, "caller", 1);
+        caller.queued.reusable_call = Some(preloop_gha_protocol::ReusableCallPlan {
+            uses: "./.github/workflows/callee.yml".to_owned(),
+            workflow_file: "callee.yml".to_owned(),
+            workflow_sha: None,
+            workflow_repository: None,
+            depth: 1,
+        });
+        let mut dependent = submit_job(run_id, "dependent", 2);
+        dependent.queued.needs = vec![JobId("caller".to_owned())];
+        let mut submit = submit_run(run_id, vec![caller, dependent]);
+        submit.record.caller_plans.insert(
+            JobId("caller".to_owned()),
+            serde_json::from_value(serde_json::json!({
+                "id": "caller",
+                "base_id": "caller",
+                "name": "caller",
+                "runs_on": ["self-hosted"],
+            }))
+            .expect("caller plan"),
+        );
+        submit.record.reusable_calls.insert(
+            "caller".to_owned(),
+            preloop_gha_parser::ReusableCallMetadata {
+                caller_job_id: "caller".to_owned(),
+                output_definitions: BTreeMap::new(),
+                inner_job_ids: Vec::new(),
+                inputs: BTreeMap::new(),
+                caller_concurrency: None,
+                embedded_concurrency: None,
+                matrix: BTreeMap::new(),
+                if_condition: None,
+                workflow_sha: None,
+                workflow_repository: None,
+            },
+        );
+        backend.submit_run(submit).await.unwrap();
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("caller expansion lease");
+        let mut child = built_matrix_leg(run_id, "caller/inner", "caller/inner", 0, 1);
+        child.plan.runs_on = vec!["windows-latest".to_owned()];
+        let meta = preloop_gha_parser::ReusableCallMetadata {
+            caller_job_id: "caller".to_owned(),
+            output_definitions: BTreeMap::new(),
+            inner_job_ids: vec!["caller/inner".to_owned()],
+            inputs: BTreeMap::new(),
+            caller_concurrency: None,
+            embedded_concurrency: None,
+            matrix: BTreeMap::new(),
+            if_condition: None,
+            workflow_sha: None,
+            workflow_repository: None,
+        };
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Reusable {
+                    caller_id: JobId("caller".to_owned()),
+                    jobs: vec![child],
+                    reusable_calls: BTreeMap::from([("caller".to_owned(), meta)]),
+                }),
+            })
+            .await
+            .unwrap();
+
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("caller/inner".to_owned())),
+            Some(&ExecutionStatus::Failure),
+            "unhostable materialized callee must fail"
+        );
+        assert_eq!(
+            record.jobs.get(&JobId("caller".to_owned())),
+            Some(&ExecutionStatus::Failure),
+            "expansion failure must fold its caller"
+        );
+        assert_eq!(
+            record.jobs.get(&JobId("dependent".to_owned())),
+            Some(&ExecutionStatus::Skipped),
+            "dependent must skip after expansion fold"
+        );
+        assert!(record.status.is_terminal(), "run must be terminal");
+    }
+
     /// A workflow-held run's row reads `queued` — its `holder_kind = 'run'`
     /// wait row carries the logical `Pending` — so it counts with
     /// in-progress, and its parked jobs are not job-level concurrency
@@ -9761,6 +9940,22 @@ mod pg {
         suite::reusable_caller_outputs_survive_a_reload(&backend).await;
     }
 
+    #[tokio::test]
+    async fn reusable_caller_folds_after_promotion_failure() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_after_promotion_failure(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_expansion_failure() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_after_expansion_failure(&backend).await;
+    }
+
     /// Pool assignments on: the pairing path only runs in that mode.
     #[tokio::test]
     async fn pairing_marks_runner_pool_proven() {
@@ -11739,6 +11934,18 @@ mod lite {
     #[tokio::test]
     async fn reusable_caller_outputs_survive_a_reload() {
         suite::reusable_caller_outputs_survive_a_reload(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_promotion_failure() {
+        suite::reusable_caller_folds_after_promotion_failure(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_expansion_failure() {
+        suite::reusable_caller_folds_after_expansion_failure(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]

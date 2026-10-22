@@ -275,6 +275,11 @@ impl LiteBackend {
                     }
                 };
                 starve_job(tx, job.run_id, &job.job_id)?;
+                // Starvation is a terminal path just like runner completion:
+                // a failed callee may be the last live member of a reusable
+                // caller, so run the ordinary fold/dependent sweep now.
+                let mut scheduling = crate::runtime_scheduling::SchedulingOutcome::default();
+                super::promote::promote_run(tx, self, job.run_id, &mut scheduling)?;
                 starved.push(StarvedJob {
                     run_id: job.run_id,
                     job_id: job.job_id.clone(),
