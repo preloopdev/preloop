@@ -24,7 +24,7 @@ use super::dispatch::{
 };
 use super::graph::{self, Node, NodeKind, ReusableNodeSpec};
 use super::needs::NeedsView;
-use super::promote::{conclude_run, settle_unrun};
+use super::promote::{conclude_run, settle_unrun, settle_unrun_row};
 use super::{PgBackend, db};
 use crate::concurrency;
 use crate::control::backend::ExpansionApply;
@@ -342,6 +342,16 @@ impl PgBackend {
     ///
     /// Runs after the caller's `inner_job_ids` / the matrix parent's splice
     /// name the subtree: a fold only sees the jobs that list names.
+    ///
+    /// Every unhostable sibling's own row write + `job.completed.v1` lands
+    /// first ([`settle_unrun_row`], no fold); only once the whole batch is
+    /// written does each settled id fold its caller, in order, and the run
+    /// conclude once. A caller whose entire subtree is unhostable is folded
+    /// by the batch's last sibling, after every sibling's own event, not by
+    /// whichever settle happened to run first (every other sibling's row was
+    /// already written terminal by [`Self::register_expansion_jobs`], so an
+    /// interleaved fold-per-settle would see them all terminal and fold on
+    /// the first sibling instead).
     async fn start_registered(
         &self,
         tx: &Transaction<'_>,
@@ -350,9 +360,10 @@ impl PgBackend {
         out: &mut SchedulingOutcome,
     ) -> Result<(), ControlError> {
         let mut ids = registered.startable;
+        let mut settled_ids = Vec::with_capacity(registered.unhostable.len());
         for (job_id, mut node) in registered.unhostable {
             ids.extend(
-                settle_unrun(
+                settle_unrun_row(
                     self,
                     tx,
                     run_id,
@@ -363,6 +374,17 @@ impl PgBackend {
                 )
                 .await?,
             );
+            settled_ids.push(job_id);
+        }
+        for job_id in &settled_ids {
+            ids.extend(
+                Sweep::settle_folded_callers(self, tx, run_id, job_id)
+                    .await?
+                    .unblocked,
+            );
+        }
+        if !settled_ids.is_empty() {
+            conclude_run(self, tx, run_id, "failure").await?;
         }
         ids.sort();
         ids.dedup();

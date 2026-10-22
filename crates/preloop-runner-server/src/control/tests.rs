@@ -6547,6 +6547,99 @@ pub(crate) mod suite {
         .await;
     }
 
+    /// A caller whose subtree registers two unhostable inner jobs: the whole
+    /// subtree settles at registration, in the same `start_registered` batch.
+    /// Every inner job's own `job.completed.v1` must land before the
+    /// caller's fold event, which must land before `run.completed.v1` — the
+    /// bug this guards was the first unhostable job's settle folding the
+    /// caller early because its sibling's row was already written terminal
+    /// (just not yet its own settle/event), producing
+    /// `a.completed, caller.completed, run.completed, b.completed`.
+    pub(crate) async fn unhostable_subtree_job_events_precede_the_caller_fold(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        backend
+            .submit_run(deferred_caller_run(
+                run_id,
+                &["caller/a", "caller/b"],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let mut job_a = deferred_callee_job(run_id, "caller/a", &[], None);
+        job_a.plan.runs_on = vec!["windows-latest".to_owned()];
+        let mut job_b = deferred_callee_job(run_id, "caller/b", &[], None);
+        job_b.plan.runs_on = vec!["windows-latest".to_owned()];
+        expand_deferred_caller(backend, vec![job_a, job_b]).await;
+
+        let record = backend.run_record(run_id).await.unwrap();
+        let caller = JobId("caller".to_owned());
+        assert_eq!(
+            record.jobs.get(&caller),
+            Some(&ExecutionStatus::Failure),
+            "the caller must fold once both unhostable inner jobs settled"
+        );
+
+        // A shared Postgres server may hold a fresh commit back for a
+        // moment (see `job_completed_statuses`); retry until every expected
+        // event is visible.
+        let mut events: Vec<(String, Option<String>)> = Vec::new();
+        for _ in 0..50 {
+            events = backend
+                .outbox_read(
+                    OutboxBookmark {
+                        txid: 0,
+                        event_id: 0,
+                    },
+                    10_000,
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.run_id == Some(run_id))
+                .map(|row| {
+                    let job_id = row
+                        .payload
+                        .get("job_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    (row.topic, job_id)
+                })
+                .collect();
+            let found_all = ["caller/a", "caller/b", "caller"].iter().all(|id| {
+                events
+                    .iter()
+                    .any(|(t, j)| t == "job.completed.v1" && j.as_deref() == Some(*id))
+            }) && events.iter().any(|(t, _)| t == "run.completed.v1");
+            if found_all {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let position = |job_id: &str| {
+            events
+                .iter()
+                .position(|(t, j)| t == "job.completed.v1" && j.as_deref() == Some(job_id))
+                .unwrap_or_else(|| panic!("missing job.completed.v1 for {job_id} in {events:?}"))
+        };
+        let a_pos = position("caller/a");
+        let b_pos = position("caller/b");
+        let caller_pos = position("caller");
+        let run_pos = events
+            .iter()
+            .position(|(t, _)| t == "run.completed.v1")
+            .unwrap_or_else(|| panic!("missing run.completed.v1 in {events:?}"));
+        assert!(
+            a_pos < caller_pos && b_pos < caller_pos,
+            "every unhostable inner job's own event must precede the caller's fold: {events:?}"
+        );
+        assert!(
+            caller_pos < run_pos,
+            "the caller's fold must precede the run's completion: {events:?}"
+        );
+    }
+
     /// A callee that is itself a caller: the cascade skips the inner caller's
     /// last open job, the inner caller folds, and so does the outer caller
     /// whose last open job it was.
@@ -10316,6 +10409,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn unhostable_subtree_job_events_precede_the_caller_fold() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::unhostable_subtree_job_events_precede_the_caller_fold(&backend).await;
+    }
+
+    #[tokio::test]
     async fn nested_reusable_callers_fold_when_the_cascade_skips_their_last_job() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -12288,6 +12389,14 @@ mod lite {
     #[tokio::test]
     async fn reusable_caller_folds_when_its_whole_subtree_is_unhostable() {
         suite::reusable_caller_folds_when_its_whole_subtree_is_unhostable(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unhostable_subtree_job_events_precede_the_caller_fold() {
+        suite::unhostable_subtree_job_events_precede_the_caller_fold(
             &LiteBackend::in_memory().unwrap(),
         )
         .await;

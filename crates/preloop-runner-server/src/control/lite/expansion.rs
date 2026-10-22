@@ -296,11 +296,13 @@ fn register_built_jobs(
         let queued = built_queued_job(run_id, &built);
         let kind = submit::kind_of(&queued);
         let parent = node_parent(&plan, &job_id);
-        let (status, queue_state) = if unhostable.is_some() {
-            (ExecutionStatus::Failure, "none")
-        } else {
-            (ExecutionStatus::Pending, "blocked")
-        };
+        // Every row starts `pending`/`blocked`, even an unhostable one:
+        // `settle::settle_node` below is the single place that writes its
+        // terminal row and emits its `job.completed.v1`. Pre-writing it
+        // terminal here would make that call see an already-terminal row
+        // and treat it as a replayed duplicate — settling nothing and
+        // emitting no event for this job at all.
+        let (status, queue_state) = (ExecutionStatus::Pending, "blocked");
         jobs::insert_job(
             tx,
             run_id,
