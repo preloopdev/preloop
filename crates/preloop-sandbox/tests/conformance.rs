@@ -678,12 +678,7 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
             .state,
         SandboxState::Preserved
     );
-    wait_for(|| {
-        h.service
-            .get(&short.sandbox.id, &short.lease.id)
-            .is_err()
-    })
-    .await;
+    wait_for(|| h.service.get(&short.sandbox.id, &short.lease.id).is_err()).await;
     // The long window outlived it: the short sandbox ended by its TTL, not
     // by reconcile.
     assert_eq!(
