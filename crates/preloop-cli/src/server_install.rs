@@ -485,14 +485,14 @@ fn install_systemd(
         format!(
             "identity: dedicated `{SERVICE_USER}` system account (kvm group for /dev/kvm);\n\
              \x20          state dir chowned to it — config.toml must be written as that user:\n\
-             \x20          sudo -u {SERVICE_USER} env PRELOOP_HOME={} preloop setup github --save\n\
+             \x20          sudo -u {SERVICE_USER} env PRELOOP_HOME={} preloop setup github --via app\n\
              \x20 ",
             home.display()
         )
     };
     let secrets = format!(
         "secrets:   --webhook-secret/--github-app-* flags land in {} (0600);\n\
-         \x20          `setup github --save` writes config.toml (0600). Define a webhook\n\
+         \x20          `setup github --via app` writes config.toml (0600). Define a webhook\n\
          \x20          secret or GitHub webhook delivery is rejected.",
         env_file_path(home, args.user).display()
     );
@@ -503,7 +503,7 @@ fn install_systemd(
          \x20 status:  systemctl {} status preloop\n\
          \x20 logs:    journalctl {} -u preloop -f\n\
          \x20 GitHub:  re-run with --github-app-* flags, or run\n\
-         \x20          {}preloop setup github --save\n\
+         \x20          {}preloop setup github --via app\n\
          \x20 {}{}{}{}",
         if args.user { "user-scope" } else { "system" },
         dir.display(),
@@ -1523,7 +1523,7 @@ fn install_launchd(
     }
 
     let secrets = "secrets:   --webhook-secret/--github-app-* flags are embedded in the plist\n\
-                   \x20          (0600); `setup github --save` writes config.toml (0600). Define\n\
+                   \x20          (0600); `setup github --via app` writes config.toml (0600). Define\n\
                    \x20          a webhook secret or GitHub webhook delivery is rejected."
         .to_owned();
     eprintln!(
@@ -1534,7 +1534,7 @@ fn install_launchd(
          \x20 logs:    {}/server.log\n\
          \x20 updates: no macOS timer — run `preloop update` from cron or a LaunchAgent\n\
          \x20 GitHub:  re-run with --github-app-* flags, or run\n\
-         \x20          PRELOOP_HOME={} preloop setup github --save\n\
+         \x20          PRELOOP_HOME={} preloop setup github --via app\n\
          \x20 {}{}{}",
         if args.user {
             "LaunchAgent (user session)"
