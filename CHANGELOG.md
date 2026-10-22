@@ -13,6 +13,45 @@ Releases before v0.27.0 predate the changelog.
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
   service. The AgentENV backend moved to the private build.
 
+### Added
+
+- **Code-scanning SARIF ingestion.** `github/codeql-action/upload-sarif` now
+  completes on an engine-hosted run: the GitHub shim serves the legacy
+  `POST /api/v3/repos/{owner}/{repo}/code-scanning/sarifs` upload, the
+  `PUT …/code-scanning/analysis` endpoint current action releases use, and the
+  status/analyses reads the action follows, all authenticated with the job
+  runtime token and bound to the token's repository (another repository's
+  token is refused, and an id under another repository reads as 404). The
+  Actions run read the action makes while deriving its analysis key is
+  answered from the same credential, so the step no longer stops on a 404
+  before uploading. A native
+  surface, `POST /api/v1/runs/{run_id}/sarif`, takes the raw
+  `application/sarif+json` document or a JSON wrapper and exposes
+  `GET /api/v1/runs/{run_id}/sarif`, `GET /api/v1/sarif/{analysis_id}` and
+  `GET /api/v1/sarif/{analysis_id}/raw`; a job token may only touch its own
+  run. Uploads are capped at 24 MiB of request body, 10 MiB of compressed
+  SARIF and 32 MiB decompressed, and at 25,000 normalized findings; malformed
+  base64/gzip/JSON or a non-2.1.0 version is rejected with a GitHub-shaped
+  error. Normalized findings carry tool, rule, level, message, path, line and
+  column range, fingerprint and suppression state, raw SARIF is stored
+  gzip-compressed beside the run store, and metadata/findings are persisted in
+  the control database (`sarif_analyses` / `sarif_findings`, new migration
+  `2026102101`). Re-uploads dedupe on a content fingerprint over the
+  repository, commit, ref, tool and sorted finding fingerprints — not on raw
+  bytes — so the same analysis is returned instead of stored twice.
+
+### Security
+
+- **CI security gates cover PRs, main, dependencies, and the runner image.**
+  Semgrep runs on every pull request (`p/github-actions`, `p/secrets`)
+  and fails on findings; CodeQL runs on merge to `main` for
+  Actions and Rust; dependency review blocks high-severity additions; and
+  OpenSSF Scorecard runs weekly. The published runner image is now signed with
+  keyless cosign and has a registry-backed provenance attestation. The golden
+  scan also requires the aarch64 apt SBOM and scans it with Grype, and the
+  main ruleset no longer allows direct pushes (admins may still merge a PR),
+  and the release-tag ruleset restricts tag creation.
+
 ### Fixed
 
 - **A second agent on one host no longer destroys a snapshot template's fork
