@@ -31,7 +31,9 @@ use tokio::task::JoinHandle;
 
 use crate::actions::Action;
 use crate::api::FeedEvent;
-use crate::app::{App, ContextInfo, Effect, Fetch, Fetched, Msg, PaletteAction, StreamKind, Subscription};
+use crate::app::{
+    App, ContextInfo, Effect, Fetch, Fetched, Msg, PaletteAction, StreamKind, Subscription,
+};
 use crate::client::engine::RunsQuery;
 use crate::client::{EngineClient, SandboxHandle};
 use crate::options::{Hooks, Options};
@@ -340,7 +342,8 @@ impl Executor {
                 let hooks = Arc::clone(&self.hooks);
                 let paused = Arc::clone(&self.paused);
                 let args = vec!["debug".to_owned(), session_id];
-                let outcome = with_terminal_suspended(terminal, &paused, || (hooks.shell_out)(&args));
+                let outcome =
+                    with_terminal_suspended(terminal, &paused, || (hooks.shell_out)(&args));
                 let result = match outcome {
                     Ok(Ok(code)) => Ok(code),
                     Ok(Err(error)) | Err(error) => Err(format!("{error:#}")),
@@ -409,7 +412,9 @@ async fn run_fetch(fetch: Fetch, clients: ContextClients) -> Msg {
             Fetched::Log { key, result }
         }
         Fetch::Bindings => Fetched::Bindings(engine.pool_bindings().await.map_err(text)),
-        Fetch::Webhooks => Fetched::Webhooks(engine.webhook_deliveries(None, 20).await.map_err(text)),
+        Fetch::Webhooks => {
+            Fetched::Webhooks(engine.webhook_deliveries(None, 20).await.map_err(text))
+        }
         Fetch::WebhookHealth => Fetched::WebhookHealth(engine.webhook_health().await.map_err(text)),
         Fetch::Debug => Fetched::Debug(engine.debug_sessions().await.map_err(text)),
         Fetch::Runners => Fetched::Runners(engine.runners(None).await.map_err(text)),
@@ -441,7 +446,12 @@ async fn run_write(action: Action, engine: EngineClient) -> Result<String, Strin
         Action::RerunRun { run_id } => engine
             .rerun(&run_id)
             .await
-            .map(|accepted| format!("queued #{} ({} jobs)", accepted.run_number, accepted.queued_jobs))
+            .map(|accepted| {
+                format!(
+                    "queued #{} ({} jobs)",
+                    accepted.run_number, accepted.queued_jobs
+                )
+            })
             .map_err(text),
         Action::ApproveJob { run_id, job_id } => engine
             .approve_job(&run_id, &job_id, None)
@@ -462,6 +472,29 @@ async fn run_write(action: Action, engine: EngineClient) -> Result<String, Strin
             .replay_delivery(&delivery_id)
             .await
             .map(|_| "requeued".to_owned())
+            .map_err(text),
+        Action::DebugRetry { session_id } => engine
+            .debug_operation(&session_id, "retry", None)
+            .await
+            .map(|_| "retry requested".to_owned())
+            .map_err(text),
+        Action::DebugRetryFrom {
+            session_id,
+            step_index,
+        } => engine
+            .debug_operation(&session_id, "retry_from", Some(step_index))
+            .await
+            .map(|_| "retry-from requested".to_owned())
+            .map_err(text),
+        Action::DebugContinue { session_id } => engine
+            .debug_operation(&session_id, "continue", None)
+            .await
+            .map(|_| "continue requested".to_owned())
+            .map_err(text),
+        Action::DebugAbort { session_id } => engine
+            .debug_operation(&session_id, "abort", None)
+            .await
+            .map(|_| "abort requested".to_owned())
             .map_err(text),
         other => Err(format!("{} is not a write", other.label())),
     }
@@ -507,7 +540,13 @@ fn is_relevant(event: &FeedEvent) -> bool {
     !matches!(event, FeedEvent::Other(_))
 }
 
-async fn live_log(client: EngineClient, tx: UnboundedSender<Msg>, run_id: String, job_id: String, attempt: u32) {
+async fn live_log(
+    client: EngineClient,
+    tx: UnboundedSender<Msg>,
+    run_id: String,
+    job_id: String,
+    attempt: u32,
+) {
     if attempt > 0 {
         tokio::time::sleep(backoff(attempt)).await;
     }
@@ -593,7 +632,8 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     let body = match &app.engine_down {
         Some(_) => {
-            let [banner, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+            let [banner, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
             let text = format!(
                 "no engine at {} — s: setup wizard, S: start engine",
                 app.current().engine_url

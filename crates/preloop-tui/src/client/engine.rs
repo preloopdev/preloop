@@ -139,7 +139,8 @@ impl EngineClient {
         if let Some(limit) = query.limit {
             pairs.push(("limit", limit.to_string()));
         }
-        self.get_json(self.url(&["api", "v1", "runs"]), &pairs).await
+        self.get_json(self.url(&["api", "v1", "runs"]), &pairs)
+            .await
     }
 
     /// `GET /api/v1/runs/{id}`: the full record, with job details and steps.
@@ -202,13 +203,15 @@ impl EngineClient {
     /// `POST /api/v1/runs/{id}/cancel`.
     pub async fn cancel_run(&self, run_id: &str) -> Result<RunRecord, EngineError> {
         let url = self.url(&["api", "v1", "runs", run_id, "cancel"]);
-        self.send_json(self.post(url).timeout(REQUEST_TIMEOUT)).await
+        self.send_json(self.post(url).timeout(REQUEST_TIMEOUT))
+            .await
     }
 
     /// `POST /api/v1/runs/{id}/rerun`: a new attempt of every job.
     pub async fn rerun(&self, run_id: &str) -> Result<RunAccepted, EngineError> {
         let url = self.url(&["api", "v1", "runs", run_id, "rerun"]);
-        self.send_json(self.post(url).timeout(REQUEST_TIMEOUT)).await
+        self.send_json(self.post(url).timeout(REQUEST_TIMEOUT))
+            .await
     }
 
     /// `POST /api/v1/runs/{id}/jobs/{job}/approve`.
@@ -219,15 +222,27 @@ impl EngineClient {
         note: Option<&str>,
     ) -> Result<Value, EngineError> {
         let url = self.url(&["api", "v1", "runs", run_id, "jobs", job_id, "approve"]);
-        self.send_json(self.post(url).json(&json!({ "note": note })).timeout(REQUEST_TIMEOUT))
-            .await
+        self.send_json(
+            self.post(url)
+                .json(&json!({ "note": note }))
+                .timeout(REQUEST_TIMEOUT),
+        )
+        .await
     }
 
     /// `POST /api/v1/runs/{id}/approve-fork`: release a fork run held for approval.
-    pub async fn approve_fork(&self, run_id: &str, note: Option<&str>) -> Result<Value, EngineError> {
+    pub async fn approve_fork(
+        &self,
+        run_id: &str,
+        note: Option<&str>,
+    ) -> Result<Value, EngineError> {
         let url = self.url(&["api", "v1", "runs", run_id, "approve-fork"]);
-        self.send_json(self.post(url).json(&json!({ "note": note })).timeout(REQUEST_TIMEOUT))
-            .await
+        self.send_json(
+            self.post(url)
+                .json(&json!({ "note": note }))
+                .timeout(REQUEST_TIMEOUT),
+        )
+        .await
     }
 
     /// `GET /api/v1/runners`, optionally only the runners serving one run.
@@ -235,14 +250,19 @@ impl EngineClient {
         let pairs: Vec<(&str, String)> = run_id
             .map(|id| vec![("run_id", id.to_owned())])
             .unwrap_or_default();
-        self.get_json(self.url(&["api", "v1", "runners"]), &pairs).await
+        self.get_json(self.url(&["api", "v1", "runners"]), &pairs)
+            .await
     }
 
     /// `POST /api/v1/runners/purge` with `{"name": ...}`.
     pub async fn purge_runner(&self, name: &str) -> Result<Value, EngineError> {
         let url = self.url(&["api", "v1", "runners", "purge"]);
-        self.send_json(self.post(url).json(&json!({ "name": name })).timeout(REQUEST_TIMEOUT))
-            .await
+        self.send_json(
+            self.post(url)
+                .json(&json!({ "name": name }))
+                .timeout(REQUEST_TIMEOUT),
+        )
+        .await
     }
 
     /// `GET /api/v1/pool/bindings`: which job holds which runner, or waits.
@@ -269,7 +289,8 @@ impl EngineClient {
     /// `POST /api/v1/webhooks/deliveries/{id}/replay`.
     pub async fn replay_delivery(&self, delivery_id: &str) -> Result<Value, EngineError> {
         let url = self.url(&["api", "v1", "webhooks", "deliveries", delivery_id, "replay"]);
-        self.send_json(self.post(url).timeout(REQUEST_TIMEOUT)).await
+        self.send_json(self.post(url).timeout(REQUEST_TIMEOUT))
+            .await
     }
 
     /// `GET /api/v1/webhooks/health`.
@@ -302,6 +323,69 @@ impl EngineClient {
             &[],
         )
         .await
+    }
+
+    /// Execute one controller operation through the lease-gated debug API.
+    pub async fn debug_operation(
+        &self,
+        session_id: &str,
+        operation: &str,
+        step_index: Option<usize>,
+    ) -> Result<Value, EngineError> {
+        let base = self.url(&["api", "v1", "debug", "sessions", session_id]);
+        let lease: Value = self
+            .send_json(
+                self.post(base.join("lease").map_err(|e| EngineError::Url {
+                    url: base.to_string(),
+                    reason: e.to_string(),
+                })?)
+                .json(&json!({
+                    "controller": "preloop-tui",
+                    "capabilities": ["step.retry", "job.retry_from", "job.continue", "job.abort"]
+                }))
+                .timeout(REQUEST_TIMEOUT),
+            )
+            .await?;
+        let lease_id = lease
+            .get("lease_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let version = lease
+            .get("session_version")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let mut body = json!({
+            "request_id": format!("tui-{}-{}", session_id, version),
+            "expected_version": version,
+            "lease_id": lease_id,
+            "operation": operation,
+        });
+        if let Some(index) = step_index {
+            body["step_index"] = json!(index);
+        }
+        let response = self
+            .send_json(
+                self.post(base.join("operations").map_err(|e| EngineError::Url {
+                    url: base.to_string(),
+                    reason: e.to_string(),
+                })?)
+                .json(&body)
+                .timeout(REQUEST_TIMEOUT),
+            )
+            .await;
+        let _ = self
+            .send_json::<Value>(
+                self.authorize(self.http.delete(base.join("lease").map_err(|e| {
+                    EngineError::Url {
+                        url: base.to_string(),
+                        reason: e.to_string(),
+                    }
+                })?))
+                .json(&json!({"lease_id": lease_id}))
+                .timeout(REQUEST_TIMEOUT),
+            )
+            .await;
+        response
     }
 
     /// `GET /api/v1/secrets`, optionally for one repository. Names only.
@@ -351,11 +435,7 @@ impl EngineClient {
             pairs.push(("env", env.to_owned()));
         }
         let url = self.url(&["api", "v1", "secrets", name]);
-        let request = self
-            .http
-            .delete(url)
-            .query(&pairs)
-            .timeout(REQUEST_TIMEOUT);
+        let request = self.http.delete(url).query(&pairs).timeout(REQUEST_TIMEOUT);
         let request = self.authorize(request);
         let _: Value = self.send_json(request).await?;
         Ok(())
@@ -407,7 +487,10 @@ impl EngineClient {
         self.send_json(request).await
     }
 
-    async fn send_json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, EngineError> {
+    async fn send_json<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<T, EngineError> {
         let response = self.transport(request.send().await)?;
         let response = check(response).await?;
         let bytes = response
@@ -443,7 +526,12 @@ async fn check(response: Response) -> Result<Response, EngineError> {
     let body = response.text().await.unwrap_or_default();
     let message = serde_json::from_str::<Value>(&body)
         .ok()
-        .and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| body.trim().chars().take(200).collect());
     Err(EngineError::Status {
         status: status.as_u16(),
@@ -660,7 +748,10 @@ mod tests {
         let mut decoder = NdjsonDecoder::default();
         assert!(decoder.push(br#"{"type":"run_st"#).is_empty());
         let lines = decoder.push(b"atus\"}\n{\"type\":\"job_status\"}\n{\"ty");
-        assert_eq!(lines, vec![r#"{"type":"run_status"}"#, r#"{"type":"job_status"}"#]);
+        assert_eq!(
+            lines,
+            vec![r#"{"type":"run_status"}"#, r#"{"type":"job_status"}"#]
+        );
         assert_eq!(decoder.finish(), Some(r#"{"ty"#.to_owned()));
     }
 
@@ -668,7 +759,10 @@ mod tests {
     fn ndjson_survives_multibyte_characters_split_across_chunks() {
         let text = "{\"type\":\"log\",\"line\":\"✓ done ⊘\"}\n";
         let lines = feed_one_byte_at_a_time(text);
-        assert_eq!(lines, vec!["{\"type\":\"log\",\"line\":\"✓ done ⊘\"}".to_owned()]);
+        assert_eq!(
+            lines,
+            vec!["{\"type\":\"log\",\"line\":\"✓ done ⊘\"}".to_owned()]
+        );
     }
 
     #[test]
@@ -679,7 +773,10 @@ mod tests {
 
     fn sse_all(chunks: &[&[u8]]) -> Vec<SseEvent> {
         let mut decoder = SseDecoder::default();
-        chunks.iter().flat_map(|chunk| decoder.push(chunk)).collect()
+        chunks
+            .iter()
+            .flat_map(|chunk| decoder.push(chunk))
+            .collect()
     }
 
     #[test]
@@ -700,7 +797,9 @@ mod tests {
         let whole = sse_all(&[text]);
         let bytewise: Vec<SseEvent> = {
             let mut decoder = SseDecoder::default();
-            text.iter().flat_map(|byte| decoder.push(std::slice::from_ref(byte))).collect()
+            text.iter()
+                .flat_map(|byte| decoder.push(std::slice::from_ref(byte)))
+                .collect()
         };
         assert_eq!(whole, bytewise);
         assert_eq!(whole.len(), 1);
@@ -723,7 +822,15 @@ mod tests {
     #[test]
     fn client_builds_percent_encoded_paths() {
         let client = EngineClient::new("http://127.0.0.1:9090/", None).expect("valid base");
-        let url = client.url(&["api", "v1", "runs", "8f3a", "jobs", "test (sandbox)", "approve"]);
+        let url = client.url(&[
+            "api",
+            "v1",
+            "runs",
+            "8f3a",
+            "jobs",
+            "test (sandbox)",
+            "approve",
+        ]);
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:9090/api/v1/runs/8f3a/jobs/test%20(sandbox)/approve"

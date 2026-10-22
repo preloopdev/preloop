@@ -50,6 +50,28 @@ pub enum Action {
         /// Delivery id.
         delivery_id: String,
     },
+    /// Retry the failed step in a debug session.
+    DebugRetry {
+        /// Session id.
+        session_id: String,
+    },
+    /// Retry a debug session from a zero-based step index.
+    DebugRetryFrom {
+        /// Session id.
+        session_id: String,
+        /// Step index.
+        step_index: usize,
+    },
+    /// Continue a paused debug session.
+    DebugContinue {
+        /// Session id.
+        session_id: String,
+    },
+    /// Abort a paused debug session.
+    DebugAbort {
+        /// Session id.
+        session_id: String,
+    },
     /// Attach to a paused debug session (`preloop debug`), suspending the TUI.
     AttachDebug {
         /// Session id.
@@ -76,6 +98,10 @@ impl Action {
             | Self::ReplayDelivery { .. } => Danger::Confirm,
             Self::PurgeRunner { name } => Danger::TypeToConfirm(name.clone()),
             Self::RerunRun { .. }
+            | Self::DebugRetry { .. }
+            | Self::DebugRetryFrom { .. }
+            | Self::DebugContinue { .. }
+            | Self::DebugAbort { .. }
             | Self::AttachDebug { .. }
             | Self::OpenUrl { .. }
             | Self::StartEngine
@@ -92,6 +118,10 @@ impl Action {
             | Self::ApproveFork { .. }
             | Self::PurgeRunner { .. }
             | Self::ReplayDelivery { .. }
+            | Self::DebugRetry { .. }
+            | Self::DebugRetryFrom { .. }
+            | Self::DebugContinue { .. }
+            | Self::DebugAbort { .. }
             | Self::AttachDebug { .. }
             | Self::StartEngine
             | Self::RunWizard => true,
@@ -111,6 +141,15 @@ impl Action {
             Self::PurgeRunner { name } => format!("purge runner {name}"),
             Self::ReplayDelivery { delivery_id } => {
                 format!("replay delivery {}", short(delivery_id))
+            }
+            Self::DebugRetry { session_id }
+            | Self::DebugContinue { session_id }
+            | Self::DebugAbort { session_id } => format!("debug action on session {session_id}"),
+            Self::DebugRetryFrom {
+                session_id,
+                step_index,
+            } => {
+                format!("retry session {session_id} from step {step_index}")
             }
             Self::AttachDebug { session_id } => format!("attach debug session {session_id}"),
             Self::OpenUrl { url } => format!("open {url}"),
@@ -135,7 +174,10 @@ mod tests {
             Danger::Confirm
         );
         assert_eq!(
-            Action::PurgeRunner { name: "plr-4".into() }.danger(),
+            Action::PurgeRunner {
+                name: "plr-4".into()
+            }
+            .danger(),
             Danger::TypeToConfirm("plr-4".to_owned())
         );
         assert_eq!(
@@ -148,7 +190,12 @@ mod tests {
     #[test]
     fn read_only_refuses_mutations_only() {
         assert!(Action::ApproveFork { run_id: "r".into() }.mutates());
-        assert!(!Action::OpenUrl { url: "https://x".into() }.mutates());
+        assert!(
+            !Action::OpenUrl {
+                url: "https://x".into()
+            }
+            .mutates()
+        );
     }
 
     #[test]
