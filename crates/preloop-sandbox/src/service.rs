@@ -1021,6 +1021,35 @@ impl Service {
                 "exactly one of pool or template is required",
             ));
         }
+        if !request.pool.is_empty() {
+            // The pool path uses the pool's placement; silently dropping these
+            // would hand back a sandbox that ignores what the caller asked for.
+            let mut ignored = Vec::new();
+            if request.shape != Shape::default() {
+                ignored.push("shape");
+            }
+            if request.network != NetworkPolicy::default() {
+                ignored.push("network");
+            }
+            if !request.mounts.is_empty() {
+                ignored.push("mounts");
+            }
+            if !request.sockets.is_empty() {
+                ignored.push("sockets");
+            }
+            if !request.options.is_empty() {
+                ignored.push("options");
+            }
+            if !ignored.is_empty() {
+                return Err(Error::invalid(format!(
+                    "pool acquires cannot set {}; set these on the pool, or acquire from the template",
+                    ignored.join(", ")
+                )));
+            }
+        }
+        // From here until the response is returned this call counts as a
+        // waiter, so maintenance will not expire the lease it is provisioning.
+        let _waiter = AcquireWaiter::register(self, &request.idempotency_key);
         let wait = match request.wait_secs {
             None => self.config.acquire_wait,
             // An explicit zero means "report the current state, do not block".
@@ -1128,8 +1157,9 @@ impl Service {
                     s.pool == pool.name && s.lease_id.is_empty() && s.state == SandboxState::Ready
                 })
                 .filter(|s| sandbox_meets(state, s, &request.requires))
-                .map(|s| s.id.clone())
-                .next();
+                // Oldest first, so warm members rotate and none goes stale.
+                .min_by_key(|s| (s.created_at, s.id.as_str()))
+                .map(|s| s.id.clone());
             match warm {
                 Some(id) => id,
                 None => {
@@ -2371,4 +2401,97 @@ pub async fn collect_exec(
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store;
+
+    fn ready_member(id: &str, created_at: i64) -> Sandbox {
+        Sandbox {
+            id: id.into(),
+            template: "alpine".into(),
+            pool: "p".into(),
+            state: SandboxState::Ready,
+            created_at,
+            ..Sandbox::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_members_rotate_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::open(
+            store::open("memory:").await.unwrap(),
+            ServiceConfig::new(dir.path().join("blobs")),
+        )
+        .await
+        .unwrap();
+        {
+            let mut state = service.state.lock();
+            state.templates.insert(
+                "alpine".into(),
+                Template {
+                    spec: TemplateSpec {
+                        name: "alpine".into(),
+                        ..TemplateSpec::default()
+                    },
+                    ..Template::default()
+                },
+            );
+            state.pools.insert(
+                "p".into(),
+                PoolSpec {
+                    name: "p".into(),
+                    template: "alpine".into(),
+                    ..PoolSpec::default()
+                },
+            );
+            // Insert the newer member first: map order must not decide.
+            state
+                .sandboxes
+                .insert("sbx-newer".into(), ready_member("sbx-newer", 200));
+            state
+                .sandboxes
+                .insert("sbx-older".into(), ready_member("sbx-older", 100));
+        }
+        let first = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k1".into(),
+                pool: "p".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.sandbox.id, "sbx-older");
+        let second = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k2".into(),
+                pool: "p".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.sandbox.id, "sbx-newer");
+        // Equal ages break the tie by id.
+        {
+            let mut state = service.state.lock();
+            state
+                .sandboxes
+                .insert("sbx-y".into(), ready_member("sbx-y", 300));
+            state
+                .sandboxes
+                .insert("sbx-x".into(), ready_member("sbx-x", 300));
+        }
+        let third = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k3".into(),
+                pool: "p".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(third.sandbox.id, "sbx-x");
+    }
 }

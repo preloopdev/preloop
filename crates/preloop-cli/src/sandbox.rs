@@ -523,12 +523,17 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
         SandboxCommand::Pool(PoolCommand::Ls) => print_json(&client.list_pools().await?),
         SandboxCommand::Pool(PoolCommand::Rm { name }) => Ok(client.delete_pool(&name).await?),
         SandboxCommand::Acquire(acquire) => {
+            let pool = acquire.pool.unwrap_or_default();
+            let template = acquire.template.unwrap_or_default();
+            // A pool acquire takes its placement from the pool; the service
+            // rejects template-only fields, so leave them unset.
+            let pooled = !pool.is_empty();
             let mut request = AcquireRequest {
                 idempotency_key: acquire
                     .key
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                pool: acquire.pool.unwrap_or_default(),
-                template: acquire.template.unwrap_or_default(),
+                pool,
+                template,
                 ttl_secs: acquire.ttl,
                 purpose: if acquire.build {
                     Purpose::Build
@@ -544,9 +549,13 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
                     os: acquire.os.unwrap_or_default(),
                     ..Requirements::default()
                 },
-                network: NetworkPolicy {
-                    mode: NetworkMode::Unrestricted,
-                    ..NetworkPolicy::default()
+                network: if pooled {
+                    NetworkPolicy::default()
+                } else {
+                    NetworkPolicy {
+                        mode: NetworkMode::Unrestricted,
+                        ..NetworkPolicy::default()
+                    }
                 },
                 ..AcquireRequest::default()
             };
