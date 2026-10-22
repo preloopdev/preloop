@@ -48,7 +48,7 @@ The captured `flows.jsonl` files are a machine-readable record of the entire pro
 ## Prerequisites
 
 - macOS arm64 (for `linux-x64` swap runner asset in `versions.toml` and `record.sh`)
-- Python 3.11+ with `pip`
+- Python 3.12+ with `pip`
 - `mitmproxy` CLI (`brew install mitmproxy` or `pip install mitmproxy`)
 - `dotnet-sdk` 8.0+ (`brew install --cask dotnet-sdk`) — for runner.server only
 - Rust toolchain (`rustup.rs`) — for preloop only

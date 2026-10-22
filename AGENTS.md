@@ -10,11 +10,11 @@
 | `preloop-gha-parser` / `-expressions` / `-protocol` | Workflow YAML → job DAG/matrix; `${{ }}` evaluator; wire DTOs, session crypto, `SecretString`, NDJSON events |
 | `preloop-runner` / `-runner-client` | Rust runner (Listener + Worker); CLI that submits workflows |
 | `preloop-cli` | The `preloop` binary (run/serve/debug/push) |
-| `preloop-orchestrator` / `preloop-vm` | Golden/env provisioning + runner pool; `VmProvider` backends (SmolVM/libkrun default, AgentENV opt-in) |
+| `preloop-orchestrator` / `preloop-vm` | Golden/env provisioning + runner pool; `VmProvider` backends (SmolVM default, AgentENV opt-in via `PRELOOP_VM_BACKEND`). |
 | `preloop-cache` / `-artifacts` / `-dap` / `-observability` / `-socket-activation` | File-backed storage, DAP bridge, logging/OTel, systemd activation |
 | `preloop-conformance` / `runner-watch` | Conformance harnesses and protocol-diff tooling |
 
-Crate/module map: `docs/architecture.md`. Pinned official runner: `runner_version` in `versions.toml`.
+Crate/module map: `docs/control-plane/architecture/overview.mdx`. Pinned official runner: `runner_version` in `versions.toml`.
 
 ## Commands
 
@@ -33,9 +33,9 @@ just dogfood    # E2E with the real runner
 - **Secrets**: `SecretString`; call `expose()` only at protocol boundaries. Never log signed URLs at any level (debug/trace included) or raw `GITHUB_ENV` values; new secret fields redact `Debug`.
 - **Lint exceptions**: narrow `#[expect(<lint>, reason = "...")]` only, never for `unsafe_code`. Workspace denies `clippy::{dbg_macro, todo, unimplemented, await_holding_lock}`; no pedantic/unwrap bans.
 - **Wire compatibility**: `/_apis/…` is the source of truth. Validate protocol changes against the **official runner**, not only unit tests. Broker + Twirp results protocol only (v2.329.0+).
-- **State**: the control database is authoritative. All durable control mutations go through the `ControlBackend` trait (`control/backend.rs`); backends are SQLite (default) and Postgres, chosen by `PRELOOP_STORE_URL`. `state.rs::InnerState` is node-local only. See the State Model in `docs/architecture.md` before touching `control/`.
+- **State**: the control database is authoritative. All durable control mutations go through the `ControlBackend` trait (`control/backend.rs`); backends are SQLite (default) and Postgres, chosen by `PRELOOP_STORE_URL`. `state.rs::InnerState` is node-local only. See [API and state](docs/control-plane/architecture/api-and-state.mdx) before touching `control/`.
 - **At-rest encryption is obfuscation**: the key sits beside the DB, so it stops a stolen DB file, not a compromised state dir.
-- **VM substrates**: `PRELOOP_VM_BACKEND` selects SmolVM or AgentENV; the orchestrator branches on `VmProvider::capabilities()`. Read `docs/vm-substrates.md` before touching pool or provider code.
+- **VM substrates**: `PRELOOP_VM_BACKEND` selects SmolVM (default) or AgentENV (opt-in); the orchestrator branches on `VmProvider::capabilities()`. Read [Sandbox architecture](docs/control-plane/architecture/sandboxes.mdx) before touching pool or provider code.
 - **Tests & rule fixtures**: changes ship behavioral tests with explicit inputs (or real child-process env); ast-grep rules ship matching and non-matching fixtures and pass `just sg-test` + `just sg-scan-strict`.
 
 ## Agent preferences
@@ -45,7 +45,7 @@ just dogfood    # E2E with the real runner
 - **Drop-in workflows**: users run their workflows unmodified.
 - **Run `just test-ci`** after each large chunk of work.
 - **`[skip ci]`** in a commit message skips the CI gate (including `contrib/pre-push`); use it only for docs/non-code changes.
-- **Supply-chain policy isolation**: a PR may carry any combination of the dependency/policy files (`deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, `supply-chain/`, any `Cargo.toml`, any `Cargo.lock`) and nothing else — no source, docs, changelog, other workflow, or script. Code that needs a dependency ships in a follow-up PR after that dependency/policy PR merges. There is no exception. Check before pushing: `just supply-chain-guard` (`supply-chain/README.md` holds the rule and the guard).
+- **Supply-chain policy isolation**: strict policy files (`deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, `supply-chain/`) may ship only with dependency/policy files, and `Cargo.toml`/`Cargo.lock` join that set only when a third-party lock entry (a `[[package]]` block with a `source` line) changes; first-party manifest and lockfile edits may ship with their code, while a new third-party dependency still needs its own PR first. There is no exception: check with `just supply-chain-guard` (`supply-chain/README.md` holds the rule and the guard).
 
 ## Dev VM (per-worktree Linux VM)
 
@@ -64,7 +64,7 @@ just dev-vm-shell omp        # interactive; just dev-vm-down to delete
 
 ## Debugging CI behavior (use preloop's own tools first)
 
-For queue stalls, job failures, check-run state, or runner churn, dogfood the debug features before log-diving (`docs/debug-sessions.md`); any divergence from that doc is a bug to report.
+For queue stalls, job failures, check-run state, or runner churn, dogfood the debug features before log-diving ([debugging guide](docs/control-plane/guides/debugging.mdx)); any divergence from that doc is a bug to report.
 
 - **Sessions**: failed jobs pause into debug sessions. List with `preloop debug` or `GET /api/v1/debug/sessions`; attach with `preloop debug [<ref>]` (`:retry`, `:retry --sync`, `:retry --from <step>`, `:sync`, `:export`); non-interactive: `preloop debug --verdict retry|continue|abort`.
 - **Agent API** (native bearer): `POST /api/v1/agent/debug/sessions/<id>/lease`, then `GET .../events`, `POST .../operations`, `GET .../audit`.
@@ -72,4 +72,4 @@ For queue stalls, job failures, check-run state, or runner churn, dogfood the de
 - **Hold VMs**: `preloop run --preserve-on-failure` keeps the VM for a later `preloop shell` when nothing can answer interactively.
 - Leaked sessions (`abandoned`, `aborted`, or never closing) are findings, not noise.
 
-Also: `docs/fidelity-gap.md` (protocol gaps), `CONTRIBUTING.md` (workflow, compatibility checklist), `fixtures/workflows/dogfood.yml` (local validation), `.runner-watch/golden/` (protocol golden captures).
+Also: `docs/contributing/fidelity-gap.md` (protocol gaps), `CONTRIBUTING.md` (workflow, compatibility checklist), `fixtures/workflows/dogfood.yml` (local validation), `.runner-watch/golden/` (protocol golden captures).

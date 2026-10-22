@@ -1063,6 +1063,7 @@ mod tests {
                 attempts: 0,
                 lease_until_us: None,
                 lease_token: None,
+                signer_app_id: None,
                 last_error: None,
             })
             .await
@@ -1425,6 +1426,7 @@ mod tests {
                 attempts: 0,
                 lease_until_us: None,
                 lease_token: None,
+                signer_app_id: None,
                 last_error: None,
             })
             .await

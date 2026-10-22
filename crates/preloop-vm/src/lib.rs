@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use preloop_gha_protocol::SecretString;
+use preloop_observability::deadline;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -15,6 +16,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+pub mod agent_rootfs;
 pub mod agentenv;
 pub mod guest_privilege;
 pub mod telemetry;
@@ -206,6 +208,136 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// A guest-local persistent directory on the machine's own disk.
+///
+/// smolvm's `--volume` takes two shapes: `host:guest[:ro]`, which is a
+/// virtiofs export of a host directory ([`VolumeMount`]), and a *bare guest
+/// path*, which smolvm turns into a directory on the machine's own storage
+/// disk rather than on its overlay root. The bare form is what a nested
+/// container runtime needs — overlayfs cannot back docker's `overlay2`
+/// driver, so `/var/lib/docker` on the overlay root degrades to
+/// `fuse-overlayfs` — and the directory persists across `stop`/`start` and
+/// into a branch, because the storage disk is copied copy-on-write.
+///
+/// A bare-path volume costs no virtio device: smolvm mounts it in the guest
+/// from a subdirectory of `/dev/vda` (measured at 1.30.1 on x86_64 Linux;
+/// `findmnt` reports `ext4 /dev/vda[/volumes/var-lib-docker-<hash>]`, not a
+/// virtiofs export), so it is deliberately absent from [`DeclaredDevices`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GuestVolume(PathBuf);
+
+impl GuestVolume {
+    /// Validate and construct a guest-local volume path.
+    ///
+    /// The value is passed as one `--volume` argument, and smolvm decides the
+    /// volume's shape from its text: a `:` separates `host:guest[:ro]`. A
+    /// colon here would therefore turn a supposedly guest-local directory
+    /// into a host export, bypassing [`VolumeMount`]'s source and read-only
+    /// validation, so it is rejected. Control bytes (including NUL) are
+    /// rejected too: they cannot be represented in a command argument and
+    /// only ever come from a malformed override. Ordinary punctuation,
+    /// spaces, and non-ASCII path bytes are valid and stay valid.
+    pub fn new(value: impl Into<PathBuf>) -> Result<Self, VmError> {
+        let value = value.into();
+        if !value.is_absolute() {
+            return Err(VmError::InvalidSpec(format!(
+                "guest volume path must be absolute: {}",
+                value.display()
+            )));
+        }
+        let bytes = value.as_os_str().as_encoded_bytes();
+        if bytes.contains(&b':') {
+            return Err(VmError::InvalidSpec(format!(
+                "guest volume path must not contain `:` (smolvm reads it as host:guest): {}",
+                value.display()
+            )));
+        }
+        if bytes.iter().any(u8::is_ascii_control) {
+            return Err(VmError::InvalidSpec(format!(
+                "guest volume path must not contain control characters: {}",
+                value.display()
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    /// The guest path.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for GuestVolume {
+    type Error = VmError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<GuestVolume> for String {
+    fn from(value: GuestVolume) -> Self {
+        value.0.to_string_lossy().into_owned()
+    }
+}
+
+/// Guest-local state directories the official runner pack gets by default.
+///
+/// These are the two paths docker and containerd must own to run their
+/// overlay-backed drivers. The default is opt-in per [`MachineRole`]: only
+/// [`MachineRole::OfficialPack`] uses it. The published official golden is
+/// built for this managed layout, with those paths created on the machine's
+/// own storage disk. A custom pack can carry state in them and a
+/// [`MachineRole::Builder`]'s writes there are not part of the pack at all, so
+/// neither gets the default. A guest-local volume starts empty: this default
+/// must never be used where existing state has to stay visible, and it does
+/// not migrate anything.
+pub const DEFAULT_GUEST_VOLUMES: [&str; 2] = ["/var/lib/docker", "/var/lib/containerd"];
+
+/// Host override for [`DEFAULT_GUEST_VOLUMES`]: a comma-separated list of
+/// absolute guest paths, applied to runtime pack machines that do not declare
+/// their own [`MachineSpec::guest_volumes`]. An empty value turns guest-local
+/// volumes off. Builders ignore it: their container state must stay in the
+/// overlay that `pack create` captures.
+pub const SMOLVM_GUEST_VOLUMES_ENV: &str = "PRELOOP_SMOLVM_GUEST_VOLUMES";
+
+/// Host override for the workload a runtime pack machine is started with, on
+/// top of whatever entrypoint/cmd the pack itself carries. Ignored by the
+/// golden builder, whose pack's own entrypoint is what it exports.
+///
+/// Unset: the role default — the managed [`DEFAULT_SMOLVM_WORKLOAD_INIT`] for
+/// an [`MachineRole::OfficialPack`], or the pack's own entrypoint/cmd for a
+/// [`MachineRole::CustomPack`]. Empty: the pack's own entrypoint/cmd runs,
+/// which is also the escape hatch for a golden whose image has no usable init.
+/// Any other value is the command, split on whitespace.
+pub const SMOLVM_WORKLOAD_INIT_ENV: &str = "PRELOOP_SMOLVM_WORKLOAD_INIT";
+
+/// Workload that runs a runtime pack machine's systemd, giving the guest the
+/// hosted runner's init: `systemctl`, `journald`, `systemd-resolved` and
+/// docker's `systemd` cgroup driver all depend on PID 1 being systemd.
+///
+/// This is the default for [`MachineRole::OfficialPack`] only. A
+/// [`MachineRole::CustomPack`] keeps its own entrypoint unless the operator
+/// names a command with [`SMOLVM_WORKLOAD_INIT_ENV`].
+///
+/// Applied as the `-- <COMMAND>` block of `machine create`, which overrides
+/// the pack's recorded entrypoint at launch. Measured at smolvm 1.30.1 on
+/// x86_64 Linux: `machine create --from <pack> --name t1 -- /sbin/init`
+/// then `machine start` leaves `ps -o pid,args -p 1` at `1 systemd /sbin/init`,
+/// `systemctl is-system-running` at `running`, and a
+/// `machine branch --freeze-source` child inherits it.
+pub const DEFAULT_SMOLVM_WORKLOAD_INIT: &str = "/sbin/init";
+
+/// systemd-resolved's stub listener address, the resolver a systemd guest
+/// should be pointed at so container DNS sees `/etc/hosts` names and
+/// systemd-resolved's synthesized `.localhost` names.
+///
+/// This is the *guest-side* resolver file's content, not necessarily the
+/// `--dns` flag: under smolvm's virtio-net backend the agent overwrites
+/// `/etc/resolv.conf` with the network gateway whatever `--dns` says, so the
+/// golden bake has to install this file (see [`resolved_guest_dns`]).
+pub const SYSTEMD_RESOLVED_STUB_DNS: &str = "127.0.0.53";
+
 /// Host Unix socket exposed at a fixed guest path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketMount {
@@ -269,6 +401,47 @@ pub enum SecretSource {
     Value(SecretString),
 }
 
+/// What a machine is for, and where its root filesystem came from.
+///
+/// The provider used to infer "pack-based" from the image path alone and apply
+/// the runtime defaults to every such machine. That conflated three very
+/// different cases: the official runner layout (whose container-state
+/// directories are disposable), an arbitrary operator pack (whose preloaded
+/// images live in exactly those directories), and a one-shot builder (whose
+/// root filesystem is about to be packed, so state on the storage disk is not
+/// captured). The caller states the role explicitly instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineRole {
+    /// Booted from an OCI image and not treated as a pack: no pack launch
+    /// defaults. This is what image machines and non-pack backends use.
+    #[default]
+    Image,
+    /// A one-shot machine whose root filesystem is packed into a golden.
+    ///
+    /// The builder's container state must stay in the overlay that `pack
+    /// create` captures: a guest-local volume lives on the storage disk, which
+    /// is not part of the pack, so mounting one would hide the source state
+    /// and drop it from the artifact. No default guest volumes or workload
+    /// override apply; an explicit [`MachineSpec::guest_volumes`] or
+    /// [`MachineSpec::workload_init`] is still honoured.
+    Builder,
+    /// A final runtime machine created from the official runner pack. The
+    /// published golden is built for Preloop's managed layout, so this is the
+    /// one role that opts into [`DEFAULT_GUEST_VOLUMES`] and
+    /// [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. The guest-local directories start
+    /// empty; do not use this role for a pack whose state there must survive.
+    OfficialPack,
+    /// A final runtime machine created from an operator-supplied pack (or a
+    /// pack baked from a custom image). Its container state and init were
+    /// packed for a reason: no default guest-local volume may be mounted over
+    /// them, and the pack's own entrypoint/cmd runs unless the operator names
+    /// a workload. Opt in explicitly with [`MachineSpec::guest_volumes`],
+    /// [`MachineSpec::workload_init`], [`SMOLVM_GUEST_VOLUMES_ENV`], or
+    /// [`SMOLVM_WORKLOAD_INIT_ENV`].
+    CustomPack,
+}
+
 /// Persistent VM configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineSpec {
@@ -301,19 +474,187 @@ pub struct MachineSpec {
     /// Enable Rosetta 2 x86_64 translation on Apple Silicon.
     #[serde(default)]
     pub rosetta: bool,
+    /// What this machine is for: image, pack builder, or a runtime pack from
+    /// the official or a custom source. See [`MachineRole`].
+    #[serde(default)]
+    pub role: MachineRole,
+    /// Guest-local persistent directories on the machine's own disk.
+    ///
+    /// Passed through as smolvm's bare-path `--volume` form, alongside (never
+    /// instead of) [`MachineSpec::volumes`]. `None` leaves the choice to the
+    /// role's provider default ([`DEFAULT_GUEST_VOLUMES`] only for
+    /// [`MachineRole::OfficialPack`]); `Some([])` explicitly disables guest
+    /// volumes, and `Some(list)` asks for exactly that list.
+    #[serde(default)]
+    pub guest_volumes: Option<Vec<GuestVolume>>,
+    /// Workload a *runtime pack* machine runs, overriding the pack's own
+    /// entrypoint/cmd.
+    ///
+    /// `None` means "whatever the provider's default is": for smolvm, the
+    /// [`SMOLVM_WORKLOAD_INIT_ENV`] switch and then the role default — the
+    /// managed [`DEFAULT_SMOLVM_WORKLOAD_INIT`] for an official pack, the
+    /// pack's own entrypoint for a custom pack. `Some([])` explicitly leaves
+    /// the pack's own entrypoint/cmd in place. Ignored for image machines,
+    /// whose workload handling (the keep-alive fallback for an image with no
+    /// usable startup command) is unchanged.
+    #[serde(default)]
+    pub workload_init: Option<Vec<String>>,
 }
 
 impl MachineSpec {
     /// The devices this spec adds to SmolVM's fixed launcher set.
     ///
     /// Counted from the spec because `machine start` carries no device flags:
-    /// see [`DeclaredDevices`].
+    /// see [`DeclaredDevices`]. Guest-local volumes cost no device, so they
+    /// are not part of the count.
     pub fn declared_devices(&self) -> DeclaredDevices {
         DeclaredDevices {
             volumes: self.volumes.len(),
             sockets: self.sockets.len(),
         }
     }
+
+    /// The guest-local volumes this machine's create command carries.
+    ///
+    /// `explicit` is [`MachineSpec::guest_volumes`]: `Some([])` disables guest
+    /// volumes and `Some(list)` names them exactly. When it is `None`, the
+    /// role decides:
+    ///
+    /// * [`MachineRole::OfficialPack`] takes `configured` (the
+    ///   [`SMOLVM_GUEST_VOLUMES_ENV`] value, where an empty value disables)
+    ///   or [`DEFAULT_GUEST_VOLUMES`];
+    /// * [`MachineRole::CustomPack`] takes the same configured override, but
+    ///   defaults to none so an operator's packed container state stays
+    ///   visible;
+    /// * [`MachineRole::Builder`] and [`MachineRole::Image`] get none, and
+    ///   ignore the host override: a builder's storage-disk writes are not
+    ///   captured by `pack create`.
+    pub fn resolve_guest_volumes(
+        explicit: Option<&[GuestVolume]>,
+        configured: Option<&str>,
+        role: MachineRole,
+    ) -> Result<Vec<GuestVolume>, VmError> {
+        if let Some(explicit) = explicit {
+            return Ok(explicit.to_vec());
+        }
+        let runtime_pack = matches!(role, MachineRole::OfficialPack | MachineRole::CustomPack);
+        if !runtime_pack {
+            return Ok(Vec::new());
+        }
+        if let Some(configured) = configured {
+            // An override, including an empty one (which turns the guest-local
+            // volumes off): parsed as the same comma-separated guest paths.
+            let list = configured.trim();
+            return if list.is_empty() {
+                Ok(Vec::new())
+            } else {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(GuestVolume::new)
+                    .collect()
+            };
+        }
+        if role == MachineRole::OfficialPack {
+            return DEFAULT_GUEST_VOLUMES
+                .iter()
+                .copied()
+                .map(GuestVolume::new)
+                .collect();
+        }
+        Ok(Vec::new())
+    }
+
+    /// The workload command a pack-based machine is created with.
+    ///
+    /// `explicit` is [`MachineSpec::workload_init`]: `Some([])` explicitly
+    /// leaves the pack's own entrypoint/cmd in place, and a non-empty command
+    /// wins. With `None`, the role decides:
+    ///
+    /// * [`MachineRole::OfficialPack`] uses `configured` (the
+    ///   [`SMOLVM_WORKLOAD_INIT_ENV`] value, where an empty value disables) or
+    ///   the managed [`DEFAULT_SMOLVM_WORKLOAD_INIT`];
+    /// * [`MachineRole::CustomPack`] keeps the pack's own entrypoint/cmd
+    ///   unless `configured` names a command: a custom pack's init is part of
+    ///   the source the operator chose, not something Preloop replaces;
+    /// * [`MachineRole::Builder`] and [`MachineRole::Image`] only get what was
+    ///   asked for explicitly (the builder is never given an ambient default).
+    pub fn resolve_workload_init(
+        explicit: Option<&[String]>,
+        configured: Option<&str>,
+        role: MachineRole,
+    ) -> Option<Vec<String>> {
+        let parse = |value: &str| {
+            let command: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
+            (!command.is_empty()).then_some(command)
+        };
+        // An image machine's workload handling is the separate keep-alive
+        // path; this override never applies to it.
+        if role == MachineRole::Image {
+            return None;
+        }
+        if let Some(command) = explicit {
+            return (!command.is_empty()).then(|| command.to_vec());
+        }
+        match role {
+            MachineRole::Image => None,
+            MachineRole::Builder => None,
+            MachineRole::OfficialPack => parse(configured.unwrap_or(DEFAULT_SMOLVM_WORKLOAD_INIT)),
+            MachineRole::CustomPack => configured.and_then(parse),
+        }
+    }
+}
+
+/// Whether a pack machine's resolved workload starts systemd as PID 1.
+///
+/// The implicit resolver stub is only useful when the guest actually runs
+/// systemd: `systemd-resolved` is started by the systemd instance that owns
+/// PID 1. The check is the program's file name — the managed default is
+/// `/sbin/init`, and an operator naming the binary explicitly uses `systemd`
+/// (for example `/lib/systemd/systemd --system`). Any other command, such as
+/// `["/bin/sh", "-c", "sleep infinity"]` or one that starts systemd
+/// indirectly, keeps the resolver smolvm would otherwise configure: the stub
+/// is only emitted when systemd is certain to answer on it.
+fn workload_init_is_systemd(workload: Option<&[String]>) -> bool {
+    workload
+        .and_then(|command| command.first())
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|program| program.to_str())
+        .is_some_and(|program| matches!(program, "init" | "systemd"))
+}
+
+/// The `--dns` resolver a machine is launched with.
+///
+/// An explicit [`MachineSpec::dns`] always wins, and a machine with no
+/// networking never gains a resolver (`--dns` implies `--net` in smolvm).
+/// Otherwise, once a machine runs systemd as PID 1 its resolver should be
+/// systemd-resolved's stub, because that is what gives containers the hosted
+/// runner's view: `systemd-resolved` answers `/etc/hosts` names and
+/// synthesizes `.localhost`, so a user-defined network's embedded resolver
+/// (127.0.0.11 forwarding to the host's `/etc/resolv.conf` nameserver) reaches
+/// them. `systemd_workload` is that condition, resolved by
+/// [`workload_init_is_systemd`]: a custom workload that does not start systemd
+/// gets no stub, because nothing would listen on it.
+///
+/// This flag only reaches the guest on smolvm's TSI backend. With virtio-net
+/// the host overwrites the guest resolver with the network gateway whatever
+/// `--dns` says — measured at smolvm 1.30.1 on x86_64 Linux:
+/// `machine create --net --net-backend virtio-net --dns 127.0.0.53` boots with
+/// `SMOLVM_NETWORK_DNS=100.96.0.1` and `/etc/resolv.conf` `nameserver
+/// 100.96.0.1`. For virtio-net the stub is therefore installed from inside the
+/// guest (preloop's per-machine init rewrite, or the golden bake) and this
+/// function returns `None`.
+pub fn resolved_guest_dns(
+    spec_dns: Option<&str>,
+    network_enabled: bool,
+    backend: &str,
+    systemd_workload: bool,
+) -> Option<String> {
+    if let Some(dns) = spec_dns.map(str::trim).filter(|dns| !dns.is_empty()) {
+        return Some(dns.to_owned());
+    }
+    let want_stub = network_enabled && systemd_workload && backend == "tsi";
+    want_stub.then(|| SYSTEMD_RESOLVED_STUB_DNS.to_owned())
 }
 
 /// Observable VM state.
@@ -469,6 +810,20 @@ pub enum VmError {
         /// Modes upstream accepts.
         expected: &'static str,
     },
+    /// The guest agent Preloop would export to smolvm cannot serve the
+    /// resolved binary (see [`agent_rootfs`]).
+    ///
+    /// Booting from it means every machine is unstoppable: smolvm refuses
+    /// `machine stop` with "running guest agent does not support safe
+    /// shutdown; VM left unchanged" and the runner pool retries forever, so
+    /// failing the boot with the diagnosis up front is the only useful
+    /// outcome.
+    #[error("{report}")]
+    GuestAgentMismatch {
+        /// One-read diagnosis: both rootfs paths, both agent hashes, the
+        /// host version, and the remedy.
+        report: String,
+    },
 }
 
 /// What a backend can express, so the orchestrator can pick a strategy
@@ -480,8 +835,9 @@ pub enum VmError {
 pub struct ProviderCapabilities {
     /// Host directories can be mounted into a guest and stay live.
     ///
-    /// `false` means [`MachineSpec::volumes`] is satisfied by copying at
-    /// start time: correct for read-mostly mounts like the runner bundle,
+    /// `false` means a read-only [`MachineSpec::volumes`] entry is delivered as an
+    /// immutable snapshot of the directory, with no live view, and a writable entry
+    /// is refused. That suits read-mostly mounts like the runner bundle, and is
     /// wrong for anything the host mutates while the guest runs.
     pub live_host_volumes: bool,
     /// Host Unix sockets can be forwarded into a guest.
@@ -502,6 +858,18 @@ pub struct ProviderCapabilities {
     /// state when resumed. Backends without this must not auto-suspend a live
     /// debug session.
     pub preserves_runtime_state_on_suspend: bool,
+    /// A fork base may mount read-only volumes, and its clones inherit them.
+    ///
+    /// `false` means a sandbox that mounts a read-only volume cannot be
+    /// snapshotted (AgentENV refuses it), so the fork base must boot without one
+    /// and each clone mounts its volumes at start through
+    /// [`VmProvider::fork_with_volumes`]. That also keeps a changed read-only
+    /// volume from forcing the fork base to be rebuilt.
+    pub fork_bases_may_mount_read_only_volumes: bool,
+    /// The runner bundle already carries the Node externals tree, so callers
+    /// should mount only the bundle and link the runner root's externals path
+    /// into it. This avoids a second AgentENV volume mount at `/home/runner`.
+    pub runner_bundle_carries_externals: bool,
 }
 
 impl Default for ProviderCapabilities {
@@ -512,6 +880,8 @@ impl Default for ProviderCapabilities {
             file_packs: true,
             fork_inherits_guest_writes: false,
             preserves_runtime_state_on_suspend: false,
+            fork_bases_may_mount_read_only_volumes: true,
+            runner_bundle_carries_externals: false,
         }
     }
 }
@@ -523,6 +893,15 @@ pub trait VmProvider: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
     }
+    /// Start the background maintenance this backend owns, if any.
+    ///
+    /// Called once when an engine starts, before any runner needs a machine: a
+    /// backend whose maintenance is otherwise armed lazily by the work it does
+    /// (AgentENV arms its idle-volume collection on the first volume it needs)
+    /// would on an idle engine — one that only resumes machines it already has —
+    /// never run it at all. Must be cheap and must not block; a provider without
+    /// background work keeps the default no-op.
+    fn start_maintenance(&self) {}
     /// Create a persistent machine.
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError>;
     /// Start an existing machine.
@@ -531,6 +910,17 @@ pub trait VmProvider: Send + Sync {
     async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError>;
     /// Fork a running forkable machine into a new clone with CoW memory and disks.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError>;
+    /// Fork a clone, attaching `volumes` when the backend cannot carry
+    /// read-only volumes through its fork-base snapshot. Backends whose
+    /// snapshots already carry the mounts use the default implementation.
+    async fn fork_with_volumes(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        _volumes: &[VolumeMount],
+    ) -> Result<(), VmError> {
+        self.fork(golden, clone).await
+    }
     /// Remove `pack/` build intermediates from a machine's data directory once
     /// its finished disk exists (issue #295).
     ///
@@ -634,6 +1024,9 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
     fn capabilities(&self) -> ProviderCapabilities {
         (**self).capabilities()
     }
+    fn start_maintenance(&self) {
+        (**self).start_maintenance()
+    }
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
         (**self).create(spec).await
     }
@@ -645,6 +1038,14 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
     }
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
         (**self).fork(golden, clone).await
+    }
+    async fn fork_with_volumes(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        volumes: &[VolumeMount],
+    ) -> Result<(), VmError> {
+        (**self).fork_with_volumes(golden, clone, volumes).await
     }
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
         (**self).stop(name).await
@@ -854,11 +1255,96 @@ impl SmolVmProvider {
     /// the sandbox reaches any command that can spawn or restart SmolVM's
     /// `_boot-vm` subprocess — create, start, start_forkable, fork, exec,
     /// pack — not just machine creation.
+    ///
+    /// The guest-agent rootfs guard runs first: a command that could boot a
+    /// guest from an agent the resolved binary cannot stop is refused before
+    /// it starts, once per provider, instead of failing hours later inside
+    /// the pool's retry loop (see [`agent_rootfs`]).
     fn sandboxed_command(&self) -> Result<Command, VmError> {
+        if let Some(report) = self.agent_mismatch() {
+            return Err(VmError::GuestAgentMismatch { report });
+        }
         let mut command = self.command();
         apply_smolvm_runtime_env_async(&mut command, Some(&self.binary), &self.paths)?;
         apply_sandbox_env(&mut command, self.env_lookup)?;
         Ok(command)
+    }
+
+    /// The guest-agent guard verdict: the one-read refusal report when the
+    /// agent Preloop would export cannot serve this binary.
+    ///
+    /// The guard reads and hashes whole rootfs trees (and may run `smolvm
+    /// --version`), so [`agent_rootfs::check_cached`] reuses its verdict while
+    /// the binary and the candidate rootfs trees are unchanged — a repair or a
+    /// replacement is picked up without restarting the engine.
+    fn agent_mismatch(&self) -> Option<String> {
+        agent_rootfs::check_cached(&agent_runtime(&self.paths), &self.binary)
+            .err()
+            .and_then(|error| match error {
+                VmError::GuestAgentMismatch { report } => Some(report),
+                _ => None,
+            })
+    }
+
+    /// Append the guest-agent context to SmolVM's "this guest cannot be
+    /// stopped" failure.
+    ///
+    /// The message alone ("running guest agent does not support safe
+    /// shutdown; VM left unchanged; update the guest agent before retrying")
+    /// names neither the rootfs Preloop pinned nor the agent that actually
+    /// booted, which is what an operator needs to repair the install. Both are
+    /// gathered here: the rootfs the engine exports, and the version the
+    /// guest logged at boot into the machine's console log. Every failure that
+    /// is not a shutdown refusal passes through untouched.
+    async fn diagnose_shutdown_refusal(&self, name: &MachineName, error: VmError) -> VmError {
+        let VmError::Command {
+            operation,
+            exit_code,
+            message,
+        } = error
+        else {
+            return error;
+        };
+        if !is_shutdown_refusal(&message) {
+            return VmError::Command {
+                operation,
+                exit_code,
+                message,
+            };
+        }
+        let mut details = vec![format!("resolved smolvm {}", self.binary.display())];
+        if let Some(rootfs) =
+            agent_rootfs::resolve_exported_rootfs(&agent_runtime(&self.paths), Some(&self.binary))
+        {
+            details.push(format!(
+                "guest-agent rootfs {} ({})",
+                rootfs.display(),
+                agent_rootfs::AgentRootfs::inspect(&rootfs).describe()
+            ));
+        }
+        match self.machine_data_dir_direct(name).await {
+            Ok(dir) => {
+                let console = dir.join(agent_rootfs::CONSOLE_LOG);
+                let version = std::fs::read_to_string(&console)
+                    .ok()
+                    .and_then(|text| agent_rootfs::agent_boot_version(&text));
+                details.push(format!(
+                    "guest agent boot version {} (console log {})",
+                    version.as_deref().unwrap_or("unknown"),
+                    console.display()
+                ));
+            }
+            Err(error) => details.push(format!("machine data dir unknown: {error}")),
+        }
+        VmError::Command {
+            operation,
+            exit_code,
+            message: format!(
+                "{message} [guest-agent diagnostics: {}; run `preloop update --ensure-runtime` to \
+                 reinstall the guest agent that matches the resolved smolvm]",
+                details.join("; ")
+            ),
+        }
     }
 
     /// A command for an operation that can never boot or restart `_boot-vm`
@@ -1417,18 +1903,20 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             spec.name.as_str().into(),
         ];
-        // `.smolmachine` packs and other local files go through `--from`.
-        // Docker-save OCI archives (`.tar`) are image inputs, not packs:
-        // smolvm's `--image` accepts them and sets up virtiofs mounts the
-        // same way it does for registry images, while `--from` machines do
-        // not (bare rootfs directories lose mounts entirely).
-        let is_pack = spec.image.ends_with(".smolmachine")
-            || (Path::new(&spec.image).is_file() && !spec.image.ends_with(".tar"));
+        let is_pack = is_pack_image(&spec.image);
         if is_pack {
             args.extend(["--from".into(), spec.image.clone()]);
         } else {
             args.extend(["--image".into(), spec.image.clone()]);
         }
+        // A runtime pack gets its workload from here (the systemd-as-PID-1
+        // switch); an image machine's workload handling stays below, untouched,
+        // and a builder only runs an explicitly requested command.
+        let workload_init = MachineSpec::resolve_workload_init(
+            spec.workload_init.as_deref(),
+            (self.env_lookup)(SMOLVM_WORKLOAD_INIT_ENV).as_deref(),
+            spec.role,
+        );
         args.extend([
             "--cpus".into(),
             spec.cpus.to_string(),
@@ -1459,8 +1947,16 @@ impl VmProvider for SmolVmProvider {
                 }
             }
         }
-        if let Some(dns) = &spec.dns {
-            args.extend(["--dns".into(), dns.clone()]);
+        if let Some(dns) = resolved_guest_dns(
+            spec.dns.as_deref(),
+            !matches!(spec.network, NetworkPolicy::Disabled),
+            match spec.network {
+                NetworkPolicy::PublicOnly => public_only_net_backend(self.env_lookup),
+                _ => "tsi",
+            },
+            workload_init_is_systemd(workload_init.as_deref()),
+        ) {
+            args.extend(["--dns".into(), dns]);
         }
         for mount in &spec.volumes {
             let mut value = format!("{}:{}", mount.host.display(), mount.guest.display());
@@ -1468,6 +1964,16 @@ impl VmProvider for SmolVmProvider {
                 value.push_str(":ro");
             }
             args.extend(["--volume".into(), value]);
+        }
+        // Guest-local volumes ride the same `--volume` flag in its bare-path
+        // form: the directory then lives on the machine's own disk instead of
+        // its overlay root, which is what an overlay2-backed dockerd needs.
+        for volume in MachineSpec::resolve_guest_volumes(
+            spec.guest_volumes.as_deref(),
+            (self.env_lookup)(SMOLVM_GUEST_VOLUMES_ENV).as_deref(),
+            spec.role,
+        )? {
+            args.extend(["--volume".into(), volume.as_path().display().to_string()]);
         }
         if !spec.sockets.is_empty()
             && !*self
@@ -1504,6 +2010,17 @@ impl VmProvider for SmolVmProvider {
                     "sleep infinity".into(),
                 ]);
             }
+        } else if let Some(workload) = &workload_init {
+            // The pack's own entrypoint/cmd is overridden at launch with
+            // systemd, so the guest becomes a systemd host: `systemctl`,
+            // `journald`, `systemd-resolved` and docker's `systemd` cgroup
+            // driver all need PID 1 to be systemd. Nothing is baked into the
+            // pack — `machine create --from <pack> -- /sbin/init` was measured
+            // to leave `ps -p 1` at `/sbin/init` while the same pack without
+            // the block still boots its recorded entrypoint. Same positional
+            // rule as above: this block is last.
+            args.push("--".into());
+            args.extend(workload.iter().cloned());
         }
         self.exclusive_with_network("create", &args, &spec.network)
             .await?;
@@ -1715,17 +2232,21 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
-        self.recovery(
-            "stop",
-            &[
-                "machine".into(),
-                "stop".into(),
-                "--name".into(),
-                name.as_str().into(),
-            ],
-        )
-        .await
-        .map(|_| ())
+        let result = self
+            .recovery(
+                "stop",
+                &[
+                    "machine".into(),
+                    "stop".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                ],
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.diagnose_shutdown_refusal(name, error).await),
+        }
     }
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
@@ -1826,19 +2347,20 @@ impl VmProvider for SmolVmProvider {
             }
             ok => ok,
         };
-        if result.is_ok() {
-            let mut forked = self.forked_machines.lock().await;
-            forked.remove(name.as_str());
-            // Deleting a golden must evict every clone forked from it. Without
-            // this, a rebaked or recreated golden name would report live
-            // clones forever, silently disabling the re-arm recovery.
-            forked.retain(|_, owner| owner != name.as_str());
-            // The device ledger is diagnostics for a machine that exists: a
-            // deleted name must not keep its inventory (or its memory) around,
-            // and a later machine created under the same name records its own.
-            self.declared_devices.lock().await.remove(name.as_str());
+        if let Err(error) = result {
+            return Err(self.diagnose_shutdown_refusal(name, error).await);
         }
-        result
+        let mut forked = self.forked_machines.lock().await;
+        forked.remove(name.as_str());
+        // Deleting a golden must evict every clone forked from it. Without
+        // this, a rebaked or recreated golden name would report live
+        // clones forever, silently disabling the re-arm recovery.
+        forked.retain(|_, owner| owner != name.as_str());
+        // The device ledger is diagnostics for a machine that exists: a
+        // deleted name must not keep its inventory (or its memory) around,
+        // and a later machine created under the same name records its own.
+        self.declared_devices.lock().await.remove(name.as_str());
+        Ok(())
     }
 
     async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
@@ -2577,24 +3099,55 @@ fn parse_df_available_kib(output: &str) -> Option<u64> {
 /// may isolate the child's `HOME` on macOS, so the REAL host locations must
 /// be probed explicitly or a standard install's agent rootfs is never found
 /// (the isolated HOME sends smolvm to an empty directory).
-fn agent_rootfs_candidates(host_home: Option<&Path>, data_dir: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
+///
+/// `binary` adds the rootfs that ships next to the resolved smolvm, which is
+/// the only copy guaranteed to match it. On Linux it leads (see
+/// [`agent_rootfs::resolve_exported_rootfs`]) so a stale data-dir copy can
+/// never override the agent that shipped with the binary; elsewhere it is
+/// appended, keeping the layouts the platform installers established.
+fn agent_rootfs_candidates(
+    host_home: Option<&Path>,
+    data_dir: Option<&Path>,
+    binary: Option<&Path>,
+) -> Vec<PathBuf> {
+    let shipped = binary.and_then(agent_rootfs::shipped_rootfs);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Some(shipped) = &shipped {
+        push_unique(&mut candidates, shipped.clone());
+    }
     if let Some(data_dir) = data_dir {
-        candidates.push(data_dir.join("agent-rootfs"));
+        push_unique(&mut candidates, data_dir.join("agent-rootfs"));
     }
     if let Some(home) = host_home {
         #[cfg(target_os = "macos")]
         {
-            candidates.push(home.join("Library/Application Support/smolvm/agent-rootfs"));
-            candidates.push(home.join(".smolvm/agent-rootfs"));
+            push_unique(
+                &mut candidates,
+                home.join("Library/Application Support/smolvm/agent-rootfs"),
+            );
+            push_unique(&mut candidates, home.join(".smolvm/agent-rootfs"));
         }
         #[cfg(not(target_os = "macos"))]
         {
-            candidates.push(home.join(".local/share/smolvm/agent-rootfs"));
-            candidates.push(home.join(".smolvm/agent-rootfs"));
+            push_unique(
+                &mut candidates,
+                home.join(".local/share/smolvm/agent-rootfs"),
+            );
+            push_unique(&mut candidates, home.join(".smolvm/agent-rootfs"));
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(shipped) = shipped {
+        push_unique(&mut candidates, shipped);
+    }
     candidates
+}
+
+fn push_unique(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.contains(&path) {
+        candidates.push(path);
+    }
 }
 
 /// Executable name libkrun's hypervisor shows up as in `ps`.
@@ -2790,12 +3343,10 @@ fn detach_orphaned_layer_mounts_with(
     if roots.is_empty() {
         return Ok(0);
     }
-    let mounts = std::process::Command::new(host_tool(tool_dir, "mount", "/sbin/mount"))
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "mount".to_owned(),
-            source,
-        })?;
+    let mounts = bounded_orphan_child(
+        std::process::Command::new(host_tool(tool_dir, "mount", "/sbin/mount")),
+        "orphaned layer-mount table (mount)",
+    )?;
     detach_orphaned_layer_mounts_in(roots, &String::from_utf8_lossy(&mounts.stdout), tool_dir)
 }
 
@@ -2818,38 +3369,72 @@ fn detach_orphaned_layer_mounts_in(
     mount_table: &str,
     tool_dir: Option<&Path>,
 ) -> Result<usize, VmError> {
-    let ps = std::process::Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "ps".to_owned(),
-            source,
-        })?;
+    let ps = bounded_orphan_child(
+        {
+            let mut scan = std::process::Command::new("ps");
+            scan.args(["ax", "-o", "pid=,command="]);
+            scan
+        },
+        "orphaned layer-mount scan (ps)",
+    )?;
     let mut detached = 0usize;
     for mount in orphan_layer_store_mounts(roots, &String::from_utf8_lossy(&ps.stdout), mount_table)
     {
-        match std::process::Command::new(host_tool(tool_dir, "hdiutil", "hdiutil"))
-            .args(["detach", "-quiet"])
-            .arg(&mount)
-            .status()
-        {
-            Ok(status) if status.success() => {
+        let mut detach = std::process::Command::new(host_tool(tool_dir, "hdiutil", "hdiutil"));
+        detach.args(["detach", "-quiet"]).arg(&mount);
+        match deadline::run_command_blocking(
+            detach,
+            ORPHAN_CHILD_TIMEOUT,
+            "orphaned layer-mount detach (hdiutil)",
+        ) {
+            Ok(output) if output.status.success() => {
                 detached += 1;
                 info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
             }
-            Ok(status) => warn!(
+            Ok(output) => warn!(
                 mount = %mount.display(),
-                %status,
+                status = %output.status,
                 "hdiutil detach refused; leaving the layer mount in place"
             ),
             Err(error) => warn!(
                 mount = %mount.display(),
                 %error,
-                "hdiutil detach failed to start"
+                "hdiutil detach failed or hit its deadline; leaving the layer mount in place"
             ),
         }
     }
     Ok(detached)
+}
+
+/// Deadline for one host child of the orphan sweeps: `ps`, `kill`,
+/// `/sbin/mount`, and `hdiutil`. Every one of them answers in milliseconds, so
+/// this only has to survive a badly loaded host.
+///
+/// The bound lives here, not at the sweeps' callers, because a caller's
+/// deadline cannot cancel a blocking sweep — it only stops waiting for it. A
+/// sweep whose children are unbounded therefore keeps running after its caller
+/// gave up, and the startup `OrphanPurge::All` pass would then kill the
+/// machines the pool boots in the meantime.
+const ORPHAN_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run one orphan-sweep child under [`ORPHAN_CHILD_TIMEOUT`], its output
+/// captured.
+///
+/// Called for the children whose failure the sweep reports (`ps`, `/sbin/mount`).
+/// The best-effort ones (`kill`, `hdiutil`) go through
+/// [`deadline::run_command_blocking`] directly, since a child that could not be
+/// run is not itself an error for them.
+fn bounded_orphan_child(
+    command: std::process::Command,
+    what: &str,
+) -> Result<std::process::Output, VmError> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    deadline::run_command_blocking(command, ORPHAN_CHILD_TIMEOUT, what).map_err(|source| {
+        VmError::Launch {
+            program,
+            source: std::io::Error::other(source),
+        }
+    })
 }
 
 /// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
@@ -2898,13 +3483,14 @@ pub fn purge_orphaned_vms(scope: OrphanPurge, paths: &VmPathConfig) -> Result<us
     if roots.is_empty() {
         return Ok(0);
     }
-    let output = std::process::Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "ps".to_owned(),
-            source,
-        })?;
+    let output = bounded_orphan_child(
+        {
+            let mut scan = std::process::Command::new("ps");
+            scan.args(["ax", "-o", "pid=,command="]);
+            scan
+        },
+        "orphaned hypervisor scan (ps)",
+    )?;
     let text = String::from_utf8_lossy(&output.stdout);
     let mut killed = 0usize;
     for line in text.lines() {
@@ -2932,10 +3518,14 @@ pub fn purge_orphaned_vms(scope: OrphanPurge, paths: &VmPathConfig) -> Result<us
         // SIGKILL: the machine is unreachable through smolvm (no record, or
         // an unresponsive agent) — the hypervisor process must die to
         // release the storage fds.
-        let status = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-        if matches!(status, Ok(status) if status.success()) {
+        let mut signal = std::process::Command::new("kill");
+        signal.args(["-9", &pid.to_string()]);
+        let killed_ok = deadline::run_command_blocking(
+            signal,
+            ORPHAN_CHILD_TIMEOUT,
+            "orphaned hypervisor kill (kill)",
+        );
+        if matches!(killed_ok, Ok(output) if output.status.success()) {
             killed += 1;
         }
     }
@@ -2958,13 +3548,14 @@ fn kill_vm_processes_in(data_dir: &Path, roots: &[PathBuf]) -> Result<usize, VmE
         return Ok(0);
     }
     let target = canonical_path(data_dir);
-    let output = std::process::Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "ps".to_owned(),
-            source,
-        })?;
+    let output = bounded_orphan_child(
+        {
+            let mut scan = std::process::Command::new("ps");
+            scan.args(["ax", "-o", "pid=,command="]);
+            scan
+        },
+        "machine hypervisor scan (ps)",
+    )?;
     let text = String::from_utf8_lossy(&output.stdout);
     // Attribute by the boot-config path as written in argv, not by splitting
     // argv on whitespace: `ps` prints the command verbatim, so a data root
@@ -3001,25 +3592,63 @@ fn kill_vm_processes_in(data_dir: &Path, roots: &[PathBuf]) -> Result<usize, VmE
         if pid <= 0 {
             continue;
         }
-        let status = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-        if matches!(status, Ok(status) if status.success()) {
+        let mut signal = std::process::Command::new("kill");
+        signal.args(["-9", &pid.to_string()]);
+        let killed_ok = deadline::run_command_blocking(
+            signal,
+            ORPHAN_CHILD_TIMEOUT,
+            "orphaned hypervisor kill (kill)",
+        );
+        if matches!(killed_ok, Ok(output) if output.status.success()) {
             killed += 1;
         }
     }
     Ok(killed)
 }
 
+/// SmolVM phrasings that mean the guest agent could not confirm a safe
+/// shutdown, so the machine was left running.
+///
+/// Upstream's current wording is "running guest agent does not support safe
+/// shutdown; VM left unchanged; update the guest agent before retrying"; the
+/// pre-1.16 agents fail one layer later, in the storage sync step, with "guest
+/// did not confirm filesystem synchronization; left the VM alive for retry".
+const SHUTDOWN_REFUSAL_MARKERS: &[&str] = &[
+    "does not support safe shutdown",
+    "did not confirm filesystem synchronization",
+];
+
+/// Whether an error message is SmolVM's refusal to stop a guest agent whose
+/// capabilities it cannot trust.
+fn is_shutdown_refusal(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    SHUTDOWN_REFUSAL_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
 /// Declared-size ceiling for SmolVM pack extraction (512 GiB): above the
 /// official golden's sparse disk sizes, still finite.
 const PACK_MAX_EXTRACT_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+
+/// The guest-agent guard's typed inputs for one [`VmPathConfig`].
+///
+/// The guard (`check_cached`, `resolve_exported_rootfs`) and the child
+/// environment (`smolvm_runtime_env`) must agree on which rootfs is exported,
+/// so both derive their [`agent_rootfs::Runtime`] here from the paths resolved
+/// at the startup boundary — neither reads the process environment.
+fn agent_runtime(paths: &VmPathConfig) -> agent_rootfs::Runtime {
+    agent_rootfs::Runtime {
+        host_home: paths.host_home.clone(),
+        data_dir: paths.effective_smolvm_data_dir(),
+        explicit_rootfs: paths.smolvm_agent_rootfs.clone(),
+    }
+}
 
 fn smolvm_runtime_env(
     binary: Option<&Path>,
     paths: &VmPathConfig,
 ) -> Vec<(String, std::ffi::OsString)> {
-    let host_home = paths.host_home.clone();
     let mut env = Vec::new();
     let data_dir = paths.effective_smolvm_data_dir();
     // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its registry
@@ -3043,12 +3672,13 @@ fn smolvm_runtime_env(
 
     // HOME may be isolated above, so preserve the host installation assets
     // explicitly for the child SmolVM process: the agent rootfs lives in the
-    // REAL host's platform data dir, which the isolated HOME would miss.
-    if let Some(path) = paths.smolvm_agent_rootfs.clone().or_else(|| {
-        agent_rootfs_candidates(host_home.as_deref(), data_dir.as_deref())
-            .into_iter()
-            .find(|path| path.is_dir())
-    }) {
+    // REAL host's platform data dir, which the isolated HOME would miss. The
+    // rootfs that ships next to the resolved binary outranks a data-dir copy
+    // that disagrees with it, so a stale copy can never pin an old guest
+    // agent (see [`agent_rootfs`]). The inputs are the typed ones this
+    // process resolved once — the guard reads no process environment here.
+    let runtime = agent_runtime(paths);
+    if let Some(path) = agent_rootfs::exported_rootfs_cached(&runtime, binary) {
         env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
     }
 
@@ -3080,7 +3710,7 @@ fn smolvm_runtime_env(
                 candidates.push(parent.join("lib"));
             }
         }
-        if let Some(home) = host_home {
+        if let Some(home) = &paths.host_home {
             candidates.push(home.join(".smolvm/lib"));
         }
         let Some(lib_dir) = candidates
@@ -3416,6 +4046,17 @@ fn read_tar_json_member(tar_path: &Path, member: &str) -> Option<serde_json::Val
     None
 }
 
+/// Whether an image string names a packed machine rather than an OCI input.
+///
+/// `.smolmachine` packs and other local files go through `--from`.
+/// Docker-save OCI archives (`.tar`) are image inputs, not packs: smolvm's
+/// `--image` accepts them and sets up virtiofs mounts the same way it does for
+/// registry images, while `--from` machines do not (bare rootfs directories
+/// lose mounts entirely).
+fn is_pack_image(image: &str) -> bool {
+    image.ends_with(".smolmachine") || (Path::new(image).is_file() && !image.ends_with(".tar"))
+}
+
 fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
     if spec.image.trim().is_empty()
         || spec.cpus == 0
@@ -3425,6 +4066,16 @@ fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
         return Err(VmError::InvalidSpec(
             "image, CPU, memory, and storage must be non-zero".into(),
         ));
+    }
+    if matches!(
+        spec.role,
+        MachineRole::OfficialPack | MachineRole::CustomPack
+    ) && !is_pack_image(&spec.image)
+    {
+        return Err(VmError::InvalidSpec(format!(
+            "a runtime pack role requires a packed image: {}",
+            spec.image
+        )));
     }
     for mount in &spec.volumes {
         if !mount.host.is_absolute() || !mount.guest.is_absolute() {
@@ -4196,6 +4847,9 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
         };
         let create_provider = provider.clone();
         let create = runtime.spawn(async move { create_provider.create(&spec).await });
@@ -4282,7 +4936,7 @@ mod tests {
         let legacy = home.join(".smolvm/agent-rootfs");
         std::fs::create_dir_all(&platform).expect("platform agent rootfs");
         std::fs::create_dir_all(&legacy).expect("legacy agent rootfs");
-        let found = agent_rootfs_candidates(Some(home), None)
+        let found = agent_rootfs_candidates(Some(home), None, None)
             .into_iter()
             .find(|path| path.is_dir())
             .expect("a candidate exists");
@@ -4294,7 +4948,7 @@ mod tests {
         // An explicit SMOLVM_DATA_DIR wins over the platform defaults.
         let explicit = home.join("custom/agent-rootfs");
         std::fs::create_dir_all(&explicit).expect("explicit agent rootfs");
-        let found = agent_rootfs_candidates(Some(home), Some(home.join("custom").as_path()))
+        let found = agent_rootfs_candidates(Some(home), Some(home.join("custom").as_path()), None)
             .into_iter()
             .find(|path| path.is_dir())
             .expect("explicit candidate exists");
@@ -4339,6 +4993,48 @@ mod tests {
             super::pack_network_from(|_: &str| None),
             (None, None),
             "no proxy variables configured means nothing is forwarded"
+        );
+    }
+
+    /// The rootfs shipped next to the resolved binary is a candidate, and on
+    /// Linux it leads: a stale data-directory copy must never outrank the
+    /// agent that came out of the same release as the binary.
+    #[test]
+    fn agent_rootfs_candidates_place_the_binaries_sibling_first_on_linux() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // macOS resolves `/var` to `/private/var`; the guard canonicalizes the
+        // binary it inspects, so build the fixture under the canonical root.
+        let root = dir.path().canonicalize().expect("canonical temp dir");
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(&prefix).expect("prefix");
+        let binary = prefix.join("smolvm");
+        std::fs::write(&binary, b"#!/bin/sh\n").expect("binary");
+        let shipped = prefix.join("agent-rootfs");
+        std::fs::create_dir_all(shipped.join("sbin")).expect("shipped rootfs");
+        std::fs::write(shipped.join("sbin/init"), b"#!/bin/sh\n").expect("init");
+        assert_eq!(
+            super::agent_rootfs::shipped_rootfs(&binary).as_deref(),
+            Some(shipped.as_path()),
+            "the fixture must look like an install prefix"
+        );
+        let data_dir = root.join("data");
+        let candidates = agent_rootfs_candidates(
+            Some(root.as_path()),
+            Some(data_dir.as_path()),
+            Some(binary.as_path()),
+        );
+        assert!(candidates.contains(&shipped), "{candidates:?}");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            candidates.first(),
+            Some(&shipped),
+            "Linux must prefer the binary's sibling over the data-directory copy"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(data_dir.join("agent-rootfs").as_path()),
+            "the data-directory candidate keeps its place on this platform"
         );
     }
 
@@ -4566,6 +5262,9 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
         };
         let create_error = provider.create(&spec).await.unwrap_err();
         assert!(
@@ -4675,6 +5374,9 @@ mod tests {
             }],
             dns: None,
             rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
         };
 
         let provider =
@@ -4822,6 +5524,9 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
         };
         assert_eq!(super::DeclaredDevices::default().total(), 0);
         spec.volumes = vec![
@@ -4848,6 +5553,277 @@ mod tests {
             }
         );
         assert_eq!(spec.declared_devices().total(), 3);
+    }
+
+    /// A guest-local volume is a bare guest path. A relative one, a colon (the
+    /// `host:guest[:ro]` delimiter), or a control byte would change the CLI
+    /// form or cannot be passed at all, so those are rejected at every
+    /// constructor: direct, serde, and the environment override.
+    #[test]
+    fn guest_volume_paths_must_fit_the_bare_path_cli_form() {
+        assert!(GuestVolume::new("/var/lib/docker").is_ok());
+        assert!(GuestVolume::new("/srv/my state").is_ok());
+        assert!(GuestVolume::new("/srv/docker.sock").is_ok());
+        assert!(GuestVolume::new("/srv/データ").is_ok());
+        let relative = GuestVolume::new("var/lib/docker").unwrap_err();
+        assert!(
+            matches!(&relative, VmError::InvalidSpec(message) if message.contains("absolute")),
+            "{relative:?}"
+        );
+        for value in ["/host/cache:/guest/cache", "/var/lib/do:cker"] {
+            let colon = GuestVolume::new(value).unwrap_err();
+            assert!(
+                matches!(&colon, VmError::InvalidSpec(message) if message.contains("host:guest")),
+                "{colon:?}"
+            );
+        }
+        for value in [
+            "/var/lib/docker\0",
+            "/var/lib/dock\ner",
+            "/var/lib/dock\t er",
+        ] {
+            let control = GuestVolume::new(value).unwrap_err();
+            assert!(
+                matches!(&control, VmError::InvalidSpec(message) if message.contains("control")),
+                "{control:?}"
+            );
+        }
+        // The serde constructor is the same validation: a persisted or
+        // deserialized machine cannot smuggle a host mount through.
+        assert!(
+            serde_json::from_str::<GuestVolume>("\"/host/cache:/guest/cache\"").is_err(),
+            "deserialization must reject the host:guest form"
+        );
+        // The host override goes through the same constructor.
+        let invalid = MachineSpec::resolve_guest_volumes(
+            None,
+            Some("/host/cache:/guest/cache"),
+            MachineRole::OfficialPack,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&invalid, VmError::InvalidSpec(message) if message.contains("host:guest")),
+            "{invalid:?}"
+        );
+        assert_eq!(
+            GuestVolume::new("/var/lib/containerd").unwrap().as_path(),
+            Path::new("/var/lib/containerd")
+        );
+    }
+
+    /// The default guest-local volumes are opt-in per role: only the official
+    /// runner pack opts into the known layout. A custom pack keeps its packed
+    /// container state visible, and a builder never mounts over state the pack
+    /// cannot capture. `Some([])` is the explicit off switch alongside an
+    /// empty host override.
+    #[test]
+    fn guest_volumes_follow_the_machine_role_and_honour_explicit_disable() {
+        let paths = |configured: Option<&str>, role| {
+            MachineSpec::resolve_guest_volumes(None, configured, role)
+                .expect("valid")
+                .into_iter()
+                .map(|volume| volume.as_path().display().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(None, MachineRole::OfficialPack),
+            vec![
+                "/var/lib/docker".to_owned(),
+                "/var/lib/containerd".to_owned()
+            ]
+        );
+        assert_eq!(
+            paths(
+                Some("/var/lib/docker,/srv/state"),
+                MachineRole::OfficialPack
+            ),
+            vec!["/var/lib/docker".to_owned(), "/srv/state".to_owned()]
+        );
+        // An empty override is the documented off switch.
+        assert!(paths(Some(""), MachineRole::OfficialPack).is_empty());
+        assert!(paths(Some("   "), MachineRole::OfficialPack).is_empty());
+        // An ordinary custom pack defaults to no mounts: its
+        // /var/lib/docker may be exactly where its preloaded images live.
+        assert!(paths(None, MachineRole::CustomPack).is_empty());
+        // An operator can still opt a custom pack in explicitly.
+        assert_eq!(
+            paths(Some("/srv/state"), MachineRole::CustomPack),
+            vec!["/srv/state".to_owned()]
+        );
+        // Builders and image machines never take the host override: the
+        // builder's writes would land on a disk `pack create` does not pack.
+        for role in [MachineRole::Builder, MachineRole::Image] {
+            assert!(paths(None, role).is_empty());
+            assert!(paths(Some("/var/lib/docker"), role).is_empty());
+        }
+        // An explicit list (including the empty one) is honoured wherever it
+        // is asked for and beats the host override.
+        let explicit = vec![GuestVolume::new("/srv/state").unwrap()];
+        assert_eq!(
+            MachineSpec::resolve_guest_volumes(
+                Some(&explicit),
+                Some("/host:guest"),
+                MachineRole::Image
+            )
+            .expect("valid"),
+            explicit
+        );
+        assert!(
+            MachineSpec::resolve_guest_volumes(Some(&[]), None, MachineRole::OfficialPack)
+                .expect("valid")
+                .is_empty()
+        );
+        // A configured relative path is a typo, not a silent no-op.
+        let invalid = MachineSpec::resolve_guest_volumes(
+            None,
+            Some("/var/lib/docker,relative"),
+            MachineRole::OfficialPack,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&invalid, VmError::InvalidSpec(message) if message.contains("absolute")),
+            "{invalid:?}"
+        );
+    }
+
+    /// Only the official pack gets the managed systemd workload by default. A
+    /// custom pack keeps its own entrypoint unless the host switch or the spec
+    /// names one, and a builder never takes an ambient default.
+    #[test]
+    fn workload_init_follows_the_machine_role_and_honours_explicit_disable() {
+        let resolve = |explicit: Option<&[String]>, configured: Option<&str>, role| {
+            MachineSpec::resolve_workload_init(explicit, configured, role)
+        };
+        assert_eq!(
+            resolve(None, None, MachineRole::OfficialPack),
+            Some(vec!["/sbin/init".to_owned()])
+        );
+        // A custom pack's init is part of the source the operator chose.
+        assert!(resolve(None, None, MachineRole::CustomPack).is_none());
+        assert_eq!(
+            resolve(
+                None,
+                Some("/lib/systemd/systemd --system"),
+                MachineRole::OfficialPack
+            ),
+            Some(vec![
+                "/lib/systemd/systemd".to_owned(),
+                "--system".to_owned()
+            ])
+        );
+        assert_eq!(
+            resolve(
+                None,
+                Some("/lib/systemd/systemd --system"),
+                MachineRole::CustomPack
+            ),
+            Some(vec![
+                "/lib/systemd/systemd".to_owned(),
+                "--system".to_owned()
+            ]),
+            "the host switch is an explicit opt-in for a custom pack"
+        );
+        assert_eq!(
+            resolve(None, Some("  /sbin/init  "), MachineRole::OfficialPack),
+            Some(vec!["/sbin/init".to_owned()]),
+            "surrounding whitespace is trimmed, not passed as an argument"
+        );
+        assert!(resolve(None, Some(""), MachineRole::OfficialPack).is_none());
+        assert!(resolve(None, Some("   "), MachineRole::CustomPack).is_none());
+        // The explicit empty list disables even when the host switch is set.
+        assert!(resolve(Some(&[]), Some("/sbin/init"), MachineRole::CustomPack).is_none());
+        // An explicit per-machine command wins over the host switch.
+        let explicit = vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()];
+        for role in [MachineRole::OfficialPack, MachineRole::CustomPack] {
+            assert_eq!(
+                resolve(Some(&explicit), Some(""), role),
+                Some(explicit.clone())
+            );
+        }
+        // A builder runs only what was asked for: its default is the pack's
+        // own entrypoint, not a workload that writes over the state it exports.
+        assert!(resolve(None, None, MachineRole::Builder).is_none());
+        assert!(resolve(None, Some("/sbin/init"), MachineRole::Builder).is_none());
+        assert_eq!(
+            resolve(Some(&explicit), Some("/sbin/init"), MachineRole::Builder),
+            Some(explicit)
+        );
+        // Image machines never get one: their keep-alive handling is separate.
+        assert!(resolve(None, None, MachineRole::Image).is_none());
+        assert!(resolve(Some(&["/sbin/init".to_owned()]), None, MachineRole::Image).is_none());
+    }
+
+    /// `--dns` only reaches a guest on the TSI backend, where a systemd guest
+    /// wants the resolved stub; an explicit value always wins, and a machine
+    /// with networking off never gains a resolver (`--dns` implies `--net`).
+    #[test]
+    fn resolved_guest_dns_is_the_stub_only_for_a_tsi_systemd_machine() {
+        assert_eq!(
+            resolved_guest_dns(None, true, "tsi", true),
+            Some("127.0.0.53".to_owned())
+        );
+        assert_eq!(resolved_guest_dns(None, true, "virtio-net", true), None);
+        assert_eq!(resolved_guest_dns(None, true, "tsi", false), None);
+        assert_eq!(resolved_guest_dns(None, false, "tsi", true), None);
+        assert_eq!(
+            resolved_guest_dns(Some("8.8.8.8"), true, "tsi", true),
+            Some("8.8.8.8".to_owned())
+        );
+        assert_eq!(
+            resolved_guest_dns(Some("  "), true, "virtio-net", true),
+            None
+        );
+    }
+
+    /// Only a workload that starts systemd gets the implicit stub: the managed
+    /// `/sbin/init` default and an operator-named `systemd` binary qualify, an
+    /// arbitrary command does not, and anything unrecognized fails closed.
+    #[test]
+    fn the_implicit_stub_requires_a_systemd_workload() {
+        let workload = |command: &[&str]| -> Option<Vec<String>> {
+            Some(command.iter().map(|arg| (*arg).to_owned()).collect())
+        };
+        for command in [
+            &["/sbin/init"][..],
+            &["/lib/systemd/systemd", "--system"][..],
+        ] {
+            assert!(
+                workload_init_is_systemd(workload(command).as_deref()),
+                "{command:?}"
+            );
+        }
+        for command in [
+            &["/bin/sh", "-c", "sleep infinity"][..],
+            &["sleep", "infinity"][..],
+            &[""][..],
+        ] {
+            assert!(
+                !workload_init_is_systemd(workload(command).as_deref()),
+                "{command:?}"
+            );
+        }
+        assert!(!workload_init_is_systemd(None));
+        assert!(!workload_init_is_systemd(Some(&[])));
+        assert_eq!(
+            resolved_guest_dns(
+                None,
+                true,
+                "tsi",
+                workload_init_is_systemd(workload(&["/bin/sh", "-c", "sleep infinity"]).as_deref())
+            ),
+            None,
+            "a custom non-systemd workload has nothing answering on the stub"
+        );
+        assert_eq!(
+            resolved_guest_dns(
+                Some("8.8.8.8"),
+                true,
+                "tsi",
+                workload_init_is_systemd(workload(&["/bin/sh"]).as_deref())
+            ),
+            Some("8.8.8.8".to_owned()),
+            "an explicit resolver still wins"
+        );
     }
 
     /// End to end through the provider: a `machine start` that reports IRQ
@@ -4908,6 +5884,9 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
         };
         provider.create(&spec).await.expect("create");
 

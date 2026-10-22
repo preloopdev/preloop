@@ -175,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(30);
-    let http = reqwest::Client::builder()
+    let http = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(timeout_seconds))
         .user_agent("preloop-runner-client")
         .build()?;
@@ -644,7 +644,9 @@ mod tests {
 
         let root =
             "on: push\njobs:\n  call:\n    uses: octo/hello/.github/workflows/reusable.yml@main\n";
-        let client = reqwest::Client::new();
+        let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+            .build()
+            .unwrap();
         let workflows = resolve_remote_workflows(
             BTreeMap::new(),
             root,
@@ -680,7 +682,9 @@ mod tests {
             ".github/workflows/reusable.yml".to_owned(),
             WORKFLOW.to_owned(),
         )]);
-        let client = reqwest::Client::new();
+        let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+            .build()
+            .unwrap();
         let resolved = resolve_remote_workflows(
             workflows.clone(),
             root,
@@ -761,7 +765,9 @@ mod tests {
         let root = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/callee.yml\n";
         let workflows =
             BTreeMap::from([(".github/workflows/callee.yml".to_owned(), CALLEE.to_owned())]);
-        let client = reqwest::Client::new();
+        let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+            .build()
+            .unwrap();
         let resolved = resolve_remote_workflows(
             workflows,
             root,
@@ -810,7 +816,9 @@ mod tests {
             ".github/workflows/inner.yml".to_owned(),
             CALLER_INNER.to_owned(),
         )]);
-        let client = reqwest::Client::new();
+        let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+            .build()
+            .unwrap();
         let resolved = resolve_remote_workflows(
             workflows,
             root,
@@ -875,7 +883,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_remote_workflows_refuses_same_repository_paths_that_are_not_plain() {
         const CALLEE: &str = "on: workflow_call\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
-        let client = reqwest::Client::new();
+        let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+            .build()
+            .unwrap();
         for uses in [
             "$/../../escape.yml",
             "$/.github/workflows/../../escape.yml",
@@ -909,7 +919,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_remote_workflows_accepts_only_workflow_files_under_github_workflows() {
         const CI: &str = "on: workflow_call\njobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ci\n";
-        let client = reqwest::Client::new();
+        let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+            .build()
+            .unwrap();
         let forge = GitHubForge::new(Some("http://127.0.0.1:1"), None);
         let workflows = BTreeMap::from([(".github/workflows/ci.yml".to_owned(), CI.to_owned())]);
         let root = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/ci.yml\n";

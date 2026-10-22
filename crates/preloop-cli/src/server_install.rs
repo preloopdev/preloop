@@ -14,9 +14,11 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use preloop_observability::deadline::run_command_blocking;
 
 #[cfg(any(target_os = "linux", test))]
 use crate::set_private_file_permissions;
@@ -64,6 +66,28 @@ const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/dev.preloop.server.plist";
 #[cfg(target_os = "linux")]
 const SYSTEMD_DIR: &str = "/etc/systemd/system";
 
+/// One `launchctl` control command (`bootstrap`, `load -w`, `bootout`).
+///
+/// launchd may legitimately be slow while it drains many services, so the
+/// bound is not tight — but a wedged launchd must not hang the installer. The
+/// call is made in-process by `preloop server install`, and a CLI blocked in a
+/// child cannot be Ctrl-C'd cleanly out of it, so without a deadline the
+/// operator is left with an install that neither finishes nor stops. A
+/// `bootstrap` that times out still falls through to the `load -w` fallback
+/// below, so a slow-but-alive launchd is not declared broken until both verbs
+/// have run out of time.
+#[cfg(target_os = "macos")]
+const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One `systemctl` control command (`daemon-reload`, `enable --now`,
+/// `disable --now`, `is-active`, `try-restart`) in the install/uninstall path.
+///
+/// A minute leaves room for a busy systemd — install drives several units and
+/// a `--now` start waits for the unit to settle — while still ending a control
+/// plane that has stopped answering instead of hanging the install.
+#[cfg(target_os = "linux")]
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Parser)]
 pub(crate) struct ServerArgs {
     #[command(subcommand)]
@@ -87,8 +111,10 @@ pub(crate) struct InstallArgs {
 
     /// Externally reachable base URL (GitHub webhook + Checks links). GitHub
     /// must be able to reach it: a public domain with DNS + reverse proxy for
-    /// production, or a tunnel (cloudflared, ngrok, Tailscale Funnel) to try
-    /// it out. See docs/setup.md "Exposing the engine to GitHub".
+    /// production, or a tunnel that publishes *only*
+    /// `/api/v1/github/webhooks` to try it out — a path-scoped Tailscale
+    /// Funnel, or a *named* Cloudflare Tunnel behind a path-filtering proxy.
+    /// See docs/control-plane/operate/deploy.mdx "Exposure options".
     #[arg(long, value_name = "URL")]
     public_url: Option<String>,
 
@@ -166,11 +192,15 @@ pub(crate) fn run(args: ServerArgs) -> Result<()> {
 /// A `server install` invocation for callers that own the surrounding flow
 /// (`preloop init --mode service`): the CLI's own defaults, with an explicit
 /// state home only when the operator set one — so a system install keeps
-/// defaulting to [`DEFAULT_HOME`] instead of silently following `PRELOOP_HOME`.
-pub(crate) fn install_args(home: Option<PathBuf>) -> ServerArgs {
+/// defaulting to [`DEFAULT_HOME`] instead of silently following `PRELOOP_HOME`
+/// — and the engine's public URL when the caller resolved one (it becomes a
+/// `PRELOOP_PUBLIC_URL` line in the service's environment file: the service
+/// does not inherit the installing shell's environment).
+pub(crate) fn install_args(home: Option<PathBuf>, public_url: Option<String>) -> ServerArgs {
     ServerArgs {
         command: ServerCommand::Install(InstallArgs {
             home,
+            public_url,
             ..InstallArgs::default()
         }),
     }
@@ -278,7 +308,25 @@ fn install(args: InstallArgs) -> Result<()> {
                 .with_context(|| format!("grant the service read access to {}", key.display()))?;
         }
     }
-    let env_lines = config_env_lines(&args, staged_key.as_deref())?;
+    // Resolved once at this boundary: the installing shell's override is the
+    // only place it can come from.
+    let runner_base_image = runner_base_image_override(
+        std::env::var(preloop_runner_server::config::BASE_IMAGE_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let env_lines = config_env_lines(&args, staged_key.as_deref(), runner_base_image.as_deref())?;
+    // The engine resolves `PRELOOP_RUNNER_BASE_IMAGE` before the config file,
+    // and the line above is what hands it to the service. Saying so here is
+    // what keeps the install summary truthful: the service's jobs fork from
+    // that image, not from `[golden]`.
+    if let Some(image) = &runner_base_image {
+        eprintln!(
+            "[preloop] runner golden: PRELOOP_RUNNER_BASE_IMAGE={image} goes into the service \
+             environment file — the service forks every job from it, not from config.toml's \
+             [golden]"
+        );
+    }
     if let Some(path) = &args.systemd_credential {
         #[cfg(not(target_os = "linux"))]
         {
@@ -412,6 +460,7 @@ fn install_systemd(
         &systemctl_args(args.user, &["try-restart", "preloop.service"]),
         dry,
         "restart a running preloop.service onto the new unit",
+        SYSTEMCTL_TIMEOUT,
     );
     run_systemctl(
         &systemctl_args(
@@ -1056,13 +1105,19 @@ fn uninstall_systemd(args: &UninstallArgs, home: &Path) -> Result<()> {
         &systemctl_args(args.user, &["disable", "--now", "preloop-update.timer"]),
         dry,
         "disable the update timer",
+        SYSTEMCTL_TIMEOUT,
     );
     // Belt and braces: verify nothing is left running before removing units.
     if !dry {
-        let status = Command::new("systemctl")
-            .args(systemctl_args(args.user, &["is-active", "preloop.service"]))
-            .status()
-            .context("check preloop.service state")?;
+        let mut command = Command::new("systemctl");
+        command.args(systemctl_args(args.user, &["is-active", "preloop.service"]));
+        let status = run_command_blocking(
+            command,
+            SYSTEMCTL_TIMEOUT,
+            "systemctl is-active preloop.service",
+        )
+        .context("check preloop.service state")?
+        .status;
         if status.success() {
             bail!("preloop.service is still active after disable --now — aborting uninstall");
         }
@@ -1086,6 +1141,7 @@ fn uninstall_systemd(args: &UninstallArgs, home: &Path) -> Result<()> {
         &systemctl_args(args.user, &["daemon-reload"]),
         dry,
         "reload systemd",
+        SYSTEMCTL_TIMEOUT,
     );
     // Secrets outlive --purge-data otherwise: for a system install the
     // environment file and the staged App key live in the root-owned config
@@ -1425,21 +1481,41 @@ fn install_launchd(
     }
 
     if !dry {
-        let boot = Command::new("launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&plist_path)
-            .status();
+        let mut bootstrap = Command::new("launchctl");
+        bootstrap.args(["bootstrap", &domain]).arg(&plist_path);
+        let boot = run_command_blocking(bootstrap, LAUNCHCTL_TIMEOUT, "launchctl bootstrap");
         match boot {
-            Ok(status) if status.success() => {}
+            Ok(output) if output.status.success() => {}
+            // Any failure — including a bootstrap that timed out because
+            // launchd is wedged — still tries the deprecated `load -w`, which
+            // is what a launchd that does not know `bootstrap` needs.
             _ => {
-                let load = Command::new("launchctl")
-                    .args(["load", "-w"])
-                    .arg(&plist_path)
-                    .status();
+                let mut load = Command::new("launchctl");
+                load.args(["load", "-w"]).arg(&plist_path);
+                let load = run_command_blocking(load, LAUNCHCTL_TIMEOUT, "launchctl load -w");
                 match load {
-                    Ok(status) if status.success() => {}
-                    other => bail!(
-                        "launchctl could not start the daemon ({other:?}); \
+                    Ok(output) if output.status.success() => {}
+                    // The runner captures the streams that used to be
+                    // inherited, so launchd's own diagnostic has to be put
+                    // back into the error the operator sees.
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stderr = stderr.trim();
+                        if stderr.is_empty() {
+                            bail!(
+                                "launchctl could not start the daemon ({}); \
+                                 check `launchctl print system/{LAUNCHD_LABEL}`",
+                                output.status
+                            );
+                        }
+                        bail!(
+                            "launchctl could not start the daemon ({}: {stderr}); \
+                             check `launchctl print system/{LAUNCHD_LABEL}`",
+                            output.status
+                        );
+                    }
+                    Err(error) => bail!(
+                        "launchctl could not start the daemon ({error}); \
                          check `launchctl print system/{LAUNCHD_LABEL}`"
                     ),
                 }
@@ -1497,9 +1573,15 @@ fn webhook_hint(public_url: Option<&str>) -> String {
         Some(_) => String::new(),
         None => "\n\
              \x20 webhooks:  no --public-url set — GitHub can't reach the engine yet.\n\
-             \x20          Re-run with --public-url (tunnel: `cloudflared tunnel --url\n\
-             \x20          http://127.0.0.1:9090`; production: DNS + reverse proxy).\n\
-             \x20          See docs/setup.md \"Exposing the engine to GitHub\"."
+             \x20          Re-run with --public-url once the webhook path is published:\n\
+             \x20          `tailscale funnel --set-path=/api/v1/github/webhooks --bg\n\
+             \x20          http://127.0.0.1:9090/api/v1/github/webhooks` on a hostname\n\
+             \x20          dedicated to it — Funnel publishes the whole host and port, not\n\
+             \x20          the path, so check `tailscale funnel status` for what else it\n\
+             \x20          exposes — a *named* Cloudflare Tunnel (a quick tunnel's URL\n\
+             \x20          changes on restart and breaks the App's webhook), or your own\n\
+             \x20          domain + reverse proxy.\n\
+             \x20          See docs/control-plane/operate/deploy.mdx \"Exposure options\"."
             .to_owned(),
     }
 }
@@ -1516,6 +1598,7 @@ fn uninstall_launchd(args: &UninstallArgs, home: &Path) -> Result<()> {
         &["bootout".to_owned(), bootout],
         dry,
         "unload the daemon",
+        LAUNCHCTL_TIMEOUT,
     );
     remove_path(&plist_path, dry)?;
     eprintln!(
@@ -1608,17 +1691,29 @@ fn render_launchd_plist(exe: &Path, home: &Path, env_lines: &[String]) -> Result
 
 /// Environment-file lines for the config the operator supplied. Keys are the
 /// names `preloop serve` / the server already read (`PRELOOP_LISTEN`,
-/// `PRELOOP_PUBLIC_URL`, `PRELOOP_GITHUB_APP_*`, `PRELOOP_WEBHOOK_SECRET`).
+/// `PRELOOP_PUBLIC_URL`, `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_GITHUB_APP_*`,
+/// `PRELOOP_WEBHOOK_SECRET`).
 /// `app_key` is the path the environment file should reference — the staged
 /// service-owned copy on Linux system installs, the caller's original
-/// elsewhere; `None` falls back to `args.github_app_key`.
-fn config_env_lines(args: &InstallArgs, app_key: Option<&Path>) -> Result<Vec<String>> {
+/// elsewhere; `None` falls back to `args.github_app_key`. `runner_base_image`
+/// is the process's non-blank `PRELOOP_RUNNER_BASE_IMAGE` (see
+/// [`runner_base_image_override`]): the engine resolves it before the config
+/// file, so the service must be handed it or it would fork from a golden other
+/// than the one this install was described as using.
+fn config_env_lines(
+    args: &InstallArgs,
+    app_key: Option<&Path>,
+    runner_base_image: Option<&str>,
+) -> Result<Vec<String>> {
     let mut lines = Vec::new();
     if let Some(listen) = args.listen {
         lines.push(env_line("PRELOOP_LISTEN", &listen.to_string())?);
     }
     if let Some(url) = &args.public_url {
         lines.push(env_line("PRELOOP_PUBLIC_URL", url)?);
+    }
+    if let Some(image) = runner_base_image {
+        lines.push(env_line("PRELOOP_RUNNER_BASE_IMAGE", image)?);
     }
     if let Some(id) = &args.github_app_id {
         lines.push(env_line("PRELOOP_GITHUB_APP_ID", id)?);
@@ -1654,6 +1749,19 @@ fn config_env_lines(args: &InstallArgs, app_key: Option<&Path>) -> Result<Vec<St
         lines.push(env_line("PRELOOP_WEBHOOK_SECRET", secret)?);
     }
     Ok(lines)
+}
+
+/// `PRELOOP_RUNNER_BASE_IMAGE` as the installer reads it: the engine's own
+/// first source for the golden
+/// ([`preloop_runner_server::config::golden_base_image`] reads it before the
+/// config file), passed in rather than re-read here. Blank counts as unset,
+/// exactly as the engine resolves it, so a service keeps resolving the config
+/// file's `[golden]`.
+fn runner_base_image_override(configured: Option<&str>) -> Option<String> {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn env_line(key: &str, value: &str) -> Result<String> {
@@ -1872,30 +1980,71 @@ fn remove_path(path: &Path, dry_run: bool) -> Result<()> {
     }
 }
 
+/// Re-emit a captured child's streams on this process's own, byte for byte,
+/// so a command that used to inherit the terminal still shows its progress
+/// messages (`Created symlink …`, `Running …`).
+fn echo_captured(output: &std::process::Output) {
+    use std::io::Write;
+
+    if !output.stdout.is_empty() {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(&output.stdout);
+        let _ = stdout.flush();
+    }
+    if !output.stderr.is_empty() {
+        let _ = std::io::stderr().write_all(&output.stderr);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn run_systemctl(args: &[String], dry_run: bool) -> Result<()> {
     if dry_run {
         eprintln!("[preloop] would run: systemctl {}", args.join(" "));
         return Ok(());
     }
-    let status = Command::new("systemctl")
-        .args(args)
-        .status()
-        .with_context(|| format!("run systemctl {}", args.join(" ")))?;
-    if !status.success() {
-        bail!("systemctl {} failed ({status})", args.join(" "));
+    let mut command = Command::new("systemctl");
+    command.args(args);
+    let output = run_command_blocking(
+        command,
+        SYSTEMCTL_TIMEOUT,
+        &format!("systemctl {}", args.join(" ")),
+    )?;
+    // The runner captures what these commands used to inherit, so systemd's
+    // own progress ("Created symlink …", "Running …") is echoed back to the
+    // operator — on success and failure alike, exactly as when it was
+    // inherited.
+    echo_captured(&output);
+    if !output.status.success() {
+        bail!("systemctl {} failed ({})", args.join(" "), output.status);
     }
     Ok(())
 }
 
-fn run_ok(program: &str, args: &[String], dry_run: bool, what: &str) {
+/// Run a best-effort service-manager command, warning instead of failing.
+///
+/// `deadline` bounds the child through the shared synchronous deadline runner
+/// (`/dev/null` stdin, drained pipes, kill-and-reap at the deadline):
+/// `systemctl`/`launchctl` are the only programs this drives, and a daemon
+/// control call that never returns must not wedge the install (or the
+/// uninstall) it is part of.
+fn run_ok(program: &str, args: &[String], dry_run: bool, what: &str, deadline: Duration) {
     if dry_run {
         eprintln!("[preloop] would run: {program} {}", args.join(" "));
         return;
     }
-    match Command::new(program).args(args).status() {
-        Ok(status) if status.success() => {}
-        other => eprintln!("[preloop] warning: {what} ({other:?}); continuing"),
+    // Failures here are tolerated with a warning, so an unbounded wait would
+    // be a pure hang with no upside.
+    let target = format!("{program} {}", args.join(" "));
+    let mut command = Command::new(program);
+    command.args(args);
+    match run_command_blocking(command, deadline, &target) {
+        Ok(output) => {
+            echo_captured(&output);
+            if !output.status.success() {
+                eprintln!("[preloop] warning: {what} ({}); continuing", output.status);
+            }
+        }
+        Err(error) => eprintln!("[preloop] warning: {what} ({error}); continuing"),
     }
 }
 
@@ -2520,7 +2669,7 @@ WantedBy=multi-user.target
             user: false,
             dry_run: false,
         };
-        let lines = config_env_lines(&args, None).unwrap();
+        let lines = config_env_lines(&args, None, None).unwrap();
         assert_eq!(
             lines,
             vec![
@@ -2536,6 +2685,81 @@ WantedBy=multi-user.target
         assert!(env_line("A", "x\ny").is_err());
         assert!(env_line("A", "x\0y").is_err());
         assert_eq!(env_line("A", "x=y=z").unwrap(), "A=x=y=z");
+    }
+
+    /// `preloop init --mode service` resolves the engine's public URL itself
+    /// (flag, prompt, or environment) and hands it to the installer here: it
+    /// has to become the service's own `PRELOOP_PUBLIC_URL`, because the
+    /// service does not inherit the installing shell's environment — dropping
+    /// it would leave Check Run links and the webhook health check on the
+    /// loopback default.
+    #[test]
+    fn init_install_args_carry_the_public_url_into_the_env_file() {
+        let ServerArgs {
+            command: ServerCommand::Install(args),
+        } = install_args(None, Some("https://ci.example.com".to_owned()))
+        else {
+            panic!("install_args must build an install command");
+        };
+        assert_eq!(args.public_url.as_deref(), Some("https://ci.example.com"));
+        assert!(
+            args.home.is_none(),
+            "no operator-set home means the default"
+        );
+        assert_eq!(
+            config_env_lines(&args, None, None).unwrap(),
+            vec!["PRELOOP_PUBLIC_URL=https://ci.example.com".to_owned()]
+        );
+
+        let ServerArgs {
+            command: ServerCommand::Install(args),
+        } = install_args(None, None)
+        else {
+            panic!("install_args must build an install command");
+        };
+        assert_eq!(args.public_url, None);
+        assert!(config_env_lines(&args, None, None).unwrap().is_empty());
+    }
+
+    /// `PRELOOP_RUNNER_BASE_IMAGE` outranks the config file's `[golden]`
+    /// everywhere the engine resolves a golden, so a service that does not
+    /// inherit the installing shell has to be handed it in its own
+    /// environment file — the label report and `init`'s done JSON describe the
+    /// override, and the service must run on the same image. Unset (or blank)
+    /// writes no line at all: the service keeps resolving the config file.
+    #[test]
+    fn a_runner_base_image_override_reaches_the_env_file_only_when_set() {
+        let args = match install_args(None, Some("https://ci.example.com".to_owned())) {
+            ServerArgs {
+                command: ServerCommand::Install(args),
+            } => args,
+            _ => panic!("install_args must build an install command"),
+        };
+        assert_eq!(
+            config_env_lines(&args, None, Some("ghcr.io/acme/base@sha256:abc")).unwrap(),
+            vec![
+                "PRELOOP_PUBLIC_URL=https://ci.example.com".to_owned(),
+                "PRELOOP_RUNNER_BASE_IMAGE=ghcr.io/acme/base@sha256:abc".to_owned(),
+            ]
+        );
+        assert_eq!(
+            config_env_lines(&args, None, None).unwrap(),
+            vec!["PRELOOP_PUBLIC_URL=https://ci.example.com".to_owned()]
+        );
+
+        // The installer reads that value off its own process environment, the
+        // only place it can come from: `PRELOOP_RUNNER_BASE_IMAGE` is exported
+        // by the installing shell. Blank behaves like unset.
+        assert_eq!(runner_base_image_override(None), None);
+        assert_eq!(
+            runner_base_image_override(Some("ghcr.io/acme/base:1")).as_deref(),
+            Some("ghcr.io/acme/base:1")
+        );
+        assert_eq!(
+            runner_base_image_override(Some(" ")),
+            None,
+            "a blank override is unset"
+        );
     }
 
     #[test]
@@ -2620,7 +2844,7 @@ WantedBy=multi-user.target
             dry_run: false,
             ..args.clone()
         };
-        let lines = config_env_lines(&env_args, None).unwrap();
+        let lines = config_env_lines(&env_args, None, None).unwrap();
         let canonical_staged = std::fs::canonicalize(&staged).unwrap();
         assert!(
             lines.iter().any(|line| line
@@ -2641,7 +2865,7 @@ WantedBy=multi-user.target
             "dry-run must not create the staged copy"
         );
         // Dry-run renders the staged path without a canonicalize round-trip.
-        let dry_lines = config_env_lines(&dry_args, Some(&dry_staged)).unwrap();
+        let dry_lines = config_env_lines(&dry_args, Some(&dry_staged), None).unwrap();
         assert!(
             dry_lines
                 .iter()

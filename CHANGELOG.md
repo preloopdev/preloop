@@ -10,6 +10,350 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- **Code-scanning SARIF ingestion.** `github/codeql-action/upload-sarif` now
+  completes on an engine-hosted run: the GitHub shim serves the legacy
+  `POST /api/v3/repos/{owner}/{repo}/code-scanning/sarifs` upload, the
+  `PUT …/code-scanning/analysis` endpoint current action releases use, and the
+  status/analyses reads the action follows, all authenticated with the job
+  runtime token and bound to the token's repository (another repository's
+  token is refused, and an id under another repository reads as 404). The
+  Actions run read the action makes while deriving its analysis key is
+  answered from the same credential, so the step no longer stops on a 404
+  before uploading. A native
+  surface, `POST /api/v1/runs/{run_id}/sarif`, takes the raw
+  `application/sarif+json` document or a JSON wrapper and exposes
+  `GET /api/v1/runs/{run_id}/sarif`, `GET /api/v1/sarif/{analysis_id}` and
+  `GET /api/v1/sarif/{analysis_id}/raw`; a job token may only touch its own
+  run. Uploads are capped at 24 MiB of request body, 10 MiB of compressed
+  SARIF and 32 MiB decompressed, and at 25,000 normalized findings; malformed
+  base64/gzip/JSON or a non-2.1.0 version is rejected with a GitHub-shaped
+  error. Normalized findings carry tool, rule, level, message, path, line and
+  column range, fingerprint and suppression state, raw SARIF is stored
+  gzip-compressed beside the run store, and metadata/findings are persisted in
+  the control database (`sarif_analyses` / `sarif_findings`, new migration
+  `2026102101`). Re-uploads dedupe on a content fingerprint over the
+  repository, commit, ref, tool and sorted finding fingerprints — not on raw
+  bytes — so the same analysis is returned instead of stored twice.
+
+### Security
+
+- **CI security gates cover PRs, main, dependencies, and the runner image.**
+  Semgrep runs on every pull request (`p/github-actions`, `p/secrets`)
+  and fails on findings; CodeQL runs on merge to `main` for
+  Actions and Rust; dependency review blocks high-severity additions; and
+  OpenSSF Scorecard runs weekly. The published runner image is now signed with
+  keyless cosign and has a registry-backed provenance attestation. The golden
+  scan also requires the aarch64 apt SBOM and scans it with Grype, and the
+  main ruleset no longer allows direct pushes (admins may still merge a PR),
+  and the release-tag ruleset restricts tag creation.
+
+### Fixed
+
+- **The runner pool's golden-release GitHub calls now go through the engine's
+  circuit breaker.** `resolve_latest_golden_tag` (the `/releases` listing), the
+  OCI manifest and token lookups, the `.sha256` sidecars and the golden
+  transfers were the last GitHub calls outside it: the pool had no handle on
+  the engine's `AppState` breaker registry. `RunnerPoolConfig` now carries the
+  engine's shared funnel (the registry and its per-subsystem accounting) from
+  the CLI through `bootstrap::serve` into `AppState` and the runner pool, so
+  golden traffic is admitted on the anonymous bucket and attributed to the new
+  `golden` subsystem. A one-shot CLI bake, with no engine to share a funnel
+  with, keeps a private one instead of leaving a call unobserved. Behaviour: an
+  open breaker refuses the metadata lookup before it opens a connection — none
+  of its 30-second deadline is spent, and the refusal is not cached as a
+  negative tag — while the transfers keep their one-hour budget and only their
+  admission decision changes. Breaker state is keyed by service origin as well
+  as credential, so the golden hosts an operator names (`PRELOOP_GOLDEN_URL`,
+  a non-GHCR `PRELOOP_GOLDEN_OCI_REF`, a token realm) keep their own breakers:
+  a mirror's outage cannot park GitHub traffic, an open GitHub breaker cannot
+  refuse a healthy mirror, and a GHES install's anonymous calls no longer share
+  a partition with the golden path's public-GitHub calls. A golden lookup also
+  inherits an outage another credential's traffic already discovered at the same
+  origin, and the `golden` subsystem now reports the bytes it moved rather than
+  zero.
+
+- **Snapshot capture is bounded end to end, and the shared object cache has a
+  ceiling.** One run's merge attach, local workspace capture, or remote
+  checkout fetch now runs under a single 90-minute backstop; on expiry only
+  that run's unaccepted staging and run-local repositories are removed, and
+  the submission fails with an operator message instead of queueing jobs.
+  Cancelling a capture kills the whole Git process group (a hung transport or
+  `index-pack` included); the per-cache refresh lock is released when
+  `ensure_object_cache` returns, a cache pin bridges the interval until the
+  snapshot publishes its alternates, and staging cleanup waits for in-flight
+  blocking copies before removing the tree. The shared snapshot object cache
+  (`<state>/snapshot-object-cache`) is pruned oldest-first at startup and
+  after each successful capture to
+  `PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES` (default 100 GiB, `0` disables).
+  An entry is retired only under the same per-entry lock a refresh takes, and
+  never while a capture pin or an alternates reference protects it; clone
+  hardlinks make the ceiling soft.
+
+## [0.35.5] - 2026-10-21
+
+### Security
+
+- **Webhook ingress bounds and times out body uploads.** The GitHub webhook
+  route buffers at most eight request bodies (each up to the 32 MiB route
+  limit) at once, so an unauthenticated caller can no longer use the ingress
+  as a memory amplifier before the HMAC check. An upload is cut off with 408
+  if it is still arriving after 10 s, or if it stops sending for 3 s — holding
+  a slot now costs an actual transfer instead of just a connection — and a
+  delivery that arrives while every slot is taken waits up to 1 s for one
+  rather than being shed outright. Those budgets cover the upload alone: once
+  the body is in, the handler keeps its own acknowledgement budget, so a slow
+  but valid delivery is still recorded. A shed or timed-out request never
+  reached the store and has no local payload to replay, so recovering one
+  means redelivering it from GitHub's delivery log; `preloop webhooks replay`
+  cannot help. With `--record-flows`, the webhook body is no longer buffered
+  by the flow recorder ahead of the route's own admission.
+### Fixed
+
+- **A stale pinned guest-agent rootfs can no longer make every VM
+  unstoppable.** The engine exports `SMOLVM_AGENT_ROOTFS` to every smolvm
+  child (the child's `HOME`/data directory is isolated), and an inherited
+  variable wins over the rootfs that ships beside the binary — so after a
+  hand-upgraded smolvm prefix the engine kept booting the old agent found in
+  the data directory, and smolvm ≥ 1.16 refused every `machine stop` with
+  `running guest agent does not support safe shutdown; VM left unchanged;
+  update the guest agent before retrying`, which the pool retried for hours.
+  On Linux the rootfs shipped next to the resolved binary is now the first
+  candidate, and on every platform a candidate that agrees with it is
+  preferred; a boot from a provably mismatched agent is refused up front with
+  both rootfs paths, both agent hashes, the host version, and the remedy. Two
+  identical trees are not enough on their own: when the agent they hold
+  advertises no `quiesced-shutdown-v1` while the resolved host requires it,
+  the boot is refused too — that is what a smolvm upgraded without its rootfs
+  looks like. `preloop update --ensure-runtime` refreshes the rootfs the engine
+  exports (`<data dir>/agent-rootfs`, where `<data dir>` is `SMOLVM_DATA_DIR`
+  or the effective Preloop home's `smolvm`), keeps the rootfs beside the
+  resolved binary in step, records the version in `.preloop-agent-version`, and
+  repairs the install whenever either tree stops matching the installed
+  smolvm — not only when the binary is reinstalled. It never installs a sibling
+  it has just proven stale, and it refuses to claim a repair while
+  `SMOLVM_AGENT_ROOTFS` pins a tree that does not hold the host's agent. A
+  refused stop now also names the rootfs Preloop exported and the agent version
+  the guest logged at boot.
+- **Self-built pull-request merges can fetch missing LFS objects.** A run on
+  an engine-built merge is served from a repository that exists only in the
+  engine, but its Git LFS objects still live upstream. The attached snapshot
+  recorded no upstream repository, so the LFS batch route treated every miss
+  as a 404 and jobs could not check out golden or other LFS-backed fixtures.
+  `attach_merge` and `attach_prebuilt_merge` now record the merge's upstream
+  `owner/repo`, with visibility left unknown so the existing route attempts a
+  fetch — App or PAT credentials when configured, anonymously otherwise.
+- **Snapshot cache deepening uses the GitHub App installation token.** A
+  shallow or partial workspace whose GitHub origin is private used to deepen
+  only with the static PAT over HTTPS, so an App-only deployment could not
+  recover the full history, and an SSH origin never received a credential at
+  all. The deepen fetch now prefers a contents-read App installation token,
+  falls back to the PAT, and fetches an SSH origin over HTTPS with that token.
+  The credential is scoped to the configured forge origin and never sent over
+  plaintext HTTP.
+
+- **Partial-clone workspaces fail the submission instead of publishing a
+  broken snapshot.** A workspace cloned with `--filter` whose objects the
+  remote could not supply left holes in the object cache. A reused cache
+  skipped the connectivity check, so the snapshot could publish a HEAD whose
+  trees or blobs no job could read. The submission is now refused with an
+  operator message when HEAD's own history is incomplete. Holes that only other
+  branches or tags reach are still published, as before; publish skips only refs
+  whose target object is absent.
+  Cache deepening also fetches tags, so objects reachable only from a tag are
+  recovered.
+
+- **Workspace snapshots build when the state directory is on another
+  filesystem.** The snapshot object cache initialized itself with
+  `git clone --bare --local`, which hardlinks object files; a workspace on a
+  bind mount, overlay or shared volume makes the kernel refuse the link with
+  `EXDEV` ("Invalid cross-device link"), and the submission failed with a 500
+  before any job ran. The clone now copies objects (`--no-hardlinks`) when the
+  workspace and the cache root are on different devices, and retries as a copy
+  if a hardlinked clone fails anyway, keeping the same-filesystem fast path.
+
+- **Submissions for repositories with thousands of refs no longer hang while
+  staging the snapshot.** `git cat-file --batch-check` was fed thousands of
+  object ids over a pipe and its answer was read only after every id had been
+  written; once the 64 KiB stdout pipe filled, the child stopped reading stdin
+  and the parent stopped draining stdout, so the submission sat there until
+  the client gave up. Git's stdin is now written while stdout and stderr are
+  drained concurrently.
+- **Retries preserve nested-action authorization.** Retrying a claimed job now
+  updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
+  Previously it still named the abandoned attempt, so nested action resolution
+  rejected the retried job's otherwise valid runtime token with HTTP 403.
+- **Direct Docker actions retain their image reference.** Job messages carrying
+  a `containerRegistry` reference now select the `docker://` action handler
+  instead of being reconstructed as an empty remote-action reference.
+- **Guest DNS follows the selected network backend unless explicitly overridden.**
+  Unset `PRELOOP_RUNNER_DNS` no longer forces a public resolver over provider
+  defaults; unrestricted TSI systemd launches select the resolved stub.
+- **Container DNS reaches systemd-resolved's stub, so `/etc/hosts` aliases
+  resolve inside a compose network.** A GitHub-hosted runner's container
+  resolves a `postgres.localhost`-style service alias because its host's
+  `/etc/resolv.conf` names `127.0.0.53`; a preloop guest named its own resolver
+  (`75.75.75.75` on AgentENV, `100.96.0.1` on SmolVM), so Docker handed the
+  container that address as its only external server and the name came back
+  NXDOMAIN. The golden now points the resolver file at the stub, and the engine
+  re-applies it per machine and again inside every runner launch, because the
+  SmolVM agent rewrites the file at each start and before each interactive run.
+  The guest's configured upstream nameservers are kept as additional lines, and
+  the runtime step waits (bounded, 30 s) for systemd-resolved to publish the
+  stub on a freshly resumed guest; no `daemon.json` `dns` override is written,
+  since a loopback address there becomes the container's own loopback and every
+  lookup fails. A guest with no resolved stub keeps its resolver and logs why.
+- **Official-pack guests get managed systemd and ext4 container state.**
+  A runtime machine from the official pack runs `/sbin/init` as the workload,
+  which gives the guest `systemctl`, `journald`, `systemd-resolved` and
+  Docker's `systemd` cgroup driver, and mounts `/var/lib/docker` and
+  `/var/lib/containerd` on the machine's own storage disk so Docker picks
+  `overlay2` instead of degrading to `fuse-overlayfs`. Those guest-local
+  directories start empty; nothing migrates existing state into them. A custom
+  pack keeps its baked container state and its own entrypoint/cmd unless
+  `PRELOOP_SMOLVM_WORKLOAD_INIT`, `PRELOOP_SMOLVM_GUEST_VOLUMES`, or an
+  explicit machine list opts in (an empty value disables the managed default).
+  The golden builder is never given guest-local volumes or a replaced
+  workload: its container state must stay in the overlay `pack create`
+  captures. The resolved launch settings are part of the golden identity, so
+  changing either override rebuilds or re-unpacks the golden instead of
+  adopting one with the previous PID 1 or mounts.
+- **The runner sees the image's whole environment, not just its PATH.** The
+  guest launcher sourced `/etc/environment` without `set -a`, so entries such
+  as `ImageOS`, `ImageVersion`, `JAVA_HOME*`, `LANG` and `DEBIAN_FRONTEND`
+  stayed shell-local and the `exec env` dropped them (measured: ~60 fewer
+  variables than hosted, and `setup-*` actions could not find the tool cache).
+  It also replaced the image's PATH with the engine fallback, making
+  `/opt/pipx_bin`, `~/.local/bin` and `/usr/local/.ghcup/bin` unreachable while
+  those tools were installed. The launcher now exports the sourced entries and
+  keeps the image's PATH, using the fallback only when the image declares none.
+- **Guest parity residue from the runner image is cleaned at bake time, and
+  custom bases keep their own policy.** `ping` gets `cap_net_raw+ep` back (an
+  OCI layer carries no file capabilities), the official golden's bake host
+  `/etc/hosts` mapping is dropped, and `/etc/fstab` entries naming Azure disks
+  this guest does not have are commented out with their original text, so
+  `systemd-remount-fs.service` no longer fails on every boot. Systemd guests
+  also get `systemd-resolved`'s upstream pinned through a
+  `resolved.conf.d` drop-in (an image's own `DNS=`, in `resolved.conf` or a
+  drop-in, is never touched)
+  and the Azure/cloud-init/snap/apt units the hosted image never runs masked.
+  A user-provided base now preserves all of that policy by default: its
+  `/etc/hosts` and `/etc/fstab` stay unchanged, its `systemd-sysctl.service`
+  and snap/apt units stay enabled (so its `/etc/sysctl.conf` and
+  `/etc/sysctl.d` tuning still applies), its `ping` is not modified, and its
+  resolver and per-machine sysctl values are not rewritten.
+  `PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1` opts a custom base into the whole
+  hosted policy when that base is itself a cloud image dump. Official release
+  bakes set it explicitly because their base is a digest-pinned reference,
+  not the official-golden sentinel.
+- **Resolver rewrites keep `search`, `domain` and compatible options.** The
+  bake and per-machine steps used to replace `/etc/resolv.conf` with only the
+  stub, one upstream and a fixed `options edns0 trust-ad` line, so a short
+  corporate name that depended on `search corp.example` or on `ndots` stopped
+  resolving in guest steps and containers. Both paths now keep every
+  configured upstream nameserver, all `search`/`domain` directives and the
+  image's options (adding the hosted defaults only when absent), and remain
+  idempotent. When the file carries only the stub, the fallback upstream comes
+  from the effective `DNS=` in `resolved.conf` and its sorted drop-ins —
+  non-empty assignments append and an empty assignment clears the list, as in
+  systemd-resolved — so an internal resolver is used instead of `1.1.1.1`;
+  the public fallback remains only when no upstream is configured anywhere.
+  The write is still atomic and replaces a symlinked file with a regular one,
+  and the per-machine application follows the base's policy: only the
+  official or explicitly opted-in hosted policy rewrites it.
+- **The job workspace uses the hosted `work` folder.** A job's checkout now
+  lands at `<runner-root>/work/<repo>/<repo>` and `RUNNER_WORKSPACE` is
+  exported; `_work` is the official runner's self-hosted default, and workflows
+  that branch on the path or look for a sibling checkout saw the wrong shape.
+- **The per-machine runtime init's reports reach the engine log.** Each half
+  exits 0 whether it applied its change or skipped it, so a silently skipped
+  resolver rewrite was invisible in the journal; every non-empty output line is
+  now logged with the machine name.
+- **`github.token` and `GITHUB_TOKEN` populate on github.com registrations**
+  (#626): `preloop-runner configure` now records which control plane the
+  runner registered against (`.runner` `controlPlane`, derived from the
+  `--url` host), and a `.runner` written before that field existed is
+  classified from the `gitHubUrl` it already carries, so an upgraded runner
+  recovers the token surface without re-registering. On a github.com
+  registration, `github.token` and the `GITHUB_TOKEN` env var resolve from
+  the job's `system.github.token` variable (or its `github_token` alias) —
+  mirroring the official runner, which builds `githubContext["token"]` from
+  that variable in `ExecutionContext.InitializeJob` — so `gh`,
+  `github-script`, and checkout's `${{ github.token }}` default authenticate
+  instead of seeing an empty value. Engine registrations keep the fence:
+  there the claim owns that slot, holding the GitHub credential it minted
+  (which the runner reads from the `github.token` context) or nothing at all,
+  and it is never exported to a step. The job-scoped runtime JWT is delivered
+  through `SystemVssConnection` and never enters that variable or the step
+  environment. On both planes a workflow's own `env: GITHUB_TOKEN` no longer
+  replaces `${{ github.token }}`, and the
+  `base64("x-access-token:<token>")` header actions/checkout persists is
+  masked for either alias. `secrets.GITHUB_TOKEN` resolution is unchanged in
+  both modes. Missing, unreadable, or malformed `.runner` metadata now fails
+  the job before any workflow, container, or service work instead of silently
+  selecting the engine plane; an unknown `controlPlane` value or an
+  unparseable `gitHubUrl` is an error, and job execution reuses the
+  registration state validated at worker startup rather than re-reading
+  `.runner` per job.
+
+### Changed
+
+- **Webhook installation-coverage lookups are cached per App.** The receiver
+  called `GET /repos/{owner}/{repo}/installation` on every signed delivery
+  before enqueueing it, so each delivery paid a GitHub API round trip inside
+  the ingress' upload slot and spent one request of the App's rate limit.
+  Only a validated positive is retained, for ten minutes. A definitive 404,
+  timeout, rate limit, 5xx, unparseable body, missing/mismatched `app_id`, or
+  suspended installation denies that delivery without being cached, so the
+  next delivery can discover a new grant immediately. Simultaneous deliveries
+  for one repository share one lookup; unrelated repositories and Apps do not
+  serialize. Signature-verified `installation` and `installation_repositories`
+  events invalidate the signer's affected answers before ordinary gating —
+  deleted/suspended installations clear all of that App's answers, and
+  added/removed repositories are re-confirmed on the next ordinary delivery.
+  Lifecycle payloads never grant access, and a payload's `app_id` is never
+  used in place of the verified signer. The cache is process-local: a
+  lifecycle event missed by a process leaves its positive valid for at most
+  the ten-minute fallback TTL, so this is not immediate distributed
+  revocation. At capacity the oldest checked answer is evicted individually,
+  and setup/doctor installation checks stay uncached.
+- **Webhook processing keeps the verified signer's App identity.** The signer
+  App id is persisted with the durable delivery and pins credential selection
+  throughout that delivery's processing (including its spawned processing task
+  and check-run reporting), so a delivery signed by App B is not processed with
+  another App's installation credentials just because that App sorts first in
+  the registry. Job-runtime token minting remains a separate repository-scoped
+  selection path; this change does not alter it.
+
+## [0.35.0] - 2026-10-19
+
+### Security
+
+- **Log masking covers base64 alignment shifts.** A secret piped through
+  `base64` with a short prefix in front of it (`printf 'x%s' "$SECRET" |
+  base64`) no longer reaches a masked log. Masked log paths now redact
+  base64 encodings of a registered secret at any byte alignment, including
+  tokens that straddle 76-column wrapped lines and tokens split across write
+  chunks in server-side log persistence. Percent- and hex-encodings of such
+  a shifted payload are still not covered by this pass; register the exact
+  value when a workflow prints it that way.
+
+### Added
+
+- **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or
+  `PRELOOP_PUBLIC_URL`), `preloop setup github --via app` asks the running
+  engine to host the App-creation form. The CLI prints a single-use setup link
+  that expires in ten minutes. The engine serves the form at `/setup/github`,
+  converts GitHub's code at `/setup/github/callback`, and stores the credentials
+  the same way the CLI does, so the browser never needs a route back to a
+  laptop. The routes answer 404 unless a setup is in progress. New endpoints:
+  `POST /api/v1/github/setup-sessions` and
+  `GET /api/v1/github/setup-sessions/{id}`, both with the system token.
+
+- **App setup over SSH.** Without a public URL, an SSH session binds the
+  loopback listener on port 8765 (or `--port`) and prints the `ssh -L` command
+  to run on your laptop, then the address to open. The redirect path is the
+  same as the local flow.
+
 - **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
   the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
   release digest and GitHub artifact attestation. Pin a release with
@@ -20,11 +364,50 @@ Releases before v0.27.0 predate the changelog.
   ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
   cargo-zigbuild match `release-runner.yml`.
 
+- **The `preloop` crate on crates.io tracks releases.** `publish-crates-io` in
+  the release workflow publishes `packaging/crates-io/preloop` — the crate that
+  holds the name on crates.io and points readers at the channels that do install
+  the CLI — at each release version, authenticating with a crates.io trusted
+  publisher instead of a stored token. The job skips with a workflow warning
+  while the name is unclaimed and no-ops when that version is already published,
+  so re-running a tag stays safe. The first version is still claimed by hand:
+  see `packaging/crates-io/README.md`.
+
+- **Superseded AgentENV volumes are collected automatically.** A runner bundle
+  change publishes a new content-addressed volume and leaves the old one behind;
+  the engine now reclaims the ones nothing needs — unmounted by any sandbox, past
+  the grace period, beyond the newest one kept for a rollback, and not a tree the
+  engine mounts — in a pass after each populate and every six hours (the timer
+  starts with the engine, so an engine that only resumes sandboxes still
+  collects). A pass never deletes a volume a sandbox mounts (AgentENV refuses), a
+  volume whose creation time nothing recorded, or a staging volume a populate is
+  writing, and every deletion is logged with its name, size and reason. A volume
+  AgentENV reports as something other than `ready` is reclaimed once it is past
+  the grace period — including one this engine published and remembers, which it
+  refuses to mount — so a start that would otherwise stay stuck on it populates
+  again. A volume a populate or a start claims between the plan and the deletion
+  is left for the next pass.
+  `PRELOOP_VOLUMES_GC=off` turns the automatic passes off;
+  `PRELOOP_VOLUMES_KEEP_PREVIOUS` (default 1), `PRELOOP_VOLUMES_GC_GRACE_SECS`
+  (default 3600) and `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600) set the
+  retention.
+
+- **`preloop volumes gc [--keep <DIR>]... [--dry-run]`** prints the plan a pass
+  acts on — one row per volume with its size, kind, age and the reason it is kept
+  or deleted — and deletes it unless `--dry-run` is given. A deletion that fails
+  exits nonzero, as `prune` does. `prune` stays as the explicit one-shot for
+  volumes that have no recorded age.
+
 - **`preloop init` workflow readiness checks.** The five-step wizard can ask for
   a stable HTTPS App webhook URL, scan local and configured repositories for
   missing workflow secrets, and report every `runs-on` label against the
   engine's actual pool rules. Use `--no-secrets-scan` to skip secret checks;
   `--json` includes the URL, secret, and runner-label decisions.
+  It accepts the tailnet name it detects on the host when a Funnel publishes
+  only the webhook path there (showing the Tailscale Funnel / named Cloudflare
+  Tunnel setup, and checking `tailscale funnel status`), and carries the URL
+  into the run mode it starts — foreground `serve`, or the installed service's
+  environment — so Check Run links and the webhook health check use it.
 
 ### Changed
 
@@ -40,6 +423,29 @@ Releases before v0.27.0 predate the changelog.
   activation now uses `listenfd`. `just test-ci` runs `clippy -D warnings` over
   the whole workspace plus the structural rules (`just sg-test` and
   `just sg-scan-strict`).
+- **`preloop serve` (and `preloop init --mode foreground`) is the only way an
+  engine starts.** Every command that talks to an
+  engine — `run` and `rerun` included, plus `status`, `logs`, `cancel`,
+  `shell`, `debug`, `dap`, `push` and `webhooks` — requires one that is
+  already running: it probes the endpoint it would use (`PRELOOP_URL`, else
+  the local default) and, when nothing answers, exits non-zero naming that
+  endpoint and how to start one (`preloop serve` in the foreground, `preloop
+  server install` for a supervised service) instead of booting a background
+  engine. Local and administrative commands (`plan`, `store`, `setup`,
+  `doctor`, `secret`, `update`, `version`, `build-golden`, `golden-path`, and
+  `init` outside `--mode foreground`) never contact one. A set `PRELOOP_URL` no
+  longer implies a live engine, and no command falls back to a local one. The
+  refusal keeps the `PRELOOP_UNREACHABLE` marker the pre-push hook fails open
+  on, so a missing engine stays a soft gate. A `PRELOOP_URL` that crosses a
+  network is probed with a longer budget than loopback, so an engine that
+  answers slowly is not reported absent. The brand-new control-database
+  initialization that the background start performed moved to `preloop serve`,
+  so a fresh `PRELOOP_HOME` still serves with no extra step, out of the store
+  `--store` / `PRELOOP_STORE_URL` selects (the same one the boot opens); an
+  existing store is still never migrated implicitly. Fixes defect 3 of
+  [#658](https://github.com/preloopdev/preloop/issues/658): a `preloop run`
+  from the pre-push hook used to start a control plane and a smolVM on the
+  developer's machine. The hook's other two defects are tracked separately.
 - **SmolVM floor and golden pin move to 1.30.1** (`smolvm_min_version` and
   `smolvm_golden_version` in `versions.toml`). The floor now also covers the
   x86_64 virtio device budget SmolVM 1.23.0 raised to 19 MMIO IRQ lines, which
@@ -72,7 +478,271 @@ Releases before v0.27.0 predate the changelog.
   kept in the keychain are copied into the file store the first time they are
   read; the keychain entry is left in place.
 
+- **AgentENV runners mount the runner bundle as a read-only volume**: the
+  complete bundle (including Node externals) is archived once into a
+  content-addressed volume named `preloop-runner-<digest>`, stamped with a
+  `.preloop-bundle.json` manifest saying which runner and Node versions it
+  holds, and clones mount it at start with `aenv start --volume`. Fork bases stay
+  volume-free because AgentENV 0.2.1 cannot snapshot a sandbox with a read-only
+  volume; a new bundle is therefore a new volume rather than a golden rebuild.
+  Writable host mounts are refused, symlinks that would leave the tree and
+  set-user-ID/set-group-ID/sticky bits are stripped, and volume create/populate
+  failures are reported by name with no tar fallback. `preloop volumes list|prune`
+  manages leftovers; `preloop volumes gc` — the plan the engine also runs by
+  itself — collects the superseded ones.
+- **`$BROWSER` is honored when the CLI opens a page.** It is tried first, as
+  `xdg-open` reads it, so VS Code and Cursor remote terminals open GitHub's
+  setup page on your laptop and forward its port. The platform opener remains
+  the fallback. Entries are parsed with shell-style quoting, so a helper whose
+  path or arguments contain spaces launches, and no entry is waited on — a
+  foreground browser can no longer hold the page it is waiting for.
+
+- **Engine-hosted App setup runs `--repo` checks.** The engine waits (up to
+  five minutes, shared across the list) for the App to be installed on each
+  requested repository, verifies the new credentials there, and reports one
+  `✓`/`✗` line per repository through the session status; the CLI prints them
+  and exits non-zero when a check failed, exactly like the loopback flow's
+  `doctor`. Up to 16 repositories per setup.
+
 ### Fixed
+
+- **A `tailscale` query that does not answer is abandoned, not waited out.**
+  The wizard's 5 s bound covered only the wait for the `tailscale` child to
+  exit; the answer was then read to the end of its stdout, so a child that had
+  forked — a shim or wrapper script on `PATH`, or a shell — left that pipe open
+  in a grandchild that outlived the kill, and the query ran for as long as
+  whatever the child left behind. The read now shares the deadline, and is
+  capped and abandoned with it, so a descendant that keeps writing can neither
+  hold the wizard nor grow the answer without bound.
+
+- **Local runs resolve a local composite's nested remote action again** (#649
+  regression from #620): the runner resolves such an action with its job's
+  runtime token and names the job by `system.orchestrationId`
+  (`{planId}.{jobId}.__default`), and the Results identity check refused that
+  plan segment. A job token now names its own plan in that form too; the job
+  UUID must still match, so a token reaches only its own job. Every refusal on
+  the action-download path logs a WARN with its run and reason, and a local
+  composite source that cannot be read is treated as incomplete, never
+  remembered as an empty answer.
+
+- **Runner mask hints are now applied in job logs.** The engine already stamped
+  `maskHints` (regex and variable) into every job message, but the runner
+  ignored the list, so pattern-shaped redaction the official runner performs
+  never happened. `run_job` now consumes it: regex hints compile once per job
+  and join the same scan as value masks on every runner egress — durable step
+  logs, check-run annotations, the live-log drain, and the retroactive re-mask —
+  and variable hints mask the named variable's value. The assembled step log
+  (`log_content`, and every slice and upload derived from it) additionally takes
+  the pattern pass over the whole text with line preservation, so a hint whose
+  pattern spans a newline still redacts it while the record count — and every
+  line checkpoint — stays intact. A hint whose pattern does not compile is
+  skipped with a warning. The completion `environment.url` guard applies the
+  hint patterns too, so a URL matching one is dropped rather than published.
+
+- **Credential-shaped container and service `env:` values are masked.** A
+  service declared as `services: db: env: POSTGRES_PASSWORD: …` showed the value
+  verbatim on the `##[command]docker create … -e` line, in the docker debug
+  trace, and in service `docker logs` output. Values whose `env` name matches
+  PASSWORD, PASSWD, SECRET, TOKEN, API_KEY, APIKEY, PRIVATE_KEY, CREDENTIAL, or
+  ACCESS_KEY (case-insensitive) are now registered as job masks before the first
+  recorded docker line, so every sink shows `***`; an empty workflow value is
+  passed as a bare `-e KEY`, which makes Docker inherit the key from the runner
+  process, so the runner's own value for a credential-shaped key is registered
+  too. The match deliberately over-masks (a `TOKEN_BUDGET=5` becomes `***`) —
+  documented at the registration site. The container-create error paths that
+  embed docker output mask it as well.
+
+- **Minted OIDC `id_token`s are redacted from logs.** A step that curls
+  `ACTIONS_ID_TOKEN_REQUEST_URL` and echoes the response leaked the bearer JWT
+  into its log. The token endpoint now registers each minted `id_token` into the
+  job's server-side mask scope before the response is sent, widening the running
+  stream masker in place (the withheld tail is flushed through the rebuilt
+  masker, so no log bytes are dropped), so both the live feed and the persisted
+  log show `***`. Unrelated content is unchanged. Registration is node-local,
+  like the existing claim-time scope merges, and bounded: each scope keeps the
+  64 most recent registrations and drops the oldest first, so a job that mints a
+  token per call cannot grow the scope — or rebuild every live masker from a
+  longer list on each mint — for the run's life. Retention removes the run's own
+  scope entry with its plan scopes. The per-log masker mutex is held across the
+  append of a widened masker's flushed tail, so a concurrent append never
+  interleaves with it.
+- **GitHub Apps created by the manifest flow now subscribe to
+  `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
+  signal joins the creation-time `default_events`, and `actions: read` joins
+  the manifest's `default_permissions` because GitHub does not render the
+  `workflow_job` checkbox without it (the permission is requested only when the
+  event list actually carries `workflow_job`). The startup subscription
+  read-back now reports a missing `workflow_job` with the permission-gating
+  remediation. GitHub cannot change an App's event subscriptions through its
+  API after creation, so **Apps created before this change need a manual
+  edit**: App settings → Permissions & events → grant Actions: read
+  (installation must accept) → Subscribe to events → tick `workflow_job`.
+  Apps created without `--public-url` were shipped with no webhook and no
+  `default_events` at all, so enabling webhooks on one of those needs the same
+  manual step for every event.
+- **Converted App credentials are `SecretString` end to end.** The private key
+  and webhook secret GitHub returns are deserialized into `SecretString`, so
+  formatting or logging either one redacts it; the plaintext is exposed only
+  where it is written through the credential store. A conversion that GitHub
+  rejects no longer puts the upstream response body into the error the CLI
+  prints.
+
+- **GitHub App installation links follow the configured GitHub host.** The
+  slug-based installation URL is built from the same web root the App was
+  created on, so a GitHub Enterprise Server engine no longer sends the operator
+  to `github.com`.
+
+- **Engine-hosted setup no longer races, clobbers, or duplicates.**
+  - A setup session that is converting, or holding a result its CLI has not
+    read yet, is no longer replaced by a second setup: the CLI that was waiting
+    gets its result instead of a 404 while its App exists on GitHub.
+  - App credential writes take the same whole-file config lock as the secrets
+    and execution-protection APIs, so an overlapping write can no longer erase
+    the other's change.
+  - The engine refuses to create a second App when its own config already has
+    one (the CLI's duplicate check cannot see a remote engine's config) and
+    reports the App id instead; `--add` still creates an additional App.
+  - The engine checks that its config loads and its credential store can hold
+    the key before GitHub creates anything, so a key that could not be stored
+    is reported before the App exists rather than after. A store selected with
+    `PRELOOP_CREDENTIAL_STORE=memory` is refused outright: it holds the key for
+    this process only, while the flow's next step is the restart that would
+    lose it.
+  - A setup is refused when `--public-url` names an origin other than the
+    engine's own `PRELOOP_PUBLIC_URL`, and plain `http` is refused outside
+    loopback: the one-time link and GitHub's redirect carry the App's token and
+    code.
+
+- **Refused setup guesses no longer end a live App setup.** The browser-facing
+  `/setup/github` route is unauthenticated, and five wrong tokens used to fail
+  the session outright — which made an onlooker's guesses a way to cancel a
+  setup that was in progress. A mismatch is now refused and logged without
+  touching the session; the one-time token is still burned the moment it is
+  used, and the request budget still caps how fast anyone can guess.
+
+- **A spent setup budget no longer gates the operator's own request.** The
+  browser-facing setup routes billed every request to one shared window before
+  the token or state was checked, so any unauthenticated caller could spend it
+  guessing and the operator's own setup link — or GitHub's redirect with the
+  App's code — was answered 429 while a setup was open. The token and state
+  checks now run first and only a refusal is charged, so the operator's request
+  is never gated; the form and the callback each have their own window, so
+  neither route's guessing can spend the other's. A burst of invalid requests
+  still reads 404 (or 400 for a forged callback) up to the window's limit and
+  429 after it, and an inactive session still reads 404.
+
+- **`PRELOOP_PUBLIC_URL` alone now updates an existing App's webhook.** The
+  effective public URL is resolved before the already-configured-App branch, so
+  setting it in the environment (without `--public-url`) points the configured
+  App's webhook at that address instead of printing only that it is configured.
+
+- **A hung Postgres no longer freezes the engine, and a stuck statement or
+  lock wait is cancelled instead of waiting forever.** Every engine Postgres
+  session now opens under a 10 s connect deadline covering resolution, TCP,
+  TLS, authentication and the session `SET`s — `tokio-postgres` bounds only
+  the TCP connect — so a database that accepts connections and then stops
+  answering fails engine startup, a pooled reconnect, and the wake listener
+  with an error that names the deadline, and the listener retries with
+  backoff instead of sitting silently dead. Sessions then carry
+  `statement_timeout` 30 s, `lock_timeout` 15 s and
+  `idle_in_transaction_session_timeout` 60 s, so a statement stuck behind a
+  lock held by another transaction (the shape of the engine freeze that
+  started with Postgres killing idle-in-transaction sessions) is cancelled
+  with an error naming the timeout, instead of holding a runtime worker, a
+  pooled connection and its row locks indefinitely. Migrations are not
+  affected: `preloop store migrate` opens its own connection without these
+  guards, and the one migration a serving process can run (test-support
+  schema creation) lifts them to migration-scoped values.
+- **The CLI can no longer hang on a wedged engine, daemon, or registry.**
+  The engine client every command uses had no timeouts at all, so the incident's
+  exact symptom — a process that accepts the TCP connection and never answers —
+  held `preloop status`, `preloop run`, `preloop logs`, `preloop push` and the
+  rest open indefinitely. It now has a 10 s connect deadline and a 10-minute
+  idle-read bound (above the engine's own 5-minute live-log liveness window, so
+  a quiet long job is never cut), with per-command totals on top: 30 s for
+  one-shot control calls, 5 minutes for a durable log fetch, and 15 minutes for
+  a git-bundle upload. The streaming paths (`logs --follow`, the run event feed)
+  keep no total on purpose and rely on the idle bound.
+  The same pass bounds the CLI's other external waits: `cosign` verification of
+  a base image (10 minutes, killed at the deadline), the AgentENV guest probes
+  behind `preloop debug` (30 s each, 2 minutes to become ready), the AgentENV
+  egress reconciliation's `sudo`/`systemctl` calls, `launchctl` during
+  `preloop server install`, `docker`/`podman` build, save and inspect during
+  `preloop init`, the release/GitHub clients in `preloop update` and
+  `preloop setup app-manifest`, and `git push` in `preloop push`, which is also
+  now run with every interactive credential path disabled
+  (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS`/`SSH_ASKPASS` neutralised,
+  `GCM_INTERACTIVE=never`) while the developer's own keychain/ssh-agent
+  credentials keep working. A push that expires its own deadline is retried on
+  the existing transient schedule instead of failing the run.
+  `preloop store migrate` bounds its Postgres connect
+  (10 s, covering the handshake *and* session setup, not the handshake alone)
+  and replaces the indefinite `pg_advisory_lock` wait with a 10-minute
+  `pg_try_advisory_lock` retry — each probe itself bounded by what is left of
+  that wait, so a connection that stops answering mid-query cannot outlive it —
+  that names the other holder instead of hanging.
+  Every deadline is a named constant, and every timeout error names the
+  dependency and the deadline, so a hang is distinguishable from a failure.
+- **A hung OS keychain or trust daemon no longer freezes the engine.** On
+  macOS, outbound TLS verified every new connection through
+  `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked
+  behind an unanswered keychain unlock dialog, every engine thread blocked with
+  it, `/healthz` included, until someone dismissed the dialog. Outbound TLS
+  (GitHub, downloads, Postgres) now verifies in-process against a root set read
+  once per process: the bundled Mozilla roots, the OS store's certificates
+  (read with a 5 s deadline), and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`.
+  Every OS credential-store call (Keychain, Secret Service, Credential Manager)
+  gets a 10 s deadline, and after one unanswered call the store is treated as
+  unavailable for the rest of the process. Platform revocation checks no longer
+  apply; a CA added to the OS store is picked up on restart.
+
+- **A hung Git fetch can no longer freeze the engine.** Snapshot creation and
+  pull-request test merges ran `git fetch` — and every other Git command — from
+  the engine with no deadline. A forge that accepted the connection and then
+  stalled, or a credential helper such as osxkeychain or Git Credential
+  Manager waiting behind a keychain dialog, never returned; because the
+  checkout-cache fetch runs under that repository's cache lock, every later
+  submission for the same repository queued behind it until the engine
+  restarted. Every engine Git child now runs under a deadline — 60 s for ref,
+  config, and index plumbing, 15 min for whole-repository work (`add`,
+  `write-tree`, `merge-tree`, `commit-tree`, `fsck`, `archive`), 30 min for
+  anything that reaches a remote — and is killed when the deadline expires,
+  which releases the cache lock with it. Git's own terminal prompt was already
+  disabled; both askpass programs are now neutralised and
+  `GCM_INTERACTIVE=never` set as well, because `GIT_TERMINAL_PROMPT=0` alone
+  does not stop a configured helper, and the helper list is cleared wherever
+  the engine stages its own GitHub header. A workspace's own remote keeps the
+  operator's helper — that credential is the only one the engine has for a
+  GitLab, enterprise, or PAT-less GitHub origin, and resetting it made the
+  deepen fail, after which the snapshot rewrote history and submitted SHAs the
+  forge had never seen; the deadline and the non-interactive policy still
+  bound it. Staged tokens now ride in `GIT_CONFIG_*` in the child's environment
+  instead of `-c` on its argv, which a process listing exposes. A child killed
+  at its deadline cannot unlink the `*.lock` it held, so locks left by a
+  killed fetch are swept before the next one: those in a repository the engine
+  holds exclusively right away, and any older than the longest possible fetch
+  elsewhere. The error names the operation and the deadline (`git fetch timed
+  out after 1800s: killed the hung git process`) so a hang reads differently
+  from a failure.
+- **Every remaining outbound client uses the in-process TLS roots, and the
+  macOS keychain probe is killed at its deadline.** The OTLP exporter's
+  blocking client (including the engine hosted by `preloop serve`, whose CLI
+  installs the same builder), the runner's engine/GitHub clients, and
+  `preloop-runner lint`'s remote-workflow fetch now verify against the same
+  process-wide roots as the engine (bundled Mozilla, the OS store read with a
+  5 s deadline, and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`) instead of
+  reqwest's platform verifier, so a hung `trustd`/`securityd` can no longer
+  stall them. `preloop-runner lint` also gains a 30 s request / 10 s connect
+  deadline. A bundle certificate the anchor parser cannot read is dropped
+  instead of failing the set, so one malformed entry in
+  `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE` no longer takes Postgres TLS
+  (which adds the list strictly) down with it. The login-keychain writability
+  probe's cleanup delete (`security
+  delete-generic-password`) is now killed after 2 s instead of leaking its
+  child and guard thread forever, and the secrets/policy API config
+  load-and-write (which can reach the keychain for the sealing key) runs on
+  the blocking pool, so a 10 s store wait no longer parks an async worker
+  while the mutation lock is held.
 
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
@@ -84,6 +754,14 @@ Releases before v0.27.0 predate the changelog.
   with fewer mounts), with the raw smolvm output appended. Previously this was
   indistinguishable from a held or corrupt disk image, and the pool restarted
   forever without naming the cause.
+- **`preloop setup github --app-id --pem-file` enables the App webhook.** The
+  manual App path saved credentials and stopped there, so an App configured
+  with `--public-url` kept a webhook that delivered nowhere: pushes and pull
+  requests never started runs. It now points the hook at the engine (reusing
+  the stored webhook secret), and a GitHub refusal is fatal and says plainly
+  that the credentials were saved but the hook still delivers nowhere. Setup
+  also says the App's webhook must be **Active** for pushes and pull requests
+  to arrive, and where to tick it: GitHub's API cannot set that flag.
 
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
 - **Job `env:` and reusable-call `secrets:` maps read the claim-minted `GITHUB_TOKEN`.**
@@ -111,8 +789,26 @@ Releases before v0.27.0 predate the changelog.
   failed with `config-secrets key conflict`. Preloop now refuses to mint while
   sealed values exist and names what to unlock. A `secrets.key` that disagrees
   with the store is settled by which key opens the sealed values, and the losing
-  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. A failed
-  background engine start now prints the engine's last log lines (#653).
+  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. (The background
+  engine start that logged its last lines on failure was removed with #658; see
+  the entry under *Changed*.)
+
+- **Every engine GitHub call now goes through the credential's circuit
+  breaker.** Thirteen call sites still sent straight through the shared HTTP
+  client: dispatch auth's installation-token round-trip and actor lookups,
+  push-back and auto-PR REST calls, dispatch's default-branch lookup, the
+  startup PAT scope probe, the App-manifest code exchange, the startup
+  schedule scan, snapshot repository-metadata lookups, and the anonymous
+  forge Git/tarball relay. A GitHub outage therefore cost one round trip per
+  caller for its whole duration instead of one probe per credential. They now
+  all funnel through `send_github` / `send_github_json`, so the breaker sees
+  the dependency on the budget each call actually spends — partitioning an
+  installation token that cannot be named yet, and a third-party token, away
+  from the operator's PAT. Callers keep their own error mapping: dispatch auth
+  still fails closed on a refusal while the breaker is open, push-back still
+  answers 502 for it, and the best-effort relay, schedule-scan, and
+  metadata lookups still degrade quietly. Presigned cross-host LFS downloads
+  stay outside the breaker by design: they spend no GitHub API budget.
 
 - **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
   RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
@@ -183,6 +879,38 @@ Releases before v0.27.0 predate the changelog.
   merged upload, and the logs endpoint falls back to the larger per-step
   representation when one exists. This preserves mutation and other
   heavy-step output after guest temporary-storage pressure.
+
+- **Pool start and golden lookups no longer hang on a stalled dependency.** The
+  host Node externals install is killed after 30 minutes — as a whole process
+  group, so the `curl`, `tar`, or `node --version` step it is stuck on dies with
+  the shell that started it, and a shutdown that arrives mid-install cancels it
+  the same way instead of waiting out the deadline. Each of its curl transfers
+  gives up after 30 seconds to connect and 10 minutes in total (2 minutes for
+  the checksum file), and the externals copies are killed after 5 minutes, so a
+  stalled nodejs.org fails with an error that names the dependency and the
+  deadline. Golden release, OCI manifest, and checksum lookups give up after 30
+  seconds instead of sharing the 60-minute download budget — the manifest lookup
+  as one budget for the whole resolution, its bearer-token exchange included,
+  and a blob's token exchange runs on that same short-lived client while the
+  transfer keeps its hour. The orphaned-VM cleanup at startup and on the
+  reconcile interval stops waiting after 10 minutes, and each `ps`, `kill`,
+  `hdiutil`, and `/sbin/mount` child it runs is killed after 30 seconds; a
+  startup sweep that outlives its own deadline now fails pool start rather than
+  serving while it could still kill a runner booted after the wait. The orphaned
+  data-directory sweeps carry the same 10-minute bound. The host memory probe
+  gives up after 10 seconds, and a `node --version` check of an externals
+  directory after 10 seconds, which counts that directory as invalid — a
+  non-native manifest whose binary hangs is no longer taken for a foreign binary
+  the host cannot execute.
+- **Post hooks of skipped actions no longer run**: a workflow step that did
+  not run, because its `if:` was false or an earlier step failed, no longer
+  runs its action's `post` hook. The official runner registers a post hook
+  while the action's handler runs — for the action's `Pre` step as well as its
+  main step — but the engine ran every post hook under its `always()` default,
+  so cleanup hooks of skipped steps ran for minutes and their failures were
+  recorded beside the real first failure. A post hook whose action never
+  reached its handler is now recorded as `skipped`; hooks of actions that ran,
+  and hooks whose action's `pre:` step ran, are unchanged.
 
 ## [0.34.4] - 2026-10-13
 
@@ -2632,7 +3360,9 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.33.7...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.5...HEAD
+[0.35.5]: https://github.com/preloopdev/preloop/compare/v0.35.0...v0.35.5
+[0.35.0]: https://github.com/preloopdev/preloop/compare/v0.34.4...v0.35.0
 [0.33.7]: https://github.com/preloopdev/preloop/compare/v0.33.6...v0.33.7
 [0.33.6]: https://github.com/preloopdev/preloop/compare/v0.33.5...v0.33.6
 [0.33.5]: https://github.com/preloopdev/preloop/compare/v0.33.2...v0.33.5

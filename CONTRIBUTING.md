@@ -11,17 +11,17 @@ Use the right template. Each one collects exactly the evidence a maintainer need
 | **Bug report** | Something misbehaves, or preloop diverges from the official runner | [`.github/ISSUE_TEMPLATE/bug_report.yml`](.github/ISSUE_TEMPLATE/bug_report.yml) |
 | **Feature request** | Something preloop should do that it doesn't yet | [`.github/ISSUE_TEMPLATE/feature_request.yml`](.github/ISSUE_TEMPLATE/feature_request.yml) |
 
-**For divergence bugs, the fastest path to a fix is a reproduction showing what the official runner does.** preloop's compatibility target is `actions/runner` v2.336.0 (pinned in `versions.toml`). Two ways to record it:
+**For divergence bugs, the fastest path to a fix is a reproduction showing what the official runner does.** preloop's compatibility target is `actions/runner` v2.337.0 (pinned in `versions.toml`). Two ways to record it:
 
 - **Easy:** run the same workflow on GitHub (or with the official runner binary) and paste `gh run view --log <run-id>` — job/step names, order, and conclusions.
 - **Wire-accurate (protocol issues):** the repo ships `runner-watch`, which records the official runner's exact request/response exchange and replays it against preloop:
 
   ```sh
   runner-watch record-golden --runner /path/to/actions-runner --scenario <name>
-  runner-watch conform --runner 2.336.0 --preloop-url http://127.0.0.1:9090
+  runner-watch conform --runner 2.337.0 --preloop-url http://127.0.0.1:9090
   ```
 
-  Attach the generated `.runner-watch/golden/v2.336.0/<scenario>/flows.jsonl` and the `conform` output.
+  Attach the generated `.runner-watch/golden/v2.337.0/<scenario>/flows.jsonl` and the `conform` output.
 
 ## Before you open a PR
 
@@ -34,7 +34,7 @@ Use the right template. Each one collects exactly the evidence a maintainer need
    - `just dogfood` — live E2E with the real runner
 3. **Wire-shape changes** to DTOs in `preloop-gha-protocol/src/azdo/` must preserve serde round-trip fidelity. Check golden captures in `.runner-watch/golden/`.
 4. Read the PR template ([`.github/pull_request_template.md`](.github/pull_request_template.md)) and fill in every gate that applies — protocol changes **require** the official-runner validation gate.
-5. **Dependency/policy isolation** — a PR may carry `deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, `supply-chain/**`, and any `Cargo.toml`/`Cargo.lock` in the tree together, and must not carry anything else. Code that needs a new dependency ships in a follow-up PR after that one merges: run `just supply-chain-guard` before pushing (rule and guard: [`supply-chain/README.md`](supply-chain/README.md)).
+5. **Dependency/policy isolation** — `deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, and `supply-chain/**` may ship only with dependency/policy files, while `Cargo.toml` and `Cargo.lock` join that set only when a third-party lock entry changes; first-party manifest and lockfile edits may ride with code, and a new third-party dependency ships in its own PR first. Run `just supply-chain-guard` before pushing (rule and guard: [`supply-chain/README.md`](supply-chain/README.md)).
 
 ## Code conventions
 
@@ -57,10 +57,10 @@ wire captures before merging.
 
 ## Conformance documentation
 
-- [`docs/conformance.md`](docs/conformance.md) — conformance harness, fixture expansion, command comparison, and the provider integration gate.
+- [`docs/contributing/conformance.md`](docs/contributing/conformance.md) — conformance harness, fixture expansion, command comparison, and the provider integration gate.
 - `benchmarks/compatibility/` — the evidence index: server fidelity (official runner against GitHub vs. preloop), runner fidelity, live behavior, MITM captures, and replay gates.
 - `.runner-watch/golden/` — golden wire captures by runner version. New protocol behaviors should ship with a golden.
-- `docs/fidelity-gap.md` — known protocol gaps and roadmap. If you're fixing a gap, link it.
+- `docs/contributing/fidelity-gap.md` — known protocol gaps and roadmap. If you're fixing a gap, link it.
 
 
 
@@ -89,17 +89,20 @@ workflow warning when the tap token is missing.
 `dist-workspace.toml` is the source of truth for what gets built and
 `cargo-dist-version` pins the dist that runs in CI, but `release.yml` is
 hand-maintained (`allow-dirty = ["ci"]`) and carries the publish jobs — change
-both together. The `preloop` name on crates.io is reserved by a documentation-only
-crate under `packaging/crates-io/preloop/`; no workflow publishes it, so it is
-released by hand (`cargo publish` from that directory, which needs a crates.io
-token with `publish-new` and a verified account email).
+both together. The `preloop` name on crates.io is held by a documentation-only
+crate under `packaging/crates-io/preloop/`. Its first version is released by hand
+(a crates.io token scoped to that crate name, with a verified account email);
+after that `publish-crates-io` publishes it on every stable tag through a trusted
+publisher, so no crates.io token is stored here. The job skips with a workflow
+warning until that first publish has happened — `packaging/crates-io/README.md`
+has the steps.
 
 ## Project structure
 
-- `docs/architecture.md` — crate map + module map.
-- `docs/setup.md` — setup, credentials, secrets, config.
-- `docs/debug-sessions.md` — the step debugger (pause, inspect, retry).
-- `docs/github-app-webhook.md` / `docs/github-tokens.md` — GitHub integration surface.
+- `docs/control-plane/architecture/overview.mdx` — crate map + module map.
+- `docs/control-plane/install.mdx` — setup, credentials, secrets, config.
+- `docs/control-plane/guides/debugging.mdx` — the step debugger (pause, inspect, retry).
+- `docs/control-plane/github/app.mdx` / `docs/control-plane/github/tokens.mdx` — GitHub integration surface.
 - `AGENTS.md` — agent/LLM-specific conventions.
 
 ## Quick start

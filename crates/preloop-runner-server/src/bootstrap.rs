@@ -57,6 +57,14 @@ pub struct ServerConfig {
     /// Observability handle to clone into AppState (heartbeat, limits).
     /// `None` falls back to `Observability::noop()` (tests).
     pub observability: Option<preloop_observability::Observability>,
+    /// The engine's outbound-GitHub funnel (breaker registry + accounting).
+    ///
+    /// The embedding CLI supplies its own and hands the same one to the runner
+    /// pool, so the pool's golden downloads — which happen before any VM boots
+    /// — resolve through the breakers the webhook path already tripped;
+    /// `None` builds a private funnel (the standalone `preloop-server`
+    /// binary, tests).
+    pub github: Option<crate::github_breaker::GithubFunnel>,
     /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: refuse to dispatch any job without
     /// a recorded assignment, including to external runners.
     pub require_job_assignments: bool,
@@ -1446,7 +1454,12 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // it binds, so a second engine can say how to stop it.
     let listen = (!config.systemd_socket_activation).then_some(config.listen);
     let _serve_lock = acquire_serve_lock(&config.state_dir, EngineOrigin::current(), listen)?;
-    let mut state = AppState::new(config.state_dir.clone(), config.startup.clone()).await?;
+    let mut state = AppState::new_with_github(
+        config.state_dir.clone(),
+        config.startup.clone(),
+        config.github.clone(),
+    )
+    .await?;
     // Wire observability if supplied (CLI/server will pass its handle).
     // Adopt the caller's handle when supplied; `AppState::new` already
     // installed a no-op one otherwise. Either way the store is instrumented,
@@ -1465,7 +1478,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if state.github_app.is_none()
         && let Some(pat) = state.static_github_pat()
     {
-        crate::runs::warm_pat_scope_cache(state.github_api_request_base.as_deref(), &pat).await;
+        crate::runs::warm_pat_scope_cache(&state, &pat).await;
     }
     // Resolve the effective store URL exactly once from the startup config
     // (explicit `--store` / resolved `PRELOOP_STORE_URL`, else SQLite at the
@@ -1807,6 +1820,16 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::snapshots::sweep_workspace_snapshots(&snapshot_sweep_shared).await;
     });
+    // The shared object cache is never garbage-collected in place (a live
+    // snapshot alternates to it), so its ceiling is enforced here and after
+    // each successful capture. The single-flight permit is taken before the
+    // spawn, so this startup request coalesces with a concurrent post-capture
+    // one instead of walking the cache twice.
+    crate::snapshots::spawn_snapshot_object_cache_sweep(
+        &shared.state.snapshot_object_cache_sweep,
+        shared.state.state_dir.clone(),
+        shared.state.snapshot_object_cache_max_bytes,
+    );
     let archive_shared = shared.clone();
     let outbox_retention =
         Duration::from_secs(config.startup.outbox_retention_seconds.unwrap_or(3600));
@@ -2078,14 +2101,19 @@ fn read_lock_record(file: &std::fs::File) -> std::io::Result<String> {
 pub enum EngineOrigin {
     /// Started in a terminal: `preloop serve`, or `preloop engine` run by hand.
     Foreground,
-    /// Spawned by a `preloop` client command that found no engine running.
+    /// Started with an explicit background marker (see [`ENGINE_ORIGIN_ENV`]),
+    /// as launchers that start the engine themselves set — including the
+    /// client-command auto-start that was removed in #658. The marker stays
+    /// honored so those launchers, and `serve.lock` records written by older
+    /// builds, still read correctly.
     Background,
     /// Started by systemd (`INVOCATION_ID` is set).
     Systemd,
 }
 
-/// Environment variable the CLI sets on the engine it autostarts, so that
-/// engine records itself as [`EngineOrigin::Background`].
+/// Environment variable a launcher sets on an engine it starts itself, so that
+/// engine records itself as [`EngineOrigin::Background`]. The CLI no longer
+/// autostarts an engine (#658) and so no longer sets it.
 pub const ENGINE_ORIGIN_ENV: &str = "PRELOOP_ENGINE_ORIGIN";
 
 impl EngineOrigin {
@@ -2117,9 +2145,9 @@ impl EngineOrigin {
 }
 
 /// [`EngineOrigin::current`] over explicit inputs, so both precedence rules can
-/// be tested. The explicit `background` marker wins: a client command started
-/// from inside a systemd unit inherits `INVOCATION_ID`, but the engine it
-/// autostarts is still a background engine.
+/// be tested. The explicit `background` marker wins: a process started from
+/// inside a systemd unit inherits `INVOCATION_ID`, but a launcher that marked
+/// it background is still recorded as such.
 fn origin_from(marker: Option<&str>, invoked_by_systemd: bool) -> EngineOrigin {
     if marker.map(str::trim) == Some(EngineOrigin::Background.as_str()) {
         EngineOrigin::Background
@@ -2313,7 +2341,7 @@ fn holder_message(holder: &LockHolder) -> String {
         .unwrap_or_default();
     let mut lines = vec![match holder.origin {
         EngineOrigin::Background => format!(
-            "a preloop engine is already running (pid {pid}{started}, in the background by a preloop command)"
+            "a preloop engine is already running (pid {pid}{started}, started in the background)"
         ),
         EngineOrigin::Systemd => format!(
             "a preloop engine is already running as a systemd service (preloop.service, pid {pid})"
@@ -2628,10 +2656,7 @@ mod tests {
                 )),
                 "{error}"
             );
-            assert!(
-                error.contains("in the background by a preloop command"),
-                "{error}"
-            );
+            assert!(error.contains("started in the background"), "{error}");
             assert!(
                 error.contains("It is serving http://127.0.0.1:9090"),
                 "{error}"

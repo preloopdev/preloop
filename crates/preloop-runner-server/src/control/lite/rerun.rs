@@ -965,14 +965,9 @@ fn patch_message_attempt(
             azdo::PipelineContextData::Number(0.0),
         );
     }
-    // `system.orchestrationId` embeds the plan id (`{plan}.{job}.{__default|
-    // _N}`): re-prefix it on the new attempt id, keeping the job suffix.
-    if let Some(value) = message.variables.get_mut("system.orchestrationId")
-        && let Some(old) = value.value.as_deref()
-    {
-        let suffix = old.split_once('.').map(|(_, tail)| tail).unwrap_or("");
-        value.value = Some(format!("{agent_job_id}.{suffix}"));
-    }
+    // The runner sends `system.orchestrationId` as the plan segment of
+    // `runnerresolve/actions`; it must name this attempt's identity.
+    logic::reprefix_orchestration_id(message, agent_job_id);
     Ok(agent_job_id)
 }
 

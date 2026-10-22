@@ -36,10 +36,15 @@ pub const PROTOCOL_VERSION: &str = "2026-06-25.preloop.v1";
 /// GitHub-hosted parity: the official runner lays out
 /// `<work>/<repo>/<repo>` (`/home/runner/work/hugo/hugo`), and workflows
 /// observe it — hugo's codegen test panics unless the absolute checkout
-/// path contains `"hugo"`. Derive both segments from the `owner/repo`
-/// basename so every consumer (worker setup, local-run preseeding) agrees.
-/// Returns `None` when the slug is missing or not a plain repo name, in
-/// which case callers keep the historical `_work/default/default`.
+/// path contains `"hugo"`, and `$RUNNER_WORKSPACE` (the `<work>/<repo>`
+/// parent, exported by `inject_github_env`) is read by actions that look for
+/// a sibling checkout. The hosted work folder is `work`; `_work` is the
+/// official runner's *self-hosted* default and is what a preloop guest used
+/// to report, so a workflow branching on the path saw the wrong shape.
+/// Derive both segments from the `owner/repo` basename so every consumer
+/// (worker setup, local-run preseeding) agrees. Returns `None` when the slug
+/// is missing or not a plain repo name, in which case callers keep the
+/// historical `work/default/default` fallback.
 pub fn workspace_dir_for_repository(repository: Option<&str>) -> Option<std::path::PathBuf> {
     let repository = repository?.trim();
     let mut parts = repository.split('/');
@@ -60,7 +65,7 @@ pub fn workspace_dir_for_repository(repository: Option<&str>) -> Option<std::pat
     {
         return None;
     }
-    Some(std::path::PathBuf::from("_work").join(name).join(name))
+    Some(std::path::PathBuf::from("work").join(name).join(name))
 }
 
 /// Line a runner prints on stdout the moment it accepts a job.
@@ -1108,10 +1113,11 @@ mod tests {
 
     #[test]
     fn workspace_dir_derives_github_layout_from_repo_basename() {
-        // `<work>/<repo>/<repo>`, matching /home/runner/work/hugo/hugo.
+        // `<work>/<repo>/<repo>`, matching /home/runner/work/hugo/hugo: the
+        // hosted work folder is `work`, not the self-hosted `_work`.
         assert_eq!(
             workspace_dir_for_repository(Some("spf13/hugo")),
-            Some(std::path::PathBuf::from("_work/hugo/hugo"))
+            Some(std::path::PathBuf::from("work/hugo/hugo"))
         );
         assert_eq!(workspace_dir_for_repository(None), None);
         assert_eq!(workspace_dir_for_repository(Some("")), None);

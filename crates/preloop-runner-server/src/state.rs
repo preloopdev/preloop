@@ -907,6 +907,17 @@ pub struct AppState {
     /// checkouts before housekeeping deletes it. Zero discards immediately.
     /// Env: `PRELOOP_SNAPSHOT_RETENTION_SECONDS` (default 1800).
     pub snapshot_retention_seconds: u64,
+    /// Ceiling, in bytes, for the shared snapshot object cache under
+    /// `<state_dir>/snapshot-object-cache`. This cache is never garbage
+    /// collected in place (a live snapshot alternates to it), so the size
+    /// sweep is what keeps it bounded. Entries referenced by a snapshot or
+    /// locked by a capture are never evicted. `0` disables the sweep.
+    /// Env: `PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES` (default 100 GiB).
+    pub snapshot_object_cache_max_bytes: u64,
+    /// Single-flight ownership of the object-cache sweep, scoped to this
+    /// engine's state directory. Startup and post-capture sweeps share it; a
+    /// second engine (or test state) is not suppressed by this one.
+    pub snapshot_object_cache_sweep: Arc<crate::snapshots::SnapshotObjectCacheSweep>,
     /// Run/check/status retention, in days, mirroring GitHub's Actions
     /// retention setting. The retention sweep deletes terminal runs (plus
     /// their checks, statuses, artifacts, and logs) older than this.
@@ -1042,6 +1053,10 @@ pub struct AppState {
     /// to one file for its whole life and cannot be retargeted underneath
     /// itself by a later environment change.
     pub config_path: PathBuf,
+    /// Engine-hosted GitHub App setup: the one live setup session, its
+    /// one-time link, and the browser-route rate limit. Node-local and
+    /// in-memory by design: a setup lasts minutes, and a restart ends it.
+    pub github_setup: Arc<crate::github_app_setup::session::SetupSessions>,
     /// `GITHUB_TOKEN` permissions ceiling loaded from the config file at
     /// startup. `None` (absent table) = no ceiling; today's behavior is
     /// unchanged. A config change takes effect on restart, like the other
@@ -1122,6 +1137,14 @@ pub struct AppState {
     /// Resolved systemd `LoadCredential=` directory (`CREDENTIALS_DIRECTORY`)
     /// for the secrets API's per-request credential overlay.
     pub credentials_dir: Option<PathBuf>,
+    /// Resolved `PRELOOP_CREDENTIAL_STORE` override layered over the config
+    /// file's `credential_store` by the engine-hosted App setup (it reads the
+    /// file per request, so the override travels with the state).
+    pub credential_store: Option<String>,
+    /// Resolved `PRELOOP_SETUP_INSTALL_WAIT_SECS`: how long the engine-hosted
+    /// App setup's `--repo` checks wait for the installation to appear.
+    /// `None` = the module default (300 s).
+    pub setup_install_wait_secs: Option<u64>,
 }
 
 /// Webhook delivery-watchdog tuning (all resolved at startup from the
@@ -1339,7 +1362,7 @@ fn bounded_reason_detail(detail: &str) -> String {
 impl AppState {
     /// Build engine state from a fully-resolved [`crate::config::StartupConfig`].
     ///
-    /// The only constructor, and the engine's typed-config boundary: it
+    /// The constructor, and the engine's typed-config boundary: it
     /// reads no process environment. Every value comes from `startup`
     /// (explicit or env, resolved once at process startup by
     /// [`crate::config::StartupConfig::from_env`]) layered over the config
@@ -1349,6 +1372,22 @@ impl AppState {
     pub async fn new(
         state_dir: PathBuf,
         startup: crate::config::StartupConfig,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_github(state_dir, startup, None).await
+    }
+
+    /// [`AppState::new`] with the engine's outbound-GitHub funnel: the
+    /// breaker registry and consumption accounting the webhook, dispatch,
+    /// check-run and runner-pool paths all share.
+    ///
+    /// The embedding CLI supplies its own so the pool's golden downloads
+    /// resolve through the breakers the webhook path already tripped;
+    /// `None` builds a private funnel (the standalone `preloop-server`
+    /// binary, tests) from the startup breaker overrides.
+    pub async fn new_with_github(
+        state_dir: PathBuf,
+        startup: crate::config::StartupConfig,
+        github: Option<crate::github_breaker::GithubFunnel>,
     ) -> anyhow::Result<Self> {
         let config_path = startup.config_path.clone();
         // Test builds must never let an ambient `PRELOOP_STORE_URL` retarget
@@ -1514,13 +1553,19 @@ impl AppState {
                 None
             }
         };
-        let github_breakers = Arc::new(crate::github_breaker::GithubBreakerRegistry::new(
-            crate::github_breaker::BreakerConfig::from_overrides(
+        // The process's outbound-GitHub funnel. The embedding engine supplies
+        // its own (`ServerConfig::github`) so the runner pool's golden
+        // downloads resolve through the same breakers and accounting as the
+        // webhook path; the standalone server and tests get a private one
+        // built from the startup breaker overrides.
+        let github = github.unwrap_or_else(|| {
+            crate::github_breaker::GithubFunnel::from_overrides(
                 startup.github_breaker_enabled,
                 startup.github_breaker_threshold,
-            ),
-        ));
-        let github_consumption = Arc::new(crate::github_breaker::GithubConsumption::default());
+            )
+        });
+        let github_breakers = Arc::clone(&github.breakers);
+        let github_consumption = Arc::clone(&github.consumption);
         // Attached before `github_app` is cloned from the registry, so the
         // legacy field reports through the same breaker and accounting.
         let github_apps = crate::github_app::load_from(&config, &startup)?
@@ -1714,6 +1759,10 @@ impl AppState {
             local_workspace,
             checkout_cache,
             snapshot_retention_seconds: startup.snapshot_retention_seconds.unwrap_or(30 * 60),
+            snapshot_object_cache_max_bytes: startup
+                .snapshot_object_cache_max_bytes
+                .unwrap_or(100 * 1024 * 1024 * 1024),
+            snapshot_object_cache_sweep: crate::snapshots::SnapshotObjectCacheSweep::new(),
             retention_days,
             max_jobs_per_run,
             diag_staging_max_age_seconds,
@@ -1755,6 +1804,7 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             config_path,
+            github_setup: Arc::new(crate::github_app_setup::session::SetupSessions::new()),
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),
             execution_protection: config.execution_protection.clone(),
@@ -1779,6 +1829,8 @@ impl AppState {
             },
             secrets_store_env: startup.secrets_store.clone(),
             credentials_dir: startup.credentials_dir.clone(),
+            credential_store: startup.credential_store.clone(),
+            setup_install_wait_secs: startup.setup_install_wait_secs,
             rerun_window_hold,
         })
     }
@@ -2329,6 +2381,18 @@ pub struct InnerState {
     /// secrets on each log chunk.
     pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
     pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
+    /// Runtime-minted mask values (today: the OIDC `id_token`, registered at
+    /// mint by [`crate::timeline_logs::register_runtime_mask_value`]), keyed
+    /// by the same plan/run scope keys as `plan_secret_masker`. Provider
+    /// secrets never change after submit, but these arrive while the job is
+    /// already logging, so they are tracked separately and merged into every
+    /// scope write (`plan_secret_masker`/`plan_secret_masker_pending`) and
+    /// into every cold resolution — a resolution that raced a registration
+    /// must never cache a scope that predates it. Each scope holds at most
+    /// `MAX_RUNTIME_MASKS_PER_SCOPE` values (oldest dropped first: a job may
+    /// mint a token per call), and a run's entries are dropped with the run
+    /// (see `memory_caps::remove_run_everywhere`).
+    pub plan_runtime_masks: BTreeMap<String, Vec<String>>,
     /// Chunk-boundary-safe streaming log maskers for the AzDO append path,
     /// keyed by log key (`{plan_id}/{log_id}`). Each masker holds a
     /// trailing-overlap buffer so a secret split across two appends is
@@ -2339,14 +2403,14 @@ pub struct InnerState {
     /// withheld tail from the lossy in-memory preview.
     ///
     /// The masker is built from the secret list resolved at the log's first
-    /// append and never reseeded: run secrets are immutable, and the only
-    /// alternative first-append resolution (the negative-cache union) is a
-    /// superset of the real list, so the masker can only over-mask, never
-    /// under-mask.
-    pub log_stream_maskers: BTreeMap<
-        String,
-        std::sync::Arc<tokio::sync::Mutex<preloop_gha_protocol::masking::StreamingMasker>>,
-    >,
+    /// append and only widened afterward (`PlanLogMasker::extend`): run
+    /// secrets are immutable, the only alternative first-append resolution
+    /// (the negative-cache union) is a superset of the real list, and a
+    /// runtime-registered value (see `plan_runtime_masks`) rebuilds the
+    /// masker from its own source list — so the masker can only over-mask,
+    /// never under-mask.
+    pub log_stream_maskers:
+        BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<crate::timeline_logs::PlanLogMasker>>>,
     /// Reaper starvation marks (node-local): when this node
     /// first saw each ready job that no registered runner matches. Cleared
     /// once a runner matches, while a pool is preparing, or when the job

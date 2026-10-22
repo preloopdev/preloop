@@ -1,0 +1,118 @@
+---
+title: MicroVM pool
+description: How preloop serve runs each job in a microVM — VM providers, golden forks, the warm pool, and teardown.
+---
+
+Every job that `preloop serve` runs itself executes in its own microVM. The runner pool prepares one golden image per environment, boots it forkable, and hands each job a copy-on-write clone that is deleted when the job ends. The pool reaches every VM through `preloop-vm`'s `VmProvider` trait.
+
+![MicroVM pool architecture](/diagrams/vm-pool.svg)
+
+## Choose a VM provider
+
+| Backend | Selected by | Runtime | Hosts |
+| --- | --- | --- | --- |
+| **SmolVM** (default) | `PRELOOP_VM_BACKEND` unset, or `smolvm` | libkrun: Hypervisor.framework on macOS, KVM on Linux | macOS arm64, Linux arm64/x86_64 |
+| **AgentENV** (opt-in) | `PRELOOP_VM_BACKEND=agentenv` (or `aenv`) | Firecracker control plane with snapshot-backed guests | Linux with `/dev/kvm` and the `aenv` CLI on `PATH` |
+
+`PRELOOP_VM_BACKEND` is authoritative: an unrecognized value fails startup instead of silently running jobs on a substrate you did not ask for. The engine logs `VM substrate selected` with the resolved backend when it starts.
+
+Both providers implement the same trait — create, start, start forkable, fork, exec, copy, pack, delete — and declare what they support through `capabilities()`, so the pool picks its strategy instead of assuming SmolVM semantics. The differences that reach an operator:
+
+- AgentENV has no host-directory or host-socket passthrough. A read-only `MachineSpec::volumes` entry is not mounted live from the host: it is archived once into a content-addressed volume and mounted by name at sandbox start (see [AgentENV read-only volumes](#agentenv-read-only-volumes)). The guest control plane runs over TCP: set `PRELOOP_RUNNER_URL` to an address the guest can reach (the host's LAN address, not loopback).
+- `stop` on AgentENV is a pause with a deadline. Every running sandbox is kept alive by a TTL re-arm — `PRELOOP_AENV_TTL_SECS` (default 3600, minimum 60) bounds how long an abandoned sandbox survives a crashed engine.
+- AgentENV packs are server-side snapshots, not portable files, so goldens stay on the AgentENV server that holds them.
+
+## AgentENV read-only volumes
+
+AgentENV volumes are block devices (`aenv volume create`, attached as `--volume /guest=<vol>`), and there is no virtiofs/9p host-directory passthrough in the CLI or the HTTP API. Read-only `MachineSpec::volumes` entries are archived once into content-addressed volumes named `preloop-runner-<12 hex>` and mounted by name at sandbox start. The archive preserves file modes and symlinks, and the mount is enforced read-only by the guest block device: uid 1001 and root writes both fail with `EROFS`, while executable files remain executable. Writable host mounts are refused; there is no silent tar fallback.
+
+- **A volume carries its own manifest.** The archive includes a synthetic `.preloop-bundle.json` (never written to the host tree) naming the runner and Node externals versions the tree was archived with, plus its file count and byte total. It is part of the digest, so a version change publishes a new volume. The engine also records the manifest, the host tree, and the creation time in a local index beside its machine registry, because AgentENV cannot be asked what is inside a volume without mounting it; `preloop volumes list` answers from that index. Nothing in the manifest is time- or host-dependent: the creation time lives only in the index.
+- **Two things never reach a guest.** A symlink whose target is absolute or climbs out of the tree with `..` fails the archive, and set-user-ID, set-group-ID and sticky bits are masked out of the archived modes. Both are enforced while the archive is built; the mount flags themselves are AgentENV's to decide, so `nosuid`/`nodev` are not something this backend can set.
+- **Fork bases cannot carry read-only volumes.** AgentENV 0.2.1 rejects a snapshot of a sandbox with a read-only volume (`HTTP 500`, volume catalog backing must enter `uploading`). The golden therefore stays volume-free and the provider attaches the current content-addressed bundle volume when starting each clone. This means a runner update creates a new volume rather than requiring a golden rebuild.
+- **A remembered volume is revalidated, never trusted.** Each start re-derives the tree's fingerprint (a metadata walk, not an archive) and re-checks that the volume still exists before mounting it, so an in-place bundle update and a `preloop volumes prune` are both noticed: the tree is archived again and, if the volume is gone, populated again. Pruning therefore costs a repopulate, not a failure — but it is still unsafe while a volume is being populated, since a volume deleted between a populate's create and its first mount fails that populate. Populates of different trees run in parallel; one tree populates once, under its own lock.
+- **Superseded volumes are collected.** A bundle change publishes a new volume and leaves the old one behind, because an unmounted volume may be about to be mounted. The engine reclaims the leftovers itself — a pass after each populate and every six hours, the timer starting with the engine rather than with the first runner — keeping the volumes it published, anything a sandbox mounts (AgentENV refuses those deletes), anything younger than the grace period or without a recorded creation time, and the newest superseded volume for a rollback (`PRELOOP_VOLUMES_KEEP_PREVIOUS`). Every deletion is logged at info with its name, size and reason, and a volume AgentENV reports as something other than `ready` is reclaimed once it is past the grace period — including one this engine published and still remembers, since it refuses to mount such a volume and would otherwise stay stuck on it, so a start stuck on a failed volume can populate again. `preloop volumes gc [--dry-run]` prints and runs the same plan; `PRELOOP_VOLUMES_GC=off` stops the automatic passes. Ages come from the index (`$PRELOOP_HOME/agentenv-runner-volumes.json`) and, for staging volumes, from `$PRELOOP_HOME/agentenv-volume-staging.json`, whose records a populate writes before it creates its staging volume and removes when it ends — so a pass can tell a populate in flight from a leftover without taking the per-tree lock. A volume that a populate or a start claims after the plan was built is left for the next pass rather than deleted. With more than one engine on one server, an idle volume another engine published can still be collected once it is past the grace period: that engine revalidates the name it remembers before reuse and repopulates (~1 minute) instead of failing.
+- **The bundle carries Node externals.** The engine mounts only the bundle at `/opt/preloop/bin` and links `/home/runner/externals` to its `externals/` subtree. A second mount at `/home/runner/externals` failed on AgentENV with `failed to chown directory ... no such file or directory`, even when the parent existed; the single-volume layout is the supported path.
+
+## How a job gets a machine
+
+<Steps>
+  <Step title="Prepare the golden">
+    The pool resolves the base image for the environment — the published official golden for `ubuntu-latest`/`ubuntu-24.04`, otherwise `PRELOOP_RUNNER_BASE_IMAGE` or the `[golden] base_image` recorded by `preloop init`. It downloads the packed artifact or bakes one with the runner contract, then starts the machine forkable so its state can be cloned.
+  </Step>
+  <Step title="Fork one clone per job">
+    When a job is queued, a slot forks the golden (`machine fork --freeze-source`, or an AgentENV snapshot start). The clone shares the golden's memory and disks copy-on-write and needs no boot or provisioning.
+  </Step>
+  <Step title="Run one job">
+    The guest `preloop-runner` is configured and started through guest exec, registers with the control plane, and runs a single job.
+  </Step>
+  <Step title="Delete the machine">
+    The runner is single-use. The slot stops and deletes the microVM when the job ends, then forks a replacement — a fresh VM for every job, with the golden as the only reused state.
+  </Step>
+</Steps>
+
+The guest reaches the control plane through a control bridge: the host socket is mounted into the VM at `/run/preloop-control/engine.sock`, and the guest binds the loopback origin the server advertises, so job-side tools (`git`, actions, `curl`) that only know that origin still connect. Where a mounted socket is not available, the bridge forwards over TCP to the host address instead.
+
+## Golden images
+
+Golden artifacts live under `<PRELOOP_HOME>/vms/`, keyed by base image and environment fingerprint, with an adoption record at `<PRELOOP_HOME>/vms/goldens/<name>.fingerprint`. A missing artifact or a changed fingerprint (new runner contract, new runtime version, different architecture inputs) triggers a rebake; a matching stopped golden is adopted and re-armed on the next start instead of being rebuilt.
+
+`runs-on` selects the base. Labels containing `ubuntu-latest` or `ubuntu-24.04` resolve to the official golden; `ubuntu-22.04` and custom labels keep the configured image rather than silently selecting a 24.04 guest. Runners advertise the matching Ubuntu label plus the pool's base labels. See [VM images](/control-plane/operate/vm-images) for what a golden contains and which versions are pinned.
+
+SmolVM fork bases carry a single retained checkpoint. If it is lost, the pool re-arms the golden — stop, restart forkable, retry the fork — and waits for live clones to drain when one blocks the re-freeze. A base that cannot be re-armed fails that provision instead of silently booting something that is not the golden, and the slot retries with backoff.
+
+## Warm pool and demand
+
+The pool is demand-driven by default:
+
+- Only the golden stays resident. A runner is forked when jobs are queued, up to `available_parallelism / cpus per runner` and the host memory cap.
+- Set `PRELOOP_RUNNER_POOL_ENABLED=1` to keep a warm set of registered runners instead. `PRELOOP_RUNNER_POOL_SIZE` overrides the target (0–64); the automatic target is derived from host CPUs and memory and capped at 8. Each warm slot still holds one VM at a time and refills after every job.
+- The memory cap is `(host memory − 2048 MiB) / PRELOOP_RUNNER_MEMORY_MIB`, minus one ceiling for the resident golden. Warm mode is reduced to that cap at startup; jobs above the cap wait instead of starting more VMs.
+- A warm runner whose environment no longer matches the queued job is recycled after a short grace period. Jobs stay queued if they never match.
+
+If no matching runner appears, a ready job gets a 120-second grace window; while the pool is preparing its golden the short clock is suspended, with a one-hour backstop. `runs-on` labels no pool can satisfy fail as unschedulable instead of waiting out the hour. See [Job lifecycle](/control-plane/architecture/job-lifecycle) and [Limits](/control-plane/operate/limits).
+
+<Accordion title="Pool configuration reference">
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `PRELOOP_VM_BACKEND` | `smolvm` | `smolvm` \| `agentenv`; invalid values fail startup. |
+| `PRELOOP_RUNNER_POOL_ENABLED` | `false` | Keep a warm set of idle runners instead of forking on demand. |
+| `PRELOOP_RUNNER_POOL_SIZE` | host-derived, cap 8 | Warm target, 0–64. |
+| `PRELOOP_USE_FORK` | `true` | Fork each runner from the golden; `false` creates a full VM per job. |
+| `PRELOOP_RUNNER_BASE_IMAGE` | official golden | Base image to bake a golden from. |
+| `PRELOOP_RUNNER_CPUS` | `8` | vCPUs per runner. |
+| `PRELOOP_RUNNER_MEMORY_MIB` | `4096` | Memory ceiling per runner (minimum 1024); feeds the host memory cap. |
+| `PRELOOP_RUNNER_STORAGE_GB` | `80` | Per-VM storage ceiling; sparsely backed, not allocated up front. |
+| `PRELOOP_RUNNER_OVERLAY_GB` | provider default | Root overlay size. |
+| `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | `20` | Free-space reserve required before a fork or create; `0` disables. |
+| `PRELOOP_AENV_TTL_SECS` | `3600` | AgentENV sandbox TTL, re-armed while a job runs. |
+| `PRELOOP_VOLUMES_GC` | `auto` | AgentENV: `auto` or `off` — collect superseded bundle volumes after a populate and on a timer. |
+| `PRELOOP_VOLUMES_KEEP_PREVIOUS` | `1` | AgentENV: superseded volumes kept for a rollback; `0` reclaims all of them. |
+| `PRELOOP_VOLUMES_GC_GRACE_SECS` | `3600` | AgentENV: grace period before a volume may be collected. |
+| `PRELOOP_VOLUMES_GC_INTERVAL_SECS` | `21600` | AgentENV: automatic pass period; `0` disables the periodic pass. |
+
+</Accordion>
+
+## Teardown and crash recovery
+
+On shutdown the pool lets every slot stop its runner, stops the golden fork bases without deleting them so the next start adopts them, and deletes the machines it owns. The CLI gives the pool 30 seconds to settle, then aborts it and purges what is left.
+
+Crash recovery is deliberate about the two things that look like a missing VM when they are not: hypervisors that outlive a detached boot, and macOS layer images still attached to a data directory. Startup — and a periodic reconcile while serving — kills orphaned hypervisor processes, detaches orphaned layer mounts, removes data directories the provider registry no longer knows about, and prunes pack intermediates. Machines this pool owns without a current golden record are treated as stale and deleted.
+
+A stop can also be refused *by smolvm* rather than fail: `machine stop` requires the guest agent to advertise `quiesced-shutdown-v1`, and a guest agent older than the installed smolvm (≥ 1.16) cannot. The engine therefore refuses to boot from a guest-agent rootfs it can prove does not match the resolved binary, and prefers the rootfs that ships next to it over a stale copy in the data directory; the surfaced error names both rootfs paths, both agent hashes, the agent version the guest logged at boot, and the remedy (`preloop update --ensure-runtime`). See [Stale guest-agent rootfs](/control-plane/operate/vm-images#stale-guest-agent-rootfs).
+
+A failed job that requested preservation is the one exception to immediate deletion: the VM is held for a debug session and reaped after 600 seconds idle. See [Debugging](/control-plane/guides/debugging).
+
+## Disk sizing
+
+Each runner gets a sparse storage ceiling — `PRELOOP_RUNNER_STORAGE_GB`, default 80 GiB — so the number is reserved, not allocated up front. Before any fork or create, the pool requires `PRELOOP_RUNNER_MIN_FREE_DISK_GB` (default 20 GiB) of free space on the host; a full host waits and re-measures rather than failing the job or filling the disk. Unpacking a golden writes several times the packed artifact's size, so keep staging room for that on top of the reserve.
+
+AgentENV treats the ceiling as a floor: it refuses to present a guest disk smaller than the base image's virtual size, so a cold start that asks for less retries without the size flag and inherits the larger base.
+
+## Requirements
+
+- **Linux:** `/dev/kvm` for the microVM pool; AgentENV additionally needs a KVM host with the `aenv` server and CLI installed.
+- **macOS:** Apple Silicon with Hypervisor.framework.
+- **Disk:** the golden artifact plus staging space (roughly 9.6 GB compressed for the official image) and the per-VM reserve above.
+
+See [Install](/control-plane/install) for setup and [Deploy](/control-plane/operate/deploy) for service exposure.

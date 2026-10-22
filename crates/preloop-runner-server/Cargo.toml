@@ -50,6 +50,7 @@ refinery.workspace = true
 postgres_rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
+webpki-root-certs.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 libc = { workspace = true }
@@ -169,6 +170,11 @@ required-features = ["test-support"]
 [[test]]
 name = "runner_deprecations"
 path = "tests/runner_deprecations.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "sarif"
+path = "tests/sarif.rs"
 required-features = ["test-support"]
 
 [[test]]

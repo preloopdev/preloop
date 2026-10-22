@@ -9,6 +9,7 @@
 //! caller keeps its own presentation (log lines, exit codes, the private-
 //! registry hint).
 
+use preloop_runner_server::github_breaker::{BreakerOpen, GithubFunnel, GithubSubsystem};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -217,11 +218,13 @@ pub fn bearer_challenge(header: &str) -> Option<BearerChallenge> {
 /// images.
 ///
 /// Returns `Ok(None)` when the token endpoint does not hand one back — the
-/// caller then treats the resource as refused.
+/// caller then treats the resource as refused. `github` gates the token request
+/// the same way [`registry_get`] gates its own.
 pub async fn request_bearer_token(
     client: &reqwest::Client,
     challenge: &BearerChallenge,
     repository: &str,
+    github: Option<&GithubFunnel>,
 ) -> Result<Option<String>, OciError> {
     let scope = challenge
         .scope
@@ -247,13 +250,24 @@ pub async fn request_bearer_token(
             query.append_pair("service", service);
         }
     }
-    let response = client
-        .get(url)
-        .send()
+    let response = send_registry_request(client.get(url.clone()), url.as_str(), github, &[])
         .await
-        .map_err(|error| OciError::Message(format!("requesting a registry token: {error}")))?;
+        .map_err(|error| match error {
+            OciError::Message(message) => {
+                OciError::Message(format!("requesting a registry token: {message}"))
+            }
+            other => other,
+        })?;
     if !response.status().is_success() {
         return Ok(None);
+    }
+    if let Some(github) = github {
+        // The token body is small but it is starved of accounting like every
+        // other golden lookup: it is one of the requests this change routes
+        // through the funnel, and the snapshot must show its share.
+        github
+            .consumption
+            .record_advertised_bytes(GithubSubsystem::Golden, &response);
     }
     let body: Value = response
         .json()
@@ -300,13 +314,30 @@ fn push_challenge_param(params: &mut Vec<(String, String)>, raw: &mut String) {
 /// A `token` already in hand short-circuits the challenge; `resume_from` adds a
 /// byte range on both the first and the retried request, which is what makes a
 /// resumed blob transfer authenticate the same way as a fresh one.
+///
+/// `github` is the engine's outbound-GitHub funnel when the caller has one (the
+/// golden downloader does): every attempt — the manifest or blob request, and
+/// the token request the challenge triggers — is then admitted by the breaker
+/// for the origin the URL reaches and accounted under the `golden` subsystem.
+/// Callers outside the engine (`preloop init`'s manifest inspection) pass
+/// `None` and send plainly.
+///
+/// `token_client` serves the token exchange only. A blob needs the caller's
+/// long-lived transfer client for its body, but the 401 that triggers the
+/// handshake comes back immediately: exchanging it on the transfer client would
+/// let a stalled token service hold a 9.6 GB pull — and therefore pool start —
+/// for the transfer's whole budget. Callers whose `client` already carries the
+/// metadata deadline pass it for both.
+#[allow(clippy::too_many_arguments)]
 pub async fn registry_get(
     client: &reqwest::Client,
+    token_client: &reqwest::Client,
     url: &str,
     repository: &str,
     accept: &str,
     token: Option<&str>,
     resume_from: Option<u64>,
+    github: Option<&GithubFunnel>,
 ) -> Result<reqwest::Response, OciError> {
     let send = |token: Option<&str>| {
         let mut request = client.get(url).header(reqwest::header::ACCEPT, accept);
@@ -316,11 +347,20 @@ pub async fn registry_get(
         if let Some(token) = token {
             request = request.bearer_auth(token);
         }
-        request.send()
+        // The unauthenticated attempt expects the `401` challenge this
+        // registry answers with before it will hand out a token: the challenge
+        // is a step in the handshake, so it must not read as a reachability
+        // proof and clear the streak a failing token endpoint is building. The
+        // retried request carries the token, so a `401` there is a verdict
+        // about the credential, not a step.
+        let expect: &[reqwest::StatusCode] = if token.is_none() {
+            &[reqwest::StatusCode::UNAUTHORIZED]
+        } else {
+            &[]
+        };
+        send_registry_request(request, url, github, expect)
     };
-    let response = send(token)
-        .await
-        .map_err(|error| OciError::Message(format!("cannot reach {url}: {error}")))?;
+    let response = send(token).await?;
     let status = response.status();
     if status.is_success() {
         return Ok(response);
@@ -334,12 +374,12 @@ pub async fn registry_get(
         let Some(challenge) = challenge else {
             return Err(OciError::Unauthorized);
         };
-        let Some(token) = request_bearer_token(client, &challenge, repository).await? else {
+        let Some(token) =
+            request_bearer_token(token_client, &challenge, repository, github).await?
+        else {
             return Err(OciError::Unauthorized);
         };
-        let response = send(Some(&token))
-            .await
-            .map_err(|error| OciError::Message(format!("cannot reach {url}: {error}")))?;
+        let response = send(Some(&token)).await?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
@@ -347,6 +387,38 @@ pub async fn registry_get(
         return Err(status_error(status));
     }
     Err(status_error(status))
+}
+
+/// Send one registry request.
+///
+/// With a funnel the attempt is admitted by the engine's breaker *for the
+/// origin the URL reaches* before anything leaves the host: an open breaker
+/// comes back as the breaker's own message ("GitHub circuit breaker is open"),
+/// not as a connection error that took a timeout to produce. The origin is part
+/// of the partition because a registry, its token realm, and GitHub are
+/// independent services — docker.io's `auth.docker.io` can be down while GHCR
+/// is fine, and neither outage should park the other. Without a funnel the
+/// request is sent plainly, and `expect` — the statuses that are protocol steps
+/// rather than reachability verdicts — is meaningless.
+async fn send_registry_request(
+    request: reqwest::RequestBuilder,
+    url: &str,
+    github: Option<&GithubFunnel>,
+    expect: &[reqwest::StatusCode],
+) -> Result<reqwest::Response, OciError> {
+    let Some(github) = github else {
+        return request
+            .send()
+            .await
+            .map_err(|error| OciError::Message(format!("cannot reach {url}: {error}")));
+    };
+    match crate::golden_send(github, url, expect, request).await {
+        Ok(response) => Ok(response),
+        Err(error) if error.downcast_ref::<BreakerOpen>().is_some() => {
+            Err(OciError::Message(error.to_string()))
+        }
+        Err(error) => Err(OciError::Message(format!("cannot reach {url}: {error}"))),
+    }
 }
 
 /// A manifest resolved to the single-image manifest it names.
@@ -372,18 +444,21 @@ pub struct ResolvedManifest {
 /// entry (the engine's packs publish exactly one platform entry), `Some` takes
 /// the entry whose `os/arch` matches and leaves the index unresolved when none
 /// does. Only one level is followed — the entries of a manifest list name
-/// single-image manifests, not further indexes.
+/// single-image manifests, not further indexes. `github` gates each request as
+/// in [`registry_get`].
 pub async fn get_manifest(
     client: &reqwest::Client,
     reference: &OciReference,
     accept: &str,
     select: Option<&(dyn Fn(&str) -> bool + Sync)>,
+    github: Option<&GithubFunnel>,
 ) -> Result<ResolvedManifest, OciError> {
     let top = fetch_json(
         client,
         &reference.manifest_url(&reference.reference),
         reference,
         accept,
+        github,
     )
     .await?;
     let entries = top.get("manifests").and_then(Value::as_array);
@@ -404,7 +479,15 @@ pub async fn get_manifest(
             follow_error: None,
         });
     };
-    match fetch_json(client, &reference.manifest_url(&digest), reference, accept).await {
+    match fetch_json(
+        client,
+        &reference.manifest_url(&digest),
+        reference,
+        accept,
+        github,
+    )
+    .await
+    {
         Ok(image) => Ok(ResolvedManifest {
             top,
             image,
@@ -450,8 +533,26 @@ async fn fetch_json(
     url: &str,
     reference: &OciReference,
     accept: &str,
+    github: Option<&GithubFunnel>,
 ) -> Result<Value, OciError> {
-    let response = registry_get(client, url, &reference.repository, accept, None, None).await?;
+    let response = registry_get(
+        client,
+        client,
+        url,
+        &reference.repository,
+        accept,
+        None,
+        None,
+        github,
+    )
+    .await?;
+    if let Some(github) = github {
+        // The body is read below: charge its advertised size to the golden
+        // subsystem so the manifest lookups are visible in the snapshot.
+        github
+            .consumption
+            .record_advertised_bytes(GithubSubsystem::Golden, &response);
+    }
     let body = response.bytes().await.map_err(|error| {
         OciError::Message(format!("cannot read the response from {url}: {error}"))
     })?;

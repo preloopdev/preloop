@@ -14,6 +14,7 @@
 //! that used to decide between it and a custom image.
 
 use preloop_gha_protocol::oci_image_ref;
+use preloop_vm::{MachineRole, MachineSpec, SMOLVM_GUEST_VOLUMES_ENV, SMOLVM_WORKLOAD_INIT_ENV};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -164,6 +165,31 @@ impl EnvironmentSpec {
     }
 
     fn from_base_with_account(base: String, user: &str, uid: u32) -> Self {
+        // These are the launch-time switches `SmolVmProvider::create` resolves
+        // for a pack machine. Adoption reuses an already-created golden
+        // without running create, so they belong in the identity: a pool that
+        // changes the workload or the guest-local volumes must not adopt the
+        // machine built with the previous ones.
+        let configured_guest_volumes = std::env::var(SMOLVM_GUEST_VOLUMES_ENV).ok();
+        let configured_workload_init = std::env::var(SMOLVM_WORKLOAD_INIT_ENV).ok();
+        Self::from_base_with_launch(
+            base,
+            user,
+            uid,
+            configured_guest_volumes.as_deref(),
+            configured_workload_init.as_deref(),
+        )
+    }
+
+    /// Resolve the fingerprint with explicit launch switches, so tests (and
+    /// callers that must not read the ambient environment) can pin them.
+    fn from_base_with_launch(
+        base: String,
+        user: &str,
+        uid: u32,
+        configured_guest_volumes: Option<&str>,
+        configured_workload_init: Option<&str>,
+    ) -> Self {
         let normalized = serde_json::json!({
             "base": &base,
             // The pool only rebuilds when the fingerprint-suffixed artifact
@@ -181,7 +207,10 @@ impl EnvironmentSpec {
             "golden": if is_official_golden(&base) {
                 crate::official_golden_source()
             } else {
-                crate::golden_contract_script(user, uid)
+                // Includes the provenance-aware residue policy: a custom base
+                // preserves `/etc/hosts` and `/etc/fstab`, and toggling the
+                // opt-in changes this text and therefore the fingerprint.
+                crate::golden_contract_for_base(&base, user, uid)
             },
             // Rosetta x86_64 translation exists only on Apple Silicon hosts.
             // The golden prep installs the amd64 loader + libc so dynamically
@@ -199,6 +228,15 @@ impl EnvironmentSpec {
                 .iter()
                 .map(|(runtime, version)| format!("{runtime}={version}"))
                 .collect::<Vec<_>>(),
+            // Resolved, not raw: the identity must move when the effective
+            // launch differs, including the explicit empty values that
+            // disable a default. `None` and an override naming the default
+            // resolve identically and deliberately share an identity.
+            "launch": launch_identity(
+                &base,
+                configured_guest_volumes,
+                configured_workload_init,
+            ),
         });
         let bytes =
             serde_json::to_vec(&normalized).expect("normalized environment is serializable");
@@ -225,6 +263,49 @@ fn resolve_runner_account() -> (String, u32) {
         .and_then(|value| value.parse().ok())
         .unwrap_or(crate::DEFAULT_RUNNER_UID);
     (user, uid)
+}
+
+/// The launch settings a runtime golden is created with, resolved exactly as
+/// [`SmolVmProvider`](preloop_vm::SmolVmProvider)'s `create` resolves them.
+///
+/// The artifact pack itself does not depend on these: a workload override or a
+/// guest-local volume is applied to the machine created from the pack. They
+/// still belong in the environment identity because adoption skips `create`
+/// entirely, so the recorded fingerprint is the only thing that can tell the
+/// pool its previous machine has the wrong PID 1 or the wrong mounts.
+///
+/// An invalid override is represented by its error text rather than panicking:
+/// the pool then fails later in `create` with the same validation error, and a
+/// golden created before the typo is not adopted in the meantime.
+fn launch_identity(
+    base: &str,
+    configured_guest_volumes: Option<&str>,
+    configured_workload_init: Option<&str>,
+) -> Value {
+    // Every runtime golden on a file-pack backend is a pack. The official
+    // golden is built for the managed layout; a custom base keeps its packed
+    // container state and its own entrypoint unless the operator opts in
+    // through an override.
+    let role = if is_official_golden(base) {
+        MachineRole::OfficialPack
+    } else {
+        MachineRole::CustomPack
+    };
+    let guest_volumes =
+        match MachineSpec::resolve_guest_volumes(None, configured_guest_volumes, role) {
+            Ok(volumes) => volumes
+                .into_iter()
+                .map(|volume| Value::String(volume.as_path().display().to_string()))
+                .collect(),
+            Err(error) => vec![Value::String(format!("invalid: {error}"))],
+        };
+    let workload_init = MachineSpec::resolve_workload_init(None, configured_workload_init, role)
+        .map(|command| Value::Array(command.into_iter().map(Value::String).collect::<Vec<_>>()))
+        .unwrap_or(Value::Null);
+    serde_json::json!({
+        "guest_volumes": guest_volumes,
+        "workload_init": workload_init,
+    })
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -310,7 +391,14 @@ mod tests {
     /// serving an artifact whose runner demands a version no longer shipped.
     #[test]
     fn fingerprint_covers_the_node_externals_pins() {
-        let spec = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".into());
+        let base = "ghcr.io/acme/runner:latest";
+        let spec = EnvironmentSpec::from_base_with_launch(
+            base.to_owned(),
+            crate::DEFAULT_RUNNER_USER,
+            crate::DEFAULT_RUNNER_UID,
+            None,
+            None,
+        );
         let pins: Vec<String> = crate::node_externals::expected_runtimes()
             .iter()
             .map(|(runtime, version)| format!("{runtime}={version}"))
@@ -321,12 +409,17 @@ mod tests {
         let bumped: Vec<String> = pins.iter().map(|pin| format!("{pin}-bumped")).collect();
         let normalized = serde_json::json!({
             "base": "ghcr.io/acme/runner:latest",
-            "golden": crate::golden_contract_script(
+            "golden": crate::golden_contract_for_base(
+                "ghcr.io/acme/runner:latest",
                 crate::DEFAULT_RUNNER_USER,
-                crate::DEFAULT_RUNNER_UID
+                crate::DEFAULT_RUNNER_UID,
             ),
             "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
             "node_externals": bumped,
+            "launch": {
+                "guest_volumes": Vec::<String>::new(),
+                "workload_init": null,
+            },
         });
         let bumped_fingerprint = hex_digest(&serde_json::to_vec(&normalized).unwrap());
         assert_ne!(
@@ -356,6 +449,86 @@ mod tests {
         assert_eq!(default.base, "ghcr.io/acme/runner:latest");
     }
 
+    /// Launch switches are applied when the golden machine is created, but
+    /// adoption reuses it without running create. The identity must therefore
+    /// move on every effective workload or guest-volume change, including the
+    /// explicit empty values that disable a default.
+    #[test]
+    fn fingerprint_tracks_resolved_launch_settings() {
+        let base = "ghcr.io/acme/runner:latest".to_owned();
+        let launched = |guest_volumes, workload_init| {
+            EnvironmentSpec::from_base_with_launch(
+                base.clone(),
+                crate::DEFAULT_RUNNER_USER,
+                crate::DEFAULT_RUNNER_UID,
+                guest_volumes,
+                workload_init,
+            )
+        };
+        let default = launched(None, None);
+        // A custom base already defaults to no guest volumes and its own
+        // entrypoint, so the empty overrides are the same effective launch,
+        // not a new identity.
+        assert_eq!(default.fingerprint, launched(Some(""), None).fingerprint);
+        assert_eq!(default.fingerprint, launched(None, Some("")).fingerprint);
+        for (name, other) in [
+            ("a guest-volume list", launched(Some("/srv/state"), None)),
+            (
+                "a named workload",
+                launched(None, Some("/lib/systemd/systemd")),
+            ),
+        ] {
+            assert_ne!(
+                default.fingerprint, other.fingerprint,
+                "{name} must change the golden identity"
+            );
+        }
+
+        // Naming the effective defaults explicitly is the same launch.
+        let official_default = EnvironmentSpec::from_base_with_launch(
+            OFFICIAL_GOLDEN.to_owned(),
+            crate::DEFAULT_RUNNER_USER,
+            crate::DEFAULT_RUNNER_UID,
+            None,
+            None,
+        );
+        let official_explicit = EnvironmentSpec::from_base_with_launch(
+            OFFICIAL_GOLDEN.to_owned(),
+            crate::DEFAULT_RUNNER_USER,
+            crate::DEFAULT_RUNNER_UID,
+            Some("/var/lib/docker,/var/lib/containerd"),
+            Some("/sbin/init"),
+        );
+        assert_eq!(
+            official_default.fingerprint, official_explicit.fingerprint,
+            "an override naming the defaults is the same effective launch"
+        );
+        let official_disabled = EnvironmentSpec::from_base_with_launch(
+            OFFICIAL_GOLDEN.to_owned(),
+            crate::DEFAULT_RUNNER_USER,
+            crate::DEFAULT_RUNNER_UID,
+            Some(""),
+            Some(""),
+        );
+        assert_ne!(
+            official_default.fingerprint, official_disabled.fingerprint,
+            "disabling the official layout must not adopt the enabled golden"
+        );
+        // The published pack is not re-baked for an account: only a
+        // configured image embeds the runner account in its bake contract.
+        let official_other_account = EnvironmentSpec::from_base_with_launch(
+            OFFICIAL_GOLDEN.to_owned(),
+            "builder",
+            2000,
+            None,
+            None,
+        );
+        assert_eq!(
+            official_default.fingerprint, official_other_account.fingerprint,
+            "the official pin keeps its account-independent behavior"
+        );
+    }
+
     /// The official golden is keyed by *where this host fetches it from*: the
     /// pinned digest, the `PRELOOP_GOLDEN_OCI_REF` override, or the mirror URL.
     /// A changed mirror must not keep serving the pack the previous one left
@@ -364,7 +537,13 @@ mod tests {
     /// the published artifact).
     #[test]
     fn fingerprint_tracks_the_official_golden_source() {
-        let official = EnvironmentSpec::for_base(OFFICIAL_GOLDEN.into());
+        let official = EnvironmentSpec::from_base_with_launch(
+            OFFICIAL_GOLDEN.to_owned(),
+            crate::DEFAULT_RUNNER_USER,
+            crate::DEFAULT_RUNNER_UID,
+            None,
+            None,
+        );
         let oci_source = format!("oci:{}", crate::official_golden_reference());
         let expected = |golden: &str| {
             let normalized = serde_json::json!({
@@ -375,6 +554,10 @@ mod tests {
                     .iter()
                     .map(|(runtime, version)| format!("{runtime}={version}"))
                     .collect::<Vec<_>>(),
+                "launch": {
+                    "guest_volumes": ["/var/lib/docker", "/var/lib/containerd"],
+                    "workload_init": ["/sbin/init"],
+                },
             });
             hex_digest(&serde_json::to_vec(&normalized).unwrap())
         };
@@ -387,9 +570,10 @@ mod tests {
         );
         assert_ne!(
             official.fingerprint,
-            expected(&crate::golden_contract_script(
+            expected(&crate::golden_contract_for_base(
+                OFFICIAL_GOLDEN,
                 crate::DEFAULT_RUNNER_USER,
-                crate::DEFAULT_RUNNER_UID
+                crate::DEFAULT_RUNNER_UID,
             )),
             "the official golden is published, not baked here"
         );

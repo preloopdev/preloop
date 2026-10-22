@@ -1,0 +1,171 @@
+---
+title: "VM images and runner bundles"
+description: "Select, build, refresh, and troubleshoot the golden image and Linux runner bundle used by the microVM pool."
+---
+
+A golden is a packed, architecture-specific microVM artifact. With no custom base, the pool uses the pinned official runner source: file-backed pools download the packed artifact, while a backend that builds in the guest can bake the official runner base. A custom base is baked with the runner contract. Each job runs in a disposable VM or copy-on-write fork of that golden.
+
+## Select an image
+
+| Workflow or setting | Image selected |
+|---|---|
+| `runs-on: ubuntu-latest` or `ubuntu-24.04` with no custom base | Official Ubuntu 24.04 golden for the host architecture. |
+| `PRELOOP_RUNNER_BASE_IMAGE` | The configured OCI reference, archive, or local image is baked as supplied plus runner setup. |
+| `[golden].base_image` | Custom base when the environment variable is absent. |
+| `ubuntu-22.04`, `ubuntu-slim`, or `ubuntu-26.04` | No separate official image; the configured base remains in use. |
+
+`PRELOOP_RUNNER_BASE_IMAGE` wins over `[golden].base_image`. `[golden].kind` and `[golden].dockerfile` record how the setup wizard chose the image; the serving path reads `base_image`.
+
+The default packed OCI references are digest-pinned:
+
+```text
+arm64: ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:cf50db4cbbb38f47f0a533e1e35b523c6427df30261a3cd5bb49d9ef7e072414
+x86_64: ghcr.io/preloopdev/preloop-x86_64-smolvm-golden@sha256:5757a8319aba0604672e62425559f207cc9f21e9380be01e8e80227eaec21914
+```
+
+Override the OCI reference with `PRELOOP_GOLDEN_OCI_REF`. To use a release-asset mirror, set `PRELOOP_GOLDEN_URL`; it replaces the release-asset candidates and skips OCI. The mirror must provide `<url>.sha256` or an explicit `PRELOOP_GOLDEN_SHA256`. Transfers resume from `<payload>.partial` with HTTP Range requests and are installed only after digest verification. Release lookup is cached for five minutes and prefers stable releases.
+
+The pool stores payloads below `<PRELOOP_HOME>/vms/`, keyed by the sanitized base-image name and environment fingerprint. `preloop golden-path --home PATH --base-image REF` prints the exact path.
+
+## Build a custom golden
+
+Build the Linux guest runner and bake an immutable base image on a host matching the guest architecture:
+
+```sh
+just build-preloop
+preloop build-golden \
+  --runner-bundle target/aarch64-unknown-linux-gnu/debug \
+  --base-image ghcr.io/acme/preloop-base@sha256:... \
+  --output dist/acme-aarch64
+```
+
+`--runner-bundle` must name a directory containing a Linux `preloop-runner`. `--base-image` accepts an OCI reference, Docker-save archive, `.smolmachine` pack, or rootfs path. `--storage-gb` raises the guest disk ceiling for large snapshots. The published official golden is normally downloaded rather than rebuilt by this command; without a configured custom base, `build-golden` refuses to invent one.
+
+For a digest-pinned custom source, require and verify provenance:
+
+```sh
+PRELOOP_REQUIRE_BASE_DIGEST=1 \
+PRELOOP_VERIFY_BASE_IMAGE=1 \
+PRELOOP_VERIFY_BASE_IMAGE_REPO=acme/runner-image-blobs \
+preloop build-golden \
+  --runner-bundle target/aarch64-unknown-linux-gnu/release \
+  --base-image ghcr.io/acme/base@sha256:... \
+  --output dist/acme-aarch64
+```
+
+`PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` changes the keyless Sigstore identity match; `PRELOOP_BASE_IMAGE_PUBKEY` switches verification to a public key. The base-image verification checks a Cosign signature and SPDX attestation. A configured image is used as supplied plus the runner contract; add organization-wide packages to that image rather than expecting `build-golden` to install a package list.
+
+### Custom bases and hosted adaptation
+
+A custom base keeps `/etc/hosts` and `/etc/fstab` exactly as supplied. A bake does not guess which routable mapping or which not-yet-attached device is residue, because a custom image's `10.20.30.40 internal-api.example` alias or an `/etc/fstab` entry for a volume attached after boot is indistinguishable from stale cloud state by content alone.
+
+The policy also covers the rest of the hosted runner's image setup. A custom base keeps its own systemd units, including `systemd-sysctl.service` and any snap/cloud/apt timers it ships, so `/etc/sysctl.conf` and `/etc/sysctl.d` tuning still applies at boot. Its `ping` binary is not modified, its resolver file is not rewritten, and the per-machine init does not overwrite its sysctl keys. The minimal runner contract still applies: the runner account and ownership, the writable tool cache and environment entries, apt index refresh, KVM access, the glibc check, and hostname resolution.
+
+The official runner image is a captured Azure VM, so it is classified differently: its bake always applies the hosted policy — dropping the bake host's own `/etc/hosts` mapping, commenting out `/etc/fstab` entries whose device does not exist in that guest, masking the cloud/snap/apt and `systemd-sysctl` units, restoring `ping`'s capability, pinning systemd-resolved's upstream, pointing `/etc/resolv.conf` at the stub while keeping its nameservers and resolver directives, and applying GitHub's sysctls per machine. To apply the same policy to a custom base that is itself a cloud VM dump or is meant to take the hosted runner's setup, opt in:
+
+```sh
+PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1 preloop build-golden ...
+PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1 preloop serve
+```
+
+Only `1`, `true`, `yes`, or `on` enable it; empty, `0`, and `false` leave it off. Enabling it can delete an intentional routable `/etc/hosts` mapping, comment out an `/etc/fstab` device that is not present at bake time, disable the image's own sysctl service, and replace its resolver configuration. Use it only when the base is a cloud or builder image dump, not for an organization's hand-maintained image.
+
+The official release bakes (`official-golden.yml`, `release-golden.yml`, and `scripts/build-golden-x86_64.sh` with its default base) set the opt-in explicitly. They bake the pinned digest reference rather than the official-golden sentinel, so the policy cannot infer that the image is the official one from the name.
+
+The policy is part of a custom environment's fingerprint, so changing the opt-in rebuilds the custom golden instead of adopting one baked under the other policy.
+
+## What the bake and guest setup provide
+
+The served pool defaults to the `runner` account (UID 1001), writable `work`, `/opt/hostedtoolcache`, and the `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` environment entries. The launcher sources `/etc/environment` with exports and keeps the image's PATH (the pool's list is only the fallback when the image declares none). A bake writes `/etc/preloop-bake.json`, checks for a glibc loader, creates or updates the runner account and ownership, refreshes apt indexes when apt exists, and configures KVM access.
+
+On the official runner image, and on a custom base only with `PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE`, the bake also restores `ping`'s file capability, masks the hosted image's Azure/cloud/snap/apt units (including `systemd-sysctl.service`), writes `DNS=` to a `resolved.conf.d` drop-in only when neither `resolved.conf` nor a drop-in already sets it, and points `/etc/resolv.conf` at the resolved stub as a regular file. The resolver rewrite keeps the image's configured upstream nameservers, `search`/`domain` directives and compatible `options` (such as `ndots`), so short corporate names still resolve inside containers; a stub-only file gains the image's effective `DNS=` from `resolved.conf` and its drop-ins (an empty assignment resets the list, matching systemd-resolved), falling back to `1.1.1.1` only when no upstream is configured anywhere. A configured `DNS=` is never overwritten. The contract does not choose language toolchains; use setup actions or a job container.
+
+At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stack limit with unlimited hard limit and 65536 soft/hard file descriptors. On the official image (or a base opted into the Clean policy), per-machine initialization also applies:
+
+| Guest setting | Value |
+|---|---:|
+| `vm.max_map_count` | `262144` |
+| `fs.inotify.max_user_watches` | `655360` |
+| `fs.inotify.max_user_instances` | `1280` |
+
+The engine also verifies that the guest hostname resolves to a local address and removes stale mappings *of that hostname only*; unrelated aliases on the same line and other lines are kept. On the Clean policy it points `/etc/resolv.conf` at systemd-resolved's `127.0.0.53` stub while keeping the guest's configured upstream nameservers, search/domain and options, and re-applies it inside every runner launch — the SmolVM agent rewrites the file before each start and interactive run. That is what lets a container resolve a compose `/etc/hosts` alias such as `postgres.localhost`; no `daemon.json` `dns` entry is written, because a loopback address there becomes the container's own loopback. A guest that cannot publish a resolved stub keeps its resolver and logs why.
+
+A custom base under the Preserve policy runs only the hostname half of that init: its sysctl tuning and resolver file are its own policy, and the runner launch does not rewrite them. The hosted process limits still apply because they are per-process runner machinery.
+
+The official runner pack is built for a managed layout: a runtime machine from it runs `/sbin/init` as its workload, so the guest has systemd as PID 1 and Docker's `systemd` cgroup driver, and keeps `/var/lib/docker` and `/var/lib/containerd` on the machine's own storage disk so Docker uses `overlay2` rather than `fuse-overlayfs`. Those guest-local directories start empty; Preloop does not migrate state into them. A custom pack keeps its baked container state and its own entrypoint/cmd: no guest-local volume or workload override is applied by default, because those directories may hold the images the pack exists for. Opt in with `PRELOOP_SMOLVM_WORKLOAD_INIT`, `PRELOOP_SMOLVM_GUEST_VOLUMES`, or the machine spec. OCI-image machines and the golden builder are unaffected: the builder's writes must stay in the overlay `pack create` captures. The guest does not expose `/dev/kvm`: workloads that need nested virtualization must run on a runner outside the microVM pool.
+
+## Runner bundle discovery
+
+The engine searches in this order:
+
+1. `PRELOOP_RUNNER_BUNDLE`.
+2. The installed release path `<prefix>/lib/preloop/runner/<triple>/preloop-runner`.
+3. Development and executable-adjacent candidates under the selected Linux target.
+
+The bundle must be a Linux ELF binary even when the host is Linux. `install.sh` and `preloop update` install the guest bundle on both Linux and macOS. On a development host, set `PRELOOP_RUNNER_BUNDLE` explicitly when automatic target discovery cannot find the right architecture.
+
+If the bundle is absent, the engine logs that there is no runner pool and jobs fail after the queue grace window. Install the bundle with `preloop update` or set `PRELOOP_RUNNER_BUNDLE` to its directory.
+
+On the AgentENV backend the bundle is not copied into each golden: the host tree is archived into a content-addressed read-only volume named `preloop-runner-<digest>`, so a bundle update publishes a new volume instead of requiring a golden rebuild. `preloop volumes list` shows what is held and the versions each volume was populated from; `preloop volumes prune` and `preloop volumes gc` reclaim what nothing needs (the engine also collects superseded volumes on its own). See [AgentENV read-only volumes](/control-plane/architecture/sandboxes#agentenv-read-only-volumes) for the retention rules.
+
+## Version pins
+
+`versions.toml` controls the runner, SmolVM, and Node external pins:
+
+| Key | Current pin |
+|---|---:|
+| `runner_version` | `2.337.0` |
+| `smolvm_min_version` | `1.30.1` |
+| `smolvm_golden_version` | `1.30.1` |
+| `node20_externals_version` | `20.20.2` |
+| `node24_externals_version` | `24.19.0` |
+| `runner_image_docker_version` | `29.6.1` |
+| `runner_image_buildx_version` | `0.35.0` |
+
+`official-image.toml` pins the upstream runner-image sources:
+
+```text
+official_runner_image_base_amd64 = "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest@sha256:4f7e4be438e4eb9c0f23bebdec12cf1d25520876ad2052412ba18580919b7795"
+official_runner_image_base_arm64 = "ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest@sha256:3884ef2266edee7ae2da8f70f54faba5340238e68ede5274d0e90fdec80faf9e"
+```
+
+That file also records the hosted runtime limits and sysctl values shown above. Changing a compiled pin requires rebuilding and replacing the `preloop` executable; it does not change an already-installed binary.
+
+`smolvm_min_version` is a capability floor rather than a tracked release: it moves when a SmolVM release becomes the first to satisfy a runtime invariant Preloop depends on (fork freeze-source, packed ownership, the x86_64 virtio device budget). `preloop update --ensure-runtime` accepts and upgrades from that floor.
+
+## The virtio device budget (IRQ lines)
+
+A microVM's device count is capped by libkrun's MMIO IRQ allocation: one line per virtio device. Measured on x86_64 Linux at SmolVM 1.30.1, the allocation is 19 lines (IRQ 5-23) since SmolVM 1.23.0 and was 11 before that; an image machine created with `--storage`/`--overlay` starts with 9 devices, and each `--volume`, `--mount-socket` or extra `--disk` costs one. The 20th device fails the boot with `krun_start_enter returned: -22 (EINVAL)` and `no more IRQs are available` — the same `EINVAL` shape as a held or corrupt disk image, which is why the engine classifies it (`VmError::IrqExhausted`) and reports the machine's declared inventory and the ceilings. The arm64/macOS ceiling has not been measured.
+
+## Troubleshooting
+
+| Symptom | Action |
+|---|---|
+| Official golden download fails | Check egress to GHCR or the mirror, the architecture-specific digest, free disk, and the retained `.partial` file. |
+| A custom base is baked on every start | Check `PRELOOP_RUNNER_BASE_IMAGE`, the configured base, and the payload path from `preloop golden-path`. |
+| Jobs fail after the queue grace window | Install a Linux guest bundle or set `PRELOOP_RUNNER_BUNDLE`; a host binary does not qualify. |
+| `SIGKILL` during compilation | Raise `PRELOOP_RUNNER_MEMORY_MIB` or lower pool concurrency. |
+| Disk waits indefinitely | Check `PRELOOP_RUNNER_MIN_FREE_DISK_GB`, `PRELOOP_SKIP_DISK_PREFLIGHT`, and `PRELOOP_GOLDEN_UNPACK_FACTOR`. |
+| Every pool start fails with `krun_start_enter returned: -22 (EINVAL)` plus `no more IRQs are available` | The host ran out of MMIO IRQ lines for the machine's virtio devices (`VmError::IrqExhausted` — see [The virtio device budget](#the-virtio-device-budget-irq-lines)). Restarting the pool cannot help: upgrade the host runtime to the compiled floor (`preloop update --ensure-runtime`) or start the machine with fewer mounts. |
+| Wrong OS or labels | Check the custom base, `PRELOOP_RUNNER_LABELS`, and the workflow's `runs-on` labels. |
+| `running guest agent does not support safe shutdown` | The guest-agent rootfs does not match the resolved smolvm; see [Stale guest-agent rootfs](#stale-guest-agent-rootfs). |
+
+### Stale guest-agent rootfs
+
+The engine exports `SMOLVM_AGENT_ROOTFS` on every smolvm child (the child's `HOME`/data directory is isolated, so the rootfs must be named explicitly), and an inherited variable wins over the rootfs beside the binary — so a stale copy in the data directory used to outrank a version-matched one. SmolVM ≥ 1.16 requires the `quiesced-shutdown-v1` capability from the agent before it will stop a machine, so a stale agent makes every machine unstoppable and the pool retries the same stop forever.
+
+Preloop now prefers the rootfs shipped next to the resolved binary and refuses (with both rootfs paths, both agent hashes, and the host version) before booting from one it can prove cannot serve that binary — including when both trees hold the same stale agent, which is what a smolvm upgraded without its rootfs looks like. Repair the install with `preloop update --ensure-runtime`, which refreshes the rootfs the engine exports (`<data dir>/agent-rootfs`, where `<data dir>` is `$SMOLVM_DATA_DIR` or the effective Preloop home's `smolvm`), keeps the rootfs beside the resolved binary in step with it, and records the version in `<data dir>/agent-rootfs/.preloop-agent-version`. By hand, the equivalent is `cp -a <smolvm prefix>/agent-rootfs <data dir>/agent-rootfs`; if `SMOLVM_AGENT_ROOTFS` names the stale tree, unset it. `<smolvm prefix>` is the directory of the `smolvm` that `PATH` resolves (following symlinks), the official installer's `~/.smolvm` by default; with no `PRELOOP_HOME` the effective Preloop home is `~/.preloop`, so `<data dir>` is `~/.preloop/smolvm` and smolvm's own platform data directory is not what the engine exports. The agent version that actually booted is in the machine's console log (`smolvm machine data-dir --name <machine>` + `agent-console.log`), which the engine now appends to the stop error along with the rootfs it exported.
+
+The failure reproduces on any host that upgrades smolvm without replacing the rootfs the engine already points at, and the two copies are easy to tell apart — this is a real macOS host, before the fix:
+
+```console
+$ smolvm --version
+smolvm 1.18.1
+$ strings ~/.smolvm/agent-rootfs/usr/local/bin/smolvm-agent | grep -c quiesced-shutdown-v1
+1
+$ strings "$HOME/Library/Application Support/smolvm/agent-rootfs/usr/local/bin/smolvm-agent" \
+    | grep -c quiesced-shutdown-v1
+0
+```
+
+The data-directory agent is 1.14.2 and reports no capability while the host requires it, so every `machine stop` is refused. `cargo nextest run -p preloop-vm` covers the same pair with fixtures (the shipped tree, a stale data-directory copy, and a host that answers `smolvm --version`), which is what keeps it from coming back.

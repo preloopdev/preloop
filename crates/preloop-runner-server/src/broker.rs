@@ -997,12 +997,7 @@ pub async fn broker_acquire_job(
             // verified (fresh cache, or re-introspected here: the job may have
             // queued past the cache TTL); unverifiable authority stays
             // withheld and the job keeps an empty token surface.
-            match crate::runs::verified_pat_scopes(
-                shared.state.github_api_request_base.as_deref(),
-                &pat,
-            )
-            .await
-            {
+            match crate::runs::verified_pat_scopes(&shared.state, &pat).await {
                 Some(scopes) => {
                     message.variables.insert(
                         "system.github.token.pat_scopes".to_owned(),

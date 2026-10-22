@@ -4131,6 +4131,7 @@ async fn retry_attempt_tx(
     message.job_id = agent_job_id;
     message.request_id = retry;
     message.plan.plan_id = agent_job_id.to_string();
+    logic::reprefix_orchestration_id(&mut message, agent_job_id);
     message.timeline.id = timeline_id;
     PgBackend::write_node_message(tx, run_id, job_id, &message).await?;
     tx.execute(

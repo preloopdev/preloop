@@ -102,6 +102,8 @@ pub use preloop_runner_server::secrets_api::*;
 
 pub use preloop_runner_server::shared_http::*;
 
+pub use preloop_runner_server::sarif::*;
+
 pub use preloop_runner_server::snapshots::*;
 
 pub use preloop_runner_server::state::*;

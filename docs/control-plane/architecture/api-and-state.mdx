@@ -1,0 +1,73 @@
+---
+title: HTTP APIs and durable state
+description: How runners, the CLI, GitHub, and operators connect to the control plane and how state changes become durable events.
+---
+
+Preloop exposes several HTTP surfaces because it must be compatible with the official Actions runner while also providing a native API for the CLI and operators. This page is useful when placing a reverse proxy, choosing credentials, or reasoning about multi-node state.
+
+![Control-plane surfaces and state](/diagrams/control-plane.svg)
+
+![Runner protocol layer](/diagrams/protocol-layer.svg)
+
+## HTTP surfaces
+
+| Surface | Main callers | What it carries |
+| --- | --- | --- |
+| `/_apis/` and `/runner/server/_apis/` | Official Actions runners and runner-compatible clients | Agent registration, sessions, messages, job requests, timelines, logs, job completion, action downloads, cache v1, and pipeline artifacts. These routes are the compatibility source of truth. |
+| `/broker/` plus `/runner/*` aliases | Current runner listener and worker | Broker sessions and message polling, `acquirejob`, `renewjob`, and `completejob`. `connectionData` advertises the runner base, broker, results, and versioned service URLs. |
+| `/api/v1/` | `preloop`, agents, operators, and integrations | Run submission and inspection, logs and events, cancellation, reruns, push-back, bundles, native cache/artifacts, runner administration, debug sessions, webhook administration, and GitHub registration. |
+| `/api/v1/github/webhooks` | GitHub App | Signed webhook intake. The handler verifies `X-Hub-Signature-256`, records the delivery durably, and returns `202 Accepted` only after the delivery row is committed. |
+| `/setup/github`, `/setup/github/callback`, and `/api/v1/github/setup-sessions` | `preloop setup github` and the browser | Engine-hosted App creation through GitHub's manifest flow. The authenticated endpoint mints the one-time setup link and reports progress; the two browser routes serve the form and GitHub's redirect. All three return `404` unless a setup is awaiting them. |
+| `/twirp/`, `/twirp-blob/`, and `/replay/results/` | Actions results clients and runners | Results metadata, step updates, signed log URLs, cache v2, artifact v2, Azure Block Blob-compatible transfers, and replay-result uploads. |
+| OIDC discovery and JWKS | Actions toolkits and relying services | `/.well-known/openid-configuration`, `/.well-known/jwks`, and the equivalent `/oidc/.well-known/...` aliases. |
+| `/healthz`, `/readyz`, `/metrics` | Load balancers and operators | Liveness, readiness, and Prometheus text exposition. `/metrics` uses the native bearer guard even though it is a monitoring endpoint. |
+
+Native run clients use `POST /api/v1/runs`; the CLI reads the run from `GET /api/v1/runs/{run_id}` and can stream `events.ndjson`, logs, or live logs. The runner-facing results and broker routes use job-scoped credentials rather than the CLI's native credential.
+
+## Authentication boundaries
+
+- **Engine/system token:** the administrator credential used by the native API and system-only routes. It is supplied through the configured credential store or `PRELOOP_SYSTEM_TOKEN`.
+- **Local JWTs:** the engine signs short-lived runner and job credentials with its HMAC key. Set `PRELOOP_HMAC_KEY` to the same 32-byte hex key on every node sharing a database; otherwise a node persists a generated key in its state directory.
+- **Runner registration:** registration accepts the system credential, a RunnerManage local JWT, or a short-lived pool provision token. The provision token is consumed when the runner identity is created.
+- **Runner listen token:** identifies a registered runner for session and message traffic. A job's runtime JWT is not accepted for listener-only acquisition.
+- **Job runtime and results tokens:** the acquired job carries a token for renew/complete, repository reads, OIDC requests, and Results/Twirp calls. Results routes accept only the system credential or a job-scoped results identity.
+- **Webhooks:** GitHub webhook requests must carry a valid HMAC `X-Hub-Signature-256`. With multiple GitHub Apps, the signature is also checked against the installation that covers the claimed repository.
+
+Keep the system, runner, and job credentials separate. In particular, workflow code receives a job runtime token; it must not be able to use that token to deregister runners or delete other runner sessions.
+
+## The `ControlBackend` contract
+
+The control database is authoritative for durable runs, jobs, runner records, sessions, queue claims, webhook deliveries, check-run projections, timelines, and retention metadata. HTTP handlers map requests to typed `ControlBackend` commands; they do not hold SQL transactions or maintain a process-local working copy of durable state.
+
+The backend runs one short transaction per command. Conditional updates use the affected-row count as the race result. Postgres claims queue rows with `FOR UPDATE SKIP LOCKED`, while both backends call the same backend-neutral scheduling logic so dependency, concurrency, and runner-matching decisions stay consistent.
+
+| Backend | Selection and concurrency model |
+| --- | --- |
+| SQLite | Default at `<state_dir>/preloop.db` (normally `$PRELOOP_HOME/state/preloop.db`). Uses WAL and one writer transaction at a time; read connections can run concurrently. |
+| Postgres | Select with `--store postgres://...` or `PRELOOP_STORE_URL`. Nodes use writer and reader pools (`PRELOOP_PG_WRITERS` and `PRELOOP_PG_READERS`, 16 each by default), row-level queue claims, and a shared `control` schema. |
+
+`preloop serve` initializes a brand-new local store (absent or empty) and otherwise checks the migration ledger, refusing an older, newer, incomplete, divergent, or incompatible control schema rather than migrating it; run `preloop store migrate` (see [Storage](/control-plane/operate/storage#apply-schema-migrations)) to upgrade an existing store. The supported first-run paths are `preloop serve` on a fresh `$PRELOOP_HOME`, `preloop init`, and `preloop server install`. Postgres lets several engine nodes share durable run and queue state. Node-local state still includes live log feeds, cache/artifact reservations, runner liveness observations, debug sessions, and the App-setup session (`github_app_setup/session.rs`: one live setup at a time, its one-time token and state nonce held in memory), so a shared database alone does not make every HTTP surface active-active.
+
+## Transactional events and check runs
+
+A run or job mutation and its versioned event are committed together in `outbox_events`. The check-run projector owns a durable `consumer_offsets` bookmark, ignores older versions, and coalesces the desired state for each run/job into `check_run_updates`.
+
+```text
+run/job transaction -> outbox_events
+                           |
+                 check-run projector
+                           v
+              check_run_updates (coalesced)
+                           |
+                  one leased sender
+                           v
+                    GitHub Checks API
+```
+
+Only the leased sender writes GitHub check runs. It renders the current check at send time, handles annotations and retries, and records the resulting check-run ID. Postgres publishes the `preloop_events` wake-up channel; SQLite and the recovery path use a local dirty signal plus polling, so a lost notification does not lose an event.
+
+## OIDC and scheduling concurrency
+
+The server signs GitHub-compatible OIDC ID tokens with a persisted RSA keypair and exposes discovery and JWKS documents. Tokens are short-lived (300 seconds). The issuer defaults to the runner base URL with `/oidc` appended; set an explicit issuer when a relying service needs a stable public URL. A job must have `id-token: write` permission before the runner can request one.
+
+Workflow and job `concurrency:` groups are evaluated by the control plane. The default `single` queue keeps one pending holder and replaces an older pending holder; `max` allows up to 100 pending holders in FIFO order. Runners do not implement this policy: they receive cancellation or dispatch decisions from the control plane.

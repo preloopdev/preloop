@@ -11,6 +11,11 @@ use crate::environment::{EnvironmentSpec, is_official_golden};
 use crate::keys::{KeyPool, StagedKey};
 use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
 use preloop_gha_protocol::{RUNNER_BUSY_SENTINEL, SecretString};
+use preloop_observability::deadline;
+use preloop_runner_server::github_breaker::{
+    BreakerOpen, GithubCredentialBucket, GithubFunnel, GithubSubsystem, send_observed_labeled_at,
+    service_origin,
+};
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
 /// `VmProvider` implementation can model the handshake this pool relies on.
@@ -20,7 +25,7 @@ use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use preloop_vm::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
 use preloop_vm::{
-    MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
+    MachineName, MachineRole, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
 };
 use serde::Deserialize;
@@ -152,6 +157,98 @@ fn runner_volumes(
     }
     Ok(volumes)
 }
+/// Volumes that may be attached to a fork base. AgentENV cannot snapshot a
+/// sandbox while a read-only volume is mounted, so those mounts are attached
+/// to each clone instead.
+fn fork_base_volumes<P: VmProvider>(provider: &P, volumes: Vec<VolumeMount>) -> Vec<VolumeMount> {
+    if provider
+        .capabilities()
+        .fork_bases_may_mount_read_only_volumes
+    {
+        volumes
+    } else {
+        volumes
+            .into_iter()
+            .filter(|volume| !volume.read_only)
+            .collect()
+    }
+}
+
+/// Deadline for the whole host node-externals install: the shell routine
+/// [`node_externals_at`] builds. It fetches two Node archives (about 57 MB and
+/// 47 MB) and a 3 KB checksum file from nodejs.org.
+///
+/// Long work, sized from the worst honest case rather than from a probe. Each
+/// curl transfer carries its own limit ([`NODE_FETCH_LIMITS`]); if every fetch
+/// stalls, those limits add up to 24 minutes. This budget sits above that sum,
+/// so a stalled install reports curl's own error first, and only a hang the
+/// per-transfer limits cannot see reaches this deadline. A healthy install
+/// takes well under a minute.
+///
+/// The install runs in its own process group
+/// ([`deadline::run_command_status_in_group`]): the routine's real work is in
+/// grandchildren (`curl`, `shasum`, `tar`, the cached `node --version`), so
+/// killing the shell alone would leave the one hanging step running behind a
+/// failure the pool already reported.
+const HOST_EXTERNALS_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Deadline for one `cp -a` of the externals tree, into the runner bundle or
+/// into the engine-owned mirror.
+///
+/// The tree is a few hundred megabytes of local files, a second or two on any
+/// host this engine runs on. The budget covers a cold page cache or a release
+/// directory behind a network mount; it exists so a wedged filesystem cannot
+/// hold pool start.
+const HOST_EXTERNALS_COPY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Deadline for a read-only host query run as a child process (`sysctl -n
+/// hw.memsize`). The kernel answers in milliseconds; this only has to survive a
+/// badly loaded host.
+const HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for the orphaned-VM cleanup in `remove_stale_machines` and
+/// `reconcile_orphans`: `ps`, `kill`, `/sbin/mount`, and `hdiutil detach`, run
+/// through `preloop-vm`. `preloop-vm` bounds each of those children at 30 s and
+/// kills it on expiry, so the total grows with the number of orphans, one child
+/// each. Ten minutes covers roughly eighteen children that each hit their own
+/// bound; past that the caller stops waiting, and the sweep finishes on its own,
+/// still bounded per child.
+const HOST_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// `cp -a` the host externals tree into `dest`, bounded by
+/// [`HOST_EXTERNALS_COPY_TIMEOUT`] through the shared runner, which kills and
+/// reaps the child at the deadline.
+///
+/// Real directories, never symlinks: virtiofs exports a symlink node verbatim
+/// and the guest kernel would then resolve its target in the guest namespace.
+async fn copy_externals_into(
+    source: &Path,
+    dest: &Path,
+) -> Result<std::process::ExitStatus, deadline::CommandError> {
+    let mut copy = tokio::process::Command::new("cp");
+    copy.arg("-a").arg(source.join(".")).arg(dest);
+    deadline::run_command_status(
+        copy,
+        HOST_EXTERNALS_COPY_TIMEOUT,
+        "host node externals copy",
+    )
+    .await
+}
+
+/// Drop runtime directories a newer pinned version has superseded.
+///
+/// Run before a copy so `cp -a` cannot leave a mix of stale and new runtimes in
+/// the destination — which `externals_complete` would refuse anyway, but only
+/// after the copy had made a second copy of gigabytes.
+fn prune_stale_externals(externals_root: &Path) {
+    for (runtime, version) in crate::node_externals::expected_runtimes() {
+        let plain = version.trim_start_matches('v');
+        let dest = externals_root.join(runtime);
+        if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain) && dest.exists() {
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+    }
+}
 
 /// Populate the host-side externals directory, validating the manifest and
 /// binary version for each runtime instead of merely checking for a file.
@@ -162,7 +259,15 @@ fn runner_volumes(
 /// re-downloaded when its `preloop-node.json` is missing, its version is stale,
 /// or `bin/node --version` disagrees. Permissions are still normalized on every
 /// call.
-fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
+///
+/// Every subprocess it runs goes through `preloop_observability::deadline`, so
+/// the install and the bundle copies are bounded and their children are killed
+/// at the deadline — the install's whole process group, so the `curl` or `tar`
+/// it is waiting on dies with it. This is called from `RunnerPool::run`, and an
+/// unbounded wait here would stop every machine the pool would create; a
+/// shutdown there cancels this future outright, which kills the group for the
+/// same reason.
+async fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
     let externals = config.externals_dir.join("externals");
     let needs_host = crate::node_externals::expected_runtimes()
         .iter()
@@ -178,15 +283,19 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
             ))
         })?;
         for command in node_externals_at(config.externals_dir.to_string_lossy().as_ref()) {
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command[2])
-                .status()
-                .map_err(|error| {
-                    OrchestratorError::Config(format!(
-                        "failed to spawn host externals install: {error}"
-                    ))
-                })?;
+            let mut install = tokio::process::Command::new(&command[0]);
+            install.args(&command[1..]);
+            // The install is a shell routine whose real work (curl, tar, shasum)
+            // runs in grandchildren, so it starts its own process group: the
+            // runner kills that whole group at the deadline, and dropping the
+            // future kills it too — which is what `RunnerPool::run` does when a
+            // shutdown wins the race.
+            let status = deadline::run_command_status_in_group(
+                install,
+                HOST_EXTERNALS_INSTALL_TIMEOUT,
+                "host node externals install (nodejs.org)",
+            )
+            .await?;
             if !status.success() {
                 return Err(OrchestratorError::Config(
                     "host node externals install failed; \
@@ -220,31 +329,24 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     let bundle_externals = config.runner_bundle.join("externals");
     if !externals_complete(&bundle_externals) {
         // Ensure bundle parent exists before copy.
-        let copy = std::fs::create_dir_all(&bundle_externals).and_then(|()| {
-            // For stale manifests, remove the stale runtime dirs in the bundle first
-            // so `cp -a` does not leave a mix of stale/new.
-            for (runtime, version) in crate::node_externals::expected_runtimes() {
-                let plain = version.trim_start_matches('v');
-                let dest = bundle_externals.join(runtime);
-                if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain)
-                    && dest.exists()
-                {
-                    let _ = std::fs::remove_dir_all(&dest);
-                }
+        let copy = match std::fs::create_dir_all(&bundle_externals) {
+            Ok(()) => {
+                // For stale manifests, remove the stale runtime dirs in the bundle
+                // first so `cp -a` does not leave a mix of stale/new.
+                prune_stale_externals(&bundle_externals);
+                copy_externals_into(&externals, &bundle_externals)
+                    .await
+                    .map_err(OrchestratorError::from)
             }
-            std::process::Command::new("cp")
-                .arg("-a")
-                .arg(externals.join("."))
-                .arg(&bundle_externals)
-                .output()
-        });
+            Err(error) => Err(OrchestratorError::Io(error)),
+        };
         match copy {
-            Ok(output) if output.status.success() => info!(
+            Ok(status) if status.success() => info!(
                 bundle = %bundle_externals.display(),
                 "Materialized node externals into runner bundle"
             ),
-            Ok(output) => warn!(
-                status = %output.status,
+            Ok(status) => warn!(
+                %status,
                 bundle = %bundle_externals.display(),
                 "Could not materialize bundle externals in place; publishing an engine-owned mirror bundle"
             ),
@@ -261,7 +363,7 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     if externals_complete(&bundle_externals) {
         return Ok(());
     }
-    materialize_mirror_bundle(config, &externals)
+    materialize_mirror_bundle(config, &externals).await
 }
 
 /// Whether `externals_root` carries every expected runtime at its pinned
@@ -285,7 +387,12 @@ fn externals_complete(externals_root: &Path) -> bool {
 /// can run at all — unlike the release directory, which is root-owned when the
 /// engine runs unprivileged.
 fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
-    config.externals_dir.join("runner-bundle")
+    mirror_bundle_dir_in(&config.externals_dir)
+}
+
+/// [`mirror_bundle_dir`] from the externals directory alone.
+fn mirror_bundle_dir_in(externals_dir: &Path) -> PathBuf {
+    externals_dir.join("runner-bundle")
 }
 
 /// The bundle directory actually mounted into guests at `/opt/preloop/bin`.
@@ -298,23 +405,50 @@ fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
 /// `<root>/externals` symlink dangled, so every JS action step failed with
 /// `bundled nodeXX is missing` long after the pool reported itself ready.
 fn effective_runner_bundle(config: &RunnerPoolConfig) -> Result<PathBuf, OrchestratorError> {
-    if externals_complete(&config.runner_bundle.join("externals")) {
-        return Ok(config.runner_bundle.clone());
+    effective_runner_bundle_path(
+        &config.runner_bundle,
+        &config.externals_dir,
+        &config.runner_binary_name,
+    )
+}
+
+/// The bundle [`effective_runner_bundle`] would mount, without a pool config.
+///
+/// Split out so `preloop runner-volumes prune` can name the same tree the engine
+/// mounts — including the engine-owned mirror — and keep its volume.
+pub fn effective_runner_bundle_path(
+    bundle: &Path,
+    externals_dir: &Path,
+    runner_binary_name: &str,
+) -> Result<PathBuf, OrchestratorError> {
+    if externals_complete(&bundle.join("externals")) {
+        return Ok(bundle.to_path_buf());
     }
-    let mirror = mirror_bundle_dir(config);
-    if mirror.join(&config.runner_binary_name).is_file()
-        && externals_complete(&mirror.join("externals"))
-    {
+    let mirror = mirror_bundle_dir_in(externals_dir);
+    if mirror.join(runner_binary_name).is_file() && externals_complete(&mirror.join("externals")) {
         return Ok(mirror);
     }
     Err(OrchestratorError::Config(format!(
         "no runner bundle with complete node externals: release bundle {} and \
          engine-owned mirror {} are both incomplete; check network egress to \
          nodejs.org and the host externals at {}",
-        config.runner_bundle.display(),
+        bundle.display(),
         mirror.display(),
-        config.externals_dir.join("externals").display(),
+        externals_dir.join("externals").display(),
     )))
+}
+
+/// The version pins stamped into every AgentENV runner volume.
+///
+/// `versions.toml` is compiled into this crate (and the CLI) by `build.rs`, not
+/// into `preloop-vm`, which archives the tree — so the provider is handed the
+/// manifest by whoever constructs it.
+pub fn runner_bundle_manifest() -> preloop_vm::agentenv::volume::BundleManifest {
+    preloop_vm::agentenv::volume::BundleManifest::new(
+        RUNNER_VERSION,
+        NODE20_EXTERNALS_VERSION,
+        NODE24_EXTERNALS_VERSION,
+    )
 }
 
 /// Publish an engine-owned bundle carrying the runner binary and the validated
@@ -323,7 +457,7 @@ fn effective_runner_bundle(config: &RunnerPoolConfig) -> Result<PathBuf, Orchest
 /// Fails when the mirror still does not validate: a pool that starts without
 /// resolvable externals reports itself ready and then fails every JS action
 /// step, which is far more expensive to diagnose than a refused startup.
-fn materialize_mirror_bundle(
+async fn materialize_mirror_bundle(
     config: &RunnerPoolConfig,
     host_externals: &Path,
 ) -> Result<(), OrchestratorError> {
@@ -331,27 +465,19 @@ fn materialize_mirror_bundle(
     let mirror_externals = mirror.join("externals");
     let runner_source = config.runner_bundle.join(&config.runner_binary_name);
     let runner_target = mirror.join(&config.runner_binary_name);
-    let published = std::fs::create_dir_all(&mirror_externals).and_then(|()| {
-        for (runtime, version) in crate::node_externals::expected_runtimes() {
-            let plain = version.trim_start_matches('v');
-            let dest = mirror_externals.join(runtime);
-            if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain)
-                && dest.exists()
-            {
-                let _ = std::fs::remove_dir_all(&dest);
-            }
-        }
+    let published: Result<(), OrchestratorError> = async {
+        std::fs::create_dir_all(&mirror_externals)?;
+        prune_stale_externals(&mirror_externals);
         // `cp -a` for both halves: the runner binary must keep its exec bit and
         // the externals must arrive as real directories, since virtiofs exports
         // a symlink node verbatim and the guest would resolve it in its own
-        // namespace.
+        // namespace. A `cp` that exits non-zero is left to the completeness
+        // check below.
         std::fs::copy(&runner_source, &runner_target)?;
-        std::process::Command::new("cp")
-            .arg("-a")
-            .arg(host_externals.join("."))
-            .arg(&mirror_externals)
-            .output()
-    });
+        copy_externals_into(host_externals, &mirror_externals).await?;
+        Ok(())
+    }
+    .await;
     if let Err(error) = published {
         return Err(OrchestratorError::Config(format!(
             "node externals are missing from the runner bundle {} and the \
@@ -454,7 +580,7 @@ fn relax_externals_permissions(_externals: &Path) {}
 /// `/proc/meminfo`, a non-Linux/non-macOS host) falls back to CPU-only
 /// sizing rather than refusing to run.
 #[cfg(target_os = "linux")]
-fn host_memory_mib() -> Option<u64> {
+async fn host_memory_mib() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let kib: u64 = meminfo.lines().find_map(|line| {
         let line = line.trim();
@@ -465,12 +591,24 @@ fn host_memory_mib() -> Option<u64> {
 }
 
 /// Total physical memory in MiB, or `None` when it cannot be determined.
+///
+/// The value comes from `sysctl`, a child process, run through the shared
+/// bounded runner with [`HOST_PROBE_TIMEOUT`]. A wedged probe is killed at the
+/// deadline and reads as unknown, so the pool is sized by CPU alone instead of
+/// parking pool start.
 #[cfg(target_os = "macos")]
-fn host_memory_mib() -> Option<u64> {
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()?;
+async fn host_memory_mib() -> Option<u64> {
+    let mut sysctl = tokio::process::Command::new("sysctl");
+    sysctl.args(["-n", "hw.memsize"]);
+    let output =
+        match deadline::run_command(sysctl, HOST_PROBE_TIMEOUT, "host memory probe (sysctl)").await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                warn!(%error, "host memory probe failed; sizing the pool by CPU only");
+                return None;
+            }
+        };
     let bytes: u64 = String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
@@ -480,7 +618,7 @@ fn host_memory_mib() -> Option<u64> {
 
 /// Total physical memory in MiB, or `None` when it cannot be determined.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn host_memory_mib() -> Option<u64> {
+async fn host_memory_mib() -> Option<u64> {
     None
 }
 
@@ -607,6 +745,65 @@ struct GitHubRelease {
     assets: Vec<GitHubReleaseAsset>,
 }
 
+/// Send one golden-path request through the engine's GitHub funnel: the
+/// anonymous bucket (every golden lookup and transfer is unauthenticated) at
+/// the origin `url` reaches, under the `golden` subsystem label.
+///
+/// The origin is part of the partition, not decoration. A golden source is a
+/// service, and the golden path reaches several: the release listing and
+/// release assets on github.com's hosts, GHCR for the packed OCI artifact, a
+/// token realm, and whatever host `PRELOOP_GOLDEN_URL` names. Keying them all
+/// on "anonymous" would let a mirror's outage park the engine's GitHub traffic
+/// and let an open GitHub breaker refuse a mirror that is perfectly healthy —
+/// so each host keeps its own breaker. On the engine's own GitHub origin those
+/// breakers *are* the ones the webhook, dispatch, and check-run paths use, and
+/// `GithubBreakerRegistry::unavailable_retry_after_at` is consulted first:
+/// an outage another bucket already discovered refuses the golden call here,
+/// before a connection is opened and before any of the 30 s metadata deadline
+/// is spent. A host that is not the engine's GitHub is never refused by
+/// GitHub's state and never refuses GitHub's.
+///
+/// A status in `expect` is a step in a protocol the caller is walking — the
+/// `401` challenge before a registry token exchange — and holds no verdict
+/// about reachability.
+async fn golden_send(
+    github: &GithubFunnel,
+    url: &str,
+    expect: &[reqwest::StatusCode],
+    request: reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    let origin = service_origin(url);
+    // An outage this process already discovered at this origin — usually on an
+    // App or installation bucket of the webhook path — refuses here rather
+    // than spending the golden call's deadline rediscovering it. Rate-limited
+    // buckets are excluded by `unavailable_retry_after_at`, so a throttled
+    // credential still gets the per-bucket answer from `acquire` below.
+    if let Some(retry_after) = github.breakers.unavailable_retry_after_at(&origin) {
+        github
+            .consumption
+            .record_breaker_blocked(GithubSubsystem::Golden);
+        return Err(anyhow::Error::new(BreakerOpen { retry_after }));
+    }
+    send_observed_labeled_at(
+        &github.breakers,
+        &origin,
+        GithubCredentialBucket::Anonymous,
+        &github.consumption,
+        GithubSubsystem::Golden,
+        expect,
+        request,
+    )
+    .await
+}
+
+/// Whether `error` is the breaker refusing a call, rather than a call that
+/// happened and failed. Distinguishing the two is what keeps a refusal out of
+/// the tag cache: the refusal is not a verdict about the release, it expires
+/// with the breaker's own window.
+fn refused_by_breaker(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BreakerOpen>().is_some()
+}
+
 /// Newest published release whose assets carry the packed golden for this
 /// architecture.
 ///
@@ -615,8 +812,13 @@ struct GitHubRelease {
 /// `/releases/latest/download/…` 404s there while a usable golden sits one
 /// release back. Stable releases win over prereleases; drafts are ignored.
 /// Best effort: any failure returns `None` and the caller falls through to the
-/// `latest` redirect.
-async fn resolve_latest_golden_tag(client: &reqwest::Client, api_base: &str) -> Option<String> {
+/// `latest` redirect. `client` must carry [`GOLDEN_METADATA_TIMEOUT`]; a listing
+/// under the download budget would let a stalled API hold start for an hour.
+async fn resolve_latest_golden_tag(
+    client: &reqwest::Client,
+    api_base: &str,
+    github: &GithubFunnel,
+) -> Option<String> {
     static CACHE: std::sync::OnceLock<GoldenTagCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some((fetched_at, tag)) = cache.lock().await.get(api_base)
@@ -626,13 +828,22 @@ async fn resolve_latest_golden_tag(client: &reqwest::Client, api_base: &str) -> 
     }
 
     let url = format!("{api_base}/repos/preloopdev/preloop/releases?per_page=30");
-    let releases = match client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
+    let releases = match golden_send(
+        github,
+        &url,
+        &[],
+        client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json"),
+    )
+    .await
     {
         Ok(response) if response.status().is_success() => {
+            // The listing body is consumed below; its advertised size is the
+            // golden subsystem's share of the GitHub API budget.
+            github
+                .consumption
+                .record_advertised_bytes(GithubSubsystem::Golden, &response);
             match response.json::<Vec<GitHubRelease>>().await {
                 Ok(releases) => releases,
                 Err(error) => {
@@ -644,6 +855,16 @@ async fn resolve_latest_golden_tag(client: &reqwest::Client, api_base: &str) -> 
         Ok(response) => {
             info!(status = %response.status(), "golden release lookup unavailable");
             Vec::new()
+        }
+        Err(error) if refused_by_breaker(&error) => {
+            // The breaker already proved GitHub is down and nothing was sent:
+            // report the refusal, and do not cache it — a negative entry would
+            // outlive the breaker's own window (five minutes against a base
+            // open of thirty seconds) and park the lookup after recovery. The
+            // caller still falls through to the `latest` redirect for the
+            // transfer itself.
+            warn!(%error, "golden release lookup skipped: GitHub circuit breaker is open");
+            return None;
         }
         Err(error) => {
             info!(%error, "golden release lookup failed");
@@ -1120,18 +1341,41 @@ async fn reconcile_orphans<P: VmProvider + 'static>(
         }
         // Sweep first, so a data dir removed on this tick has the hypervisor
         // still holding its blocks released by the purge below, in the same
-        // tick, instead of an interval later.
-        match provider.sweep_orphaned_data_dirs().await {
-            Ok(swept) if swept > 0 => info!(swept, "removed orphaned machine data directories"),
-            Ok(_) => {}
-            Err(error) => warn!(%error, "periodic orphaned data-dir sweep failed"),
+        // tick, instead of an interval later. Bounded like the purge: the
+        // provider walks the registry and the data roots and can shell out for
+        // each machine, so a stalled sweep would stop this reconciler from ever
+        // reaching its deadline-protected work.
+        match tokio::time::timeout(HOST_CLEANUP_TIMEOUT, provider.sweep_orphaned_data_dirs()).await
+        {
+            Ok(Ok(swept)) if swept > 0 => info!(swept, "removed orphaned machine data directories"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "periodic orphaned data-dir sweep failed"),
+            Err(_) => warn!(
+                deadline = ?HOST_CLEANUP_TIMEOUT,
+                "periodic orphaned data-dir sweep abandoned at its deadline"
+            ),
         }
-        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::RemovedDataDir, &paths) {
-            Ok(killed) if killed > 0 => {
+        // The closure runs on the blocking pool, so it owns its inputs: a
+        // borrow of `paths` cannot outlive this task.
+        let purge_paths = paths.clone();
+        match deadline::run_blocking(
+            HOST_CLEANUP_TIMEOUT,
+            "periodic orphaned hypervisor purge",
+            move || {
+                preloop_vm::purge_orphaned_vms(
+                    preloop_vm::OrphanPurge::RemovedDataDir,
+                    &purge_paths,
+                )
+            },
+        )
+        .await
+        {
+            Ok(Ok(killed)) if killed > 0 => {
                 info!(killed, "purged orphaned SmolVM hypervisor processes")
             }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "periodic orphaned hypervisor purge failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "periodic orphaned hypervisor purge failed"),
+            Err(error) => warn!(%error, "periodic orphaned hypervisor purge abandoned"),
         }
     }
 }
@@ -1179,6 +1423,24 @@ const GOLDEN_OCI_REF_X86_64: &str = "ghcr.io/preloopdev/preloop-x86_64-smolvm-go
 /// ordinary connection cannot serve — it killed the transfer around two-thirds
 /// through, and the artifact then read as missing.
 const GOLDEN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Deadline for a golden metadata lookup: the GitHub release listing, an OCI
+/// manifest and its bearer token, and a `.sha256` sidecar. All three bodies are
+/// small. A listing of thirty releases is far below a megabyte, and a manifest or
+/// sidecar is a few kilobytes at most, so 30 s covers a slow link with room to
+/// spare. Every lookup is best effort and falls through to the next source on
+/// failure, so giving up early costs a fallback and never a failed start. These
+/// lookups used to share the 60-minute download client, so a stalled
+/// `api.github.com` could hold pool start for an hour.
+const GOLDEN_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// HTTP client for golden transfers and lookups: the shared TLS roots with the
+/// given total deadline. Transfers pass [`GOLDEN_DOWNLOAD_TIMEOUT`]; lookups
+/// pass [`GOLDEN_METADATA_TIMEOUT`].
+fn golden_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder().timeout(timeout))
+        .build()
+}
+
 /// Transfer attempts for one golden source before it is abandoned.
 ///
 /// Each attempt resumes from the bytes already on disk, so a link that drops
@@ -1372,6 +1634,7 @@ pub(crate) fn official_boot_image() -> Option<&'static str> {
 async fn download_prebaked_golden(
     config: &RunnerPoolConfig,
     payload: &Path,
+    github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
     let forced_url = config.golden_mirror_url();
     download_prebaked_golden_with_space(
@@ -1380,6 +1643,7 @@ async fn download_prebaked_golden(
         filesystem_available_space,
         forced_url.as_deref(),
         config.skip_disk_preflight,
+        github,
     )
     .await
 }
@@ -1390,6 +1654,7 @@ async fn download_prebaked_golden_with_space(
     available_space: AvailableSpace,
     forced_url: Option<&str>,
     skip_disk_preflight: bool,
+    github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
     // Per-architecture OCI golden: try it wherever a packed artifact is
     // published for this platform; `PRELOOP_GOLDEN_OCI_REF` overrides the
@@ -1401,8 +1666,14 @@ async fn download_prebaked_golden_with_space(
             .filter(|value| !value.trim().is_empty())
             .or_else(|| default_golden_oci_ref().map(str::to_owned));
         if let Some(reference) = reference {
-            if download_oci_golden(payload, &reference, available_space, skip_disk_preflight)
-                .await?
+            if download_oci_golden(
+                payload,
+                &reference,
+                available_space,
+                skip_disk_preflight,
+                github,
+            )
+            .await?
             {
                 return Ok(true);
             }
@@ -1410,10 +1681,14 @@ async fn download_prebaked_golden_with_space(
         }
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
-        .build()
-    {
+    let metadata = match golden_http_client(GOLDEN_METADATA_TIMEOUT) {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(%error, "Could not create golden metadata client");
+            return Ok(false);
+        }
+    };
+    let client = match golden_http_client(GOLDEN_DOWNLOAD_TIMEOUT) {
         Ok(client) => client,
         Err(error) => {
             warn!(%error, "Could not create golden download client");
@@ -1425,7 +1700,7 @@ async fn download_prebaked_golden_with_space(
     // common case needs no API call, and an unauthenticated lookup is rate
     // limited.
     let resolved_tag = if forced_url.is_none() {
-        resolve_latest_golden_tag(&client, GITHUB_API_BASE).await
+        resolve_latest_golden_tag(&metadata, GITHUB_API_BASE, github).await
     } else {
         None
     };
@@ -1449,11 +1724,13 @@ async fn download_prebaked_golden_with_space(
         // accident, and refusing would strand every host that updates first).
         if download_release_asset(
             &client,
+            &metadata,
             &url,
             payload,
             available_space,
             mirror,
             skip_disk_preflight,
+            github,
         )
         .await?
         {
@@ -1467,13 +1744,21 @@ async fn download_prebaked_golden_with_space(
 ///
 /// The transfer resumes from whatever a previous attempt left behind, so a
 /// dropped connection costs the bytes in flight rather than the artifact.
+///
+/// The parameter list mirrors the inputs the download genuinely needs: the
+/// two clients (metadata is rate-limited separately from the body transfer),
+/// the destination, the space preflight, the checksum policy, and the GitHub
+/// funnel every request is admitted through.
+#[allow(clippy::too_many_arguments)]
 async fn download_release_asset(
     client: &reqwest::Client,
+    metadata: &reqwest::Client,
     url: &str,
     payload: &Path,
     available_space: AvailableSpace,
     require_checksum: bool,
     skip_disk_preflight: bool,
+    github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
     // Fetch the companion checksum before committing bandwidth to the body.
     // A truncated or corrupted golden only fails much later, when a VM tries
@@ -1489,18 +1774,26 @@ async fn download_release_asset(
         .and_then(|value| parse_sha256_checksum(&value));
     let expected_sha256 = match pinned_sha256 {
         Some(sha256) => Some(sha256),
-        None => match tokio::time::timeout(
-            Duration::from_secs(15),
-            client.get(format!("{url}.sha256")).send(),
-        )
-        .await
-        {
-            Ok(Ok(res)) if res.status().is_success() => match res.text().await {
-                Ok(text) => parse_sha256_checksum(&text),
-                Err(_) => None,
-            },
-            _ => None,
-        },
+        None => {
+            let checksum_url = format!("{url}.sha256");
+            match tokio::time::timeout(
+                Duration::from_secs(15),
+                golden_send(github, &checksum_url, &[], metadata.get(&checksum_url)),
+            )
+            .await
+            {
+                Ok(Ok(res)) if res.status().is_success() => {
+                    github
+                        .consumption
+                        .record_advertised_bytes(GithubSubsystem::Golden, &res);
+                    match res.text().await {
+                        Ok(text) => parse_sha256_checksum(&text),
+                        Err(_) => None,
+                    }
+                }
+                _ => None,
+            }
+        }
     };
     if expected_sha256.is_none() {
         if require_checksum {
@@ -1514,7 +1807,7 @@ async fn download_release_asset(
         }
         warn!(url = %format!("{url}.sha256"), "no golden checksum published; downloading without verification");
     }
-    let probe = match client.get(url).send().await {
+    let probe = match golden_send(github, url, &[], client.get(url)).await {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
             info!(
@@ -1536,23 +1829,25 @@ async fn download_release_asset(
     let downloaded_bytes = {
         let client = client.clone();
         let url = url.to_owned();
+        let funnel = github.clone();
         download_golden_with_resume(
             &partial,
             "release",
             None,
             Some(probe),
             skip_disk_preflight,
+            github,
             move |offset| {
                 let client = client.clone();
                 let url = url.clone();
+                let funnel = funnel.clone();
                 Box::pin(async move {
                     let mut request = client.get(&url);
                     if offset > 0 {
                         request =
                             request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
                     }
-                    request
-                        .send()
+                    golden_send(&funnel, &url, &[], request)
                         .await
                         .map_err(|error| format!("request failed: {error}"))
                 }) as BoxFuture<'static, Result<reqwest::Response, String>>
@@ -1602,13 +1897,16 @@ async fn download_release_asset(
 /// `request_at` issues the request for a given byte offset; the caller decides
 /// how to authenticate (a plain GET for a release asset, a registry token for
 /// an OCI blob). Returns the bytes the file holds once the server has sent the
-/// whole body.
+/// whole body; every byte the server sent is attributed to the `golden`
+/// subsystem as it arrives, so a multi-gigabyte artifact does not report as
+/// free bandwidth in the consumption snapshot.
 async fn download_golden_with_resume(
     partial: &Path,
     source: &str,
     expected_total_bytes: Option<u64>,
     initial_response: Option<reqwest::Response>,
     skip_disk_preflight: bool,
+    github: &GithubFunnel,
     mut request_at: impl FnMut(u64) -> BoxFuture<'static, Result<reqwest::Response, String>>,
 ) -> Result<u64, String> {
     // Claim the companion lock before creating the payload: a staging file
@@ -1677,6 +1975,7 @@ async fn download_golden_with_resume(
                     offset,
                     source,
                     expected_total_bytes,
+                    github,
                 )
                 .await
                 {
@@ -1706,7 +2005,9 @@ async fn download_golden_with_resume(
 ///
 /// Returns the total bytes the file now holds. The file is left in place on
 /// failure so the next attempt resumes it; the caller's checksum decides
-/// whether what is on disk is usable.
+/// whether what is on disk is usable. Each chunk is charged to the `golden`
+/// subsystem as it arrives — the body is the reason these calls exist, and its
+/// size is measured here, where the resumption arithmetic cannot flatter it.
 async fn stream_golden_body(
     response: reqwest::Response,
     partial: &Path,
@@ -1714,6 +2015,7 @@ async fn stream_golden_body(
     already_have: u64,
     source: &str,
     expected_total_bytes: Option<u64>,
+    github: &GithubFunnel,
 ) -> Result<u64, String> {
     let mut file = if resuming {
         tokio::fs::OpenOptions::new()
@@ -1737,6 +2039,9 @@ async fn stream_golden_body(
         file.write_all(&chunk)
             .await
             .map_err(|error| format!("write failed after {downloaded_bytes} bytes: {error}"))?;
+        github
+            .consumption
+            .record_bytes(GithubSubsystem::Golden, chunk.len() as u64);
         downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
         if downloaded_bytes >= next_progress {
             report_golden_download_progress(source, downloaded_bytes, total_bytes);
@@ -1777,15 +2082,22 @@ async fn download_oci_golden(
     reference: &str,
     available_space: AvailableSpace,
     skip_disk_preflight: bool,
+    github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
     let Ok(oci) = OciReference::parse(reference) else {
         warn!(reference, "invalid OCI golden reference");
         return Ok(false);
     };
-    let client = match reqwest::Client::builder()
-        .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
-        .build()
-    {
+    // The manifest and its bearer token are small lookups: they get the short
+    // metadata deadline. The blob below is the download and keeps the long one.
+    let metadata = match golden_http_client(GOLDEN_METADATA_TIMEOUT) {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(%error, "Could not create OCI golden metadata client");
+            return Ok(false);
+        }
+    };
+    let client = match golden_http_client(GOLDEN_DOWNLOAD_TIMEOUT) {
         Ok(client) => client,
         Err(error) => {
             warn!(%error, "Could not create OCI golden download client");
@@ -1796,10 +2108,29 @@ async fn download_oci_golden(
     // under an OCI index, so the digest/tags resolve to one indirection. The
     // shared client follows that one level, taking the first listed manifest
     // (our packs publish exactly one platform entry).
-    let resolved = match get_manifest(&client, &oci, MANIFEST_ACCEPT, None).await {
-        Ok(resolved) => resolved,
-        Err(error) => {
+    //
+    // One budget for the whole resolution, not the client's per-request one:
+    // an index costs two manifest fetches and possibly a bearer-token
+    // exchange, and each request would otherwise get its own
+    // [`GOLDEN_METADATA_TIMEOUT`], so a registry that dribbles `HEAD`-like
+    // answers could hold startup for a multiple of the advertised budget.
+    let resolved = match tokio::time::timeout(
+        GOLDEN_METADATA_TIMEOUT,
+        get_manifest(&metadata, &oci, MANIFEST_ACCEPT, None, Some(github)),
+    )
+    .await
+    {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => {
             warn!(reference, %error, "OCI golden manifest unavailable");
+            return Ok(false);
+        }
+        Err(_) => {
+            warn!(
+                reference,
+                deadline = ?GOLDEN_METADATA_TIMEOUT,
+                "OCI golden metadata lookup abandoned at its deadline"
+            );
             return Ok(false);
         }
     };
@@ -1840,26 +2171,36 @@ async fn download_oci_golden(
     let partial = golden_partial_path(payload);
     let downloaded = {
         let client = client.clone();
+        // The blob's 401 handshake goes to the metadata client: the token
+        // lookup is a small request, and answering it on the transfer client
+        // would give it the download's hour.
+        let token_client = metadata.clone();
         let blob_url = blob_url.clone();
         let repository = oci.repository.clone();
+        let funnel = github.clone();
         download_golden_with_resume(
             &partial,
             "OCI",
             layer_size,
             None,
             skip_disk_preflight,
+            github,
             move |offset| {
                 let client = client.clone();
+                let token_client = token_client.clone();
                 let url = blob_url.clone();
                 let repository = repository.clone();
+                let funnel = funnel.clone();
                 Box::pin(async move {
                     crate::oci::registry_get(
                         &client,
+                        &token_client,
                         &url,
                         &repository,
                         "*/*",
                         None,
                         (offset > 0).then_some(offset),
+                        Some(&funnel),
                     )
                     .await
                     .map_err(|error| error.to_string())
@@ -2030,7 +2371,57 @@ const GUEST_NOFILE_ULIMIT: &str = GOLDEN_NOFILE_ULIMIT_RAISE;
 /// strict form above and fail loudly.
 const GUEST_NOFILE_ULIMIT_BEST_EFFORT: &str = GOLDEN_NOFILE_ULIMIT_RAISE_BEST_EFFORT;
 
+/// Time limits on the curl calls in the host externals install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeFetchLimits {
+    /// Seconds to establish the TCP and TLS connection.
+    connect_secs: u32,
+    /// Seconds for one Node archive transfer, body included.
+    archive_max_secs: u32,
+    /// Seconds for the `SHASUMS256.txt` transfer.
+    shasums_max_secs: u32,
+}
+
+/// Production limits for [`node_externals_at`]. Every transfer carries a total
+/// budget, so a stalled nodejs.org ends in curl's error instead of holding pool
+/// start.
+///
+/// - Connect, 30 s: a TCP and TLS handshake to nodejs.org takes well under a
+///   second; 30 s covers a slow proxy without waiting out a black-holed route.
+/// - Archive, 10 min: the archives are 57 MB and 47 MB. Ten minutes needs about
+///   0.8 Mbps sustained for the larger one, and a healthy link takes under a
+///   minute.
+/// - Checksum file, 2 min: a 3 KB file.
+const NODE_FETCH_LIMITS: NodeFetchLimits = NodeFetchLimits {
+    connect_secs: 30,
+    archive_max_secs: 10 * 60,
+    shasums_max_secs: 2 * 60,
+};
+
+/// Where the host externals install fetches Node from.
+const NODE_DIST_BASE: &str = "https://nodejs.org/dist";
+
+/// The host externals install script for `runner_root`, with the production
+/// download root and curl limits. See [`node_externals_script`].
 fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
+    node_externals_script(runner_root, NODE_DIST_BASE, NODE_FETCH_LIMITS)
+}
+
+/// The shell routine that installs Node externals under `runner_root`, fetching
+/// from `dist_base` with the curl limits in `limits`.
+///
+/// The download root and the limits are parameters so a test can run this exact
+/// script against a local listener with short limits.
+fn node_externals_script(
+    runner_root: &str,
+    dist_base: &str,
+    limits: NodeFetchLimits,
+) -> Vec<Vec<String>> {
+    let NodeFetchLimits {
+        connect_secs,
+        archive_max_secs,
+        shasums_max_secs,
+    } = limits;
     // Pinned SHA per runtime+platform, derived from versions.toml via build.rs.
     // Empty string means no pinned entry — SHASUMS verification still applies.
     let n20_plain = NODE20_EXTERNALS_VERSION.trim_start_matches('v');
@@ -2072,10 +2463,10 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
                 ARCH=$(uname -m); \
                 if [ \"$ARCH\" = \"aarch64\" ] || [ \"$ARCH\" = \"arm64\" ]; then NODE_ARCH=linux-arm64; else NODE_ARCH=linux-x64; fi; \
                 ARCHIVE=\"node-$VERSION-$NODE_ARCH.tar.gz\"; \
-                URL=\"https://nodejs.org/dist/$VERSION/$ARCHIVE\"; \
-                SHASUMS_URL=\"https://nodejs.org/dist/$VERSION/SHASUMS256.txt\"; \
+                URL=\"{dist_base}/$VERSION/$ARCHIVE\"; \
+                SHASUMS_URL=\"{dist_base}/$VERSION/SHASUMS256.txt\"; \
                 TMP_ARCHIVE=$(mktemp \"$RUNNER_EXTERNALS/.$NAME.archive.XXXXXX.tar.gz\"); \
-                if ! curl -fsSL -o \"$TMP_ARCHIVE\" \"$URL\"; then echo \"FAILED fetching $NAME $VERSION\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                if ! curl -fsSL --connect-timeout {connect_secs} --max-time {archive_max_secs} -o \"$TMP_ARCHIVE\" \"$URL\"; then echo \"FAILED fetching $NAME $VERSION\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
                 ACTUAL=$(shasum -a 256 \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); \
                 if [ -z \"$ACTUAL\" ]; then ACTUAL=$(sha256sum \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); fi; \
                 if [ -z \"$ACTUAL\" ]; then echo \"no sha256 tool available\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
@@ -2094,7 +2485,7 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
                   VERIFIED=1; \
                 fi; \
                 SHASUMS_TMP=$(mktemp \"$RUNNER_EXTERNALS/.SHASUMS.XXXXXX\"); \
-                if curl -fsSL -o \"$SHASUMS_TMP\" \"$SHASUMS_URL\" 2>/dev/null; then \
+                if curl -fsSL --connect-timeout {connect_secs} --max-time {shasums_max_secs} -o \"$SHASUMS_TMP\" \"$SHASUMS_URL\" 2>/dev/null; then \
                   EXPECTED_SHASUMS=$(grep -F \" $ARCHIVE\" \"$SHASUMS_TMP\" | awk '{{print $1}}'); \
                   if [ -n \"$EXPECTED_SHASUMS\" ] && [ \"$ACTUAL\" != \"$EXPECTED_SHASUMS\" ]; then echo \"ERROR: $NAME $VERSION SHASUMS256.txt mismatch (got $ACTUAL expected $EXPECTED_SHASUMS)\" >&2; rm -f \"$TMP_ARCHIVE\" \"$SHASUMS_TMP\"; rm -rf \"$TEMP\"; exit 1; fi; \
                   if [ -n \"$EXPECTED_SHASUMS\" ]; then VERIFIED=1; fi; \
@@ -2179,8 +2570,8 @@ pub fn runner_account_script(user: &str, uid: u32) -> String {
          fi; \
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
            && chmod 0440 /etc/sudoers.d/preloop-{user}; \
-         mkdir -p /run/user/{uid} /opt/hostedtoolcache {root}/_work; \
-         chown {uid}:{uid} /run/user/{uid} {root} {root}/_work 2>/dev/null; \
+         mkdir -p /run/user/{uid} /opt/hostedtoolcache {root}/work; \
+         chown {uid}:{uid} /run/user/{uid} {root} {root}/work 2>/dev/null; \
          [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || \
            chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
@@ -2258,6 +2649,570 @@ pub fn golden_ownership_script(uid: u32) -> String {
     )
 }
 
+/// Restore the file capability a container-image dump loses: `ping`.
+///
+/// A hosted runner's `/usr/bin/ping` is capability-based (`cap_net_raw+ep`),
+/// not setuid, and the OCI layer the golden is built from carries no extended
+/// attributes, so every preloop guest answers `ping: socket: Operation not
+/// permitted` as `runner` while the same command works on GitHub. The other way
+/// to allow it is the `net.ipv4.ping_group_range` sysctl, but the image
+/// deliberately leaves that at `1 0` (no group) exactly as hosted does, so the
+/// capability is the hosted-parity fix.
+///
+/// `setcap` is preferred and `getcap` re-reads what landed; a guest without
+/// `setcap` falls back to the setuid bit the `iputils-ping` package itself
+/// installs. Best-effort throughout: a bake is not worth failing over a
+/// diagnostic tool, and a step that cannot land says so on stderr, which the
+/// engine logs. Idempotent — `setcap`/`chmod` set the same state on every run.
+/// No `#` comments in the text: the contract's statements are joined into one
+/// physical line.
+///
+/// Only [`GoldenResiduePolicy::Clean`] runs this step. Changing a custom
+/// image's `ping` mode or capability is a privilege change the operator did
+/// not ask for; [`GoldenResiduePolicy::Preserve`] leaves the binary alone.
+pub fn golden_ping_capability_script(ping: &str) -> String {
+    let ping = shell_quote(ping);
+    format!(
+        "if [ -e {ping} ]; then \
+           ok=0; \
+           if command -v setcap >/dev/null 2>&1; then \
+             setcap cap_net_raw+ep {ping} 2>/dev/null; \
+             if command -v getcap >/dev/null 2>&1; then \
+               [ -n \"$(getcap {ping} 2>/dev/null)\" ] && ok=1; \
+             else ok=1; fi; \
+           fi; \
+           if [ \"$ok\" != 1 ]; then chmod u+s {ping} 2>/dev/null && ok=1; fi; \
+           if [ \"$ok\" = 1 ]; then echo 'preloop: restored cap_net_raw+ep on {ping}'; \
+           else echo 'preloop: warning: could not make {ping} usable by the runner account' >&2; fi; \
+         fi"
+    )
+}
+
+/// Whether a bake and the per-machine runtime may apply hosted-runner
+/// adaptations to the base image.
+///
+/// The official runner image is captured from an Azure VM, so its `/etc/hosts`
+/// and `/etc/fstab` carry the bake host's own entries, and its systemd,
+/// resolver and sysctl setup is the hosted image's. A custom base is the
+/// operator's image: a routable `/etc/hosts` alias may name a real service, an
+/// `/etc/fstab` device may be attached later (a network or lazily mounted
+/// volume), a shipped `systemd-sysctl.service` may apply tuning the image
+/// depends on, and its resolver configuration may carry search domains and
+/// options that must survive. None of those can be classified from their
+/// contents alone. There is no reliable provenance heuristic: an address or
+/// hostname is not proof of Azure, a missing device node is not proof of a
+/// stale mount, and a shipped unit is not proof that masking it is safe. The
+/// policy therefore comes from how the base was selected, never from text that
+/// happens to look like a cloud image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoldenResiduePolicy {
+    /// Apply the hosted runner image's adaptations: normalize bake-host and
+    /// Azure residue, mask the hosted image's cloud/snap/apt units (including
+    /// `systemd-sysctl.service`), grant `ping` its file capability, point the
+    /// resolver at systemd-resolved's stub, and apply GitHub's sysctl values
+    /// per machine. Official runner images and explicit opt-ins.
+    Clean,
+    /// Keep the operator's image policy: `/etc/hosts`, `/etc/fstab`, systemd
+    /// units, `ping`, resolver configuration and sysctl tuning are left as
+    /// supplied. Only the minimal runner contract (account, ownership, tool
+    /// cache, apt indices, KVM access, hostname resolution) is applied.
+    Preserve,
+}
+
+/// Opt a custom base into the official image's hosted-runner adaptations.
+///
+/// The official golden always applies them regardless of this variable. A
+/// custom base applies them only when the operator sets this to `1`, `true`,
+/// `yes`, or `on` (surrounding whitespace ignored, otherwise case-sensitive).
+/// Every other value, including a typo, keeps the Preserve policy. This is the
+/// escape hatch for a custom base that is itself a cloud VM dump or an image
+/// whose systemd/resolver setup is meant to be replaced by the hosted
+/// runner's. Enabling it can drop an
+/// intentional routable `/etc/hosts` mapping, comment out an `/etc/fstab`
+/// device that is not present at bake time, mask the image's cloud/snap/apt
+/// and `systemd-sysctl` units, change `ping`'s file capability, and replace
+/// the image's resolver and sysctl policy.
+///
+/// Official release bakes must set this explicitly: their `--base-image` is
+/// the pinned digest reference, not the [`crate::environment::OFFICIAL_GOLDEN`]
+/// sentinel, so the policy cannot infer that the image is the official one.
+pub const GOLDEN_CLEAN_CLOUD_RESIDUE_ENV: &str = "PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE";
+
+/// Resolve the hosted-adaptation policy for a base image.
+///
+/// Official goldens always apply it. Custom bases preserve their own policy by
+/// default. The opt-in is read while the environment fingerprint is computed,
+/// so turning it on rotates the artifact instead of adopting a golden baked
+/// under the other policy.
+pub fn golden_residue_policy(base: &str) -> GoldenResiduePolicy {
+    golden_residue_policy_with(base, clean_cloud_residue_opted_in())
+}
+
+fn golden_residue_policy_with(base: &str, opted_in: bool) -> GoldenResiduePolicy {
+    if is_official_golden(base) || opted_in {
+        GoldenResiduePolicy::Clean
+    } else {
+        GoldenResiduePolicy::Preserve
+    }
+}
+
+fn clean_cloud_residue_opted_in() -> bool {
+    std::env::var(GOLDEN_CLEAN_CLOUD_RESIDUE_ENV)
+        .is_ok_and(|value| clean_cloud_residue_enabled(&value))
+}
+
+fn clean_cloud_residue_enabled(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true" | "yes" | "on")
+}
+
+/// Strip the bake host's own mapping out of `/etc/hosts`.
+///
+/// The runner image is dumped from a machine that was itself a runner, so its
+/// `/etc/hosts` carries that host's mapping — measured on both bakes as
+/// `10.1.0.59 runnervm…internal.cloudapp.net` — and every fork inherits it: a
+/// name that resolves to an address which is not this machine's, the same
+/// stale-mapping class [`guest_hostname_script`] repairs at run time. Cleaning
+/// it in the bake means no fork ever carries it.
+///
+/// The rule is conservative, and deliberately so: a line survives when its
+/// address is loopback, link-local, multicast or unspecified — the standard
+/// `localhost`/`ip6-localhost`/`ip6-allnodes` block must never be touched — and
+/// when any of its names is this machine's own hostname. Only a routable
+/// address naming something else (the bake host's own mapping) is dropped.
+/// Idempotent: a cleaned file has nothing left to drop, and best-effort — a
+/// bake is not worth failing over it, and a guest whose `/etc/hosts` cannot be
+/// written fails provisioning later, loudly, in [`guest_hostname_script`].
+/// `hosts` is the file the shell test substitutes for `/etc/hosts`.
+fn golden_hosts_cleanup_script_at(hosts: &str) -> String {
+    let hosts = shell_quote(hosts);
+    format!(
+        "host=$(hostname 2>/dev/null || uname -n); \
+         tmp=$(mktemp 2>/dev/null) || tmp=/tmp/.preloop-hosts-clean.$$; \
+         if awk -v host=\"$host\" ' \
+           /^[[:space:]]*$/ {{ print; next }} \
+           /^[[:space:]]*#/ {{ print; next }} \
+           {{ \
+             addr = $1; keep = 0; \
+             if (addr ~ /^127\\./) keep = 1; \
+             else if (addr == \"::1\" || addr == \"::\" || addr == \"0.0.0.0\") keep = 1; \
+             else if (addr ~ /^169\\.254\\./) keep = 1; \
+             else if (addr ~ /^22[4-9]\\./ || addr ~ /^23[0-9]\\./) keep = 1; \
+             else if (addr ~ /^[fF][eE]/ || addr ~ /^[fF][fF]/) keep = 1; \
+             if (!keep) for (i = 2; i <= NF; i++) if ($i == host) {{ keep = 1; break }}; \
+             if (keep) print; \
+           }}' {hosts} > \"$tmp\" 2>/dev/null; then \
+           if [ -s \"$tmp\" ]; then \
+             cat \"$tmp\" > {hosts} || \
+               echo 'preloop: warning: could not drop the bake host mapping from {hosts}' >&2; \
+           fi; \
+         else echo 'preloop: warning: could not read {hosts} for cleaning' >&2; fi; \
+         rm -f \"$tmp\""
+    )
+}
+
+/// Drop `/etc/fstab` entries whose device this guest does not have.
+///
+/// The runner image is a dump of an Azure VM, so its `/etc/fstab` still names
+/// that VM's disks: the root filesystem by UUID (`UUID=4fb3…`), the EFI system
+/// partition, and the cloud resource disk
+/// (`/dev/disk/cloud/azure_resource-part1`, often carrying swap). None of them
+/// exists on a SmolVM guest, whose root is the storage disk the agent mounts
+/// before systemd starts, so `systemd-remount-fs.service` fails with
+/// `can't find UUID=…` on every boot and leaves `systemctl --failed`
+/// permanently non-empty.
+///
+/// The rule is deliberately narrow: an entry is commented out only when its
+/// device spec cannot resolve on this guest — a `UUID=`/`LABEL=`/`PARTUUID=`/
+/// `PARTLABEL=` with no `/dev/disk/by-*` entry, a `/dev/…` path with no node,
+/// any `/dev/disk/cloud/…` path (cloud udev, never this guest's), or an
+/// absolute path with no file. Everything else survives untouched:
+/// pseudo-filesystems (`tmpfs`, `proc`, `none`, …), a valid UUID, and any mount
+/// the image really has. Commented lines keep their original text behind
+/// `# preloop: dropped stale fstab entry: ` so nothing is lost, and a second
+/// bake finds nothing left to drop.
+///
+/// Best-effort like the other image-residue steps: a read-only, absent or
+/// unreadable `/etc/fstab` warns on stderr and leaves the bake alone. `fstab`
+/// and `disk` are the file and the `/dev` tree the shell test substitutes.
+fn golden_fstab_cleanup_script_at(fstab: &str, disk: &str) -> String {
+    format!(
+        "prfs_fstab={fstab}; prfs_disk={disk}; \
+         if [ -f \"$prfs_fstab\" ] && [ -r \"$prfs_fstab\" ] && [ -w \"$prfs_fstab\" ]; then \
+           prfs_tmp=$prfs_fstab.preloop.$$; prfs_dropped=0; prfs_ok=1; \
+           if : > \"$prfs_tmp\" 2>/dev/null; then \
+             while IFS= read -r prfs_line || [ -n \"$prfs_line\" ]; do \
+               prfs_dev=$(printf '%s\\n' \"$prfs_line\" | awk '{{ print $1 }}' 2>/dev/null); \
+               prfs_drop=0; \
+               case \"$prfs_dev\" in \
+                 /dev/disk/cloud/*) prfs_drop=1 ;; \
+                 /dev/*) [ -e \"$prfs_disk/${{prfs_dev#/dev/}}\" ] || prfs_drop=1 ;; \
+                 UUID=*) [ -e \"$prfs_disk/disk/by-uuid/${{prfs_dev#UUID=}}\" ] || prfs_drop=1 ;; \
+                 LABEL=*) [ -e \"$prfs_disk/disk/by-label/${{prfs_dev#LABEL=}}\" ] || prfs_drop=1 ;; \
+                 PARTUUID=*) [ -e \"$prfs_disk/disk/by-partuuid/${{prfs_dev#PARTUUID=}}\" ] || prfs_drop=1 ;; \
+                 PARTLABEL=*) [ -e \"$prfs_disk/disk/by-partlabel/${{prfs_dev#PARTLABEL=}}\" ] || prfs_drop=1 ;; \
+                 /*) [ -e \"$prfs_dev\" ] || prfs_drop=1 ;; \
+               esac; \
+               if [ \"$prfs_drop\" = 1 ]; then \
+                 prfs_dropped=$((prfs_dropped+1)); \
+                 printf '# preloop: dropped stale fstab entry: %s\\n' \"$prfs_line\" >> \"$prfs_tmp\" 2>/dev/null || prfs_ok=0; \
+               else \
+                 printf '%s\\n' \"$prfs_line\" >> \"$prfs_tmp\" 2>/dev/null || prfs_ok=0; \
+               fi; \
+             done < \"$prfs_fstab\"; \
+             if [ \"$prfs_ok\" = 1 ] && [ \"$prfs_dropped\" -gt 0 ]; then \
+               if cat \"$prfs_tmp\" > \"$prfs_fstab\" 2>/dev/null; then \
+                 echo \"preloop: commented out $prfs_dropped stale $prfs_fstab entries\"; \
+               else \
+                 echo \"preloop: warning: could not write $prfs_fstab; stale entries may fail at boot\" >&2; \
+               fi; \
+             elif [ \"$prfs_ok\" = 1 ]; then \
+               echo \"preloop: $prfs_fstab has no stale entries\"; \
+             else \
+               echo \"preloop: warning: could not stage $prfs_fstab; stale entries may fail at boot\" >&2; \
+             fi; \
+             rm -f \"$prfs_tmp\" 2>/dev/null; \
+           else \
+             echo \"preloop: warning: could not stage $prfs_fstab for cleaning\" >&2; \
+           fi; \
+         else \
+           echo \"preloop: no writable $prfs_fstab on this guest; nothing to clean\" >&2; \
+         fi"
+    )
+}
+
+/// The residue steps a bake runs for `policy`, against the real paths.
+///
+/// A custom base yields no step at all: nothing rewrites the files before the
+/// pack captures them, so a user alias or mount survives the bake byte for
+/// byte.
+fn golden_residue_cleanup_steps(policy: GoldenResiduePolicy) -> Vec<String> {
+    golden_residue_cleanup_steps_at(policy, "/etc/hosts", "/etc/fstab", "/dev")
+}
+
+/// [`golden_residue_cleanup_steps`] against the files a shell test substitutes.
+fn golden_residue_cleanup_steps_at(
+    policy: GoldenResiduePolicy,
+    hosts: &str,
+    fstab: &str,
+    disk: &str,
+) -> Vec<String> {
+    match policy {
+        GoldenResiduePolicy::Clean => vec![
+            golden_hosts_cleanup_script_at(hosts),
+            golden_fstab_cleanup_script_at(fstab, disk),
+        ],
+        GoldenResiduePolicy::Preserve => Vec::new(),
+    }
+}
+
+/// The units a hosted runner never runs, and a preloop guest should not either.
+///
+/// Provenance: every Azure/Hyper-V/cloud-init/snap/apt-timer unit in the current
+/// golden's enabled set (`smolvm-probe.txt`, §systemd), plus
+/// `systemd-sysctl.service`, which fails on the SmolVM kernel
+/// (`kernel/pid_max: Invalid argument`, `yama/ptrace_scope` ENOENT). Masking
+/// them leaves `systemctl --failed` empty and `is-system-running` `running` on
+/// a guest that boots systemd.
+///
+/// Only [`GoldenResiduePolicy::Clean`] masks them. A custom image may ship any
+/// of these units with a real purpose — above all `systemd-sysctl.service`,
+/// which applies its `/etc/sysctl.conf` and `/etc/sysctl.d` tuning, and the
+/// snapd/apt timers its operator relies on. That the unit exists is not proof
+/// that disabling it is safe: [`GoldenResiduePolicy::Preserve`] leaves every
+/// unit untouched.
+const SYSTEMD_MASKED_UNITS: &[&str] = &[
+    "walinuxagent.service",
+    "cloud-init.service",
+    "cloud-init-local.service",
+    "cloud-config.service",
+    "cloud-final.service",
+    "snapd.service",
+    "snapd.socket",
+    "snapd.seeded.service",
+    "snapd.apparmor.service",
+    "snapd.autoimport.service",
+    "snapd.core-fixup.service",
+    "snapd.recovery-chooser-trigger.service",
+    "snapd.system-shutdown.service",
+    "unattended-upgrades.service",
+    "apt-daily.service",
+    "apt-daily-upgrade.service",
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer",
+    "systemd-sysctl.service",
+    "hv-kvp-daemon.service",
+    "hv-vss-daemon.service",
+    "hv-fcopy-daemon.service",
+    "ModemManager.service",
+    "multipathd.service",
+    "multipathd.socket",
+    "apport-autoreport.path",
+    "ubuntu-advantage.service",
+    "ua-reboot-cmds.service",
+    "systemd-networkd-wait-online.service",
+    "systemd-networkd.service",
+    "networkd-dispatcher.service",
+    "getty@.service",
+    "e2scrub_reap.service",
+];
+
+/// Point `resolv_conf` at systemd-resolved's stub without dropping the
+/// image's resolver policy.
+///
+/// The file keeps every configured upstream nameserver (the target file's own
+/// plus the ones resolved itself carries), all `search`/`domain` directives,
+/// and every compatible `options` line. Only the `nameserver` lines are
+/// regenerated, so the stub is first and a stub every older golden already had
+/// still gains an upstream; the hosted defaults `edns0` and `trust-ad` are
+/// appended only when those options are not already present. A missing
+/// upstream gets `1.1.1.1` so a stub-only file can still resolve external
+/// names.
+///
+/// The write is atomic and symlink-safe: a temp file beside the target is
+/// `mv`ed over it, which replaces a symlinked `/etc/resolv.conf` with a
+/// regular file (SmolVM refuses to start a guest whose resolver is a symlink)
+/// and never writes through to the file the link named. The step is
+/// idempotent: a file that already matches is left byte for byte and logged.
+///
+/// `upstream_file` is resolved's own `resolv.conf` on the runtime path and
+/// `/dev/null` at bake time. When neither it nor the target file carries a
+/// non-stub nameserver, the fallback is the effective `DNS=` from
+/// `resolved.conf` and its sorted `resolved.conf.d` drop-ins (later non-empty
+/// assignments append, an empty assignment resets the list, matching
+/// systemd-resolved); `1.1.1.1` is used only when that configured list is also
+/// empty. The bake host's resolver is never consulted.
+fn resolver_stub_rewrite_shell(
+    resolv_conf: &str,
+    upstream_file: &str,
+    resolved_etc: &str,
+) -> String {
+    let conf = shell_quote(resolv_conf);
+    let upstream = shell_quote(upstream_file);
+    let resolved_etc = shell_quote(resolved_etc);
+    format!(
+        "prs_etc={resolved_etc}; prs_conf={conf}; prs_upstream_file={upstream}; \
+         prs_tmp=$prs_conf.preloop.$$; prs_keep=$prs_tmp.keep; \
+         prs_upstreams=$(cat \"$prs_conf\" \"$prs_upstream_file\" 2>/dev/null \
+           | awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2 }}' \
+           | grep -v '^127\\.0\\.0\\.53$' | grep -v '^::1$' | grep -v '^0\\.0\\.0\\.0$' | grep -v '^::$' \
+           | awk '!seen[$0]++'); \
+         if [ -z \"$prs_upstreams\" ]; then \
+           prs_upstreams=$(for prs_resolved in \"$prs_etc/systemd/resolved.conf\" \
+               \"$prs_etc/systemd/resolved.conf.d\"/*.conf; do \
+             [ -f \"$prs_resolved\" ] || continue; \
+             cat \"$prs_resolved\"; \
+             printf '\\n'; \
+           done | awk ' \
+             function is_ip(s) {{ \
+               if (s ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$/) return 1; \
+               if (s ~ /:/) return 1; \
+               return 0; \
+             }} \
+             function clean(s) {{ \
+               sub(/#.*/, \"\", s); \
+               if (s ~ /^\\[[^]]+\\](:[0-9]+)?$/) {{ sub(/^\\[/, \"\", s); sub(/\\].*/, \"\", s); }} \
+               else if (s ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:[0-9]+$/) {{ sub(/:[0-9]+$/, \"\", s); }} \
+               return s; \
+             }} \
+             /^[[:space:]]*DNS[[:space:]]*=/ {{ \
+               line=$0; sub(/^[^=]*=[[:space:]]*/, \"\", line); sub(/[[:space:]]+$/, \"\", line); \
+               if (line == \"\") {{ count=0; next }} \
+               n=split(line, parts, /[[:space:]]+/); \
+               for (i=1; i<=n; i++) {{ \
+                 token=clean(parts[i]); \
+                 if (token != \"\" && is_ip(token)) dns[++count]=token; \
+               }} \
+             }} \
+             END {{ for (i=1; i<=count; i++) print dns[i] }}' \
+             | grep -v '^127\\.0\\.0\\.53$' | grep -v '^::1$' | grep -v '^0\\.0\\.0\\.0$' | grep -v '^::$' \
+             | awk '!seen[$0]++'); \
+         fi; \
+         if [ -z \"$prs_upstreams\" ]; then prs_upstreams=1.1.1.1; fi; \
+         prs_ok=1; \
+         if [ -f \"$prs_conf\" ]; then \
+           if ! awk '!/^[[:space:]]*nameserver[[:space:]]/ && !/^[[:space:]]*nameserver$/' \
+             \"$prs_conf\" > \"$prs_keep\" 2>/dev/null; then prs_ok=0; fi; \
+         elif ! : > \"$prs_keep\" 2>/dev/null; then prs_ok=0; fi; \
+         if [ \"$prs_ok\" = 1 ] && printf 'nameserver 127.0.0.53\\n' > \"$prs_tmp\" 2>/dev/null; then \
+           for prs_ns in $prs_upstreams; do \
+             printf 'nameserver %s\\n' \"$prs_ns\" >> \"$prs_tmp\" 2>/dev/null || prs_ok=0; \
+           done; \
+           prs_defaults=\" edns0 trust-ad\"; \
+           if [ -f \"$prs_conf\" ]; then \
+             prs_defaults=$(awk '/^[[:space:]]*options[[:space:]]/ {{ for (i=2; i<=NF; i++) seen[$i]=1 }} \
+               END {{ if (!seen[\"edns0\"]) printf \" edns0\"; if (!seen[\"trust-ad\"]) printf \" trust-ad\" }}' \
+               \"$prs_conf\" 2>/dev/null); \
+           fi; \
+           if [ -n \"$prs_defaults\" ]; then \
+             printf 'options%s\\n' \"$prs_defaults\" >> \"$prs_tmp\" 2>/dev/null || prs_ok=0; \
+           fi; \
+           cat \"$prs_keep\" >> \"$prs_tmp\" 2>/dev/null || prs_ok=0; \
+         else \
+           prs_ok=0; \
+         fi; \
+         if [ \"$prs_ok\" = 1 ]; then \
+           if [ ! -L \"$prs_conf\" ] && [ \"$(cat \"$prs_tmp\" 2>/dev/null)\" = \"$(cat \"$prs_conf\" 2>/dev/null)\" ]; then \
+             rm -f \"$prs_tmp\" \"$prs_keep\" 2>/dev/null; \
+             echo \"preloop: $prs_conf already names the 127.0.0.53 stub resolver first\"; \
+           else \
+             chmod 0644 \"$prs_tmp\" 2>/dev/null || true; \
+             if mv -f \"$prs_tmp\" \"$prs_conf\" 2>/dev/null; then \
+               rm -f \"$prs_keep\" 2>/dev/null; \
+               echo \"preloop: pointed $prs_conf at the 127.0.0.53 stub resolver\"; \
+             else \
+               rm -f \"$prs_tmp\" \"$prs_keep\" 2>/dev/null; \
+               echo \"preloop: warning: could not write $prs_conf; containers follow the guest resolver\" >&2; \
+             fi; \
+           fi; \
+         else \
+           rm -f \"$prs_tmp\" \"$prs_keep\" 2>/dev/null; \
+           echo \"preloop: warning: could not stage $prs_conf; containers follow the guest resolver\" >&2; \
+         fi"
+    )
+}
+
+/// The bake-time hosted systemd preparation a guest that boots systemd needs,
+/// and that the per-machine init cannot do.
+///
+/// Applied only under [`GoldenResiduePolicy::Clean`]. [`GoldenResiduePolicy::Preserve`]
+/// returns a no-op: a custom image's units, sysctl service and resolver are its
+/// own policy, and the mere presence of a unit does not make masking it safe.
+///
+/// Three things the hosted image has and a guest that boots systemd does not:
+///
+/// * **resolved's upstream.** Nothing feeds systemd-resolved its DNS on a
+///   preloop guest — the interface has no DHCP or networkd provider and
+///   `resolved` runs in `foreign` mode — so it takes the upstream from
+///   `/etc/resolv.conf` alone. Naming the stub there without also giving
+///   resolved an upstream leaves it with none, which breaks external DNS for the
+///   whole guest while `/etc/hosts` names keep working (measured: `curl
+///   https://github.com` → `Could not resolve host`). `DNS=` in
+///   `resolved.conf` (or a `resolved.conf.d` drop-in) makes the upstream
+///   explicit and survives a rewrite of `/etc/resolv.conf`; when neither sets
+///   it, the value is the first configured nameserver the image carries, and
+///   `1.1.1.1` when there is none or it is loopback (an image whose resolver
+///   is itself the stub cannot supply one). The bake writes that value to a
+///   `resolved.conf.d/90-preloop-upstream.conf` drop-in instead of editing the
+///   image's `resolved.conf`: a bare `DNS=` appended to a file that does not
+///   exist has no `[Resolve]` section, which systemd ignores. A `DNS=` the
+///   image or the operator already set is never touched, and the bake host's
+///   own resolver is never consulted.
+/// * **`/etc/resolv.conf` naming the stub**, as a regular file. This is the
+///   golden half of [`guest_resolver_stub_script`]: it runs whether or not
+///   systemd is *running* (the SmolVM builder has no systemd PID 1, and a
+///   "resolved is active" gate would skip exactly there), so the gate is the
+///   binaries existing. The rewrite keeps the image's upstream nameservers,
+///   `search`/`domain` directives and resolver options (see
+///   [`resolver_stub_rewrite_shell`]). The runtime half re-applies after the
+///   SmolVM agent rewrites the file at every start.
+/// * **the unit masks** ([`SYSTEMD_MASKED_UNITS`]): Azure/Hyper-V/cloud-init/
+///   snapd/apt-timer units the hosted image does not run, plus the one that
+///   fails on the SmolVM kernel. `systemctl mask` when a running systemd answers
+///   (which also covers a guest whose `systemctl` writes the same
+///   `/dev/null` symlink), the symlink directly otherwise — the builder case,
+///   verified identical to what `systemctl mask` creates.
+///
+/// Best-effort and idempotent throughout: every failure warns on stderr (the
+/// engine logs it) instead of failing the bake, a second run appends nothing,
+/// rewrites nothing and re-masks nothing, and an image without systemd is left
+/// exactly as it is.
+pub fn golden_systemd_parity_script(policy: GoldenResiduePolicy) -> String {
+    golden_systemd_parity_script_at(
+        policy,
+        &["/lib/systemd/systemd", "/usr/lib/systemd/systemd"],
+        "/etc",
+        &["/lib/systemd/system", "/usr/lib/systemd/system"],
+        SYSTEMD_MASKED_UNITS,
+    )
+}
+
+/// The scratch paths and unit list the shell test substitutes; production passes
+/// the paths above and [`SYSTEMD_MASKED_UNITS`].
+fn golden_systemd_parity_script_at(
+    policy: GoldenResiduePolicy,
+    systemd_bins: &[&str],
+    etc: &str,
+    unit_dirs: &[&str],
+    units: &[&str],
+) -> String {
+    if policy == GoldenResiduePolicy::Preserve {
+        return "echo \"preloop: custom-base policy preserves this image's systemd units and resolver configuration\" >&2"
+            .to_owned();
+    }
+    let gate = systemd_bins
+        .iter()
+        .map(|path| format!("[ -x {} ]", shell_quote(path)))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    let unit_dirs = unit_dirs
+        .iter()
+        .map(|dir| shell_quote(dir))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let units = units
+        .iter()
+        .map(|unit| shell_quote(unit))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let etc_path = etc;
+    let etc = shell_quote(etc_path);
+    let rewrite =
+        resolver_stub_rewrite_shell(&format!("{etc_path}/resolv.conf"), "/dev/null", etc_path);
+    format!(
+        "prsys_etc={etc}; \
+         if {gate}; then \
+           prsys_resolved=$prsys_etc/systemd/resolved.conf; \
+           prsys_has_dns=0; \
+           if [ -f \"$prsys_resolved\" ] \
+             && grep -q '^[[:space:]]*DNS=' \"$prsys_resolved\" 2>/dev/null; then \
+             prsys_has_dns=1; \
+           fi; \
+           for prsys_dropin in \"$prsys_etc/systemd/resolved.conf.d\"/*.conf; do \
+             [ -f \"$prsys_dropin\" ] || continue; \
+             if grep -q '^[[:space:]]*DNS=' \"$prsys_dropin\" 2>/dev/null; then prsys_has_dns=1; fi; \
+           done; \
+           if [ \"$prsys_has_dns\" = 1 ]; then \
+             echo \"preloop: systemd-resolved already sets DNS=; leaving it alone\" >&2; \
+           elif [ -e \"$prsys_resolved\" ] || [ -d \"$prsys_etc/systemd\" ]; then \
+             prsys_ns=$(awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2 }}' \
+               \"$prsys_etc/resolv.conf\" 2>/dev/null \
+               | grep -v '^127\\.' | grep -v '^::1$' | grep -v '^0\\.0\\.0\\.0$' | grep -v '^::$' \
+               | awk 'NR == 1 {{ print; exit }}'); \
+             if [ -z \"$prsys_ns\" ]; then prsys_ns=1.1.1.1; fi; \
+             mkdir -p \"$prsys_etc/systemd/resolved.conf.d\" 2>/dev/null || true; \
+             prsys_dropin=$prsys_etc/systemd/resolved.conf.d/90-preloop-upstream.conf; \
+             if printf '[Resolve]\\nDNS=%s\\n' \"$prsys_ns\" > \"$prsys_dropin\" 2>/dev/null; then \
+               echo \"preloop: set the systemd-resolved upstream to $prsys_ns\"; \
+             else \
+               echo \"preloop: warning: could not write a systemd-resolved DNS= drop-in\" >&2; \
+             fi; \
+           fi; \
+           {rewrite}; \
+           prsys_masked=0; prsys_absent=0; \
+           for prsys_unit in {units}; do \
+             prsys_shipped=0; \
+             for prsys_dir in {unit_dirs}; do \
+               if [ -e \"$prsys_dir/$prsys_unit\" ]; then prsys_shipped=1; fi; \
+             done; \
+             if [ \"$prsys_shipped\" != 1 ]; then prsys_absent=$((prsys_absent + 1)); continue; fi; \
+             if command -v systemctl >/dev/null 2>&1 && systemctl mask \"$prsys_unit\" >/dev/null 2>&1; then \
+               prsys_masked=$((prsys_masked + 1)); \
+             else \
+               mkdir -p \"$prsys_etc/systemd/system\" 2>/dev/null || true; \
+               if ln -sf /dev/null \"$prsys_etc/systemd/system/$prsys_unit\" 2>/dev/null; then \
+                 prsys_masked=$((prsys_masked + 1)); \
+               else \
+                 echo \"preloop: warning: could not mask $prsys_unit\" >&2; \
+               fi; \
+             fi; \
+           done; \
+           echo \"preloop: masked $prsys_masked systemd units ($prsys_absent not shipped by this image)\"; \
+         else \
+           echo 'preloop: this image has no systemd; skipping the systemd parity preparation' >&2; \
+         fi"
+    )
+}
+
 /// Sysctls GitHub's hosted `ubuntu-24.04` image applies, with their values.
 ///
 /// Provenance: `actions/runner-images` appends these to `/etc/sysctl.conf`
@@ -2299,9 +3254,12 @@ pub const GITHUB_GUEST_SYSCTLS: &[(&str, &str)] = &[
 /// `/etc/sysctl.d` or `/etc/sysctl.conf` — so an image-level sysctl file would
 /// never take effect and every job saw raw kernel defaults (`vm.max_map_count`
 /// 65530, inotify watches and instances a fraction of the hosted values).
-/// Applied per machine by [`guest_hosted_runtime_init_script`], from the same
-/// post-boot exec path as [`runner_ownership_reconcile_script`], so no golden
-/// rebake is needed.
+/// Applied per machine by [`guest_hosted_runtime_init_script`] under
+/// [`GoldenResiduePolicy::Clean`], from the same post-boot exec path as
+/// [`runner_ownership_reconcile_script`], so no golden rebake is needed. A
+/// Preserve base keeps its own sysctl policy: its unmasked
+/// `systemd-sysctl.service` applies its files, and this step does not overwrite
+/// the same keys with GitHub's values.
 ///
 /// Idempotent: the first loop only compares `/proc/sys` values and exits
 /// without writing when the machine already matches. A needed write escalates
@@ -2397,6 +3355,11 @@ fn guest_sysctl_script_at(root: &str) -> String {
 /// entry that also carries `localhost` keeps it, and a line left with no name
 /// at all is dropped.
 ///
+/// Only lines that name the machine's own hostname are rewritten. Every other
+/// line — including a custom routable alias the image supplied — is printed
+/// back byte for byte, so the runtime hostname repair never becomes a second
+/// policy that deletes an operator's mapping.
+///
 /// Idempotent: a machine whose name already resolves locally — the baked
 /// golden itself, a fork that ran this once, or a GitHub-shaped
 /// interface-address mapping — exits without touching `/etc/hosts`. The
@@ -2470,6 +3433,9 @@ fn guest_hostname_script_at(hosts: &str) -> String {
            /^[[:space:]]*#/ {{ print; next }} \
            {{ \
              n = split($0, field, /[[:space:]]+/); \
+             has = 0; \
+             for (i = 2; i <= n; i++) if (field[i] == host) {{ has = 1; break; }} \
+             if (!has) {{ print; next; }} \
              out = \"\"; names = 0; \
              for (i = 1; i <= n; i++) {{ \
                if (i > 1 && field[i] == host) continue; \
@@ -2489,6 +3455,131 @@ fn guest_hostname_script_at(hosts: &str) -> String {
     )
 }
 
+/// Point the guest's `/etc/resolv.conf` at the systemd-resolved stub.
+///
+/// A GitHub-hosted runner's container resolves a `/etc/hosts`-only name — a
+/// compose service alias such as `postgres.localhost` — because Docker reads
+/// the *host file* and gives its embedded DNS server `ExtServers:
+/// [host(127.0.0.53)]`: measured on hosted `ubuntu-24.04`, whose
+/// `/etc/resolv.conf` is the stub. A preloop guest that names its own resolver
+/// instead (`75.75.75.75` on AgentENV, `100.96.0.1` on SmolVM) hands its
+/// containers `ExtServers: [host(75.75.75.75)]` and the name comes back
+/// NXDOMAIN, while every external name still resolves.
+///
+/// The *file* is what has to name the stub, never a `daemon.json` `dns` entry:
+/// a `dns` pin reaches the container as `ExtServers: [127.0.0.53]` with
+/// `Overrides: [nameservers]`, and the address is then the container's own
+/// loopback, so every lookup inside it fails. Through the host file Docker
+/// keeps the `host(...)` wrapper and queries the stub from the host namespace,
+/// which is why the hosted shape works.
+///
+/// A regular file, not a symlink: the SmolVM agent's per-start overlay refresh
+/// rejects a symlinked `/etc/resolv.conf` and the machine then refuses to start
+/// (measured), and a symlink to the stub is the upstream-less shape above on
+/// AgentENV. Replaced by rename in the same directory — `mv` swaps the link
+/// itself, so a symlinked file never clobbers the file it points at — and no
+/// reader ever sees a half-written resolver file.
+///
+/// The guest's own resolver is *kept*, as a second `nameserver` line. On
+/// AgentENV nothing feeds systemd-resolved its upstreams — the interface has no
+/// DHCP or networkd provider and `resolved` runs in `foreign` mode — so it
+/// takes them from `/etc/resolv.conf` alone: a file naming only the stub makes
+/// resolved drop that address as itself and leaves it with no upstream at all,
+/// which breaks external DNS for the whole guest (`curl https://github.com` →
+/// `Could not resolve host`) while `/etc/hosts` names keep working, so a
+/// hosts-only probe looks healthy. Measured shape that works end to end:
+/// `nameserver 127.0.0.53`, the original nameserver, `options edns0 trust-ad`
+/// — the container then reads `ExtServers: [host(127.0.0.53) host(75.75.75.75)]`
+/// and resolves both kinds of name. The upstreams are read from the file and
+/// from resolved's own `/run/systemd/resolve/resolv.conf` *before* the file is
+/// replaced, so an image that keeps them there (or in `resolved.conf.d`) is
+/// covered too.
+///
+/// Applied in the golden — an AgentENV restore keeps the baked file, so the
+/// daemon the guest's systemd starts at boot reads it — and per machine, only
+/// under [`GoldenResiduePolicy::Clean`]. A custom base's resolver file is its
+/// own policy, including its `search`/`domain` directives and options; a
+/// Preserve bake and launch leave it alone. The per-machine application runs
+/// twice on Clean: in the runtime init, and in every runner launch
+/// ([`as_runner_user`]). The SmolVM agent re-points a persistent container's
+/// file at the gateway before each *interactive* run's command starts, and the
+/// runner launch is one (`machine exec --stream`), so a stub the init wrote is
+/// already gone when the job's first command runs.
+///
+/// The runtime half waits, bounded, for the stub to exist ([`RESOLVER_STUB_WAIT_ATTEMPTS`]):
+/// the SmolVM agent writes the gateway resolver during its own network setup
+/// and only then execs the golden's `/sbin/init`, so provisioning's exec can
+/// arrive while systemd is still starting and `/run/systemd/resolve/stub-resolv.conf`
+/// does not exist yet. A one-shot check took the "no stub" branch there and
+/// never ran again, which left Docker reading the gateway as its `ExtServers`
+/// and made a compose `/etc/hosts` alias such as `postgres.localhost` NXDOMAIN
+/// for every job on the machine (`db_migrate` on the 1.30.1 template run).
+/// A guest that genuinely has no resolved stub — no systemd and no
+/// `resolvectl` — is checked once and left alone, with the reason on stderr;
+/// the wait never runs on it.
+pub fn guest_resolver_stub_script() -> String {
+    guest_resolver_stub_script_at(
+        "/etc/resolv.conf",
+        "/run/systemd/resolve/stub-resolv.conf",
+        "/run/systemd/resolve/resolv.conf",
+        "/etc",
+        RESOLVER_STUB_WAIT_ATTEMPTS,
+        RESOLVER_STUB_WAIT_INTERVAL,
+    )
+}
+
+/// How many checks the runtime resolver step makes while systemd-resolved
+/// comes up, and how long each one waits.
+///
+/// Thirty seconds covers a fork that resumes with systemd just starting on a
+/// loaded host — the stub had not appeared after six seconds on a measured
+/// 1.30.1 run, and the machine then kept the gateway resolver. Only paid when
+/// the stub is missing at the first check and the guest ships `resolvectl` —
+/// the same package as `systemd-resolved`, so a guest with no resolved is not
+/// waited on. The bake's builder (the smolvm agent as PID 1, no systemd) pays
+/// it once per bake, and the golden's own [`golden_systemd_parity_script`] has
+/// already named the stub there.
+const RESOLVER_STUB_WAIT_ATTEMPTS: u32 = 60;
+const RESOLVER_STUB_WAIT_INTERVAL: &str = "0.5";
+
+/// `resolv_conf`, `stub`, `upstream_file` and `resolved_etc` are the scratch
+/// paths the shell tests substitute for `/etc/resolv.conf`, the stub's own
+/// file, resolved's upstream list and the `/etc` tree holding `resolved.conf`
+/// and its drop-ins; `wait_attempts` and `wait_interval` are the runtime wait
+/// ([`RESOLVER_STUB_WAIT_ATTEMPTS`], [`RESOLVER_STUB_WAIT_INTERVAL`], shortened
+/// by the tests). No `#` comments in the text: the golden contract's statements
+/// are joined into one physical line.
+fn guest_resolver_stub_script_at(
+    resolv_conf: &str,
+    stub: &str,
+    upstream_file: &str,
+    resolved_etc: &str,
+    wait_attempts: u32,
+    wait_interval: &str,
+) -> String {
+    let rewrite = resolver_stub_rewrite_shell(resolv_conf, upstream_file, resolved_etc);
+    format!(
+        "prs_conf={conf}; prs_stub={stub}; \
+         prs_tries=0; \
+         while [ ! -e \"$prs_stub\" ] && [ \"$prs_tries\" -lt {attempts} ] \
+           && command -v resolvectl >/dev/null 2>&1; do \
+           sleep {interval} 2>/dev/null || true; \
+           prs_tries=$((prs_tries+1)); \
+         done; \
+         if [ -e \"$prs_stub\" ] || {{ command -v resolvectl >/dev/null 2>&1 && resolvectl status >/dev/null 2>&1; }}; then \
+           {rewrite}; \
+         else \
+           prs_systemd=no; if [ -e /run/systemd/system ]; then prs_systemd=yes; fi; \
+           prs_resolvectl=no; if command -v resolvectl >/dev/null 2>&1; then prs_resolvectl=yes; fi; \
+           echo \"preloop: no resolved stub resolver on this guest; leaving $prs_conf alone (waited $prs_tries of {attempts} checks; systemd=$prs_systemd resolvectl=$prs_resolvectl)\" >&2; \
+         fi",
+        conf = shell_quote(resolv_conf),
+        stub = shell_quote(stub),
+        attempts = wait_attempts,
+        interval = shell_quote(wait_interval),
+    )
+}
+
 /// The per-guest **hosted runtime init**: what the hosted image's own init
 /// applies to a job's environment, applied by preloop instead.
 ///
@@ -2499,8 +3590,16 @@ fn guest_hostname_script_at(hosts: &str) -> String {
 /// `/run/smolvm/init`, with no systemd at all, and an AgentENV job arrives via
 /// `aenv exec` off `envd`, outside systemd and PAM. The golden carries
 /// GitHub's files, but nothing ever applies them. This is the per-guest half
-/// of that gap — the kernel values and the machine's own name, applied once on
-/// the post-boot exec path, before the runner registers.
+/// of that gap — the kernel values, the machine's own name and the resolver
+/// file, applied once on the post-boot exec path, before the runner registers.
+///
+/// Only [`GoldenResiduePolicy::Clean`] applies the hosted kernel values and
+/// resolver rewrite. [`GoldenResiduePolicy::Preserve`] runs only the hostname
+/// half: a custom image's `/etc/sysctl.d` tuning (applied by its own
+/// `systemd-sysctl.service`, which is not masked) and its resolver policy are
+/// the operator's, not residue to normalize. The environment's actual base
+/// chooses the policy, so a job routed to a custom golden never inherits the
+/// pool default's hosted settings.
 ///
 /// The other half cannot live here: process limits are per process, so the
 /// pair a step and a container inherit is applied where the workload is
@@ -2508,25 +3607,134 @@ fn guest_hostname_script_at(hosts: &str) -> String {
 /// re-raise of an engine chain inherited from a golden).
 ///
 /// Each half runs in its own subshell so its early `exit 0` ("already at the
-/// hosted values") cannot skip the other, and `set -e` turns either half's
+/// hosted values") cannot skip the others, and `set -e` turns either half's
 /// failure into a provisioning failure rather than leaving the machine half
 /// converted. Hostname resolution runs first because the sysctl half escalates
 /// through passwordless sudo, and sudo resolves its hostname on every
 /// invocation: with a stale mapping it would print
 /// `sudo: unable to resolve host` into the apply's stderr before the name is
-/// fixed.
-pub fn guest_hosted_runtime_init_script() -> String {
-    hosted_runtime_init_script_at("/etc/hosts", "/proc/sys")
+/// fixed. The resolver half runs last: it is the only one that has to run
+/// *after* the guest agent settled the network, and it waits (bounded) for the
+/// booted systemd to publish `/run/systemd/resolve/stub-resolv.conf` — the
+/// agent execs `/sbin/init` and this exec can reach the guest before resolved
+/// starts, which is the race that left the gateway resolver in place. The CA
+/// half is a security fix rather than hosted adaptation: it runs for both
+/// policies, and the script itself no-ops when the image has no Debian CA
+/// configuration.
+pub fn guest_hosted_runtime_init_script(policy: GoldenResiduePolicy) -> String {
+    hosted_runtime_init_script_at(
+        policy,
+        HostedInitPaths {
+            hosts: "/etc/hosts",
+            sysctl_root: "/proc/sys",
+            resolv_conf: "/etc/resolv.conf",
+            stub: "/run/systemd/resolve/stub-resolv.conf",
+            upstream_file: "/run/systemd/resolve/resolv.conf",
+            resolved_etc: "/etc",
+            ca_conf: "/etc/ca-certificates.conf",
+        },
+    )
 }
 
-/// `hosts` and `sysctl_root` are the scratch paths the shell tests substitute
-/// for `/etc/hosts` and `/proc/sys`; production passes those.
-fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str) -> String {
+/// `hosts`, `sysctl_root`, `resolv_conf`, `stub`, `upstream_file`,
+/// `resolved_etc` and `ca_conf` are the scratch paths the shell tests
+/// substitute for `/etc/hosts`, `/proc/sys`, `/etc/resolv.conf`, the stub's
+/// own file, resolved's upstream list, the `/etc` tree holding `resolved.conf`
+/// and its drop-ins, and the Debian CA bundle list; production passes those.
+struct HostedInitPaths<'a> {
+    hosts: &'a str,
+    sysctl_root: &'a str,
+    resolv_conf: &'a str,
+    stub: &'a str,
+    upstream_file: &'a str,
+    resolved_etc: &'a str,
+    ca_conf: &'a str,
+}
+
+fn hosted_runtime_init_script_at(
+    policy: GoldenResiduePolicy,
+    paths: HostedInitPaths<'_>,
+) -> String {
+    let HostedInitPaths {
+        hosts,
+        sysctl_root,
+        resolv_conf,
+        stub,
+        upstream_file,
+        resolved_etc,
+        ca_conf,
+    } = paths;
+    let hostname = format!("( {} )", guest_hostname_script_at(hosts));
+    let ca = guest_ca_distrust_script(ca_conf);
+    if policy == GoldenResiduePolicy::Preserve {
+        return format!(
+            "set -e; {hostname}; ( {ca} ); \
+             echo \"preloop: custom-base policy preserves this image's sysctl tuning and resolver configuration\" >&2"
+        );
+    }
     format!(
-        "set -e; ( {} ); ( {} )",
-        guest_hostname_script_at(hosts),
-        guest_sysctl_script_at(sysctl_root)
+        "set -e; {hostname}; ( {} ); ( {ca} ); ( {} )",
+        guest_sysctl_script_at(sysctl_root),
+        guest_resolver_stub_script_at(
+            resolv_conf,
+            stub,
+            upstream_file,
+            resolved_etc,
+            RESOLVER_STUB_WAIT_ATTEMPTS,
+            RESOLVER_STUB_WAIT_INTERVAL,
+        )
     )
+}
+
+/// The third half: published goldens predate the 2026-10-20 eMudhra
+/// intermediate CA compromise and still anchor the revoked chain. Clients
+/// that ignore revocation data keep trusting it, so drop the two roots from
+/// the guest bundle before the runner registers. Idempotent: a bundle whose
+/// package already removed them is left untouched.
+fn guest_ca_distrust_script(ca_conf: &str) -> String {
+    format!(
+        r#"conf={ca_conf}
+if [ -f "$conf" ] && grep -qE '^mozilla/(emSign_ECC_Root_CA_-_G3|Comodo_AAA_Services_root)\.crt$' "$conf"; then
+  sed -i.bak \
+    -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
+    -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' \
+    "$conf"
+  rm -f "$conf.bak"
+  if [ "$(id -u)" -eq 0 ]; then
+    update-ca-certificates
+  else
+    sudo -n update-ca-certificates
+  fi
+  echo "preloop: disabled revoked eMudhra CA roots" >&2
+fi"#
+    )
+}
+
+/// Apply only the Ubuntu security pocket before a golden is packed.
+///
+/// The base is an upstream snapshot that can be days old; this closes the gap
+/// to the bake date without a blanket `apt-get upgrade` (which would also move
+/// packages the image deliberately pins). `unattended-upgrade` handles the
+/// dpkg/grub/conffile mechanics and exits non-zero when an update fails, so a
+/// bake that cannot reach the security state fails instead of shipping.
+pub fn golden_security_update_script() -> &'static str {
+    r#"set -eu
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v unattended-upgrade >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends unattended-upgrades
+fi
+cat > /etc/apt/apt.conf.d/99preloop-security-only <<'EOF'
+#clear Unattended-Upgrade::Allowed-Origins;
+Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Package-Blacklist {};
+EOF
+apt-get update -qq
+unattended-upgrade --verbose
+apt-get clean
+"#
 }
 
 /// The guest bootstrap script, one shell round trip.
@@ -2549,27 +3757,45 @@ pub fn golden_glibc_check_script() -> &'static str {
      }"
 }
 
-/// The complete golden contract for a configured image: the image is used
-/// exactly as it is, and this is everything Preloop adds.
+/// The complete golden contract for a configured image: the minimal runner
+/// machinery every golden needs, plus the hosted adaptations its base's
+/// provenance allows.
 ///
-/// GitHub-runner machinery only — the account jobs run as (with its home,
-/// `_work` and passwordless sudo), the ownership of the paths they write, the
-/// writable tool cache with `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in
-/// `/etc/environment`, the glibc requirement above, and the image's apt package
-/// indices ([`golden_apt_lists_script`]). No packages, no
-/// toolchains, no PATH or environment overrides: on a hosted runner a missing
-/// `bash`, `git` or `docker` fails the step that needs it, and the same is true
-/// here.
+/// The minimal runner contract applies to every base — the account jobs run as
+/// (with its home, `work` and passwordless sudo), the ownership of the paths
+/// they write, the writable tool cache with
+/// `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in `/etc/environment`, the glibc
+/// requirement above, the image's apt package indices
+/// ([`golden_apt_lists_script`]), and the KVM access a job's container engine
+/// needs. No packages, no toolchains, no PATH or environment overrides: on a
+/// hosted runner a missing `bash`, `git` or `docker` fails the step that needs
+/// it, and the same is true here.
+///
+/// [`GoldenResiduePolicy::Clean`] adds the hosted image's own policy on top:
+/// `/etc/hosts` and `/etc/fstab` residue cleanup, `ping`'s file capability
+/// ([`golden_ping_capability_script`]), the systemd unit masks and resolved
+/// configuration ([`golden_systemd_parity_script`]), and the baked resolver
+/// stub ([`guest_resolver_stub_script`]). [`GoldenResiduePolicy::Preserve`],
+/// which a custom base gets by default, skips all of them: the image's host
+/// files, systemd units (including its `systemd-sysctl.service`), `ping`,
+/// resolver and sysctl policy survive the bake and the per-machine init. See
+/// [`golden_residue_policy`].
 ///
 /// The text is also the fingerprint input for configured images (see
 /// `EnvironmentSpec::from_base`), so editing a step rebuilds every golden baked
 /// from an image instead of adopting one the old contract produced.
-pub fn golden_contract_script(user: &str, uid: u32) -> String {
-    golden_contract_steps(user, uid).join("; ")
+pub fn golden_contract_script(user: &str, uid: u32, residue: GoldenResiduePolicy) -> String {
+    golden_contract_steps(user, uid, residue).join("; ")
+}
+
+/// The contract a base image's golden is built with, using the provenance
+/// policy resolved from `base`.
+pub(crate) fn golden_contract_for_base(base: &str, user: &str, uid: u32) -> String {
+    golden_contract_script(user, uid, golden_residue_policy(base))
 }
 
 /// The contract's statements in order; [`golden_contract_script`] joins them.
-pub fn golden_contract_steps(user: &str, uid: u32) -> Vec<String> {
+pub fn golden_contract_steps(user: &str, uid: u32, residue: GoldenResiduePolicy) -> Vec<String> {
     // `PRELOOP_RUNNER_USER=root` restores the old "run as root" behavior, and
     // `as_runner_user` runs the runner unchanged for it. The account steps must
     // skip then: creating and chowning a `root` account (and moving its home
@@ -2582,6 +3808,30 @@ pub fn golden_contract_steps(user: &str, uid: u32) -> Vec<String> {
         steps.push(golden_ownership_script(uid));
     }
     steps.push(golden_apt_lists_script());
+    // Only the official image (or a custom base whose operator opted in) gets
+    // the hosted policy: `/etc/hosts` and `/etc/fstab` are that image's
+    // residue, and its systemd units, `ping` capability and resolver are the
+    // hosted runner's setup. A custom image's routable alias, not-yet-attached
+    // device, systemd-sysctl tuning and resolver policy are indistinguishable
+    // from policy by content alone, and the mere existence of a unit is not
+    // proof that masking it is safe. None of these touches the runner's
+    // groups, so they stay ahead of the membership step below.
+    if residue == GoldenResiduePolicy::Clean {
+        steps.extend(golden_residue_cleanup_steps(residue));
+        steps.push(golden_ping_capability_script("/usr/bin/ping"));
+        // The systemd preparation is bake-time only: it is gated on the
+        // systemd binaries rather than on a running systemd, because the
+        // SmolVM builder has no systemd PID 1 and would skip a "resolved is
+        // active" gate.
+        steps.push(golden_systemd_parity_script(residue));
+        // The resolver file has to name the resolved stub before the container
+        // engine reads it: Docker hands a container the *host file's*
+        // nameservers, so a guest naming its own resolver gives a compose
+        // network NXDOMAIN for `/etc/hosts`-only aliases. Baked here as well as
+        // per machine — an AgentENV restore keeps the baked file, and the
+        // daemon the guest's systemd starts reads it.
+        steps.push(guest_resolver_stub_script());
+    }
     if user != "root" {
         // The runner's groups are written last: nothing after this step may
         // change them, so the membership it grants is the one the bake keeps.
@@ -2924,14 +4174,16 @@ pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
 /// sets, with no launcher shell. [`guest_env_prefix`] adds the shell that
 /// sources the image's `/etc/environment` on top of these.
 ///
+/// No `PATH` here: the image's own PATH is the one a hosted step shell gets,
+/// and only the launcher — which has sourced `/etc/environment` by then — can
+/// tell whether the image declared one. [`guest_runner_path`] is the launcher's
+/// fallback, not an entry `env` re-asserts over the image's value.
+///
 /// Control-socket routing and failure-marker debugging are independent
 /// features: a pool can debug failed jobs without a mounted control socket and
 /// vice versa, so neither may gate the other.
 fn guest_env_entries(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
-    let mut env = vec![
-        format!("PATH={}", guest_runner_path(config)),
-        format!("PRELOOP_MACHINE_NAME={}", name.as_str()),
-    ];
+    let mut env = vec![format!("PRELOOP_MACHINE_NAME={}", name.as_str())];
     if config.control_socket.is_some() {
         env.push(format!(
             "PRELOOP_CONTROL_ORIGIN={}",
@@ -2964,26 +4216,54 @@ fn guest_env_entries(config: &RunnerPoolConfig, name: &MachineName) -> Vec<Strin
 /// `sh -c` so the image's `/etc/environment` is sourced first.
 ///
 /// `/etc/environment` is where a Linux image declares the PATH its toolchains
-/// live on, and `smolvm machine exec` starts the process without a login shell
-/// that would read it; a step calling a preinstalled tool would fail command
-/// lookup. Sourcing it *is* the hosted-runner parity fix, and an image without
-/// the file keeps [`guest_runner_path`]'s system default. The pool's own
-/// variables are re-asserted by `env` after the source, so a malformed
-/// `/etc/environment` cannot unset `HOME` or the control routing.
+/// live on *and* the environment its steps expect (`ImageOS`/`ImageVersion`,
+/// `JAVA_HOME*`, `LANG`, `DEBIAN_FRONTEND`, …), and `smolvm machine exec`
+/// starts the process without a login shell that would read it. Sourcing it
+/// with `set -a` is what exports those entries to the child: sourced without
+/// `-a` they stay shell variables and the `exec env` that follows drops them,
+/// which is how a guest job saw ~60 fewer variables than the same job on
+/// GitHub-hosted and every `setup-*` action failed to find its tool cache.
+///
+/// PATH is the launcher's, not an entry `env` re-asserts: the image's PATH is
+/// the one a hosted step shell gets, and a step that cannot find
+/// `/opt/pipx_bin`/`~/.local/bin`/`/usr/local/.ghcup/bin` fails while the tool
+/// is installed. [`guest_runner_path`] therefore applies only when the image
+/// declares no PATH at all. The pool's own variables are still re-asserted by
+/// `env` *after* the source, so a malformed `/etc/environment` cannot unset
+/// the control routing or the machine name.
 fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
+    guest_env_prefix_at(config, name, "/etc/environment")
+}
+
+/// [`guest_env_prefix`] against a chosen environment file.
+///
+/// Production passes `/etc/environment`; the shell test below passes a scratch
+/// file, so the generated launcher runs end to end without touching the host's
+/// environment, the way [`guest_hostname_script_at`] stands in for `/etc/hosts`.
+fn guest_env_prefix_at(
+    config: &RunnerPoolConfig,
+    name: &MachineName,
+    environment_file: &str,
+) -> Vec<String> {
     let env = guest_env_entries(config, name);
-    // `env` re-asserts every variable above *after* the image's environment is
-    // sourced, so a malformed `/etc/environment` cannot unset `HOME` or the
-    // control routing. It also resolves the program through the PATH the
-    // source may have replaced (a running process keeps the PATH it started
-    // with), which is exactly the heap the image declares.
+    // `env` re-asserts every pool variable *after* the image's environment is
+    // sourced, so a malformed `/etc/environment` cannot unset the control
+    // routing or the machine name. PATH is exported by the launcher instead:
+    // the image's value survives, and the pool's list is only the fallback for
+    // an image that declares none. `PATH=` first, so an environment file
+    // without a PATH falls back instead of inheriting whatever the exec
+    // channel happened to hand the shell.
     let pairs = env
         .iter()
         .map(|entry| shell_quote(entry))
         .collect::<Vec<_>>()
         .join(" ");
+    let environment_file = shell_quote(environment_file);
+    let fallback = shell_quote(&guest_runner_path(config));
     let launcher = format!(
-        "if [ -r /etc/environment ]; then . /etc/environment; fi; \
+        "PATH=; if [ -r {environment_file} ]; then set -a; . {environment_file}; set +a; fi; \
+         [ -n \"$PATH\" ] || PATH={fallback}; \
+         export PATH; \
          exec /usr/bin/env {pairs} \"$0\" \"$@\""
     );
     let mut argv = vec!["sh".to_owned(), "-c".to_owned(), launcher];
@@ -3138,6 +4418,18 @@ pub struct RunnerPoolConfig {
     /// deregisters them at teardown; `None` (tests, legacy callers) skips
     /// the wiring.
     pub observability: Option<preloop_observability::Observability>,
+    /// The engine's outbound-GitHub funnel (breaker registry + accounting).
+    ///
+    /// The embedding engine (`bootstrap::serve` via the CLI) supplies its own,
+    /// so the golden release listing, the OCI manifest/token lookups, the
+    /// `.sha256` sidecars and the golden transfers themselves resolve through
+    /// the same per-credential breakers as every other GitHub call in the
+    /// process: a GitHub outage discovered by the webhook path must refuse the
+    /// pool's first lookup instead of being rediscovered with a fresh 30 s
+    /// wait. `None` (a one-shot CLI bake, tests) makes the pool keep a private
+    /// funnel — the same protection, with no engine to share it with — rather
+    /// than let a GitHub call go unobserved.
+    pub github: Option<preloop_runner_server::github_breaker::GithubFunnel>,
 }
 
 /// How many environment goldens the host can retain alongside the pool's
@@ -3426,6 +4718,10 @@ pub enum OrchestratorError {
     /// Host filesystem failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A host command (install script, copy) failed, or hit its deadline and was
+    /// killed. The message names the dependency and the deadline.
+    #[error(transparent)]
+    Dependency(#[from] deadline::CommandError),
     /// The destination filesystem cannot hold the golden plus operating
     /// headroom. This is fatal rather than a local-build fallback: baking
     /// requires substantially more space than downloading.
@@ -3452,6 +4748,10 @@ pub enum OrchestratorError {
 pub struct RunnerPool<P: VmProvider = SmolVmProvider> {
     provider: Arc<P>,
     config: RunnerPoolConfig,
+    /// The funnel every golden GitHub and registry call is admitted through:
+    /// the engine's shared one when [`RunnerPoolConfig::github`] carries it,
+    /// a private one otherwise.
+    github: GithubFunnel,
 }
 
 /// Pull `images` into a golden so every runner forked from it starts warm.
@@ -3843,6 +5143,7 @@ async fn prepare_fork_base<P: VmProvider + 'static>(
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
     shutdown: &CancellationToken,
+    github: &GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     // Adoption first: without it every engine restart repays the golden's full
     // build or unpack (tens of GB of storage writes) before the first job.
@@ -3866,7 +5167,7 @@ async fn prepare_fork_base<P: VmProvider + 'static>(
         ));
     }
     let prepared = if provider.capabilities().file_packs {
-        unpack_golden_pack(provider, config, golden, env_spec, shutdown).await
+        unpack_golden_pack(provider, config, golden, env_spec, shutdown, github).await
     } else {
         bake_golden_in_guest(provider, config, golden, env_spec).await
     };
@@ -3912,9 +5213,10 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
     shutdown: &CancellationToken,
+    github: &GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     let payload = artifact_payload(&config.artifact_stem, &env_spec.base);
-    ensure_golden_payload(provider, config, env_spec, &payload, shutdown).await?;
+    ensure_golden_payload(provider, config, env_spec, &payload, shutdown, github).await?;
     // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
     // launcher stub written at the payload stem. A downloaded release asset
     // IS the pack at the stem; a locally built golden leaves the pack in the
@@ -3939,6 +5241,15 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
             .collect(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        // The official runner pack has the known empty-state layout; any
+        // other pack is the operator's and keeps its packed container state.
+        role: if is_official_golden(&env_spec.base) {
+            MachineRole::OfficialPack
+        } else {
+            MachineRole::CustomPack
+        },
+        guest_volumes: None,
+        workload_init: None,
     };
     let unpacked: Result<(), OrchestratorError> = async {
         // Serialize the headroom check against the write that consumes it:
@@ -4090,7 +5401,14 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config, golden, true)?,
+        volumes: fork_base_volumes(
+            provider.as_ref(),
+            runner_volumes(
+                config,
+                golden,
+                !provider.capabilities().runner_bundle_carries_externals,
+            )?,
+        ),
         sockets: config
             .control_socket
             .iter()
@@ -4101,13 +5419,19 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
             .collect(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        role: MachineRole::Image,
+        guest_volumes: None,
+        workload_init: None,
     };
     provider.create(&spec).await?;
     provider.start(golden).await?;
     vm_telemetry_register(config, golden, "golden", Some(&spec));
     await_guest_ready(provider.as_ref(), golden).await?;
     prepare_rosetta_multiarch(provider.as_ref(), golden, false).await?;
-    apply_golden_contract(provider.as_ref(), config, golden).await?;
+    apply_golden_contract(provider.as_ref(), config, golden, &env_spec.base).await?;
+    if provider.capabilities().runner_bundle_carries_externals {
+        link_runner_externals(provider.as_ref(), golden).await?;
+    }
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         warn!(
             machine = golden.as_str(),
@@ -4130,10 +5454,11 @@ async fn apply_golden_contract<P: VmProvider>(
     provider: &P,
     config: &RunnerPoolConfig,
     name: &MachineName,
+    base: &str,
 ) -> Result<(), OrchestratorError> {
     let user = config.runner_user.as_deref().unwrap_or(DEFAULT_RUNNER_USER);
     let uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
-    let contract = golden_contract_script(user, uid);
+    let contract = golden_contract_for_base(base, user, uid);
     let output = provider
         .exec(
             name,
@@ -4169,6 +5494,41 @@ async fn apply_golden_contract<P: VmProvider>(
     }
     Ok(())
 }
+/// AgentENV carries the externals inside the bundle volume. Point the runner
+/// root's conventional externals path at that tree instead of mounting a
+/// second volume under `/home/runner`, which envd cannot create reliably.
+async fn link_runner_externals<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+) -> Result<(), OrchestratorError> {
+    let command = format!(
+        "mkdir -p {root} && rm -rf {root}/externals && \
+         ln -s /opt/preloop/bin/externals {root}/externals",
+        root = RUNNER_ROOT
+    );
+    let output = provider
+        .exec(
+            name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                run_as_root_or_sudo_strict(&command),
+            ],
+        )
+        .await?;
+    if output.exit_code != 0 {
+        return Err(OrchestratorError::Config(format!(
+            "linking runner externals failed on {} (exit {}): {}",
+            name.as_str(),
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown error")
+        )));
+    }
+    Ok(())
+}
 
 /// Ensure the packed golden payload exists at `payload`.
 ///
@@ -4187,6 +5547,7 @@ async fn ensure_golden_payload<P: VmProvider + 'static>(
     env_spec: &EnvironmentSpec,
     payload: &Path,
     shutdown: &CancellationToken,
+    github: &GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     if payload.is_file() {
         return Ok(());
@@ -4197,7 +5558,7 @@ async fn ensure_golden_payload<P: VmProvider + 'static>(
     if is_official_golden(&env_spec.base) {
         abort_preparation_if_shutting_down(shutdown)?;
         info!(target = %payload.display(), "downloading the official golden");
-        return match download_prebaked_golden(config, payload).await {
+        return match download_prebaked_golden(config, payload, github).await {
             Ok(true) => Ok(()),
             Ok(false) => Err(OrchestratorError::Config(format!(
                 "the official golden could not be downloaded for {}: no OCI image at `{}` and no \
@@ -4258,6 +5619,12 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
         sockets: Vec::new(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        // This machine's root filesystem is about to be packed. Its container
+        // state must stay in the overlay `pack create` captures, never on a
+        // storage-disk directory the pack does not include.
+        role: MachineRole::Builder,
+        guest_volumes: None,
+        workload_init: None,
     };
     provider.create(&spec).await?;
     provider.start(&name).await?;
@@ -4265,13 +5632,72 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
         let _ = provider.delete(&name).await;
         return Err(error);
     }
-    if let Err(error) = apply_golden_contract(provider.as_ref(), config, &name).await {
+    if let Err(error) =
+        apply_golden_contract(provider.as_ref(), config, &name, &env_spec.base).await
+    {
         // A golden whose runner account is wrong cannot run a job: every step
         // fails on permissions, which reads as flaky CI. A gold build that
         // cannot satisfy the contract (no glibc loader, no way to escalate to
         // root) must not produce an artifact.
         let _ = provider.delete(&name).await;
         return Err(error);
+    }
+    // Apply the security pocket before packing. The rootfs is an upstream
+    // snapshot; this is the only place a golden picks up Ubuntu security
+    // fixes published after that snapshot, without waiting for the next
+    // upstream image rebuild and without a blanket `apt-get upgrade`.
+    let output = provider
+        .exec(
+            &name,
+            &[
+                "sudo".to_owned(),
+                "-n".to_owned(),
+                "sh".to_owned(),
+                "-c".to_owned(),
+                golden_security_update_script().to_owned(),
+            ],
+        )
+        .await?;
+    if output.exit_code != 0 {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "security update during golden bake failed (exit {}): {}",
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown")
+        )));
+    }
+    let manifest = provider
+        .exec(
+            &name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\n' | LC_ALL=C sort"
+                    .to_owned(),
+            ],
+        )
+        .await?;
+    if manifest.exit_code != 0 {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "reading the baked package manifest failed (exit {}): {}",
+            manifest.exit_code,
+            String::from_utf8_lossy(&manifest.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown")
+        )));
+    }
+    let manifest_path = PathBuf::from(format!("{}.apt-manifest.txt", payload.display()));
+    if let Err(error) = std::fs::write(&manifest_path, &manifest.stdout) {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "writing baked package manifest {} failed: {error}",
+            manifest_path.display()
+        )));
     }
     // Bake the externals *pointer*, not the externals: the packed rootfs
     // gets `<root>/externals -> /opt/preloop/bin/externals` so node rides
@@ -4342,11 +5768,41 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
     Ok(())
 }
 
+/// What an `OrphanPurge::All` sweep that outlived its deadline means to its
+/// caller.
+///
+/// `All` is the only scope that may kill a *live* hypervisor, so it is only
+/// ever used where nothing of ours can be running: pool startup and pool
+/// teardown ([`preloop_vm::purge_orphaned_vms`]). Those two moments differ in
+/// what an abandoned sweep costs, which is all this decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanPurgeDuty {
+    /// The pool is about to boot machines. The sweep is bounded per child now,
+    /// but a caller that stopped waiting cannot know it finished, and it kills
+    /// from a process table it read after that: a runner booted in the
+    /// meantime is in it. Do not serve on that.
+    BeforeServing,
+    /// The pool is stopping, and this process is going away with the sweep
+    /// thread. An unfinished sweep is worth a warning, not an error that turns
+    /// an intentional stop into a reported failure.
+    WhileStopping,
+}
+
 impl<P: VmProvider + 'static> RunnerPool<P> {
     /// Construct a runner pool.
     pub fn new(provider: Arc<P>, config: RunnerPoolConfig) -> Result<Self, OrchestratorError> {
         config.validate()?;
-        Ok(Self { provider, config })
+        // The engine hands the pool the same funnel its `AppState` uses, so a
+        // GitHub outage parked by the webhook path also refuses the golden
+        // lookup. A caller with no engine (a one-shot CLI bake, tests) gets a
+        // private funnel instead: every GitHub call is still admitted by a
+        // breaker, there is just nothing outside this pool to share it with.
+        let github = config.github.clone().unwrap_or_default();
+        Ok(Self {
+            provider,
+            config,
+            github,
+        })
     }
 
     /// Prepare the immutable runner image once, then supervise all slots until cancellation.
@@ -4361,6 +5817,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // "no runner can ever match these labels".
             ps.set_labels(self.config.labels.clone());
         }
+        // Maintenance the backend owns starts with the pool rather than with the
+        // first runner: a pool that only resumes machines it already has never
+        // reaches the paths that arm it lazily, and what it collects (AgentENV's
+        // superseded runner volumes) would then never be collected.
+        self.provider.start_maintenance();
         // Any error exit below (host externals, artifact prep, stale-machine
         // cleanup, golden bake) must clear the flag again; the guard is
         // disarmed once the warm completes.
@@ -4369,10 +5830,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             pool_status: self.config.pool_status.clone(),
             armed: true,
         };
-        ensure_host_externals(&self.config)?;
         // Every machine the phases below create before a shutdown is torn
         // down by `teardown`, so the cache exists from the first one on.
         let golden_cache = Arc::new(GoldenCache::new(self.config.name_prefix.clone()));
+        // A stop that arrives during the install must not wait out its
+        // 30-minute deadline: the install runs in its own process group, so
+        // dropping it here takes the shell, its `curl`, and its `tar` with it,
+        // and the next start redoes only what is still missing.
+        let Some(installed) = unless_shutdown(&shutdown, ensure_host_externals(&self.config)).await
+        else {
+            info!("shutdown during host externals install; stopping the pool");
+            return self.teardown(&golden_cache).await;
+        };
+        installed?;
         // A backend whose packs are not host files (AgentENV keeps them as
         // server-side snapshots) has no artifact to build, download, or
         // relocate: its golden is prepared directly from the base image by
@@ -4404,7 +5874,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             return Err(error);
         }
         self.sweep_stale_artifacts().await;
-        if let Err(error) = self.remove_stale_machines().await {
+        if let Err(error) = self
+            .remove_stale_machines(OrphanPurgeDuty::BeforeServing)
+            .await
+        {
             // A sweep that failed halfway may have left machines behind; give
             // the teardown a chance to finish the cleanup before reporting
             // the failure.
@@ -4461,6 +5934,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     &golden,
                     &environment,
                     &shutdown,
+                    &self.github,
                 ),
             )
             .await
@@ -4523,7 +5997,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // golden — so the host must fit one runner ceiling per slot. Sizing
         // down at startup is safer than OOMing mid-run;
         // `PRELOOP_RUNNER_POOL_SIZE` remains an explicit override that wins.
-        let warm_size = match host_memory_mib() {
+        let warm_size = match host_memory_mib().await {
             Some(total) => self
                 .config
                 .size
@@ -4559,6 +6033,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let slot_shutdown = shutdown.child_token();
             let slot_registry = golden_cache.clone();
             let slot_budget = golden_budget.clone();
+            let slot_github = self.github.clone();
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
@@ -4574,6 +6049,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_registry,
                     slot_budget,
                     slot_handles,
+                    slot_github,
                 )
                 .await
             });
@@ -4642,7 +6118,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 );
             }
         }
-        self.remove_stale_machines().await
+        self.remove_stale_machines(OrphanPurgeDuty::WhileStopping)
+            .await
     }
 
     /// Golden slots the host can still afford alongside `runners` live VMs.
@@ -4653,7 +6130,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
     /// left is what another environment may bake into. A host whose memory
     /// cannot be read keeps the previous unbounded behaviour.
     async fn golden_budget(&self, runners: usize, golden_cache: &GoldenCache) -> GoldenBudget {
-        let Some(total) = host_memory_mib() else {
+        let Some(total) = host_memory_mib().await else {
             return GoldenBudget::unbounded();
         };
         let capacity = host_vm_capacity(total, u64::from(self.config.memory_mib));
@@ -4690,7 +6167,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // and OOM the whole control plane. Reserve the golden's memory
             // plus host headroom, then fit the remainder with per-runner
             // ceilings. A host we cannot measure falls back to CPU-only.
-            match host_memory_mib() {
+            match host_memory_mib().await {
                 Some(total) => by_cpu.min(on_demand_memory_cap(
                     total,
                     u64::from(self.config.memory_mib),
@@ -4758,6 +6235,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let permit_slot = Arc::new(std::sync::Mutex::new(Some(permit)));
             let slot_semaphore = semaphore.clone();
             let slot_budget = golden_budget.clone();
+            let slot_github = self.github.clone();
 
             slots.spawn(async move {
                 let result = run_on_demand_slot(
@@ -4770,6 +6248,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_handles,
                     slot_semaphore,
                     permit_slot,
+                    slot_github,
                 )
                 .await;
                 if let Err(error) = &result {
@@ -4850,7 +6329,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
     ) -> Result<(), OrchestratorError> {
         let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
         let payload = self.config.artifact_payload();
-        ensure_golden_payload(&self.provider, &self.config, &env_spec, &payload, shutdown).await
+        ensure_golden_payload(
+            &self.provider,
+            &self.config,
+            &env_spec,
+            &payload,
+            shutdown,
+            &self.github,
+        )
+        .await
     }
 
     /// Delete every machine this pool owns that the startup adoption path
@@ -4905,7 +6392,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         Ok(())
     }
 
-    async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
+    /// Sweep the machines a previous engine left behind, then the hypervisors
+    /// and layer mounts they orphaned.
+    ///
+    /// `purge_duty` decides what an unfinished `All` orphan purge means to the
+    /// caller; see [`OrphanPurgeDuty`].
+    async fn remove_stale_machines(
+        &self,
+        purge_duty: OrphanPurgeDuty,
+    ) -> Result<(), OrchestratorError> {
         self.remove_stale_runner_machines().await?;
         // A crashed server orphans its detached `_boot-vm` hypervisor
         // processes; when the data dir was cleaned out from under them the
@@ -4916,11 +6411,38 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // nothing of ours can be running. The periodic reconcile the pool
         // runs while serving uses `RemovedDataDir`, which spares any process
         // whose boot config still exists.
-        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All, &self.config.paths) {
-            Ok(killed) if killed > 0 => {
+        // The closure runs on the blocking pool, where `&self` cannot
+        // outlive the call: the path config is the only input it needs.
+        let paths = self.config.paths.clone();
+        match deadline::run_blocking(
+            HOST_CLEANUP_TIMEOUT,
+            "orphaned hypervisor purge",
+            move || preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All, &paths),
+        )
+        .await
+        {
+            Ok(Ok(killed)) if killed > 0 => {
                 info!(killed, "purged orphaned SmolVM hypervisor processes")
             }
-            _ => {}
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "orphaned hypervisor purge failed"),
+            // `All` kills every hypervisor under this home, so a sweep this
+            // caller stopped waiting for is still a sweep that will kill: it
+            // reads the process table *after* the wait gave up, and a machine
+            // booted in the meantime is in that table. Continuing into machine
+            // creation would hand it exactly that.
+            Err(error) => match purge_duty {
+                OrphanPurgeDuty::BeforeServing => {
+                    return Err(OrchestratorError::Pool(format!(
+                        "orphaned hypervisor purge did not finish, so the host's hypervisor \
+                         state is unknown and an `All` sweep still running would kill the \
+                         runners booted next: {error}"
+                    )));
+                }
+                OrphanPurgeDuty::WhileStopping => {
+                    warn!(%error, "orphaned hypervisor purge abandoned")
+                }
+            },
         }
         // Killing a hypervisor releases its storage but not its layer mount:
         // the `pack/layers-cs` sparseimage stays attached to the host, and
@@ -4929,23 +6451,43 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // hypervisor just died is collectable in the same pass. A mount whose
         // hypervisor is still alive is skipped (a spared golden), and
         // `hdiutil` refuses a busy volume, so a running machine is safe.
-        match preloop_vm::detach_orphaned_layer_mounts(&self.config.paths) {
-            Ok(detached) if detached > 0 => {
+        // The blocking closure owns its inputs for the same reason.
+        let mount_paths = self.config.paths.clone();
+        match deadline::run_blocking(
+            HOST_CLEANUP_TIMEOUT,
+            "orphaned layer-mount detach",
+            move || preloop_vm::detach_orphaned_layer_mounts(&mount_paths),
+        )
+        .await
+        {
+            Ok(Ok(detached)) if detached > 0 => {
                 info!(detached, "detached orphaned SmolVM layer mounts")
             }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "orphaned layer-mount detach failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "orphaned layer-mount detach failed"),
+            Err(error) => warn!(%error, "orphaned layer-mount detach abandoned"),
         }
         // The registry sweep above cannot see a machine whose registry row is
         // gone but whose data dir survived (smolvm's delete drops the row
         // first; a failed remove_dir_all or a crashed engine strands the
-        // files). Reconcile the filesystem against the registry.
-        match self.provider.sweep_orphaned_data_dirs().await {
-            Ok(swept) if swept > 0 => {
+        // files). Reconcile the filesystem against the registry, bounded like
+        // every other step here: the sweep walks the data roots and can shell
+        // out per machine.
+        match tokio::time::timeout(
+            HOST_CLEANUP_TIMEOUT,
+            self.provider.sweep_orphaned_data_dirs(),
+        )
+        .await
+        {
+            Ok(Ok(swept)) if swept > 0 => {
                 info!(swept, "removed orphaned machine data directories")
             }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "orphaned data-dir sweep failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(%error, "orphaned data-dir sweep failed"),
+            Err(_) => warn!(
+                deadline = ?HOST_CLEANUP_TIMEOUT,
+                "orphaned data-dir sweep abandoned at its deadline"
+            ),
         }
         self.sweep_pack_intermediates().await;
         Ok(())
@@ -5164,9 +6706,10 @@ async fn notify_runner_gone(config: &RunnerPoolConfig, name: &MachineName) {
         "{}/api/v1/runners/purge",
         config.server_url.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1500))
-        .build()
+    let client = match preloop_runner_server::shared_http::with_tls_roots(
+        reqwest::Client::builder().timeout(std::time::Duration::from_millis(1500)),
+    )
+    .build()
     {
         Ok(client) => client,
         Err(_) => return,
@@ -5400,6 +6943,14 @@ const DEBUG_SUSPEND_IDLE: Duration = Duration::from_secs(15);
 /// probe cadence bounds it, and one exec per interval per active machine is
 /// negligible against the guest work happening anyway.
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// A closed private funnel for tests that drive the golden download path
+/// directly: every request is admitted exactly as it was before the breaker
+/// existed, and one test's breaker state never leaks into another's.
+#[cfg(test)]
+fn test_github() -> GithubFunnel {
+    GithubFunnel::default()
+}
+
 /// Watch a machine's guest pause marker and release its pool concurrency
 /// permit for the duration of a debug-session pause.
 ///
@@ -5632,6 +7183,7 @@ async fn resolve_slot_environment<P: VmProvider + 'static>(
     golden_cache: &Arc<GoldenCache>,
     golden_budget: &GoldenBudget,
     shutdown: &CancellationToken,
+    github: &GithubFunnel,
 ) -> Result<SlotEnvironment, OrchestratorError> {
     if !config.use_fork {
         // create-per-runner path: no golden, provision fresh each time.
@@ -5673,7 +7225,7 @@ async fn resolve_slot_environment<P: VmProvider + 'static>(
                     name_prefix,
                     &fp[..12.min(fp.len())]
                 ))?;
-                prepare_fork_base(&provider, &config, &name, &env_spec, shutdown).await?;
+                prepare_fork_base(&provider, &config, &name, &env_spec, shutdown, github).await?;
                 Ok(name)
             }
         })
@@ -5721,6 +7273,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     handles: PoolHandles,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    github: GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     // Mirror `run_slot`: once the packed golden is known-unusable, on-demand
     // slots must not attempt another environment-golden bake either — fall
@@ -5741,7 +7294,14 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     // Resolve the golden for the queued job's environment.
     let Some(resolved) = unless_shutdown(
         &shutdown,
-        resolve_slot_environment(&provider, &config, &golden_cache, &golden_budget, &shutdown),
+        resolve_slot_environment(
+            &provider,
+            &config,
+            &golden_cache,
+            &golden_budget,
+            &shutdown,
+            &github,
+        ),
     )
     .await
     else {
@@ -5829,6 +7389,9 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     result
 }
 
+// Mirrors `run_on_demand_slot`'s argument list: the slot needs its own copy of
+// every shared handle plus the funnel the golden lookups go through.
+#[allow(clippy::too_many_arguments)]
 async fn run_slot<P: VmProvider + 'static>(
     provider: Arc<P>,
     config: RunnerPoolConfig,
@@ -5837,6 +7400,7 @@ async fn run_slot<P: VmProvider + 'static>(
     golden_cache: Arc<GoldenCache>,
     golden_budget: GoldenBudget,
     handles: PoolHandles,
+    github: GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     let PoolHandles {
         idle,
@@ -5866,7 +7430,14 @@ async fn run_slot<P: VmProvider + 'static>(
         // half-baked machine with the rest.
         let Some(resolution) = unless_shutdown(
             &shutdown,
-            resolve_slot_environment(&provider, &config, &golden_cache, &golden_budget, &shutdown),
+            resolve_slot_environment(
+                &provider,
+                &config,
+                &golden_cache,
+                &golden_budget,
+                &shutdown,
+                &github,
+            ),
         )
         .await
         else {
@@ -6709,14 +8280,42 @@ async fn provision_runner<P: VmProvider + 'static>(
     keys: &Arc<KeyPool>,
     environment: &RunnerEnvironment,
 ) -> Result<Vec<String>, OrchestratorError> {
+    // The environment the slot actually serves, not the pool's configured
+    // default: a queued job's `runs-on` labels can select a different golden.
+    // The residue/hosted-adaptation policy must follow that base so a custom
+    // image is never normalized with the official image's rules (or vice
+    // versa) just because the pool default is different.
+    let residue = golden_residue_policy(&environment.base);
     // Every runner is a fork of the pool's golden. There is no backup path that
     // boots a raw image: such a machine carries neither the published golden's
     // contents nor the contract this pool baked, so it would register as a
     // runner that cannot run the job it was created for. A fork that cannot be
     // recovered here is an error, and the slot retries it with backoff.
+    let fork_volumes = match golden {
+        Some(_)
+            if !provider
+                .capabilities()
+                .fork_bases_may_mount_read_only_volumes =>
+        {
+            runner_volumes(
+                config,
+                name,
+                !provider.capabilities().runner_bundle_carries_externals,
+            )?
+        }
+        _ => Vec::new(),
+    };
     let forked_golden = match golden {
-        Some(golden) => match provider.fork(golden, name).await {
-            Ok(()) => Some(golden),
+        Some(golden) => match provider
+            .fork_with_volumes(golden, name, &fork_volumes)
+            .await
+        {
+            Ok(()) => {
+                if provider.capabilities().runner_bundle_carries_externals {
+                    link_runner_externals(provider.as_ref(), name).await?;
+                }
+                Some(golden)
+            }
             Err(error) if managed_golden(config, golden) => {
                 if fork_base_unusable(&error) {
                     // The base is spent. Re-arm it atomically with forking:
@@ -6734,8 +8333,16 @@ async fn provision_runner<P: VmProvider + 'static>(
                     match provider.rearm_fork_base(golden, Some(name)).await {
                         Ok(true) => {
                             info!(golden = golden.as_str(), "golden fork base re-armed");
-                            match provider.fork(golden, name).await {
-                                Ok(()) => Some(golden),
+                            match provider
+                                .fork_with_volumes(golden, name, &fork_volumes)
+                                .await
+                            {
+                                Ok(()) => {
+                                    if provider.capabilities().runner_bundle_carries_externals {
+                                        link_runner_externals(provider.as_ref(), name).await?;
+                                    }
+                                    Some(golden)
+                                }
                                 Err(retry_error) => {
                                     error!(
                                         machine = name.as_str(),
@@ -6795,8 +8402,16 @@ async fn provision_runner<P: VmProvider + 'static>(
                                 }
                             }
                             if rearmed {
-                                match provider.fork(golden, name).await {
-                                    Ok(()) => Some(golden),
+                                match provider
+                                    .fork_with_volumes(golden, name, &fork_volumes)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        if provider.capabilities().runner_bundle_carries_externals {
+                                            link_runner_externals(provider.as_ref(), name).await?;
+                                        }
+                                        Some(golden)
+                                    }
                                     Err(retry_error) => {
                                         error!(
                                             machine = name.as_str(),
@@ -6849,8 +8464,14 @@ async fn provision_runner<P: VmProvider + 'static>(
                             error = %last_error,
                             "golden fork failed; retrying the fork"
                         );
-                        match provider.fork(golden, name).await {
+                        match provider
+                            .fork_with_volumes(golden, name, &fork_volumes)
+                            .await
+                        {
                             Ok(()) => {
+                                if provider.capabilities().runner_bundle_carries_externals {
+                                    link_runner_externals(provider.as_ref(), name).await?;
+                                }
                                 retried = Some(golden);
                                 break;
                             }
@@ -6913,7 +8534,11 @@ async fn provision_runner<P: VmProvider + 'static>(
             storage_gib: config.storage_gib,
             overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(config, name, !from_packed)?,
+            volumes: runner_volumes(
+                config,
+                name,
+                !from_packed && !provider.capabilities().runner_bundle_carries_externals,
+            )?,
             sockets: config
                 .control_socket
                 .iter()
@@ -6924,13 +8549,28 @@ async fn provision_runner<P: VmProvider + 'static>(
                 .collect(),
             dns: config.dns.clone(),
             rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+            // A direct create from the packed artifact is a runtime pack with
+            // the source's state policy. Without a pack it boots the image and
+            // gets no pack launch defaults.
+            role: if !from_packed {
+                MachineRole::Image
+            } else if is_official_golden(&environment.base) {
+                MachineRole::OfficialPack
+            } else {
+                MachineRole::CustomPack
+            },
+            guest_volumes: None,
+            workload_init: None,
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
         vm_telemetry_register(config, name, "runner", Some(&spec));
         if !from_packed {
             await_guest_ready(provider.as_ref(), name).await?;
-            apply_golden_contract(provider.as_ref(), config, name).await?;
+            apply_golden_contract(provider.as_ref(), config, name, &environment.base).await?;
+            if provider.capabilities().runner_bundle_carries_externals {
+                link_runner_externals(provider.as_ref(), name).await?;
+            }
         }
     }
 
@@ -6945,32 +8585,50 @@ async fn provision_runner<P: VmProvider + 'static>(
     // reason: the guest enters the job workload through the exec channel, so
     // the image's `/etc/sysctl.*` (no init reads them) and its hostname setup
     // (the fork's name is decided after the bake) never applied, and jobs ran
-    // against kernel defaults and a hostname that resolved nowhere. See
-    // [`guest_hosted_runtime_init_script`] for what each half covers; a
-    // machine that already matches pays one exec round trip and no writes.
+    // against kernel defaults and a hostname that resolved nowhere. A Preserve
+    // base runs only the hostname half; its sysctl and resolver policy are its
+    // own. See [`guest_hosted_runtime_init_script`] for what each half covers;
+    // a machine that already matches pays one exec round trip and no writes.
     {
-        let script = guest_hosted_runtime_init_script();
+        let script = guest_hosted_runtime_init_script(residue);
         let output = provider
             .exec(name, &["sh".to_owned(), "-c".to_owned(), script])
             .await?;
         if output.exit_code != 0 {
+            let expectation = match residue {
+                GoldenResiduePolicy::Clean => format!(
+                    "reach GitHub's hosted sysctls ({}) and resolve its own hostname to \
+                     an address of this machine",
+                    GITHUB_GUEST_SYSCTLS
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                GoldenResiduePolicy::Preserve => {
+                    "resolve its own hostname to an address of this machine".to_owned()
+                }
+            };
             return Err(OrchestratorError::Config(format!(
                 "hosted runtime init failed on {} (exit {}): {} — the machine must \
-                 reach GitHub's hosted sysctls ({}) and resolve its own hostname to \
-                 an address of this machine, or jobs run against a different \
-                 environment than a hosted runner's",
+                 {expectation}, or jobs run against a different environment than a \
+                 hosted runner's",
                 name.as_str(),
                 output.exit_code,
                 String::from_utf8_lossy(&output.stderr)
                     .lines()
                     .last()
                     .unwrap_or("unknown"),
-                GITHUB_GUEST_SYSCTLS
-                    .iter()
-                    .map(|(key, value)| format!("{key}={value}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
             )));
+        }
+        // Each half reports what it did (or why it skipped) on stderr and exits
+        // 0 either way, so a no-op is only observable if it is logged.
+        for line in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .chain(String::from_utf8_lossy(&output.stderr).lines())
+            .filter(|line| !line.trim().is_empty())
+        {
+            info!(machine = name.as_str(), "hosted runtime init: {line}");
         }
     }
 
@@ -7098,7 +8756,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     }
 
     let configure_result = provider
-        .exec_with_secret_env(name, &as_runner_user(config, &configure), &secrets)
+        .exec_with_secret_env(name, &as_runner_user(config, &configure, residue), &secrets)
         .await;
     drop(staged);
     if configure_result.is_err()
@@ -7127,16 +8785,21 @@ async fn provision_runner<P: VmProvider + 'static>(
         "--runner-root".into(),
         RUNNER_ROOT.into(),
     ]);
-    Ok(as_runner_user(config, &run))
+    Ok(as_runner_user(config, &run, residue))
 }
 
-/// Wrap a guest argv so it launches on the hosted process limits without
-/// switching accounts.
+/// Wrap a guest argv with the launch prelude for a launch that keeps its
+/// identity: under [`GoldenResiduePolicy::Clean`], the resolver step
+/// ([`guest_resolver_stub_script`]), then the hosted limits. The account branch
+/// of [`as_runner_user`] runs the same resolver step inside its root-only
+/// provisioning; this is its root branch. Under
+/// [`GoldenResiduePolicy::Preserve`] the resolver is the image's own policy
+/// and only the limits are added.
 ///
 /// The `runner_user`-less and `runner_user: root` launches keep their identity
 /// (the exec channel's user — root, or the image's own `USER`); only the
-/// limits are added. The wrapped argv travels as the shell's positional
-/// parameters (`sh -c '<raise>; exec "$@"' sh <argv…>`), so nothing is
+/// prelude is added. The wrapped argv travels as the shell's positional
+/// parameters (`sh -c '<prelude>; exec "$@"' sh <argv…>`), so nothing is
 /// re-quoted and the launch stays byte-identical after the wrapper: a
 /// mis-quoted argument cannot corrupt a step command, and the exec records
 /// the pool's tests read still carry the original argv.
@@ -7144,12 +8807,20 @@ async fn provision_runner<P: VmProvider + 'static>(
 /// Neither half can assume root here: raising a hard limit needs it, so the
 /// launch keeps whatever it inherited — with a line on stderr saying which
 /// limit stayed — rather than failing ([`GUEST_STACK_ULIMIT_BEST_EFFORT`],
-/// [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`]). A root exec reaches the hosted pairs.
-fn with_guest_hosted_limits(argv: &[String]) -> Vec<String> {
+/// [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`]). The resolver step has the same shape:
+/// a non-root exec cannot write `/etc/resolv.conf` and says so on stderr. A root
+/// exec reaches the hosted pairs and the stub.
+fn with_guest_launch_prelude(argv: &[String], policy: GoldenResiduePolicy) -> Vec<String> {
+    let resolver = match policy {
+        GoldenResiduePolicy::Clean => format!("{}; ", guest_resolver_stub_script()),
+        GoldenResiduePolicy::Preserve => String::new(),
+    };
     let mut wrapped = vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        format!("{GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""),
+        format!(
+            "{resolver}{GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""
+        ),
         "sh".to_owned(),
     ];
     wrapped.extend_from_slice(argv);
@@ -7162,7 +8833,11 @@ fn with_guest_hosted_limits(argv: &[String]) -> Vec<String> {
 /// `setpriv` and export the account identity for the step-environment
 /// contract (USER/LOGNAME/XDG_RUNTIME_DIR are derived from it by the
 /// worker). Purely a guest-side concern — never applied on the host.
-fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
+fn as_runner_user(
+    config: &RunnerPoolConfig,
+    argv: &[String],
+    policy: GoldenResiduePolicy,
+) -> Vec<String> {
     // Unset or root means no account switch, not no limits: the guest applies
     // neither the image's systemd nor its PAM limits on this path either, so
     // the runner would keep the VM init's 8192 KiB stack — and the exec
@@ -7170,10 +8845,10 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // launch is wrapped instead of replaced — the exec channel's identity
     // (root, or the image user) stays exactly as it was.
     let Some(user) = &config.runner_user else {
-        return with_guest_hosted_limits(argv);
+        return with_guest_launch_prelude(argv, policy);
     };
     if user == "root" {
-        return with_guest_hosted_limits(argv);
+        return with_guest_launch_prelude(argv, policy);
     }
     let uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
     let home = format!("/home/{user}");
@@ -7207,9 +8882,22 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // Per launch: re-add the runner to kvm after docker, and re-assert the device
     // grant, so a golden that lost either still gives every job's steps the group
     // and the node.
+    //
+    // Per launch too, under the Clean policy: the resolver stub. The agent
+    // re-points a persistent container's `/etc/resolv.conf` at the gateway
+    // before every interactive run starts (`storage::prepare_for_run_persistent`
+    // → `refresh_overlay_resolver`), and this launch and the configure exec are
+    // both interactive, so a stub the runtime init wrote is gone before any job
+    // step runs. The write has to come after that refresh, so it lives here, at
+    // the head of the root-only provisioning every launch runs before it drops
+    // privileges. A Preserve base keeps its own resolver: no step is written.
     let kvm_access = runner_kvm_access_script(user, "/dev/kvm");
+    let resolver = match policy {
+        GoldenResiduePolicy::Clean => format!("{}; ", guest_resolver_stub_script()),
+        GoldenResiduePolicy::Preserve => String::new(),
+    };
     let provisioning = format!(
-        "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; \
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; {resolver}\
          getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null || true; \
          mkdir -p /etc/sudoers.d; \
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} 2>/dev/null \
@@ -8244,7 +9932,7 @@ chmod +x "$dest/bin/node"
     /// launcher sources `/etc/environment` before handing over, so the PATH a
     /// hosted step shell would get is the PATH a step here gets. The curated
     /// Rust/Go bakes that used to justify host-side toolchain entries are
-    /// gone, so the pool's own list stays a system default and nothing
+    /// gone, so the pool's own list stays a fallback and nothing
     /// exports a Rust home.
     #[test]
     fn runner_env_comes_from_the_image_environment_file() {
@@ -8256,30 +9944,40 @@ chmod +x "$dest/bin/node"
         assert_eq!(argv[1], "-c");
         let launcher = &argv[2];
         assert!(
-            launcher.contains(". /etc/environment"),
+            launcher.contains(". '/etc/environment'"),
             "the image's environment must be sourced: {launcher}"
+        );
+        assert!(
+            launcher.contains("set -a; . '/etc/environment'; set +a"),
+            "the image's entries must be *exported*, not left shell-local: {launcher}"
         );
         assert!(
             launcher.contains("exec /usr/bin/env"),
             "the pool's variables must survive the source: {launcher}"
         );
+        // PATH is not an entry `env` re-asserts over the image's value: the
+        // launcher decides it after the source, so an image PATH survives and
+        // the pool's list is only the fallback for an image without one.
+        assert!(
+            !launcher.contains(&format!("PATH={}", guest_runner_path(&config))),
+            "the fallback PATH must not be handed to `env` as an assignment: {launcher}"
+        );
+        assert!(
+            launcher.contains(&format!(
+                "[ -n \"$PATH\" ] || PATH='{}'",
+                guest_runner_path(&config)
+            )),
+            "the fallback PATH must be the empty-PATH branch: {launcher}"
+        );
         // The `KEY=value` words after the launcher are the runner's
         // environment, so the entries the assertions below read are exactly
         // what `env` applies.
-        assert_eq!(
-            &argv[3],
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        );
-        assert_eq!(argv[4], format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
+        assert_eq!(argv[3], format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
 
         let env = guest_env_entries(&config, &name);
-        let path = env
-            .iter()
-            .find_map(|entry| entry.strip_prefix("PATH="))
-            .expect("the runner is launched with a PATH");
-        assert_eq!(
-            path,
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        assert!(
+            !env.iter().any(|entry| entry.starts_with("PATH=")),
+            "PATH belongs to the launcher, not to the pool's entries: {env:?}"
         );
         for absent in [
             "/usr/local/cargo/bin",
@@ -8288,10 +9986,81 @@ chmod +x "$dest/bin/node"
             "CARGO_HOME=",
         ] {
             assert!(
-                !path.contains(absent) && !env.iter().any(|entry| entry.starts_with(absent)),
+                !env.iter().any(|entry| entry.starts_with(absent)),
                 "the curated toolchain contract is deleted; {absent} must not be exported: {env:?}"
             );
         }
+    }
+
+    /// Run the generated launcher for real, against a scratch environment file
+    /// standing in for `/etc/environment`, with an empty inherited environment
+    /// (`env -i`): the child is `/usr/bin/env`, so its stdout *is* the
+    /// environment a guest runner would start with.
+    ///
+    /// This is the measured parity gap, not a text assertion: sourcing without
+    /// `set -a` left the image's `ImageOS`/`LANG`/… unexported, and
+    /// `exec /usr/bin/env PATH=<fallback>` replaced the image PATH, making
+    /// installed tools unreachable.
+    #[cfg(unix)]
+    #[test]
+    fn runner_launcher_exports_the_image_environment_and_keeps_its_path() {
+        let config = test_config(false);
+        let name = MachineName::new("runner").unwrap();
+
+        let child_env = |contents: &str| -> std::collections::HashMap<String, String> {
+            let temp = tempfile::tempdir().unwrap();
+            let environment_file = temp.path().join("environment");
+            std::fs::write(&environment_file, contents).unwrap();
+
+            let mut argv = guest_env_prefix_at(&config, &name, environment_file.to_str().unwrap());
+            // The program `env` execs: it prints the environment it received.
+            argv.push("/usr/bin/env".to_owned());
+            let output = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .env_clear()
+                .output()
+                .expect("the launcher shell must run");
+            assert!(
+                output.status.success(),
+                "the launcher failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect()
+        };
+
+        // (a) The image's PATH survives, pipx-bin-like entry and all.
+        let image_path = "/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/usr/bin";
+        let env = child_env(&format!("PATH={image_path}\n"));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(image_path),
+            "the image's PATH must reach the runner: {env:?}"
+        );
+
+        // (b) An image with no PATH falls back to the pool's system default.
+        let env = child_env("LANG=C.UTF-8\n");
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(guest_runner_path(&config).as_str()),
+            "an image without a PATH keeps the fallback: {env:?}"
+        );
+
+        // (c) Every entry the image declares is exported, and the pool's own
+        // variables still win over the image's.
+        let env = child_env(
+            "foo=bar\nImageOS=ubuntu24\nPATH=/opt/pipx_bin:/usr/bin\nPRELOOP_MACHINE_NAME=clobbered\n",
+        );
+        assert_eq!(env.get("foo").map(String::as_str), Some("bar"));
+        assert_eq!(env.get("ImageOS").map(String::as_str), Some("ubuntu24"));
+        assert_eq!(
+            env.get("PRELOOP_MACHINE_NAME").map(String::as_str),
+            Some(name.as_str()),
+            "a malformed environment file must not unset the pool's variables: {env:?}"
+        );
     }
 
     #[test]
@@ -8314,7 +10083,11 @@ chmod +x "$dest/bin/node"
     /// runner account everything it writes.
     #[test]
     fn golden_contract_requires_glibc_and_hands_over_the_runner_paths() {
-        let contract = golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID);
+        let contract = golden_contract_script(
+            DEFAULT_RUNNER_USER,
+            DEFAULT_RUNNER_UID,
+            GoldenResiduePolicy::Clean,
+        );
         assert!(
             contract.contains("/lib64/ld-linux-*.so.*"),
             "the glibc loader probe must be part of the contract: {contract}"
@@ -8325,7 +10098,7 @@ chmod +x "$dest/bin/node"
         );
         assert!(contract.contains("NOPASSWD"), "{contract}");
         assert!(
-            contract.contains("/home/runner/_work") && contract.contains("mkdir -p"),
+            contract.contains("/home/runner/work") && contract.contains("mkdir -p"),
             "{contract}"
         );
         assert!(
@@ -8868,6 +10641,7 @@ done
             "127.0.0.1 localhost\n\
              10.1.0.59 runnervm.bnlheokxlokujiv1ylew4udf0c.gx.internal.cloudapp.net runnervmvrwv9\n\
              10.1.0.60 localhost runnervmvrwv9\n\
+             10.20.30.40\tinternal-api.example\n\
              # a comment that mentions runnervmvrwv9\n",
         )
         .unwrap();
@@ -8925,10 +10699,11 @@ done
             "127.0.0.1 localhost\n\
              10.1.0.59 runnervm.bnlheokxlokujiv1ylew4udf0c.gx.internal.cloudapp.net\n\
              10.1.0.60 localhost\n\
+             10.20.30.40\tinternal-api.example\n\
              # a comment that mentions runnervmvrwv9\n\
              127.0.0.1 runnervmvrwv9\n",
             "the machine's name must leave the foreign mapping, other names and \
-             comments untouched"
+             comments untouched; an unrelated custom alias keeps its exact bytes"
         );
         let after = std::process::Command::new("/bin/sh")
             .args(["-c", "getent hosts \"$(hostname)\""])
@@ -9001,29 +10776,37 @@ done
     /// the contract: the hostname half first (the sysctl half escalates
     /// through passwordless sudo, which resolves the hostname on every
     /// invocation — with a stale mapping it would print
-    /// `sudo: unable to resolve host` into the apply's stderr), each half in
-    /// its own subshell (either half's early `exit 0` must not skip the
-    /// other), and `set -e` so a half that fails fails provisioning.
+    /// `sudo: unable to resolve host` into the apply's stderr), the CA half
+    /// after the sysctls, and the resolver half last (it must run after the
+    /// guest agent settled the network), each half in its own subshell (either
+    /// half's early `exit 0` must not skip the others), and `set -e` so a half
+    /// that fails fails provisioning.
     #[test]
     fn hosted_runtime_init_orders_the_hostname_before_the_sysctls() {
-        let script = guest_hosted_runtime_init_script();
+        let script = guest_hosted_runtime_init_script(GoldenResiduePolicy::Clean);
         let hostname = script
             .find("host=$(hostname")
             .unwrap_or_else(|| panic!("the init must resolve the machine's name: {script}"));
         let sysctl = script
             .find("guest sysctls already match the hosted image")
             .unwrap_or_else(|| panic!("the init must apply the hosted sysctls: {script}"));
+        let ca = script
+            .find("disabled revoked eMudhra CA roots")
+            .unwrap_or_else(|| panic!("the init must disable the revoked CA roots: {script}"));
+        let resolver = script
+            .find("prs_conf=")
+            .unwrap_or_else(|| panic!("the init must point the resolver at the stub: {script}"));
         assert!(
-            hostname < sysctl,
-            "the hostname half must run first: {script}"
+            hostname < sysctl && sysctl < ca && ca < resolver,
+            "the hostname half first, the CA half after the sysctls, and the resolver half last: {script}"
         );
         assert!(
             script.starts_with("set -e; ("),
             "each half must be its own subshell under set -e: {script}"
         );
         assert!(
-            script.contains("); ( "),
-            "the two halves must be separate subshells: {script}"
+            script.matches("); ( ").count() == 3,
+            "the four halves must be separate subshells: {script}"
         );
         // Each half's early exit lives inside its own subshell, so neither
         // can end the other's half.
@@ -9035,9 +10818,44 @@ done
             script.contains("guest sysctls already match the hosted image"),
             "the sysctl half's already-correct exit must stay in its subshell: {script}"
         );
+        assert!(
+            script.contains("already names the 127.0.0.53 stub resolver first"),
+            "the resolver half's already-correct exit must stay in its subshell: {script}"
+        );
         // The production roots, not a scratch path.
         assert!(script.contains("'/etc/hosts'"), "{script}");
         assert!(script.contains("root='/proc/sys'"), "{script}");
+        assert!(script.contains("prs_conf='/etc/resolv.conf'"), "{script}");
+    }
+
+    /// The init must disable the roots revoked by the 2026-10-20 eMudhra
+    /// intermediate compromise; a golden that still anchors them lets a
+    /// forged leaf validate in every client that ignores revocation.
+    #[test]
+    fn hosted_runtime_init_disables_revoked_emudhra_roots() {
+        let script = guest_hosted_runtime_init_script(GoldenResiduePolicy::Clean);
+        for root in [
+            "mozilla/emSign_ECC_Root_CA_-_G3.crt",
+            "mozilla/Comodo_AAA_Services_root.crt",
+        ] {
+            assert!(script.contains(root), "missing {root}: {script}");
+        }
+        assert!(script.contains("update-ca-certificates"), "{script}");
+        assert!(
+            script.contains("sudo -n update-ca-certificates"),
+            "{script}"
+        );
+    }
+
+    /// Bake-time security updates are security-pocket only. A blanket
+    /// `apt-get upgrade` would also move packages the image deliberately
+    /// pins, so the script must stay on `unattended-upgrade`.
+    #[test]
+    fn golden_security_updates_use_unattended_upgrade_not_apt_upgrade() {
+        let script = golden_security_update_script();
+        assert!(script.contains("unattended-upgrade --verbose"), "{script}");
+        assert!(script.contains("-security"), "{script}");
+        assert!(!script.contains("apt-get upgrade"), "{script}");
     }
 
     /// The expected golden runtime lives in `official-image.toml`, and
@@ -9203,32 +11021,1446 @@ done
         );
     }
 
-    /// The composed init run end to end against scratch roots: the fork's own
-    /// name resolves and the sysctls reach the hosted values in one exec, and
-    /// a second run changes nothing. Textual order alone would not catch a
-    /// half whose `exit 0` swallows the other — this runs both halves in one
-    /// shell, the way provisioning does.
+    /// The bake host's own `/etc/hosts` mapping is the measured residue
+    /// (`10.1.0.59 runnervm…internal.cloudapp.net`), and it must not survive
+    /// into a golden: a name that resolves to an address which is not this
+    /// machine's is what every later `sudo` prints `unable to resolve host`
+    /// over. The standard local block — and a routable address that *does* name
+    /// this machine — has to survive untouched, and a second run must change
+    /// nothing.
     #[cfg(unix)]
     #[test]
-    fn hosted_runtime_init_applies_both_halves_in_one_run() {
+    fn golden_hosts_cleanup_drops_the_bake_host_and_keeps_local_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let host = String::from_utf8_lossy(
+            &std::process::Command::new("hostname")
+                .output()
+                .expect("hostname must run")
+                .stdout,
+        )
+        .trim()
+        .to_owned();
+        assert!(!host.is_empty(), "the fixture needs this machine's name");
+        let fixture = format!(
+            "127.0.0.1 localhost\n\
+             # The following lines are desirable for IPv6 capable hosts\n\
+             ::1     localhost ip6-localhost ip6-loopback\n\
+             fe00::0 ip6-localnet\n\
+             ff00::0 ip6-mcastprefix\n\
+             ff02::1 ip6-allnodes\n\
+             ff02::2 ip6-allrouters\n\
+             ff02::3 ip6-allhosts\n\
+             10.1.0.59 runnervmvrwv9.oibkqik1sgtutjdscjavv13dxh.gx.internal.cloudapp.net runnervmvrwv9\n\
+             127.0.1.1\tcpane-runner-golden\n\
+             10.9.9.9\t{host}\n"
+        );
+        std::fs::write(&hosts, &fixture).unwrap();
+        let script = golden_hosts_cleanup_script_at(hosts.to_str().unwrap());
+
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .expect("the cleanup shell must run")
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "the cleanup must not fail: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cleaned = std::fs::read_to_string(&hosts).unwrap();
+        assert!(
+            !cleaned.contains("runnervmvrwv9"),
+            "the bake host's mapping must be dropped: {cleaned}"
+        );
+        for kept in [
+            "127.0.0.1 localhost",
+            "::1     localhost ip6-localhost ip6-loopback",
+            "fe00::0 ip6-localnet",
+            "ff00::0 ip6-mcastprefix",
+            "ff02::1 ip6-allnodes",
+            "127.0.1.1\tcpane-runner-golden",
+        ] {
+            assert!(cleaned.contains(kept), "{kept} must survive: {cleaned}");
+        }
+        assert!(
+            cleaned.contains(&format!("10.9.9.9\t{host}")),
+            "a routable address naming this machine must survive: {cleaned}"
+        );
+
+        // Idempotent: the second run rewrites the same bytes.
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            cleaned,
+            "a re-run must not change the file"
+        );
+    }
+
+    /// The runner image is an Azure VM dump, so its `/etc/fstab` names disks a
+    /// SmolVM guest does not have — measured on the live fork: the root
+    /// `UUID=4fb3…`, a BOOT/EFI entry and `/dev/disk/cloud/azure_resource-part1`
+    /// (with swap) — and `systemd-remount-fs.service` fails `can't find
+    /// UUID=…` on every boot. The rule has to bite exactly on the devices this
+    /// guest cannot resolve and leave the image's real mounts alone, so the
+    /// fixture pins both sides: pseudo-filesystems, a resolvable UUID, a present
+    /// node and a present loop file survive; the stale UUIDs, the cloud
+    /// resource path, an absent node and an absent swap file are commented out
+    /// with their original text kept.
+    #[cfg(unix)]
+    #[test]
+    fn golden_fstab_cleanup_comments_only_unresolvable_devices() {
+        let temp = tempfile::tempdir().unwrap();
+        let fstab = temp.path().join("fstab");
+        let disk = temp.path().join("dev");
+        std::fs::create_dir_all(disk.join("disk/by-uuid")).unwrap();
+        // The one UUID, node and file this guest really has.
+        std::fs::write(disk.join("disk/by-uuid/1111-2222"), "").unwrap();
+        std::fs::write(disk.join("vdb"), "").unwrap();
+        std::fs::create_dir_all(temp.path().join("mnt")).unwrap();
+        std::fs::write(temp.path().join("mnt/data.img"), "").unwrap();
+        let present_file = temp.path().join("mnt/data.img");
+        let absent_swap = temp.path().join("mnt/swapfile");
+
+        let stale_uuid = "UUID=4fb3aaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let resource = "/dev/disk/cloud/azure_resource-part1";
+        let fixture = format!(
+            "# /etc/fstab: static file system information.\n\
+             #\n\
+             {stale_uuid} /        ext4 discard,errors=remount-ro 0 1\n\
+             {stale_uuid} /boot/efi vfat umask=0077               0 1\n\
+             UUID=1111-2222        /data     ext4 defaults        0 2\n\
+             {resource} /mnt     ext4 defaults,nofail     0 2\n\
+             /dev/vdb              /scratch  ext4 defaults        0 2\n\
+             /dev/vdc              /missing  ext4 defaults        0 2\n\
+             {absent_swap} none      swap sw                    0 0\n\
+             {present_file} /loop  ext4 loop                  0 0\n\
+             tmpfs                 /tmp      tmpfs defaults       0 0\n\
+             none                  /proc     proc defaults       0 0\n",
+            present_file = present_file.display(),
+            absent_swap = absent_swap.display(),
+        );
+        std::fs::write(&fstab, &fixture).unwrap();
+
+        let script = format!(
+            "set -e; {}",
+            golden_fstab_cleanup_script_at(fstab.to_str().unwrap(), disk.to_str().unwrap())
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .expect("the fstab cleanup shell must run")
+        };
+
+        let output = run();
+        assert!(
+            output.status.success(),
+            "the cleanup must not fail the bake: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cleaned = std::fs::read_to_string(&fstab).unwrap();
+        let absent_swap = absent_swap.display().to_string();
+        let present_file = present_file.display().to_string();
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("commented out 5 stale"),
+            "the report must name how many entries went: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        // Every unresolvable device is commented out, its original text kept.
+        for dropped in [
+            format!("# preloop: dropped stale fstab entry: {stale_uuid}"),
+            format!("# preloop: dropped stale fstab entry: {resource}"),
+            "# preloop: dropped stale fstab entry: /dev/vdc".to_owned(),
+            format!("# preloop: dropped stale fstab entry: {absent_swap}"),
+        ] {
+            assert!(
+                cleaned.contains(&dropped),
+                "{dropped} must be commented out: {cleaned}"
+            );
+        }
+        assert_eq!(
+            cleaned
+                .matches(&format!(
+                    "# preloop: dropped stale fstab entry: {stale_uuid}"
+                ))
+                .count(),
+            2,
+            "both the root and the BOOT/EFI entry name the same stale UUID: {cleaned}"
+        );
+        for kept_text in ["/boot/efi", "discard,errors=remount-ro", "defaults,nofail"] {
+            assert!(
+                cleaned
+                    .lines()
+                    .any(|line| line.starts_with("# preloop: dropped") && line.contains(kept_text)),
+                "a dropped entry keeps its own text ({kept_text}): {cleaned}"
+            );
+        }
+        assert_eq!(
+            cleaned
+                .matches("# preloop: dropped stale fstab entry:")
+                .count(),
+            5,
+            "exactly the unresolvable entries must go: {cleaned}"
+        );
+        // The image's real mounts and pseudo-filesystems stay real entries.
+        for kept in [
+            "# /etc/fstab: static file system information.",
+            "UUID=1111-2222",
+            "/dev/vdb",
+            present_file.as_str(),
+            "tmpfs",
+            "none",
+        ] {
+            assert!(
+                cleaned.lines().any(|line| line.starts_with(kept)),
+                "{kept} must survive as an entry: {cleaned}"
+            );
+        }
+        let leftovers: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+
+        // Idempotent: the commented entries are no longer entries, so a second
+        // bake rewrites nothing.
+        let output = run();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("has no stale entries"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(std::fs::read_to_string(&fstab).unwrap(), cleaned);
+        // An absent file warns without failing the bake.
+        std::fs::remove_file(&fstab).unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no writable"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The official contract carries the step; a custom base does not.
+        let official = golden_contract_script(
+            DEFAULT_RUNNER_USER,
+            DEFAULT_RUNNER_UID,
+            GoldenResiduePolicy::Clean,
+        );
+        assert!(
+            official.contains(&golden_fstab_cleanup_script_at("/etc/fstab", "/dev")),
+            "the official golden contract must carry the fstab cleanup"
+        );
+        assert!(
+            official.contains(&golden_hosts_cleanup_script_at("/etc/hosts")),
+            "the official golden contract must carry the hosts cleanup"
+        );
+    }
+
+    /// Only the official image is classified as cloud residue. A custom base
+    /// preserves both files unless its operator explicitly opts in; there is
+    /// no content-based guess (an address or hostname is not proof of Azure).
+    #[test]
+    fn residue_policy_follows_base_provenance() {
+        let official = crate::environment::OFFICIAL_GOLDEN;
+        let custom = "ghcr.io/acme/base@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        assert_eq!(
+            golden_residue_policy_with(official, false),
+            GoldenResiduePolicy::Clean
+        );
+        assert_eq!(
+            golden_residue_policy_with(official, true),
+            GoldenResiduePolicy::Clean,
+            "the official golden always cleans"
+        );
+        assert_eq!(
+            golden_residue_policy_with(custom, false),
+            GoldenResiduePolicy::Preserve,
+            "a custom base is preserved by default, including an Azure-looking one"
+        );
+        assert_eq!(
+            golden_residue_policy_with(custom, true),
+            GoldenResiduePolicy::Clean,
+            "the opt-in is the only way a custom base is cleaned"
+        );
+        assert_eq!(
+            golden_residue_policy_with("10.1.0.59.cloudapp.example", false),
+            GoldenResiduePolicy::Preserve,
+            "residue must never be inferred from an address or hostname"
+        );
+    }
+
+    #[test]
+    fn destructive_cleanup_requires_a_documented_positive_opt_in() {
+        for disabled in ["", "0", "false", "off", "no", "typo", "FALSE"] {
+            assert!(!clean_cloud_residue_enabled(disabled), "{disabled}");
+        }
+        for enabled in ["1", "true", "yes", "on", "  true  "] {
+            assert!(clean_cloud_residue_enabled(enabled), "{enabled}");
+        }
+    }
+
+    /// A custom base's `/etc/hosts` routable alias and its `/etc/fstab` entry
+    /// for a device that is not attached at bake time survive the bake byte for
+    /// byte. The same fixture run under the official policy proves the cleanup
+    /// would have removed them, so this is a policy gate rather than a fixture
+    /// that never exercised the cleanup.
+    #[cfg(unix)]
+    #[test]
+    fn custom_base_preserves_hosts_and_fstab_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let fstab = temp.path().join("fstab");
+        let disk = temp.path().join("dev");
+        std::fs::create_dir_all(&disk).unwrap();
+        let host = String::from_utf8_lossy(
+            &std::process::Command::new("hostname")
+                .output()
+                .expect("hostname must run")
+                .stdout,
+        )
+        .trim()
+        .to_owned();
+        assert!(!host.is_empty(), "the fixture needs this machine's name");
+        let custom_alias = "10.20.30.40 internal-api.example";
+        let stale_uuid = "UUID=4fb3aaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let hosts_fixture = format!(
+            "127.0.0.1 localhost\n\
+             10.9.9.9 {host}\n\
+             {custom_alias}\n"
+        );
+        let fstab_fixture = format!(
+            "# custom mounts\n\
+             {stale_uuid} /srv ext4 defaults 0 2\n\
+             tmpfs /tmp tmpfs defaults 0 0\n"
+        );
+        std::fs::write(&hosts, &hosts_fixture).unwrap();
+        std::fs::write(&fstab, &fstab_fixture).unwrap();
+
+        let custom = "ghcr.io/acme/base@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let steps = golden_residue_cleanup_steps_at(
+            golden_residue_policy_with(custom, false),
+            hosts.to_str().unwrap(),
+            fstab.to_str().unwrap(),
+            disk.to_str().unwrap(),
+        );
+        assert!(
+            steps.is_empty(),
+            "a custom base must not receive a hosts or fstab rewrite: {steps:?}"
+        );
+        // A bake joins the steps; an empty list runs no shell at all.
+        assert!(steps.join("; ").is_empty());
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), hosts_fixture);
+        assert_eq!(std::fs::read_to_string(&fstab).unwrap(), fstab_fixture);
+
+        // The contract the bake actually runs proves the same: neither cleanup
+        // is present, and both files' custom content is therefore untouched.
+        let contract = golden_contract_for_base(custom, "runner", 1001);
+        assert!(
+            !contract.contains("dropped stale fstab entry"),
+            "a custom contract must not rewrite /etc/fstab: {contract}"
+        );
+        assert!(
+            !contract.contains("could not drop the bake host mapping"),
+            "a custom contract must not rewrite /etc/hosts: {contract}"
+        );
+
+        // Same fixture, official policy: the routable alias and the absent
+        // device are exactly what the cleanup removes.
+        for step in golden_residue_cleanup_steps_at(
+            GoldenResiduePolicy::Clean,
+            hosts.to_str().unwrap(),
+            fstab.to_str().unwrap(),
+            disk.to_str().unwrap(),
+        ) {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &step])
+                .output()
+                .expect("the cleanup shell must run");
+            assert!(
+                output.status.success(),
+                "the cleanup must not fail: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let cleaned_hosts = std::fs::read_to_string(&hosts).unwrap();
+        assert!(
+            !cleaned_hosts.contains(custom_alias),
+            "the official cleanup drops the custom routable alias: {cleaned_hosts}"
+        );
+        assert!(
+            cleaned_hosts.contains(&format!("10.9.9.9 {host}")),
+            "the guest's own mapping survives: {cleaned_hosts}"
+        );
+        let cleaned_fstab = std::fs::read_to_string(&fstab).unwrap();
+        assert!(
+            cleaned_fstab.contains(&format!(
+                "# preloop: dropped stale fstab entry: {stale_uuid}"
+            )),
+            "the official cleanup comments out the absent device: {cleaned_fstab}"
+        );
+        assert!(
+            cleaned_fstab.lines().any(|line| line.starts_with("tmpfs ")),
+            "pseudo-filesystems survive: {cleaned_fstab}"
+        );
+    }
+
+    /// A custom base keeps its own systemd and resolver policy. Masking a
+    /// shipped `systemd-sysctl.service` disables every `/etc/sysctl.conf` and
+    /// `/etc/sysctl.d` setting the image depends on, and the runtime's three
+    /// hosted values would overwrite the same keys; the resolver rewrite would
+    /// replace the image's search/domain and options. The Preserve policy must
+    /// therefore skip all of it, and the contract must still carry the minimal
+    /// runner machinery.
+    #[cfg(unix)]
+    #[test]
+    fn preserve_policy_keeps_custom_systemd_and_resolver_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let systemd_bin = root.join("lib/systemd/systemd");
+        let unit_dir = root.join("lib/systemd/system");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(etc.join("systemd/system")).unwrap();
+        std::fs::create_dir_all(etc.join("systemd/resolved.conf.d")).unwrap();
+        std::fs::create_dir_all(etc.join("sysctl.d")).unwrap();
+        std::fs::write(&systemd_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&systemd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Every hosted mask candidate the custom image ships, including the
+        // one whose loss silently disables its tuning.
+        for unit in ["systemd-sysctl.service", "snapd.service", "apt-daily.timer"] {
+            std::fs::write(unit_dir.join(unit), "[Unit]\n").unwrap();
+        }
+        let resolv = etc.join("resolv.conf");
+        let resolv_fixture = "nameserver 10.20.30.53\n\
+                              search corp.example svc.example\n\
+                              domain corp.example\n\
+                              options ndots:5 rotate\n";
+        let sysctl_fixture = "vm.max_map_count = 12345\nfs.inotify.max_user_watches = 99999\n";
+        std::fs::write(&resolv, resolv_fixture).unwrap();
+        std::fs::write(etc.join("sysctl.d/99-custom.conf"), sysctl_fixture).unwrap();
+
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in [
+            "awk", "grep", "printf", "chmod", "mv", "rm", "mkdir", "ln", "cat",
+        ] {
+            symlink_tool(&bin, tool);
+        }
+        let units = ["systemd-sysctl.service", "snapd.service", "apt-daily.timer"];
+        let script = golden_systemd_parity_script_at(
+            GoldenResiduePolicy::Preserve,
+            &[systemd_bin.to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &units,
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the systemd preparation shell must run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("preserves this image"),
+            "the skip must say why: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for unit in units {
+            assert!(
+                !std::fs::symlink_metadata(etc.join("systemd/system").join(unit))
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false),
+                "{unit} must not be masked on a custom base"
+            );
+            assert!(
+                unit_dir.join(unit).is_file(),
+                "{unit} must survive the preserve policy"
+            );
+        }
+        assert!(
+            !etc.join("systemd/resolved.conf").exists(),
+            "a custom base's resolved configuration must not gain a forced DNS="
+        );
+        assert!(
+            !etc.join("systemd/resolved.conf.d/90-preloop-upstream.conf")
+                .exists(),
+            "a custom base must not gain a resolver drop-in"
+        );
+        assert_eq!(std::fs::read_to_string(&resolv).unwrap(), resolv_fixture);
+        assert_eq!(
+            std::fs::read_to_string(etc.join("sysctl.d/99-custom.conf")).unwrap(),
+            sysctl_fixture
+        );
+
+        // The contract still carries the minimal runner machinery, and none of
+        // the hosted-only adaptations.
+        let steps = golden_contract_steps("runner", 1001, GoldenResiduePolicy::Preserve);
+        let joined = steps.join("; ");
+        for required in [
+            "useradd -m -u 1001 -s /bin/bash runner",
+            "chown 1001:1001", // golden ownership
+            "apt-get update",  // apt index refresh
+            "usermod -aG kvm runner",
+        ] {
+            assert!(
+                joined.contains(required),
+                "missing runner step {required}: {joined}"
+            );
+        }
+        for forbidden in [
+            "systemd-sysctl.service",
+            "systemctl mask",
+            "cap_net_raw",
+            "127.0.0.53",
+            "DNS=",
+            "hosted sysctls",
+        ] {
+            assert!(
+                !joined.contains(forbidden),
+                "a custom contract must not carry {forbidden}: {joined}"
+            );
+        }
+    }
+
+    /// `ping` reaches the runner account with `cap_net_raw` (or, where
+    /// `setcap` is missing, the setuid bit): without it every guest answers
+    /// `ping: socket: Operation not permitted` while the same step works on a
+    /// hosted runner.
+    #[cfg(unix)]
+    #[test]
+    fn golden_ping_capability_makes_ping_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let ping = temp.path().join("ping");
+        std::fs::write(&ping, "#!/bin/sh\nexit 0\n").unwrap();
+        let script = golden_ping_capability_script(ping.to_str().unwrap());
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .expect("the capability shell must run");
+        assert!(
+            output.status.success(),
+            "restoring the capability must not fail the bake: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let setuid = std::fs::metadata(&ping).unwrap().permissions().mode() & 0o4000 != 0;
+        let has_capability = std::process::Command::new("getcap")
+            .arg(&ping)
+            .output()
+            .map(|output| !output.stdout.is_empty())
+            .unwrap_or(false);
+        assert!(
+            setuid || has_capability,
+            "ping must end up either capability- or setuid-based: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A binary the image does not carry is a no-op, not a failure.
+        let missing = golden_ping_capability_script("/nonexistent/preloop-ping");
+        assert!(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &missing])
+                .status()
+                .expect("the capability shell must run")
+                .success()
+        );
+    }
+
+    /// The resolver file is what gives a container the stub: Docker hands a
+    /// container the *host file's* nameservers, so a guest naming its own
+    /// resolver makes a compose network's `/etc/hosts`-only alias NXDOMAIN.
+    /// A `daemon.json` `dns` pin is the opposite — the address becomes the
+    /// container's own loopback and every lookup fails — which is why this
+    /// step writes the file. The guest's own upstream is *kept*: on AgentENV
+    /// resolved takes its upstreams from this very file, so a stub-only file
+    /// leaves it with none and breaks external DNS for the whole guest.
+    #[cfg(unix)]
+    #[test]
+    fn guest_resolver_stub_points_the_guest_at_the_stub() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let upstream = temp.path().join("resolved-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // A PATH without `resolvectl`: on a host that runs systemd-resolved the
+        // stub would answer and the "no stub" case would write the file, so the
+        // harness pins which branch the step takes instead of trusting the
+        // machine running the test. `/bin/sh` is absolute for the same reason —
+        // a bare `sh` is looked up through the harness PATH.
+        for tool in ["printf", "chmod", "mv", "rm", "grep", "cat", "awk"] {
+            symlink_tool(&bin, tool);
+        }
+        let script = guest_resolver_stub_script_at(
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+            temp.path().to_str().unwrap(),
+            // The runtime wait is irrelevant to this test's branches: PATH has
+            // no `resolvectl`, so the step never waits, and a present stub
+            // satisfies the gate on the first check.
+            2,
+            "0.1",
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the resolver shell must run")
+        };
+
+        // No stub resolver on this guest: the file keeps the guest's resolver.
+        std::fs::write(&resolv, "nameserver 75.75.75.75\n").unwrap();
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 75.75.75.75\n",
+            "a guest without the stub must keep its own resolver"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no resolved stub resolver"),
+            "the skip must say why: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // With the stub present the file names it first and keeps the guest's
+        // own upstream: the measured shape that resolves `/etc/hosts` names
+        // *and* external names, host-wide.
+        std::fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n"
+        );
+
+        // An upstream resolved keeps in its own file is preserved too, and the
+        // stub's own address is never duplicated. `search`, `domain` and the
+        // image's options survive: a short corporate name still resolves and
+        // `ndots` keeps its meaning inside containers.
+        std::fs::write(
+            &resolv,
+            "nameserver 100.96.0.1\n\
+             search internal.example corp.example\n\
+             domain corp.example\n\
+             options ndots:5 rotate\n\
+             options timeout:2 attempts:3\n",
+        )
+        .unwrap();
+        std::fs::write(&upstream, "nameserver 127.0.0.53\nnameserver 8.8.8.8\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        let prepared = "nameserver 127.0.0.53\n\
+                        nameserver 100.96.0.1\n\
+                        nameserver 8.8.8.8\n\
+                        options edns0 trust-ad\n\
+                        search internal.example corp.example\n\
+                        domain corp.example\n\
+                        options ndots:5 rotate\n\
+                        options timeout:2 attempts:3\n";
+        assert_eq!(std::fs::read_to_string(&resolv).unwrap(), prepared);
+
+        // Idempotent: the second run rewrites nothing.
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(std::fs::read_to_string(&resolv).unwrap(), prepared);
+
+        // A symlinked `/etc/resolv.conf` becomes a regular file — SmolVM's agent
+        // refuses to start the machine over a symlink — and the file the link
+        // pointed at is never written through.
+        let managed = temp.path().join("managed-resolv.conf");
+        std::fs::write(
+            &managed,
+            "nameserver 75.75.75.75\nsearch managed.example\noptions ndots:2\n",
+        )
+        .unwrap();
+        std::fs::remove_file(&resolv).unwrap();
+        std::os::unix::fs::symlink(&managed, &resolv).unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert!(
+            !std::fs::symlink_metadata(&resolv)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must be replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\n\
+             nameserver 75.75.75.75\n\
+             nameserver 8.8.8.8\n\
+             options edns0 trust-ad\n\
+             search managed.example\n\
+             options ndots:2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&managed).unwrap(),
+            "nameserver 75.75.75.75\nsearch managed.example\noptions ndots:2\n",
+            "the file the symlink pointed at must not be clobbered"
+        );
+
+        // A golden cut before the upstream line existed carries the stub
+        // alone; the runtime step must add an upstream instead of treating
+        // "stub first" as already prepared, or external DNS stays dead.
+        std::fs::remove_file(&upstream).unwrap();
+        std::fs::write(&resolv, "nameserver 127.0.0.53\noptions edns0 trust-ad\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 1.1.1.1\noptions edns0 trust-ad\n",
+            "a stub-only runtime file must gain an upstream"
+        );
+
+        // No staging file is left behind for a later bake or fork to adopt.
+        let leftovers: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+
+        // And the golden carries the step: an AgentENV restore keeps the baked
+        // file, which is what the daemon the guest's systemd starts reads.
+        assert!(
+            golden_contract_script(
+                DEFAULT_RUNNER_USER,
+                DEFAULT_RUNNER_UID,
+                GoldenResiduePolicy::Clean,
+            )
+            .contains(&guest_resolver_stub_script()),
+            "the golden contract must carry the resolver step"
+        );
+    }
+
+    /// The runtime rewrite uses the image's configured systemd-resolved
+    /// upstream when the guest's file has only the stub. Falling back to a
+    /// public resolver there would leak corporate lookups even though
+    /// `resolved.conf` names the internal resolvers.
+    #[cfg(unix)]
+    #[test]
+    fn guest_resolver_stub_uses_configured_dns_for_a_stub_only_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let etc = temp.path().join("etc");
+        std::fs::create_dir_all(etc.join("systemd/resolved.conf.d")).unwrap();
+        let resolv = etc.join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let upstream = temp.path().join("absent-resolved-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["printf", "chmod", "mv", "rm", "grep", "cat", "awk"] {
+            symlink_tool(&bin, tool);
+        }
+        std::fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
+        std::fs::write(&resolv, "nameserver 127.0.0.53\noptions edns0 trust-ad\n").unwrap();
+        std::fs::write(
+            etc.join("systemd/resolved.conf.d/10-corp.conf"),
+            "DNS=10.30.0.53 10.30.0.54\n",
+        )
+        .unwrap();
+        let script = guest_resolver_stub_script_at(
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+            etc.to_str().unwrap(),
+            2,
+            "0.1",
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the resolver shell must run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\n\
+             nameserver 10.30.0.53\n\
+             nameserver 10.30.0.54\n\
+             options edns0 trust-ad\n",
+            "the configured corporate DNS must be the fallback, not 1.1.1.1"
+        );
+    }
+
+    /// The runtime resolver step must wait out systemd's start: the SmolVM
+    /// agent writes the gateway resolver into `/etc/resolv.conf` during its own
+    /// network setup and only then execs the golden's `/sbin/init`, so a fork's
+    /// provisioning exec can arrive before systemd-resolved has created
+    /// `/run/systemd/resolve/stub-resolv.conf`. A one-shot check took the
+    /// "no stub" branch there and never ran again, leaving Docker the gateway
+    /// as its `ExtServers` — a compose `/etc/hosts` alias such as
+    /// `postgres.localhost` then came back NXDOMAIN.
+    #[cfg(unix)]
+    #[test]
+    fn guest_resolver_stub_waits_for_resolved_to_appear() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let upstream = temp.path().join("resolved-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // `sleep` is on PATH because the wait really runs here; `resolvectl`
+        // exists but answers nothing, which is a guest whose systemd (and so
+        // its resolved) is still starting.
+        for tool in ["printf", "chmod", "mv", "rm", "grep", "cat", "awk", "sleep"] {
+            symlink_tool(&bin, tool);
+        }
+        hostname_harness_stub(&bin.join("resolvectl"), "#!/bin/sh\nexit 1\n");
+        std::fs::write(&resolv, "nameserver 100.96.0.1\n").unwrap();
+
+        let script = guest_resolver_stub_script_at(
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+            temp.path().to_str().unwrap(),
+            20,
+            "0.1",
+        );
+        // resolved publishes the stub after the first checks, as it does on a
+        // clone that resumes right after the workload was exec'd.
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "sleep 0.4; printf 'nameserver 127.0.0.53\\n' > {}",
+                    shell_quote(stub.to_str().unwrap())
+                ),
+            ])
+            .spawn()
+            .expect("the stub writer must start");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the resolver shell must run");
+        writer.wait().unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("no resolved stub resolver"),
+            "the step must wait for resolved instead of taking the no-stub branch: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 100.96.0.1\noptions edns0 trust-ad\n",
+            "the stub must come first and the guest's gateway upstream must survive"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("pointed"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    }
+
+    /// A guest that genuinely has no resolved stub is checked a bounded number
+    /// of times and left alone — provisioning never hangs on it — and the
+    /// reason (with the wait) reaches the engine log. A guest that does not
+    /// even look like a systemd boot is not waited on at all.
+    #[cfg(unix)]
+    #[test]
+    fn guest_resolver_stub_wait_is_bounded_and_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let upstream = temp.path().join("resolved-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["printf", "chmod", "mv", "rm", "grep", "cat", "awk", "sleep"] {
+            symlink_tool(&bin, tool);
+        }
+        hostname_harness_stub(&bin.join("resolvectl"), "#!/bin/sh\nexit 1\n");
+        std::fs::write(&resolv, "nameserver 100.96.0.1\n").unwrap();
+
+        // The production bound is the field requirement, not a test detail: a
+        // loaded host's fork had not published the stub after six seconds, and
+        // the machine then kept the gateway resolver.
+        const {
+            assert!(
+                RESOLVER_STUB_WAIT_ATTEMPTS >= 60,
+                "the runtime wait must cover a loaded fork's systemd start"
+            )
+        };
+        assert!(
+            guest_resolver_stub_script().contains(&format!("-lt {}", RESOLVER_STUB_WAIT_ATTEMPTS)),
+            "the production step must carry the bounded wait"
+        );
+
+        let script = guest_resolver_stub_script_at(
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+            temp.path().to_str().unwrap(),
+            4,
+            "0.1",
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the resolver shell must run")
+        };
+
+        let started = std::time::Instant::now();
+        let output = run();
+        let elapsed = started.elapsed();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 100.96.0.1\n",
+            "a guest without the stub keeps its own resolver"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("no resolved stub resolver"), "{stderr}");
+        assert!(
+            stderr.contains("waited 4 of 4 checks"),
+            "the report must say the wait was exhausted: {stderr}"
+        );
+        assert!(
+            stderr.contains("resolvectl=yes"),
+            "the report must say what the guest has, so the next run can tell \
+             'resolved was slow' from 'resolved never starts': {stderr}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the wait must be bounded; took {elapsed:?}"
+        );
+
+        // No systemd and no `resolvectl`: the one-shot path, no wait.
+        std::fs::remove_file(bin.join("resolvectl")).unwrap();
+        let output = run();
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("waited 0 of 4 checks"),
+            "a guest that cannot boot resolved must not be waited on: {stderr}"
+        );
+        assert!(
+            stderr.contains("resolvectl=no"),
+            "the report must say the guest ships no resolvectl: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 100.96.0.1\n"
+        );
+    }
+
+    /// The bake-time systemd preparation: resolved's upstream, the stub in
+    /// `/etc/resolv.conf`, and the unit masks — gated on the systemd binaries,
+    /// because the SmolVM builder has no systemd PID 1 and a "resolved is
+    /// active" gate would skip exactly there.
+    #[cfg(unix)]
+    #[test]
+    fn golden_systemd_parity_prepares_the_guest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let systemd_bin = root.join("lib/systemd/systemd");
+        let unit_dir = root.join("lib/systemd/system");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(etc.join("systemd")).unwrap();
+        std::fs::write(&systemd_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&systemd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(unit_dir.join("fake-parity.service"), "[Unit]\n").unwrap();
+        std::fs::write(
+            etc.join("resolv.conf"),
+            "nameserver 100.96.0.1\n\
+             search corp.example svc.example\n\
+             domain corp.example\n\
+             options ndots:5 rotate\n",
+        )
+        .unwrap();
+
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // No `systemctl` in the harness PATH: the mask falls back to the
+        // `/dev/null` symlink, which is the builder's case and what
+        // `systemctl mask` creates.
+        for tool in [
+            "awk", "grep", "printf", "chmod", "mv", "rm", "mkdir", "ln", "cat",
+        ] {
+            symlink_tool(&bin, tool);
+        }
+
+        let units = ["fake-parity.service", "absent-unit.service"];
+        let script = golden_systemd_parity_script_at(
+            GoldenResiduePolicy::Clean,
+            &[systemd_bin.to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &units,
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the systemd preparation shell must run")
+        };
+        let resolv_conf = etc.join("resolv.conf");
+        let resolved_conf = etc.join("systemd/resolved.conf");
+        let upstream_dropin = etc.join("systemd/resolved.conf.d/90-preloop-upstream.conf");
+        let masked = etc.join("systemd/system/fake-parity.service");
+
+        let first = run();
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        // resolved's upstream is the image's own nameserver, so naming the stub
+        // in resolv.conf cannot leave resolved without one. It is written as a
+        // drop-in: a bare `DNS=` appended to a file that does not exist has no
+        // `[Resolve]` section, and systemd ignores it.
+        assert_eq!(
+            std::fs::read_to_string(&upstream_dropin).unwrap(),
+            "[Resolve]\nDNS=100.96.0.1\n"
+        );
+        assert!(
+            !resolved_conf.exists(),
+            "the image's resolved.conf must not be created or edited"
+        );
+        // The upstream line is what lets glibc resolve before resolved starts:
+        // an AgentENV restore resumes mid-boot, so a stub-only file leaves the
+        // guest with a dead socket as its only server for ~40-90 s.
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).unwrap(),
+            "nameserver 127.0.0.53\n\
+             nameserver 100.96.0.1\n\
+             options edns0 trust-ad\n\
+             search corp.example svc.example\n\
+             domain corp.example\n\
+             options ndots:5 rotate\n",
+            "the bake must keep the image's search/domain and resolver options"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&resolv_conf)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the stub must be a regular file: a symlink breaks SmolVM's start"
+        );
+        assert_eq!(
+            std::fs::read_link(&masked).unwrap(),
+            std::path::Path::new("/dev/null"),
+            "a shipped unit must be masked"
+        );
+        assert!(
+            !etc.join("systemd/system/absent-unit.service").exists(),
+            "a unit the image does not ship must be skipped"
+        );
+        assert!(
+            String::from_utf8_lossy(&first.stdout).contains("masked 1 systemd units"),
+            "{}",
+            String::from_utf8_lossy(&first.stdout)
+        );
+
+        // Idempotent: nothing is appended, rewritten or re-staged.
+        let second = run();
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&upstream_dropin).unwrap(),
+            "[Resolve]\nDNS=100.96.0.1\n",
+            "a second run must not rewrite the drop-in or duplicate DNS="
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).unwrap(),
+            "nameserver 127.0.0.53\n\
+             nameserver 100.96.0.1\n\
+             options edns0 trust-ad\n\
+             search corp.example svc.example\n\
+             domain corp.example\n\
+             options ndots:5 rotate\n",
+            "a second run must not duplicate nameserver, options or search lines"
+        );
+        assert!(
+            String::from_utf8_lossy(&second.stderr).contains("already sets DNS="),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&etc)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+
+        // An image with systemd but a resolver it cannot name: the fallback is
+        // a public resolver, and a `DNS=` the image configured is never touched.
+        std::fs::remove_file(&upstream_dropin).unwrap();
+        std::fs::write(&resolv_conf, "search only.example\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&upstream_dropin).unwrap(),
+            "[Resolve]\nDNS=1.1.1.1\n",
+            "a guest whose resolver is itself the stub needs a public upstream"
+        );
+        std::fs::remove_file(&upstream_dropin).unwrap();
+        std::fs::write(&resolved_conf, "DNS=9.9.9.9\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolved_conf).unwrap(),
+            "DNS=9.9.9.9\n",
+            "a configured DNS= must survive"
+        );
+        assert!(
+            !upstream_dropin.exists(),
+            "a configured DNS= must not get a competing drop-in"
+        );
+        // systemd-resolved also accepts DNS= in a drop-in; that is the image's
+        // configuration too, so the bake must not write a competing one.
+        std::fs::remove_file(&resolved_conf).unwrap();
+        let dropin = etc.join("systemd/resolved.conf.d/10-upstream.conf");
+        std::fs::create_dir_all(dropin.parent().unwrap()).unwrap();
+        std::fs::write(&dropin, "DNS=8.8.4.4\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert!(
+            !resolved_conf.exists(),
+            "a drop-in DNS= must not cause the main resolved.conf to be created"
+        );
+        assert!(
+            !upstream_dropin.exists(),
+            "an image drop-in DNS= must not be supplemented"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dropin).unwrap(),
+            "DNS=8.8.4.4\n",
+            "the drop-in must survive"
+        );
+
+        // No systemd in the image: nothing is touched, and the reason is said.
+        let absent = golden_systemd_parity_script_at(
+            GoldenResiduePolicy::Clean,
+            &[root.join("nope/systemd").to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &units,
+        );
+        std::fs::write(&resolv_conf, "nameserver 8.8.8.8\n").unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &absent])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the systemd preparation shell must run");
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).unwrap(),
+            "nameserver 8.8.8.8\n"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no systemd"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // And the golden contract carries the step.
+        assert!(
+            golden_contract_script(
+                DEFAULT_RUNNER_USER,
+                DEFAULT_RUNNER_UID,
+                GoldenResiduePolicy::Clean,
+            )
+            .contains(&golden_systemd_parity_script(GoldenResiduePolicy::Clean)),
+            "the golden contract must carry the systemd preparation"
+        );
+    }
+
+    /// The goldens cut before the upstream line existed carry the stub alone.
+    /// Re-running the bake preparation must add an upstream rather than
+    /// conclude the file is already right: an AgentENV restore resumes
+    /// mid-boot, so a stub-only file is a dead socket until resolved starts,
+    /// and every DNS lookup in that window fails.
+    #[cfg(unix)]
+    #[test]
+    fn golden_systemd_parity_upgrades_a_stub_only_resolver_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let systemd_bin = root.join("lib/systemd/systemd");
+        let unit_dir = root.join("lib/systemd/system");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(etc.join("systemd")).unwrap();
+        std::fs::write(&systemd_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&systemd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Exactly what the older goldens carry.
+        std::fs::write(
+            etc.join("resolv.conf"),
+            "nameserver 127.0.0.53\noptions edns0 trust-ad\n",
+        )
+        .unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in [
+            "awk", "grep", "printf", "chmod", "mv", "rm", "mkdir", "ln", "cat",
+        ] {
+            symlink_tool(&bin, tool);
+        }
+        let script = golden_systemd_parity_script_at(
+            GoldenResiduePolicy::Clean,
+            &[systemd_bin.to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &["absent-unit.service"],
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the systemd preparation shell must run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(etc.join("resolv.conf")).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 1.1.1.1\noptions edns0 trust-ad\n",
+            "a stub-only file must gain an upstream, not count as already prepared"
+        );
+    }
+
+    /// The bake half must handle a symlinked `/etc/resolv.conf` the same way
+    /// the runtime does: replace the link with a regular file, never write
+    /// through it to the target, and keep the target's configured upstream,
+    /// search/domain and options. SmolVM refuses to start a guest whose
+    /// resolver is a symlink, and an image whose `/etc/resolv.conf` points at
+    /// a distro-managed file is the common case.
+    #[cfg(unix)]
+    #[test]
+    fn golden_systemd_parity_replaces_a_symlinked_resolver_safely() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let systemd_bin = root.join("lib/systemd/systemd");
+        let unit_dir = root.join("lib/systemd/system");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(etc.join("systemd")).unwrap();
+        std::fs::write(&systemd_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&systemd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let managed = root.join("managed-resolv.conf");
+        let managed_fixture = "nameserver 10.20.30.53\n\
+                               search corp.example\n\
+                               options ndots:4\n";
+        std::fs::write(&managed, managed_fixture).unwrap();
+        std::os::unix::fs::symlink(&managed, etc.join("resolv.conf")).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in [
+            "awk", "grep", "printf", "chmod", "mv", "rm", "mkdir", "ln", "cat",
+        ] {
+            symlink_tool(&bin, tool);
+        }
+        let script = golden_systemd_parity_script_at(
+            GoldenResiduePolicy::Clean,
+            &[systemd_bin.to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &["absent-unit.service"],
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the systemd preparation shell must run")
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let resolv_conf = etc.join("resolv.conf");
+        assert!(
+            !std::fs::symlink_metadata(&resolv_conf)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the bake must replace the symlink with a regular file"
+        );
+        let prepared = "nameserver 127.0.0.53\n\
+                        nameserver 10.20.30.53\n\
+                        options edns0 trust-ad\n\
+                        search corp.example\n\
+                        options ndots:4\n";
+        assert_eq!(std::fs::read_to_string(&resolv_conf).unwrap(), prepared);
+        assert_eq!(
+            std::fs::read_to_string(&managed).unwrap(),
+            managed_fixture,
+            "the file the symlink pointed at must not be clobbered"
+        );
+        // Repeated bake is byte-identical.
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(std::fs::read_to_string(&resolv_conf).unwrap(), prepared);
+        assert_eq!(std::fs::read_to_string(&managed).unwrap(), managed_fixture);
+    }
+
+    /// A stub-only image whose upstream is configured in `resolved.conf` or a
+    /// drop-in must use that upstream, not a public resolver. The effective
+    /// list follows systemd-resolved: main file first, sorted drop-ins next,
+    /// non-empty `DNS=` assignments append, and an empty assignment resets.
+    #[cfg(unix)]
+    #[test]
+    fn golden_systemd_parity_uses_configured_dns_for_the_upstream_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let systemd_bin = root.join("lib/systemd/systemd");
+        let unit_dir = root.join("lib/systemd/system");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(etc.join("systemd/resolved.conf.d")).unwrap();
+        std::fs::write(&systemd_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&systemd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolv = etc.join("resolv.conf");
+        let stub_only = "nameserver 127.0.0.53\noptions edns0 trust-ad\n";
+        std::fs::write(&resolv, stub_only).unwrap();
+        // The main file is cleared by a drop-in, then a later drop-in sets the
+        // corporate resolvers: only the last pair is effective.
+        std::fs::write(etc.join("systemd/resolved.conf"), "DNS=10.10.0.53\n").unwrap();
+        std::fs::write(etc.join("systemd/resolved.conf.d/10-clear.conf"), "DNS=\n").unwrap();
+        std::fs::write(
+            etc.join("systemd/resolved.conf.d/20-corp.conf"),
+            "DNS=10.20.0.53#corp.example 10.20.0.54:5353\n",
+        )
+        .unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in [
+            "awk", "grep", "printf", "chmod", "mv", "rm", "mkdir", "ln", "cat",
+        ] {
+            symlink_tool(&bin, tool);
+        }
+        let script = golden_systemd_parity_script_at(
+            GoldenResiduePolicy::Clean,
+            &[systemd_bin.to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &["absent-unit.service"],
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the systemd preparation shell must run")
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\n\
+             nameserver 10.20.0.53\n\
+             nameserver 10.20.0.54\n\
+             options edns0 trust-ad\n",
+            "the configured corporate DNS must be the fallback, not 1.1.1.1"
+        );
+        // The configured file is policy: the bake must not rewrite it.
+        assert_eq!(
+            std::fs::read_to_string(etc.join("systemd/resolved.conf")).unwrap(),
+            "DNS=10.10.0.53\n"
+        );
+
+        // An empty reset with no later assignment leaves no configured DNS;
+        // only then does the public fallback apply.
+        std::fs::remove_file(etc.join("systemd/resolved.conf.d/20-corp.conf")).unwrap();
+        std::fs::write(&resolv, stub_only).unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 1.1.1.1\noptions edns0 trust-ad\n"
+        );
+    }
+
+    /// The composed init run end to end against scratch roots: the fork's own
+    /// name resolves, the sysctls reach the hosted values, the resolver file
+    /// names the stub, and the revoked CA roots are disabled in one exec, and
+    /// a second run changes nothing. Textual
+    /// order alone would not catch a half whose `exit 0` swallows the others —
+    /// this runs every half in one shell, the way provisioning does.
+    #[cfg(unix)]
+    #[test]
+    fn hosted_runtime_init_applies_every_half_in_one_run() {
         let temp = tempfile::tempdir().unwrap();
         let hosts = temp.path().join("hosts");
         let root = temp.path().join("sys");
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let ca_conf = temp.path().join("ca-certificates.conf");
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(root.join("vm")).unwrap();
         std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+        std::fs::write(&resolv, "nameserver 75.75.75.75\n").unwrap();
+        std::fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
         std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_watches"), "655360").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_instances"), "128").unwrap();
+        std::fs::write(
+            &ca_conf,
+            "mozilla/emSign_ECC_Root_CA_-_G3.crt\n\
+             mozilla/Comodo_AAA_Services_root.crt\n\
+             mozilla/Other.crt\n",
+        )
+        .unwrap();
         // The sysctl half's procps is absent here, so the apply writes the
         // scratch tree directly — the same branch a guest without procps
-        // takes. Every other tool both halves call is linked in, so the test
-        // exercises the real scripts rather than the harness PATH.
+        // takes. Every other tool all three halves call is linked in, so the
+        // test exercises the real scripts rather than the harness PATH.
         for tool in [
             "cat", "tr", "id", "base64", "sh", "awk", "sed", "sort", "cut", "grep", "mktemp",
-            "tee", "rm", "uname", "head",
+            "tee", "rm", "uname", "head", "printf", "chmod", "mv",
         ] {
             symlink_tool(&bin, tool);
         }
@@ -9248,8 +12480,24 @@ done
             ),
         );
         hostname_harness_stub(&bin.join("sudo"), SUDO_STUB);
+        hostname_harness_stub(&bin.join("update-ca-certificates"), "#!/bin/sh\nexit 0\n");
 
-        let script = hosted_runtime_init_script_at(hosts.to_str().unwrap(), root.to_str().unwrap());
+        let script = hosted_runtime_init_script_at(
+            GoldenResiduePolicy::Clean,
+            HostedInitPaths {
+                hosts: hosts.to_str().unwrap(),
+                sysctl_root: root.to_str().unwrap(),
+                resolv_conf: resolv.to_str().unwrap(),
+                stub: stub.to_str().unwrap(),
+                upstream_file: temp
+                    .path()
+                    .join("absent-resolved-resolv.conf")
+                    .to_str()
+                    .unwrap(),
+                resolved_etc: temp.path().to_str().unwrap(),
+                ca_conf: ca_conf.to_str().unwrap(),
+            },
+        );
         let run = || {
             std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
@@ -9277,6 +12525,18 @@ done
             std::fs::read_to_string(root.join("fs/inotify/max_user_instances")).unwrap(),
             "1280"
         );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n",
+            "the resolver half must land in the same run, keeping the guest's upstream"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ca_conf).unwrap(),
+            "!mozilla/emSign_ECC_Root_CA_-_G3.crt\n\
+             !mozilla/Comodo_AAA_Services_root.crt\n\
+             mozilla/Other.crt\n",
+            "the CA half must disable exactly the revoked roots"
+        );
         // Idempotent: the second run writes nothing at all.
         let second = run();
         assert!(
@@ -9287,6 +12547,121 @@ done
         assert_eq!(
             std::fs::read_to_string(&hosts).unwrap(),
             "127.0.0.1 localhost\n127.0.0.1 fork-7c1f\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n"
+        );
+    }
+
+    /// A custom base's per-machine init resolves the machine's name and
+    /// nothing else. Its sysctl files stay authoritative (the engine must not
+    /// overwrite the same keys with GitHub's three values), and its resolver
+    /// file — including `search`/`domain` and options — is byte-identical
+    /// after the init and after a second run.
+    #[cfg(unix)]
+    #[test]
+    fn hosted_runtime_init_preserves_a_custom_base_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let root = temp.path().join("sys");
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(root.join("vm")).unwrap();
+        std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+        let resolv_fixture = "nameserver 10.20.30.53\n\
+                              search corp.example svc.example\n\
+                              domain corp.example\n\
+                              options ndots:5 rotate\n";
+        std::fs::write(&resolv, resolv_fixture).unwrap();
+        std::fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
+        std::fs::write(root.join("vm/max_map_count"), "12345").unwrap();
+        std::fs::write(root.join("fs/inotify/max_user_watches"), "99999").unwrap();
+        std::fs::write(root.join("fs/inotify/max_user_instances"), "777").unwrap();
+        for tool in [
+            "cat", "tr", "id", "base64", "sh", "awk", "sed", "sort", "cut", "grep", "mktemp",
+            "tee", "rm", "uname", "head", "printf", "chmod", "mv",
+        ] {
+            symlink_tool(&bin, tool);
+        }
+        hostname_harness_stub(
+            &bin.join("hostname"),
+            "#!/bin/sh\nprintf '%s\\n' fork-7c1f\n",
+        );
+        hostname_harness_stub(
+            &bin.join("getent"),
+            &format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = hosts ] || [ \"$1\" = ahosts ] || exit 2\n\
+                 line=$(grep -E \"^[^#]*[[:space:]]$2([[:space:]]|$)\" {} | head -n 1)\n\
+                 [ -n \"$line\" ] || exit 2\n\
+                 printf '%s\\n' \"$line\"\n",
+                shell_quote(hosts.to_str().unwrap())
+            ),
+        );
+        hostname_harness_stub(&bin.join("sudo"), SUDO_STUB);
+        let script = hosted_runtime_init_script_at(
+            GoldenResiduePolicy::Preserve,
+            HostedInitPaths {
+                hosts: hosts.to_str().unwrap(),
+                sysctl_root: root.to_str().unwrap(),
+                resolv_conf: resolv.to_str().unwrap(),
+                stub: stub.to_str().unwrap(),
+                upstream_file: temp.path().join("resolved-resolv.conf").to_str().unwrap(),
+                resolved_etc: temp.path().to_str().unwrap(),
+                ca_conf: temp
+                    .path()
+                    .join("absent-ca-certificates.conf")
+                    .to_str()
+                    .unwrap(),
+            },
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .unwrap()
+        };
+        let first = run();
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n127.0.0.1 fork-7c1f\n",
+            "the hostname half is still runner machinery"
+        );
+        assert_eq!(std::fs::read_to_string(&resolv).unwrap(), resolv_fixture);
+        assert_eq!(
+            std::fs::read_to_string(root.join("vm/max_map_count")).unwrap(),
+            "12345",
+            "the custom sysctl tuning must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("fs/inotify/max_user_instances")).unwrap(),
+            "777"
+        );
+        assert!(
+            String::from_utf8_lossy(&first.stderr).contains("preserves this image"),
+            "the skip must say why: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let second = run();
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&resolv).unwrap(), resolv_fixture);
+        assert_eq!(
+            std::fs::read_to_string(root.join("vm/max_map_count")).unwrap(),
+            "12345"
         );
     }
 
@@ -9301,7 +12676,7 @@ done
             "--once".to_owned(),
         ];
 
-        let wrapped = as_runner_user(&config, &argv);
+        let wrapped = as_runner_user(&config, &argv, GoldenResiduePolicy::Clean);
         assert_eq!(wrapped[0], "sh");
         assert_eq!(wrapped[1], "-c");
         let script = &wrapped[2];
@@ -9512,7 +12887,7 @@ done
             "run".to_owned(),
             "--once".to_owned(),
         ];
-        let wrapped = as_runner_user(&config, &argv);
+        let wrapped = as_runner_user(&config, &argv, GoldenResiduePolicy::Clean);
         assert_eq!(wrapped[0], "sh");
         assert_eq!(wrapped[1], "-c");
         assert!(
@@ -9813,7 +13188,7 @@ done
             "/opt/preloop/bin/preloop-runner".to_owned(),
             "run".to_owned(),
         ];
-        let script = &as_runner_user(&config, &argv)[2];
+        let script = &as_runner_user(&config, &argv, GoldenResiduePolicy::Clean)[2];
 
         // The exec shell's PATH lacks /usr/sbin; the account tools live there.
         assert!(
@@ -9839,11 +13214,168 @@ done
         );
     }
 
-    /// Unset and root still skip the account switch, but not the limits: the
-    /// launch is wrapped around the same argv, so the exec channel's identity
-    /// is untouched while the runner and every step it spawns inherit the
-    /// hosted stack, and the descriptor pair best-effort (a hard limit can
-    /// only be raised by root, and this path cannot assume it).
+    /// The runner launch must write the resolver stub itself, after the agent's
+    /// refresh. A stub the runtime init wrote does not survive the launch: the
+    /// launch is an interactive `Run` (`machine exec --stream` →
+    /// `run_streaming_with`), and the agent re-points a persistent container's
+    /// `/etc/resolv.conf` at the gateway before such a run's command starts. So
+    /// the account branch carries the step in its root-only provisioning, which
+    /// runs before the privilege drop on a root exec and through sudo otherwise,
+    /// and the root branch carries it in the prelude ahead of the limits.
+    #[test]
+    fn runner_launch_rewrites_the_resolver_stub_before_the_job_starts() {
+        let stub = guest_resolver_stub_script();
+        let argv = vec![
+            "/opt/preloop/bin/preloop-runner".to_owned(),
+            "run".to_owned(),
+            "--once".to_owned(),
+        ];
+
+        let mut account = test_config(false);
+        account.runner_user = Some("runner".to_owned());
+        account.runner_uid = Some(1001);
+        let script = &as_runner_user(&account, &argv, GoldenResiduePolicy::Clean)[2];
+        // The root branch runs the provisioning as written; the account branch
+        // base64s it. Both carry the same step, so check the raw text here.
+        assert!(
+            script.contains(&stub),
+            "a root exec must rewrite the resolver stub before the drop: {script}"
+        );
+        let blobs: Vec<String> = script
+            .split("| base64 -d")
+            .filter_map(|part| {
+                let close = part.rfind('\'')?;
+                let open = part[..close].rfind('\'')?;
+                Some(part[open + 1..close].to_owned())
+            })
+            .collect();
+        let decoded: Vec<String> = blobs
+            .iter()
+            .map(|b| {
+                String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let provisioning = decoded
+            .iter()
+            .find(|text| text.contains("useradd"))
+            .expect("the account branch carries the root provisioning");
+        assert!(
+            provisioning.contains(&stub),
+            "the root provisioning must rewrite the resolver stub before the launch \
+             drops privileges: {provisioning}"
+        );
+        let drop = decoded
+            .iter()
+            .find(|text| text.contains("setpriv"))
+            .expect("the account branch drops privileges");
+        assert!(
+            !drop.contains(&stub),
+            "the stub belongs before the drop, not after it: {drop}"
+        );
+
+        let mut root = test_config(false);
+        root.runner_user = Some("root".to_owned());
+        let wrapped = as_runner_user(&root, &argv, GoldenResiduePolicy::Clean);
+        assert!(
+            wrapped[2].starts_with(&stub),
+            "the root launch must rewrite the resolver stub ahead of its limits: {}",
+            wrapped[2]
+        );
+    }
+
+    /// A Preserve base's runner launch keeps the image's resolver and still
+    /// gets the account, KVM grant and hosted limits. The resolver step would
+    /// overwrite the custom `/etc/resolv.conf` after the SmolVM agent refresh,
+    /// which is exactly the policy a custom base owns; only the Clean policy
+    /// may write it.
+    #[test]
+    fn custom_base_launch_keeps_its_resolver_and_runner_contract() {
+        let stub = guest_resolver_stub_script();
+        let argv = vec![
+            "/opt/preloop/bin/preloop-runner".to_owned(),
+            "run".to_owned(),
+            "--once".to_owned(),
+        ];
+
+        let mut account = test_config(false);
+        account.runner_user = Some("runner".to_owned());
+        account.runner_uid = Some(1001);
+        let script = &as_runner_user(&account, &argv, GoldenResiduePolicy::Preserve)[2];
+        assert!(
+            !script.contains(&stub) && !script.contains("127.0.0.53"),
+            "a custom base's launch must not rewrite its resolver: {script}"
+        );
+        assert!(
+            script.contains("useradd -m -u 1001 runner"),
+            "the account is still provisioned: {script}"
+        );
+        assert!(
+            script.contains("usermod -aG kvm runner") && script.contains("chmod 0666 /dev/kvm"),
+            "the KVM grant is still runner machinery: {script}"
+        );
+        // The account branch carries the account setup and the limit raise as
+        // base64 blobs; decode both and check the privileged half.
+        let blobs: Vec<String> = script
+            .split("| base64 -d")
+            .filter_map(|part| {
+                let close = part.rfind('\'')?;
+                let open = part[..close].rfind('\'')?;
+                Some(part[open + 1..close].to_owned())
+            })
+            .collect();
+        let decoded: Vec<String> = blobs
+            .iter()
+            .map(|blob| {
+                String::from_utf8(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(blob)
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let provisioning = decoded
+            .iter()
+            .find(|text| text.contains("useradd"))
+            .expect("the account branch carries the root provisioning");
+        assert!(
+            !provisioning.contains("127.0.0.53"),
+            "the custom base's resolver must not be in the provisioning: {provisioning}"
+        );
+        let inner = decoded
+            .iter()
+            .find(|text| text.contains("setpriv"))
+            .expect("the account branch drops privileges");
+        assert!(
+            inner.contains(GUEST_STACK_ULIMIT),
+            "the hosted process limits still apply: {inner}"
+        );
+
+        for user in [None, Some("root".to_owned())] {
+            let mut config = test_config(false);
+            config.runner_user = user.clone();
+            let wrapped = as_runner_user(&config, &argv, GoldenResiduePolicy::Preserve);
+            assert!(
+                !wrapped[2].contains("127.0.0.53"),
+                "a custom base's pass-through launch must not rewrite its resolver: {user:?} {}",
+                wrapped[2]
+            );
+            assert!(
+                wrapped[2].contains(GUEST_STACK_ULIMIT_BEST_EFFORT),
+                "the limits still apply: {user:?} {}",
+                wrapped[2]
+            );
+        }
+    }
+
+    /// Unset and root still skip the account switch, but not the limits or the
+    /// resolver step: the launch is wrapped around the same argv, so the exec
+    /// channel's identity is untouched while the runner and every step it spawns
+    /// inherit the hosted stack, and the descriptor pair best-effort (a hard limit
+    /// can only be raised by root, and this path cannot assume it). The resolver
+    /// step runs first, in the same shell, so the stub is in place when the
+    /// runner starts.
     #[test]
     fn runner_user_wrapper_passes_root_and_unset_through_with_the_hosted_limits() {
         let mut config = test_config(false);
@@ -9855,16 +13387,18 @@ done
         ];
         for user in [None, Some("root".to_owned())] {
             config.runner_user = user.clone();
-            let wrapped = as_runner_user(&config, &argv);
+            let wrapped = as_runner_user(&config, &argv, GoldenResiduePolicy::Clean);
             assert_eq!(wrapped[0], "sh", "{user:?}");
             assert_eq!(wrapped[1], "-c", "{user:?}");
             assert_eq!(
                 wrapped[2],
                 format!(
-                    "{GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; \
-                     exec \"$@\""
+                    "{resolver}; {GUEST_STACK_ULIMIT_BEST_EFFORT}; \
+                     {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\"",
+                    resolver = guest_resolver_stub_script(),
                 ),
-                "the pass-through launch must run on the hosted limits best-effort: {user:?}"
+                "the pass-through launch must rewrite the resolver stub and run on the \
+                 hosted limits best-effort: {user:?}"
             );
             // The original argv travels as the shell's positional parameters,
             // so nothing is re-quoted and the launch is untouched.
@@ -9932,7 +13466,8 @@ done
     /// would-be `root` account's home would leave the image broken.
     #[test]
     fn root_runner_user_skips_the_account_and_ownership_steps() {
-        let contract = golden_contract_script("root", DEFAULT_RUNNER_UID);
+        let contract =
+            golden_contract_script("root", DEFAULT_RUNNER_UID, GoldenResiduePolicy::Clean);
         assert!(
             !contract.contains("useradd"),
             "root must not be created as an account: {contract}"
@@ -10231,7 +13766,7 @@ fi"#,
     /// nothing the contract runs after it can change the runner's groups.
     #[test]
     fn kvm_membership_is_the_last_group_write_in_the_golden_contract() {
-        let steps = golden_contract_steps("runner", 1001);
+        let steps = golden_contract_steps("runner", 1001, GoldenResiduePolicy::Clean);
         let membership = steps
             .iter()
             .position(|step| step.contains("usermod -aG kvm runner"))
@@ -10261,7 +13796,7 @@ fi"#,
             "/opt/preloop/bin/preloop-runner".to_owned(),
             "run".to_owned(),
         ];
-        let script = &as_runner_user(&config, &argv)[2];
+        let script = &as_runner_user(&config, &argv, GoldenResiduePolicy::Clean)[2];
         let docker = script
             .find("usermod -aG docker runner")
             .expect("the launch joins the docker group");
@@ -10331,7 +13866,7 @@ fi"#,
             ("guest_sysctl_script".to_owned(), guest_sysctl_script()),
             (
                 "guest_hosted_runtime_init_script".to_owned(),
-                guest_hosted_runtime_init_script(),
+                guest_hosted_runtime_init_script(GoldenResiduePolicy::Clean),
             ),
             (
                 "runner_account_script".to_owned(),
@@ -10362,16 +13897,16 @@ fi"#,
                 scope_rosetta_apt_sources("/etc/apt"),
             ),
             (
-                "with_guest_hosted_limits".to_owned(),
-                with_guest_hosted_limits(&argv)[2].clone(),
+                "with_guest_launch_prelude".to_owned(),
+                with_guest_launch_prelude(&argv, GoldenResiduePolicy::Clean)[2].clone(),
             ),
             (
                 "as_runner_user (pass-through)".to_owned(),
-                as_runner_user(&config, &argv)[2].clone(),
+                as_runner_user(&config, &argv, GoldenResiduePolicy::Clean)[2].clone(),
             ),
             (
                 "as_runner_user (runner account)".to_owned(),
-                as_runner_user(&switched, &argv)[2].clone(),
+                as_runner_user(&switched, &argv, GoldenResiduePolicy::Clean)[2].clone(),
             ),
             (
                 "run_as_root_or_sudo".to_owned(),
@@ -10383,11 +13918,15 @@ fi"#,
             ),
             (
                 "golden_contract_script".to_owned(),
-                golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+                golden_contract_script(
+                    DEFAULT_RUNNER_USER,
+                    DEFAULT_RUNNER_UID,
+                    GoldenResiduePolicy::Clean,
+                ),
             ),
             (
                 "golden_contract_script (root)".to_owned(),
-                golden_contract_script("root", DEFAULT_RUNNER_UID),
+                golden_contract_script("root", DEFAULT_RUNNER_UID, GoldenResiduePolicy::Clean),
             ),
             (
                 "restore_apt_lists_script".to_owned(),
@@ -10677,6 +14216,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             handles,
+            test_github(),
         ));
 
         // Wait until the slot's first provision reaches configure (i.e. the
@@ -10732,8 +14272,8 @@ fi"#,
 
     /// A release directory the engine cannot write must not strand the pool
     /// without node: the engine publishes its own bundle and mounts that.
-    #[test]
-    fn mirror_bundle_is_published_when_the_release_bundle_lacks_externals() {
+    #[tokio::test]
+    async fn mirror_bundle_is_published_when_the_release_bundle_lacks_externals() {
         let home = tempfile::tempdir().unwrap();
         let release = tempfile::tempdir().unwrap();
         std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -10755,6 +14295,7 @@ fi"#,
         );
 
         materialize_mirror_bundle(&config, &host_externals)
+            .await
             .expect("the engine-owned mirror is publishable");
 
         let mirror = mirror_bundle_dir(&config);
@@ -10769,8 +14310,8 @@ fi"#,
 
     /// Starting a pool whose bundle cannot resolve node reports ready and then
     /// fails every JS action step, so publishing must fail loudly instead.
-    #[test]
-    fn mirror_bundle_publication_fails_when_host_externals_are_incomplete() {
+    #[tokio::test]
+    async fn mirror_bundle_publication_fails_when_host_externals_are_incomplete() {
         let home = tempfile::tempdir().unwrap();
         let release = tempfile::tempdir().unwrap();
         std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -10783,6 +14324,7 @@ fi"#,
         config.externals_dir = home.path().to_path_buf();
 
         let error = materialize_mirror_bundle(&config, &host_externals)
+            .await
             .expect_err("an unusable bundle must refuse to start the pool");
         assert!(
             format!("{error}").contains("incomplete"),
@@ -10798,8 +14340,8 @@ fi"#,
     /// sequence — `ensure_host_externals` materializing the bundle, then
     /// `runner_volumes` selecting it — must hand the golden a bundle that
     /// carries node, never an externals-less mount.
-    #[test]
-    fn startup_materializes_bundle_before_golden_volumes_are_computed() {
+    #[tokio::test]
+    async fn startup_materializes_bundle_before_golden_volumes_are_computed() {
         let home = tempfile::tempdir().unwrap();
         let release = tempfile::tempdir().unwrap();
         std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -10812,7 +14354,9 @@ fi"#,
         config.externals_dir = home.path().join("externals");
 
         // Startup order: install/materialize first, then compute volumes.
-        ensure_host_externals(&config).expect("bundle materialization must succeed");
+        ensure_host_externals(&config)
+            .await
+            .expect("bundle materialization must succeed");
         assert!(
             externals_complete(&release.path().join("externals")),
             "the release bundle must be materialized before any golden is created"
@@ -10914,6 +14458,7 @@ fi"#,
             preparing_signal: None,
             pool_status: None,
             observability: None,
+            github: None,
         }
     }
 
@@ -11826,6 +15371,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect("golden preparation succeeds");
@@ -11865,6 +15411,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect_err("start failure aborts golden preparation");
@@ -11875,6 +15422,34 @@ fi"#,
             "a failed unpack prunes the partial extraction before returning"
         );
     }
+
+    /// The engine's shared funnel must be the one the pool spends from: a
+    /// private funnel per pool would rediscover an outage the engine's other
+    /// GitHub traffic already parked. With no funnel supplied the pool still
+    /// gets one, so no golden call can go unobserved.
+    #[test]
+    fn pool_adopts_the_supplied_github_funnel_or_mints_a_private_one() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let shared = GithubFunnel::default();
+        let mut config = test_config(false);
+        config.github = Some(shared.clone());
+
+        let pool = RunnerPool::new(provider.clone(), config).expect("pool config validates");
+        assert!(
+            Arc::ptr_eq(&pool.github.breakers, &shared.breakers),
+            "the pool must admit golden calls through the engine's registry"
+        );
+        assert!(Arc::ptr_eq(&pool.github.consumption, &shared.consumption));
+
+        let mut config = test_config(false);
+        config.github = None;
+        let pool = RunnerPool::new(provider, config).expect("pool config validates");
+        assert!(
+            !Arc::ptr_eq(&pool.github.breakers, &shared.breakers),
+            "a pool with no engine funnel must mint its own rather than borrow one"
+        );
+    }
+
     /// Startup prunes `pack/` intermediates from every surviving pool
     /// machine — a failed unpack's residue lives inside a registered data dir
     /// the orphan sweep cannot see — and leaves foreign machines alone.
@@ -11898,6 +15473,9 @@ fi"#,
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
         };
         let surviving = MachineName::new("lifecycle-test-golden").unwrap();
         let foreign = MachineName::new("foreign-vm").unwrap();
@@ -11942,7 +15520,17 @@ fi"#,
             let env_spec = env_spec.clone();
             let golden = golden.clone();
             let shutdown = shutdown.clone();
-            async move { prepare_fork_base(&provider, &config, &golden, &env_spec, &shutdown).await }
+            async move {
+                prepare_fork_base(
+                    &provider,
+                    &config,
+                    &golden,
+                    &env_spec,
+                    &shutdown,
+                    &test_github(),
+                )
+                .await
+            }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -11966,6 +15554,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect("unpack proceeds once the pack fits");
@@ -11999,6 +15588,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect_err("a create that never registers still fails preparation");
@@ -12064,6 +15654,7 @@ fi"#,
                     &golden,
                     &env_spec,
                     &CancellationToken::new(),
+                    &test_github(),
                 )
                 .await
             }
@@ -12077,7 +15668,17 @@ fi"#,
             let config = config.clone();
             let shutdown = shutdown_b.clone();
             let golden = golden_b.clone();
-            async move { prepare_fork_base(&provider, &config, &golden, &env_spec, &shutdown).await }
+            async move {
+                prepare_fork_base(
+                    &provider,
+                    &config,
+                    &golden,
+                    &env_spec,
+                    &shutdown,
+                    &test_github(),
+                )
+                .await
+            }
         });
 
         unpack_a
@@ -12461,6 +16062,9 @@ fi"#,
                 sockets: Vec::new(),
                 dns: None,
                 rosetta: false,
+                role: MachineRole::Image,
+                guest_volumes: None,
+                workload_init: None,
             })
             .await
             .unwrap();
@@ -12533,6 +16137,9 @@ fi"#,
                 sockets: Vec::new(),
                 dns: None,
                 rosetta: false,
+                role: MachineRole::Image,
+                guest_volumes: None,
+                workload_init: None,
             })
             .await
             .unwrap();
@@ -12684,6 +16291,9 @@ fi"#,
                     sockets: Vec::new(),
                     dns: None,
                     rosetta: false,
+                    role: MachineRole::Image,
+                    guest_volumes: None,
+                    workload_init: None,
                 })
                 .await
                 .unwrap();
@@ -12879,6 +16489,7 @@ fi"#,
             handles,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
+            test_github(),
         )
         .await
         .unwrap();
@@ -12974,6 +16585,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             pool_handles(),
+            test_github(),
         ));
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -13054,6 +16666,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             pool_handles(),
+            test_github(),
         ));
 
         // Booting: the configure step is gated, so the slot is mid-provision
@@ -13143,6 +16756,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             pool_handles(),
+            test_github(),
         ));
 
         let first = format!("{}-0-1", config.name_prefix);
@@ -13216,6 +16830,7 @@ fi"#,
             // No golden slot left on this host.
             GoldenBudget::new(0),
             pool_handles(),
+            test_github(),
         ));
 
         let runner = format!("{}-0-1", config.name_prefix);
@@ -13283,6 +16898,7 @@ fi"#,
             handles,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
+            test_github(),
         ));
 
         let booting = wait_for_pool_status("the on-demand boot", &pool_status, |snapshot| {
@@ -13326,7 +16942,7 @@ fi"#,
         let config = test_config(false);
         let name = MachineName::new("lifecycle-test-builder").unwrap();
 
-        apply_golden_contract(provider.as_ref(), &config, &name)
+        apply_golden_contract(provider.as_ref(), &config, &name, &config.base_image)
             .await
             .expect("the contract applies to the image as-is");
 
@@ -13338,13 +16954,18 @@ fi"#,
         // The contract travels base64-encoded inside the root-or-sudo wrapper,
         // which is what makes it work whether the exec lands as root or as an
         // image-declared user with passwordless sudo.
-        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_script(
+        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_for_base(
+            &config.base_image,
             DEFAULT_RUNNER_USER,
             DEFAULT_RUNNER_UID,
         ));
         assert!(
             events.iter().any(|event| event.contains(&contract)),
             "the golden contract must run on the builder: {events:?}"
+        );
+        assert!(
+            !contract.is_empty(),
+            "the custom-base contract must still be applied"
         );
         assert!(
             events.iter().any(|event| event.contains("sudo -n sh")),
@@ -13391,6 +17012,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect("the in-guest golden preparation succeeds");
@@ -13410,7 +17032,8 @@ fi"#,
                 || event.contains(&format!("start:{}", golden.as_str()))),
             "the golden must be frozen as the fork base: {events:?}"
         );
-        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_script(
+        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_for_base(
+            &config.base_image,
             DEFAULT_RUNNER_USER,
             DEFAULT_RUNNER_UID,
         ));
@@ -13424,6 +17047,9 @@ fi"#,
 #[cfg(test)]
 mod golden_download_tests {
     use super::*;
+    use preloop_runner_server::github_breaker::{
+        BreakerConfig, GithubBreakerRegistry, GithubConsumption, GithubFailureKind,
+    };
     use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
 
@@ -13449,6 +17075,7 @@ mod golden_download_tests {
             Some(u64::MAX / 2),
             None,
             false,
+            &test_github(),
             move |_| {
                 observed.store(true, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async { Err("must not be requested".to_owned()) })
@@ -13573,6 +17200,7 @@ mod golden_download_tests {
             |_| Ok(u64::MAX),
             Some(&url),
             false,
+            &test_github(),
         )
         .await
         .unwrap();
@@ -13594,10 +17222,16 @@ mod golden_download_tests {
         )
         .await;
 
-        let error =
-            download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(1024), Some(&url), false)
-                .await
-                .expect_err("the download must stop when the target filesystem is full");
+        let error = download_prebaked_golden_with_space(
+            &payload,
+            "9.9.9",
+            |_| Ok(1024),
+            Some(&url),
+            false,
+            &test_github(),
+        )
+        .await
+        .expect_err("the download must stop when the target filesystem is full");
 
         match error {
             OrchestratorError::GoldenDiskSpace {
@@ -13638,6 +17272,7 @@ mod golden_download_tests {
             |_| Ok(u64::MAX),
             Some(&url),
             false,
+            &test_github(),
         )
         .await
         .unwrap();
@@ -13735,12 +17370,141 @@ mod golden_download_tests {
         .await;
         let api_base = url.trim_end_matches("/golden").to_owned();
 
-        let tag = resolve_latest_golden_tag(&reqwest::Client::new(), &api_base).await;
+        let tag = resolve_latest_golden_tag(
+            &preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+                .build()
+                .unwrap(),
+            &api_base,
+            &test_github(),
+        )
+        .await;
 
         assert_eq!(
             tag.as_deref(),
             Some("v9.9.7"),
             "the newest stable release carrying the golden wins"
+        );
+    }
+
+    /// G10: a golden metadata lookup against a listener that accepts the
+    /// connection and never answers must give up at [`GOLDEN_METADATA_TIMEOUT`],
+    /// not at the 60-minute download budget. Paused time reaches the deadline at
+    /// once, so the test reads the time the lookup actually waited.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_golden_release_lookup_gives_up_at_the_metadata_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let tag = resolve_latest_golden_tag(&client, &api_base, &test_github()).await;
+        let waited = started.elapsed();
+
+        assert_eq!(tag, None, "a lookup that never answers resolves to no tag");
+        assert!(
+            waited >= GOLDEN_METADATA_TIMEOUT,
+            "gave up after {waited:?}, before the metadata deadline"
+        );
+        assert!(
+            waited < GOLDEN_DOWNLOAD_TIMEOUT / 10,
+            "waited {waited:?}: the lookup ran on the download budget"
+        );
+    }
+
+    /// G10: an open breaker at the golden endpoint's own origin must refuse the
+    /// golden release lookup before it reaches the network — no connection to
+    /// `api_base`, and none of the 30 s metadata deadline spent — and the same
+    /// lookup, once the open window lapses, must go out again, take the answer,
+    /// and close the breaker.
+    ///
+    /// The client is built *before* the breaker is tripped: the first client in
+    /// a process waits up to five seconds for the OS certificate store
+    /// (`shared_http::tls_roots`), and a wait like that between the trip and
+    /// the lookup would let the window lapse and admit the very request this
+    /// test needs refused. Between the trip and the call there is only
+    /// in-memory work, and the window is a second wide, so a scheduling stall
+    /// cannot blur the premise either. (The breaker's window is a
+    /// `std::time::Instant`, so this test runs on the real clock rather than a
+    /// paused one.)
+    #[tokio::test]
+    async fn open_breaker_refuses_the_golden_release_lookup_before_it_spends_the_deadline() {
+        let body = serde_json::json!([
+            {"tag_name": "v9.9.9", "assets": [{"name": golden_asset_name()}]}
+        ])
+        .to_string();
+        let (api_base, hits) = json_listing_stub(body).await;
+
+        // See the doc comment: the TLS roots (and therefore this client) are
+        // resolved before the breaker is tripped.
+        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
+
+        let funnel = GithubFunnel {
+            breakers: Arc::new(GithubBreakerRegistry::new(BreakerConfig {
+                enabled: true,
+                // One failure trips the bucket; the window is short enough to
+                // wait out and long enough that the refusal below cannot race
+                // its expiry.
+                failure_threshold: 1,
+                base_open: Duration::from_secs(1),
+                max_open: Duration::from_secs(1),
+                probe_timeout: Duration::from_secs(5),
+            })),
+            consumption: Arc::new(GithubConsumption::default()),
+        };
+        let breaker = funnel.breakers.breaker_at(
+            &service_origin(&api_base),
+            GithubCredentialBucket::Anonymous,
+        );
+        breaker.record_failure(&GithubFailureKind::Unavailable, "503 from api.github.com");
+        assert!(breaker.is_open(), "the anonymous bucket starts open");
+
+        let started = std::time::Instant::now();
+        let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
+        let waited = started.elapsed();
+        assert_eq!(tag, None, "a refused lookup resolves to no tag");
+        assert!(
+            waited < GOLDEN_METADATA_TIMEOUT / 10,
+            "the refusal waited {waited:?}: it must not spend the metadata deadline"
+        );
+        // A refusal never opens a connection, so the stub's hit count is the
+        // proof — and it stays zero after a grace period in which a wrongly
+        // sent request would have been accepted.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an open breaker must not touch GitHub"
+        );
+        assert_eq!(
+            funnel
+                .consumption
+                .snapshot()
+                .iter()
+                .find(|usage| usage.subsystem == "golden")
+                .map(|usage| usage.breaker_blocked),
+            Some(1),
+            "the refusal must be accounted under `golden`"
+        );
+
+        // The refusal must not have been cached as a negative answer: once the
+        // window lapses the lookup is admitted, the stub answers, and the
+        // breaker closes on the reachability proof.
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
+        assert_eq!(tag.as_deref(), Some("v9.9.9"), "the lookup must answer");
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "an admitted lookup must reach the stub"
+        );
+        assert!(
+            !breaker.is_open(),
+            "a reachable answer must close the breaker"
         );
     }
 
@@ -13774,10 +17538,16 @@ mod golden_download_tests {
             Some(body.len() as u64),
             None,
             false,
+            &test_github(),
             move |offset| {
                 let url = url.clone();
                 Box::pin(async move {
-                    let mut request = reqwest::Client::new().get(&url);
+                    let mut request = preloop_runner_server::shared_http::with_tls_roots(
+                        reqwest::Client::builder(),
+                    )
+                    .build()
+                    .unwrap()
+                    .get(&url);
                     if offset > 0 {
                         request =
                             request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
@@ -13809,6 +17579,190 @@ mod golden_download_tests {
         );
     }
 
+    /// A release listing served by a stub, counting the connections it accepts.
+    async fn json_listing_stub(body: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (api_base, hits)
+    }
+
+    /// A funnel whose bucket-keyed methods speak for `origin`, with a window
+    /// short enough to wait out inside a test.
+    fn funnel_at(origin: &str) -> GithubFunnel {
+        GithubFunnel {
+            breakers: Arc::new(GithubBreakerRegistry::for_origin(
+                BreakerConfig {
+                    enabled: true,
+                    failure_threshold: 1,
+                    base_open: Duration::from_secs(1),
+                    max_open: Duration::from_secs(1),
+                    probe_timeout: Duration::from_secs(5),
+                },
+                origin,
+            )),
+            consumption: Arc::new(GithubConsumption::default()),
+        }
+    }
+
+    /// G10: an outage the engine already discovered at its own GitHub origin —
+    /// here an App bucket parked by the webhook path — refuses the golden
+    /// lookup before a connection is opened, without spending the metadata
+    /// deadline. The party that discovered it is deliberately *not* the
+    /// anonymous bucket: the point is that golden traffic inherits an outage
+    /// found by another credential's traffic at the same origin.
+    #[tokio::test]
+    async fn engine_origin_outage_refuses_the_lookup_from_another_bucket() {
+        let body = serde_json::json!([
+            {"tag_name": "v9.9.9", "assets": [{"name": golden_asset_name()}]}
+        ])
+        .to_string();
+        let (api_base, hits) = json_listing_stub(body).await;
+        // See the test above: the TLS roots are resolved before the trip.
+        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
+
+        let funnel = funnel_at(&service_origin(&api_base));
+        funnel
+            .breakers
+            .breaker_for(GithubCredentialBucket::App(7))
+            .record_failure(&GithubFailureKind::Unavailable, "502 from api.github.com");
+
+        let started = std::time::Instant::now();
+        let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
+        let waited = started.elapsed();
+
+        assert_eq!(tag, None, "a refused lookup resolves to no tag");
+        assert!(
+            waited < GOLDEN_METADATA_TIMEOUT / 10,
+            "the refusal waited {waited:?}: an outage the engine already knows about must not be \
+             rediscovered on the golden deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refused lookup must not touch the host"
+        );
+        assert_eq!(
+            funnel
+                .consumption
+                .snapshot()
+                .into_iter()
+                .find(|usage| usage.subsystem == "golden")
+                .map(|usage| usage.breaker_blocked),
+            Some(1),
+            "the refusal is golden's, and accounted as such"
+        );
+    }
+
+    /// The other half of the same partition: a GitHub outage says nothing about
+    /// a mirror at another origin. An operator whose `PRELOOP_GOLDEN_URL` points
+    /// at an internal host must still be able to download from it while
+    /// api.github.com is parked — and a mirror's outage must not park GitHub.
+    #[tokio::test]
+    async fn open_github_breaker_does_not_refuse_a_foreign_golden_host() {
+        let body = serde_json::json!([
+            {"tag_name": "v9.9.9", "assets": [{"name": golden_asset_name()}]}
+        ])
+        .to_string();
+        let (api_base, hits) = json_listing_stub(body).await;
+        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
+
+        let funnel = funnel_at("api.github.com");
+        for bucket in [
+            GithubCredentialBucket::Anonymous,
+            GithubCredentialBucket::App(7),
+            GithubCredentialBucket::Installation(42),
+        ] {
+            funnel
+                .breakers
+                .breaker_for(bucket)
+                .record_failure(&GithubFailureKind::Unavailable, "502 from api.github.com");
+        }
+
+        let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
+
+        assert_eq!(
+            tag.as_deref(),
+            Some("v9.9.9"),
+            "a healthy host must still be usable during a GitHub outage"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the lookup must reach the foreign host"
+        );
+    }
+
+    /// The `golden` subsystem reports the bytes it moved, not just its request
+    /// count: a multi-gigabyte transfer that accounted for nothing made the
+    /// per-subsystem consumption snapshot lie about where the bandwidth went.
+    #[tokio::test]
+    async fn golden_download_accounts_the_bytes_it_moved() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("golden.smolmachine");
+
+        let body: Vec<u8> = (0..1024_u32).map(|i| i as u8).collect();
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(&body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let url = serve_with_checksum(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
+            body.clone(),
+            format!("{digest}  golden\n").into_bytes(),
+        )
+        .await;
+        let funnel = test_github();
+
+        let downloaded = download_prebaked_golden_with_space(
+            &payload,
+            "9.9.9",
+            |_| Ok(u64::MAX),
+            Some(&url),
+            false,
+            &funnel,
+        )
+        .await
+        .unwrap();
+
+        assert!(downloaded);
+        let usage = funnel
+            .consumption
+            .snapshot()
+            .into_iter()
+            .find(|usage| usage.subsystem == "golden")
+            .expect("the golden subsystem is reported");
+        assert!(
+            usage.bytes >= body.len() as u64,
+            "the transfer body must be charged to `golden`, got {} bytes for a {} byte artifact",
+            usage.bytes,
+            body.len()
+        );
+        assert!(
+            usage.requests >= 2,
+            "the checksum and the transfer are two requests, got {}",
+            usage.requests
+        );
+    }
+
     #[tokio::test]
     async fn matching_checksum_is_verified_before_the_payload_lands() {
         let directory = tempfile::tempdir().unwrap();
@@ -13833,6 +17787,7 @@ mod golden_download_tests {
             |_| Ok(u64::MAX),
             Some(&url),
             false,
+            &test_github(),
         )
         .await
         .unwrap();
@@ -13861,6 +17816,7 @@ mod golden_download_tests {
             |_| Ok(u64::MAX),
             Some(&url),
             false,
+            &test_github(),
         )
         .await
         .unwrap();
@@ -13997,5 +17953,107 @@ mod golden_cache_tests {
             .expect("the retry fits the freed slot");
         assert_eq!(golden.as_str(), "env-a-golden");
         assert_eq!(budget.free(), 0, "a registered golden keeps its slot");
+    }
+}
+
+#[cfg(test)]
+mod host_externals_bound_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// Whether a process with `pid` still exists (`kill -0`).
+    fn process_exists(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// A fake externals step that never finishes. It records its pid, then
+    /// sleeps; `exec` makes the sleeping process the one that pid names, so the
+    /// deadline has to kill that exact process.
+    #[tokio::test]
+    async fn a_hung_host_externals_step_is_killed_at_its_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("pid");
+        let script = format!("echo $$ > '{}' && exec sleep 600", pid_file.display());
+        let mut step = tokio::process::Command::new("sh");
+        step.args(["-c", script.as_str()]);
+
+        let started = std::time::Instant::now();
+        let error =
+            deadline::run_command_status(step, Duration::from_secs(2), "fake externals install")
+                .await
+                .expect_err("a step that never finishes must time out");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited {:?} for a 2s deadline",
+            started.elapsed()
+        );
+        assert!(error.timed_out(), "{error}");
+        assert_eq!(error.what(), "fake externals install");
+        let pid = std::fs::read_to_string(&pid_file).expect("the fake step recorded its pid");
+        let pid = pid.trim();
+        for _ in 0..100 {
+            if !process_exists(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("pid {pid} still running after its deadline");
+    }
+
+    /// The real install script against a listener that accepts and never
+    /// answers. curl's own `--max-time` must end the stalled transfer, and the
+    /// failed fetch must publish no runtime. The backstop deadline only exists
+    /// so a regression fails this test instead of hanging it.
+    #[tokio::test]
+    async fn a_stalled_node_download_ends_at_curl_max_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dist = format!("http://{}/dist", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let limits = NodeFetchLimits {
+            connect_secs: 1,
+            archive_max_secs: 1,
+            shasums_max_secs: 1,
+        };
+        let command = node_externals_script(directory.path().to_str().unwrap(), &dist, limits)
+            .pop()
+            .unwrap();
+        let mut install = tokio::process::Command::new(&command[0]);
+        install.args(&command[1..]);
+
+        let started = std::time::Instant::now();
+        let status =
+            deadline::run_command_status(install, Duration::from_secs(120), "stalled node install")
+                .await
+                .expect("curl's own limit must end the stalled transfer before the backstop");
+
+        assert!(
+            !status.success(),
+            "a stalled download must fail the install"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "waited {:?} for a 1s curl limit",
+            started.elapsed()
+        );
+        let externals = directory.path().join("externals");
+        assert!(
+            !externals.join("node20").exists(),
+            "no runtime may be published"
+        );
+        assert!(
+            !externals.join("node24").exists(),
+            "no runtime may be published"
+        );
     }
 }

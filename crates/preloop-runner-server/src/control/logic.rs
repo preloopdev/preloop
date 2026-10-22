@@ -46,6 +46,27 @@ fn uuid_v5(namespace: &uuid::Uuid, name: &str) -> uuid::Uuid {
     uuid::Builder::from_sha1_bytes(bytes).into_uuid()
 }
 
+/// Re-prefix the runner-visible `system.orchestrationId` when a retry gives
+/// the attempt a fresh runtime identity.
+///
+/// The value is `{planId}.{baseJobId}.{__default|_N}` and `planId` is the
+/// attempt's `agent_job_id` (see `runs::orchestration_id`). The runner sends
+/// this value as the plan segment of `runnerresolve/actions`; leaving the
+/// abandoned attempt's id in the prefix makes the engine refuse the retried
+/// job's own runtime token (`auth::path_names_token_plan`). The job/suffix
+/// tail is preserved verbatim.
+pub(crate) fn reprefix_orchestration_id(
+    message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
+    agent_job_id: uuid::Uuid,
+) {
+    if let Some(value) = message.variables.get_mut("system.orchestrationId")
+        && let Some(old) = value.value.as_deref()
+    {
+        let suffix = old.split_once('.').map(|(_, tail)| tail).unwrap_or("");
+        value.value = Some(format!("{agent_job_id}.{suffix}"));
+    }
+}
+
 /// Events a person triggers by hand: a comment (`@pullfrog review`) or a
 /// manual dispatch. Their jobs are claimed ahead of push/pull_request CI.
 pub(crate) const INTERACTIVE_EVENTS: [&str; 2] = ["issue_comment", "workflow_dispatch"];

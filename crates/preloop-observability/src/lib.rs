@@ -19,9 +19,11 @@
 //! - Always retain `stderr`/`journald` even when OTLP is configured.
 //! - `Debug` on config never reveals headers or credential-bearing endpoint parts.
 
+pub mod deadline;
 pub mod metrics;
 pub mod prometheus;
 pub mod status;
+pub mod tls;
 pub mod vm_telemetry;
 
 /// middleware's span parent extraction.
@@ -205,6 +207,13 @@ pub struct ObservabilityConfig {
     otel_metrics_headers: Option<String>,
     /// Whether any OTLP endpoint is present (i.e. export enabled).
     pub otlp_enabled: bool,
+    /// Optional customizer for the OTLP exporters' blocking HTTP client —
+    /// normally the host's `with_tls_roots_blocking`, which pins TLS
+    /// verification to the workspace's in-process root set instead of
+    /// reqwest's platform verifier (whose macOS handshake asks
+    /// `trustd`/`securityd` synchronously, with no deadline).
+    otel_client_builder:
+        Option<fn(reqwest::blocking::ClientBuilder) -> reqwest::blocking::ClientBuilder>,
 }
 
 impl ObservabilityConfig {
@@ -294,6 +303,7 @@ impl ObservabilityConfig {
             otel_traces_headers,
             otel_metrics_headers,
             otlp_enabled,
+            otel_client_builder: None,
         }
     }
 
@@ -323,6 +333,26 @@ impl ObservabilityConfig {
     /// own version is meaningless to an operator reading telemetry.
     pub fn with_service_version(mut self, version: &str) -> Self {
         self.service_version = version.to_string();
+        self
+    }
+
+    /// Install the workspace's in-process TLS roots on the OTLP exporters'
+    /// blocking client.
+    ///
+    /// Pass the host's shared-root installer — for the engine and CLI that is
+    /// `preloop_runner_server::shared_http::with_tls_roots_blocking`. Without
+    /// it the blocking reqwest client falls back to reqwest's default TLS
+    /// stack, which on macOS delegates each handshake to the platform
+    /// verifier: `SecTrustEvaluateWithError` asks `trustd`/`securityd` on the
+    /// exporting thread with no deadline of its own. A hung or prompting trust
+    /// daemon then stalls that exporter (and the 2 s shutdown flush) for as
+    /// long as the daemon likes. The customizer runs on the dedicated thread
+    /// that builds the client, outside any async runtime.
+    pub fn with_otel_client_builder(
+        mut self,
+        customize: fn(reqwest::blocking::ClientBuilder) -> reqwest::blocking::ClientBuilder,
+    ) -> Self {
+        self.otel_client_builder = Some(customize);
         self
     }
 
@@ -626,6 +656,7 @@ impl Observability {
             otel_traces_headers: None,
             otel_metrics_headers: None,
             otlp_enabled: false,
+            otel_client_builder: None,
         };
         Self {
             inner: Arc::new(Inner {
@@ -653,11 +684,17 @@ impl Observability {
         // client is built on a fresh thread: reqwest's blocking client spins
         // up an internal runtime whose drop panics when constructed inside an
         // entered tokio runtime (we are called from async main / tests).
-        let http_client = std::thread::spawn(|| {
-            reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .ok()
+        // The host's customizer (normally `shared_http::with_tls_roots_blocking`)
+        // swaps the platform TLS verifier for the workspace's in-process roots;
+        // see `with_otel_client_builder`.
+        let customize = config.otel_client_builder;
+        let http_client = std::thread::spawn(move || {
+            let builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10));
+            let builder = match customize {
+                Some(customize) => customize(builder),
+                None => builder,
+            };
+            builder.build().ok()
         })
         .join()
         .ok()

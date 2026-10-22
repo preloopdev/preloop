@@ -1563,6 +1563,8 @@ pub struct StartupConfig {
     pub max_poll_window_secs: Option<u64>,
     /// `PRELOOP_SNAPSHOT_RETENTION_SECONDS` (default 1800).
     pub snapshot_retention_seconds: Option<u64>,
+    /// `PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES` (default 100 GiB).
+    pub snapshot_object_cache_max_bytes: Option<u64>,
     /// `PRELOOP_RUNNER_VERSION_DEPRECATED` (`1|true|yes`).
     pub runner_version_deprecated: Option<bool>,
     /// `PRELOOP_REGISTRATION_POLICY` (`permissive` opts in; default strict).
@@ -1584,6 +1586,10 @@ pub struct StartupConfig {
     pub token_ttl_secs: Option<u64>,
     /// `PRELOOP_OUTBOX_RETENTION_SECONDS` (default 3600).
     pub outbox_retention_seconds: Option<u64>,
+    /// `PRELOOP_SETUP_INSTALL_WAIT_SECS` (default 300): how long the
+    /// engine-hosted App setup's `--repo` checks wait for the App's
+    /// installation to appear before reporting it missing.
+    pub setup_install_wait_secs: Option<u64>,
     /// `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` over the manifest default
     /// (`push,pull_request,check_run`).
     pub github_app_default_events: Option<String>,
@@ -1718,6 +1724,10 @@ impl StartupConfig {
                 .filter(|value| *value > 0),
             snapshot_retention_seconds: env_override("PRELOOP_SNAPSHOT_RETENTION_SECONDS")
                 .and_then(|raw| raw.parse().ok()),
+            snapshot_object_cache_max_bytes: env_override(
+                "PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES",
+            )
+            .and_then(|raw| raw.parse().ok()),
             runner_version_deprecated: env_flag_value("PRELOOP_RUNNER_VERSION_DEPRECATED"),
             registration_policy: env_override("PRELOOP_REGISTRATION_POLICY"),
             webhook_workers: env_override("PRELOOP_WEBHOOK_WORKERS")
@@ -1738,6 +1748,8 @@ impl StartupConfig {
                 .and_then(|raw| raw.parse().ok()),
             token_ttl_secs: env_override("PRELOOP_TOKEN_TTL_SECS").and_then(|raw| raw.parse().ok()),
             outbox_retention_seconds: env_override("PRELOOP_OUTBOX_RETENTION_SECONDS")
+                .and_then(|raw| raw.parse().ok()),
+            setup_install_wait_secs: env_override("PRELOOP_SETUP_INSTALL_WAIT_SECS")
                 .and_then(|raw| raw.parse().ok()),
             github_app_default_events: env_override("PRELOOP_GITHUB_APP_DEFAULT_EVENTS"),
             github_app_registration: env_switch_value(APP_REGISTRATION_ENV),
@@ -1799,6 +1811,7 @@ impl StartupConfig {
             runner_liveness_timeout_secs: None,
             max_poll_window_secs: None,
             snapshot_retention_seconds: None,
+            snapshot_object_cache_max_bytes: None,
             runner_version_deprecated: None,
             registration_policy: None,
             webhook_workers: None,
@@ -1809,6 +1822,7 @@ impl StartupConfig {
             webhook_watchdog_max_pages: None,
             token_ttl_secs: None,
             outbox_retention_seconds: None,
+            setup_install_wait_secs: None,
             github_app_default_events: None,
             github_app_registration: None,
             github_skip_workflows: None,
@@ -1925,6 +1939,7 @@ impl std::fmt::Debug for StartupConfig {
             )
             .field("token_ttl_secs", &self.token_ttl_secs)
             .field("outbox_retention_seconds", &self.outbox_retention_seconds)
+            .field("setup_install_wait_secs", &self.setup_install_wait_secs)
             .field("github_app_default_events", &self.github_app_default_events)
             .field("github_app_registration", &self.github_app_registration)
             .field("github_skip_workflows", &self.github_skip_workflows)
@@ -2903,6 +2918,27 @@ pub fn write_config_to_with(
 /// concurrent tests cannot tear each other's read-modify-write cycles.
 #[cfg(any(test, feature = "test-support"))]
 static CONFIG_PATH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Serializes whole-file config mutations: every "load, change, write back"
+/// cycle on a config file holds this for its whole length.
+///
+/// Atomic renames keep the file itself intact, but two cycles that both start
+/// from the same base snapshot still lose one another's change — the later
+/// rename publishes a document written from the older read. The fronts that
+/// rewrite the file (the secrets API, the execution-protection API, and
+/// engine-hosted App setup) therefore share this one lock rather than one per
+/// API.
+///
+/// Held only around synchronous work, never across an `await`, so an async
+/// caller blocks an executor thread for no longer than a load and a write. It
+/// is process-local, like the mutation locks the HTTP APIs use: two processes
+/// pointed at one config file are still last-writer-wins.
+static CONFIG_MUTATION_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// See [`CONFIG_MUTATION_LOCK`].
+pub fn config_mutation_lock() -> &'static parking_lot::Mutex<()> {
+    &CONFIG_MUTATION_LOCK
+}
 
 /// The pinned per-process test config path. Test builds never resolve (or
 /// write) the developer's real config through the default path: the default

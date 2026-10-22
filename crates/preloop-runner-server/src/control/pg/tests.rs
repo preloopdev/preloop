@@ -589,6 +589,7 @@ fn webhook_record(delivery_id: &str) -> WebhookDeliveryRecord {
         attempts: 0,
         lease_until_us: None,
         lease_token: None,
+        signer_app_id: None,
         last_error: None,
     }
 }
@@ -2311,4 +2312,231 @@ async fn claim_order_is_served_by_the_global_ready_index() {
         !plan.contains("Sort"),
         "the front read must not sort:\n{plan}"
     );
+}
+
+// ── session deadline and guards ─────────────────────────────────────────
+
+/// A TCP listener that accepts every connection and never answers: the
+/// shape of a database that is hung rather than down. Each accepted socket
+/// is held open by a task that never returns, so the peer sees a live
+/// connection that simply never speaks. Returns its port and how many
+/// connections it accepted.
+async fn silent_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepts);
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _held = socket;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    (port, accepts)
+}
+
+/// A hung database ends the session open at the deadline. Before the connect
+/// deadline, `connect_one` waited on the startup handshake forever, which is
+/// how a stalled Postgres froze engine startup and every pooled reconnect.
+///
+/// The deadline is shortened so the test proves the wait ends at *a*
+/// deadline without spending the production 10 s; the production value is
+/// covered by `the_connect_deadline_error_names_postgres_and_the_deadline`
+/// and by `pooled_sessions_carry_the_control_timeouts`.
+#[tokio::test]
+async fn a_stalled_database_ends_the_session_open_at_the_deadline() {
+    let (port, accepts) = silent_listener().await;
+    let url = format!("postgres://preloop@127.0.0.1:{port}/control");
+    let deadline = std::time::Duration::from_millis(250);
+    let started = std::time::Instant::now();
+    let error = super::connect_one_within(&url, "test-origin", deadline)
+        .await
+        .expect_err("a database that never answers must not open a session");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(200),
+        "the attempt gave up after {elapsed:?}, before the deadline: it must have waited for \
+         the answer, not failed for another reason"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the attempt ended after {elapsed:?}, not at its {deadline:?} deadline"
+    );
+    let message = format!("{error:?}");
+    for needle in ["Postgres", "connect deadline", "0.25"] {
+        assert!(message.contains(needle), "{message}");
+    }
+    assert!(
+        accepts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the TCP connect must have been accepted, so the stall was after it"
+    );
+}
+
+/// Seconds of a time-unit GUC as Postgres reports it (`30s` → 30.0), so the
+/// assertion does not depend on how Postgres prints the value. `extract`
+/// returns `numeric`, which the driver cannot deserialize into `f64` without
+/// the cast.
+async fn setting_seconds(client: &tokio_postgres::Client, name: &str) -> f64 {
+    client
+        .query_one(
+            &format!("SELECT (extract(epoch from current_setting('{name}')::interval))::float8"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// The Postgres message of a driver error. `Display` on a database error is
+/// only `db error`; the server's detail (which timeout fired) is on the
+/// `DbError`.
+fn db_message(error: &tokio_postgres::Error) -> String {
+    error
+        .as_db_error()
+        .map(|detail| detail.message().to_owned())
+        .unwrap_or_else(|| error.to_string())
+}
+
+/// Every pooled session carries the server-side guards, on both pools, at
+/// the values the module documents: a statement that gets past the connect
+/// deadline cannot then hold a runtime worker, a pooled connection and its
+/// row locks forever.
+#[tokio::test]
+async fn pooled_sessions_carry_the_control_timeouts() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        skip_no_postgres();
+        return;
+    };
+    let backend = connect(&url).await;
+    let sessions = [
+        ("writer", backend.writer().await.unwrap()),
+        ("reader", backend.reader().await.unwrap()),
+    ];
+    for (pool, client) in &sessions {
+        for (setting, expected) in [
+            ("statement_timeout", crate::store_pg::STATEMENT_TIMEOUT),
+            ("lock_timeout", crate::store_pg::LOCK_TIMEOUT),
+            (
+                "idle_in_transaction_session_timeout",
+                crate::store_pg::IDLE_IN_TRANSACTION_TIMEOUT,
+            ),
+        ] {
+            assert_eq!(
+                setting_seconds(client, setting).await,
+                expected.as_secs_f64(),
+                "{pool} session {setting}"
+            );
+        }
+    }
+}
+
+/// The statement guard turns a stuck statement into an error at the
+/// deadline. The serving 30 s would make this test take 30 s, so the same
+/// builder installs a short one: what is under test is that the guard SQL
+/// Postgres receives really cancels the statement, with the error naming the
+/// timeout.
+#[tokio::test]
+async fn the_statement_guard_kills_a_stuck_statement() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        skip_no_postgres();
+        return;
+    };
+    let backend = connect(&url).await;
+    let client = backend.writer().await.unwrap();
+    let short = std::time::Duration::from_millis(250);
+    client
+        .batch_execute(&crate::store_pg::session_timeouts_sql_with(
+            short, short, short,
+        ))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = client
+        .batch_execute("SELECT pg_sleep(10)")
+        .await
+        .expect_err("a statement past its deadline must be cancelled");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the statement ran for {elapsed:?} instead of dying at {short:?}"
+    );
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::QUERY_CANCELED),
+        "{error}"
+    );
+    assert!(
+        db_message(&error).contains("statement timeout"),
+        "{}",
+        db_message(&error)
+    );
+}
+
+/// The lock guard ends a lock wait at its own deadline and names the lock,
+/// instead of letting the command queue behind a stuck transaction — the
+/// shape of the incident this family of deadlines exists for. The serving
+/// 15 s would make this test take 15 s, so the lock deadline is shortened
+/// through the same builder.
+#[tokio::test]
+async fn the_lock_guard_kills_a_stuck_lock_wait() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        skip_no_postgres();
+        return;
+    };
+    let backend = connect(&url).await;
+    let mut holder = backend.writer().await.unwrap();
+    let waiter = backend.writer().await.unwrap();
+    holder
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS public.lock_probe (id int PRIMARY KEY); \
+             INSERT INTO public.lock_probe VALUES (1) ON CONFLICT DO NOTHING",
+        )
+        .await
+        .unwrap();
+    let held = holder.transaction().await.unwrap();
+    held.query_one(
+        "SELECT id FROM public.lock_probe WHERE id = 1 FOR NO KEY UPDATE",
+        &[],
+    )
+    .await
+    .unwrap();
+    let short = std::time::Duration::from_millis(250);
+    waiter
+        .batch_execute(&crate::store_pg::session_timeouts_sql_with(
+            std::time::Duration::from_secs(5),
+            short,
+            std::time::Duration::from_secs(5),
+        ))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = waiter
+        .execute(
+            "SELECT id FROM public.lock_probe WHERE id = 1 FOR NO KEY UPDATE",
+            &[],
+        )
+        .await
+        .expect_err("a lock wait past its deadline must be cancelled");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the lock wait ran for {elapsed:?} instead of dying at {short:?}"
+    );
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "{error}"
+    );
+    assert!(
+        db_message(&error).contains("lock timeout"),
+        "{}",
+        db_message(&error)
+    );
+    held.rollback().await.unwrap();
 }

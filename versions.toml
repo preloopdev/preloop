@@ -1,4 +1,4 @@
-runner_version = "2.336.0"
+runner_version = "2.337.0"
 
 # SmolVM runtime floor: v1.30.1, the release this branch was measured on. Below
 # the floor a machine preloop builds can fail to boot, fork, or restore packed
@@ -39,7 +39,7 @@ smolvm_min_version = "1.30.1"
 # floor rarely moves. Raising this pin does NOT rebuild the published golden:
 # the official golden is a prebuilt OCI artifact pinned by digest in
 # crates/preloop-orchestrator/src/lib.rs (`GOLDEN_OCI_REF_*`), and a new one
-# only exists after a host-driven bake and publish — see docs/build-goldens.md.
+# only exists after a host-driven bake and publish — see docs/contributing/build-goldens.md.
 smolvm_golden_version = "1.30.1"
 
 # Image inputs for the runner golden. The official golden is baked from the
