@@ -1,0 +1,65 @@
+name: codeql
+
+# Deep analysis on merge to main, not per PR: CodeQL upload needs a real
+# GitHub token with security-events: write, which engine-hosted runs do not
+# have. The PR gate is Semgrep (semgrep.yml).
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Wednesday 06:00 UTC, offset from the daily golden scan.
+    - cron: "0 6 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, rust]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          # Rust supports only `none`: CodeQL uses rust-analyzer and does not
+          # invoke a full cargo build. `actions` is interpreted.
+          build-mode: none
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:${{ matrix.language }}"
+          # Preloop engine runs have no GitHub code-scanning backend. Keep the
+          # SARIF in the run artifact until the SARIF ingestion endpoint exists.
+          upload: never
+          upload-database: false
+          output: ${{ runner.temp }}/codeql-results
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codeql-${{ matrix.language }}-sarif
+          path: ${{ runner.temp }}/codeql-results
+          if-no-files-found: warn
+          retention-days: 14
