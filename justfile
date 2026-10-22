@@ -69,7 +69,7 @@ store-status:
 zizmor:
     uvx zizmor .github/workflows/
 
-test-ci: fmt-check clippy zizmor
+test-ci: fmt-check clippy zizmor sg-test sg-scan-strict
     PROPTEST_CASES=8 cargo test --locked --workspace --quiet
     just test-control-migrations
     just conform
@@ -98,6 +98,12 @@ supply-chain-guard:
     supply-chain/guard-policy-files.sh origin/main HEAD
 
 #lint (ast-grep structural rules)
+
+# Rule unit tests: valid/invalid fixtures for every rule in rules/.
+# --skip-snapshot-tests keeps the gate on matching behavior only: no
+# diagnostic/source snapshot baselines are created or pinned.
+sg-test:
+    ast-grep test --skip-snapshot-tests
 
 sg-scan:
     ast-grep scan

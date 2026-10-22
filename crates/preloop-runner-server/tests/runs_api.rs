@@ -13,7 +13,9 @@ use common::*;
 #[tokio::test]
 async fn list_runs_projects_step_records() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
     let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -57,7 +59,9 @@ async fn list_runs_projects_step_records() {
 #[tokio::test]
 async fn list_runs_puts_active_work_before_newer_terminal_runs() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let first: RunId = submit_simple_run(&app).await["run_id"]
         .as_str()
@@ -102,7 +106,9 @@ async fn list_runs_puts_active_work_before_newer_terminal_runs() {
 async fn step_manifests_survive_a_restart() {
     let temp = tempfile::tempdir().unwrap();
     let (run_id, plan_id, agent_job_id, ids) = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
         let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -131,7 +137,9 @@ async fn step_manifests_survive_a_restart() {
     };
 
     // A fresh AppState over the same state dir is the restart.
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let restored = workflow_step_ids(&state, run_id, "build").await;
     assert_eq!(
@@ -199,7 +207,9 @@ async fn step_reports_after_a_restart_are_persisted() {
     };
 
     let (plan_id, agent_job_id, ids) = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
         let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -226,7 +236,9 @@ async fn step_reports_after_a_restart_are_persisted() {
     };
 
     {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         report(
             app,
@@ -239,7 +251,9 @@ async fn step_reports_after_a_restart_are_persisted() {
     }
 
     // Only a second restart can tell whether that write reached the store.
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let inner = state.test_tx().await;
     let records = &inner.job_steps[&agent_job_id.parse::<uuid::Uuid>().unwrap()];
     let reported = records
@@ -262,7 +276,9 @@ async fn step_reports_after_a_restart_are_persisted() {
 #[tokio::test]
 async fn step_lists_and_job_logs_follow_execution_order() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
     let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -356,7 +372,9 @@ async fn step_lists_and_job_logs_follow_execution_order() {
 #[tokio::test]
 async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, _) = two_job_run_for_log_filters(&app, &state).await;
     let first_ids = workflow_step_ids(&state, run_id, "build").await;
@@ -436,7 +454,9 @@ async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
 #[tokio::test]
 async fn step_manifests_are_scoped_per_job_attempt() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let first_ids = workflow_step_ids(&state, run_id, "build").await;
@@ -531,7 +551,9 @@ async fn step_manifests_are_scoped_per_job_attempt() {
 #[tokio::test]
 async fn log_run_logs_step_filter_selects_one_step() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
     let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -562,7 +584,9 @@ async fn log_run_logs_step_filter_selects_one_step() {
 #[tokio::test]
 async fn log_run_logs_step_filter_uses_workflow_step_ids() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -600,7 +624,9 @@ async fn log_run_logs_step_filter_uses_workflow_step_ids() {
 #[tokio::test]
 async fn log_run_logs_step_out_of_range_is_404() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
     let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -628,7 +654,9 @@ async fn log_run_logs_step_out_of_range_is_404() {
 #[tokio::test]
 async fn log_run_logs_step_zero_is_rejected_as_one_based() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     write_step_job_logs(&temp, &jobs[0].1, &jobs[0].2, &[("a", "step one\n")]).await;
@@ -640,7 +668,9 @@ async fn log_run_logs_step_zero_is_rejected_as_one_based() {
 #[tokio::test]
 async fn log_run_logs_step_on_merged_upload_is_conflict() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     // A merged job log carries no step boundaries.
@@ -662,7 +692,9 @@ async fn log_run_logs_step_on_merged_upload_is_conflict() {
 #[tokio::test]
 async fn log_run_logs_step_without_job_in_multi_job_run_is_ambiguous() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     write_step_job_logs(&temp, &jobs[0].1, &jobs[0].2, &[("a", "step one\n")]).await;
@@ -683,7 +715,9 @@ async fn log_run_logs_step_without_job_in_multi_job_run_is_ambiguous() {
 #[tokio::test]
 async fn log_run_logs_step_filter_refuses_live_console_blocks() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
 
@@ -729,7 +763,9 @@ async fn log_run_logs_step_filter_refuses_live_console_blocks() {
 #[tokio::test]
 async fn live_run_logs_native_route_requires_job_when_ambiguous() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
 
@@ -749,7 +785,9 @@ async fn live_run_logs_native_route_requires_job_when_ambiguous() {
 #[tokio::test]
 async fn live_run_logs_native_route_rejects_unknown_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
 
@@ -760,7 +798,9 @@ async fn live_run_logs_native_route_rejects_unknown_job() {
 #[tokio::test]
 async fn live_run_logs_native_route_rejects_uuid_from_other_run() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_foreign_run_id, foreign_jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
@@ -797,7 +837,9 @@ async fn live_run_logs_native_route_rejects_uuid_from_other_run() {
 #[tokio::test]
 async fn live_run_logs_native_route_defaults_single_job_run() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_yaml(
         &app,
@@ -830,7 +872,9 @@ async fn live_run_logs_native_route_defaults_single_job_run() {
 #[tokio::test]
 async fn live_run_logs_native_route_rejects_unauthenticated() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
 
@@ -854,7 +898,9 @@ async fn live_run_logs_native_route_rejects_unauthenticated() {
 #[tokio::test]
 async fn live_log_stream_ends_when_job_completes() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let build_uuid = jobs[0].2.clone();
@@ -896,7 +942,9 @@ async fn live_log_stream_ends_when_job_completes() {
 #[tokio::test]
 async fn live_log_stream_for_already_completed_job_serves_snapshot_and_ends() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let build_uuid = jobs[0].2.clone();
@@ -929,7 +977,9 @@ async fn live_log_stream_for_already_completed_job_serves_snapshot_and_ends() {
 #[tokio::test]
 async fn live_log_stream_ends_on_cancellation() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
 
@@ -951,7 +1001,9 @@ async fn live_log_stream_ends_on_cancellation() {
 #[tokio::test]
 async fn live_log_reopens_when_a_completed_job_streams_again() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let build_uuid = jobs[0].2.clone();
@@ -984,7 +1036,9 @@ async fn live_log_reopens_when_a_completed_job_streams_again() {
 #[tokio::test]
 async fn log_append_masks_submitted_secrets() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1034,7 +1088,9 @@ jobs:
 #[tokio::test]
 async fn registration_persists_runner_public_key_material() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let public_key = AgentRsaKeypair::generate().unwrap().public_key_xml();
 
@@ -1067,7 +1123,9 @@ async fn registration_persists_runner_public_key_material() {
 #[tokio::test]
 async fn log_append_masks_environment_secrets_on_a_cold_masker_cache() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     {
         let mut secrets = state.secrets.write();
         secrets
@@ -1161,7 +1219,9 @@ jobs:
 #[tokio::test]
 async fn log_append_fails_closed_when_the_secret_provider_errors() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let failing = state.test_install_toggled_secret_provider();
     let app = app(state.clone(), CancellationToken::new());
 
@@ -1247,7 +1307,9 @@ async fn log_append_fails_closed_when_the_secret_provider_errors() {
 #[tokio::test]
 async fn native_runner_list_reports_registered_runners() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // No runners yet: the CLI must be able to distinguish this from a
@@ -1300,7 +1362,9 @@ async fn native_runner_list_reports_registered_runners() {
 #[tokio::test]
 async fn native_runner_list_run_scoped_claimable() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // A Linux pool runner is registered, so the raw runner count is positive.
@@ -1395,7 +1459,9 @@ async fn session_key_uses_registered_runner_public_key() {
     let temp = tempfile::tempdir().unwrap();
     let runner_keypair = AgentRsaKeypair::generate().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -1432,7 +1498,9 @@ async fn session_key_uses_registered_runner_public_key() {
 async fn session_key_falls_back_to_plaintext_without_registered_public_key() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -1469,7 +1537,9 @@ async fn session_key_falls_back_to_plaintext_without_registered_public_key() {
 #[tokio::test]
 async fn task_agent_registration_extracts_nested_public_key() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let runner_keypair = AgentRsaKeypair::generate().unwrap();
     let public_xml = runner_keypair.public_key_xml();
     let modulus = public_xml
@@ -1518,7 +1588,9 @@ async fn task_agent_registration_extracts_nested_public_key() {
 #[tokio::test]
 async fn register_runner_dedupes_official_label_set() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // Generate a real RSA keypair so the registration request's publicKey
@@ -1613,7 +1685,9 @@ async fn register_runner_dedupes_official_label_set() {
 async fn connection_data_exposes_current_runner_service_locations() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -1654,7 +1728,9 @@ async fn connection_data_exposes_current_runner_service_locations() {
 async fn registration_and_oauth_return_runner_compatible_tokens() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -1697,7 +1773,9 @@ async fn registration_and_oauth_return_runner_compatible_tokens() {
 async fn registration_mint_credential_rules_are_strict_by_default() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let body = json!({"url": "https://github.com/preloopdev/preloop", "runner_event": "register"});
@@ -1755,7 +1833,9 @@ async fn registration_mint_credential_rules_are_strict_by_default() {
 #[tokio::test]
 async fn registration_mint_permissive_only_under_an_explicit_env_opt_in() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.registration_policy = RegistrationPolicy::Permissive;
     let app = app(state, CancellationToken::new());
     let minted = request_json_with_bearer(
@@ -1796,12 +1876,12 @@ async fn current_runner_registration_to_broker_job_e2e() {
     // `403 refusing to embed an invalid PAT`, which is not what this e2e
     // exercises — it is about registration reaching the broker. Hold the env
     // lock so the unset cannot race a test that needs the token.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+    let startup = stub_startup(None, None);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let runner_keypair = AgentRsaKeypair::generate().unwrap();
     let public_xml = runner_keypair.public_key_xml();
@@ -2071,7 +2151,9 @@ async fn current_runner_registration_to_broker_job_e2e() {
 #[tokio::test]
 async fn job_message_carries_the_official_github_token_variable() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_runner_id, runner_token) =
         register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
@@ -2173,7 +2255,9 @@ async fn job_message_carries_the_official_github_token_variable() {
 #[tokio::test]
 async fn environment_secrets_override_repo_and_global_per_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_runner_id, runner_token) =
         register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
@@ -2372,7 +2456,9 @@ async fn environment_secrets_override_repo_and_global_per_job() {
 #[tokio::test]
 async fn current_service_broker_flow_uses_queued_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let runner_token = state
         .local_jwt(json!({
@@ -2471,7 +2557,7 @@ jobs:
     );
     assert_eq!(
         acquired["variables"]["system.github.launch_endpoint"]["value"],
-        public_base_url()
+        state.public_base_url()
     );
     assert!(
         wire_variable(&acquired, "system.github.token").is_none_or(str::is_empty),
@@ -2592,7 +2678,9 @@ jobs:
 #[tokio::test]
 async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // Registration IDs are allocated monotonically. Register a predecessor so
@@ -2689,7 +2777,7 @@ async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
     .await;
     assert_eq!(pool_ref["messageType"], "RunnerJobRequest");
     let pool_body: Value = serde_json::from_str(pool_ref["body"].as_str().unwrap()).unwrap();
-    let expected_run_service_url = format!("{}/broker/{runner_id}/", public_base_url());
+    let expected_run_service_url = format!("{}/broker/{runner_id}/", state.public_base_url());
     assert_eq!(pool_body["run_service_url"], expected_run_service_url);
     assert!(
         !pool_body["run_service_url"]
@@ -2760,9 +2848,8 @@ async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
 
 #[tokio::test]
 async fn action_download_info_returns_batch_download_collection() {
-    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "mock-bearer-token");
+    // The stub base rides the test startup config; nothing here reads the
+    // process environment.
 
     // Hermetic ref→SHA resolution: a mock GitHub API answers `commits/{ref}`
     // with a fixed SHA so the batch handler never touches real GitHub.
@@ -2777,10 +2864,12 @@ async fn action_download_info_returns_batch_download_collection() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), Some("mock-bearer-token"));
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // The endpoint resolves the run from the plan id in the URL and mints
@@ -2874,11 +2963,12 @@ jobs:
 
 #[tokio::test]
 async fn action_download_info_returns_null_auth_when_token_unset() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let startup = stub_startup(None, None);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
@@ -2914,7 +3004,6 @@ jobs:
 
 #[tokio::test]
 async fn action_download_info_discards_malformed_or_abbreviated_sha() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     // Mock API returns an abbreviated 7-char SHA rather than full 40-char SHA
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
@@ -2925,10 +3014,12 @@ async fn action_download_info_discards_malformed_or_abbreviated_sha() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), None);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
@@ -2971,7 +3062,6 @@ jobs:
 
 #[tokio::test]
 async fn action_download_info_rejects_all_zero_sha() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     // The all-zero sentinel is a valid SHA shape but names no commit. The
     // resolver must not short-circuit it as "already resolved"; it goes
     // through lookup like any other ref. The mock answers 404 for it (as
@@ -2998,10 +3088,12 @@ async fn action_download_info_rejects_all_zero_sha() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), None);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
@@ -3043,7 +3135,6 @@ jobs:
 
 #[tokio::test]
 async fn remote_workflow_content_is_fetched_at_resolved_sha() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     // The mutable ref `main` resolves to a fixed SHA. The contents request
     // must carry `?ref=<sha>` — not `?ref=main` — so a branch retargeted
     // between the two requests cannot mix content from commit A with the
@@ -3080,7 +3171,7 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), None);
 
     let root_yaml = "on: push\njobs:\n  caller:\n    uses: someowner/somerepo/.github/workflows/callee.yml@main\n";
     let workflow = preloop_gha_parser::parse_workflow(root_yaml).unwrap();
@@ -3092,7 +3183,7 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
         ..Default::default()
     };
     let temp = tempfile::tempdir().unwrap();
-    let state = crate::state::AppState::new(temp.path().to_path_buf())
+    let state = crate::state::AppState::new(temp.path().to_path_buf(), startup)
         .await
         .unwrap();
     crate::remote_workflows::resolve_remote_workflows(
@@ -3133,9 +3224,6 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
 /// against the same value.
 #[tokio::test]
 async fn resolve_ref_to_sha_sends_pat_to_the_configured_origin_over_http() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "secret-pat");
-
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let seen_auth = std::sync::Arc::new(parking_lot::Mutex::new(None));
@@ -3156,10 +3244,12 @@ async fn resolve_ref_to_sha_sends_pat_to_the_configured_origin_over_http() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), Some("secret-pat"));
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
@@ -3196,8 +3286,8 @@ jobs:
 
 #[tokio::test]
 async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
-    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // The stub base rides the test startup config; nothing here reads the
+    // process environment.
     // Hermetic ref→SHA resolution: point PRELOOP_GITHUB_API_URL at a mock that
     // answers `commits/{ref}` with a fixed SHA, so the test never touches the
     // real GitHub API (and pins the new SHA-pinning behavior deterministically).
@@ -3212,10 +3302,12 @@ async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), None);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // runnerresolve keys the run off the (orchestration_id, job_id) path
@@ -3286,8 +3378,6 @@ jobs:
 /// for another job.
 #[tokio::test]
 async fn local_run_resolves_a_composites_nested_action_with_the_job_token() {
-    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
@@ -3299,7 +3389,9 @@ async fn local_run_resolves_a_composites_nested_action_with_the_job_token() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    // The stub base rides the typed startup: no process-global is involved,
+    // so this test needs no env lock.
+    let startup = stub_startup(Some(&api_base), None);
 
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
@@ -3329,7 +3421,9 @@ async fn local_run_resolves_a_composites_nested_action_with_the_job_token() {
     git(&["add", "."]);
     git(&["commit", "-qm", "workspace"]);
 
-    let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+    let mut state = AppState::new(temp.path().join("state"), startup)
+        .await
+        .unwrap();
     state.local_workspace = Some(workspace);
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, plan_id, agent_job_id) = submit_run_first_job(
@@ -3391,8 +3485,8 @@ async fn local_run_resolves_a_composites_nested_action_with_the_job_token() {
 /// mints nothing, and an unknown plan fails closed too.
 #[tokio::test]
 async fn action_download_info_denies_undeclared_action() {
-    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // The stub base rides the test startup config; nothing here reads the
+    // process environment.
     // Full SHAs short-circuit ref resolution, so the mock only needs to 404
     // the manifest probe the transitive closure makes for undeclared
     // requests (axum returns 404 for unrouted paths).
@@ -3407,10 +3501,12 @@ async fn action_download_info_denies_undeclared_action() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), None);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
@@ -3500,7 +3596,6 @@ jobs:
 /// for a declared one.
 #[tokio::test]
 async fn action_download_info_job_token_cannot_mint_undeclared() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
@@ -3512,10 +3607,12 @@ async fn action_download_info_job_token_cannot_mint_undeclared() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), None);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, agent_job_id) = submit_run_first_job(
@@ -3570,7 +3667,6 @@ jobs:
 /// preloop runner (and the official runner's launch flow) actually calls.
 #[tokio::test]
 async fn runnerresolve_denies_undeclared_action() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
@@ -3582,10 +3678,12 @@ async fn runnerresolve_denies_undeclared_action() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), None);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, agent_job_id) = submit_run_first_job(
@@ -3652,7 +3750,6 @@ jobs:
 /// manifest) while still denying unrelated repos.
 #[tokio::test]
 async fn action_download_allows_transitive_composite_nested() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     // The mock forge serves a composite manifest for myorg/composite whose
     // only nested remote action is nested/dep.
     let manifest = "name: composite\ndescription: test composite\nruns:\n  using: composite\n  steps:\n    - uses: nested/dep@v2\n    - run: echo hi\n";
@@ -3681,10 +3778,12 @@ async fn action_download_allows_transitive_composite_nested() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), None);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
@@ -3758,7 +3857,9 @@ async fn action_download_requires_a_ticket_for_the_action_it_serves() {
     // the URL is the capability. Without this, workflow code could make the
     // engine fetch any repository with the engine's own GitHub credential.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     for (owner, repo, git_ref) in [("acme", "public-action", "v1"), ("acme", "private", "v1")] {
@@ -3855,7 +3956,10 @@ async fn action_download_requires_a_ticket_for_the_action_it_serves() {
 #[tokio::test]
 async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let startup = stub_startup(None, None);
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // Pre-populate cache for testing
@@ -3966,7 +4070,6 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     assert_eq!(response.status(), StatusCode::OK);
 
     // 1d. Cache miss with special ref (v1#beta) correctly percent-encodes outbound fetch
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
@@ -3991,10 +4094,12 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    let startup = stub_startup(Some(&api_base), None);
 
     let miss_temp = tempfile::tempdir().unwrap();
-    let miss_state = AppState::new(miss_temp.path().to_path_buf()).await.unwrap();
+    let miss_state = AppState::new(miss_temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let miss_app = crate::routes::app(miss_state.clone(), CancellationToken::new());
     let miss_sig = miss_state.sign_action_ticket("test-owner", "test-repo", "v1#beta", expires_at);
     let enc_hash_ref = percent_encode_path_segment("v1#beta");
@@ -4071,7 +4176,9 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
 async fn protected_apis_require_bearer_token() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -4107,7 +4214,9 @@ async fn protected_apis_require_bearer_token() {
 async fn runner_protocol_errors_use_official_envelopes_without_changing_native_api() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -4223,7 +4332,9 @@ async fn runner_protocol_errors_use_official_envelopes_without_changing_native_a
 #[tokio::test]
 async fn dispatch_inputs_do_not_erase_reusable_caller_with_values() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let caller_yaml = "on:\n  workflow_dispatch:\n    inputs:\n      dry_run: { type: boolean, default: false }\njobs:\n  infra:\n    uses: ./.github/workflows/callee.yml\n    with:\n      mode: ${{ inputs.dry_run && 'plan' || 'apply' }}\n";
@@ -4272,7 +4383,9 @@ async fn dispatch_inputs_do_not_erase_reusable_caller_with_values() {
 #[tokio::test]
 async fn action_resolution_requires_bound_live_results_identity() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let workflow = r#"
 on: push

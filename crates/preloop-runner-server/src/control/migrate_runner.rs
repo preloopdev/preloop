@@ -812,8 +812,6 @@ mod tests {
     /// absent/empty SQLite store and never touches an existing one.
     #[tokio::test]
     async fn brand_new_preparation_is_create_only() {
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _env = crate::state::TestEnvVar::unset(crate::store::STORE_URL_ENV);
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -837,8 +835,6 @@ mod tests {
     /// service-owned state tree uses to aim a privileged write anywhere.
     #[tokio::test]
     async fn brand_new_preparation_refuses_a_symlinked_store_path() {
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _env = crate::state::TestEnvVar::unset(crate::store::STORE_URL_ENV);
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -867,8 +863,6 @@ mod tests {
     async fn brand_new_preparation_never_migrates_through_a_link_or_a_non_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _env = crate::state::TestEnvVar::unset(crate::store::STORE_URL_ENV);
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();

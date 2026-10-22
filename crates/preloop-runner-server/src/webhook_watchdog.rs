@@ -60,11 +60,7 @@ use crate::models::{WebhookRedeliveryRecord, WebhookRepairReason, WebhookWatchdo
 use crate::state::SharedState;
 use crate::webhook_status::now_us;
 
-const DEFAULT_INTERVAL_SECS: u64 = 300;
 const MIN_INTERVAL_SECS: u64 = 10;
-const DEFAULT_GRACE_SECS: i64 = 120;
-const DEFAULT_MAX_ATTEMPTS: u32 = 5;
-const DEFAULT_MAX_PAGES: usize = 5;
 const PER_PAGE: usize = 100;
 /// Cap on repair rows read for the backlog gauge and the retry pass. A
 /// number this large is already an incident; the exact count past it changes
@@ -145,55 +141,9 @@ fn newest_marker(
     })
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn watchdog_enabled() -> bool {
-    !std::env::var("PRELOOP_WEBHOOK_WATCHDOG")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "off" | "0" | "false" | "disabled"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn poll_interval() -> Duration {
-    Duration::from_secs(
-        env_u64(
-            "PRELOOP_WEBHOOK_WATCHDOG_INTERVAL_SECS",
-            DEFAULT_INTERVAL_SECS,
-        )
-        .max(MIN_INTERVAL_SECS),
-    )
-}
-
-fn grace_us() -> i64 {
-    env_u64(
-        "PRELOOP_WEBHOOK_WATCHDOG_GRACE_SECS",
-        DEFAULT_GRACE_SECS as u64,
-    ) as i64
-        * 1_000_000
-}
-
-fn max_attempts() -> u32 {
-    env_u64(
-        "PRELOOP_WEBHOOK_WATCHDOG_MAX_ATTEMPTS",
-        DEFAULT_MAX_ATTEMPTS as u64,
-    ) as u32
-}
-
-fn max_pages() -> usize {
-    env_u64(
-        "PRELOOP_WEBHOOK_WATCHDOG_MAX_PAGES",
-        DEFAULT_MAX_PAGES as u64,
-    ) as usize
-}
+// The watchdog's tunables (`PRELOOP_WEBHOOK_WATCHDOG*`) are resolved once at
+// startup into `AppState::webhook_watchdog` (see
+// [`crate::config::StartupConfig`]); nothing here reads the environment.
 
 /// Backoff before the next redelivery of the same GUID.
 ///
@@ -214,7 +164,13 @@ fn redelivery_backoff_us(attempts: u32) -> i64 {
 /// Background loop. One pass per interval, plus status publication so a
 /// stalled watchdog is visible instead of silently absent.
 pub async fn run_webhook_watchdog(shared: Arc<SharedState>) {
-    let interval = poll_interval();
+    let interval = Duration::from_secs(
+        shared
+            .state
+            .webhook_watchdog
+            .interval_secs
+            .max(MIN_INTERVAL_SECS),
+    );
     loop {
         if shared.shutdown.is_cancelled() {
             break;
@@ -243,7 +199,7 @@ pub async fn run_webhook_watchdog(shared: Arc<SharedState>) {
 /// One pass over every configured App's delivery history.
 pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<WatchdogPollOutcome> {
     let apps = crate::github_app::registered_apps(&shared.state);
-    if apps.is_empty() || !watchdog_enabled() {
+    if apps.is_empty() || !shared.state.webhook_watchdog.enabled {
         // No App JWT means no delivery history to read. Report it as
         // disabled rather than letting "last success" age into a false
         // alarm forever.
@@ -349,14 +305,15 @@ async fn poll_app(
     store_healthy: bool,
 ) -> anyhow::Result<WatchdogPollOutcome> {
     let jwt = crate::github_app::sign_app_jwt(&app.app_id, &app.private_key)?;
-    let api_base = crate::github::github_api_base();
+    let api_base = shared.state.github_api_base();
     let previous = shared
         .state
         .backend
         .load_webhook_watchdog_cursor(&app.app_id)
         .await?;
     let attempted_at = now_us();
-    let grace_boundary = attempted_at - grace_us();
+    let grace_boundary =
+        attempted_at - (shared.state.webhook_watchdog.grace_secs as i64 * 1_000_000);
     let previous_watermark = previous
         .as_ref()
         .and_then(|cursor| cursor.cursor_delivered_at_us);
@@ -414,7 +371,7 @@ async fn poll_app(
         .and_then(|cursor| cursor.scan_cursor);
     let mut reached_watermark = false;
     let mut has_more_pages = false;
-    for _page in 0..max_pages().max(1) {
+    for _page in 0..shared.state.webhook_watchdog.max_pages.max(1) {
         let (items, next_cursor) = list_deliveries(shared, app, &api_base, &jwt, cursor.as_deref())
             .await
             .map_err(|error| anyhow::anyhow!("listing deliveries: {error}"))?;
@@ -590,7 +547,11 @@ async fn retry_open_repairs(
     let open = shared
         .state
         .backend
-        .retryable_webhook_redeliveries(&app.app_id, max_attempts(), OPEN_REPAIR_SCAN_LIMIT)
+        .retryable_webhook_redeliveries(
+            &app.app_id,
+            shared.state.webhook_watchdog.max_attempts,
+            OPEN_REPAIR_SCAN_LIMIT,
+        )
         .await?;
     if open.is_empty() {
         return Ok(0);
@@ -674,12 +635,12 @@ async fn repair_delivery(
         ..observed.clone()
     };
 
-    if observed.attempts >= max_attempts() {
+    if observed.attempts >= shared.state.webhook_watchdog.max_attempts {
         // Kept open on purpose. A GUID we could never get back is a standing
         // finding for an operator, not something to forget.
         let message = format!(
             "redelivery cap of {} attempts reached; repair the ingress and replay manually",
-            max_attempts()
+            shared.state.webhook_watchdog.max_attempts
         );
         if observed.last_error.as_deref() != Some(message.as_str()) {
             let mut capped = candidate.clone();
@@ -960,15 +921,20 @@ mod tests {
 
     async fn shared_with_app(api_base: &str) -> (tempfile::TempDir, Arc<SharedState>) {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut state = crate::AppState::new(
+            temp.path().to_path_buf(),
+            crate::config::StartupConfig {
+                github_api_url: Some(api_base.to_owned()),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         state.github_app = Some(GitHubAppCredentials::for_tests(
             "424",
             TEST_KEY.clone(),
             crate::github_app::MintFailurePolicy::LocalJwt,
         ));
-        let _ = api_base;
         (
             temp,
             Arc::new(SharedState {
@@ -1021,13 +987,11 @@ mod tests {
 
     #[tokio::test]
     async fn redelivers_a_failed_delivery_that_never_landed() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(
             vec![delivery(7, "guid-fail", 502, 600)],
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
         seed_watermark(&shared, 3600).await;
 
@@ -1050,13 +1014,11 @@ mod tests {
 
     #[tokio::test]
     async fn redelivers_a_phantom_ack() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(
             vec![delivery(9, "guid-phantom", 202, 600)],
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
         seed_watermark(&shared, 3600).await;
 
@@ -1082,13 +1044,11 @@ mod tests {
 
     #[tokio::test]
     async fn locally_present_delivery_is_not_redelivered() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(
             vec![delivery(11, "guid-present", 500, 600)],
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
         seed_watermark(&shared, 3600).await;
         shared
@@ -1120,7 +1080,6 @@ mod tests {
     async fn first_poll_adopts_history_from_before_the_store() {
         // A new store (cutover, deleted state dir) finds GitHub's whole
         // history without local rows; another store already handled it.
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(
             vec![
                 delivery(21, "guid-old-ack", 202, 600),
@@ -1129,7 +1088,6 @@ mod tests {
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
 
         let outcome = watchdog_poll_once(&shared).await.unwrap();
@@ -1164,14 +1122,12 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_inside_the_grace_window_is_left_alone() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let delivered_before = now_us() - 5_000_000;
         let (api_base, attempts) = stub_github(
             vec![delivery(13, "guid-fresh", 500, 5)],
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
 
         let outcome = watchdog_poll_once(&shared).await.unwrap();
@@ -1196,13 +1152,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_poll_does_not_advance_the_watermark() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(
             vec![delivery(15, "guid-any", 500, 600)],
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
         seed_watermark(&shared, 3600).await;
         let seeded = shared
@@ -1235,13 +1189,17 @@ mod tests {
 
     #[tokio::test]
     async fn an_app_behind_an_open_breaker_is_skipped_while_the_others_are_polled() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, _attempts) = stub_github(Vec::new(), axum::http::StatusCode::OK).await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut state = crate::AppState::new(
+            temp.path().to_path_buf(),
+            crate::config::StartupConfig {
+                github_api_url: Some(api_base),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         state.github_apps = Some(crate::github_app::GitHubApps {
             apps: vec![
                 GitHubAppCredentials::for_tests(
@@ -1317,11 +1275,8 @@ mod tests {
         // The adoption line must be fixed at the first attempt. Redrawing it
         // at the first successful poll would push it past every delivery
         // that failed while history calls were down.
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _grace = crate::state::TestEnvVar::set("PRELOOP_WEBHOOK_WATCHDOG_GRACE_SECS", "120");
         let (api_base, attempts) =
             stub_github(Vec::new(), axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
 
         assert!(watchdog_poll_once(&shared).await.is_err());
@@ -1335,7 +1290,10 @@ mod tests {
             .unwrap()
             .expect("the adopted range is persisted before the history call");
         let watermark = cursor.cursor_delivered_at_us.expect("adoption watermark");
-        let (grace, now) = (grace_us(), now_us());
+        let (grace, now) = (
+            shared.state.webhook_watchdog.grace_secs as i64 * 1_000_000,
+            now_us(),
+        );
         assert!(
             watermark <= now - grace && watermark > now - grace - 60_000_000,
             "expected the first attempt's grace boundary ({}), got {watermark}",
@@ -1351,11 +1309,8 @@ mod tests {
         // be judged and repaired: it sits above the boundary drawn at T, so
         // adoption must not swallow it the way a recovery-time boundary
         // would.
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _grace = crate::state::TestEnvVar::set("PRELOOP_WEBHOOK_WATCHDOG_GRACE_SECS", "120");
         let stub =
             stub_github_mutable(Vec::new(), axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &stub.api_base);
         let (_temp, shared) = shared_with_app(&stub.api_base).await;
 
         assert!(watchdog_poll_once(&shared).await.is_err());
@@ -1427,13 +1382,11 @@ mod tests {
         // The scan never looks below the watermark, so a repair row is the
         // only thing keeping a judged-missing delivery alive. Its saved
         // delivery id is enough to ask GitHub again.
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(
             vec![delivery(42, "guid-stranded", 502, 900)],
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
         seed_watermark(&shared, 600).await;
         seed_open_repair(&shared, "guid-stranded", 42).await;
@@ -1458,9 +1411,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_repairs_close_when_the_delivery_landed() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(Vec::new(), axum::http::StatusCode::OK).await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
         seed_open_repair(&shared, "guid-landed", 7).await;
         shared
@@ -1508,13 +1459,11 @@ mod tests {
         // its first scan hit the page limit. That unfinished scan is
         // adopted — not resumed, and its untracked history is not replayed —
         // but the repairs it opened are still retried.
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(
             vec![delivery(42, "guid-upgraded", 502, 900)],
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
         shared
             .state
@@ -1560,9 +1509,7 @@ mod tests {
         // the window never reaches a repair that can still be made; the
         // scan is scoped and capped in the query, so the starvers cannot
         // occupy it.
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(Vec::new(), axum::http::StatusCode::OK).await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
         seed_watermark(&shared, 600).await;
         // Oldest first: half the window belongs to another App, half to
@@ -1585,7 +1532,7 @@ mod tests {
                 &format!("guid-capped-{i}"),
                 2000 + i,
                 "424",
-                max_attempts(),
+                shared.state.webhook_watchdog.max_attempts,
                 7100,
                 Some(7100),
             )
@@ -1631,9 +1578,7 @@ mod tests {
         // A window full of rows still in backoff must not hide a row that
         // is already due: rows are read longest-since-last-attempt first,
         // not oldest-seen first.
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, attempts) = stub_github(Vec::new(), axum::http::StatusCode::OK).await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
         seed_watermark(&shared, 600).await;
         // Seen two hours ago, tried one second ago: five minutes of backoff

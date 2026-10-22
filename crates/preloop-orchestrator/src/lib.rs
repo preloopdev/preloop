@@ -10,7 +10,7 @@ pub mod oci;
 use crate::environment::{EnvironmentSpec, is_official_golden};
 use crate::keys::{KeyPool, StagedKey};
 use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
-use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
+use preloop_gha_protocol::{RUNNER_BUSY_SENTINEL, SecretString};
 use preloop_observability::deadline;
 use preloop_runner_server::github_breaker::{
     BreakerOpen, GithubCredentialBucket, GithubFunnel, GithubSubsystem, send_observed_labeled_at,
@@ -903,6 +903,7 @@ fn golden_partial_path(payload: &Path) -> PathBuf {
     payload.with_file_name(format!("{name}.partial"))
 }
 
+/// Bytes in one gibibyte (1024³), the unit the disk-preflight constants use.
 pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Kept free beyond the bytes a golden download writes, so landing the
 /// artifact never takes the volume to zero.
@@ -919,6 +920,8 @@ pub const GOLDEN_BUILDER_MIN_STORAGE_GIB: u32 = 40;
 /// quotas): proceed past a disk refusal with a warning instead.
 pub const DISK_PREFLIGHT_OVERRIDE: &str = "PRELOOP_SKIP_DISK_PREFLIGHT";
 
+/// Whether [`DISK_PREFLIGHT_OVERRIDE`] turns disk-space refusals into
+/// warnings: enabled when set to any value other than empty, `0`, or `false`.
 pub fn disk_preflight_overridden() -> bool {
     std::env::var(DISK_PREFLIGHT_OVERRIDE)
         .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false"))
@@ -932,7 +935,7 @@ pub fn golden_builder_storage_gib(storage_gib: u32) -> u32 {
 /// Volume golden and job-VM disks land on; the artifact directory stands in
 /// when the SmolVM data root cannot be resolved.
 fn golden_disk_root(config: &RunnerPoolConfig) -> PathBuf {
-    preloop_vm::machine_data_root().unwrap_or_else(|| {
+    config.paths.machine_data_root().unwrap_or_else(|| {
         config
             .artifact_stem
             .parent()
@@ -951,7 +954,13 @@ fn format_gib(bytes: u64) -> String {
 /// Refuse an operation needing `required` bytes on the volume holding `path`
 /// when they are not free. A volume `df` cannot measure is not a refusal: the
 /// check exists to fail early, never to block a host it cannot read.
-fn ensure_free_disk(path: &Path, required: u64, purpose: &str, remedy: &str) -> Result<(), String> {
+fn ensure_free_disk(
+    path: &Path,
+    required: u64,
+    purpose: &str,
+    remedy: &str,
+    skip: bool,
+) -> Result<(), String> {
     let free = match preloop_vm::filesystem_available_bytes(path) {
         Ok(free) => free,
         Err(error) => {
@@ -968,14 +977,18 @@ fn ensure_free_disk(path: &Path, required: u64, purpose: &str, remedy: &str) -> 
         path.display(),
         format_gib(free),
     );
-    if disk_preflight_overridden() {
+    if skip {
         warn!("{message} ({DISK_PREFLIGHT_OVERRIDE} set; continuing)");
         return Ok(());
     }
     Err(message)
 }
 
-fn ensure_disk_for_golden_build(root: &Path, builder_storage_gib: u32) -> Result<(), String> {
+fn ensure_disk_for_golden_build(
+    root: &Path,
+    builder_storage_gib: u32,
+    skip: bool,
+) -> Result<(), String> {
     ensure_free_disk(
         root,
         golden_build_required_bytes(builder_storage_gib),
@@ -984,6 +997,7 @@ fn ensure_disk_for_golden_build(root: &Path, builder_storage_gib: u32) -> Result
             "free space or lower PRELOOP_RUNNER_STORAGE_GB (builder disk {builder_storage_gib} GiB \
              + {GOLDEN_BUILD_DISK_HEADROOM_GIB} GiB pack staging)"
         ),
+        skip,
     )
 }
 
@@ -1030,7 +1044,7 @@ async fn wait_for_golden_unpack_disk(
     pack: &Path,
     shutdown: &CancellationToken,
 ) -> bool {
-    if disk_preflight_overridden() {
+    if config.skip_disk_preflight {
         return true;
     }
     let pack_bytes = match std::fs::metadata(pack) {
@@ -1111,6 +1125,18 @@ impl JobVmDiskReserve {
         )
     }
 
+    /// The same policy from an explicit raw [`MIN_FREE_DISK_ENV`] value
+    /// (`None` = the caller had none): unset, blank, or unparseable keeps the
+    /// 20 GiB default, `0` disables the reserve. For callers that resolve the
+    /// environment at their own startup boundary instead of letting this
+    /// constructor read it.
+    pub fn from_raw(raw: Option<&str>) -> Self {
+        Self::new(
+            min_free_disk_bytes(raw),
+            preloop_vm::filesystem_available_bytes,
+        )
+    }
+
     /// Reserve `reserve_bytes` of the volume `measure` reports on.
     pub fn new<F>(reserve_bytes: u64, measure: F) -> Self
     where
@@ -1129,10 +1155,12 @@ impl JobVmDiskReserve {
         self
     }
 
+    /// Bytes held in reserve on the volume being checked.
     pub fn reserve_bytes(&self) -> u64 {
         self.reserve_bytes
     }
 
+    /// Cadence at which a held slot re-measures free space while waiting.
     pub fn probe_interval(&self) -> Duration {
         self.probe_interval
     }
@@ -1299,6 +1327,7 @@ async fn reconcile_orphans<P: VmProvider + 'static>(
     provider: Arc<P>,
     shutdown: CancellationToken,
     interval: Duration,
+    paths: preloop_vm::VmPathConfig,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1326,10 +1355,18 @@ async fn reconcile_orphans<P: VmProvider + 'static>(
                 "periodic orphaned data-dir sweep abandoned at its deadline"
             ),
         }
+        // The closure runs on the blocking pool, so it owns its inputs: a
+        // borrow of `paths` cannot outlive this task.
+        let purge_paths = paths.clone();
         match deadline::run_blocking(
             HOST_CLEANUP_TIMEOUT,
             "periodic orphaned hypervisor purge",
-            || preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::RemovedDataDir),
+            move || {
+                preloop_vm::purge_orphaned_vms(
+                    preloop_vm::OrphanPurge::RemovedDataDir,
+                    &purge_paths,
+                )
+            },
         )
         .await
         {
@@ -1566,13 +1603,15 @@ pub(crate) fn official_golden_reference() -> String {
 /// returns immediately for an existing file and would otherwise serve the
 /// previous pack forever.
 pub(crate) fn official_golden_source() -> String {
-    golden_url_override().unwrap_or_else(|| format!("oci:{}", official_golden_reference()))
+    env_golden_url().unwrap_or_else(|| format!("oci:{}", official_golden_reference()))
 }
 
 /// `PRELOOP_GOLDEN_URL` when it names a mirror. An exported-but-blank value
-/// behaves like an unset one, exactly as [`download_prebaked_golden_with_space`]
-/// resolves it.
-fn golden_url_override() -> Option<String> {
+/// behaves like an unset one. This is the inherited-env layer of
+/// [`RunnerPoolConfig::golden_mirror_url`] and the official golden's
+/// fingerprint input; the process environment is immutable for the process
+/// lifetime, so resolving it here is equivalent to a startup-boundary read.
+fn env_golden_url() -> Option<String> {
     std::env::var("PRELOOP_GOLDEN_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -1593,14 +1632,17 @@ pub(crate) fn official_boot_image() -> Option<&'static str> {
 }
 
 async fn download_prebaked_golden(
+    config: &RunnerPoolConfig,
     payload: &Path,
-    release_version: &str,
     github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
+    let forced_url = config.golden_mirror_url();
     download_prebaked_golden_with_space(
         payload,
-        release_version,
+        &config.release_version,
         filesystem_available_space,
+        forced_url.as_deref(),
+        config.skip_disk_preflight,
         github,
     )
     .await
@@ -1610,14 +1652,10 @@ async fn download_prebaked_golden_with_space(
     payload: &Path,
     release_version: &str,
     available_space: AvailableSpace,
+    forced_url: Option<&str>,
+    skip_disk_preflight: bool,
     github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
-    // An exported-but-blank `PRELOOP_GOLDEN_URL` must behave like an unset
-    // one in both places below: the operator otherwise gets neither the OCI
-    // default nor their (empty) override.
-    let forced_url = std::env::var("PRELOOP_GOLDEN_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
     // Per-architecture OCI golden: try it wherever a packed artifact is
     // published for this platform; `PRELOOP_GOLDEN_OCI_REF` overrides the
     // per-arch default regardless of platform. A missing package (e.g. an
@@ -1628,7 +1666,15 @@ async fn download_prebaked_golden_with_space(
             .filter(|value| !value.trim().is_empty())
             .or_else(|| default_golden_oci_ref().map(str::to_owned));
         if let Some(reference) = reference {
-            if download_oci_golden(payload, &reference, available_space, github).await? {
+            if download_oci_golden(
+                payload,
+                &reference,
+                available_space,
+                skip_disk_preflight,
+                github,
+            )
+            .await?
+            {
                 return Ok(true);
             }
             info!(reference, "OCI golden unavailable; trying release asset");
@@ -1659,7 +1705,11 @@ async fn download_prebaked_golden_with_space(
         None
     };
     let mirror = forced_url.is_some();
-    for url in golden_url_candidates(release_version, resolved_tag.as_deref(), forced_url) {
+    for url in golden_url_candidates(
+        release_version,
+        resolved_tag.as_deref(),
+        forced_url.map(str::to_owned),
+    ) {
         info!(
             url = %url,
             target = %payload.display(),
@@ -1679,6 +1729,7 @@ async fn download_prebaked_golden_with_space(
             payload,
             available_space,
             mirror,
+            skip_disk_preflight,
             github,
         )
         .await?
@@ -1693,6 +1744,12 @@ async fn download_prebaked_golden_with_space(
 ///
 /// The transfer resumes from whatever a previous attempt left behind, so a
 /// dropped connection costs the bytes in flight rather than the artifact.
+///
+/// The parameter list mirrors the inputs the download genuinely needs: the
+/// two clients (metadata is rate-limited separately from the body transfer),
+/// the destination, the space preflight, the checksum policy, and the GitHub
+/// funnel every request is admitted through.
+#[allow(clippy::too_many_arguments)]
 async fn download_release_asset(
     client: &reqwest::Client,
     metadata: &reqwest::Client,
@@ -1700,6 +1757,7 @@ async fn download_release_asset(
     payload: &Path,
     available_space: AvailableSpace,
     require_checksum: bool,
+    skip_disk_preflight: bool,
     github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
     // Fetch the companion checksum before committing bandwidth to the body.
@@ -1777,6 +1835,7 @@ async fn download_release_asset(
             "release",
             None,
             Some(probe),
+            skip_disk_preflight,
             github,
             move |offset| {
                 let client = client.clone();
@@ -1846,6 +1905,7 @@ async fn download_golden_with_resume(
     source: &str,
     expected_total_bytes: Option<u64>,
     initial_response: Option<reqwest::Response>,
+    skip_disk_preflight: bool,
     github: &GithubFunnel,
     mut request_at: impl FnMut(u64) -> BoxFuture<'static, Result<reqwest::Response, String>>,
 ) -> Result<u64, String> {
@@ -1886,6 +1946,7 @@ async fn download_golden_with_resume(
                 total.saturating_sub(have) + GOLDEN_DOWNLOAD_DISK_MARGIN,
                 "golden download",
                 "free space on this volume",
+                skip_disk_preflight,
             )?;
         }
         let response = match pending_response.take().filter(|_| have == 0) {
@@ -2020,6 +2081,7 @@ async fn download_oci_golden(
     payload: &Path,
     reference: &str,
     available_space: AvailableSpace,
+    skip_disk_preflight: bool,
     github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
     let Ok(oci) = OciReference::parse(reference) else {
@@ -2116,27 +2178,35 @@ async fn download_oci_golden(
         let blob_url = blob_url.clone();
         let repository = oci.repository.clone();
         let funnel = github.clone();
-        download_golden_with_resume(&partial, "OCI", layer_size, None, github, move |offset| {
-            let client = client.clone();
-            let token_client = token_client.clone();
-            let url = blob_url.clone();
-            let repository = repository.clone();
-            let funnel = funnel.clone();
-            Box::pin(async move {
-                crate::oci::registry_get(
-                    &client,
-                    &token_client,
-                    &url,
-                    &repository,
-                    "*/*",
-                    None,
-                    (offset > 0).then_some(offset),
-                    Some(&funnel),
-                )
-                .await
-                .map_err(|error| error.to_string())
-            }) as BoxFuture<'static, Result<reqwest::Response, String>>
-        })
+        download_golden_with_resume(
+            &partial,
+            "OCI",
+            layer_size,
+            None,
+            skip_disk_preflight,
+            github,
+            move |offset| {
+                let client = client.clone();
+                let token_client = token_client.clone();
+                let url = blob_url.clone();
+                let repository = repository.clone();
+                let funnel = funnel.clone();
+                Box::pin(async move {
+                    crate::oci::registry_get(
+                        &client,
+                        &token_client,
+                        &url,
+                        &repository,
+                        "*/*",
+                        None,
+                        (offset > 0).then_some(offset),
+                        Some(&funnel),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                }) as BoxFuture<'static, Result<reqwest::Response, String>>
+            },
+        )
         .await
     };
     match downloaded {
@@ -4220,6 +4290,11 @@ pub struct RunnerPoolConfig {
     pub base_image: String,
     /// Host path stem for the reusable packed VM artifact.
     pub artifact_stem: PathBuf,
+    /// Engine home + VM paths, resolved once at the startup boundary (see
+    /// [`preloop_vm::VmPathConfig`]). The golden disk root, crash purges, and
+    /// layer-mount detach scans all resolve against these; explicit fields
+    /// override the inherited environment.
+    pub paths: preloop_vm::VmPathConfig,
     /// Preloop release whose architecture-specific golden asset should be used.
     ///
     /// This comes from the embedding CLI rather than this crate's package
@@ -4250,8 +4325,22 @@ pub struct RunnerPoolConfig {
     /// Guest DNS resolver override (smolvm `--dns`), for networks that
     /// filter smolvm's default public resolvers.
     pub dns: Option<String>,
-    /// Host environment variable containing the registration credential.
-    pub registration_token_env: String,
+    /// Registration credential delivered to the guest's `configure` call and
+    /// used as the runner-purge bearer token. The caller resolves it at its
+    /// own startup boundary and passes the value: nothing here reads the
+    /// process environment at use time, and [`SecretString`] redacts `Debug`.
+    pub registration_token: SecretString,
+    /// Operator mirror for the pre-baked golden download. `Some` overrides
+    /// `PRELOOP_GOLDEN_URL` (blank behaves unset); `None` keeps the
+    /// historical env fallback. Deliberately download-only: the official
+    /// golden's fingerprint input keeps resolving `PRELOOP_GOLDEN_URL`, so
+    /// production callers pass `None` and the two never diverge.
+    pub golden_url_override: Option<String>,
+    /// Whether the disk preflights are skipped. Callers resolve the
+    /// historical [`DISK_PREFLIGHT_OVERRIDE`] rule at their startup boundary
+    /// ([`disk_preflight_overridden`] implements it); the pool never reads
+    /// the process environment for it.
+    pub skip_disk_preflight: bool,
     /// Runner labels advertised to the scheduler.
     pub labels: Vec<String>,
     /// vCPUs per runner.
@@ -4301,6 +4390,10 @@ pub struct RunnerPoolConfig {
     /// UID for [`RunnerPoolConfig::runner_user`] (default 1001, matching the
     /// hosted `runner` account).
     pub runner_uid: Option<u32>,
+    /// `runs-on` labels of the next ready job at the queue front, shared with
+    /// the control plane as the queue moves. The pool reads them to select the
+    /// base image for the next golden and to retire a machine whose labels no
+    /// longer match; `None` means every job uses `config.base_image`.
     pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
     /// One-time provision-token map shared with the control plane. When set,
     /// every provisioning event registers a token here and injects it into
@@ -4520,6 +4613,16 @@ impl GoldenCache {
 }
 
 impl RunnerPoolConfig {
+    /// The mirror the pre-baked golden download fetches from: the explicit
+    /// override when set, else `PRELOOP_GOLDEN_URL`. Blank behaves unset in
+    /// both layers, so an empty override falls through to the env fallback.
+    fn golden_mirror_url(&self) -> Option<String> {
+        self.golden_url_override
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(env_golden_url)
+    }
+
     /// Validate configuration before changing machine state.
     pub fn validate(&self) -> Result<(), OrchestratorError> {
         if self.size > 64 {
@@ -4581,11 +4684,10 @@ impl RunnerPoolConfig {
                 )));
             }
         }
-        if std::env::var_os(&self.registration_token_env).is_none() {
-            return Err(OrchestratorError::Config(format!(
-                "registration token environment variable `{}` is not set",
-                self.registration_token_env
-            )));
+        if self.registration_token.expose().is_empty() {
+            return Err(OrchestratorError::Config(
+                "registration token is required".into(),
+            ));
         }
         Ok(())
     }
@@ -4630,8 +4732,11 @@ pub enum OrchestratorError {
         required_bytes
     )]
     GoldenDiskSpace {
+        /// Destination directory whose volume was measured.
         path: PathBuf,
+        /// Free bytes on that volume when the check ran.
         available_bytes: u64,
+        /// Bytes the golden download needs: the artifact plus the 2 GiB headroom.
         required_bytes: u64,
     },
     /// One or more runner slots exited unexpectedly.
@@ -5452,8 +5557,8 @@ async fn ensure_golden_payload<P: VmProvider + 'static>(
     }
     if is_official_golden(&env_spec.base) {
         abort_preparation_if_shutting_down(shutdown)?;
-        info!(payload = %payload.display(), "downloading the official golden");
-        return match download_prebaked_golden(payload, &config.release_version, github).await {
+        info!(target = %payload.display(), "downloading the official golden");
+        return match download_prebaked_golden(config, payload, github).await {
             Ok(true) => Ok(()),
             Ok(false) => Err(OrchestratorError::Config(format!(
                 "the official golden could not be downloaded for {}: no OCI image at `{}` and no \
@@ -5496,8 +5601,12 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
     // storage allocated to job VMs.
     let builder_storage_gib = golden_builder_storage_gib(config.storage_gib);
     // Checked after the stale builder is gone, so its space counts as free.
-    ensure_disk_for_golden_build(&golden_disk_root(config), builder_storage_gib)
-        .map_err(OrchestratorError::Config)?;
+    ensure_disk_for_golden_build(
+        &golden_disk_root(config),
+        builder_storage_gib,
+        config.skip_disk_preflight,
+    )
+    .map_err(OrchestratorError::Config)?;
     let spec = MachineSpec {
         name: name.clone(),
         image: golden_boot_image(env_spec)?,
@@ -5787,9 +5896,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             shutdown: reconciler_shutdown.clone(),
             handle: {
                 let provider = self.provider.clone();
+                let paths = self.config.paths.clone();
                 tokio::spawn(async move {
-                    reconcile_orphans(provider, reconciler_shutdown, ORPHAN_RECONCILE_INTERVAL)
-                        .await
+                    reconcile_orphans(
+                        provider,
+                        reconciler_shutdown,
+                        ORPHAN_RECONCILE_INTERVAL,
+                        paths,
+                    )
+                    .await
                 })
             },
         };
@@ -6296,9 +6411,14 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // nothing of ours can be running. The periodic reconcile the pool
         // runs while serving uses `RemovedDataDir`, which spares any process
         // whose boot config still exists.
-        match deadline::run_blocking(HOST_CLEANUP_TIMEOUT, "orphaned hypervisor purge", || {
-            preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All)
-        })
+        // The closure runs on the blocking pool, where `&self` cannot
+        // outlive the call: the path config is the only input it needs.
+        let paths = self.config.paths.clone();
+        match deadline::run_blocking(
+            HOST_CLEANUP_TIMEOUT,
+            "orphaned hypervisor purge",
+            move || preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All, &paths),
+        )
         .await
         {
             Ok(Ok(killed)) if killed > 0 => {
@@ -6331,10 +6451,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // hypervisor just died is collectable in the same pass. A mount whose
         // hypervisor is still alive is skipped (a spared golden), and
         // `hdiutil` refuses a busy volume, so a running machine is safe.
+        // The blocking closure owns its inputs for the same reason.
+        let mount_paths = self.config.paths.clone();
         match deadline::run_blocking(
             HOST_CLEANUP_TIMEOUT,
             "orphaned layer-mount detach",
-            preloop_vm::detach_orphaned_layer_mounts,
+            move || preloop_vm::detach_orphaned_layer_mounts(&mount_paths),
         )
         .await
         {
@@ -6576,12 +6698,10 @@ struct ReadyRunner {
 /// Fire-and-forget: machine deletion must not stall on control-plane
 /// availability, and a missed purge only reverts to the old reaper path.
 async fn notify_runner_gone(config: &RunnerPoolConfig, name: &MachineName) {
-    let Some(token) = std::env::var(&config.registration_token_env)
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
+    let token = config.registration_token.expose();
+    if token.is_empty() {
         return;
-    };
+    }
     let url = format!(
         "{}/api/v1/runners/purge",
         config.server_url.trim_end_matches('/')
@@ -8550,7 +8670,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     ]);
     let mut secrets = vec![(
         "PRELOOP_RUNNER_TOKEN".to_owned(),
-        SecretSource::HostEnv(config.registration_token_env.clone()),
+        SecretSource::Value(config.registration_token.clone()),
     )];
     // One-time provision token: the control plane pairs this machine's
     // registration with the queued job the machine was provisioned for. The
@@ -13324,9 +13444,6 @@ done
         }
 
         // And the pool refuses it before touching machine state.
-        // `validate` also checks the registration-token environment; seed the
-        // fixture so this test stays focused on the account-name contract.
-        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
         let mut config = test_config(false);
         config.runner_user = Some("runner;id".to_owned());
         let error = config
@@ -14307,6 +14424,9 @@ fi"#,
             name_prefix: "lifecycle-test".to_owned(),
             base_image: "base-image".to_owned(),
             artifact_stem: PathBuf::from("/tmp/lifecycle-artifact"),
+            // Pure-input paths: no home is resolved, so nothing in these
+            // tests can reach the developer's real `~/.preloop`.
+            paths: preloop_vm::VmPathConfig::default(),
             release_version: "9.9.9".to_owned(),
             runner_bundle,
             externals_dir,
@@ -14316,7 +14436,9 @@ fi"#,
             control_socket: control_socket.then(|| PathBuf::from("/tmp/engine.sock")),
             control_upstream: None,
             dns: None,
-            registration_token_env: "LIFECYCLE_TEST_TOKEN".to_owned(),
+            registration_token: SecretString::new("test"),
+            golden_url_override: None,
+            skip_disk_preflight: false,
             labels: vec!["test".to_owned()],
             cpus: 1,
             memory_mib: 128,
@@ -15038,11 +15160,12 @@ fi"#,
     #[tokio::test]
     async fn periodic_reconcile_sweeps_registered_machines_are_spared() {
         let home = std::env::temp_dir().join(format!("preloop-reconcile-{}", std::process::id()));
-        let previous_home = std::env::var_os("PRELOOP_HOME");
-        // SAFETY: no other test in this crate reads PRELOOP_HOME; it is set
-        // only so the reconcile tick's hypervisor purge scans a scratch home
-        // instead of the developer's.
-        unsafe { std::env::set_var("PRELOOP_HOME", &home) };
+        // Pure-input paths: the reconcile tick's hypervisor purge scans a
+        // scratch home instead of the developer's.
+        let paths = preloop_vm::VmPathConfig {
+            preloop_home: Some(home),
+            ..Default::default()
+        };
 
         let provider = Arc::new(TestProvider::new(false, false, false, false, false));
         let registered = MachineName::new("lifecycle-test-0-1").unwrap();
@@ -15056,6 +15179,7 @@ fi"#,
             provider.clone(),
             shutdown.clone(),
             Duration::from_millis(20),
+            paths,
         ));
 
         let sweeps = |events: &[String]| events.iter().filter(|event| *event == "sweep").count();
@@ -15095,13 +15219,6 @@ fi"#,
             after_shutdown,
             "the reconcile must stop with the pool"
         );
-
-        match previous_home {
-            // SAFETY: see above.
-            Some(value) => unsafe { std::env::set_var("PRELOOP_HOME", value) },
-            // SAFETY: see above.
-            None => unsafe { std::env::remove_var("PRELOOP_HOME") },
-        }
     }
 
     fn packed_fork_config() -> RunnerPoolConfig {
@@ -15316,8 +15433,6 @@ fi"#,
         let shared = GithubFunnel::default();
         let mut config = test_config(false);
         config.github = Some(shared.clone());
-        // SAFETY: test-only env for config validation; the pool is never run.
-        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
 
         let pool = RunnerPool::new(provider.clone(), config).expect("pool config validates");
         assert!(
@@ -15344,8 +15459,6 @@ fi"#,
         let scratch = tempfile::tempdir().expect("scratch dir");
         let mut config = test_config(false);
         config.artifact_stem = scratch.path().join("artifact");
-        // SAFETY: test-only env for config validation; the pool is never run.
-        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
         let pool =
             RunnerPool::new(provider.clone(), config.clone()).expect("pool config validates");
         let spec = |name: &MachineName| MachineSpec {
@@ -16054,8 +16167,6 @@ fi"#,
         std::fs::create_dir_all(&vms).unwrap();
         let mut config = test_config(false);
         config.artifact_stem = vms.join("preloop-image-aarch64");
-        // SAFETY: test-only env for config validation; the pool is never run.
-        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
         let pool = RunnerPool::new(
             Arc::new(TestProvider::new(false, false, false, false, false)),
             config.clone(),
@@ -16094,8 +16205,6 @@ fi"#,
         std::fs::create_dir_all(&vms).unwrap();
         let mut config = test_config(false);
         config.artifact_stem = vms.join("preloop-preloop-official-golden-aarch64");
-        // SAFETY: test-only env for config validation; the pool is never run.
-        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
         let pool = RunnerPool::new(
             Arc::new(TestProvider::new(false, false, false, false, false)),
             config.clone(),
@@ -16150,8 +16259,6 @@ fi"#,
         let mut config = test_config(false);
         config.artifact_stem = vms.join("preloop-image-aarch64");
         config.base_image = "ghcr.io/acme/runner-images:custom".to_owned();
-        // SAFETY: test-only env for config validation; the pool is never run.
-        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
         let provider = Arc::new(TestProvider::new(false, false, false, false, false));
         let pool =
             RunnerPool::new(provider.clone(), config.clone()).expect("pool config validates");
@@ -16281,8 +16388,6 @@ fi"#,
         std::fs::create_dir_all(&vms).unwrap();
         let mut config = test_config(false);
         config.artifact_stem = vms.join("preloop-image-aarch64");
-        // SAFETY: test-only env for config validation; the pool is never run.
-        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
         let pool = RunnerPool::new(
             Arc::new(TestProvider::new(false, false, false, false, false)),
             config.clone(),
@@ -16876,8 +16981,6 @@ fi"#,
         let provider = Arc::new(TestProvider::new(false, false, false, false, false));
         let mut config = test_config(false);
         config.base_image = crate::environment::OFFICIAL_GOLDEN.to_owned();
-        // SAFETY: test-only env for config validation; the pool never serves.
-        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
         let pool = RunnerPool::new(provider.clone(), config).unwrap();
 
         let error = pool
@@ -16950,16 +17053,11 @@ mod golden_download_tests {
     use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
 
-    /// `download_prebaked_golden` takes its URL from the process environment,
-    /// which every test in this binary shares, so two of them pointing at
-    /// different servers would otherwise interleave.
-    static GOLDEN_URL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[test]
     fn disk_check_refuses_only_what_cannot_fit() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(ensure_free_disk(directory.path(), 0, "test", "remedy").is_ok());
-        assert!(ensure_free_disk(directory.path(), u64::MAX, "test", "remedy").is_err());
+        assert!(ensure_free_disk(directory.path(), 0, "test", "remedy", false).is_ok());
+        assert!(ensure_free_disk(directory.path(), u64::MAX, "test", "remedy", false).is_err());
     }
 
     /// An artifact that cannot land must be refused before any byte is
@@ -16976,6 +17074,7 @@ mod golden_download_tests {
             "test",
             Some(u64::MAX / 2),
             None,
+            false,
             &test_github(),
             move |_| {
                 observed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -17077,7 +17176,6 @@ mod golden_download_tests {
 
     #[tokio::test]
     async fn streamed_download_lands_at_the_payload_path_byte_for_byte() {
-        let _serialized = GOLDEN_URL.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let payload = directory.path().join("golden.smolmachine");
 
@@ -17095,18 +17193,18 @@ mod golden_download_tests {
             format!("{digest}  golden\n").into_bytes(),
         )
         .await;
-        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
         let downloaded = download_prebaked_golden_with_space(
             &payload,
             "9.9.9",
             |_| Ok(u64::MAX),
+            Some(&url),
+            false,
             &test_github(),
         )
         .await
         .unwrap();
 
-        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
         assert_eq!(std::fs::read(&payload).unwrap(), body);
         assert!(leftovers(directory.path()).is_empty());
@@ -17114,7 +17212,6 @@ mod golden_download_tests {
 
     #[tokio::test]
     async fn insufficient_space_stops_before_creating_a_partial_golden() {
-        let _serialized = GOLDEN_URL.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let payload = directory.path().join("golden.smolmachine");
         let expected_bytes = 512 * 1024;
@@ -17124,14 +17221,18 @@ mod golden_download_tests {
             format!("{}  golden\n", "00".repeat(32)).into_bytes(),
         )
         .await;
-        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let error =
-            download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(1024), &test_github())
-                .await
-                .expect_err("the download must stop when the target filesystem is full");
+        let error = download_prebaked_golden_with_space(
+            &payload,
+            "9.9.9",
+            |_| Ok(1024),
+            Some(&url),
+            false,
+            &test_github(),
+        )
+        .await
+        .expect_err("the download must stop when the target filesystem is full");
 
-        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         match error {
             OrchestratorError::GoldenDiskSpace {
                 path,
@@ -17150,7 +17251,6 @@ mod golden_download_tests {
 
     #[tokio::test]
     async fn truncated_download_reports_failure_and_leaves_nothing_behind() {
-        let _serialized = GOLDEN_URL.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let payload = directory.path().join("golden.smolmachine");
 
@@ -17165,18 +17265,18 @@ mod golden_download_tests {
             body,
         )
         .await;
-        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
         let downloaded = download_prebaked_golden_with_space(
             &payload,
             "9.9.9",
             |_| Ok(u64::MAX),
+            Some(&url),
+            false,
             &test_github(),
         )
         .await
         .unwrap();
 
-        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // The caller reads `false` as "build the golden locally", so a partial
         // file surviving here would be booted as if it were complete.
         assert!(!downloaded);
@@ -17437,6 +17537,7 @@ mod golden_download_tests {
             "test",
             Some(body.len() as u64),
             None,
+            false,
             &test_github(),
             move |offset| {
                 let url = url.clone();
@@ -17614,7 +17715,6 @@ mod golden_download_tests {
     /// per-subsystem consumption snapshot lie about where the bandwidth went.
     #[tokio::test]
     async fn golden_download_accounts_the_bytes_it_moved() {
-        let _serialized = GOLDEN_URL.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let payload = directory.path().join("golden.smolmachine");
 
@@ -17630,15 +17730,19 @@ mod golden_download_tests {
             format!("{digest}  golden\n").into_bytes(),
         )
         .await;
-        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
         let funnel = test_github();
 
-        let downloaded =
-            download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX), &funnel)
-                .await
-                .unwrap();
+        let downloaded = download_prebaked_golden_with_space(
+            &payload,
+            "9.9.9",
+            |_| Ok(u64::MAX),
+            Some(&url),
+            false,
+            &funnel,
+        )
+        .await
+        .unwrap();
 
-        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
         let usage = funnel
             .consumption
@@ -17661,7 +17765,6 @@ mod golden_download_tests {
 
     #[tokio::test]
     async fn matching_checksum_is_verified_before_the_payload_lands() {
-        let _serialized = GOLDEN_URL.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let payload = directory.path().join("golden.smolmachine");
 
@@ -17677,18 +17780,18 @@ mod golden_download_tests {
             format!("{digest}  golden\n").into_bytes(),
         )
         .await;
-        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
         let downloaded = download_prebaked_golden_with_space(
             &payload,
             "9.9.9",
             |_| Ok(u64::MAX),
+            Some(&url),
+            false,
             &test_github(),
         )
         .await
         .unwrap();
 
-        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
         assert_eq!(std::fs::read(&payload).unwrap(), body);
         assert!(leftovers(directory.path()).is_empty());
@@ -17696,7 +17799,6 @@ mod golden_download_tests {
 
     #[tokio::test]
     async fn mismatched_checksum_discards_the_download() {
-        let _serialized = GOLDEN_URL.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let payload = directory.path().join("golden.smolmachine");
 
@@ -17707,18 +17809,18 @@ mod golden_download_tests {
             format!("{}  golden\n", "00".repeat(32)).into_bytes(),
         )
         .await;
-        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
         let downloaded = download_prebaked_golden_with_space(
             &payload,
             "9.9.9",
             |_| Ok(u64::MAX),
+            Some(&url),
+            false,
             &test_github(),
         )
         .await
         .unwrap();
 
-        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // A corrupted artifact must never be published as the payload: the
         // pool would boot it and only fail when a VM cannot start.
         assert!(!downloaded);

@@ -81,7 +81,10 @@ pub async fn oidc_token(
             .as_ref()
             .ok_or_else(|| ApiError::internal("OIDC signing keypair not available"))?
             .clone();
-        (kp, oidc_issuer_url(&inner))
+        (
+            kp,
+            oidc_issuer_url(&inner.oidc_issuer, &shared.state.runner_base_url()),
+        )
     };
 
     // Build claims from the run's submission and parser-resolved job context.
@@ -274,7 +277,7 @@ pub async fn oidc_discovery(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let inner = shared.state.inner.lock().await;
-    let issuer = oidc_issuer_url(&inner);
+    let issuer = oidc_issuer_url(&inner.oidc_issuer, &shared.state.runner_base_url());
     let jwks_uri = format!("{issuer}/.well-known/jwks");
     Ok(Json(oidc::discovery_document(&issuer, &jwks_uri)))
 }
@@ -322,7 +325,9 @@ mod tests {
     impl OidcJob {
         async fn submit() -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+            let state = AppState::new_for_tests(temp.path().to_path_buf())
+                .await
+                .unwrap();
             let app = crate::routes::app(state.clone(), CancellationToken::new());
             let response = app
                 .clone()

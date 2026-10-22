@@ -1164,7 +1164,7 @@ async fn github_upload(state: &AppState, owner: &str, repo: &str, request: Reque
     };
     match ingest_sarif(state, upload).await {
         Ok((record, _inserted)) => {
-            let base = crate::broker::public_base_url();
+            let base = state.public_base_url();
             let url = format!(
                 "{base}/api/v3/repos/{owner}/{repo}/code-scanning/sarifs/{}",
                 record.analysis_id
@@ -1234,7 +1234,7 @@ pub async fn github_sarif_status(
         // Never disclose that an analysis exists under another repository.
         return github_error_response(SarifError::not_found("Not Found"));
     }
-    let base = crate::broker::public_base_url();
+    let base = shared.state.public_base_url();
     let analyses_url = format!(
         "{base}/api/v3/repos/{owner}/{repo}/code-scanning/analyses?run_id={}",
         record.run_id

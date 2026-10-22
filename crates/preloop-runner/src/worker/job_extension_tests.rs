@@ -1678,7 +1678,7 @@ fn golden_runner_version_for(scenario: &str) -> Option<String> {
         .filter(|version| version.starts_with(|c: char| c.is_ascii_digit()))
         .filter(|version| has(version))
         .collect();
-    versions.sort_by(|a, b| version_key(a).cmp(&version_key(b)));
+    versions.sort_by_key(|a| version_key(a));
     versions.pop()
 }
 

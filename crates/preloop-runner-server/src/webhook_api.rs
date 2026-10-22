@@ -226,7 +226,7 @@ mod tests {
 
     async fn shared_state() -> (Arc<SharedState>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
-        let state = crate::AppState::new(temp.path().to_path_buf())
+        let state = crate::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap();
         (

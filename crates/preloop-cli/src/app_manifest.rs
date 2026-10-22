@@ -33,12 +33,15 @@ use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
 use preloop_runner_server::github_app_setup::{
     AppCredentials, FormPage, convert_manifest_code, creation_url, error_page, form_page, manifest,
-    random_nonce, success_page,
+    success_page,
 };
 use serde::Deserialize;
+use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
+
+use crate::output::Out;
 
 /// Where the loopback flow creates Apps. The engine-hosted setup uses the
 /// engine's configured GitHub host instead.
@@ -82,6 +85,9 @@ struct Flow {
     name: String,
     redirect_url: String,
     api_base: String,
+    /// Resolved `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` override for the App's
+    /// creation-time event subscriptions.
+    default_events: Option<String>,
     /// Install URL, published by the callback for the `/installed` page.
     install_url: Mutex<Option<String>>,
     /// Fires once, with the converted credentials.
@@ -103,6 +109,16 @@ struct InstalledQuery {
     installation_id: Option<u64>,
 }
 
+/// The GitHub App registration request: the App to create (name, install org,
+/// webhook base URL, default events) and the GitHub API endpoint to create it
+/// against.
+struct RegistrationRequest<'a> {
+    name: &'a str,
+    org: Option<&'a str>,
+    api_base: &'a str,
+    default_events: Option<&'a str>,
+}
+
 /// Run the browser flow and persist the converted credentials immediately.
 ///
 /// The callback runs as soon as GitHub's conversion response arrives, before
@@ -113,6 +129,7 @@ struct InstalledQuery {
 /// `guidance`, when given, replaces the plain "open this URL" lines. It is
 /// printed once the listener is bound, so it can name the port it reached.
 pub(crate) async fn register_with_persist<F, T>(
+    out: &mut Out,
     name: &str,
     org: Option<&str>,
     port: u16,
@@ -121,7 +138,7 @@ pub(crate) async fn register_with_persist<F, T>(
     persist: F,
 ) -> Result<(Registration, T)>
 where
-    F: FnOnce(&AppCredentials) -> Result<T>,
+    F: FnOnce(&AppCredentials, &mut Out) -> Result<T>,
 {
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         .await
@@ -131,22 +148,30 @@ where
         .context("reading the local listener address")?;
     let base = format!("http://127.0.0.1:{}", local.port());
     match guidance {
-        Some(text) => println!("{text}"),
-        None => println!("Open this URL to create the GitHub App:\n  {base}"),
+        Some(text) => writeln!(out, "{text}")?,
+        None => writeln!(out, "Open this URL to create the GitHub App:\n  {base}")?,
     }
-    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned());
+    let api_base = crate::github_api_base();
+    let default_events = std::env::var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS").ok();
+    let request = RegistrationRequest {
+        name,
+        org,
+        api_base: &api_base,
+        default_events: default_events.as_deref(),
+    };
     // The listener is bound, but nothing answers on it until the server task
     // starts inside `register_on_with_persist` — so the browser is opened from
     // there. Otherwise a browser that connects immediately could wait on a
     // socket no one is serving yet.
-    register_on_with_persist(listener, name, org, &api_base, persist, |base| {
+    register_on_with_persist(listener, out, &request, persist, |base, out| {
         if open_browser && open_in_browser(base).is_err() {
-            println!("(could not open a browser automatically — open the URL above)");
+            writeln!(
+                out,
+                "(could not open a browser automatically — open the URL above)"
+            )?;
         }
-        println!("Waiting for GitHub to redirect back…");
+        writeln!(out, "Waiting for GitHub to redirect back…")?;
+        Ok(())
     })
     .await
 }
@@ -156,12 +181,20 @@ where
 #[cfg(test)]
 async fn register_on(
     listener: tokio::net::TcpListener,
+    out: &mut Out,
     name: &str,
     org: Option<&str>,
     api_base: &str,
+    default_events: Option<&str>,
 ) -> Result<Registration> {
+    let request = RegistrationRequest {
+        name,
+        org,
+        api_base,
+        default_events,
+    };
     let (registration, ()) =
-        register_on_with_persist(listener, name, org, api_base, |_| Ok(()), |_| {}).await?;
+        register_on_with_persist(listener, out, &request, |_, _| Ok(()), |_, _| Ok(())).await?;
     Ok(registration)
 }
 
@@ -171,15 +204,14 @@ async fn register_on(
 /// that opens a browser can do it after the page it asks for can be answered.
 async fn register_on_with_persist<F, T, A>(
     listener: tokio::net::TcpListener,
-    name: &str,
-    org: Option<&str>,
-    api_base: &str,
+    out: &mut Out,
+    request: &RegistrationRequest<'_>,
     persist: F,
     announce: A,
 ) -> Result<(Registration, T)>
 where
-    F: FnOnce(&AppCredentials) -> Result<T>,
-    A: FnOnce(&str),
+    F: FnOnce(&AppCredentials, &mut Out) -> Result<T>,
+    A: FnOnce(&str, &mut Out) -> Result<()>,
 {
     let local = listener
         .local_addr()
@@ -188,15 +220,16 @@ where
     let (credentials_tx, credentials_rx) = oneshot::channel();
     let (installed_tx, installed_rx) = oneshot::channel();
     let flow = Arc::new(Flow {
-        state: random_nonce(),
-        name: name.to_owned(),
+        state: preloop_runner_server::github_app_setup::random_nonce(),
+        name: request.name.to_owned(),
         redirect_url: format!("{base}/callback"),
-        api_base: api_base.to_owned(),
+        api_base: request.api_base.to_owned(),
+        default_events: request.default_events.map(str::to_owned),
         install_url: Mutex::new(None),
         credentials_tx: Mutex::new(Some(credentials_tx)),
         installed_tx: Mutex::new(Some(installed_tx)),
     });
-    let org = org.map(str::to_owned);
+    let org = request.org.map(str::to_owned);
     let router = Router::new()
         .route("/", get(page_form))
         .route("/callback", get(page_callback))
@@ -213,7 +246,7 @@ where
         }
     });
 
-    announce(&base);
+    announce(&base, out)?;
 
     let credentials = match tokio::time::timeout(BROWSER_TIMEOUT, credentials_rx).await {
         Ok(Ok(result)) => result?,
@@ -223,7 +256,7 @@ where
             BROWSER_TIMEOUT.as_secs()
         ),
     };
-    let persisted = match persist(&credentials) {
+    let persisted = match persist(&credentials, out) {
         Ok(value) => value,
         Err(error) => {
             shutdown.cancel();
@@ -255,7 +288,17 @@ async fn page_form(State((flow, org)): State<(Arc<Flow>, Option<String>)>) -> im
         "{}/installed",
         flow.redirect_url.trim_end_matches("/callback")
     );
-    let manifest = manifest(&flow.name, &flow.redirect_url, None, Some(&setup_url));
+    // The events the manifest subscribes: the resolved override, which only
+    // travels with a webhook GitHub can reach.
+    let events =
+        preloop_runner_server::github::manifest_default_events(flow.default_events.as_deref());
+    let manifest = manifest(
+        &flow.name,
+        &flow.redirect_url,
+        None,
+        Some(&setup_url),
+        &events,
+    );
     let action = creation_url(GITHUB_WEB, org.as_deref(), &flow.state);
     Html(form_page(&FormPage {
         name: &flow.name,
@@ -614,8 +657,10 @@ mod tests {
             .await
             .unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let flow =
-            tokio::spawn(async move { register_on(listener, "preloop-local", None, &api).await });
+        let flow = tokio::spawn(async move {
+            let mut out = crate::output::Out::capturing();
+            register_on(listener, &mut out, "preloop-local", None, &api, None).await
+        });
 
         let client = preloop_runner_server::shared_http::with_tls_roots(
             reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
@@ -745,8 +790,10 @@ mod tests {
             );
             axum::serve(api_listener, router).await
         });
-        let flow =
-            tokio::spawn(async move { register_on(listener, "preloop-local", None, &api).await });
+        let flow = tokio::spawn(async move {
+            let mut out = crate::output::Out::capturing();
+            register_on(listener, &mut out, "preloop-local", None, &api, None).await
+        });
 
         let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
             .build()
@@ -781,6 +828,62 @@ mod tests {
         assert!(
             !error.contains("code expired"),
             "GitHub's response body stays in the log, not in the operator's error: {error}"
+        );
+    }
+
+    #[test]
+    fn manifest_disables_webhooks_without_a_public_url() {
+        let manifest = manifest(
+            "preloop",
+            "http://127.0.0.1:4000/callback",
+            None,
+            Some("http://127.0.0.1:4000/installed"),
+            &[],
+        );
+        assert!(
+            manifest.get("hook_attributes").is_none(),
+            "GitHub rejects hook URLs it cannot reach over the public \
+             Internet (127.0.0.1), even when the hook is inactive; no \
+             public URL must mean no webhook configured"
+        );
+        assert!(manifest.get("default_events").is_none());
+        assert_eq!(
+            manifest["setup_url"], "http://127.0.0.1:4000/installed",
+            "the post-install redirect must return to this listener"
+        );
+        assert_eq!(manifest["public"], false);
+        assert_eq!(manifest["default_permissions"]["contents"], "read");
+    }
+
+    #[test]
+    fn manifest_points_webhooks_at_a_public_url() {
+        let events = preloop_runner_server::github::manifest_default_events(None);
+        let manifest = manifest(
+            "preloop",
+            "http://127.0.0.1:4000/callback",
+            Some("https://ci.example.com/"),
+            None,
+            &events,
+        );
+        assert_eq!(
+            manifest["hook_attributes"]["url"],
+            "https://ci.example.com/api/v1/github/webhooks"
+        );
+        assert_eq!(manifest["hook_attributes"]["active"], true);
+        let events = manifest["default_events"].as_array().unwrap();
+        assert!(events.iter().any(|e| e == "push"));
+        assert!(events.iter().any(|e| e == "pull_request"));
+    }
+
+    #[test]
+    fn creation_url_targets_the_org_when_given() {
+        assert_eq!(
+            creation_url(GITHUB_WEB, Some("acme"), "abc123"),
+            "https://github.com/organizations/acme/settings/apps/new?state=abc123"
+        );
+        assert_eq!(
+            creation_url(GITHUB_WEB, None, "abc123"),
+            "https://github.com/settings/apps/new?state=abc123"
         );
     }
 

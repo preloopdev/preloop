@@ -1386,7 +1386,7 @@ mod tests {
     async fn merge_fixture() -> (tempfile::TempDir, Arc<SharedState>, PathBuf, MergedMerge) {
         let temp = tempfile::tempdir().unwrap();
         let shared = Arc::new(SharedState {
-            state: crate::AppState::new(temp.path().join("state"))
+            state: crate::AppState::new_for_tests(temp.path().join("state"))
                 .await
                 .unwrap(),
             shutdown: tokio_util::sync::CancellationToken::new(),

@@ -71,11 +71,12 @@ chrono-tz.workspace = true
 serde_yaml.workspace = true
 utoipa.workspace = true
 keyring.workspace = true
-
 toml = { workspace = true }
 parking_lot.workspace = true
 prost = "0.14.3"
 
+# Safe `geteuid` wrapper for the store-admin ownership checks (unix only;
+# the same `nix` line the runner/orchestrator crates carry).
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["user"] }
 
@@ -85,7 +86,8 @@ path = "src/main.rs"
 
 [features]
 # Exposes the deterministic test hooks (fixed system token, fixed local JWT
-# signing key, TestEnvVar) that `#[cfg(test)]` normally gates. Integration
+# signing key, `StartupConfig::for_tests` and the `AppState::new_for_tests*`
+# constructors) that `#[cfg(test)]` normally gates. Integration
 # tests under `tests/` link against the non-test lib build, so they need this
 # feature to see the same hooks the in-crate unit tests used. Never enable for
 # a production build — it pins the admin token to a well-known value.

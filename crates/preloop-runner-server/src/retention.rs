@@ -216,7 +216,7 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("config.toml");
         std::fs::write(&config_path, format!("retention_days = {retention_days}\n")).unwrap();
-        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        let state = AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path)
             .await
             .unwrap();
         (state.shared(), config_dir)
@@ -536,7 +536,7 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("config.toml");
         std::fs::write(&config_path, "").unwrap();
-        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        let state = AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path)
             .await
             .unwrap();
         assert_eq!(state.retention_days, 90);

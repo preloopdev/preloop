@@ -13,3 +13,7 @@ rule:
       has:
         field: name
         regex: "^mask_secrets$"
+      # `inside` defaults to stopBy: neighbor, which checks only the direct
+      # parent of the call — the function's block — and never reaches the
+      # enclosing function_item. Search the full ancestor chain instead.
+      stopBy: end

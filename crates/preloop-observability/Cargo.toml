@@ -29,6 +29,13 @@ uuid = { workspace = true }
 webpki-root-certs = { workspace = true }
 tokio = { workspace = true }
 
+# SIGKILL one process group at a deadline. `nix` is the safe wrapper around
+# `kill(2)`: the workspace forbids `unsafe`, which rules out raw `libc` calls.
+# Already in the tree via command-group. Unix-only — non-Unix builds take the
+# `cfg(not(unix))` path, which never signals a group.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal"] }
+
 [dev-dependencies]
 rcgen.workspace = true
 

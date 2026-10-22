@@ -7,7 +7,7 @@ use preloop_gha_parser::secrets::ENGINE_PROVIDED_SECRETS;
 use preloop_gha_parser::{Job, RunsOn, Workflow, parse_workflow};
 use preloop_gha_protocol::expr_scan::find_expression_end;
 use preloop_orchestrator::environment::{EnvironmentSpec, OFFICIAL_GOLDEN};
-use preloop_runner_server::config::ConfigFile;
+use preloop_runner_server::config::{ConfigFile, StartupConfig};
 use preloop_runner_server::github_app;
 use preloop_runner_server::runtime_scheduling::{job_matches_runner, unhostable_platform};
 use serde_json::{Value, json};
@@ -97,7 +97,12 @@ pub(super) struct Scan {
 /// Read one target: its checkout when it has one, else GitHub with the
 /// configured credential. A repository that cannot be read is skipped with a
 /// reason; it never fails the run.
-pub(super) async fn read_target(target: Target, config: &ConfigFile) -> Scan {
+pub(super) async fn read_target(
+    target: Target,
+    config: &ConfigFile,
+    startup: &StartupConfig,
+    api_base: &str,
+) -> Scan {
     if let Some(root) = target.checkout.clone() {
         let mut notes = Vec::new();
         let files = scan_checkout(&root, &mut notes);
@@ -118,7 +123,7 @@ pub(super) async fn read_target(target: Target, config: &ConfigFile) -> Scan {
             notes: Vec::new(),
         };
     };
-    match fetch_repo(config, &repo).await {
+    match fetch_repo(config, startup, &repo, api_base).await {
         Ok((files, notes)) => Scan {
             target,
             source: "github",
@@ -275,17 +280,19 @@ fn relative_path(root: &Path, path: &Path) -> String {
 /// and pass.
 async fn fetch_repo(
     config: &ConfigFile,
+    startup: &StartupConfig,
     repo: &str,
+    api_base: &str,
 ) -> Result<(Vec<WorkflowFile>, Vec<String>), String> {
     if !preloop_runner_server::secrets_api::valid_repo_slug(repo) {
         return Err(format!("`{repo}` is not a GitHub owner/repository name"));
     }
-    let token = github_token(config, repo).await?;
+    let token = github_token(config, startup, repo, api_base).await?;
     let client = preloop_runner_server::shared_http::github_client_builder()
         .user_agent("preloop-init")
         .build()
         .map_err(|error| format!("could not build the GitHub client ({error})"))?;
-    let base = format!("{}/repos/{repo}", github_api_base());
+    let base = format!("{}/repos/{repo}", api_base.trim_end_matches('/'));
     let info = get_json(&client, &token, &base).await?;
     let branch = info["default_branch"]
         .as_str()
@@ -314,13 +321,18 @@ async fn fetch_repo(
 
 /// A token that can read `repo`'s files: the first configured App that can
 /// mint one for it, else the PAT. The token itself is never reported.
-async fn github_token(config: &ConfigFile, repo: &str) -> Result<String, String> {
+async fn github_token(
+    config: &ConfigFile,
+    startup: &StartupConfig,
+    repo: &str,
+    api_base: &str,
+) -> Result<String, String> {
     let read_only = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
     let mut app_failure = None;
-    match github_app::load_from(config) {
+    match github_app::load_from(config, startup) {
         Ok(Some(apps)) => {
             for app in &apps.apps {
-                match github_app::get_or_mint_token(app, repo, &read_only).await {
+                match github_app::get_or_mint_token(api_base, app, repo, &read_only).await {
                     Ok(token) => return Ok(token),
                     Err(error) => app_failure = Some(format!("{error:#}")),
                 }
@@ -342,15 +354,6 @@ async fn github_token(config: &ConfigFile, repo: &str) -> Result<String, String>
         Some(error) => format!("no GitHub App token for {repo} ({error})"),
         None => "no GitHub credential is configured".to_owned(),
     })
-}
-
-/// The GitHub API base, as the engine reads `PRELOOP_GITHUB_API_URL`.
-fn github_api_base() -> String {
-    std::env::var("PRELOOP_GITHUB_API_URL")
-        .ok()
-        .map(|base| base.trim().trim_end_matches('/').to_owned())
-        .filter(|base| !base.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned())
 }
 
 async fn get_json(client: &reqwest::Client, token: &str, url: &str) -> Result<Value, String> {
@@ -2576,17 +2579,15 @@ runs:
         let mut config = ConfigFile::default();
         config.github.legacy_pat = Some("stub-token".to_owned());
 
-        let _env_lock = crate::TEST_ENV_LOCK.lock().await;
-        let previous = std::env::var_os("PRELOOP_GITHUB_API_URL");
-        // SAFETY: TEST_ENV_LOCK serializes this process-global env access, and
-        // the scan reaches GitHub through this variable alone.
-        unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", &base) };
+        let startup = StartupConfig::from_env();
         let scan = read_target(
             Target {
                 repo: Some("o/r".to_owned()),
                 checkout: None,
             },
             &config,
+            &startup,
+            &base,
         )
         .await;
         let refused = read_target(
@@ -2595,13 +2596,10 @@ runs:
                 checkout: None,
             },
             &config,
+            &startup,
+            &base,
         )
         .await;
-        match previous {
-            Some(value) => unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", value) },
-            None => unsafe { std::env::remove_var("PRELOOP_GITHUB_API_URL") },
-        }
-        drop(_env_lock);
 
         assert_eq!(scan.source, "github");
         assert_eq!(
@@ -2639,8 +2637,11 @@ runs:
     #[tokio::test]
     async fn a_repo_that_is_not_a_slug_is_refused_before_any_request() {
         let config = ConfigFile::default();
+        let startup = StartupConfig::from_env();
         for bad in ["o/r/../../app/hook/deliveries", "o/r?x=1", "o/r#f", "a/b/c"] {
-            let error = fetch_repo(&config, bad).await.unwrap_err();
+            let error = fetch_repo(&config, &startup, bad, "https://api.github.com")
+                .await
+                .unwrap_err();
             assert!(
                 error.contains("owner/repository"),
                 "{bad} was not refused before a request: {error}"

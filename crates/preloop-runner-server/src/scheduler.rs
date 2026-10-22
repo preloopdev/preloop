@@ -11,7 +11,7 @@
 //! The `cron` crate expects a 7-field expression (`sec min hour dom month dow year`).
 //! Conversion: prepend `0` (second=0) and append `*` (year=any).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -75,7 +75,6 @@ fn adjust_dow(dow: &str) -> String {
 /// Check whether a cron minute field resolves to fewer than 5-minute intervals.
 /// Handles `*`, `*/N`, ranges (`0-4`), comma lists (`0,1,2`), and single values.
 fn minute_field_too_frequent(minute: &str) -> bool {
-    use std::collections::BTreeSet;
     let mut values = BTreeSet::new();
     for part in minute.split(',') {
         if part == "*" {
@@ -214,10 +213,8 @@ impl Scheduler {
         let filename = canonical_path
             .strip_prefix(".github/workflows/")
             .unwrap_or(&canonical_path);
-        let skipped = crate::github::is_github_owned_workflow(
-            filename,
-            &crate::github::configured_github_owned_workflows(),
-        );
+        let skipped =
+            crate::github::is_github_owned_workflow(filename, &shared.state.github_owned_workflows);
         let (current_crons, timezones) = if skipped {
             info!("scheduler: skipping GitHub-owned workflow {canonical_path}");
             (vec![], BTreeMap::new())
@@ -381,20 +378,20 @@ impl Scheduler {
     }
 
     /// Fetch and install schedules for a remote-backed server at startup.
-    /// The repository and token use `PRELOOP_GITHUB_REPOSITORY` and
-    /// `PRELOOP_GITHUB_TOKEN`, the same explicit remote workflow configuration.
+    /// The repository and token are the explicit remote workflow
+    /// configuration (`PRELOOP_GITHUB_REPOSITORY` / `PRELOOP_GITHUB_TOKEN`,
+    /// resolved once at process startup and passed in).
     pub async fn scan_remote(
         self: &Arc<Self>,
         shared: Arc<SharedState>,
         heartbeat: Option<preloop_observability::HeartbeatHandle>,
+        repository: Option<String>,
+        token: Option<String>,
     ) {
         if let Some(hb) = &heartbeat {
             hb.beat();
         }
-        let (Some(repository), Some(token)) = (
-            env_or_test("PRELOOP_GITHUB_REPOSITORY"),
-            env_or_test("PRELOOP_GITHUB_TOKEN"),
-        ) else {
+        let (Some(repository), Some(token)) = (repository, token) else {
             warn!(
                 "scheduler: remote startup scan requires PRELOOP_GITHUB_REPOSITORY and PRELOOP_GITHUB_TOKEN"
             );
@@ -818,55 +815,6 @@ async fn cron_loop(
     }
 }
 
-/// `std::env::var` with a test-only thread-local override. Edition 2024 makes
-/// `std::env::set_var` unsafe and the workspace denies `unsafe`, so tests
-/// redirect reads rather than write the process environment.
-fn env_or_test(name: &str) -> Option<String> {
-    #[cfg(test)]
-    if let Some(value) = TEST_ENV.with(|cell| cell.borrow().get(name).cloned()) {
-        // Blank override reads as unset, matching the empty-value filters the
-        // production callers apply.
-        if !value.trim().is_empty() {
-            return Some(value);
-        }
-        return None;
-    }
-    std::env::var(name).ok()
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_ENV: std::cell::RefCell<std::collections::HashMap<&'static str, String>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Run `body` with `vars` visible to `env_or_test` on this thread only.
-/// Replaces `std::env::set_var`; the override survives `await` points because
-/// `#[tokio::test]` drives the whole future on one thread.
-#[cfg(test)]
-async fn with_test_env<T>(
-    vars: &[(&'static str, Option<String>)],
-    body: impl Future<Output = T>,
-) -> T {
-    let saved = TEST_ENV.with(|cell| cell.borrow().clone());
-    TEST_ENV.with(|cell| {
-        let mut map = cell.borrow_mut();
-        for (name, value) in vars {
-            match value {
-                Some(value) => {
-                    map.insert(*name, value.clone());
-                }
-                None => {
-                    map.insert(*name, String::new());
-                }
-            }
-        }
-    });
-    let result = body.await;
-    TEST_ENV.with(|cell| *cell.borrow_mut() = saved);
-    result
-}
-
 // ── unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -968,9 +916,12 @@ jobs:
     #[tokio::test]
     async fn test_scheduler_reconcile_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
-        let state = crate::AppState::new(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let state = crate::AppState::new(
+            temp.path().to_path_buf(),
+            crate::config::StartupConfig::for_tests(),
+        )
+        .await
+        .unwrap();
         let shared = Arc::new(crate::SharedState {
             state,
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -1062,13 +1013,16 @@ jobs:
 
     #[tokio::test]
     async fn skipped_github_owned_workflow_has_no_cron_schedule() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let initial_skip =
-            crate::state::TestEnvVar::set(crate::github::GITHUB_OWNED_WORKFLOWS_ENV, "other.yml");
         let temp = tempfile::tempdir().unwrap();
-        let state = crate::AppState::new(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let state = crate::AppState::new(
+            temp.path().to_path_buf(),
+            crate::config::StartupConfig {
+                github_skip_workflows: Some("other.yml".to_owned()),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         let shared = Arc::new(crate::SharedState {
             state,
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -1102,11 +1056,32 @@ jobs:
             .await;
         assert_eq!(scheduler.jobs.lock().await.len(), 1);
 
-        drop(initial_skip);
-        let _skip =
-            crate::state::TestEnvVar::set(crate::github::GITHUB_OWNED_WORKFLOWS_ENV, "release.yml");
+        // Phase 2: reconcile the same `Scheduler` against a shared state whose
+        // startup-derived skip set marks `release.yml` as GitHub-owned.
+        // `reconcile` reads `github_owned_workflows` fresh on every call and
+        // the scheduler keys nothing on which `SharedState` registered a job,
+        // so this drives the identical skip -> remove path. The mark cannot be
+        // applied to `shared` in place: the phase-1 `cron_loop` task holds
+        // `Arc::clone(&shared)` for as long as it lives, so `Arc::get_mut`
+        // would hinge on that task exiting rather than on the behavior under
+        // test. The states that matter are shared: the `Scheduler` under test
+        // is the same instance and the shutdown token is cloned from phase 1.
+        let marked_temp = tempfile::tempdir().unwrap();
+        let marked_state = crate::AppState::new(
+            marked_temp.path().to_path_buf(),
+            crate::config::StartupConfig {
+                github_skip_workflows: Some("release.yml".to_owned()),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
+        let marked_shared = Arc::new(crate::SharedState {
+            state: marked_state,
+            shutdown: shared.shutdown.clone(),
+        });
         scheduler
-            .reconcile(workflow_path, workflow_yaml, push_payload, shared)
+            .reconcile(workflow_path, workflow_yaml, push_payload, marked_shared)
             .await;
         assert!(
             scheduler.jobs.lock().await.is_empty(),
@@ -1276,9 +1251,12 @@ jobs:
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::state::AppState::new(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut state = crate::state::AppState::new(
+            temp.path().to_path_buf(),
+            crate::config::StartupConfig::for_tests(),
+        )
+        .await
+        .unwrap();
         state.github_urls.api_url = api_base;
         state.github_pat = Some(preloop_gha_protocol::SecretString::new(
             "test-token".to_owned(),
@@ -1286,14 +1264,14 @@ jobs:
         let shared = state.shared();
 
         let scheduler = Scheduler::new();
-        with_test_env(
-            &[
-                ("PRELOOP_GITHUB_REPOSITORY", Some("o/r".to_owned())),
-                ("PRELOOP_GITHUB_TOKEN", Some("test-token".to_owned())),
-            ],
-            scheduler.scan_remote(shared, None),
-        )
-        .await;
+        scheduler
+            .scan_remote(
+                shared,
+                None,
+                Some("o/r".to_owned()),
+                Some("test-token".to_owned()),
+            )
+            .await;
 
         let jobs = scheduler.jobs.lock().await;
         let keys: Vec<&(String, String)> = jobs.keys().collect();

@@ -70,22 +70,17 @@ impl Default for BreakerConfig {
 }
 
 impl BreakerConfig {
-    /// `PRELOOP_GITHUB_BREAKER=off` disables tripping entirely (calls are
-    /// still observed, so the status snapshot keeps reporting failures);
-    /// `PRELOOP_GITHUB_BREAKER_THRESHOLD` overrides the failure count.
-    pub fn from_env() -> Self {
+    /// The `PRELOOP_GITHUB_BREAKER*` overrides as explicit values (resolved
+    /// at startup by [`crate::config::StartupConfig`]): `enabled: Some(false)`
+    /// disables tripping entirely (calls are still observed, so the status
+    /// snapshot keeps reporting failures); `failure_threshold: Some(n)`
+    /// overrides the failure count (`0` and smaller keep the default).
+    pub fn from_overrides(enabled: Option<bool>, failure_threshold: Option<u32>) -> Self {
         let mut config = Self::default();
-        if let Ok(value) = std::env::var("PRELOOP_GITHUB_BREAKER") {
-            let value = value.trim().to_ascii_lowercase();
-            if matches!(value.as_str(), "off" | "0" | "false" | "disabled") {
-                config.enabled = false;
-            }
+        if let Some(enabled) = enabled {
+            config.enabled = enabled;
         }
-        if let Some(threshold) = std::env::var("PRELOOP_GITHUB_BREAKER_THRESHOLD")
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok())
-            .filter(|threshold| *threshold > 0)
-        {
+        if let Some(threshold) = failure_threshold.filter(|threshold| *threshold > 0) {
             config.failure_threshold = threshold;
         }
         config
@@ -125,7 +120,7 @@ pub struct GithubBreaker {
 
 impl Default for GithubBreaker {
     fn default() -> Self {
-        Self::new(BreakerConfig::from_env())
+        Self::new(BreakerConfig::default())
     }
 }
 
@@ -651,7 +646,7 @@ impl BreakerRegistryInner {
 
 impl Default for GithubBreakerRegistry {
     fn default() -> Self {
-        Self::new(BreakerConfig::from_env())
+        Self::new(BreakerConfig::default())
     }
 }
 
@@ -687,6 +682,21 @@ impl Default for GithubFunnel {
     fn default() -> Self {
         Self {
             breakers: Arc::new(GithubBreakerRegistry::default()),
+            consumption: Arc::new(GithubConsumption::default()),
+        }
+    }
+}
+
+impl GithubFunnel {
+    /// A funnel whose breakers use the configured overrides
+    /// (`PRELOOP_GITHUB_BREAKER`, `PRELOOP_GITHUB_BREAKER_THRESHOLD`), so the
+    /// engine that shares this funnel and the registry built inside
+    /// [`crate::AppState::new`] agree on when GitHub counts as down.
+    pub fn from_overrides(enabled: Option<bool>, threshold: Option<u32>) -> Self {
+        Self {
+            breakers: Arc::new(GithubBreakerRegistry::new(BreakerConfig::from_overrides(
+                enabled, threshold,
+            ))),
             consumption: Arc::new(GithubConsumption::default()),
         }
     }
@@ -2177,7 +2187,7 @@ mod tests {
     /// against the same breaker registry and consumption counters.
     async fn funnel_state() -> crate::state::AppState {
         let temp = tempfile::tempdir().unwrap();
-        crate::state::AppState::new(temp.path().to_path_buf())
+        crate::state::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap()
     }

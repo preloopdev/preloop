@@ -506,22 +506,33 @@ pub fn mint_blob_jwt_for_jti(
         .unwrap()
 }
 
-/// Point PAT scope introspection at a dead local address so tests that
-/// submit runs with a configured PAT stay hermetic: the probe fails fast with
-/// connection-refused instead of reaching api.github.com, where a fake PAT
-/// would 401 and fail the run. The scopes are then `Unverifiable`, so the PAT
-/// is withheld from jobs while the run itself still proceeds.
-pub fn dead_pat_scope_api() -> crate::state::TestEnvVar {
+/// Startup config for tests that point request-path GitHub calls at
+/// `api_base` under the static `pat` (or no PAT when `None`).
+pub fn stub_startup(api_base: Option<&str>, pat: Option<&str>) -> StartupConfig {
+    StartupConfig {
+        github_api_url: api_base.map(str::to_owned),
+        github_token: pat.map(preloop_gha_protocol::SecretString::new),
+        ..StartupConfig::for_tests()
+    }
+}
+
+/// The base URL of a dead local address for PAT scope introspection, so tests
+/// that submit runs with a configured PAT stay hermetic: the probe fails fast
+/// with connection-refused instead of reaching api.github.com, where a fake
+/// PAT would 401 and fail the run. The scopes are then `Unverifiable`, so the
+/// PAT is withheld from jobs while the run itself still proceeds. Pass it to
+/// [`stub_startup`].
+pub fn dead_pat_scope_api() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead API port");
     let port = listener.local_addr().expect("dead API local addr").port();
     drop(listener);
-    crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"))
+    format!("http://127.0.0.1:{port}")
 }
 
-/// Point PAT scope introspection at a local stub that reports `scopes` as
-/// the PAT's classic OAuth scopes, so the credential can be verified and is
-/// therefore embedded.
-pub async fn live_pat_scope_api(scopes: &'static str) -> crate::state::TestEnvVar {
+/// The base URL of a local stub that reports `scopes` as the PAT's classic
+/// OAuth scopes, so the credential can be verified and is therefore embedded.
+/// Pass it to [`stub_startup`].
+pub async fn live_pat_scope_api(scopes: &'static str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind API stub port");
@@ -538,7 +549,7 @@ pub async fn live_pat_scope_api(scopes: &'static str) -> crate::state::TestEnvVa
     tokio::spawn(async move {
         axum::serve(listener, stub).await.unwrap();
     });
-    crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://{addr}"))
+    format!("http://{addr}")
 }
 
 /// A PAT-only deployment embeds the static PAT into job messages at build
@@ -743,7 +754,9 @@ pub fn open_session_body(run_id: RunId, agent_job_id: uuid::Uuid) -> Value {
 ///
 pub async fn verdict_poll_timeout_is_not_an_abort_impl() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
 
@@ -824,7 +837,7 @@ pub struct WebhookDedupFixture {
 }
 
 impl WebhookDedupFixture {
-    pub async fn new(temp: &tempfile::TempDir) -> Self {
+    pub async fn new(temp: &tempfile::TempDir, startup: StartupConfig) -> Self {
         let ws_dir = temp.path().join("ws");
         std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
         std::fs::write(
@@ -835,7 +848,7 @@ impl WebhookDedupFixture {
 
         let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
-        let mut state = AppState::new(temp.path().join("state").to_path_buf())
+        let mut state = AppState::new(temp.path().join("state").to_path_buf(), startup)
             .await
             .unwrap();
         state.webhook_secret = Some("super-secret".to_owned());
@@ -909,6 +922,14 @@ impl WebhookDedupFixture {
 
 pub fn oauth2_token_uri() -> axum::http::Uri {
     "/runner/server/_apis/v1/oauth2/token".parse().unwrap()
+}
+
+/// The base URL those URIs are addressed to: the fallback an `AppState` with
+/// no public/runner URL resolved uses. `validate_client_assertion_claims` takes
+/// it as an argument (it no longer reads the process environment per call), so
+/// the claim fixtures and the callers here share this one value.
+pub fn assertion_base_url() -> &'static str {
+    "http://127.0.0.1:9090"
 }
 
 pub fn assertion_claims(now: i64, aud: serde_json::Value) -> serde_json::Value {
@@ -1056,7 +1077,9 @@ pub async fn request_json_status(
 
 pub async fn terminal_job_completion_terminalizes_an_active_step() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_yaml(
         &app,
@@ -1204,7 +1227,9 @@ pub async fn generated_server_dag_properties_1000_cases() {
         *seed
     }
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     for case in 0..100u64 {
@@ -1635,7 +1660,9 @@ pub async fn submit_simple_run(app: &Router) -> Value {
 }
 
 pub async fn pool_managed_state(temp: &tempfile::TempDir) -> AppState {
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.test_set_pool_assignments(true);
     state
 }

@@ -45,7 +45,10 @@ pub(crate) struct DebugAttach {
 impl DebugAttach {
     /// Write ACTIVE, start the heartbeat, and resume a suspended guest.
     /// `None` when the session has no machine to guard.
-    pub(crate) async fn claim(machine: Option<&str>) -> Result<Option<Self>> {
+    pub(crate) async fn claim(
+        tool: &crate::GuestTool,
+        machine: Option<&str>,
+    ) -> Result<Option<Self>> {
         let Some(machine) = machine else {
             return Ok(None);
         };
@@ -63,7 +66,7 @@ impl DebugAttach {
         // rewriting ACTIVE for a controller that never attached: the guard
         // below is never constructed on error, and a dropped JoinHandle
         // detaches rather than cancels.
-        crate::resume_guest_if_needed(machine).await?;
+        crate::resume_guest_if_needed(tool, machine).await?;
         std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE)?;
         let heartbeat_marker = marker.clone();
         let heartbeat = tokio::spawn(async move {
@@ -210,12 +213,15 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&session)?);
         return Ok(());
     }
+    // Everything below drives the guest, so the resolved tool is needed
+    // only from here (a listing or `--json` never touches the VM layer).
+    let tool = crate::GuestTool::resolve()?;
     if args.export {
         // A suspended sandbox cannot be reached, and an unattached one may be
         // suspended mid-export: hold the same attach guard as every other
         // controller path for the duration of the guest diff.
-        let attach = DebugAttach::claim(session.machine.as_deref()).await?;
-        let outcome = export_from_guest(&session, !args.patch_only);
+        let attach = DebugAttach::claim(&tool, session.machine.as_deref()).await?;
+        let outcome = export_from_guest(&tool, &session, !args.patch_only);
         if let Some(attach) = attach {
             attach.release().await;
         }
@@ -223,12 +229,12 @@ pub async fn run(
     }
 
     if let Some(verdict) = &args.verdict {
-        let attach = DebugAttach::claim(session.machine.as_deref()).await?;
+        let attach = DebugAttach::claim(&tool, session.machine.as_deref()).await?;
         let outcome: Result<()> = async {
             let verdict = parse_verdict(verdict)?;
             let revert = parse_revert(&args.revert)?;
             let revision = if args.sync {
-                Some(sync_workspace(&session, args.force)?)
+                Some(sync_workspace(&tool, &session, args.force)?)
             } else {
                 None
             };
@@ -269,8 +275,8 @@ pub async fn run(
         return Ok(());
     }
 
-    let attach = DebugAttach::claim(session.machine.as_deref()).await?;
-    let result = repl(&ctx, session).await.map(|_| ());
+    let attach = DebugAttach::claim(&tool, session.machine.as_deref()).await?;
+    let result = repl(&tool, &ctx, session).await.map(|_| ());
     if let Some(attach) = attach {
         attach.release().await;
     }
@@ -445,6 +451,7 @@ pub async fn prompt_at_failure(
         base_url: base_url.to_owned(),
         token,
     };
+    let tool = crate::GuestTool::resolve()?;
 
     print_banner(&session);
 
@@ -458,7 +465,7 @@ pub async fn prompt_at_failure(
     // Attached from here on: the marker tells the engine's watcher this
     // session is live, so a suspendable backend must not park the sandbox
     // under the prompt.
-    let attach = DebugAttach::claim(session.machine.as_deref()).await?;
+    let attach = DebugAttach::claim(&tool, session.machine.as_deref()).await?;
     loop {
         println!();
         println!("  → d  debug here      r  retry step");
@@ -476,7 +483,7 @@ pub async fn prompt_at_failure(
         }
         match answer.trim() {
             "d" | "" => {
-                let outcome = repl(&api, session).await;
+                let outcome = repl(&tool, &api, session).await;
                 if let Some(attach) = attach {
                     attach.release().await;
                 }
@@ -499,7 +506,7 @@ pub async fn prompt_at_failure(
                 return finish_with_verdict(attach, &api, &session.session_id, sent, true).await;
             }
             "s" => {
-                let revision = match sync_workspace(&session, false) {
+                let revision = match sync_workspace(&tool, &session, false) {
                     Ok(revision) => Some(revision),
                     Err(error) => {
                         println!("  sync failed: {error:#}");
@@ -935,7 +942,11 @@ enum ReplOutcome {
     Detached,
 }
 
-async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
+async fn repl(
+    tool: &crate::GuestTool,
+    ctx: &Api,
+    mut session: DebugSession,
+) -> Result<ReplOutcome> {
     let prompt = format!("{}$ ", session.job_name);
     loop {
         print!("{prompt}");
@@ -955,7 +966,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
         }
 
         let Some(verb) = line.strip_prefix(':') else {
-            run_in_guest(&session, line);
+            run_in_guest(tool, &session, line);
             continue;
         };
 
@@ -987,10 +998,10 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                                 shell_quote(commit),
                                 paths.join(" ")
                             );
-                            let _ = guest_check(machine, &cmd);
+                            let _ = guest_check(tool, machine, &cmd);
                         }
                     }
-                    match sync_workspace(&session, flags.contains(&"--force")) {
+                    match sync_workspace(tool, &session, flags.contains(&"--force")) {
                         Ok(revision) => {
                             session.source_revision = revision.clone();
                             (RevertPolicy::None, Some(revision))
@@ -1073,11 +1084,13 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                 return Ok(ReplOutcome::Resumed);
             }
             "export" => {
-                if let Err(error) = export_from_guest(&session, !flags.contains(&"--patch-only")) {
+                if let Err(error) =
+                    export_from_guest(tool, &session, !flags.contains(&"--patch-only"))
+                {
                     println!("  export failed: {error:#}");
                 }
             }
-            "sync" => match sync_workspace(&session, flags.contains(&"--force")) {
+            "sync" => match sync_workspace(tool, &session, flags.contains(&"--force")) {
                 Ok(revision) => {
                     session.source_revision = revision.clone();
                     println!("  workspace now at {revision}");
@@ -1096,6 +1109,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
             "steps" => print_journal(&session),
             "changes" => show_changes(&session),
             "log" => run_in_guest(
+                tool,
                 &session,
                 "tail -n 200 /var/log/preloop-runner.log 2>/dev/null || echo 'no log file in guest'",
             ),
@@ -1240,7 +1254,7 @@ fn choose_revert(session: &DebugSession, flags: &[&str]) -> Option<RevertPolicy>
 /// detected up front and refused unless `--force`.
 ///
 /// Returns the new source revision label for the attempt journal.
-fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
+fn sync_workspace(tool: &crate::GuestTool, session: &DebugSession, force: bool) -> Result<String> {
     let guest_workspace = session
         .workspace
         .as_deref()
@@ -1261,6 +1275,7 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
     // host-side change before mutating the guest: checking only present files
     // would let a host deletion silently destroy a guest edit.
     let conflicts = guest_modified(
+        tool,
         machine,
         guest_workspace,
         &sync_candidates(&modified, &deleted),
@@ -1284,7 +1299,7 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
             .iter()
             .map(|path| shell_quote(&format!("{guest_workspace}/{path}")))
             .collect();
-        guest_check(machine, &format!("rm -f {}", targets.join(" ")))?;
+        guest_check(tool, machine, &format!("rm -f {}", targets.join(" ")))?;
     }
 
     if !modified.is_empty() {
@@ -1355,10 +1370,11 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
         // repair flow uses to detect guest-side edits.
         let remote = "/var/tmp/preloop-sync.tar";
 
-        push_to_guest(machine, &archive, remote)?;
+        push_to_guest(tool, machine, &archive, remote)?;
         let _ = std::fs::remove_file(&archive);
 
         guest_check(
+            tool,
             machine,
             &format!(
                 "cd {} && tar -xf {remote} && rm -f {remote}",
@@ -1396,7 +1412,7 @@ fn sync_candidates(modified: &[String], deleted: &[String]) -> Vec<String> {
 /// turns the job green, and then evaporates with the machine — leaving the user
 /// to retype it from memory against a workspace that no longer exists. Writes a
 /// patch to the host and applies it unless `--patch-only`.
-fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
+fn export_from_guest(tool: &crate::GuestTool, session: &DebugSession, apply: bool) -> Result<()> {
     let guest_workspace = session
         .workspace
         .as_deref()
@@ -1408,7 +1424,7 @@ fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
 
     // Use a temporary index so `git add -N` can expose untracked files in the
     // patch without changing the guest workspace's real index.
-    let output = crate::guest_exec_command(machine)?
+    let output = crate::guest_exec_command(tool, machine)?
         .args(["sh", "-c"])
         .arg(format!(
             "cd {} && \
@@ -1470,12 +1486,13 @@ fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
 /// Compared against the guest's own checkout, so this reports edits made in the
 /// VM since it cloned the snapshot — precisely the work a sync would destroy.
 fn guest_modified(
+    tool: &crate::GuestTool,
     machine: &str,
     guest_workspace: &str,
     candidates: &[String],
 ) -> Result<Vec<String>> {
     let quoted: Vec<String> = candidates.iter().map(|p| shell_quote(p)).collect();
-    let output = crate::guest_exec_command(machine)?
+    let output = crate::guest_exec_command(tool, machine)?
         .args(["sh", "-c"])
         .arg(format!(
             "cd {} && git --literal-pathspecs status --porcelain -- {} 2>/dev/null || true",
@@ -1600,13 +1617,18 @@ fn next_revision(current: &str) -> String {
 /// Callers stage outside those paths, and this `wc -c` check makes a
 /// regression loud instead of producing a retry that silently ran the old
 /// code.
-fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result<()> {
+fn push_to_guest(
+    tool: &crate::GuestTool,
+    machine: &str,
+    local: &std::path::Path,
+    remote: &str,
+) -> Result<()> {
     let expected = std::fs::metadata(local)
         .with_context(|| format!("reading {}", local.display()))?
         .len();
 
-    guest_check(machine, &format!("rm -f {}", shell_quote(remote)))?;
-    let output = crate::guest_upload_command(machine, &local.to_string_lossy(), remote)?
+    guest_check(tool, machine, &format!("rm -f {}", shell_quote(remote)))?;
+    let output = crate::guest_upload_command(tool, machine, &local.to_string_lossy(), remote)?
         .output()
         .context("copying a file into the guest")?;
     if !output.status.success() {
@@ -1616,7 +1638,7 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
         );
     }
 
-    let seen = crate::guest_exec_command(machine)?
+    let seen = crate::guest_exec_command(tool, machine)?
         .args(["sh", "-c"])
         .arg(format!("wc -c < {} 2>/dev/null", shell_quote(remote)))
         .output()
@@ -1635,8 +1657,8 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
 }
 
 /// Run a command in the guest, failing loudly on a non-zero exit.
-fn guest_check(machine: &str, command: &str) -> Result<()> {
-    let output = crate::guest_exec_command(machine)?
+fn guest_check(tool: &crate::GuestTool, machine: &str, command: &str) -> Result<()> {
+    let output = crate::guest_exec_command(tool, machine)?
         .args(["sh", "-c", command])
         .output()
         .context("running smolvm machine exec")?;
@@ -1659,14 +1681,14 @@ fn guest_command_script(workspace: &str, command: &str) -> String {
 }
 
 /// Execute a command inside the paused VM.
-fn run_in_guest(session: &DebugSession, command: &str) {
+fn run_in_guest(tool: &crate::GuestTool, session: &DebugSession, command: &str) {
     let Some(machine) = &session.machine else {
         println!("  No VM recorded for this session — cannot run commands.");
         return;
     };
     let workspace = session.workspace.as_deref().unwrap_or("/");
     let script = guest_command_script(workspace, command);
-    let mut guest = match crate::guest_exec_command(machine) {
+    let mut guest = match crate::guest_exec_command(tool, machine) {
         Ok(command) => command,
         Err(error) => {
             println!("  Could not reach the guest: {error:#}");
@@ -2114,6 +2136,15 @@ mod tests {
         assert_eq!(shell_quote("'; rm -rf /; '"), r"''\''; rm -rf /; '\'''");
     }
 
+    /// A [`crate::GuestTool`] that drives the fake smolvm at `executable`.
+    fn fake_tool(executable: &std::path::Path) -> crate::GuestTool {
+        crate::GuestTool {
+            backend: crate::VmBackend::Smolvm,
+            smolvm: executable.to_path_buf().into(),
+            paths: preloop_vm::VmPathConfig::default(),
+        }
+    }
+
     /// Execute the real guest shell through the provider boundary with a
     /// login profile that sources a missing file. A login shell must fail
     /// before the command; the debug helper must keep the provider's PATH and
@@ -2121,74 +2152,75 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn guest_command_ignores_broken_login_profile_without_losing_path() {
-        crate::with_fake_smolvm_path(|executable| {
-            use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt;
 
-            let fixture = tempfile::tempdir().unwrap();
-            let home = fixture.path().join("home");
-            let workspace = fixture.path().join("workspace");
-            std::fs::create_dir_all(&home).unwrap();
-            std::fs::create_dir_all(&workspace).unwrap();
-            // dash aborts on the failed `.` itself; POSIX-mode bash (macOS
-            // /bin/sh) reports it and continues, so the explicit `exit`
-            // keeps the fixture fatal under both shells — matching the
-            // reporter's observation that bash masks the bug.
-            std::fs::write(
-                home.join(".profile"),
-                "PATH=/profile-only\n. \"$HOME/missing-cargo-env\" || exit 2\n",
-            )
-            .unwrap();
+        let (_directory, executable) = crate::fake_smolvm();
+        let tool = fake_tool(&executable);
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        // dash aborts on the failed `.` itself; POSIX-mode bash (macOS
+        // /bin/sh) reports it and continues, so the explicit `exit`
+        // keeps the fixture fatal under both shells — matching the
+        // reporter's observation that bash masks the bug.
+        std::fs::write(
+            home.join(".profile"),
+            "PATH=/profile-only\n. \"$HOME/missing-cargo-env\" || exit 2\n",
+        )
+        .unwrap();
 
-            let expected_path = "/job/toolchain/bin:/usr/bin:/bin";
-            let login_marker = fixture.path().join("login-marker");
-            let login = std::process::Command::new("/bin/sh")
-                .args([
-                    "-lc",
-                    &format!(
-                        "printf login > {}",
-                        shell_quote(&login_marker.display().to_string())
-                    ),
-                ])
-                .env("HOME", &home)
-                .env("PATH", expected_path)
-                .output()
-                .unwrap();
-            assert!(
-                !login.status.success(),
-                "the fixture must make a login shell fail: {}",
-                String::from_utf8_lossy(&login.stderr)
-            );
-            assert!(!login_marker.exists());
-
-            let wrapper = format!(
-                "#!/bin/sh\nexport HOME={}\nexport PATH={}\n\
-                 while [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\n\
-                 [ \"$#\" -gt 0 ] && shift\n\
-                 exec \"$@\"\n",
-                shell_quote(&home.display().to_string()),
-                shell_quote(expected_path),
-            );
-            std::fs::write(executable, wrapper).unwrap();
-            let mut permissions = std::fs::metadata(executable).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(executable, permissions).unwrap();
-
-            let marker = fixture.path().join("command-marker");
-            let mut paused = session();
-            paused.workspace = Some(workspace.display().to_string());
-            run_in_guest(
-                &paused,
+        let expected_path = "/job/toolchain/bin:/usr/bin:/bin";
+        let login_marker = fixture.path().join("login-marker");
+        let login = std::process::Command::new("/bin/sh")
+            .args([
+                "-lc",
                 &format!(
-                    "printf '%s' \"$PATH\" > {}",
-                    shell_quote(&marker.display().to_string())
+                    "printf login > {}",
+                    shell_quote(&login_marker.display().to_string())
                 ),
-            );
-            assert_eq!(std::fs::read_to_string(marker).unwrap(), expected_path);
+            ])
+            .env("HOME", &home)
+            .env("PATH", expected_path)
+            .output()
+            .unwrap();
+        assert!(
+            !login.status.success(),
+            "the fixture must make a login shell fail: {}",
+            String::from_utf8_lossy(&login.stderr)
+        );
+        assert!(!login_marker.exists());
 
-            // The helper paths share the same provider boundary — a broken
-            // profile must not abort them either.
-            guest_check("probe", "true").unwrap();
-        });
+        let wrapper = format!(
+            "#!/bin/sh\nexport HOME={}\nexport PATH={}\n\
+             while [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\n\
+             [ \"$#\" -gt 0 ] && shift\n\
+             exec \"$@\"\n",
+            shell_quote(&home.display().to_string()),
+            shell_quote(expected_path),
+        );
+        std::fs::write(&executable, wrapper).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let marker = fixture.path().join("command-marker");
+        let mut paused = session();
+        paused.workspace = Some(workspace.display().to_string());
+        run_in_guest(
+            &tool,
+            &paused,
+            &format!(
+                "printf '%s' \"$PATH\" > {}",
+                shell_quote(&marker.display().to_string())
+            ),
+        );
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), expected_path);
+
+        // The helper paths share the same provider boundary — a broken
+        // profile must not abort them either.
+        guest_check(&tool, "probe", "true").unwrap();
     }
 
     #[test]
@@ -2234,46 +2266,46 @@ mod tests {
 
     #[test]
     fn guest_check_carries_the_sandbox_environment() {
-        crate::with_fake_smolvm_path(|executable| {
-            guest_check("vm-1", "echo ok").unwrap();
-            assert_sandbox_carried(executable);
-        });
+        let (_directory, executable) = crate::fake_smolvm();
+        let tool = fake_tool(&executable);
+        guest_check(&tool, "vm-1", "echo ok").unwrap();
+        assert_sandbox_carried(&executable);
     }
 
     #[test]
     fn guest_modified_carries_the_sandbox_environment() {
-        crate::with_fake_smolvm_path(|executable| {
-            let modified = guest_modified("vm-1", "/work", &["src/a.rs".into()]).unwrap();
-            assert!(modified.is_empty());
-            assert_sandbox_carried(executable);
-        });
+        let (_directory, executable) = crate::fake_smolvm();
+        let tool = fake_tool(&executable);
+        let modified = guest_modified(&tool, "vm-1", "/work", &["src/a.rs".into()]).unwrap();
+        assert!(modified.is_empty());
+        assert_sandbox_carried(&executable);
     }
 
     #[test]
     fn push_to_guest_carries_the_sandbox_environment() {
-        crate::with_fake_smolvm_path(|executable| {
-            let staging = tempfile::tempdir().unwrap();
-            let local = staging.path().join("artifact.bin");
-            // The fake answers the post-copy byte-count probe with 12345.
-            std::fs::write(&local, vec![b'x'; 12_345]).unwrap();
-            push_to_guest("vm-1", &local, "/work/artifact.bin").unwrap();
-            assert_sandbox_carried(executable);
-        });
+        let (_directory, executable) = crate::fake_smolvm();
+        let tool = fake_tool(&executable);
+        let staging = tempfile::tempdir().unwrap();
+        let local = staging.path().join("artifact.bin");
+        // The fake answers the post-copy byte-count probe with 12345.
+        std::fs::write(&local, vec![b'x'; 12_345]).unwrap();
+        push_to_guest(&tool, "vm-1", &local, "/work/artifact.bin").unwrap();
+        assert_sandbox_carried(&executable);
     }
 
     #[test]
     fn export_from_guest_carries_the_sandbox_environment() {
-        crate::with_fake_smolvm_path(|executable| {
-            export_from_guest(&session(), true).unwrap();
-            assert_sandbox_carried(executable);
-        });
+        let (_directory, executable) = crate::fake_smolvm();
+        let tool = fake_tool(&executable);
+        export_from_guest(&tool, &session(), true).unwrap();
+        assert_sandbox_carried(&executable);
     }
 
     #[test]
     fn run_in_guest_carries_the_sandbox_environment() {
-        crate::with_fake_smolvm_path(|executable| {
-            run_in_guest(&session(), "echo hi");
-            assert_sandbox_carried(executable);
-        });
+        let (_directory, executable) = crate::fake_smolvm();
+        let tool = fake_tool(&executable);
+        run_in_guest(&tool, &session(), "echo hi");
+        assert_sandbox_carried(&executable);
     }
 }

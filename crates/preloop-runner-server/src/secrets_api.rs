@@ -221,7 +221,8 @@ pub async fn set_secret(
     // `set` here would be overridden at the next startup when the credential
     // re-applies over config.toml — reject with guidance instead of silently
     // reverting.
-    let credential = crate::config::load_credential_secrets()
+    let credentials_dir = shared.state.credentials_dir.as_deref();
+    let credential = crate::config::load_credential_secrets(credentials_dir)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     if credential_scope_conflict(
         &credential,
@@ -303,7 +304,7 @@ fn set_secret_locked(
         }
         (None, Some(_)) => unreachable!("env without repo rejected above"),
     }
-    if !crate::config::store_memory(&config)
+    if !crate::config::store_memory(&config, shared.state.secrets_store_env.as_deref())
         .map_err(|error| ApiError::internal(format!("{error:#}")))?
     {
         crate::config::write_config_to(&shared.state.config_path, &config)
@@ -362,7 +363,8 @@ pub async fn delete_secret(
     // Same immutable-scope rule as `set_secret`: credential-backed entries
     // re-apply at startup, so a config-file removal would either 404 or
     // silently reappear. The credential file is the only supported edit path.
-    let credential = crate::config::load_credential_secrets()
+    let credentials_dir = shared.state.credentials_dir.as_deref();
+    let credential = crate::config::load_credential_secrets(credentials_dir)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     if credential_scope_conflict(
         &credential,
@@ -407,7 +409,7 @@ fn delete_secret_locked(
     let _config_mutation = crate::config::config_mutation_lock().lock();
     let config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
-    let memory = crate::config::store_memory(&config)
+    let memory = crate::config::store_memory(&config, shared.state.secrets_store_env.as_deref())
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
 
     if memory {
@@ -661,16 +663,19 @@ mod tests {
             .status()
             .expect("mkfifo must be on PATH (coreutils)");
         assert!(made.success(), "mkfifo {} failed", fifo.display());
-        // The engine's systemd credential is an operator-machine input; keep the
-        // handler from reading an ambient one. Memory mode keeps the section
-        // from writing back into the FIFO once the read completes.
-        let _credentials = crate::state::TestEnvVar::unset(crate::config::CREDENTIALS_ENV);
-        let _store_mode = crate::state::TestEnvVar::set(crate::config::SECRETS_STORE_ENV, "memory");
         // Built against a config path that does not exist (the FIFO would park
-        // the constructor instead), then pointed at the FIFO for the call.
-        let mut state = crate::state::AppState::new_with_config(
+        // the constructor instead), then pointed at the FIFO for the call. The
+        // section reads its systemd credential directory and store override
+        // from startup state, so an ambient operator machine contributes
+        // nothing; memory mode keeps the section from writing back into the
+        // FIFO once the read completes.
+        let mut state = crate::state::AppState::new(
             dir.path().join("state"),
-            dir.path().join("absent.toml"),
+            crate::config::StartupConfig {
+                config_path: dir.path().join("absent.toml"),
+                secrets_store: Some("memory".to_owned()),
+                ..crate::config::StartupConfig::for_tests()
+            },
         )
         .await
         .expect("build the state");

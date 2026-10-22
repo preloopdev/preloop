@@ -8,24 +8,62 @@ use anyhow::Context;
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use preloop_gha_protocol::RunId;
+use preloop_runner_server::config::CONFIG_PATH_ENV;
+use preloop_runner_server::credential_store::{CREDENTIAL_STORE_ENV, load_engine_token};
 use reqwest::Url;
 use serde_json::Value;
 
 const MAX_REUSABLE_WORKFLOW_DEPTH: usize = 4;
 
-fn resolve_native_api_token(server: &Url) -> anyhow::Result<String> {
-    if let Ok(token) = env::var("PRELOOP_SYSTEM_TOKEN") {
-        return Ok(token);
+/// Where the native API token comes from, resolved once at the command entry
+/// and passed in explicitly — the lookup reads no process state. The explicit
+/// token wins over the local engine's stored administrator token, which the
+/// credential store selects by environment override, then the config file's
+/// `credential_store` key, then the `file` default.
+struct TokenSources {
+    /// Explicit administrator token (`PRELOOP_SYSTEM_TOKEN`), when set.
+    system_token: Option<String>,
+    /// Engine home the local engine stores its administrator token under
+    /// (`PRELOOP_HOME`, default `.preloop`).
+    storage_dir: PathBuf,
+    /// Engine config whose `credential_store` key selects the backend
+    /// (`PRELOOP_CONFIG`, default `<storage_dir>/config.toml`).
+    config_path: PathBuf,
+    /// Resolved `PRELOOP_CREDENTIAL_STORE` backend override.
+    credential_store_env: Option<String>,
+}
+
+impl TokenSources {
+    /// Startup boundary: read the token and credential-store settings from the
+    /// process environment once.
+    fn from_env() -> Self {
+        let storage_dir = env::var_os("PRELOOP_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".preloop"));
+        let config_path = env::var_os(CONFIG_PATH_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| storage_dir.join("config.toml"));
+        Self {
+            system_token: env::var("PRELOOP_SYSTEM_TOKEN").ok(),
+            storage_dir,
+            config_path,
+            credential_store_env: env::var(CREDENTIAL_STORE_ENV).ok(),
+        }
+    }
+}
+
+fn resolve_native_api_token(server: &Url, sources: &TokenSources) -> anyhow::Result<String> {
+    if let Some(token) = &sources.system_token {
+        return Ok(token.clone());
     }
 
     let is_local_server = matches!(server.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
     if is_local_server {
-        let storage_dir = env::var_os("PRELOOP_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".preloop"));
+        let dir = &sources.storage_dir;
+        let config = &sources.config_path;
+        let store_env = sources.credential_store_env.as_deref();
         if let Some(token) =
-            preloop_runner_server::credential_store::load_engine_token(&storage_dir)
-                .context("load local engine token")?
+            load_engine_token(dir, config, store_env).context("load local engine token")?
         {
             return Ok(token);
         }
@@ -131,6 +169,7 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    let token_sources = TokenSources::from_env();
     let timeout_seconds = env::var("PRELOOP_CLIENT_TIMEOUT_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -155,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
             debug,
             debugger_welcome_message,
         } => {
-            let native_api_token = resolve_native_api_token(&cli.server)?;
+            let native_api_token = resolve_native_api_token(&cli.server, &token_sources)?;
             let workflow_yaml = tokio::fs::read_to_string(&workflow)
                 .await
                 .with_context(|| format!("read workflow {}", workflow.display()))?;
@@ -222,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{response}");
         }
         Command::Run { run_id } => {
-            let native_api_token = resolve_native_api_token(&cli.server)?;
+            let native_api_token = resolve_native_api_token(&cli.server, &token_sources)?;
             print_response(
                 http.get(cli.server.join(&format!("/api/v1/runs/{run_id}"))?)
                     .bearer_auth(native_api_token)
@@ -232,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::Cancel { run_id } => {
-            let native_api_token = resolve_native_api_token(&cli.server)?;
+            let native_api_token = resolve_native_api_token(&cli.server, &token_sources)?;
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/cancel"))?)
                     .bearer_auth(native_api_token)
@@ -246,7 +285,7 @@ async fn main() -> anyhow::Result<()> {
             job_id,
             note,
         } => {
-            let native_api_token = resolve_native_api_token(&cli.server)?;
+            let native_api_token = resolve_native_api_token(&cli.server, &token_sources)?;
             let body = serde_json::json!({ "note": note });
             print_response(
                 http.post(
@@ -261,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::Rerun { run_id } => {
-            let native_api_token = resolve_native_api_token(&cli.server)?;
+            let native_api_token = resolve_native_api_token(&cli.server, &token_sources)?;
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/rerun"))?)
                     .bearer_auth(native_api_token)
@@ -271,7 +310,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::ApproveFork { run_id, note } => {
-            let native_api_token = resolve_native_api_token(&cli.server)?;
+            let native_api_token = resolve_native_api_token(&cli.server, &token_sources)?;
             let body = serde_json::json!({ "note": note });
             print_response(
                 http.post(
@@ -286,7 +325,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::Events { run_id } => {
-            let native_api_token = resolve_native_api_token(&cli.server)?;
+            let native_api_token = resolve_native_api_token(&cli.server, &token_sources)?;
             print_response(
                 http.get(
                     cli.server
@@ -309,8 +348,13 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("parse workflow {}", workflow.display()))?;
             let reusable_workflows =
                 collect_reusable_workflows(workspace_root.as_deref(), &workflow).await?;
-            let reusable_workflows =
-                resolve_remote_workflows(reusable_workflows, &workflow_yaml, &http).await?;
+            let reusable_workflows = resolve_remote_workflows(
+                reusable_workflows,
+                &workflow_yaml,
+                &http,
+                &GitHubForge::from_env(),
+            )
+            .await?;
             let expanded =
                 preloop_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows)
                     .with_context(|| format!("expand workflow {}", workflow.display()))?;
@@ -413,15 +457,10 @@ async fn resolve_remote_workflows(
     mut workflows: BTreeMap<String, String>,
     root_yaml: &str,
     client: &reqwest::Client,
+    forge: &GitHubForge,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    let token = env_or_test("PRELOOP_GITHUB_TOKEN");
-    // Same override the engine reads (`PRELOOP_GITHUB_API_URL`), so a client
-    // driving a redirected forge fetches reusable workflows from it instead of
-    // hardcoded api.github.com.
-    let api_base = env_or_test("PRELOOP_GITHUB_API_URL")
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned());
-    let api_base = api_base.trim_end_matches('/');
+    let token = forge.token.as_deref();
+    let api_base = forge.api_base.as_str();
     // Each queued workflow carries the remote reference it was fetched from and
     // the ref it is pinned to. `None` marks the submitted repository (the root
     // and workspace files), where a same-repository reference names a workspace
@@ -487,7 +526,7 @@ async fn resolve_remote_workflows(
                     "{api_base}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
                 ))
                 .header(reqwest::header::ACCEPT, "application/vnd.github.raw+json");
-            if let Some(token) = token.as_deref() {
+            if let Some(token) = token {
                 request = request.bearer_auth(token);
             }
             let pin = git_ref.to_owned();
@@ -497,6 +536,44 @@ async fn resolve_remote_workflows(
         }
     }
     Ok(workflows)
+}
+
+/// The forge remote `uses:` resolution fetches from: the contents API base
+/// and an optional bearer token. Resolved once at the command entry
+/// (`PRELOOP_GITHUB_API_URL` / `PRELOOP_GITHUB_TOKEN`) and passed in
+/// explicitly — the fetcher reads no process state.
+struct GitHubForge {
+    /// Base URL of the GitHub API, trailing slash stripped.
+    api_base: String,
+    /// Bearer token for the contents endpoint, when one is configured.
+    token: Option<String>,
+}
+
+impl GitHubForge {
+    /// Startup boundary: read the two overrides from the process environment.
+    fn from_env() -> Self {
+        Self::new(
+            std::env::var("PRELOOP_GITHUB_API_URL").ok().as_deref(),
+            std::env::var("PRELOOP_GITHUB_TOKEN").ok().as_deref(),
+        )
+    }
+
+    /// Explicit inputs. A blank API base behaves like an unset one; an unset
+    /// token keeps the request anonymous.
+    fn new(api_base: Option<&str>, token: Option<&str>) -> Self {
+        // Same override the engine reads (`PRELOOP_GITHUB_API_URL`), so a
+        // client driving a redirected forge fetches reusable workflows from
+        // it instead of hardcoded api.github.com.
+        let api_base = api_base
+            .filter(|value| !value.is_empty())
+            .unwrap_or("https://api.github.com")
+            .trim_end_matches('/')
+            .to_owned();
+        Self {
+            api_base,
+            token: token.map(str::to_owned),
+        }
+    }
 }
 
 fn parse_remote_reference(reference: &str) -> Option<(&str, &str, &str, &str)> {
@@ -519,55 +596,6 @@ async fn print_response(response: reqwest::Response) -> anyhow::Result<()> {
     let text = response.error_for_status()?.text().await?;
     println!("{text}");
     Ok(())
-}
-
-/// `std::env::var` with a test-only thread-local override. Edition 2024 makes
-/// `std::env::set_var` unsafe and the workspace denies `unsafe`, so tests
-/// redirect reads rather than write the process environment.
-fn env_or_test(name: &str) -> Option<String> {
-    #[cfg(test)]
-    if let Some(value) = TEST_ENV.with(|cell| cell.borrow().get(name).cloned()) {
-        // Blank override reads as unset, matching the empty-value filters the
-        // production callers apply.
-        if !value.trim().is_empty() {
-            return Some(value);
-        }
-        return None;
-    }
-    std::env::var(name).ok()
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_ENV: std::cell::RefCell<std::collections::HashMap<&'static str, String>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Run `body` with `vars` visible to `env_or_test` on this thread only.
-/// Replaces `std::env::set_var`; the override survives `await` points because
-/// `#[tokio::test]` drives the whole future on one thread.
-#[cfg(test)]
-async fn with_test_env<T>(
-    vars: &[(&'static str, Option<String>)],
-    body: impl Future<Output = T>,
-) -> T {
-    let saved = TEST_ENV.with(|cell| cell.borrow().clone());
-    TEST_ENV.with(|cell| {
-        let mut map = cell.borrow_mut();
-        for (name, value) in vars {
-            match value {
-                Some(value) => {
-                    map.insert(*name, value.clone());
-                }
-                None => {
-                    map.insert(*name, String::new());
-                }
-            }
-        }
-    });
-    let result = body.await;
-    TEST_ENV.with(|cell| *cell.borrow_mut() = saved);
-    result
 }
 
 #[cfg(test)]
@@ -619,12 +647,11 @@ mod tests {
         let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
             .build()
             .unwrap();
-        let workflows = with_test_env(
-            &[
-                ("PRELOOP_GITHUB_API_URL", Some(api_base)),
-                ("PRELOOP_GITHUB_TOKEN", None),
-            ],
-            resolve_remote_workflows(BTreeMap::new(), root, &client),
+        let workflows = resolve_remote_workflows(
+            BTreeMap::new(),
+            root,
+            &client,
+            &GitHubForge::new(Some(&api_base), None),
         )
         .await
         .unwrap();
@@ -658,12 +685,11 @@ mod tests {
         let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
             .build()
             .unwrap();
-        let resolved = with_test_env(
-            &[(
-                "PRELOOP_GITHUB_API_URL",
-                Some("http://127.0.0.1:1".to_owned()),
-            )],
-            resolve_remote_workflows(workflows.clone(), root, &client),
+        let resolved = resolve_remote_workflows(
+            workflows.clone(),
+            root,
+            &client,
+            &GitHubForge::new(Some("http://127.0.0.1:1"), None),
         )
         .await
         .unwrap();
@@ -742,12 +768,11 @@ mod tests {
         let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
             .build()
             .unwrap();
-        let resolved = with_test_env(
-            &[
-                ("PRELOOP_GITHUB_API_URL", Some(api_base)),
-                ("PRELOOP_GITHUB_TOKEN", None),
-            ],
-            resolve_remote_workflows(workflows, root, &client),
+        let resolved = resolve_remote_workflows(
+            workflows,
+            root,
+            &client,
+            &GitHubForge::new(Some(&api_base), None),
         )
         .await
         .unwrap();
@@ -794,12 +819,11 @@ mod tests {
         let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
             .build()
             .unwrap();
-        let resolved = with_test_env(
-            &[
-                ("PRELOOP_GITHUB_API_URL", Some(api_base)),
-                ("PRELOOP_GITHUB_TOKEN", None),
-            ],
-            resolve_remote_workflows(workflows, root, &client),
+        let resolved = resolve_remote_workflows(
+            workflows,
+            root,
+            &client,
+            &GitHubForge::new(Some(&api_base), None),
         )
         .await
         .unwrap();
@@ -878,15 +902,11 @@ mod tests {
                 (".github/workflows/a b.yml".to_owned(), CALLEE.to_owned()),
             ]);
             let root = format!("on: push\njobs:\n  call:\n    uses: {uses}\n");
-            let result = with_test_env(
-                &[
-                    (
-                        "PRELOOP_GITHUB_API_URL",
-                        Some("http://127.0.0.1:1".to_owned()),
-                    ),
-                    ("PRELOOP_GITHUB_TOKEN", None),
-                ],
-                resolve_remote_workflows(workflows, &root, &client),
+            let result = resolve_remote_workflows(
+                workflows,
+                &root,
+                &client,
+                &GitHubForge::new(Some("http://127.0.0.1:1"), None),
             )
             .await;
             assert!(result.is_err(), "`{uses}` must be refused");
@@ -902,21 +922,12 @@ mod tests {
         let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
             .build()
             .unwrap();
-        let env = [
-            (
-                "PRELOOP_GITHUB_API_URL",
-                Some("http://127.0.0.1:1".to_owned()),
-            ),
-            ("PRELOOP_GITHUB_TOKEN", None),
-        ];
+        let forge = GitHubForge::new(Some("http://127.0.0.1:1"), None);
         let workflows = BTreeMap::from([(".github/workflows/ci.yml".to_owned(), CI.to_owned())]);
         let root = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/ci.yml\n";
-        let resolved = with_test_env(
-            &env,
-            resolve_remote_workflows(workflows.clone(), root, &client),
-        )
-        .await
-        .expect("a workflow file under .github/workflows/ resolves from the workspace");
+        let resolved = resolve_remote_workflows(workflows.clone(), root, &client, &forge)
+            .await
+            .expect("a workflow file under .github/workflows/ resolves from the workspace");
         assert_eq!(resolved, workflows);
         for uses in [
             "$/src/x.yml",
@@ -924,11 +935,7 @@ mod tests {
             "$/../../../repos/other/private/contents/.github/workflows/x.yml",
         ] {
             let root = format!("on: push\njobs:\n  call:\n    uses: {uses}\n");
-            let result = with_test_env(
-                &env,
-                resolve_remote_workflows(workflows.clone(), &root, &client),
-            )
-            .await;
+            let result = resolve_remote_workflows(workflows.clone(), &root, &client, &forge).await;
             assert!(result.is_err(), "`{uses}` must be refused");
         }
     }

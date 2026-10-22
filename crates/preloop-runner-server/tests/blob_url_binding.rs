@@ -18,7 +18,9 @@ use common::*;
 #[tokio::test]
 async fn artifact_download_url_rejects_put_and_preserves_bytes() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -146,7 +148,9 @@ async fn artifact_download_url_rejects_put_and_preserves_bytes() {
 #[tokio::test]
 async fn cache_download_url_rejects_put() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let (read_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string(), "read");
@@ -169,7 +173,9 @@ async fn cache_download_url_rejects_put() {
 #[tokio::test]
 async fn blob_token_with_empty_job_claim_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let jti = uuid::Uuid::new_v4().to_string();
     let token = state
@@ -206,7 +212,9 @@ async fn blob_token_with_empty_job_claim_is_rejected() {
 #[tokio::test]
 async fn blob_token_without_op_claim_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4().to_string();
     let jti = uuid::Uuid::new_v4().to_string();
@@ -243,7 +251,9 @@ async fn blob_token_without_op_claim_is_rejected() {
 #[tokio::test]
 async fn signed_blob_url_ttl_is_short() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let job_id = uuid::Uuid::new_v4().to_string();
     let (jwt, _jti) = mint_blob_jwt(&state, "artifact", &job_id, "write");
     let claims = state
@@ -268,7 +278,9 @@ async fn signed_blob_url_ttl_is_short() {
 #[tokio::test]
 async fn system_minted_upload_url_accepts_bearerless_put() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";

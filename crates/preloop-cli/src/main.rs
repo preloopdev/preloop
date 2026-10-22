@@ -6,7 +6,9 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{OFFICIAL_GOLDEN, is_official_golden};
-use preloop_orchestrator::{RunnerPool, RunnerPoolConfig, artifact_payload};
+use preloop_orchestrator::{
+    DEFAULT_RUNNER_USER, DISK_PREFLIGHT_OVERRIDE, RunnerPool, RunnerPoolConfig, artifact_payload,
+};
 use preloop_runner_server::credential_store::CredentialStore;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -25,6 +27,7 @@ mod engine_app_setup;
 mod github_auth;
 mod github_setup;
 mod init;
+mod output;
 
 mod push;
 mod server_install;
@@ -35,6 +38,62 @@ mod webhooks;
 
 pub(crate) fn server_url() -> String {
     std::env::var("PRELOOP_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
+}
+
+/// The engine a command talks to, resolved once at its command boundary.
+///
+/// `url` is `PRELOOP_URL` or the default local endpoint; `configured` records
+/// whether an endpoint was named at all, which decides whether a submission may
+/// carry the local-workspace header. Resolving both here keeps the submission
+/// path from rereading the process environment for either answer.
+#[derive(Debug, Clone)]
+struct EngineTarget {
+    /// Base URL of the engine, without a trailing slash.
+    url: String,
+    /// Whether the endpoint was named explicitly rather than defaulted.
+    configured: bool,
+}
+
+impl EngineTarget {
+    /// Boundary read: the environment is consulted once per command.
+    fn from_env() -> Self {
+        match std::env::var("PRELOOP_URL") {
+            Ok(url) => Self::named(url),
+            Err(_) => Self::default_local(),
+        }
+    }
+
+    /// An endpoint the caller already resolved. Treated as explicitly named, so
+    /// the transport decision matches an operator-set `PRELOOP_URL`.
+    fn named(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            configured: true,
+        }
+    }
+
+    /// The default local engine, for an unset `PRELOOP_URL`.
+    fn default_local() -> Self {
+        Self {
+            url: server_url(),
+            configured: false,
+        }
+    }
+}
+
+/// Resolve the GitHub REST API root once at each CLI command boundary.
+///
+/// Whitespace-only values are unset, and trailing slashes are removed so
+/// callers can append endpoint paths without changing a GHES/proxy path.
+pub(crate) fn github_api_base() -> String {
+    normalize_github_api_base(std::env::var("PRELOOP_GITHUB_API_URL").ok().as_deref())
+}
+
+fn normalize_github_api_base(value: Option<&str>) -> String {
+    value
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned())
 }
 
 fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
@@ -479,13 +538,25 @@ fn maybe_offer_hook() -> anyhow::Result<()> {
 }
 
 pub(crate) fn api_token() -> Option<String> {
+    // Resolved once at this boundary and passed down: the token lookup takes
+    // the config path and credential-store override as explicit inputs — the
+    // same resolution `main` pins for the whole process.
+    let config_path = std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(github_setup::config_path_for_home);
+    let credential_store_env =
+        std::env::var(preloop_runner_server::credential_store::CREDENTIAL_STORE_ENV).ok();
     std::env::var("PRELOOP_TOKEN")
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
-            preloop_runner_server::credential_store::load_engine_token(&preloop_home())
-                .ok()
-                .flatten()
+            preloop_runner_server::credential_store::load_engine_token(
+                &preloop_home(),
+                &config_path,
+                credential_store_env.as_deref(),
+            )
+            .ok()
+            .flatten()
         })
         .or_else(|| {
             // Standalone `serve` without PRELOOP_HOME stores under its
@@ -497,9 +568,13 @@ pub(crate) fn api_token() -> Option<String> {
             if home == cwd_default {
                 return None;
             }
-            preloop_runner_server::credential_store::load_engine_token(&cwd_default)
-                .ok()
-                .flatten()
+            preloop_runner_server::credential_store::load_engine_token(
+                &cwd_default,
+                &config_path,
+                credential_store_env.as_deref(),
+            )
+            .ok()
+            .flatten()
         })
 }
 
@@ -669,13 +744,43 @@ fn default_vm_backend() -> VmBackend {
 
 /// The VM provider for the resolved backend, boxed so the pool's type does
 /// not depend on the choice.
-pub(crate) fn vm_provider(backend: VmBackend) -> Box<dyn preloop_vm::VmProvider> {
+pub(crate) fn vm_provider(
+    backend: VmBackend,
+    paths: &preloop_vm::VmPathConfig,
+) -> Box<dyn preloop_vm::VmProvider> {
     match backend {
-        VmBackend::Smolvm => Box::new(preloop_vm::SmolVmProvider::default()),
+        VmBackend::Smolvm => Box::new(preloop_vm::SmolVmProvider::from_environment(
+            "smolvm",
+            paths.clone(),
+        )),
         VmBackend::Agentenv => Box::new(
-            preloop_vm::agentenv::AgentEnvProvider::default()
+            preloop_vm::agentenv::AgentEnvProvider::from_environment(paths.clone())
                 .with_bundle_manifest(preloop_orchestrator::runner_bundle_manifest()),
         ),
+    }
+}
+
+/// How this process reaches job VMs: the substrate backend, the smolvm
+/// binary, and the paths its runtime must be launched with. Resolved once at
+/// a command entry ([`GuestTool::resolve`]) and passed down explicitly — the
+/// guest-command builders read no process state.
+#[derive(Debug, Clone)]
+pub(crate) struct GuestTool {
+    pub(crate) backend: VmBackend,
+    /// The smolvm binary: a name resolved through `PATH` at spawn, or a path.
+    pub(crate) smolvm: std::ffi::OsString,
+    pub(crate) paths: preloop_vm::VmPathConfig,
+}
+
+impl GuestTool {
+    /// Startup boundary: `PRELOOP_VM_BACKEND`, the `smolvm` on `PATH`, and
+    /// the VM path environment (`PRELOOP_HOME`, `HOME`, `SMOLVM_*`).
+    pub(crate) fn resolve() -> anyhow::Result<Self> {
+        Ok(Self {
+            backend: vm_backend()?,
+            smolvm: "smolvm".into(),
+            paths: preloop_vm::VmPathConfig::resolve(),
+        })
     }
 }
 
@@ -686,15 +791,18 @@ pub(crate) fn vm_provider(backend: VmBackend) -> Box<dyn preloop_vm::VmProvider>
 /// separate process, so this is the one place that knows how to address a
 /// guest per backend: SmolVM by machine name, AgentENV by the sandbox id the
 /// engine recorded in its registry.
-pub(crate) fn guest_exec_command(machine: &str) -> anyhow::Result<std::process::Command> {
-    match vm_backend()? {
+pub(crate) fn guest_exec_command(
+    tool: &GuestTool,
+    machine: &str,
+) -> anyhow::Result<std::process::Command> {
+    match tool.backend {
         VmBackend::Smolvm => {
-            let mut command = smolvm_command()?;
+            let mut command = smolvm_command(tool)?;
             command.args(["machine", "exec", "--name", machine, "--"]);
             Ok(command)
         }
         VmBackend::Agentenv => {
-            let sandbox = recorded_sandbox(machine)?;
+            let sandbox = recorded_sandbox(tool, machine)?;
             let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
             command.args(["exec", &sandbox, "--"]);
             Ok(command)
@@ -704,18 +812,19 @@ pub(crate) fn guest_exec_command(machine: &str) -> anyhow::Result<std::process::
 
 /// A command that copies a host file to `remote` inside `machine`'s guest.
 pub(crate) fn guest_upload_command(
+    tool: &GuestTool,
     machine: &str,
     local: &str,
     remote: &str,
 ) -> anyhow::Result<std::process::Command> {
-    match vm_backend()? {
+    match tool.backend {
         VmBackend::Smolvm => {
-            let mut command = smolvm_command()?;
+            let mut command = smolvm_command(tool)?;
             command.args(["machine", "cp", local, &format!("{machine}:{remote}")]);
             Ok(command)
         }
         VmBackend::Agentenv => {
-            let sandbox = recorded_sandbox(machine)?;
+            let sandbox = recorded_sandbox(tool, machine)?;
             let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
             command.args(["upload", &sandbox, local, remote]);
             Ok(command)
@@ -724,15 +833,18 @@ pub(crate) fn guest_upload_command(
 }
 
 /// An interactive shell attached to `machine`'s guest.
-pub(crate) fn guest_shell_command(machine: &str) -> anyhow::Result<std::process::Command> {
-    match vm_backend()? {
+pub(crate) fn guest_shell_command(
+    tool: &GuestTool,
+    machine: &str,
+) -> anyhow::Result<std::process::Command> {
+    match tool.backend {
         VmBackend::Smolvm => {
-            let mut command = smolvm_command()?;
+            let mut command = smolvm_command(tool)?;
             command.args(["machine", "shell", "--name", machine]);
             Ok(command)
         }
         VmBackend::Agentenv => {
-            let sandbox = recorded_sandbox(machine)?;
+            let sandbox = recorded_sandbox(tool, machine)?;
             let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
             command.args(["cn", &sandbox]);
             Ok(command)
@@ -742,11 +854,14 @@ pub(crate) fn guest_shell_command(machine: &str) -> anyhow::Result<std::process:
 
 /// Resume an AgentENV sandbox before an attach. SmolVM's shell command owns
 /// its own lifecycle, so it needs no separate resume command.
-pub(crate) fn guest_resume_command(machine: &str) -> anyhow::Result<Option<std::process::Command>> {
-    if vm_backend()? != VmBackend::Agentenv {
+pub(crate) fn guest_resume_command(
+    tool: &GuestTool,
+    machine: &str,
+) -> anyhow::Result<Option<std::process::Command>> {
+    if tool.backend != VmBackend::Agentenv {
         return Ok(None);
     }
-    let sandbox = recorded_sandbox(machine)?;
+    let sandbox = recorded_sandbox(tool, machine)?;
     let timeout = std::env::var("PRELOOP_AENV_TTL_SECS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -781,8 +896,8 @@ pub(crate) const AENV_READY_DEADLINE: Duration = Duration::from_secs(120);
 /// Returns `Ok(false)` when the guest did not answer in time (or answered
 /// non-zero), so callers can treat a wedged runtime like an unreachable guest
 /// instead of blocking. The child is killed at the deadline.
-async fn guest_answers(machine: &str, argv: &[&str]) -> anyhow::Result<bool> {
-    let mut command = guest_exec_command(machine)?;
+async fn guest_answers(tool: &GuestTool, machine: &str, argv: &[&str]) -> anyhow::Result<bool> {
+    let mut command = guest_exec_command(tool, machine)?;
     command.args(argv);
     // Process policy (null stdin, kill_on_drop, kill+reap on expiry) belongs to
     // the shared runner; the guest's own argv/cwd stay here.
@@ -810,11 +925,11 @@ async fn guest_answers(machine: &str, argv: &[&str]) -> anyhow::Result<bool> {
     }
 }
 
-pub(crate) async fn resume_guest_if_needed(machine: &str) -> anyhow::Result<()> {
-    let Some(resume) = guest_resume_command(machine)? else {
+pub(crate) async fn resume_guest_if_needed(tool: &GuestTool, machine: &str) -> anyhow::Result<()> {
+    let Some(resume) = guest_resume_command(tool, machine)? else {
         return Ok(());
     };
-    if guest_answers(machine, &["/bin/true"]).await? {
+    if guest_answers(tool, machine, &["/bin/true"]).await? {
         return Ok(());
     }
 
@@ -842,7 +957,7 @@ pub(crate) async fn resume_guest_if_needed(machine: &str) -> anyhow::Result<()> 
     }
     let ready_by = std::time::Instant::now() + AENV_READY_DEADLINE;
     loop {
-        if guest_answers(machine, &["/bin/true"]).await? {
+        if guest_answers(tool, machine, &["/bin/true"]).await? {
             return Ok(());
         }
         if std::time::Instant::now() >= ready_by {
@@ -858,8 +973,8 @@ pub(crate) async fn resume_guest_if_needed(machine: &str) -> anyhow::Result<()> 
 
 /// The AgentENV sandbox behind `machine`, or an explanation of why the guest
 /// cannot be reached.
-fn recorded_sandbox(machine: &str) -> anyhow::Result<String> {
-    preloop_vm::agentenv::recorded_sandbox(machine).with_context(|| {
+fn recorded_sandbox(tool: &GuestTool, machine: &str) -> anyhow::Result<String> {
+    preloop_vm::agentenv::recorded_sandbox(&tool.paths, machine).with_context(|| {
         format!(
             "no AgentENV sandbox is recorded for machine `{machine}`; the engine that created it \
              may have exited, or its sandbox TTL expired"
@@ -876,8 +991,8 @@ fn recorded_sandbox(machine: &str) -> anyhow::Result<String> {
 /// applies to its own boots. This is the single chokepoint for them; the
 /// policy lives in [`preloop_vm::smolvm_sandbox_env`] and is a no-op on
 /// macOS, matching the provider.
-pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
-    let mut command = std::process::Command::new("smolvm");
+pub(crate) fn smolvm_command(tool: &GuestTool) -> anyhow::Result<std::process::Command> {
+    let mut command = std::process::Command::new(&tool.smolvm);
     // The service unit pins `SMOLVM_DATA_DIR=<PRELOOP_HOME>/smolvm`
     // (see crates/preloop-cli/src/server_install.rs), so the engine records
     // its machines in that registry. A separately invoked `preloop shell` /
@@ -885,30 +1000,16 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
     // paused, service-owned machine. `apply_smolvm_runtime_env` fills the
     // same gap from the effective Preloop home (and isolates `HOME` on macOS,
     // where SmolVM ignores `SMOLVM_DATA_DIR`); an operator value still wins.
-    preloop_vm::apply_smolvm_runtime_env(&mut command, None)?;
+    preloop_vm::apply_smolvm_runtime_env(&mut command, None, &tool.paths)?;
     preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
     Ok(command)
 }
 
+/// A fake `smolvm` executable that records the sandbox environment it was
+/// given and answers the debug-session byte-count probe. Tests hand its path
+/// to a [`GuestTool`] explicitly; nothing touches `PATH` or process env.
 #[cfg(test)]
-pub(crate) static SMOLVM_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Serializes every test that reads or writes process-global environment
-/// variables (`PRELOOP_HOME`, `PRELOOP_CONFIG`, `PRELOOP_CREDENTIAL_STORE`,
-/// `PRELOOP_TOKEN`, `HOME`, …). Process env is per-process state, so parallel
-/// test threads would otherwise race each other's `set_var`/`remove_var`
-/// pairs and observe each other's transient values across modules. Sync
-/// tests take it with [`tokio::sync::Mutex::blocking_lock`]; async tests with
-/// `lock().await`.
-#[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// A fake `smolvm` on PATH that records the sandbox environment it was given
-/// and answers the debug-session byte-count probe. Serialized with
-/// [`SMOLVM_PATH_LOCK`]: `PATH` is process-global and the debug-session and
-/// shell tests run in the same binary.
-#[cfg(test)]
-pub(crate) fn fake_smolvm_on_path() -> (tempfile::TempDir, PathBuf) {
+pub(crate) fn fake_smolvm() -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let executable = directory.path().join("smolvm");
     std::fs::write(
@@ -930,37 +1031,6 @@ exit 0
     permissions.set_mode(0o755);
     std::fs::set_permissions(&executable, permissions).unwrap();
     (directory, executable)
-}
-
-/// Run `test` with a fake `smolvm` first on PATH, restoring PATH afterwards.
-///
-/// The backend is pinned to SmolVM for the duration: these tests assert the
-/// argv and environment of `smolvm` spawns, and on a Linux host that has
-/// `/dev/kvm` and an `aenv` binary the backend default would otherwise select
-/// AgentENV and never spawn the fake at all.
-#[cfg(test)]
-pub(crate) fn with_fake_smolvm_path<T>(test: impl FnOnce(&PathBuf) -> T) -> T {
-    let _guard = SMOLVM_PATH_LOCK.blocking_lock();
-    let (directory, executable) = fake_smolvm_on_path();
-    let previous = std::env::var_os("PATH");
-    let previous_backend = std::env::var_os("PRELOOP_VM_BACKEND");
-    let mut path = directory.path().as_os_str().to_owned();
-    path.push(":");
-    if let Some(previous) = &previous {
-        path.push(previous);
-    }
-    unsafe { std::env::set_var("PATH", path) };
-    unsafe { std::env::set_var("PRELOOP_VM_BACKEND", "smolvm") };
-    let result = test(&executable);
-    match previous {
-        Some(previous) => unsafe { std::env::set_var("PATH", previous) },
-        None => unsafe { std::env::remove_var("PATH") },
-    }
-    match previous_backend {
-        Some(previous) => unsafe { std::env::set_var("PRELOOP_VM_BACKEND", previous) },
-        None => unsafe { std::env::remove_var("PRELOOP_VM_BACKEND") },
-    }
-    result
 }
 
 #[derive(Debug, Parser)]
@@ -1387,19 +1457,16 @@ async fn main() -> anyhow::Result<()> {
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();
     let cli = Cli::parse();
-    // One config path for the whole process. `setup`/`doctor`/`secret` return
-    // before `cmd_engine` runs, so pinning this only inside the engine let a
-    // custom PRELOOP_HOME split the CLI's writes ($HOME/.preloop/config.toml)
-    // from the engine's reads ($PRELOOP_HOME/config.toml) — setup silently had
-    // no effect. An explicit operator override still wins.
-    if std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV).is_none() {
-        unsafe {
-            std::env::set_var(
-                preloop_runner_server::config::CONFIG_PATH_ENV,
-                github_setup::config_path_for_home(),
-            )
-        };
-    }
+    // One config path for the whole process, resolved once and passed to
+    // every command that reads or writes it: `setup`/`doctor`/`secret` return
+    // before `cmd_engine` runs, so leaving the resolution to each component
+    // let a custom PRELOOP_HOME split the CLI's writes
+    // ($HOME/.preloop/config.toml) from the engine's reads
+    // ($PRELOOP_HOME/config.toml) — setup silently had no effect. An explicit
+    // operator override still wins.
+    let config_path = std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(github_setup::config_path_for_home);
     // Both run the daemon in this process, so neither may bootstrap another
     // one underneath itself.
     let result = match cli.command {
@@ -1411,16 +1478,25 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::Serve(args) => cmd_engine(args, observability.clone()).await,
-        Command::Engine => cmd_engine(ServeArgs::default(), observability.clone()).await,
-        Command::BuildGolden(args) => cmd_build_golden(args).await,
-        Command::GoldenPath(args) => cmd_golden_path(args).await,
+        Command::Serve(args) => cmd_engine(args, observability.clone(), config_path.clone()).await,
+        Command::Engine => {
+            cmd_engine(
+                ServeArgs::default(),
+                observability.clone(),
+                config_path.clone(),
+            )
+            .await
+        }
+        Command::BuildGolden(args) => cmd_build_golden(args, &config_path).await,
+        Command::GoldenPath(args) => cmd_golden_path(args, &config_path).await,
         Command::Update(args) => update::run(args).await,
         // Local configuration commands must not spawn the engine.
-        Command::Setup(args) => github_setup::cmd_setup(args).await,
-        Command::Init(args) => init::run(args, Some(observability.clone())).await,
-        Command::Doctor(args) => github_setup::cmd_doctor(args).await,
-        Command::Secret(args) => github_setup::cmd_secret(args).await,
+        Command::Setup(args) => github_setup::cmd_setup(args, &config_path).await,
+        Command::Init(args) => init::run(args, Some(observability.clone()), &config_path).await,
+        Command::Doctor(args) => github_setup::cmd_doctor(args, &config_path).await,
+        Command::Secret(args) => {
+            github_setup::cmd_secret(args, &config_path, &github_setup::SecretEnv::from_env()).await
+        }
         Command::Server(args) => server_install::run(args),
         // Schema administration and the legacy import are explicit and
         // offline; never bootstrap (or migrate) the engine for them.
@@ -1444,7 +1520,10 @@ async fn main() -> anyhow::Result<()> {
                     Command::Logs(args) => cmd_logs(args).await,
                     Command::Cancel(args) => cmd_cancel(args).await,
                     Command::Rerun(args) => cmd_rerun(args).await,
-                    Command::Shell(args) => cmd_shell(args).await,
+                    Command::Shell(args) => {
+                        let tool = GuestTool::resolve()?;
+                        cmd_shell(args, &preloop_home(), &tool).await
+                    }
                     Command::Debug(args) => {
                         debug_session::run(args, build_client(), server_url(), api_token()).await
                     }
@@ -1490,7 +1569,11 @@ fn systemd_socket_activation_requested() -> bool {
     cfg!(target_os = "linux") && std::env::var_os("LISTEN_FDS").is_some()
 }
 
-async fn cmd_golden_path(args: GoldenPathArgs) -> anyhow::Result<()> {
+async fn cmd_golden_path(
+    args: GoldenPathArgs,
+    config_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let env = PoolEnv::read();
     // Same resolution and stem construction as the pool config:
     // home/vms/preloop-<base>-<arch>, then the environment fingerprint.
     let home = args.home.map(Ok).unwrap_or_else(|| {
@@ -1502,7 +1585,10 @@ async fn cmd_golden_path(args: GoldenPathArgs) -> anyhow::Result<()> {
     // one, exactly as `serve` resolves it.
     let base_image = match args.base_image.filter(|value| !value.trim().is_empty()) {
         Some(base) => base,
-        None => configured_base_image()?,
+        None => {
+            let config = preloop_runner_server::config::load_config_from(config_path)?;
+            configured_base_image(&config, env.base_image.as_deref())
+        }
     };
     let stem = home.join("vms").join(format!(
         "preloop-{}-{}",
@@ -1513,9 +1599,11 @@ async fn cmd_golden_path(args: GoldenPathArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
-    const TOKEN_ENV: &str = "PRELOOP_GOLDEN_BUILD_TOKEN";
-    unsafe { std::env::set_var(TOKEN_ENV, "artifact-build-only") };
+async fn cmd_build_golden(
+    args: BuildGoldenArgs,
+    config_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let env = PoolEnv::read();
     let runner_bundle = std::fs::canonicalize(&args.runner_bundle).with_context(|| {
         format!(
             "runner bundle does not exist: {}",
@@ -1534,7 +1622,10 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     // bail instead of trying to fetch one.
     let base_image = match args.base_image.filter(|value| !value.trim().is_empty()) {
         Some(base) => base,
-        None => configured_base_image()?,
+        None => {
+            let config = preloop_runner_server::config::load_config_from(config_path)?;
+            configured_base_image(&config, env.base_image.as_deref())
+        }
     };
     if is_official_golden(&base_image) {
         anyhow::bail!(
@@ -1552,7 +1643,10 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     {
         verify_base_image(&base_image).await?;
     }
-    if env_flag("PRELOOP_REQUIRE_BASE_DIGEST", false) {
+    if flag_or(
+        std::env::var("PRELOOP_REQUIRE_BASE_DIGEST").ok().as_deref(),
+        false,
+    ) {
         require_digest_pinned_base(&base_image)?;
     }
     let config = RunnerPoolConfig {
@@ -1577,27 +1671,30 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         artifact_stem: output.clone(),
         release_version: env!("CARGO_PKG_VERSION").to_owned(),
         runner_bundle,
-        externals_dir: std::env::var_os("PRELOOP_RUNNER_EXTERNALS")
-            .map(PathBuf::from)
+        externals_dir: env
+            .externals_dir
+            .clone()
             .unwrap_or_else(|| std::env::temp_dir().join("preloop-externals")),
         runner_binary_name: "preloop-runner".into(),
         server_url: "http://127.0.0.1:1".into(),
         control_origin: None,
         control_socket: None,
         control_upstream: None,
-        dns: runner_dns_for(vm_backend()?),
-        registration_token_env: TOKEN_ENV.into(),
+        dns: runner_dns_for(vm_backend()?, env.dns.as_deref()),
+        // The bake never registers anywhere; the pool config still requires a
+        // non-empty credential, so it gets a build-only placeholder.
+        registration_token: preloop_gha_protocol::SecretString::new("artifact-build-only"),
         labels: vec![
             "self-hosted".into(),
             "Linux".into(),
             std::env::consts::ARCH.into(),
         ],
-        cpus: runner_cpus(),
-        memory_mib: runner_memory_mib(),
-        storage_gib: args.storage_gib.unwrap_or_else(runner_storage_gib),
-        overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
-            .ok()
-            .and_then(|v| v.parse().ok()),
+        cpus: runner_cpus(env.cpus.as_deref()),
+        memory_mib: runner_memory_mib(env.memory_mib.as_deref()),
+        storage_gib: args
+            .storage_gib
+            .unwrap_or_else(|| runner_storage_gib(env.storage_gib.as_deref())),
+        overlay_gib: env.overlay_gib.as_deref().and_then(|v| v.parse().ok()),
         // Unused by a bake (the builder VM is gated by
         // `ensure_disk_for_golden_build`), but the pool config is shared.
         job_vm_disk: preloop_orchestrator::JobVmDiskReserve::from_env(),
@@ -1608,8 +1705,9 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         // The golden bake provisions the image (runner install, apt, service
         // files); it must run as root. The official runner image declares
         // USER=runner, so the machine's default exec user is not root.
-        runner_user: std::env::var("PRELOOP_RUNNER_USER")
-            .ok()
+        runner_user: env
+            .runner_user
+            .clone()
             .filter(|value| !value.is_empty())
             .or_else(|| Some("root".to_owned())),
         runner_uid: None,
@@ -1618,6 +1716,13 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         preparing_signal: None,
         pool_status: None,
         observability: None,
+        // The mirror override is deliberately download-only and resolved
+        // from `PRELOOP_GOLDEN_URL` by the downloader itself: production
+        // callers pass `None` so the download and the fingerprint's source
+        // can never diverge.
+        golden_url_override: None,
+        skip_disk_preflight: skip_disk_preflight(env.skip_disk_preflight.as_deref()),
+        paths: preloop_vm::VmPathConfig::resolve(),
         // A one-shot bake has no engine to share a funnel with; the pool
         // builds a private one so this download still honours the breakers.
         github: None,
@@ -1627,9 +1732,12 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     // `.smolmachine`, AgentENV writes a descriptor naming the server-side
     // snapshot it just created (portable only within that server).
     let backend = vm_backend()?;
-    RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
-        .rebuild_artifact()
-        .await?;
+    RunnerPool::new(
+        std::sync::Arc::new(vm_provider(backend, &config.paths)),
+        config,
+    )?
+    .rebuild_artifact()
+    .await?;
     if payload != output {
         let temporary = output.with_file_name(format!(
             ".{}.tmp-{}",
@@ -2131,16 +2239,23 @@ fn migrate_legacy_github_credentials(
     Ok(migrated)
 }
 
-/// Merge stored and command-line GitHub credentials into the environment the
-/// server reads, optionally persisting them, and report the effective state.
+/// Merge stored and command-line GitHub credentials with the credential
+/// environment, optionally persisting them, and report the effective state.
 ///
 /// Precedence, widest to narrowest: existing environment, then `--flags`,
 /// then `github-app.json` (written by `--save`), then `config.toml`'s
 /// `[github]` section (written by `preloop setup` and read by the server at
 /// startup). The environment stays authoritative so a container that
 /// injects secrets is never overridden by a file left behind by `--save`.
-fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow::Result<()> {
+/// The result's overrides are handed to the server as explicit startup
+/// values — the CLI never writes the process environment.
+fn resolve_github_auth(
+    args: &ServeArgs,
+    state_dir: &std::path::Path,
+    config_path: &std::path::Path,
+) -> anyhow::Result<github_auth::ResolvedGithubAuth> {
     let mut auth = github_auth::StoredAuth::load(state_dir)?;
+    let stored_key_present = auth.private_key_pem.is_some();
 
     let private_key_pem = args
         .github_app_key
@@ -2150,6 +2265,7 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
                 .with_context(|| format!("reading GitHub App key {}", path.display()))
         })
         .transpose()?;
+    let flags_key_present = private_key_pem.is_some();
 
     let from_flags = github_auth::StoredAuth {
         app_id: args.github_app_id.clone(),
@@ -2163,10 +2279,12 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     // `preloop setup` stores credentials in config.toml's [github] section,
     // which is what the server itself loads at startup. Fill any gaps from
     // it so the startup report matches what the server will actually see.
-    let mut file_config = preloop_runner_server::config::load_config()?;
-    let config_path = preloop_runner_server::config::config_path();
+    let mut file_config = preloop_runner_server::config::load_config_from(config_path)?;
+    let credential_store_env =
+        std::env::var(preloop_runner_server::credential_store::CREDENTIAL_STORE_ENV).ok();
     let store = preloop_runner_server::credential_store::selected_store_for_config(
-        &config_path,
+        config_path,
+        credential_store_env.as_deref(),
         file_config.credential_store.as_deref(),
     )?;
     // Read before migrating: migration moves the inline values out of
@@ -2178,7 +2296,7 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
         webhook_secret: file_config.github.webhook_secret().map(str::to_owned),
     };
     if migrate_legacy_github_credentials(&mut file_config, store.as_ref())? {
-        preloop_runner_server::config::write_config(&file_config)?;
+        preloop_runner_server::config::write_config_to(config_path, &file_config)?;
         eprintln!("[preloop] migrated legacy GitHub credentials to the credential store");
     }
     auth.fill_gaps(from_file);
@@ -2191,14 +2309,23 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
         eprintln!("[preloop] saved GitHub credentials to {}", path.display());
     }
 
-    auth.apply();
-    eprintln!("[preloop] {}", github_auth::StoredAuth::report());
-    if github_auth::StoredAuth::is_unconfigured() {
+    // Where the merged key came from, for the report and the server's key
+    // source label.
+    let key_label = if flags_key_present {
+        "--github-app-key"
+    } else if stored_key_present {
+        "github-app.json"
+    } else {
+        "config.toml [github]"
+    };
+    let resolved = github_auth::GithubAuthInputs::read().resolve(auth, key_label);
+    eprintln!("[preloop] {}", resolved.effective.report());
+    if resolved.effective.is_unconfigured() {
         eprintln!(
             "[preloop] connect GitHub with `preloop setup` — until then, jobs get local tokens and webhooks are unverified"
         );
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// The pool snapshot an engine starts from. `mode` is the one field with no
@@ -2218,20 +2345,30 @@ fn initial_pool_snapshot(pool_enabled: bool) -> preloop_observability::status::P
 async fn cmd_engine(
     args: ServeArgs,
     observability: preloop_observability::Observability,
+    config_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     let home = preloop_home();
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
 
-    // Keep AppState's resolver on the same engine home as this CLI.
-    unsafe { std::env::set_var("PRELOOP_HOME", &home) };
-    let store = preloop_runner_server::credential_store::engine_store(&home)?;
+    let env = PoolEnv::read();
+    // Keep the VM subsystem and the pool on the same engine home as this CLI.
+    let paths = preloop_vm::VmPathConfig {
+        preloop_home: Some(home.clone()),
+        ..preloop_vm::VmPathConfig::resolve()
+    };
+    let credential_store_env =
+        std::env::var(preloop_runner_server::credential_store::CREDENTIAL_STORE_ENV).ok();
+    let store = preloop_runner_server::credential_store::engine_store(
+        &home,
+        &config_path,
+        credential_store_env.as_deref(),
+    )?;
     let token = prepare_engine_token(
         &home,
         std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
         store.as_ref(),
     )?;
-    unsafe { std::env::set_var("PRELOOP_SYSTEM_TOKEN", &token) };
     let listen: std::net::SocketAddr = args
         .listen
         .clone()
@@ -2239,12 +2376,11 @@ async fn cmd_engine(
         .unwrap_or_else(|| "127.0.0.1:9090".to_owned())
         .parse()
         .context("--listen / PRELOOP_LISTEN must be a socket address")?;
-    let public_url = args
+    let mut public_url = args
         .public_url
         .clone()
         .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
-    unsafe { std::env::set_var("PRELOOP_PUBLIC_URL", &public_url) };
 
     // Runner-facing origin is always the loopback listen address: in-VM
     // runners reach it over the mounted control socket, and their job-side
@@ -2257,35 +2393,67 @@ async fn cmd_engine(
     // the server advertises loopback URLs in job messages — the in-guest
     // bridge makes them work.
     let control_upstream = std::env::var("PRELOOP_CONTROL_UPSTREAM").ok();
-    if std::env::var("PRELOOP_RUNNER_URL").is_err() {
-        unsafe {
-            std::env::set_var(
-                "PRELOOP_RUNNER_URL",
-                format!("http://127.0.0.1:{}", listen.port()),
-            )
-        };
-    }
-    let runner_url = std::env::var("PRELOOP_RUNNER_URL").unwrap();
+    let runner_url = std::env::var("PRELOOP_RUNNER_URL")
+        .ok()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
     let control_origin = mounted_control_origin(&runner_url);
 
     // `preloop serve` is the only command that starts an engine (#658), so
     // it owns the zero-config first run: create the home and initialize a
     // brand-new control database. The removed client-command auto-start used
     // to perform this step. `--store` selects the database, exactly as it
-    // selects the one the server below opens.
-    prepare_local_engine_home(&home, args.store.as_deref())?;
+    // selects the one the server below opens; without it, the operator's
+    // `PRELOOP_STORE_URL` is resolved once here, like the server does.
+    let store_url = args
+        .store
+        .clone()
+        .or_else(|| std::env::var(preloop_runner_server::store::STORE_URL_ENV).ok());
+    prepare_local_engine_home(&home, store_url.as_deref())?;
 
-    // Resolve GitHub credentials before `AppState::new` reads the environment.
-    // Both `github_app::load_from_env` and the webhook-secret lookup happen
-    // inside `serve`, so anything published after that call is ignored.
+    // Resolve GitHub credentials before `serve` consumes the startup config,
+    // so the effective values reported here are the ones the server uses.
     //
     // The offer comes first: `preloop init` writes credentials too, and a
     // credential configured by the wizard must be the one this process picks
     // up, not the one it read a moment earlier. The wizard may also resolve a
     // public URL of its own (the App flow's question), which has to reach the
     // engine *this* process is about to start.
-    offer_init_when_unconfigured(&public_url).await?;
-    resolve_github_auth(&args, &state_dir)?;
+    if let Some(resolved) =
+        offer_init_when_unconfigured(&config_path, env.base_image.as_deref(), &public_url).await?
+    {
+        public_url = resolved;
+    }
+    let github_auth = resolve_github_auth(&args, &state_dir, &config_path)?;
+    // Everything the engine resolves from process state, handed over as
+    // typed startup config: explicit values win over the environment layer
+    // exactly where the old in-process publications did.
+    let mut startup = preloop_runner_server::config::StartupConfig {
+        config_path: config_path.clone(),
+        engine_home: Some(home.clone()),
+        system_token: Some(token.clone()),
+        public_url: Some(public_url.clone()),
+        runner_url: Some(runner_url.clone()),
+        ..preloop_runner_server::config::StartupConfig::from_env()
+    };
+    if let Some(store_url) = args.store.clone() {
+        startup.store_url = Some(store_url);
+    }
+    if let Some(app_id) = github_auth.overrides.app_id.clone() {
+        startup.github_app_id = Some(app_id);
+    }
+    if let Some(installation_id) = github_auth.overrides.installation_id {
+        startup.github_installation_id = Some(installation_id.to_string());
+    }
+    if let Some(webhook_secret) = github_auth.overrides.webhook_secret.clone() {
+        startup.webhook_secret = Some(webhook_secret);
+    }
+    if let Some(private_key_pem) = github_auth.overrides.private_key_pem.clone() {
+        startup.github_app_pem = vec![(
+            github_auth.effective.key_source.clone().unwrap_or_default(),
+            false,
+            private_key_pem,
+        )];
+    }
 
     // Shared with the runner pool so it can size provisioning to the work
     // actually waiting, not just to whether it has an idle runner left.
@@ -2306,7 +2474,10 @@ async fn cmd_engine(
             String,
             std::time::SystemTime,
         >::new()));
-    let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", DEFAULT_RUNNER_POOL_ENABLED);
+    let pool_enabled = flag_or(
+        std::env::var("PRELOOP_RUNNER_POOL_ENABLED").ok().as_deref(),
+        DEFAULT_RUNNER_POOL_ENABLED,
+    );
     // One shared handle: the server and the pool both observe the same
     // preparing/queue state, and the server exports via the process handle
     // instead of a fresh no-op one. Seed `mode` from the pool switch — the
@@ -2323,6 +2494,11 @@ async fn cmd_engine(
     // metadata deadline rediscovering it.
     let github = preloop_runner_server::github_breaker::GithubFunnel::default();
     let pool_config = local_runner_pool_config(
+        &config_path,
+        vm_backend()?,
+        paths.clone(),
+        preloop_gha_protocol::SecretString::new(&token),
+        &env,
         &home,
         runner_url.clone(),
         control_origin.clone(),
@@ -2428,9 +2604,14 @@ async fn cmd_engine(
             pool_status: Some(pool_status.clone()),
             observability: Some(observability),
             github: Some(github),
-            require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
+            require_job_assignments: flag_or(
+                std::env::var("PRELOOP_REQUIRE_JOB_ASSIGNMENTS")
+                    .ok()
+                    .as_deref(),
+                false,
+            ),
             state_dir,
-            store_url: args.store.clone(),
+            startup,
             record_flows: None,
             tls: preloop_runner_server::TlsMode::None,
             enable_test_api: false,
@@ -2451,14 +2632,16 @@ async fn cmd_engine(
     // will not run because the pool is disabled. Reap them here, where the
     // purge cannot race a live engine.
     if agent_guard_error.is_some() {
-        purge_stuck_vms();
+        purge_stuck_vms(&paths);
     }
 
     // Every way out of this process — the normal shutdown below, a pool that
     // never recovers, an error return like a failed `vm_backend()` — must not
     // leave VMs running: see `VmTeardownOnExit`. Armed before the first pool
     // spawn so even those early returns run the exit scan.
-    let _vm_teardown = VmTeardownOnExit;
+    let _vm_teardown = VmTeardownOnExit {
+        paths: paths.clone(),
+    };
 
     let shutdown = tokio_util::sync::CancellationToken::new();
 
@@ -2467,9 +2650,12 @@ async fn cmd_engine(
                       backend: VmBackend| {
         let config = config.clone();
         tokio::spawn(async move {
-            RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
-                .run(pool_shutdown)
-                .await
+            RunnerPool::new(
+                std::sync::Arc::new(vm_provider(backend, &config.paths)),
+                config,
+            )?
+            .run(pool_shutdown)
+            .await
         })
     };
     // Each generation gets a fresh child token: `RunnerPool::run` cancels the
@@ -2672,11 +2858,13 @@ async fn settle_pool<P>(
 /// machine: the purge keys on this home's boot-config paths (and `All` is
 /// sound because by now this process is exiting, so nothing of ours can be
 /// running), and a mount whose hypervisor still exists is skipped.
-struct VmTeardownOnExit;
+struct VmTeardownOnExit {
+    paths: preloop_vm::VmPathConfig,
+}
 
 impl Drop for VmTeardownOnExit {
     fn drop(&mut self) {
-        purge_stuck_vms();
+        purge_stuck_vms(&self.paths);
     }
 }
 
@@ -2693,15 +2881,15 @@ impl Drop for VmTeardownOnExit {
 /// boot-config paths (and `All` is sound because the caller is either exiting
 /// or holding the engine's socket, so nothing of ours is provisioning), and a
 /// mount whose hypervisor still exists is skipped.
-fn purge_stuck_vms() {
-    match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
+fn purge_stuck_vms(paths: &preloop_vm::VmPathConfig) {
+    match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All, paths) {
         Ok(killed) if killed > 0 => {
             tracing::info!(killed, "purged orphaned SmolVM hypervisor processes")
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "orphaned hypervisor purge failed"),
     }
-    match preloop_vm::detach_orphaned_layer_mounts() {
+    match preloop_vm::detach_orphaned_layer_mounts(paths) {
         Ok(detached) if detached > 0 => {
             tracing::info!(detached, "detached orphaned SmolVM layer mounts")
         }
@@ -2838,10 +3026,12 @@ fn truncate_reason(s: &str) -> String {
 /// baked locally unless an image is configured. Reading the file here is what
 /// makes one `preloop init` enough: `serve` and `server install` never needed
 /// a separate golden flag.
-fn configured_base_image() -> anyhow::Result<String> {
-    let config = preloop_runner_server::config::load_config()?;
-    Ok(preloop_runner_server::config::golden_base_image(&config)
-        .unwrap_or_else(|| OFFICIAL_GOLDEN.to_owned()))
+fn configured_base_image(
+    config: &preloop_runner_server::config::ConfigFile,
+    base_image_env: Option<&str>,
+) -> String {
+    preloop_runner_server::config::golden_base_image(config, base_image_env)
+        .unwrap_or_else(|| OFFICIAL_GOLDEN.to_owned())
 }
 
 /// `serve` with no golden configured: offer the wizard when a human is
@@ -2850,16 +3040,21 @@ fn configured_base_image() -> anyhow::Result<String> {
 ///
 /// `engine_public_url` is the origin this engine resolved for itself before the
 /// wizard ran. The wizard can resolve a different one — the App flow asks for
-/// the address GitHub is given — and the handoff installs that answer into the
-/// running engine (or reports which origin won when the two disagree).
-async fn offer_init_when_unconfigured(engine_public_url: &str) -> anyhow::Result<()> {
-    let config = preloop_runner_server::config::load_config()?;
-    if preloop_runner_server::config::golden_base_image(&config).is_some() {
-        return Ok(());
+/// the address GitHub is given — and the answer must reach this engine's own
+/// startup config (or the decision is reported when the two disagree). Returns
+/// that origin when the wizard changed it.
+async fn offer_init_when_unconfigured(
+    config_path: &std::path::Path,
+    base_image_env: Option<&str>,
+    engine_public_url: &str,
+) -> anyhow::Result<Option<String>> {
+    let config = preloop_runner_server::config::load_config_from(config_path)?;
+    if preloop_runner_server::config::golden_base_image(&config, base_image_env).is_some() {
+        return Ok(None);
     }
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         eprintln!("[preloop] custom base? run `preloop init`");
-        return Ok(());
+        return Ok(None);
     }
     eprintln!(
         "[preloop] no golden image configured — the engine will download the packed official \
@@ -2873,23 +3068,24 @@ async fn offer_init_when_unconfigured(engine_public_url: &str) -> anyhow::Result
         eprintln!(
             "[preloop] continuing with the official golden; `preloop init` reconfigures later"
         );
-        return Ok(());
+        return Ok(None);
     }
     // Configure only: this process is already the foreground engine, so a
     // nested `serve` would fight it for the socket. Boxed because the call
     // graph is genuinely cyclic (`serve` offers `init`, which can start
     // `serve`); the mode this entry point forces is what keeps it from
     // recursing at runtime.
-    let resolved = Box::pin(init::run_from_serve()).await?;
-    // The engine has not started serving yet, and its Check Run links and
-    // webhook health check read the origin off this environment: the answer
-    // has to land here, in-process, or the App would point at the new URL
-    // while every link and health check stayed on the old one.
-    if let Some(note) = init::apply_engine_public_url(engine_public_url, resolved.as_deref()) {
+    let resolved = Box::pin(init::run_from_serve(config_path)).await?;
+    // The engine has not started serving yet, and Check Run links and the
+    // webhook health check advertise the origin its startup config carries:
+    // the answer has to land here, in-process, or the App would point at the
+    // new URL while every link and health check stayed on the old one.
+    let applied = init::apply_engine_public_url(engine_public_url, resolved.as_deref());
+    if let Some(note) = applied.note {
         eprintln!("[preloop] {note}");
     }
     eprintln!("[preloop] configuration written; continuing to serve");
-    Ok(())
+    Ok((applied.url != engine_public_url).then_some(applied.url))
 }
 
 /// The Linux runner bundle the engine mounts: `PRELOOP_RUNNER_BUNDLE` when it
@@ -2965,6 +3161,11 @@ pub(crate) const RUNNER_BINARY_NAME: &str = "preloop-runner";
 // inputs the pool genuinely needs.
 #[allow(clippy::too_many_arguments)]
 fn local_runner_pool_config(
+    config_path: &std::path::Path,
+    backend: VmBackend,
+    paths: preloop_vm::VmPathConfig,
+    registration_token: preloop_gha_protocol::SecretString,
+    env: &PoolEnv,
     home: &std::path::Path,
     server_url: String,
     control_origin: Option<String>,
@@ -2983,10 +3184,14 @@ fn local_runner_pool_config(
     let control_bridge = home.join("control-bridge");
     std::fs::create_dir_all(&control_bridge)?;
     set_private_directory_permissions(&control_bridge)?;
-    let runner_bundle = discovered_runner_bundle().context(
-        "Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/control-plane/operate/vm-images.mdx)",
-    )?;
-    let backend = vm_backend()?;
+    let runner_bundle = env
+        .runner_bundle
+        .clone()
+        .filter(|path| linux_runner_bundle(path))
+        .or_else(discovered_runner_bundle)
+        .context(
+            "Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/control-plane/operate/vm-images.mdx)",
+        )?;
     // AgentENV has no socket relay: the guest dials the runner URL over plain
     // TCP, so a loopback URL points at the guest itself and no job can ever
     // register. Fail here with the fix instead of timing jobs out one by one.
@@ -3006,7 +3211,7 @@ fn local_runner_pool_config(
     // ordered firewall rules. No-op on drift-free hosts; loud failure
     // otherwise (a half-open egress reads as jobs queueing forever).
     if backend == VmBackend::Agentenv {
-        aenv_egress::ensure_engine_egress(&server_url)?;
+        aenv_egress::ensure_engine_egress(&server_url, &aenv_egress::EgressInputs::from_env())?;
     }
     // The mounted control socket only makes sense when the runner URL is
     // loopback (the VM reaches the host through the socket relay). With
@@ -3027,7 +3232,8 @@ fn local_runner_pool_config(
     };
     // The golden's base image: `PRELOOP_RUNNER_BASE_IMAGE`, else the choice
     // `preloop init` persisted, else the official golden.
-    let base_image = configured_base_image()?;
+    let file_config = preloop_runner_server::config::load_config_from(config_path)?;
+    let base_image = configured_base_image(&file_config, env.base_image.as_deref());
     // A configured image serves every queued job itself, so environment-based
     // runner replacement has nothing to switch to: a queued job's implied
     // environment (`ubuntu-latest`/`ubuntu-24.04` resolve to the official
@@ -3035,13 +3241,13 @@ fn local_runner_pool_config(
     // would be replaced forever. Only the official golden takes part in that
     // replacement.
     let custom_base = !is_official_golden(&base_image);
-    let cpus = runner_cpus();
+    let cpus = runner_cpus(env.cpus.as_deref());
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
         // supervisor alive, but build a runner only when a job is queued.
         size: if pool_enabled {
-            std::env::var("PRELOOP_RUNNER_POOL_SIZE")
-                .ok()
+            env.pool_size
+                .as_deref()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(|| host_runner_pool_size(cpus))
         } else {
@@ -3051,13 +3257,14 @@ fn local_runner_pool_config(
         // restore the packed golden, and AgentENV keeps immutable,
         // re-forkable snapshots. Size-zero mode still prepares one golden and
         // forks a disposable VM per job.
-        use_fork: env_flag("PRELOOP_USE_FORK", true),
+        use_fork: flag_or(env.use_fork.as_deref(), true),
         // Multiple engines on one host must not share a namespace: smolvm
         // keys machines and persistent overlays by name, and cross-engine
         // reuse boots a runner whose persisted state points at the other
         // engine's control plane.
-        name_prefix: std::env::var("PRELOOP_RUNNER_NAME_PREFIX")
-            .ok()
+        name_prefix: env
+            .name_prefix
+            .clone()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "preloop-runner".into()),
         // The resolved base: the official sentinel when nothing is
@@ -3069,13 +3276,14 @@ fn local_runner_pool_config(
         // instead of root, so steps see the hosted user-session contract.
         // PRELOOP_RUNNER_USER=root restores root; an empty value disables
         // switching (runner keeps the guest's root identity).
-        runner_user: match std::env::var("PRELOOP_RUNNER_USER") {
-            Ok(value) if value.is_empty() => None,
-            Ok(value) => Some(value),
-            Err(_) => Some("runner".to_owned()),
+        runner_user: match &env.runner_user {
+            Some(value) if value.is_empty() => None,
+            Some(value) => Some(value.clone()),
+            None => Some(DEFAULT_RUNNER_USER.to_owned()),
         },
-        runner_uid: std::env::var("PRELOOP_RUNNER_UID")
-            .ok()
+        runner_uid: env
+            .runner_uid
+            .as_deref()
             .and_then(|value| value.parse().ok())
             .or(Some(1001)),
         // The packed artifact cache key is the resolved base image — the
@@ -3094,23 +3302,22 @@ fn local_runner_pool_config(
         // Node externals shared with every VM via a read-only mount. The
         // operator may point this anywhere; the default lives next to the
         // control-bridge state.
-        externals_dir: std::env::var_os("PRELOOP_RUNNER_EXTERNALS")
-            .map(PathBuf::from)
+        externals_dir: env
+            .externals_dir
+            .clone()
             .unwrap_or_else(|| home.join("externals")),
         runner_binary_name: "preloop-runner".to_owned(),
         server_url,
         control_origin,
         control_socket,
         control_upstream,
-        dns: runner_dns_for(vm_backend()?),
-        registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
-        labels: runner_pool_labels(),
+        dns: runner_dns_for(backend, env.dns.as_deref()),
+        registration_token,
+        labels: runner_pool_labels(env.labels.as_deref()),
         cpus,
-        memory_mib: runner_memory_mib(),
-        storage_gib: runner_storage_gib(),
-        overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
-            .ok()
-            .and_then(|v| v.parse().ok()),
+        memory_mib: runner_memory_mib(env.memory_mib.as_deref()),
+        storage_gib: runner_storage_gib(env.storage_gib.as_deref()),
+        overlay_gib: env.overlay_gib.as_deref().and_then(|v| v.parse().ok()),
         job_vm_disk: preloop_orchestrator::JobVmDiskReserve::from_env(),
         debug_dir: Some(home.join("state").join("debug")),
         runner_key_dir: None,
@@ -3125,8 +3332,77 @@ fn local_runner_pool_config(
         preparing_signal: Some(preparing_signal),
         pool_status: Some(pool_status),
         observability: Some(observability),
+        // The mirror override is deliberately download-only and resolved
+        // from `PRELOOP_GOLDEN_URL` by the downloader itself: production
+        // callers pass `None` so the download and the fingerprint's source
+        // can never diverge.
+        golden_url_override: None,
+        skip_disk_preflight: skip_disk_preflight(env.skip_disk_preflight.as_deref()),
+        paths,
         github,
     })
+}
+
+/// Raw `PRELOOP_*` inputs to the runner-pool configuration, read once at a
+/// command entry ([`PoolEnv::read`]). The parsers in this module take these
+/// raw values explicitly, so precedence and fallbacks are tested with
+/// explicit inputs instead of process-environment mutation.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PoolEnv {
+    /// `PRELOOP_RUNNER_BASE_IMAGE`.
+    pub(crate) base_image: Option<String>,
+    /// `PRELOOP_RUNNER_BUNDLE`.
+    pub(crate) runner_bundle: Option<PathBuf>,
+    /// `PRELOOP_RUNNER_EXTERNALS`.
+    pub(crate) externals_dir: Option<PathBuf>,
+    /// `PRELOOP_RUNNER_CPUS`.
+    pub(crate) cpus: Option<String>,
+    /// `PRELOOP_RUNNER_MEMORY_MIB`.
+    pub(crate) memory_mib: Option<String>,
+    /// `PRELOOP_RUNNER_STORAGE_GB`.
+    pub(crate) storage_gib: Option<String>,
+    /// `PRELOOP_RUNNER_OVERLAY_GB`.
+    pub(crate) overlay_gib: Option<String>,
+    /// `PRELOOP_RUNNER_POOL_SIZE`.
+    pub(crate) pool_size: Option<String>,
+    /// `PRELOOP_RUNNER_LABELS`.
+    pub(crate) labels: Option<String>,
+    /// `PRELOOP_RUNNER_DNS`.
+    pub(crate) dns: Option<String>,
+    /// `PRELOOP_RUNNER_NAME_PREFIX`.
+    pub(crate) name_prefix: Option<String>,
+    /// `PRELOOP_RUNNER_USER`.
+    pub(crate) runner_user: Option<String>,
+    /// `PRELOOP_RUNNER_UID`.
+    pub(crate) runner_uid: Option<String>,
+    /// `PRELOOP_USE_FORK`.
+    pub(crate) use_fork: Option<String>,
+    /// `PRELOOP_SKIP_DISK_PREFLIGHT`.
+    pub(crate) skip_disk_preflight: Option<String>,
+}
+
+impl PoolEnv {
+    /// Startup boundary: capture the pool's process environment once.
+    pub(crate) fn read() -> Self {
+        let raw = std::env::var;
+        Self {
+            base_image: raw("PRELOOP_RUNNER_BASE_IMAGE").ok(),
+            runner_bundle: std::env::var_os("PRELOOP_RUNNER_BUNDLE").map(PathBuf::from),
+            externals_dir: std::env::var_os("PRELOOP_RUNNER_EXTERNALS").map(PathBuf::from),
+            cpus: raw("PRELOOP_RUNNER_CPUS").ok(),
+            memory_mib: raw("PRELOOP_RUNNER_MEMORY_MIB").ok(),
+            storage_gib: raw(RUNNER_STORAGE_GB_ENV).ok(),
+            overlay_gib: raw("PRELOOP_RUNNER_OVERLAY_GB").ok(),
+            pool_size: raw("PRELOOP_RUNNER_POOL_SIZE").ok(),
+            labels: raw("PRELOOP_RUNNER_LABELS").ok(),
+            dns: raw("PRELOOP_RUNNER_DNS").ok(),
+            name_prefix: raw("PRELOOP_RUNNER_NAME_PREFIX").ok(),
+            runner_user: raw("PRELOOP_RUNNER_USER").ok(),
+            runner_uid: raw("PRELOOP_RUNNER_UID").ok(),
+            use_fork: raw("PRELOOP_USE_FORK").ok(),
+            skip_disk_preflight: raw(DISK_PREFLIGHT_OVERRIDE).ok(),
+        }
+    }
 }
 
 /// Base runner labels plus any extras from `PRELOOP_RUNNER_LABELS`.
@@ -3134,13 +3410,13 @@ fn local_runner_pool_config(
 /// The scheduler matches `runs-on` labels against what a runner declares, so
 /// a non-x86 host can still volunteer for X64-pinned workflows by declaring
 /// the extra label explicitly. Comma-separated; empty entries are ignored.
-fn runner_pool_labels() -> Vec<String> {
+fn runner_pool_labels(extra: Option<&str>) -> Vec<String> {
     let mut labels = vec![
         "self-hosted".to_owned(),
         "Linux".to_owned(),
         std::env::consts::ARCH.to_owned(),
     ];
-    if let Ok(extra) = std::env::var("PRELOOP_RUNNER_LABELS") {
+    if let Some(extra) = extra {
         for label in extra.split(',').map(str::trim).filter(|l| !l.is_empty()) {
             if !labels
                 .iter()
@@ -3169,6 +3445,9 @@ const RUNNER_MEMORY_MIB: u32 = 4096;
 /// while unused: the disk is sparse/overlay-backed, so the ceiling is
 /// reserved, not allocated.
 const RUNNER_STORAGE_GIB: u32 = 80;
+/// The environment variable behind [`runner_storage_gib`]; named here so the
+/// wizard's builder budget reads the same one.
+pub(crate) const RUNNER_STORAGE_GB_ENV: &str = "PRELOOP_RUNNER_STORAGE_GB";
 
 /// Memory ceiling for each runner VM, honouring `PRELOOP_RUNNER_MEMORY_MIB`.
 ///
@@ -3178,11 +3457,9 @@ const RUNNER_STORAGE_GIB: u32 = 80;
 /// already tunable via `PRELOOP_RUNNER_POOL_SIZE`; memory has to be too, or
 /// the only lever on a memory-bound host is running fewer machines.
 /// Ballooning means a raised ceiling costs nothing while runners sit idle.
-fn runner_memory_mib() -> u32 {
+fn runner_memory_mib(raw: Option<&str>) -> u32 {
     const MIN_MEMORY_MIB: u32 = 1024;
-    std::env::var("PRELOOP_RUNNER_MEMORY_MIB")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
+    raw.and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|value| *value >= MIN_MEMORY_MIB)
         .unwrap_or(RUNNER_MEMORY_MIB)
 }
@@ -3191,30 +3468,26 @@ fn runner_memory_mib() -> u32 {
 /// Invalid, zero, or out-of-range values fall back to the default. Keeping the
 /// value positive prevents invalid VM configurations and pool sizing division
 /// by zero.
-fn runner_cpus() -> u16 {
-    std::env::var("PRELOOP_RUNNER_CPUS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok())
+fn runner_cpus(raw: Option<&str>) -> u16 {
+    raw.and_then(|raw| raw.trim().parse::<u16>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(RUNNER_CPUS)
 }
 /// Persistent storage for each runner VM, honouring
 /// `PRELOOP_RUNNER_STORAGE_GB`.
-fn runner_storage_gib() -> u32 {
-    std::env::var("PRELOOP_RUNNER_STORAGE_GB")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
+fn runner_storage_gib(raw: Option<&str>) -> u32 {
+    raw.and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(RUNNER_STORAGE_GIB)
 }
-
-/// Only an operator override is explicit guest DNS. When unset, the provider
-/// selects its resolver for the actual network backend and workload.
-fn runner_dns_for(backend: VmBackend) -> Option<String> {
-    runner_dns_override(backend, std::env::var("PRELOOP_RUNNER_DNS").ok().as_deref())
-}
-
-fn runner_dns_override(backend: VmBackend, configured: Option<&str>) -> Option<String> {
+/// The guest DNS resolver to request, if this backend takes one.
+///
+/// Only an operator override is explicit guest DNS: when unset, the provider
+/// selects its resolver for the actual network backend and workload. AgentENV
+/// sandboxes always use the node's resolver and refuse a per-sandbox `dns`, so
+/// an override is not sent to them: sending it fails every golden build and
+/// runner-pool start on that backend.
+fn runner_dns_for(backend: VmBackend, configured: Option<&str>) -> Option<String> {
     match backend {
         VmBackend::Smolvm => configured
             .map(str::trim)
@@ -3315,11 +3588,10 @@ pub(crate) fn linux_guest_triple() -> &'static str {
     }
 }
 
-fn env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| parse_flag(&value))
-        .unwrap_or(default)
+/// A boolean flag honouring the usual spellings; `default` when the value is
+/// unset or unrecognized. The raw input is resolved at a startup boundary.
+fn flag_or(raw: Option<&str>, default: bool) -> bool {
+    raw.and_then(parse_flag).unwrap_or(default)
 }
 
 fn parse_flag(value: &str) -> Option<bool> {
@@ -3328,6 +3600,12 @@ fn parse_flag(value: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// `PRELOOP_SKIP_DISK_PREFLIGHT`: anything but an empty, `0`, or `false`
+/// value (trimmed) proceeds past a disk refusal — the engine's rule.
+fn skip_disk_preflight(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| !matches!(value.trim(), "" | "0" | "false"))
 }
 
 fn default_local_activity_type(event: &str, payload: &serde_json::Value) -> Option<String> {
@@ -3743,12 +4021,15 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // A hook that fails to install after the user accepted is a real
     // failure: report it instead of silently running ungated.
     maybe_offer_hook()?;
-    run_workflow(args).await
+    // Resolved once at this command boundary and passed down: the submission
+    // and its transport decision never reread the environment.
+    let engine = EngineTarget::from_env();
+    run_workflow(args, engine).await
 }
 
 /// Everything `preloop run` does after the interactive hook offer: build the
 /// submission from the flags and the checkout, send it, and follow the run.
-async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
+async fn run_workflow(args: RunArgs, engine: EngineTarget) -> anyhow::Result<()> {
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
         .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
@@ -3788,12 +4069,19 @@ async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
+    // Resolved once at this command boundary and passed down: the preflight
+    // asks the engine about stored secrets over the same transport and token
+    // the submission itself uses.
+    let base = engine.url.clone();
+    let token = api_token();
     preflight_secrets(
         &workflow_path,
         &workflow_yaml,
         &reusable_workflows,
         &args.secrets,
         args.strict_secrets,
+        &base,
+        token.as_deref(),
     )
     .await?;
 
@@ -3905,7 +4193,7 @@ async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let client = build_client();
-    let url = server_url();
+    let EngineTarget { url, configured } = engine;
     if let Some(commit) = submit_commit.as_ref() {
         // The bundle is single-use scratch: remove it whether or not the upload
         // succeeded, so a refused or failed upload (413, network error) cannot
@@ -3924,9 +4212,7 @@ async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
     .json(&submission.to_request_json()?);
     // A bundled submission carries its own workspace; a workspace header would
     // point the engine at the live checkout instead of the commit under test.
-    if submit_commit.is_none()
-        && should_send_local_workspace_header(&url, std::env::var("PRELOOP_URL").is_err())
-    {
+    if submit_commit.is_none() && should_send_local_workspace_header(&url, !configured) {
         let workspace = std::fs::canonicalize(".")?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(workspace.as_os_str().to_string_lossy().as_bytes());
@@ -4970,6 +5256,8 @@ async fn preflight_secrets(
     reusable_workflows: &BTreeMap<String, String>,
     inline_secrets: &[String],
     strict: bool,
+    base: &str,
+    token: Option<&str>,
 ) -> anyhow::Result<()> {
     let Ok(workflow) = preloop_gha_parser::parse_workflow(workflow_yaml) else {
         return Ok(());
@@ -4998,7 +5286,7 @@ async fn preflight_secrets(
 
     let mut stored: HashSet<String> = HashSet::new();
     for (repo_scope, env_scope) in scopes {
-        match api_list_secrets(repo_scope.as_deref(), env_scope.as_deref()).await? {
+        match api_list_secrets(base, token, repo_scope.as_deref(), env_scope.as_deref()).await? {
             ApiOutcome::Applied(entries) => {
                 stored.extend(entries.into_iter().map(|(name, ..)| name));
             }
@@ -6067,8 +6355,12 @@ async fn latest_run_id(
         .map(str::to_owned))
 }
 
-async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
-    let debug_dir = preloop_home().join("state").join("debug");
+async fn cmd_shell(
+    args: ShellArgs,
+    home: &std::path::Path,
+    tool: &GuestTool,
+) -> anyhow::Result<()> {
+    let debug_dir = home.join("state").join("debug");
 
     // Find the preserved VM. If a run_ref is given, treat it as a machine
     // name prefix; otherwise pick the first (usually only) marker.
@@ -6093,12 +6385,12 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
     // otherwise the preserved VM would stay marked ACTIVE (with the
     // heartbeat touching the marker) until the orchestrator's idle timeout,
     // with nobody attached.
-    let mut command = guest_shell_command(&machine_name)?;
+    let mut command = guest_shell_command(tool, &machine_name)?;
 
     // Claim the session before starting so the orchestrator stops counting
     // down; the guard writes ACTIVE, starts the heartbeat, and resumes a
     // suspended AgentENV sandbox.
-    let attach = debug_session::DebugAttach::claim(Some(&machine_name)).await?;
+    let attach = debug_session::DebugAttach::claim(tool, Some(&machine_name)).await?;
 
     // Attach interactively. On SmolVM this boots a stopped machine, so the
     // sandbox environment applies exactly as for a provider spawn; on
@@ -6166,17 +6458,28 @@ mod tests {
     use clap::error::ErrorKind;
 
     #[test]
-    fn runner_dns_preserves_provider_choice_unless_explicitly_overridden() {
-        assert_eq!(runner_dns_override(VmBackend::Smolvm, None), None);
-        assert_eq!(runner_dns_override(VmBackend::Smolvm, Some("  ")), None);
+    fn github_api_base_normalizes_whitespace_and_trailing_slashes() {
         assert_eq!(
-            runner_dns_override(VmBackend::Smolvm, Some(" 10.0.0.53 ")),
+            normalize_github_api_base(Some("  https://ghe.example/api/v3///  ")),
+            "https://ghe.example/api/v3"
+        );
+        assert_eq!(
+            normalize_github_api_base(Some(" \t ")),
+            "https://api.github.com"
+        );
+        assert_eq!(normalize_github_api_base(None), "https://api.github.com");
+    }
+
+    #[test]
+    fn runner_dns_preserves_provider_choice_unless_explicitly_overridden() {
+        assert_eq!(runner_dns_for(VmBackend::Agentenv, None), None);
+        assert_eq!(runner_dns_for(VmBackend::Smolvm, None), None);
+        assert_eq!(runner_dns_for(VmBackend::Smolvm, Some("  ")), None);
+        assert_eq!(
+            runner_dns_for(VmBackend::Smolvm, Some(" 10.0.0.53 ")),
             Some("10.0.0.53".into())
         );
-        assert_eq!(
-            runner_dns_override(VmBackend::Agentenv, Some("10.0.0.53")),
-            None
-        );
+        assert_eq!(runner_dns_for(VmBackend::Agentenv, Some("10.0.0.53")), None);
     }
 
     fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {
@@ -6426,9 +6729,6 @@ mod tests {
         // nondeterministic; the assertion that matters is above: the stop
         // reason is the server error, inside the backoff window.
     }
-
-    // Env-var serialization for these tests lives in the crate-wide
-    // [`crate::TEST_ENV_LOCK`].
 
     mod github_credential_migration {
         use super::super::migrate_legacy_github_credentials;
@@ -6731,7 +7031,6 @@ mod tests {
 
     #[test]
     fn runner_cpus_honors_positive_values_and_rejects_invalid_values() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("1", 1),
             (" 8 ", 8),
@@ -6740,35 +7039,22 @@ mod tests {
             ("not-a-number", RUNNER_CPUS),
             ("65536", RUNNER_CPUS),
         ] {
-            unsafe {
-                std::env::set_var("PRELOOP_RUNNER_CPUS", value);
-            }
-            assert_eq!(runner_cpus(), expected, "{value}");
+            assert_eq!(runner_cpus(Some(value)), expected, "{value}");
         }
-        unsafe {
-            std::env::remove_var("PRELOOP_RUNNER_CPUS");
-        }
-        assert_eq!(runner_cpus(), RUNNER_CPUS);
+        assert_eq!(runner_cpus(None), RUNNER_CPUS);
     }
 
     #[test]
     fn runner_storage_gib_ignores_invalid_or_zero_values() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("80", 80),
             (" 96 ", 96),
             ("0", RUNNER_STORAGE_GIB),
             ("not-a-number", RUNNER_STORAGE_GIB),
         ] {
-            unsafe {
-                std::env::set_var("PRELOOP_RUNNER_STORAGE_GB", value);
-            }
-            assert_eq!(runner_storage_gib(), expected, "{value}");
+            assert_eq!(runner_storage_gib(Some(value)), expected, "{value}");
         }
-        unsafe {
-            std::env::remove_var("PRELOOP_RUNNER_STORAGE_GB");
-        }
-        assert_eq!(runner_storage_gib(), RUNNER_STORAGE_GIB);
+        assert_eq!(runner_storage_gib(None), RUNNER_STORAGE_GIB);
     }
 
     #[test]
@@ -6794,7 +7080,7 @@ mod tests {
     }
 
     #[test]
-    fn env_flag_accepts_common_boolean_values() {
+    fn flag_or_accepts_common_boolean_values() {
         for value in ["1", "true", "yes", "on", " TRUE "] {
             assert_eq!(parse_flag(value), Some(true));
         }
@@ -6802,24 +7088,16 @@ mod tests {
             assert_eq!(parse_flag(value), Some(false));
         }
         assert_eq!(parse_flag("maybe"), None);
-        assert!(env_flag("__PRELOOP_TEST_FLAG_UNSET__", true));
-        assert!(!env_flag("__PRELOOP_TEST_FLAG_UNSET__", false));
-        assert!(!env_flag(
-            "__PRELOOP_TEST_POOL_FLAG_UNSET__",
-            DEFAULT_RUNNER_POOL_ENABLED
-        ));
-        assert!(env_flag("__PRELOOP_TEST_FORK_FLAG_UNSET__", true));
+        assert!(flag_or(None, true));
+        assert!(!flag_or(None, false));
+        assert!(!flag_or(None, DEFAULT_RUNNER_POOL_ENABLED));
+        assert!(flag_or(Some("maybe"), true));
+        assert!(!flag_or(Some("off"), true));
     }
 
     #[test]
     fn runner_pool_labels_includes_base_and_extra_labels() {
-        unsafe {
-            std::env::set_var("PRELOOP_RUNNER_LABELS", "X64,linux, custom ");
-        }
-        let labels = runner_pool_labels();
-        unsafe {
-            std::env::remove_var("PRELOOP_RUNNER_LABELS");
-        }
+        let labels = runner_pool_labels(Some("X64,linux, custom "));
         assert!(labels.iter().any(|l| l == "self-hosted"));
         assert!(labels.iter().any(|l| l == "Linux"));
         assert!(labels.iter().any(|l| l == std::env::consts::ARCH));
@@ -6830,13 +7108,7 @@ mod tests {
         assert!(labels.iter().any(|l| l == "custom"));
         assert_eq!(labels.len(), 5);
         // Empty extras add nothing.
-        unsafe {
-            std::env::set_var("PRELOOP_RUNNER_LABELS", ", ,");
-        }
-        let labels = runner_pool_labels();
-        unsafe {
-            std::env::remove_var("PRELOOP_RUNNER_LABELS");
-        }
+        let labels = runner_pool_labels(Some(", ,"));
         assert_eq!(labels.len(), 3);
     }
 
@@ -6845,7 +7117,6 @@ mod tests {
     /// `PRELOOP_RUNNER_BASE_IMAGE` still overrides it.
     #[test]
     fn the_pool_reads_the_golden_init_recorded() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let mut config = preloop_runner_server::config::ConfigFile::default();
@@ -6854,56 +7125,35 @@ mod tests {
             base_image: Some("ghcr.io/acme/base:1".to_owned()),
             dockerfile: None,
         };
-        preloop_runner_server::config::write_config_to(&config_path, &config).unwrap();
-        let previous_config = std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV);
-        let previous_base = std::env::var_os(preloop_runner_server::config::BASE_IMAGE_ENV);
-        unsafe {
-            std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, &config_path);
-            std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV);
-        }
+        preloop_runner_server::config::write_config_to_with(&config_path, &config, None).unwrap();
+        // The same resolution `serve` runs, with the environment layer as
+        // explicit inputs instead of process-environment mutation.
+        let resolved = |base_image_env: Option<&str>| -> String {
+            let config =
+                preloop_runner_server::config::load_config_from_with(&config_path, None).unwrap();
+            configured_base_image(&config, base_image_env)
+        };
 
         assert_eq!(
-            configured_base_image().unwrap(),
+            resolved(None),
             "ghcr.io/acme/base:1",
             "the recorded golden is what the pool boots from"
         );
 
-        unsafe {
-            std::env::set_var(
-                preloop_runner_server::config::BASE_IMAGE_ENV,
-                "ubuntu:24.04",
-            )
-        };
         assert_eq!(
-            configured_base_image().unwrap(),
+            resolved(Some("ubuntu:24.04")),
             "ubuntu:24.04",
             "the environment variable still wins over the recorded choice"
         );
         // An exported-but-blank variable must not become an empty base image.
-        unsafe { std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, " ") };
-        assert_eq!(configured_base_image().unwrap(), "ghcr.io/acme/base:1");
+        assert_eq!(resolved(Some(" ")), "ghcr.io/acme/base:1");
 
         // Nothing recorded and no override: the pool boots the packed
         // official golden — no stock Ubuntu default exists any more.
-        unsafe { std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV) };
         let unconfigured = preloop_runner_server::config::ConfigFile::default();
-        preloop_runner_server::config::write_config_to(&config_path, &unconfigured).unwrap();
-        assert_eq!(configured_base_image().unwrap(), OFFICIAL_GOLDEN);
-
-        unsafe {
-            match previous_config {
-                Some(value) => {
-                    std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, value)
-                }
-                None => std::env::remove_var(preloop_runner_server::config::CONFIG_PATH_ENV),
-            }
-            match previous_base {
-                Some(value) => {
-                    std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, value)
-                }
-                None => std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV),
-            }
-        }
+        preloop_runner_server::config::write_config_to_with(&config_path, &unconfigured, None)
+            .unwrap();
+        assert_eq!(resolved(None), OFFICIAL_GOLDEN);
     }
 
     /// Nothing configured boots the packed official golden, and only the
@@ -6913,7 +7163,6 @@ mod tests {
     /// it forever and idle runners would be replaced forever.
     #[test]
     fn only_the_official_golden_keeps_environment_replacement() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         // The config resolves a Linux guest runner bundle; fabricate one so
         // the construction reaches the base-image decision.
@@ -6923,29 +7172,24 @@ mod tests {
             [0x7f, b'E', b'L', b'F'],
         )
         .unwrap();
-        // Pin the config path to a file that does not exist, so an operator's
-        // real `[golden]` cannot leak into the unset case.
-        let previous_config = std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV);
-        unsafe {
-            std::env::set_var("PRELOOP_RUNNER_BUNDLE", bundle.path());
-            std::env::set_var("PRELOOP_RUNNER_STORAGE_GB", "80");
-            std::env::set_var(
-                preloop_runner_server::config::CONFIG_PATH_ENV,
-                home.path().join("config.toml"),
-            );
-            std::env::remove_var("PRELOOP_RUNNER_BASE_IMAGE");
-        }
         let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let next_job_runs_on =
             std::sync::Arc::new(std::sync::RwLock::new(vec!["ubuntu-latest".to_owned()]));
+        // The config path is pinned to a file that does not exist, so an
+        // operator's real `[golden]` cannot leak into the unset case; every
+        // process-environment input is passed explicitly instead.
         let config = |base: Option<&str>| {
-            unsafe {
-                match base {
-                    Some(base) => std::env::set_var("PRELOOP_RUNNER_BASE_IMAGE", base),
-                    None => std::env::remove_var("PRELOOP_RUNNER_BASE_IMAGE"),
-                }
-            }
-            let config = local_runner_pool_config(
+            local_runner_pool_config(
+                &home.path().join("config.toml"),
+                VmBackend::Smolvm,
+                preloop_vm::VmPathConfig::default(),
+                preloop_gha_protocol::SecretString::new("test-registration"),
+                &PoolEnv {
+                    runner_bundle: Some(bundle.path().to_path_buf()),
+                    storage_gib: Some("80".to_owned()),
+                    base_image: base.map(str::to_owned),
+                    ..PoolEnv::default()
+                },
                 home.path(),
                 "http://127.0.0.1:9090".to_owned(),
                 None,
@@ -6961,11 +7205,7 @@ mod tests {
                 preloop_observability::Observability::noop(),
                 None,
             )
-            .unwrap();
-            unsafe {
-                std::env::remove_var("PRELOOP_RUNNER_BASE_IMAGE");
-            }
-            config
+            .unwrap()
         };
         // Nothing configured: the official golden, replacement stays enabled.
         let official = config(None);
@@ -6998,21 +7238,10 @@ mod tests {
                 "{base} must disable environment-based replacement"
             );
         }
-        unsafe {
-            std::env::remove_var("PRELOOP_RUNNER_BUNDLE");
-            std::env::remove_var("PRELOOP_RUNNER_STORAGE_GB");
-            match previous_config {
-                Some(value) => {
-                    std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, value)
-                }
-                None => std::env::remove_var(preloop_runner_server::config::CONFIG_PATH_ENV),
-            }
-        }
     }
 
     #[test]
     fn packed_artifact_cache_key_tracks_base_image_digest() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         let bundle = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -7020,20 +7249,20 @@ mod tests {
             [0x7f, b'E', b'L', b'F'],
         )
         .unwrap();
-        unsafe {
-            std::env::set_var("PRELOOP_RUNNER_BUNDLE", bundle.path());
-        }
         let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let next_job_runs_on =
             std::sync::Arc::new(std::sync::RwLock::new(vec!["ubuntu-latest".to_owned()]));
         let stem = |digest: &str| {
-            unsafe {
-                std::env::set_var(
-                    "PRELOOP_RUNNER_BASE_IMAGE",
-                    format!("ubuntu:24.04@sha256:{digest}"),
-                );
-            }
             let config = local_runner_pool_config(
+                &home.path().join("config.toml"),
+                VmBackend::Smolvm,
+                preloop_vm::VmPathConfig::default(),
+                preloop_gha_protocol::SecretString::new("test-registration"),
+                &PoolEnv {
+                    runner_bundle: Some(bundle.path().to_path_buf()),
+                    base_image: Some(format!("ubuntu:24.04@sha256:{digest}")),
+                    ..PoolEnv::default()
+                },
                 home.path(),
                 "http://127.0.0.1:9090".to_owned(),
                 None,
@@ -7050,16 +7279,10 @@ mod tests {
                 None,
             )
             .unwrap();
-            unsafe {
-                std::env::remove_var("PRELOOP_RUNNER_BASE_IMAGE");
-            }
             config.artifact_stem
         };
         let first = stem("aaaa");
         let second = stem("bbbb");
-        unsafe {
-            std::env::remove_var("PRELOOP_RUNNER_BUNDLE");
-        }
         assert_ne!(
             first, second,
             "a digest bump must invalidate the packed golden cache key (stale golden reuse)"
@@ -7643,37 +7866,28 @@ mod tests {
     /// spawned process.
     #[tokio::test]
     async fn shell_spawn_carries_the_sandbox_environment() {
-        let _guard = crate::SMOLVM_PATH_LOCK.lock().await;
-        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
-        let (directory, executable) = crate::fake_smolvm_on_path();
-        let previous_path = std::env::var_os("PATH");
-        let previous_home = std::env::var_os("PRELOOP_HOME");
-        let mut path = directory.path().as_os_str().to_owned();
-        path.push(":");
-        if let Some(previous) = &previous_path {
-            path.push(previous);
-        }
-        unsafe { std::env::set_var("PATH", path) };
-
+        let (_directory, executable) = crate::fake_smolvm();
         let home = tempfile::tempdir().unwrap();
         let debug_dir = home.path().join("state/debug");
         std::fs::create_dir_all(&debug_dir).unwrap();
         std::fs::write(debug_dir.join("preloop-runner-0-1"), "claimed").unwrap();
-        unsafe { std::env::set_var("PRELOOP_HOME", home.path()) };
+        let tool = crate::GuestTool {
+            backend: VmBackend::Smolvm,
+            smolvm: executable.clone().into(),
+            paths: preloop_vm::VmPathConfig {
+                preloop_home: Some(home.path().to_path_buf()),
+                ..preloop_vm::VmPathConfig::default()
+            },
+        };
 
-        let result = cmd_shell(ShellArgs {
-            run_ref: Some("preloop-runner-0-1".to_owned()),
-        })
+        let result = cmd_shell(
+            ShellArgs {
+                run_ref: Some("preloop-runner-0-1".to_owned()),
+            },
+            home.path(),
+            &tool,
+        )
         .await;
-
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("PRELOOP_HOME", previous) },
-            None => unsafe { std::env::remove_var("PRELOOP_HOME") },
-        }
-        match previous_path {
-            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
         result.unwrap();
 
         let read = |suffix: &str| {
@@ -7786,7 +8000,6 @@ mod tests {
         // (and this test's `.git/`) cannot leak into other tests.
         // The other cwd-changing test holds the same lock, so the two
         // cannot swap directories under each other.
-        let _cwd_lock = crate::TEST_ENV_LOCK.blocking_lock();
         struct CwdGuard(std::path::PathBuf);
         impl Drop for CwdGuard {
             fn drop(&mut self) {
@@ -7880,7 +8093,6 @@ mod tests {
     /// changed-path and filter-branch derivations actually run.
     #[tokio::test]
     async fn run_submits_every_flag_and_derived_fact_to_the_engine() {
-        let _env_lock = crate::TEST_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("checkout");
         let workflows = repo.join(".github/workflows");
@@ -7938,34 +8150,33 @@ mod tests {
                 let _ = std::env::set_current_dir(&self.0);
             }
         }
-        let previous_url = std::env::var_os("PRELOOP_URL");
-        unsafe { std::env::set_var("PRELOOP_URL", &base) };
         let cwd_guard = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(&repo).unwrap();
-        let result = run_workflow(RunArgs {
-            file: Some(std::path::PathBuf::from("ci.yml")),
-            job: Some("build".to_owned()),
-            event: Some("pull_request".to_owned()),
-            payload: Some(payload),
-            base: Some("main".to_owned()),
-            message: None,
-            debug: true,
-            no_debug: false,
-            preserve_on_failure: false,
-            secrets: vec!["TOKEN=s3cret".to_owned()],
-            strict_secrets: false,
-            detach: true,
-            push: false,
-            create_pr: false,
-            pr_draft: true,
-            no_merge: true,
-        })
+        let result = run_workflow(
+            RunArgs {
+                file: Some(std::path::PathBuf::from("ci.yml")),
+                job: Some("build".to_owned()),
+                event: Some("pull_request".to_owned()),
+                payload: Some(payload),
+                base: Some("main".to_owned()),
+                message: None,
+                debug: true,
+                no_debug: false,
+                preserve_on_failure: false,
+                secrets: vec!["TOKEN=s3cret".to_owned()],
+                strict_secrets: false,
+                detach: true,
+                push: false,
+                create_pr: false,
+                pr_draft: true,
+                no_merge: true,
+            },
+            // An explicitly named engine, the way `PRELOOP_URL` would name it:
+            // no process-environment mutation, and the same transport decision.
+            EngineTarget::named(&base),
+        )
         .await;
         drop(cwd_guard);
-        match previous_url {
-            Some(previous) => unsafe { std::env::set_var("PRELOOP_URL", previous) },
-            None => unsafe { std::env::remove_var("PRELOOP_URL") },
-        }
         result.expect("the run is submitted");
 
         let body = submitted.get().expect("the engine received a submission");
@@ -8439,9 +8650,38 @@ mod tests {
     /// header on the probe only leaks the credential. Failing first: with
     /// `PRELOOP_TOKEN` set (so `api_token()` resolves to a real secret),
     /// the probe must still arrive without an `Authorization` header.
+    ///
+    /// The token must be visible to `api_token()` without this process ever
+    /// writing its own environment, so the probe body runs in a child of the
+    /// test binary that receives the token with `Command::env` (child-only).
     #[tokio::test]
     async fn health_probe_sends_no_authorization_header() {
-        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
+        let Some(marker) = std::env::var_os("PRELOOP_TEST_PROBE_MARKER") else {
+            // Outer run: re-execute exactly this test in a child whose
+            // environment carries the token.
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("ran");
+            let test_name = std::thread::current()
+                .name()
+                .expect("libtest names test threads after the test")
+                .to_owned();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env("PRELOOP_TOKEN", "dummy-api-token")
+                .env("PRELOOP_TEST_PROBE_MARKER", &marker)
+                .status()
+                .unwrap();
+            assert!(status.success(), "the child probe test must pass");
+            assert!(
+                marker.is_file(),
+                "the child must have run the probe body (test name: {test_name})"
+            );
+            return;
+        };
+        // Inner run: `PRELOOP_TOKEN` is inherited, so `api_token()` resolves
+        // to a real secret — exactly the configuration the probe must ignore.
+        let marker = std::path::PathBuf::from(marker);
+        assert_eq!(api_token().as_deref(), Some("dummy-api-token"));
         let saw_authorization = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_authorization_clone = std::sync::Arc::clone(&saw_authorization);
         let app = axum::Router::new().route(
@@ -8463,13 +8703,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let previous_token = std::env::var_os("PRELOOP_TOKEN");
-        unsafe { std::env::set_var("PRELOOP_TOKEN", "dummy-api-token") };
         let healthy = probe_engine_health(&build_client(), &base).await;
-        match previous_token {
-            Some(previous) => unsafe { std::env::set_var("PRELOOP_TOKEN", previous) },
-            None => unsafe { std::env::remove_var("PRELOOP_TOKEN") },
-        }
+        std::fs::write(&marker, b"ran").unwrap();
 
         assert!(healthy, "stub /healthz should answer the probe");
         assert!(
@@ -8533,10 +8768,6 @@ mod tests {
     /// migrate`.
     #[test]
     fn serve_prepares_a_fresh_home_and_leaves_an_existing_store_alone() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
-        let previous_store = std::env::var_os(preloop_runner_server::store::STORE_URL_ENV);
-        unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) };
-
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("fresh-home");
         std::fs::create_dir_all(&home).unwrap();
@@ -8552,13 +8783,6 @@ mod tests {
             (untouched.len(), untouched.modified().unwrap()),
             "an existing store must not be rewritten"
         );
-
-        match previous_store {
-            Some(previous) => unsafe {
-                std::env::set_var(preloop_runner_server::store::STORE_URL_ENV, previous)
-            },
-            None => unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) },
-        }
     }
 
     /// `preloop serve --store` selects the store, and the first-run
@@ -8567,21 +8791,12 @@ mod tests {
     /// and then refuse the empty one it was pointed at.
     #[test]
     fn serve_prepares_the_store_it_was_pointed_at() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
-        let previous_store = std::env::var_os(preloop_runner_server::store::STORE_URL_ENV);
-        // The explicit selection must win over the environment, exactly as it
-        // does for the boot.
-        unsafe {
-            std::env::set_var(
-                preloop_runner_server::store::STORE_URL_ENV,
-                "postgres://ignored",
-            )
-        };
-
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("fresh-home");
         let custom = dir.path().join("custom.db");
         std::fs::create_dir_all(&home).unwrap();
+        // `--store` is resolved by `cmd_engine` before this call, so the
+        // explicit selection is the whole input here.
         prepare_local_engine_home(&home, Some(&format!("sqlite://{}", custom.display()))).unwrap();
 
         assert!(
@@ -8592,13 +8807,6 @@ mod tests {
             !home.join("state").join("preloop.db").exists(),
             "the state-dir default must stay untouched"
         );
-
-        match previous_store {
-            Some(previous) => unsafe {
-                std::env::set_var(preloop_runner_server::store::STORE_URL_ENV, previous)
-            },
-            None => unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) },
-        }
     }
 
     /// The probe's budget follows the endpoint class: loopback is probed

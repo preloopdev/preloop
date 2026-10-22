@@ -935,7 +935,9 @@ impl GcState {
     pub fn from_environment() -> Self {
         GcState::new(
             Config::from_environment(),
-            crate::effective_preloop_home().map(|home| home.join(STAGING_FILE)),
+            crate::VmPathConfig::resolve()
+                .effective_preloop_home()
+                .map(|home| home.join(STAGING_FILE)),
         )
     }
 

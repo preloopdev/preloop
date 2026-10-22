@@ -210,7 +210,7 @@ fn install(args: InstallArgs) -> Result<()> {
     if !args.user && !args.dry_run {
         require_root()?;
     }
-    let home = resolve_home(args.home.as_deref(), args.user)?;
+    let home = resolve_home(args.home.as_deref(), &crate::preloop_home(), args.user)?;
     let exe = std::env::current_exe().context("resolve current executable path")?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     if exe.to_string_lossy().contains("/target/") {
@@ -308,7 +308,13 @@ fn install(args: InstallArgs) -> Result<()> {
                 .with_context(|| format!("grant the service read access to {}", key.display()))?;
         }
     }
-    let runner_base_image = runner_base_image_override();
+    // Resolved once at this boundary: the installing shell's override is the
+    // only place it can come from.
+    let runner_base_image = runner_base_image_override(
+        std::env::var(preloop_runner_server::config::BASE_IMAGE_ENV)
+            .ok()
+            .as_deref(),
+    );
     let env_lines = config_env_lines(&args, staged_key.as_deref(), runner_base_image.as_deref())?;
     // The engine resolves `PRELOOP_RUNNER_BASE_IMAGE` before the config file,
     // and the line above is what hands it to the service. Saying so here is
@@ -353,7 +359,7 @@ fn uninstall(args: UninstallArgs) -> Result<()> {
     if !args.user && !args.dry_run {
         require_root()?;
     }
-    let home = resolve_home(args.home.as_deref(), args.user)?;
+    let home = resolve_home(args.home.as_deref(), &crate::preloop_home(), args.user)?;
 
     #[cfg(target_os = "linux")]
     uninstall_systemd(&args, &home)?;
@@ -1461,7 +1467,8 @@ fn install_launchd(
     env_lines: &[String],
 ) -> Result<()> {
     let dry = args.dry_run;
-    let (plist_path, domain) = launchd_target(args.user);
+    let user_home = std::env::var_os("HOME");
+    let (plist_path, domain) = launchd_target(args.user, user_home.as_deref().map(Path::new));
     let plist = render_launchd_plist(exe, home, env_lines)?;
 
     if dry {
@@ -1583,7 +1590,8 @@ fn webhook_hint(public_url: Option<&str>) -> String {
 fn uninstall_launchd(args: &UninstallArgs, home: &Path) -> Result<()> {
     let _ = home;
     let dry = args.dry_run;
-    let (plist_path, domain) = launchd_target(args.user);
+    let user_home = std::env::var_os("HOME");
+    let (plist_path, domain) = launchd_target(args.user, user_home.as_deref().map(Path::new));
     let bootout = format!("{domain}/{LAUNCHD_LABEL}");
     run_ok(
         "launchctl",
@@ -1604,16 +1612,18 @@ fn uninstall_launchd(args: &UninstallArgs, home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Plist path and launchctl domain for the requested scope.
+/// Plist path and launchctl domain for the requested scope. `user_home` is
+/// the invoking user's home directory, resolved once at the command entry —
+/// nothing here reads process state.
 #[cfg(any(target_os = "macos", test))]
-fn launchd_target(user: bool) -> (PathBuf, String) {
+fn launchd_target(user: bool, user_home: Option<&Path>) -> (PathBuf, String) {
     if user {
-        let home = std::env::var_os("HOME")
+        let home = user_home
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         (
             home.join("Library/LaunchAgents/dev.preloop.server.plist"),
-            format!("gui/{}", unsafe { libc::getuid() }),
+            format!("gui/{}", nix::unistd::getuid().as_raw()),
         )
     } else {
         (PathBuf::from(LAUNCHD_PLIST), "system".to_owned())
@@ -1741,15 +1751,17 @@ fn config_env_lines(
     Ok(lines)
 }
 
-/// The runner base image override this process carries, if any: the engine's
-/// own first source for the golden
-/// ([`preloop_runner_server::config::golden_base_image`] reads
-/// `PRELOOP_RUNNER_BASE_IMAGE` before the config file). Blank counts as unset,
-/// exactly as the engine resolves it.
-fn runner_base_image_override() -> Option<String> {
-    std::env::var(preloop_runner_server::config::BASE_IMAGE_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+/// `PRELOOP_RUNNER_BASE_IMAGE` as the installer reads it: the engine's own
+/// first source for the golden
+/// ([`preloop_runner_server::config::golden_base_image`] reads it before the
+/// config file), passed in rather than re-read here. Blank counts as unset,
+/// exactly as the engine resolves it, so a service keeps resolving the config
+/// file's `[golden]`.
+fn runner_base_image_override(configured: Option<&str>) -> Option<String> {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn env_line(key: &str, value: &str) -> Result<String> {
@@ -1766,9 +1778,13 @@ fn env_line(key: &str, value: &str) -> Result<String> {
     Ok(format!("{key}={escaped}"))
 }
 
-fn resolve_home(home: Option<&Path>, user: bool) -> Result<PathBuf> {
+/// The service's state home: `--home` when given, else the scope's default.
+/// `engine_home` is the already-resolved engine home (the CLI's
+/// `preloop_home()`); a user install defaults to it so the service and the
+/// invoker share one state tree.
+fn resolve_home(home: Option<&Path>, engine_home: &Path, user: bool) -> Result<PathBuf> {
     let default = if user {
-        crate::preloop_home()
+        engine_home.to_path_buf()
     } else {
         PathBuf::from(DEFAULT_HOME)
     };
@@ -1781,7 +1797,7 @@ fn resolve_home(home: Option<&Path>, user: bool) -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn require_root() -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !nix::unistd::geteuid().is_root() {
         bail!("server install/uninstall must run as root (sudo preloop server install)")
     }
     Ok(())
@@ -2479,11 +2495,8 @@ WantedBy=multi-user.target
 
     #[test]
     fn user_home_defaults_to_preloop_home() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let unique = std::env::temp_dir().join("preloop-home-test");
-        unsafe { std::env::set_var("PRELOOP_HOME", &unique) };
-        let home = resolve_home(None, true).unwrap();
-        unsafe { std::env::remove_var("PRELOOP_HOME") };
+        let home = resolve_home(None, &unique, true).unwrap();
         assert_eq!(home, unique);
     }
 
@@ -2593,14 +2606,11 @@ WantedBy=multi-user.target
 
     #[test]
     fn user_launchd_target_is_gui_domain_in_home() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let unique = std::env::temp_dir().join("preloop-home-test");
-        unsafe { std::env::set_var("HOME", &unique) };
-        let (path, domain) = launchd_target(true);
-        unsafe { std::env::remove_var("HOME") };
+        let (path, domain) = launchd_target(true, Some(unique.as_path()));
         assert!(path.ends_with("Library/LaunchAgents/dev.preloop.server.plist"));
         assert!(domain.starts_with("gui/"));
-        let (system_path, system_domain) = launchd_target(false);
+        let (system_path, system_domain) = launchd_target(false, None);
         assert_eq!(system_path, PathBuf::from(LAUNCHD_PLIST));
         assert_eq!(system_domain, "system");
     }
@@ -2718,7 +2728,6 @@ WantedBy=multi-user.target
     /// override, and the service must run on the same image. Unset (or blank)
     /// writes no line at all: the service keeps resolving the config file.
     #[test]
-    #[allow(unsafe_code)]
     fn a_runner_base_image_override_reaches_the_env_file_only_when_set() {
         let args = match install_args(None, Some("https://ci.example.com".to_owned())) {
             ServerArgs {
@@ -2741,42 +2750,26 @@ WantedBy=multi-user.target
         // The installer reads that value off its own process environment, the
         // only place it can come from: `PRELOOP_RUNNER_BASE_IMAGE` is exported
         // by the installing shell. Blank behaves like unset.
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
-        let previous = std::env::var_os(preloop_runner_server::config::BASE_IMAGE_ENV);
-        unsafe { std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV) };
-        assert_eq!(runner_base_image_override(), None);
-        unsafe {
-            std::env::set_var(
-                preloop_runner_server::config::BASE_IMAGE_ENV,
-                "ghcr.io/acme/base:1",
-            )
-        };
+        assert_eq!(runner_base_image_override(None), None);
         assert_eq!(
-            runner_base_image_override().as_deref(),
+            runner_base_image_override(Some("ghcr.io/acme/base:1")).as_deref(),
             Some("ghcr.io/acme/base:1")
         );
-        unsafe { std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, " ") };
         assert_eq!(
-            runner_base_image_override(),
+            runner_base_image_override(Some(" ")),
             None,
             "a blank override is unset"
         );
-        // SAFETY: restores the value read above; TEST_ENV_LOCK serializes this
-        // process-global env access.
-        unsafe {
-            match previous {
-                Some(value) => {
-                    std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, value)
-                }
-                None => std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV),
-            }
-        }
     }
 
     #[test]
     fn resolve_home_requires_absolute() {
-        assert!(resolve_home(None, false).unwrap().is_absolute());
-        assert!(resolve_home(Some(Path::new("relative")), false).is_err());
+        assert!(
+            resolve_home(None, Path::new("/engine"), false)
+                .unwrap()
+                .is_absolute()
+        );
+        assert!(resolve_home(Some(Path::new("relative")), Path::new("/engine"), false).is_err());
     }
 
     #[test]

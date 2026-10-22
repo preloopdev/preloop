@@ -60,8 +60,17 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("parse workflow {}: {e}", args.workflow.display()))?;
             let reusable_workflows =
                 collect_reusable_workflows(args.workspace_root.as_deref(), &args.workflow).await?;
-            let reusable_workflows =
-                resolve_remote_workflows(reusable_workflows, &workflow_yaml).await?;
+            // Startup boundary: the GitHub API access is configured by env,
+            // then passed down as typed values.
+            let token = std::env::var("PRELOOP_GITHUB_TOKEN").ok();
+            let api_base = github_api_base(std::env::var("PRELOOP_GITHUB_API_URL").ok());
+            let reusable_workflows = resolve_remote_workflows(
+                reusable_workflows,
+                &workflow_yaml,
+                &api_base,
+                token.as_deref(),
+            )
+            .await?;
             let expanded =
                 preloop_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows)
                     .map_err(|e| {
@@ -146,6 +155,8 @@ type RemoteOrigin = Option<(String, String)>;
 async fn resolve_remote_workflows(
     mut workflows: BTreeMap<String, String>,
     root_yaml: &str,
+    api_base: &str,
+    token: Option<&str>,
 ) -> Result<BTreeMap<String, String>> {
     // Bounded like every other outbound client in the workspace: a total
     // deadline, a connect deadline, and the shared in-process root set
@@ -157,12 +168,6 @@ async fn resolve_remote_workflows(
         .user_agent("preloop-runner")
         .use_preconfigured_tls(preloop_observability::tls::client_config(None)?)
         .build()?;
-    let token = env_or_test("PRELOOP_GITHUB_TOKEN");
-    // Honour the engine's `PRELOOP_GITHUB_API_URL` override so `lint` against a
-    // redirected forge resolves reusable workflows from it, not api.github.com.
-    let api_base = env_or_test("PRELOOP_GITHUB_API_URL")
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned());
     let api_base = api_base.trim_end_matches('/');
     // Each queued workflow carries the remote reference it was fetched from and
     // the ref it is pinned to. `None` marks the submitted repository (the root
@@ -229,7 +234,7 @@ async fn resolve_remote_workflows(
                     "{api_base}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
                 ))
                 .header(reqwest::header::ACCEPT, "application/vnd.github.raw+json");
-            if let Some(token) = token.as_deref() {
+            if let Some(token) = token {
                 request = request.bearer_auth(token);
             }
             let pin = git_ref.to_owned();
@@ -257,53 +262,13 @@ fn parse_remote_reference(reference: &str) -> Option<(&str, &str, &str, &str)> {
     Some((owner, repo, path, git_ref))
 }
 
-/// `std::env::var` with a test-only thread-local override. Edition 2024 makes
-/// `std::env::set_var` unsafe and the workspace denies `unsafe`, so tests
-/// redirect reads rather than write the process environment.
-fn env_or_test(name: &str) -> Option<String> {
-    #[cfg(test)]
-    if let Some(value) = TEST_ENV.with(|cell| cell.borrow().get(name).cloned()) {
-        // Blank override reads as unset, matching the empty-value filters the
-        // production callers apply.
-        if !value.trim().is_empty() {
-            return Some(value);
-        }
-        return None;
-    }
-    std::env::var(name).ok()
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_ENV: std::cell::RefCell<std::collections::HashMap<&'static str, String>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Run `body` with `vars` visible to `env_or_test` on this thread only.
-/// Replaces `std::env::set_var`; the override survives `await` points because
-/// `#[tokio::test]` drives the whole future on one thread.
-#[cfg(test)]
-async fn with_test_env<T>(
-    vars: &[(&'static str, Option<String>)],
-    body: impl Future<Output = T>,
-) -> T {
-    let saved = TEST_ENV.with(|cell| cell.borrow().clone());
-    TEST_ENV.with(|cell| {
-        let mut map = cell.borrow_mut();
-        for (name, value) in vars {
-            match value {
-                Some(value) => {
-                    map.insert(*name, value.clone());
-                }
-                None => {
-                    map.insert(*name, String::new());
-                }
-            }
-        }
-    });
-    let result = body.await;
-    TEST_ENV.with(|cell| *cell.borrow_mut() = saved);
-    result
+/// Startup-boundary resolution of the GitHub API base for `lint`'s remote
+/// reusable-workflow fetches. Honour the engine's `PRELOOP_GITHUB_API_URL`
+/// override so `lint` against a redirected forge resolves reusable workflows
+/// from it, not api.github.com; empty or unset keeps the public API.
+fn github_api_base(raw: Option<String>) -> String {
+    raw.filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned())
 }
 
 #[cfg(test)]
@@ -340,26 +305,36 @@ mod tests {
         (base, handle)
     }
 
-    /// `PRELOOP_GITHUB_API_URL` must steer remote `uses:` resolution at the
-    /// override, not api.github.com. A reusable workflow reachable only on
-    /// the mock resolves under the override — the same call would
-    /// `error_for_status` a 404 from the real API.
+    /// The startup boundary maps `PRELOOP_GITHUB_API_URL` onto the API base:
+    /// an explicit value wins; empty or unset falls back to the public API.
+    #[test]
+    fn github_api_base_honours_override_and_fallback() {
+        assert_eq!(
+            github_api_base(Some("http://forge:8080/api/v3".to_owned())),
+            "http://forge:8080/api/v3"
+        );
+        assert_eq!(
+            github_api_base(Some(String::new())),
+            "https://api.github.com"
+        );
+        assert_eq!(github_api_base(None), "https://api.github.com");
+    }
+
+    /// Remote `uses:` resolution must fetch at the supplied API base (the
+    /// `PRELOOP_GITHUB_API_URL` override the startup boundary passes in), not
+    /// api.github.com. A reusable workflow reachable only on the mock
+    /// resolves under that base — the same call would `error_for_status` a
+    /// 404 from the real API.
     #[tokio::test]
-    async fn resolve_remote_workflows_honours_api_url_override() {
+    async fn resolve_remote_workflows_fetches_from_supplied_api_base() {
         const WORKFLOW: &str = "on: workflow_call\njobs:\n  inner:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n";
         let (api_base, server) = serve_once(WORKFLOW).await;
 
         let root =
             "on: push\njobs:\n  call:\n    uses: octo/hello/.github/workflows/reusable.yml@main\n";
-        let workflows = with_test_env(
-            &[
-                ("PRELOOP_GITHUB_API_URL", Some(api_base)),
-                ("PRELOOP_GITHUB_TOKEN", None),
-            ],
-            resolve_remote_workflows(BTreeMap::new(), root),
-        )
-        .await
-        .unwrap();
+        let workflows = resolve_remote_workflows(BTreeMap::new(), root, &api_base, None)
+            .await
+            .unwrap();
 
         let request = server.await.unwrap();
         assert!(
@@ -433,15 +408,9 @@ mod tests {
         let root = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/callee.yml\n";
         let workflows =
             BTreeMap::from([(".github/workflows/callee.yml".to_owned(), CALLEE.to_owned())]);
-        let resolved = with_test_env(
-            &[
-                ("PRELOOP_GITHUB_API_URL", Some(api_base)),
-                ("PRELOOP_GITHUB_TOKEN", None),
-            ],
-            resolve_remote_workflows(workflows, root),
-        )
-        .await
-        .unwrap();
+        let resolved = resolve_remote_workflows(workflows, root, &api_base, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             server.await.unwrap(),
@@ -496,17 +465,8 @@ mod tests {
                 (".github/workflows/a b.yml".to_owned(), CALLEE.to_owned()),
             ]);
             let root = format!("on: push\njobs:\n  call:\n    uses: {uses}\n");
-            let result = with_test_env(
-                &[
-                    (
-                        "PRELOOP_GITHUB_API_URL",
-                        Some("http://127.0.0.1:1".to_owned()),
-                    ),
-                    ("PRELOOP_GITHUB_TOKEN", None),
-                ],
-                resolve_remote_workflows(workflows, &root),
-            )
-            .await;
+            let result =
+                resolve_remote_workflows(workflows, &root, "http://127.0.0.1:1", None).await;
             assert!(result.is_err(), "`{uses}` must be refused");
         }
     }
@@ -517,18 +477,12 @@ mod tests {
     #[tokio::test]
     async fn resolve_remote_workflows_accepts_only_workflow_files_under_github_workflows() {
         const CI: &str = "on: workflow_call\njobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ci\n";
-        let env = [
-            (
-                "PRELOOP_GITHUB_API_URL",
-                Some("http://127.0.0.1:1".to_owned()),
-            ),
-            ("PRELOOP_GITHUB_TOKEN", None),
-        ];
         let workflows = BTreeMap::from([(".github/workflows/ci.yml".to_owned(), CI.to_owned())]);
         let root = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/ci.yml\n";
-        let resolved = with_test_env(&env, resolve_remote_workflows(workflows.clone(), root))
-            .await
-            .expect("a workflow file under .github/workflows/ resolves from the workspace");
+        let resolved =
+            resolve_remote_workflows(workflows.clone(), root, "http://127.0.0.1:1", None)
+                .await
+                .expect("a workflow file under .github/workflows/ resolves from the workspace");
         assert_eq!(resolved, workflows);
         for uses in [
             "$/src/x.yml",
@@ -537,7 +491,8 @@ mod tests {
         ] {
             let root = format!("on: push\njobs:\n  call:\n    uses: {uses}\n");
             let result =
-                with_test_env(&env, resolve_remote_workflows(workflows.clone(), &root)).await;
+                resolve_remote_workflows(workflows.clone(), &root, "http://127.0.0.1:1", None)
+                    .await;
             assert!(result.is_err(), "`{uses}` must be refused");
         }
     }

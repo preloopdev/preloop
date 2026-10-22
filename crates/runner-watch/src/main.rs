@@ -1973,6 +1973,11 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
         },
         ..compare::GatePolicy::default()
     };
+    // Startup boundary: the native API token is read from the process env
+    // once and passed down as a typed value.
+    let native_token = std::env::var("PRELOOP_SYSTEM_TOKEN")
+        .ok()
+        .context("PRELOOP_SYSTEM_TOKEN must be set for runner-watch replay")?;
     let mut results: Vec<serde_json::Value> = Vec::new();
     for golden in scenarios {
         let scenario = golden
@@ -1987,6 +1992,7 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
             &replay_dir,
             &args.preloop_url,
             &config.general.mitm_dir.join("scenarios"),
+            &native_token,
         )
         .await
         .with_context(|| format!("replay scenario {scenario}"))?;
@@ -2092,28 +2098,12 @@ fn scenario_dirs(root: &Path, only: Option<&str>) -> anyhow::Result<Vec<PathBuf>
     Ok(dirs)
 }
 
-/// `PRELOOP_SYSTEM_TOKEN` for native API calls. Tests override via a
-/// thread-local instead of `std::env::set_var`, which is unsafe under
-/// edition 2024 and forbidden in this crate.
-fn preloop_system_token() -> Option<String> {
-    #[cfg(test)]
-    if let Some(token) = TEST_SYSTEM_TOKEN.with(|cell| cell.borrow().clone()) {
-        return Some(token);
-    }
-    std::env::var("PRELOOP_SYSTEM_TOKEN").ok()
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_SYSTEM_TOKEN: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-
 async fn replay_flows_to_preloop(
     golden_dir: &Path,
     out_dir: &Path,
     preloop_url: &str,
     scenario_root: &Path,
+    native_token: &str,
 ) -> anyhow::Result<PathBuf> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -2122,8 +2112,6 @@ async fn replay_flows_to_preloop(
         .parent()
         .unwrap_or(out_dir)
         .join("official-filtered");
-    let native_token = preloop_system_token()
-        .context("PRELOOP_SYSTEM_TOKEN must be set for runner-watch replay")?;
     // Runs are submitted by materialize before the replay starts; they must
     // be cancelled on EVERY exit from here on — including a materialization
     // or replay error — or the next scenario's acquire picks up this
@@ -2137,11 +2125,11 @@ async fn replay_flows_to_preloop(
         preloop_url,
         scenario_root,
         &client,
-        &native_token,
+        native_token,
         &mut run_ids,
     )
     .await;
-    let cancel_result = cancel_scenario_runs(&client, preloop_url, &native_token, &run_ids).await;
+    let cancel_result = cancel_scenario_runs(&client, preloop_url, native_token, &run_ids).await;
     match (replay_result, cancel_result) {
         (Ok(dir), Ok(())) => Ok(dir),
         (Ok(_), Err(cancel_error)) => Err(cancel_error),
@@ -2170,7 +2158,15 @@ async fn replay_flows_to_preloop_inner(
     let flows_path = golden_dir.join("flows.jsonl");
     let flows = fs::read_to_string(&flows_path)?;
     fs::create_dir_all(baseline_dir)?;
-    materialize_replay_state(golden_dir, scenario_root, preloop_url, client, run_ids).await?;
+    materialize_replay_state(
+        golden_dir,
+        scenario_root,
+        preloop_url,
+        client,
+        run_ids,
+        native_token,
+    )
+    .await?;
     // Pre-flight: register a replay runner with an RSA keypair, then exchange a
     // signed client_assertion for a runner-listen token.  Broker endpoints require
     // a JWT whose sub is "preloop-runner-listen-{numeric_id}" — the system token
@@ -3195,6 +3191,7 @@ async fn materialize_replay_state(
     preloop_url: &str,
     client: &reqwest::Client,
     run_ids: &mut Vec<String>,
+    native_api_token: &str,
 ) -> anyhow::Result<()> {
     let flows_path = golden_dir.join("flows.jsonl");
     let flows = fs::read_to_string(&flows_path)?;
@@ -3219,8 +3216,6 @@ async fn materialize_replay_state(
         return Ok(());
     }
 
-    let native_api_token = preloop_system_token()
-        .context("PRELOOP_SYSTEM_TOKEN must be set for runner-watch replay")?;
     let submissions = replay_workflow_submissions(golden_dir, scenario_root)?;
     // Idle scenarios have no submit_workflow steps — skip job creation.
     // The replay will use the golden capture's message responses directly.
@@ -3231,7 +3226,7 @@ async fn materialize_replay_state(
     for submit_body in submissions {
         let accepted = client
             .post(format!("{}/api/v1/runs", preloop_url.trim_end_matches('/')))
-            .bearer_auth(&native_api_token)
+            .bearer_auth(native_api_token)
             .json(&submit_body)
             .send()
             .await?
@@ -5094,9 +5089,6 @@ mod tests {
     /// swallowed (`let _ =`), so queued runs cannot silently survive.
     #[tokio::test]
     async fn replay_surfaces_failed_cancellation_instead_of_silently_succeeding() {
-        TEST_SYSTEM_TOKEN.with(|cell| {
-            *cell.borrow_mut() = Some("runner-watch-test-token".to_owned());
-        });
         let temp = TestTemp::new("cancel-failure");
         let (golden, out, scenario_root) = replay_scenario_fixture(&temp, false);
         let cancels = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -5113,7 +5105,14 @@ mod tests {
         })
         .await;
 
-        let result = replay_flows_to_preloop(&golden, &out, &server_url, &scenario_root).await;
+        let result = replay_flows_to_preloop(
+            &golden,
+            &out,
+            &server_url,
+            &scenario_root,
+            "runner-watch-test-token",
+        )
+        .await;
 
         assert!(
             result.is_err(),
@@ -5129,9 +5128,6 @@ mod tests {
     /// submissions: leftover queued runs contaminate the next scenario.
     #[tokio::test]
     async fn replay_cancels_runs_even_when_the_replay_errors() {
-        TEST_SYSTEM_TOKEN.with(|cell| {
-            *cell.borrow_mut() = Some("runner-watch-test-token".to_owned());
-        });
         let temp = TestTemp::new("cancel-on-error");
         let (golden, out, scenario_root) = replay_scenario_fixture(&temp, true);
         let cancels = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -5148,7 +5144,14 @@ mod tests {
         })
         .await;
 
-        let result = replay_flows_to_preloop(&golden, &out, &server_url, &scenario_root).await;
+        let result = replay_flows_to_preloop(
+            &golden,
+            &out,
+            &server_url,
+            &scenario_root,
+            "runner-watch-test-token",
+        )
+        .await;
 
         assert!(
             result.is_err(),

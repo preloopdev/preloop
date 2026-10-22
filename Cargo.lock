@@ -2638,7 +2638,6 @@ dependencies = [
  "connectrpc",
  "flate2",
  "futures-util",
- "libc",
  "nix 0.31.3",
  "preloop-gha-parser",
  "preloop-gha-protocol",
@@ -2812,6 +2811,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "nix 0.31.3",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-http",
@@ -3015,7 +3015,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "hex",
- "parking_lot",
  "preloop-gha-protocol",
  "preloop-observability",
  "serde",

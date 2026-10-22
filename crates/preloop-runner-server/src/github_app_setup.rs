@@ -9,7 +9,7 @@
 
 pub mod session;
 
-use crate::config::{AppConfig, ConfigFile, load_config_from, write_config_to};
+use crate::config::{AppConfig, ConfigFile, load_config_from_with, write_config_to_with};
 use crate::credential_store::{
     CredentialRef, CredentialWriter, SecretString, Written, github_reference,
     github_reference_with_host,
@@ -103,10 +103,15 @@ pub fn creation_url(github: &str, org: Option<&str>, state: &str) -> String {
 ///
 /// Empty without a public URL: the list only travels with a configured
 /// webhook, so an App GitHub cannot reach subscribes to nothing.
-fn manifest_events(public_url: Option<&str>) -> Vec<String> {
-    public_url
-        .map(|_| crate::github::manifest_default_events())
-        .unwrap_or_default()
+/// `default_events` is the resolved `PRELOOP_GITHUB_APP_DEFAULT_EVENTS`
+/// value ([`crate::state::AppState::manifest_default_events`]), passed in
+/// rather than re-read from the process environment here.
+fn manifest_events(public_url: Option<&str>, default_events: &[String]) -> Vec<String> {
+    if public_url.is_some() {
+        default_events.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Permissions the generated App requests for the events it subscribes.
@@ -145,11 +150,12 @@ pub fn manifest(
     redirect_url: &str,
     public_url: Option<&str>,
     setup_url: Option<&str>,
+    default_events: &[String],
 ) -> serde_json::Value {
     // Decided once: `actions: read` and the event list cannot disagree, and
     // an App whose operator dropped `workflow_job` from the list has no use
     // for the grant that event alone needs.
-    let events = manifest_events(public_url);
+    let events = manifest_events(public_url, default_events);
     let mut manifest = serde_json::json!({
         "name": name,
         "url": public_url.unwrap_or("https://github.com/preloop-dev/preloop"),
@@ -202,13 +208,20 @@ pub fn form_page(page: &FormPage<'_>) -> String {
         Some(public) => format!("Webhooks deliver to {}.", escape_html(public)),
         None => "Webhooks are off — this engine is not reachable from GitHub.".to_owned(),
     };
-    // The same decision the manifest makes, so the page cannot promise fewer
-    // permissions than GitHub is about to request.
-    let permissions = manifest_permissions(&manifest_events(page.public_url))
-        .iter()
-        .map(|(scope, access)| format!("{scope}: {}", access.as_str().unwrap_or_default()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // The permissions the manifest already decided, read back from it so the
+    // page cannot promise fewer than GitHub is about to request.
+    let permissions = page
+        .manifest
+        .get("default_permissions")
+        .and_then(serde_json::Value::as_object)
+        .map(|granted| {
+            granted
+                .iter()
+                .map(|(scope, access)| format!("{scope}: {}", access.as_str().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
     let submit = if page.auto_submit {
         "<script>document.getElementById('manifest-form').submit();</script>"
     } else {
@@ -308,6 +321,7 @@ pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 /// fell back to the private file store). The caller decides how to show them.
 pub fn save_app_credentials_at(
     path: &Path,
+    credential_store_env: Option<&str>,
     app_id: &str,
     pem: &SecretString,
     webhook_secret: Option<SecretString>,
@@ -316,10 +330,14 @@ pub fn save_app_credentials_at(
     // other front that rewrites this file also takes, so a secrets or policy
     // update landing mid-flight is not dropped by this older snapshot.
     let _mutation = crate::config::config_mutation_lock().lock();
-    let mut config = load_config_from(path)?;
-    let mut writer = CredentialWriter::for_config(path, config.credential_store.as_deref())?;
+    let mut config = load_config_from_with(path, credential_store_env)?;
+    let mut writer = CredentialWriter::for_config(
+        path,
+        credential_store_env,
+        config.credential_store.as_deref(),
+    )?;
     let notices = record_app_credentials(&mut config, &mut writer, app_id, pem, webhook_secret)?;
-    write_config_to(path, &config)?;
+    write_config_to_with(path, &config, credential_store_env)?;
     Ok(notices)
 }
 
@@ -498,6 +516,7 @@ mod tests {
             "http://127.0.0.1:4000/callback",
             None,
             Some("http://127.0.0.1:4000/installed"),
+            &crate::github::manifest_default_events(None),
         );
         assert!(
             manifest.get("hook_attributes").is_none(),
@@ -528,6 +547,7 @@ mod tests {
             "https://ci.example.com/setup/github/callback",
             Some("https://ci.example.com/"),
             None,
+            &crate::github::manifest_default_events(None),
         );
         assert_eq!(
             manifest["hook_attributes"]["url"],
@@ -550,7 +570,10 @@ mod tests {
         );
         assert_eq!(
             manifest["default_events"],
-            serde_json::json!(manifest_events(Some("https://ci.example.com/"))),
+            serde_json::json!(manifest_events(
+                Some("https://ci.example.com/"),
+                &crate::github::manifest_default_events(None),
+            )),
             "the subscriptions and the permission decision are the same list"
         );
         assert!(
@@ -593,6 +616,7 @@ mod tests {
                 "https://ci.example.com/setup/github/callback",
                 public_url,
                 None,
+                &crate::github::manifest_default_events(None),
             );
             let html = form_page(&FormPage {
                 name: "preloop",
@@ -702,7 +726,13 @@ mod tests {
 
     #[test]
     fn form_page_submits_on_load_only_when_asked() {
-        let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None, None);
+        let manifest = manifest(
+            "preloop",
+            "http://127.0.0.1:4000/callback",
+            None,
+            None,
+            &crate::github::manifest_default_events(None),
+        );
         let page = |auto_submit| {
             form_page(&FormPage {
                 name: "preloop",
@@ -724,7 +754,13 @@ mod tests {
 
     #[test]
     fn form_page_escapes_the_name_and_carries_the_manifest_intact() {
-        let manifest = manifest("a\"<b>", "http://127.0.0.1:4000/callback", None, None);
+        let manifest = manifest(
+            "a\"<b>",
+            "http://127.0.0.1:4000/callback",
+            None,
+            None,
+            &crate::github::manifest_default_events(None),
+        );
         let html = form_page(&FormPage {
             name: "a\"<b>",
             org: Some("acme"),
@@ -774,6 +810,7 @@ mod tests {
 
         let notices = save_app_credentials_at(
             &path,
+            None,
             "4242",
             &SecretString::new(PEM),
             Some(SecretString::new("hook-secret")),
@@ -795,7 +832,7 @@ mod tests {
         );
         assert!(text.contains("app_pem_ref"), "{text}");
 
-        let loaded = load_config_from(&path).unwrap();
+        let loaded = load_config_from_with(&path, None).unwrap();
         assert_eq!(loaded.github.app_id.as_deref(), Some("4242"));
         assert_eq!(loaded.github.app_pem(), Some(PEM));
         assert_eq!(loaded.github.webhook_secret(), Some("hook-secret"));

@@ -60,7 +60,7 @@ pub async fn github_registration_token(
     Ok(Json(json!({
         "token": token,
         "token_schema": "OAuthAccessToken",
-        "url": runner_server_url()
+        "url": shared.state.runner_server_url()
     })))
 }
 
@@ -101,15 +101,6 @@ pub fn decode_jwt_segment(segment: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Token TTL in seconds. Override with PRELOOP_TOKEN_TTL_SECS for testing
-/// short-lived tokens (e.g. =1 triggers the proactive refresh immediately).
-pub fn token_ttl_secs() -> u64 {
-    std::env::var("PRELOOP_TOKEN_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2999)
-}
-
 /// Maximum accepted client-assertion lifetime (RFC 7523 recommends short
 /// lifetimes; 10 minutes bounds the replay window of a captured assertion).
 const MAX_ASSERTION_LIFETIME_SECS: i64 = 600;
@@ -126,6 +117,7 @@ const ASSERTION_CLOCK_SKEW_SECS: i64 = 60;
 pub fn validate_client_assertion_claims(
     claims: &serde_json::Value,
     uri: &axum::http::Uri,
+    base: &str,
 ) -> Result<(), ApiError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -165,10 +157,9 @@ pub fn validate_client_assertion_claims(
     // aud is REQUIRED (RFC 7523 §3.2) and must identify this server. Accept
     // the called token endpoint URL or the server base URL, in string or
     // array form.
-    let base = crate::broker::runner_base_url();
     let endpoint = format!("{base}{}", uri.path());
     let aud_ok = match claims.get("aud") {
-        Some(serde_json::Value::String(aud)) => aud == &base || aud == &endpoint,
+        Some(serde_json::Value::String(aud)) => aud == base || aud == &endpoint,
         Some(serde_json::Value::Array(auds)) => auds
             .iter()
             .any(|aud| aud.as_str().is_some_and(|s| s == base || s == endpoint)),
@@ -213,7 +204,7 @@ pub async fn oauth2_token(
         return Ok(Json(TokenResponse {
             access_token: token,
             token_type: "JWT".to_owned(),
-            expires_in: token_ttl_secs(),
+            expires_in: shared.state.token_ttl_secs,
         }));
     }
 
@@ -309,7 +300,7 @@ pub async fn oauth2_token(
     // does not bind the assertion to this server or to a time window: without
     // exp/aud checks a captured assertion replays indefinitely against any
     // preloop server holding the runner's public key.
-    validate_client_assertion_claims(&_claims_val, &uri)?;
+    validate_client_assertion_claims(&_claims_val, &uri, &shared.state.runner_base_url())?;
 
     let token = shared.state.local_jwt(json!({
         "sub": format!("preloop-runner-listen-{runner_id}"),
@@ -320,6 +311,6 @@ pub async fn oauth2_token(
     Ok(Json(TokenResponse {
         access_token: token,
         token_type: "JWT".to_owned(),
-        expires_in: token_ttl_secs(),
+        expires_in: shared.state.token_ttl_secs,
     }))
 }

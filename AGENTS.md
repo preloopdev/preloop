@@ -19,7 +19,7 @@ Crate/module map: `docs/control-plane/architecture/overview.mdx`. Pinned officia
 ## Commands
 
 ```sh
-just test-ci    # fmt-check + clippy + zizmor + tests + control migrations + conform (the full gate)
+just test-ci    # fmt-check + clippy + zizmor + ast-grep (sg-test + strict scan) + tests + control migrations + conform (the full gate)
 just serve      # engine on 127.0.0.1:9090
 just dogfood    # E2E with the real runner
 ```
@@ -27,12 +27,16 @@ just dogfood    # E2E with the real runner
 ## Conventions
 
 - **Toolchain**: Rust per `rust-toolchain.toml` (1.99); `cargo fmt`, `cargo clippy --workspace --all-targets`.
+- **No `unsafe`**: `unsafe_code = "forbid"` at the workspace root, inherited by every crate — all targets: production, tests, benchmarks. It cannot be lifted with `allow`/`expect`; `std::env::set_var`/`remove_var` (unsafe in edition 2024) are banned outright, including tests.
+- **Process env**: read once at startup boundaries, then pass explicit typed config; never use process env as component state. Tests take explicit inputs or spawn a child process with `Command::env`/`env_remove` — no env locks, thread-local fakes, or override registries.
 - **Errors**: `anyhow` at top level; `ApiError` in HTTP handlers; `thiserror` in libraries.
-- **Secrets**: `SecretString`; call `expose()` only at protocol boundaries.
+- **Secrets**: `SecretString`; call `expose()` only at protocol boundaries. Never log signed URLs at any level (debug/trace included) or raw `GITHUB_ENV` values; new secret fields redact `Debug`.
+- **Lint exceptions**: narrow `#[expect(<lint>, reason = "...")]` only, never for `unsafe_code`. Workspace denies `clippy::{dbg_macro, todo, unimplemented, await_holding_lock}`; no pedantic/unwrap bans.
 - **Wire compatibility**: `/_apis/…` is the source of truth. Validate protocol changes against the **official runner**, not only unit tests. Broker + Twirp results protocol only (v2.329.0+).
 - **State**: the control database is authoritative. All durable control mutations go through the `ControlBackend` trait (`control/backend.rs`); backends are SQLite (default) and Postgres, chosen by `PRELOOP_STORE_URL`. `state.rs::InnerState` is node-local only. See [API and state](docs/control-plane/architecture/api-and-state.mdx) before touching `control/`.
 - **At-rest encryption is obfuscation**: the key sits beside the DB, so it stops a stolen DB file, not a compromised state dir.
 - **VM substrates**: `PRELOOP_VM_BACKEND` selects SmolVM (default) or AgentENV (opt-in); the orchestrator branches on `VmProvider::capabilities()`. Read [Sandbox architecture](docs/control-plane/architecture/sandboxes.mdx) before touching pool or provider code.
+- **Tests & rule fixtures**: changes ship behavioral tests with explicit inputs (or real child-process env); ast-grep rules ship matching and non-matching fixtures and pass `just sg-test` + `just sg-scan-strict`.
 
 ## Agent preferences
 

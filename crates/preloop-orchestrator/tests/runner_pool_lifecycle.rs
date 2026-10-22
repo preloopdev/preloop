@@ -1,11 +1,15 @@
+//! Runner pool lifecycle tests exercising `RunnerPool` behavior against the
+//! test VM provider.
 use async_trait::async_trait;
+use preloop_gha_protocol::SecretString;
 use preloop_orchestrator::{
     DEBUG_MARKER_IDLE, JobVmDiskReserve, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig,
     artifact_payload, node_externals,
 };
 use preloop_vm::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
-    ProviderCapabilities, SecretSource, SocketMount, VmError, VmProvider, VolumeMount,
+    ProviderCapabilities, SecretSource, SocketMount, VmError, VmPathConfig, VmProvider,
+    VolumeMount,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -17,8 +21,6 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-static TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, Copy)]
 enum RunAction {
@@ -344,87 +346,9 @@ impl VmProvider for RecordingVmProvider {
 }
 
 struct Fixture {
-    // Fields drop in declaration order, so the pins go back while the lock is
-    // still held: releasing it first lets the next test repin and then have its
-    // pins clobbered by this fixture's late restore.
-    _hermetic_env: HermeticEnvGuard,
-    _lock_still_held: EnvLockStillHeld,
-    _env_guard: std::sync::MutexGuard<'static, ()>,
     root: PathBuf,
     config: RunnerPoolConfig,
-    token_env: String,
     token: String,
-}
-
-/// Asserts, on drop, that `TEST_ENV_LOCK` is still held.
-///
-/// `Fixture` drops it between `HermeticEnvGuard` and the lock guard, so releasing
-/// the lock first — the order this fixture had before the fix — fails here
-/// instead of letting the next test repin under the lock and then have its pins
-/// clobbered by this fixture's late restore.
-struct EnvLockStillHeld;
-
-impl Drop for EnvLockStillHeld {
-    fn drop(&mut self) {
-        assert!(
-            TEST_ENV_LOCK.try_lock().is_err(),
-            "Fixture released TEST_ENV_LOCK before HermeticEnvGuard restored the environment"
-        );
-    }
-}
-
-/// Pins the host-sensitive environment for the fixture's lifetime and
-/// restores the previous values on drop. The pool reads all of these from the
-/// process environment, so without the pins the tests depend on the host:
-///
-/// - `PRELOOP_GOLDEN_URL` -> unreachable. Configured-image fixtures bake
-///   their golden locally and never download; only the official sentinel does
-///   (`prepare_artifact` -> `download_prebaked_golden`), so the pin keeps
-///   that download off the network and failing fast in
-///   `official_golden_download_failure_is_a_startup_error` instead of
-///   fetching a real pack from GHCR or GitHub on a host with egress.
-/// - `PRELOOP_SKIP_DISK_PREFLIGHT` -> on. The golden build refuses when the
-///   host volume lacks builder disk + pack staging (60 GiB for this fixture);
-///   the provider here is a recording mock that writes nothing, so a host
-///   with less free space would refuse the build and hang the same wait.
-/// - `PRELOOP_HOME` -> the fixture root. Startup reconciliation kills real
-///   `_boot-vm` processes and sweeps data dirs under the Preloop home; left
-///   unset it resolves to the developer's `~/.preloop`, where a running
-///   engine's VMs live.
-struct HermeticEnvGuard {
-    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl HermeticEnvGuard {
-    fn new(root: &Path) -> Self {
-        let pins: [(&'static str, std::ffi::OsString); 3] = [
-            (
-                "PRELOOP_GOLDEN_URL",
-                "http://127.0.0.1:1/preloop-golden-unreachable".into(),
-            ),
-            ("PRELOOP_SKIP_DISK_PREFLIGHT", "1".into()),
-            ("PRELOOP_HOME", root.join("preloop-home").into_os_string()),
-        ];
-        let previous = pins
-            .iter()
-            .map(|(name, _)| (*name, std::env::var_os(name)))
-            .collect();
-        for (name, value) in &pins {
-            unsafe { std::env::set_var(name, value) };
-        }
-        Self { previous }
-    }
-}
-
-impl Drop for HermeticEnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.previous {
-            match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-    }
 }
 
 impl Fixture {
@@ -433,9 +357,6 @@ impl Fixture {
         // it locally (as-is plus the runner contract), so no fixture here
         // depends on the released official golden.
         const BASE_IMAGE: &str = "ghcr.io/preloop/base:latest";
-        let env_guard = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "preloop-orchestrator-{label}-{}-{id}",
@@ -467,9 +388,7 @@ impl Fixture {
         fs::write(&control_socket, b"test-control-socket").unwrap();
         fs::create_dir(root.join("control-bridge")).unwrap();
 
-        let token_env = format!("PRELOOP_TEST_TOKEN_{label}_{id}");
         let token = format!("sentinel-registration-token-{id}");
-        unsafe { std::env::set_var(&token_env, &token) };
         let config = RunnerPoolConfig {
             size: 1,
             use_fork: false,
@@ -477,6 +396,14 @@ impl Fixture {
             pool_status: None,
             base_image: BASE_IMAGE.to_owned(),
             artifact_stem,
+            // Startup reconciliation kills real `_boot-vm` processes and
+            // sweeps data dirs under the Preloop home; an explicit scratch
+            // home keeps that off the developer's `~/.preloop`, where a
+            // running engine's VMs live.
+            paths: VmPathConfig {
+                preloop_home: Some(root.join("preloop-home")),
+                ..Default::default()
+            },
             release_version: "9.9.9".to_owned(),
             runner_bundle: bundle,
             externals_dir,
@@ -486,7 +413,21 @@ impl Fixture {
             control_socket: None,
             control_upstream: None,
             dns: None,
-            registration_token_env: token_env.clone(),
+            registration_token: SecretString::new(token.clone()),
+            // Configured-image fixtures bake their golden locally and never
+            // download; only the official sentinel does
+            // (`prepare_artifact` -> `download_prebaked_golden`), so an
+            // unreachable mirror keeps that download off the network and
+            // failing fast in
+            // `official_golden_download_failure_is_a_startup_error` instead
+            // of fetching a real pack from GHCR or GitHub on a host with
+            // egress.
+            golden_url_override: Some("http://127.0.0.1:1/preloop-golden-unreachable".to_owned()),
+            // The golden build refuses when the host volume lacks builder
+            // disk + pack staging (60 GiB for this fixture); the provider
+            // here is a recording mock that writes nothing, so a host with
+            // less free space would refuse the build and hang the same wait.
+            skip_disk_preflight: true,
             labels: vec!["self-hosted".to_owned(), "linux".to_owned()],
             cpus: 2,
             memory_mib: 256,
@@ -508,12 +449,8 @@ impl Fixture {
             github: None,
         };
         Self {
-            _hermetic_env: HermeticEnvGuard::new(&root),
-            _lock_still_held: EnvLockStillHeld,
-            _env_guard: env_guard,
             root,
             config,
-            token_env,
             token,
         }
     }
@@ -521,7 +458,6 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        unsafe { std::env::remove_var(&self.token_env) };
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -838,7 +774,7 @@ async fn fork_golden_is_marked_forkable_after_guest_provisioning() {
 }
 
 #[tokio::test]
-async fn configure_passes_secret_environment_mapping_without_token_value() {
+async fn configure_delivers_the_credential_out_of_band_never_in_argv() {
     let fixture = Fixture::new("secret", true);
     let provider = Arc::new(RecordingVmProvider::with_machines(
         &[],
@@ -860,23 +796,26 @@ async fn configure_passes_secret_environment_mapping_without_token_value() {
         configure.1,
         &vec![(
             "PRELOOP_RUNNER_TOKEN".to_owned(),
-            SecretSource::HostEnv(fixture.token_env.clone())
+            SecretSource::Value(SecretString::new(fixture.token.clone()))
         )]
     );
+    // The credential never rides argv or a recorded name: the guest receives
+    // the value only through the out-of-band secret channel (the child
+    // process env behind `--secret-env` for SmolVM, the 0600 payload script
+    // for AgentENV).
     assert!(
         configure
             .0
             .iter()
             .all(|argument| argument != &fixture.token)
     );
-    // Only a reference to the credential is ever handed to SmolVM.
-    assert!(configure.1.iter().all(|(key, source)| {
-        key != &fixture.token
-            && match source {
-                SecretSource::HostEnv(name) => name != &fixture.token,
-                SecretSource::HostFile(path) => path.as_os_str() != fixture.token.as_str(),
-            }
-    }));
+    for (key, source) in configure.1 {
+        assert_ne!(key, &fixture.token);
+        assert!(
+            !format!("{source:?}").contains(&fixture.token),
+            "the secret source must redact its value in Debug: {source:?}"
+        );
+    }
 }
 
 #[tokio::test]

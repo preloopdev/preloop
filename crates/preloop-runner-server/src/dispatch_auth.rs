@@ -320,7 +320,7 @@ async fn validate_installation_online(
     if let Some(info) = shared.state.dispatch_token_cache.get(&cache_key) {
         return Ok(info);
     }
-    let api_base = crate::github::github_api_base();
+    let api_base = shared.state.github_api_base();
     let info = match fetch_installation_info(&shared.state, &api_base, token).await {
         Ok(info) => info,
         Err(error) => {
@@ -569,7 +569,7 @@ async fn resolve_pat_actor(shared: &Arc<SharedState>, pat: &str) -> String {
     if let Some(actor) = shared.state.dispatch_actor_cache.get(&key) {
         return actor;
     }
-    let api_base = crate::github::github_api_base();
+    let api_base = shared.state.github_api_base();
     let credential = GithubCredential::bearer(pat, GithubCredentialBucket::Pat);
     match fetch_json(&shared.state, &credential, &format!("{api_base}/user")).await {
         Ok(user) => {
@@ -610,7 +610,7 @@ async fn resolve_app_actor(shared: &Arc<SharedState>, app_id: &str) -> String {
                 Ok(jwt) => jwt,
                 Err(_) => return format!("{app_id}[bot]"),
             };
-            let api_base = crate::github::github_api_base();
+            let api_base = shared.state.github_api_base();
             // The App's own JWT spends that App's unauthenticated budget:
             // each App is its own rate-limit identity.
             let credential =

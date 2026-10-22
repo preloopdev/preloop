@@ -23,10 +23,9 @@ use crate::github_setup::{self, GithubSetupArgs, Via};
 use crate::preloop_home;
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
-use preloop_runner_server::config::{ConfigFile, GoldenConfig, load_config, write_config};
+use preloop_runner_server::config::{ConfigFile, GoldenConfig, load_config_from, write_config_to};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::future::Future;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -107,7 +106,7 @@ use preloop_orchestrator::oci::{
 };
 use preloop_orchestrator::{
     DISK_PREFLIGHT_OVERRIDE, GIB, GOLDEN_BUILD_DISK_HEADROOM_GIB, GOLDEN_DOWNLOAD_DISK_MARGIN,
-    disk_preflight_overridden, golden_builder_storage_gib,
+    golden_builder_storage_gib,
 };
 
 /// Compressed packed-official-golden transfer, the size the engine's own
@@ -275,9 +274,10 @@ impl RunMode {
 pub(crate) async fn run(
     args: InitArgs,
     observability: Option<preloop_observability::Observability>,
+    config_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     if args.probe {
-        return print_probe().await;
+        return print_probe(config_path).await;
     }
     // The wizard owns the terminal; `--json` output is one object per line, so
     // it is never mixed with prompts.
@@ -289,6 +289,7 @@ pub(crate) async fn run(
         json,
         yes: args.yes,
         from_serve: false,
+        config_path: config_path.to_path_buf(),
     };
     match session.execute(args, observability, false).await {
         // The resolved URL matters to the `serve` caller, which is already
@@ -325,7 +326,9 @@ pub(crate) async fn run(
 /// pointed at); `None` when the wizard left the origin to `serve`'s own
 /// resolution. The caller hands it to the engine it is already running — see
 /// [`apply_engine_public_url`].
-pub(crate) async fn run_from_serve() -> anyhow::Result<Option<String>> {
+pub(crate) async fn run_from_serve(
+    config_path: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
     let args = InitArgs {
         mode: Some(RunMode::Configure),
         ..InitArgs::default()
@@ -335,6 +338,7 @@ pub(crate) async fn run_from_serve() -> anyhow::Result<Option<String>> {
         json: false,
         yes: false,
         from_serve: true,
+        config_path: config_path.to_path_buf(),
     };
     session.execute(args, None, true).await
 }
@@ -347,6 +351,11 @@ struct Session {
     /// Entered from `serve`, which is already running this config: the
     /// "start `serve` on its next run" messages would be wrong.
     from_serve: bool,
+    /// The engine config file this run reads and writes. `main` resolves it
+    /// once (an explicit `PRELOOP_CONFIG`, else the engine home's
+    /// `config.toml`); the service-mode step may redirect it at
+    /// [`Session::prepare_service_home`].
+    config_path: std::path::PathBuf,
 }
 
 /// The answers the five steps produce, before any of them is applied.
@@ -411,9 +420,11 @@ fn oversized_archive_warning(bytes: u64, what: &str) -> Option<String> {
 /// packed official golden. The resolver itself cannot be called here — the
 /// config file still holds the pre-wizard golden until the run ends — so
 /// `chosen` stands in for the `[golden]` section.
-fn effective_base_image(chosen: Option<&str>) -> String {
-    if let Some(override_image) = base_image_override() {
-        return override_image;
+fn effective_base_image(chosen: Option<&str>, override_image: Option<&str>) -> String {
+    // A blank override behaves like an unset one, matching the resolution the
+    // engine itself applies to `PRELOOP_RUNNER_BASE_IMAGE`.
+    if let Some(override_image) = override_image.filter(|value| !value.trim().is_empty()) {
+        return override_image.to_owned();
     }
     chosen
         .filter(|value| !value.trim().is_empty())
@@ -515,7 +526,7 @@ impl Session {
         observability: Option<preloop_observability::Observability>,
         from_serve: bool,
     ) -> anyhow::Result<Option<String>> {
-        let config = load_config().context("reading the engine config")?;
+        let config = load_config_from(&self.config_path).context("reading the engine config")?;
         let answers = self.resolve(&args, &config, from_serve)?;
 
         // A system service reads its own state dir, so when the operator did
@@ -531,12 +542,13 @@ impl Session {
         // `PRELOOP_PUBLIC_URL`, and the run mode that starts is the only thing
         // that can carry the answer there (for the service, its environment
         // file is written now — it does not inherit this shell).
+        let public_url_env = std::env::var("PRELOOP_PUBLIC_URL").ok();
         let public_url = if answers.auth_unchanged {
             self.report_stored_credentials(&config, &args).await?;
-            engine_public_url(&args, None)
+            engine_public_url(&args, None, public_url_env.as_deref())
         } else {
             let answer = self.configure_credentials(&args, answers.auth).await?;
-            engine_public_url(&args, answer.as_ref())
+            engine_public_url(&args, answer.as_ref(), public_url_env.as_deref())
         };
         let decision = if answers.golden_unchanged {
             let decision = decision_from_config(&config, &answers.golden).ok_or_else(|| {
@@ -563,13 +575,15 @@ impl Session {
         let preflight = self.preflight(&decision, answers.mode)?;
 
         // Re-read: the credentials step rewrote the file (or created it).
-        let mut config = load_config().context("re-reading the engine config")?;
+        let mut config =
+            load_config_from(&self.config_path).context("re-reading the engine config")?;
         config.golden = GoldenConfig {
             kind: Some(decision.kind.as_str().to_owned()),
             base_image: decision.base_image.clone(),
             dockerfile: decision.dockerfile.clone(),
         };
-        let written = write_config(&config).context("writing the engine config")?;
+        write_config_to(&self.config_path, &config).context("writing the engine config")?;
+        let written = self.config_path.clone();
         if !self.json {
             println!("\nwrote {}", written.display());
         }
@@ -580,7 +594,8 @@ impl Session {
         // service's environment file. Saying only the stored choice would
         // describe a golden the engine does not use.
         let env_override = base_image_override();
-        let effective_golden = effective_base_image(decision.base_image.as_deref());
+        let effective_golden =
+            effective_base_image(decision.base_image.as_deref(), env_override.as_deref());
         if let Some(image) = &env_override {
             // `note` escapes control characters, so a crafted environment
             // value cannot move the cursor in the report.
@@ -630,7 +645,7 @@ impl Session {
             println!(
                 "preloop init — configuring {}\n\
                  Five steps; press Enter to keep the current answer.",
-                preloop_runner_server::config::config_path().display()
+                self.config_path.display()
             );
         }
         let (auth, auth_unchanged) = self.ask_auth(args, config)?;
@@ -715,7 +730,7 @@ impl Session {
             self.note(&format!("using --auth {}", describe_auth(auth)));
             return Ok((auth, false));
         }
-        if let Some((prior, summary)) = credential_prior(config) {
+        if let Some((prior, summary)) = credential_prior(config, &self.config_path) {
             self.note(&format!("current: {summary}"));
             if !self.ask_bool("    change? [y/N] ", false)? {
                 return Ok((prior, true));
@@ -1032,15 +1047,19 @@ impl Session {
         // In `--json` the reused flow's human output would land between our
         // one-object-per-line steps, so it is captured and attached instead.
         let log = if self.json {
-            let (result, captured) =
-                capture_stdout(github_setup::cmd_setup_github(setup_args)).await;
-            result?;
-            captured
+            let mut out = crate::output::Out::capturing();
+            github_setup::cmd_setup_github(setup_args, &mut out, &self.config_path).await?;
+            out.into_captured()
         } else {
-            github_setup::cmd_setup_github(setup_args).await?;
+            github_setup::cmd_setup_github(
+                setup_args,
+                &mut crate::output::Out::stdout(),
+                &self.config_path,
+            )
+            .await?;
             String::new()
         };
-        let config = load_config().context("re-reading the engine config")?;
+        let config = load_config_from(&self.config_path).context("re-reading the engine config")?;
         let summary = credential_summary(&config).unwrap_or_else(|| "configured".to_owned());
         self.note(&format!("configured: {summary}"));
         let verified = self.verify_credentials(&config, args).await?;
@@ -1085,20 +1104,33 @@ impl Session {
             self.note("credential check skipped (pass --repo owner/name to verify against GitHub)");
             return Ok(json!({"skipped": "no --repo and no detected remote"}));
         }
+        // Resolved once at this boundary and passed down: the live check never
+        // reads the process environment itself.
+        let api_base = crate::github_api_base();
+        let mut verify_out = if self.json {
+            crate::output::Out::capturing()
+        } else {
+            crate::output::Out::stdout()
+        };
         let result = match (
             config.github.app_id.as_deref(),
             config.github.app_pem(),
             config.github.pat(),
         ) {
-            (Some(app_id), Some(pem), _) => github_setup::doctor_app(app_id, pem, &repos).await,
-            (_, _, Some(token)) => github_setup::doctor_pat(token, &repos).await,
+            (Some(app_id), Some(pem), _) => {
+                github_setup::doctor_app(app_id, pem, &repos, &mut verify_out, &api_base).await
+            }
+            (_, _, Some(token)) => {
+                github_setup::doctor_pat(token, &repos, &mut verify_out, &api_base).await
+            }
             _ => {
                 self.note("no credential is configured to verify");
                 return Ok(json!({"skipped": "no credential"}));
             }
         };
+        let verification_log = verify_out.into_captured();
         match result {
-            Ok(()) => Ok(json!({"repos": repos, "ok": true})),
+            Ok(()) => Ok(json!({"repos": repos, "ok": true, "output": verification_log})),
             Err(error) => {
                 let message = format!("{error:#}");
                 if !self.json {
@@ -1107,7 +1139,9 @@ impl Session {
                 if self.yes || !self.interactive {
                     if self.yes {
                         self.note("continuing anyway (--yes)");
-                        return Ok(json!({"repos": repos, "ok": false, "error": message}));
+                        return Ok(
+                            json!({"repos": repos, "ok": false, "error": message, "output": verification_log}),
+                        );
                     }
                     return Err(anyhow::anyhow!(
                         "credential check failed: {message}\n\
@@ -1116,7 +1150,9 @@ impl Session {
                     ));
                 }
                 if self.ask_bool("    continue anyway? [y/N] ", false)? {
-                    Ok(json!({"repos": repos, "ok": false, "error": message}))
+                    Ok(
+                        json!({"repos": repos, "ok": false, "error": message, "output": verification_log}),
+                    )
                 } else {
                     Err(anyhow::anyhow!(
                         "credential check failed: {message}\n\
@@ -1452,7 +1488,7 @@ impl Session {
         golden: &GoldenDecision,
     ) -> anyhow::Result<()> {
         self.section("3/5 Workflows: secrets and runner labels");
-        let config = load_config().context("reading the engine config")?;
+        let config = load_config_from(&self.config_path).context("reading the engine config")?;
         let checkout = workflows::checkout_root();
         // A checkout with no `origin` keeps its `local/<dir>` identity: it is
         // the scope local workflow submissions store and read secrets under,
@@ -1476,9 +1512,16 @@ impl Session {
             }));
             return Ok(());
         }
+        // `github_app::load_from` resolves the App credential sources from the
+        // process environment: read them once, here at the boundary of the
+        // step that uses them, rather than once per repository below it.
+        let startup = preloop_runner_server::config::StartupConfig::from_env();
+        // The API base is read once here too: the scan never reads the process
+        // environment itself.
+        let api_base = crate::github_api_base();
         let mut scans = Vec::new();
         for target in targets {
-            scans.push(workflows::read_target(target, &config).await);
+            scans.push(workflows::read_target(target, &config, &startup, &api_base).await);
         }
         for scan in &scans {
             self.note(&workflows::describe(scan));
@@ -1493,9 +1536,12 @@ impl Session {
         // alone would claim `ubuntu-22.04` runs on the official golden while
         // an override makes the engine run it on the override.
         let pool = workflows::Pool::new(
-            crate::runner_pool_labels(),
+            crate::runner_pool_labels(std::env::var("PRELOOP_RUNNER_LABELS").ok().as_deref()),
             std::env::consts::ARCH,
-            &effective_base_image(golden.base_image.as_deref()),
+            &effective_base_image(
+                golden.base_image.as_deref(),
+                base_image_override().as_deref(),
+            ),
         );
         self.workflow_labels(&scans, &pool);
         Ok(())
@@ -1599,7 +1645,13 @@ impl Session {
                     repo: repo.clone(),
                     env: None,
                 };
-                match github_setup::cmd_secret(github_setup::SecretArgs { command }).await {
+                match github_setup::cmd_secret(
+                    github_setup::SecretArgs { command },
+                    &self.config_path,
+                    &github_setup::SecretEnv::from_env(),
+                )
+                .await
+                {
                     Ok(()) => {
                         // The write succeeded, so the row is configured at the
                         // scope it was written to: the table, the JSON entries,
@@ -1715,9 +1767,13 @@ impl Session {
     /// The secret names the engine holds: the running engine's when it
     /// answers, else the config file's, as `preloop secret list` reads them.
     async fn stored_secret_names(config: &ConfigFile) -> (workflows::Stored, &'static str) {
+        // Resolved once at this boundary: the same transport and API token
+        // `preloop secret list` uses against the running engine.
+        let base = crate::server_url();
+        let token = crate::api_token();
         match tokio::time::timeout(
             Duration::from_secs(2),
-            github_setup::api_list_secrets(None, None),
+            github_setup::api_list_secrets(&base, token.as_deref(), None, None),
         )
         .await
         {
@@ -1747,7 +1803,7 @@ impl Session {
     fn preflight(&mut self, decision: &GoldenDecision, mode: RunMode) -> anyhow::Result<Value> {
         self.section("5/5 Preflight");
         let starting = matches!(mode, RunMode::Foreground | RunMode::Service);
-        let data_root = preloop_vm::machine_data_root();
+        let data_root = preloop_vm::VmPathConfig::resolve().machine_data_root();
         let free = data_root.as_deref().and_then(|root| {
             match preloop_vm::filesystem_available_bytes(root) {
                 Ok(free) => Some(free),
@@ -1765,7 +1821,9 @@ impl Session {
             }
         });
         // The engine's own builder rule: builder disk + pack staging.
-        let builder_gib = u64::from(golden_builder_storage_gib(crate::runner_storage_gib()));
+        let builder_gib = u64::from(golden_builder_storage_gib(crate::runner_storage_gib(
+            std::env::var(crate::RUNNER_STORAGE_GB_ENV).ok().as_deref(),
+        )));
         let bake_bytes = (builder_gib + GOLDEN_BUILD_DISK_HEADROOM_GIB) * GIB;
         let download_bytes = decision
             .artifact_bytes
@@ -1876,7 +1934,13 @@ impl Session {
 
         if !shortfalls.is_empty() {
             let disk_only = shortfalls.iter().all(|short| short["resource"] == "disk");
-            if disk_only && disk_preflight_overridden() {
+            // Resolved at this command's startup boundary: the same rule the
+            // pool's `skip_disk_preflight` config field gets.
+            if disk_only
+                && crate::skip_disk_preflight(
+                    std::env::var(DISK_PREFLIGHT_OVERRIDE).ok().as_deref(),
+                )
+            {
                 self.emit(json!({"step": "preflight", "decision": "overridden", "result": report}));
                 if !self.json {
                     println!(
@@ -1914,7 +1978,7 @@ impl Session {
     /// A system service reads its own state dir; write the config there when
     /// the operator did not pin `PRELOOP_HOME` (which the service would then
     /// be told to use, because `install` gets the same value).
-    fn prepare_service_home(&self) -> anyhow::Result<()> {
+    fn prepare_service_home(&mut self) -> anyhow::Result<()> {
         ensure_service_root()?;
         let service_home = std::env::var_os("PRELOOP_HOME")
             .map(PathBuf::from)
@@ -1927,13 +1991,12 @@ impl Session {
             "service state dir: {} — the installed service reads this file, so the answers below \
              are written there (not {})",
             target.display(),
-            preloop_runner_server::config::config_path().display(),
+            self.config_path.display(),
         ));
-        // SAFETY: the CLI is single-threaded here and nothing else reads the
-        // environment concurrently; `main` sets the same variable the same way.
-        unsafe {
-            std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, &target);
-        }
+        // Redirect the run's config file: every later step reads and writes
+        // the service's config, exactly as the old process-wide publication
+        // did — as explicit state instead of process environment.
+        self.config_path = target;
         Ok(())
     }
 
@@ -1970,7 +2033,12 @@ impl Session {
                 }
                 // First-run preparation (state dir, brand-new control
                 // database) lives in `cmd_engine`.
-                crate::cmd_engine(serve_args_for(public_url), observability).await
+                crate::cmd_engine(
+                    serve_args_for(public_url),
+                    observability,
+                    config_path.to_path_buf(),
+                )
+                .await
             }
             RunMode::Service => {
                 ensure_service_root()?;
@@ -2181,7 +2249,7 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn ensure_service_root() -> anyhow::Result<()> {
-    if unsafe { libc::geteuid() } == 0 {
+    if nix::unistd::geteuid().is_root() {
         return Ok(());
     }
     Err(anyhow::anyhow!(
@@ -2197,7 +2265,7 @@ fn ensure_service_root() -> anyhow::Result<()> {
 /// as the previous answer instead of asking the whole menu again. A machine
 /// that has never run `init` has no file, and gets the menu (whose default is
 /// the recommended App).
-fn credential_prior(config: &ConfigFile) -> Option<(AuthChoice, String)> {
+fn credential_prior(config: &ConfigFile, config_path: &Path) -> Option<(AuthChoice, String)> {
     if let Some(summary) = credential_summary(config) {
         let choice = if config.github.app_id.is_none()
             && config.github.apps.is_empty()
@@ -2209,7 +2277,7 @@ fn credential_prior(config: &ConfigFile) -> Option<(AuthChoice, String)> {
         };
         return Some((choice, summary));
     }
-    preloop_runner_server::config::config_path()
+    config_path
         .exists()
         .then(|| (AuthChoice::None, "none — local only".to_owned()))
 }
@@ -2250,13 +2318,17 @@ struct PublicUrlAnswer {
 /// `preloop serve` reads them. A value that does not validate is dropped:
 /// `serve` would fall back to loopback anyway, and only the App flow, which has
 /// to give GitHub a working URL, refuses the input outright.
-fn engine_public_url(args: &InitArgs, answer: Option<&PublicUrlAnswer>) -> Option<String> {
+fn engine_public_url(
+    args: &InitArgs,
+    answer: Option<&PublicUrlAnswer>,
+    env: Option<&str>,
+) -> Option<String> {
     if let Some(answer) = answer {
         return answer.url.clone();
     }
     args.public_url
         .clone()
-        .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
+        .or_else(|| env.map(str::to_owned))
         .and_then(|raw| validate_public_url(&raw).ok())
 }
 
@@ -2270,47 +2342,60 @@ fn serve_args_for(public_url: Option<&str>) -> crate::ServeArgs {
     }
 }
 
+/// The origin `serve` must advertise once the wizard has run, and the line
+/// that says which one won. See [`apply_engine_public_url`].
+pub(crate) struct AppliedPublicUrl {
+    /// The origin the engine's startup config must carry.
+    pub(crate) url: String,
+    /// The line to print, when there was a decision to report.
+    pub(crate) note: Option<String>,
+}
+
 /// Hand the URL the wizard resolved to the engine that is already running in
 /// this process: `serve` offers the wizard before it starts its server, and
-/// Check Run detail links and the webhook health check read
-/// `PRELOOP_PUBLIC_URL` off this process's environment — a `serve` that never
-/// starts cannot pick the answer up any other way. Without this the App's
-/// webhook would point at the new URL while the running engine stayed on the
-/// old (loopback) one.
+/// Check Run detail links and the webhook health check advertise the origin
+/// the engine resolved at startup — a `serve` that never starts cannot pick
+/// the answer up any other way, and the startup config is the only channel
+/// that reaches it. Without this the App's webhook would point at the new URL
+/// while the running engine stayed on the old (loopback) one.
 ///
 /// `current` is the origin the engine resolved for itself before the wizard
 /// ran (`--public-url`, `PRELOOP_PUBLIC_URL`, or the loopback default). The
 /// wizard's answer replaces only a loopback default, and is a no-op when the
 /// two already agree: an origin the operator configured deliberately is never
-/// silently replaced. Returns the line that says which one won — `None` when
-/// there was nothing to decide (no answer, or the same one).
-pub(crate) fn apply_engine_public_url(current: &str, resolved: Option<&str>) -> Option<String> {
+/// silently replaced. `note` is `None` when there was nothing to decide (no
+/// answer, or the same one).
+pub(crate) fn apply_engine_public_url(current: &str, resolved: Option<&str>) -> AppliedPublicUrl {
+    let unchanged = |note: Option<String>| AppliedPublicUrl {
+        url: current.to_owned(),
+        note,
+    };
     let Some(resolved) = resolved.map(str::trim).filter(|url| !url.is_empty()) else {
         // The wizard skipped the question: the engine's own origin stands.
-        return None;
+        return unchanged(None);
     };
     let resolved = resolved.trim_end_matches('/');
-    let current = current.trim().trim_end_matches('/');
-    if resolved == current {
-        return None;
+    let configured = current.trim().trim_end_matches('/');
+    if resolved == configured {
+        return unchanged(None);
     }
-    if !is_loopback_url(current) {
-        return Some(format!(
+    if !is_loopback_url(configured) {
+        return unchanged(Some(format!(
             "keeping this engine's configured public URL {}; the wizard's {} is not applied to \
              it — restart `serve` with PRELOOP_PUBLIC_URL={} to switch",
-            escape_control(current),
+            escape_control(configured),
             escape_control(resolved),
             escape_control(resolved),
-        ));
+        )));
     }
-    // SAFETY: this runs at engine startup, before the server reads the
-    // variable, and nothing else touches the environment concurrently.
-    unsafe { std::env::set_var("PRELOOP_PUBLIC_URL", resolved) };
-    Some(format!(
-        "public URL {} — this engine now advertises it (Check Run detail links and the webhook \
-         health check use it)",
-        escape_control(resolved)
-    ))
+    AppliedPublicUrl {
+        url: resolved.to_owned(),
+        note: Some(format!(
+            "public URL {} — this engine now advertises it (Check Run detail links and the webhook \
+             health check use it)",
+            escape_control(resolved)
+        )),
+    }
 }
 
 /// What a configure-only run says when it starts nothing: `serve` reads the
@@ -3033,20 +3118,24 @@ fn hypervisor_state() -> (bool, String) {
 
 /// `preloop init --probe --json`: a side-effect-free capability report. Nothing
 /// here writes, creates, or starts anything.
-async fn print_probe() -> anyhow::Result<()> {
-    let data_root = preloop_vm::machine_data_root();
+async fn print_probe(config_path: &Path) -> anyhow::Result<()> {
+    let data_root = preloop_vm::VmPathConfig::resolve().machine_data_root();
     let disk_free_bytes = data_root
         .as_deref()
         .and_then(|root| preloop_vm::filesystem_available_bytes(root).ok());
     let (hypervisor, hypervisor_detail) = hypervisor_state();
-    let (config, config_error) = match load_config() {
+    let (config, config_error) = match load_config_from(config_path) {
         Ok(config) => (config, None),
         Err(error) => (ConfigFile::default(), Some(format!("{error:#}"))),
     };
-    let config_path = preloop_runner_server::config::config_path();
     let docker = container_engine();
     let dockerfile_detected = default_dockerfile().is_file();
-    let base_image = preloop_runner_server::config::golden_base_image(&config);
+    let base_image = preloop_runner_server::config::golden_base_image(
+        &config,
+        std::env::var(preloop_runner_server::config::BASE_IMAGE_ENV)
+            .ok()
+            .as_deref(),
+    );
     let report = json!({
         "arch": std::env::consts::ARCH,
         "os": std::env::consts::OS,
@@ -3452,89 +3541,6 @@ fn github_pat_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-// -- stdout capture -------------------------------------------------------
-
-/// Run `future` with this process's stdout redirected into a temporary file,
-/// and return what it printed there. Used so the reused `preloop setup` flow's
-/// human output cannot corrupt `--json`'s one-object-per-line contract.
-async fn capture_stdout<F: Future>(future: F) -> (F::Output, String) {
-    #[cfg(unix)]
-    {
-        let Ok(capture) = StdoutCapture::begin() else {
-            return (future.await, String::new());
-        };
-        let output = future.await;
-        (output, capture.finish())
-    }
-    #[cfg(not(unix))]
-    {
-        (future.await, String::new())
-    }
-}
-
-/// Restores fd 1 on drop, so an unwinding future cannot leave the process
-/// writing its output into the capture file.
-#[cfg(unix)]
-struct StdoutCapture {
-    saved: libc::c_int,
-    file: std::fs::File,
-    active: bool,
-}
-
-#[cfg(unix)]
-impl StdoutCapture {
-    fn begin() -> anyhow::Result<Self> {
-        use std::os::fd::AsRawFd;
-        std::io::stdout().flush().context("flushing stdout")?;
-        let file = tempfile::tempfile().context("creating the capture file")?;
-        // SAFETY: dup/dup2 operate on this process's own descriptor table, and
-        // the guard restores fd 1 when it is dropped.
-        let saved = unsafe { libc::dup(1) };
-        if saved < 0 {
-            anyhow::bail!("dup(1) failed");
-        }
-        if unsafe { libc::dup2(file.as_raw_fd(), 1) } < 0 {
-            unsafe { libc::close(saved) };
-            anyhow::bail!("dup2(2) failed");
-        }
-        Ok(Self {
-            saved,
-            file,
-            active: true,
-        })
-    }
-
-    fn finish(mut self) -> String {
-        self.restore();
-        use std::io::{Read, Seek, SeekFrom};
-        let mut text = String::new();
-        if self.file.seek(SeekFrom::Start(0)).is_ok() {
-            let _ = self.file.read_to_string(&mut text);
-        }
-        text
-    }
-
-    fn restore(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.active = false;
-        let _ = std::io::stdout().flush();
-        // SAFETY: same descriptor table; `saved` is the fd dup'd in `begin`.
-        unsafe {
-            libc::dup2(self.saved, 1);
-            libc::close(self.saved);
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for StdoutCapture {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3546,6 +3552,7 @@ mod tests {
             json: true,
             yes: true,
             from_serve: false,
+            config_path: PathBuf::from("/nonexistent/preloop-init-test/config.toml"),
         };
         // Nothing supplied: every step flag is named, so a script knows what to
         // add instead of guessing.
@@ -3566,6 +3573,7 @@ mod tests {
             json: false,
             yes: false,
             from_serve: false,
+            config_path: PathBuf::from("/nonexistent/preloop-init-test/config.toml"),
         };
         let args = InitArgs {
             auth: Some(AuthChoice::None),
@@ -3585,6 +3593,7 @@ mod tests {
             json: false,
             yes: false,
             from_serve: false,
+            config_path: PathBuf::from("/nonexistent/preloop-init-test/config.toml"),
         };
         let args = InitArgs {
             auth: Some(AuthChoice::None),
@@ -3674,7 +3683,7 @@ mod tests {
 
     #[test]
     fn service_mode_refuses_to_install_without_root() {
-        if unsafe { libc::geteuid() } == 0 {
+        if nix::unistd::geteuid().is_root() {
             return;
         }
         let error = ensure_service_root().unwrap_err();
@@ -3688,7 +3697,7 @@ mod tests {
         // its precedence here is what makes the probe's answer trustworthy.
         let mut config = ConfigFile::default();
         assert_eq!(
-            preloop_runner_server::config::golden_base_image(&config),
+            preloop_runner_server::config::golden_base_image(&config, None),
             None
         );
         config.golden = GoldenConfig {
@@ -3697,7 +3706,17 @@ mod tests {
             dockerfile: None,
         };
         assert_eq!(
-            preloop_runner_server::config::golden_base_image(&config).as_deref(),
+            preloop_runner_server::config::golden_base_image(&config, None).as_deref(),
+            Some("ghcr.io/x/y:1")
+        );
+        // The environment override wins over the persisted choice; a blank
+        // export behaves like an unset one, so the probe reports the persisted
+        // image either way.
+        let with_env =
+            preloop_runner_server::config::golden_base_image(&config, Some("ghcr.io/env:2"));
+        assert_eq!(with_env.as_deref(), Some("ghcr.io/env:2"));
+        assert_eq!(
+            preloop_runner_server::config::golden_base_image(&config, Some("  ")).as_deref(),
             Some("ghcr.io/x/y:1")
         );
     }
@@ -3801,6 +3820,7 @@ mod tests {
     #[test]
     fn the_public_url_question_never_prompts_without_a_terminal() {
         let mut session = Session {
+            config_path: std::path::PathBuf::from("config.toml"),
             interactive: false,
             json: true,
             yes: false,
@@ -3860,20 +3880,18 @@ mod tests {
     /// path never reaches `configure_credentials`, so it resolves the URL from
     /// `--public-url`/`PRELOOP_PUBLIC_URL` there.
     #[test]
-    #[allow(unsafe_code)]
     fn the_chosen_url_reaches_serve_and_the_service_install() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let mut args = InitArgs {
             public_url: Some(" https://flag.example.com/ ".to_owned()),
             ..InitArgs::default()
         };
         // No App answer (PAT, `--auth none`, or a kept credential): the flag.
         assert_eq!(
-            engine_public_url(&args, None).as_deref(),
+            engine_public_url(&args, None, None).as_deref(),
             Some("https://flag.example.com")
         );
         assert_eq!(
-            serve_args_for(engine_public_url(&args, None).as_deref())
+            serve_args_for(engine_public_url(&args, None, None).as_deref())
                 .public_url
                 .as_deref(),
             Some("https://flag.example.com"),
@@ -3889,7 +3907,7 @@ mod tests {
             source: "suggested",
         };
         assert_eq!(
-            engine_public_url(&args, Some(&answer)).as_deref(),
+            engine_public_url(&args, Some(&answer), None).as_deref(),
             Some("https://tail.example.ts.net")
         );
         // A skipped answer is still an answer: webhooks stay off on purpose.
@@ -3897,31 +3915,22 @@ mod tests {
             url: None,
             source: "skipped",
         };
-        assert_eq!(engine_public_url(&args, Some(&skipped)), None);
+        assert_eq!(engine_public_url(&args, Some(&skipped), None), None);
 
         // The kept-credential path has no App answer to hand over, so the
-        // environment stands in for the flag there.
+        // environment value — read once at the boundary — stands in for the
+        // flag there.
         args.public_url = None;
-        let previous = std::env::var_os("PRELOOP_PUBLIC_URL");
-        // SAFETY: TEST_ENV_LOCK serializes this process-global env access; the
-        // value read above is restored below.
-        unsafe { std::env::set_var("PRELOOP_PUBLIC_URL", "https://env.example.com/") };
         assert_eq!(
-            engine_public_url(&args, None).as_deref(),
+            engine_public_url(&args, None, Some("https://env.example.com/")).as_deref(),
             Some("https://env.example.com"),
             "a kept credential still needs the engine's public origin"
         );
         // The local-dev loopback default is not an origin GitHub can use.
-        // SAFETY: as above.
-        unsafe { std::env::set_var("PRELOOP_PUBLIC_URL", "http://127.0.0.1:9090") };
-        assert_eq!(engine_public_url(&args, None), None);
-        // SAFETY: restores the value read above.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("PRELOOP_PUBLIC_URL", value),
-                None => std::env::remove_var("PRELOOP_PUBLIC_URL"),
-            }
-        }
+        assert_eq!(
+            engine_public_url(&args, None, Some("http://127.0.0.1:9090")),
+            None
+        );
     }
 
     /// A suggestion is offered from evidence, never guessed:
@@ -4476,70 +4485,40 @@ mod tests {
 
     /// From `serve` the wizard runs inside the process that *is* the engine:
     /// the URL it resolved (the one the App's webhook was pointed at) has to
-    /// reach that engine's own origin, because Check Run detail links and the
-    /// webhook health check read `PRELOOP_PUBLIC_URL` off this environment —
+    /// reach that engine's own startup config, because Check Run detail links
+    /// and the webhook health check advertise the origin the engine resolved —
     /// no `serve` starts to pick it up any other way. An origin configured
     /// deliberately is never silently replaced, and which one won is said.
     #[test]
-    #[allow(unsafe_code)]
     fn the_wizard_answer_reaches_the_running_engine_or_says_who_won() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
-        let previous = std::env::var_os("PRELOOP_PUBLIC_URL");
-        // SAFETY: TEST_ENV_LOCK serializes this process-global env access; the
-        // value read above is restored below.
-        unsafe { std::env::set_var("PRELOOP_PUBLIC_URL", "http://127.0.0.1:9090") };
-
-        let note =
-            apply_engine_public_url("http://127.0.0.1:9090", Some("https://tail.example.ts.net"))
-                .expect("replacing the loopback default is reported");
-        assert_eq!(
-            std::env::var("PRELOOP_PUBLIC_URL").unwrap(),
-            "https://tail.example.ts.net"
-        );
+        let applied =
+            apply_engine_public_url("http://127.0.0.1:9090", Some("https://tail.example.ts.net"));
+        assert_eq!(applied.url, "https://tail.example.ts.net");
+        let note = applied
+            .note
+            .expect("replacing the loopback default is reported");
         assert!(note.contains("https://tail.example.ts.net"), "{note}");
-        // The engine's own consumers read exactly this variable.
-        let details =
-            preloop_runner_server::github::run_details_url(preloop_gha_protocol::RunId::new())
-                .expect("the engine has an origin");
-        assert!(
-            details.starts_with("https://tail.example.ts.net/runs/"),
-            "{details}"
-        );
 
         // A deliberate origin wins: the wizard's answer is not applied, and
         // the note names both so the difference is not silent.
-        // SAFETY: as above.
-        unsafe { std::env::set_var("PRELOOP_PUBLIC_URL", "https://ci.example.com") };
-        let note = apply_engine_public_url(
+        let applied = apply_engine_public_url(
             "https://ci.example.com",
             Some("https://tail.example.ts.net"),
-        )
-        .expect("a disagreement is reported");
-        assert_eq!(
-            std::env::var("PRELOOP_PUBLIC_URL").unwrap(),
-            "https://ci.example.com"
         );
+        assert_eq!(applied.url, "https://ci.example.com");
+        let note = applied.note.expect("a disagreement is reported");
         assert!(note.contains("https://ci.example.com"), "{note}");
         assert!(note.contains("https://tail.example.ts.net"), "{note}");
 
         // The same answer is no change at all, and a skipped question leaves
         // the engine's own origin alone.
-        assert_eq!(
-            apply_engine_public_url("https://ci.example.com/", Some("https://ci.example.com")),
-            None
-        );
-        assert_eq!(apply_engine_public_url("http://127.0.0.1:9090", None), None);
-        assert_eq!(
-            std::env::var("PRELOOP_PUBLIC_URL").unwrap(),
-            "https://ci.example.com"
-        );
-        // SAFETY: restores the value read above.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("PRELOOP_PUBLIC_URL", value),
-                None => std::env::remove_var("PRELOOP_PUBLIC_URL"),
-            }
-        }
+        let same =
+            apply_engine_public_url("https://ci.example.com/", Some("https://ci.example.com"));
+        assert_eq!(same.url, "https://ci.example.com/");
+        assert_eq!(same.note, None);
+        let unchanged = apply_engine_public_url("http://127.0.0.1:9090", None);
+        assert_eq!(unchanged.url, "http://127.0.0.1:9090");
+        assert_eq!(unchanged.note, None);
     }
 
     /// The configure-only hint is for the run that starts nothing: the written
@@ -4693,11 +4672,11 @@ mod tests {
 
     /// `PRELOOP_RUNNER_BASE_IMAGE` beats the wizard's choice at serve time, so
     /// the label verdicts must be classified against the override: the engine
-    /// runs `ubuntu-22.04` on the override, not on the official golden.
+    /// runs `ubuntu-22.04` on the override, not on the official golden. The
+    /// override is an explicit input, so the test passes it instead of
+    /// mutating the process environment.
     #[test]
     fn label_verdicts_follow_the_effective_base_image() {
-        let _guard = crate::TEST_ENV_LOCK.blocking_lock();
-        let previous = std::env::var_os(preloop_runner_server::config::BASE_IMAGE_ENV);
         let pool = |base: &str| {
             workflows::Pool::new(
                 vec![
@@ -4709,25 +4688,18 @@ mod tests {
                 base,
             )
         };
-        unsafe { std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV) };
         assert_eq!(
-            effective_base_image(Some("ghcr.io/acme/chosen:1")),
+            effective_base_image(Some("ghcr.io/acme/chosen:1"), None),
             "ghcr.io/acme/chosen:1"
         );
-        assert_eq!(effective_base_image(None), OFFICIAL_GOLDEN);
+        assert_eq!(effective_base_image(None, None), OFFICIAL_GOLDEN);
         assert_eq!(
-            workflows::classify("ubuntu-22.04", &pool(&effective_base_image(None))),
+            workflows::classify("ubuntu-22.04", &pool(&effective_base_image(None, None))),
             workflows::Verdict::HostedLinux { official: true },
             "nothing configured means the packed official golden"
         );
 
-        unsafe {
-            std::env::set_var(
-                preloop_runner_server::config::BASE_IMAGE_ENV,
-                "ghcr.io/acme/base:1",
-            )
-        };
-        let base = effective_base_image(Some("ghcr.io/acme/chosen:1"));
+        let base = effective_base_image(Some("ghcr.io/acme/chosen:1"), Some("ghcr.io/acme/base:1"));
         assert_eq!(base, "ghcr.io/acme/base:1");
         assert_eq!(
             workflows::classify("ubuntu-22.04", &pool(&base)),
@@ -4742,18 +4714,11 @@ mod tests {
         assert!(message.contains("your configured golden"), "{message}");
 
         // An exported-but-blank override behaves like an unset one.
-        unsafe { std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, " ") };
-        assert_eq!(effective_base_image(None), OFFICIAL_GOLDEN);
+        assert_eq!(effective_base_image(None, Some(" ")), OFFICIAL_GOLDEN);
         assert_eq!(
-            effective_base_image(Some("ghcr.io/acme/chosen:1")),
+            effective_base_image(Some("ghcr.io/acme/chosen:1"), Some(" ")),
             "ghcr.io/acme/chosen:1"
         );
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, value)
-            },
-            None => unsafe { std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV) },
-        }
     }
 
     /// A checkout without an `origin` remote keeps its `local/<dir>` identity:

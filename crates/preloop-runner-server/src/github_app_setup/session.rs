@@ -21,7 +21,7 @@
 //! poller has not read — replacing that would drop an App GitHub has already
 //! created.
 
-use crate::config::load_config_from;
+use crate::config::load_config_from_with;
 use crate::credential_store::{CredentialStoreKind, CredentialWriter, SecretString, selected_kind};
 use crate::errors::ApiError;
 use crate::github_app_setup::{
@@ -68,13 +68,12 @@ const INSTALL_WAIT: Duration = Duration::from_secs(300);
 /// How often the installation lookup is re-tried while waiting.
 const INSTALL_POLL: Duration = Duration::from_secs(3);
 
-/// [`INSTALL_WAIT`], or `PRELOOP_SETUP_INSTALL_WAIT_SECS` when the operator set
-/// it — tests use `0` to keep a check from waiting on an installation that
-/// will never appear.
-fn install_wait() -> Duration {
-    std::env::var("PRELOOP_SETUP_INSTALL_WAIT_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
+/// [`INSTALL_WAIT`], or the operator's resolved `PRELOOP_SETUP_INSTALL_WAIT_SECS`
+/// when set — tests set `0` to keep a check from waiting on an installation
+/// that will never appear.
+fn install_wait(state: &crate::state::AppState) -> Duration {
+    state
+        .setup_install_wait_secs
         .map_or(INSTALL_WAIT, Duration::from_secs)
 }
 
@@ -519,7 +518,8 @@ pub async fn open_session(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<OpenRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let engine_origin = engine_public_origin().map_err(ApiError::internal)?;
+    let engine_origin =
+        engine_public_origin(shared.state.public_url.as_deref()).map_err(ApiError::internal)?;
     let public_url = normalize_public_url(&request.public_url, engine_origin.as_ref())
         .map_err(ApiError::bad_request)?;
     let org = match request.org.map(|org| org.trim().to_owned()) {
@@ -538,9 +538,13 @@ pub async fn open_session(
         return Err(ApiError::bad_request("app_name must not be empty"));
     }
     let repos = validate_repos(&request.repos)?;
-    match preflight_config(shared.state.config_path.clone(), request.add)
-        .await
-        .map_err(ApiError::internal)?
+    match preflight_config(
+        shared.state.config_path.clone(),
+        shared.state.credential_store.clone(),
+        request.add,
+    )
+    .await
+    .map_err(ApiError::internal)?
     {
         ConfigPreflight::Ready => {}
         ConfigPreflight::AppConfigured(app_ids) => {
@@ -604,9 +608,14 @@ enum ConfigPreflight {
 ///
 /// Blocking, and therefore run off the async workers: resolving credentials
 /// can wait on the OS keychain.
-async fn preflight_config(path: PathBuf, add: bool) -> Result<ConfigPreflight, String> {
+async fn preflight_config(
+    path: PathBuf,
+    credential_store_env: Option<String>,
+    add: bool,
+) -> Result<ConfigPreflight, String> {
     tokio::task::spawn_blocking(move || {
-        let config = load_config_from(&path).map_err(|error| format!("{error:#}"))?;
+        let config = load_config_from_with(&path, credential_store_env.as_deref())
+            .map_err(|error| format!("{error:#}"))?;
         // The same store selection the save will use, so a store that cannot
         // hold the key is reported before the App exists rather than after.
         //
@@ -616,9 +625,15 @@ async fn preflight_config(path: PathBuf, add: bool) -> Result<ConfigPreflight, S
         // flow asks the operator to do next. Refuse before GitHub creates
         // anything, and say why, rather than trade a working setup for an
         // orphaned App.
+        //
+        // Both the startup-resolved override and the config's own choice are
+        // passed in: the store selection takes explicit inputs.
         if matches!(
-            selected_kind(config.credential_store.as_deref())
-                .map_err(|error| format!("{error:#}"))?,
+            selected_kind(
+                credential_store_env.as_deref(),
+                config.credential_store.as_deref()
+            )
+            .map_err(|error| format!("{error:#}"))?,
             CredentialStoreKind::Memory
         ) {
             return Err(
@@ -630,8 +645,12 @@ async fn preflight_config(path: PathBuf, add: bool) -> Result<ConfigPreflight, S
                     .to_owned(),
             );
         }
-        CredentialWriter::for_config(&path, config.credential_store.as_deref())
-            .map_err(|error| format!("{error:#}"))?;
+        CredentialWriter::for_config(
+            &path,
+            credential_store_env.as_deref(),
+            config.credential_store.as_deref(),
+        )
+        .map_err(|error| format!("{error:#}"))?;
         if add {
             return Ok(ConfigPreflight::Ready);
         }
@@ -729,6 +748,7 @@ pub async fn setup_form(
         &redirect_url,
         Some(&grant.public_url),
         None,
+        &shared.state.manifest_default_events,
     );
     let action = creation_url(
         &shared.state.github_urls.server_url,
@@ -836,6 +856,7 @@ async fn complete_conversion(
     let install_url = credentials.install_url(&shared.state.github_urls.server_url);
     let webhook_secret_stored = credentials.webhook_secret.is_some();
     let config_path = shared.state.config_path.clone();
+    let credential_store = shared.state.credential_store.clone();
     let AppCredentials {
         id: app_id,
         slug,
@@ -848,7 +869,13 @@ async fn complete_conversion(
     let verify_pem = pem.clone();
     // The keychain can block, so the write leaves the async workers.
     let saved = tokio::task::spawn_blocking(move || {
-        save_app_credentials_at(&config_path, &app_id.to_string(), &pem, webhook_secret)
+        save_app_credentials_at(
+            &config_path,
+            credential_store.as_deref(),
+            &app_id.to_string(),
+            &pem,
+            webhook_secret,
+        )
     })
     .await;
     let notices = match saved {
@@ -943,7 +970,7 @@ async fn verify_repos(
 ) -> Vec<RepoCheck> {
     let api_base = shared.state.github_urls.api_url.clone();
     let app_id_text = app_id.to_string();
-    let deadline = Instant::now() + install_wait();
+    let deadline = Instant::now() + install_wait(&shared.state);
     let mut checks = Vec::with_capacity(repos.len());
     for repo in repos {
         let mut installed = crate::github_app::app_covers_repository_at(
@@ -1159,15 +1186,15 @@ fn normalize_public_url(raw: &str, engine_origin: Option<&reqwest::Url>) -> Resu
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
-/// The origin this engine publishes as its own, from `PRELOOP_PUBLIC_URL` —
-/// the same value the webhook URL, run links, and drift reports are built
-/// from. `None` when the operator has not set one.
+/// The origin this engine publishes as its own, from the startup-resolved
+/// `PRELOOP_PUBLIC_URL` — the same value the webhook URL, run links, and
+/// drift reports are built from. `None` when the operator has not set one.
 ///
 /// A value that is not an absolute URL is reported rather than ignored:
 /// skipping the origin check silently would let a setup redirect anywhere
 /// while the operator believes the engine is pinned.
-fn engine_public_origin() -> Result<Option<reqwest::Url>, String> {
-    let Ok(raw) = std::env::var("PRELOOP_PUBLIC_URL") else {
+fn engine_public_origin(public_url: Option<&str>) -> Result<Option<reqwest::Url>, String> {
+    let Some(raw) = public_url else {
         return Ok(None);
     };
     let raw = raw.trim().to_owned();
@@ -1800,48 +1827,41 @@ mod tests {
             base
         }
 
+        /// Startup configuration for these tests: the shared test defaults,
+        /// with the install wait at zero so a check for a repository the stub
+        /// never installs returns immediately instead of sitting out the five
+        /// minutes an operator gets.
+        fn test_startup() -> crate::config::StartupConfig {
+            crate::config::StartupConfig {
+                setup_install_wait_secs: Some(0),
+                ..crate::config::StartupConfig::for_tests()
+            }
+        }
+
         /// The production router over a fresh engine whose config lives in a
         /// temp file, with GitHub's conversion pointed at `api_base`.
         async fn engine(api_base: &str) -> (axum::Router, AppState, tempfile::TempDir) {
-            engine_with_config(api_base, "credential_store = \"file\"\n").await
+            engine_with_config(api_base, "credential_store = \"file\"\n", test_startup()).await
         }
 
-        /// [`engine`] with the config file's text chosen by the caller, for the
-        /// cases that depend on what the engine already has configured.
+        /// [`engine`] with the config file's text and startup values chosen by
+        /// the caller, for the cases that depend on what the engine already
+        /// has configured.
         async fn engine_with_config(
             api_base: &str,
             config_text: &str,
+            mut startup: crate::config::StartupConfig,
         ) -> (axum::Router, AppState, tempfile::TempDir) {
             let temp = tempfile::tempdir().unwrap();
             let config_path = temp.path().join("config.toml");
             std::fs::write(&config_path, config_text).unwrap();
-            let mut state = AppState::new_with_config(temp.path().join("state"), config_path)
+            startup.config_path = config_path;
+            let mut state = AppState::new(temp.path().join("state"), startup)
                 .await
                 .unwrap();
             state.github_urls.api_url = api_base.to_owned();
             let router = crate::routes::app(state.clone(), CancellationToken::new());
             (router, state, temp)
-        }
-
-        /// Pin the two process-globals this route reads — the engine's own
-        /// `PRELOOP_PUBLIC_URL` and the `--repo` install wait — the way every
-        /// other test that touches the environment does: under
-        /// `GITHUB_ENV_LOCK`, for the whole test. The wait is zero so a check
-        /// against a stub that will never grow an installation does not sit
-        /// out its five minutes.
-        async fn pin_setup_env(
-            public_url: Option<&'static str>,
-        ) -> (
-            (crate::state::TestEnvVar, crate::state::TestEnvVar),
-            tokio::sync::MutexGuard<'static, ()>,
-        ) {
-            let guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-            let public = match public_url {
-                Some(value) => crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", value),
-                None => crate::state::TestEnvVar::unset("PRELOOP_PUBLIC_URL"),
-            };
-            let wait = crate::state::TestEnvVar::set("PRELOOP_SETUP_INSTALL_WAIT_SECS", "0");
-            ((public, wait), guard)
         }
 
         async fn send(app: &axum::Router, request: Request<Body>) -> axum::response::Response {
@@ -1923,7 +1943,6 @@ mod tests {
 
         #[tokio::test]
         async fn opening_a_session_needs_the_system_token() {
-            let _env = pin_setup_env(None).await;
             let (app, state, _temp) = engine("http://127.0.0.1:1").await;
             let anonymous = Request::builder()
                 .method("POST")
@@ -1991,7 +2010,6 @@ mod tests {
         /// opens the form.
         #[tokio::test]
         async fn a_spent_refusal_window_never_gates_the_operators_link() {
-            let _env = pin_setup_env(None).await;
             let api = stub_github().await;
             let (app, state, _temp) = engine(&api).await;
             let (_session, link) = open_link(&app, &state).await;
@@ -2023,7 +2041,6 @@ mod tests {
         /// refuses GitHub's redirect for the live setup.
         #[tokio::test]
         async fn each_route_refuses_on_its_own_window() {
-            let _env = pin_setup_env(None).await;
             let api = stub_github().await;
             let (app, state, _temp) = engine(&api).await;
             let (session, link) = open_link(&app, &state).await;
@@ -2088,7 +2105,6 @@ mod tests {
         /// credentials land in the config, and the poller sees completion.
         #[tokio::test]
         async fn a_full_setup_stores_the_credentials_and_reports_completion() {
-            let _env = pin_setup_env(None).await;
             let api = stub_github().await;
             let (app, state, temp) = engine(&api).await;
             let (session, link) = open_link(&app, &state).await;
@@ -2186,7 +2202,6 @@ mod tests {
 
         #[tokio::test]
         async fn a_refused_conversion_fails_the_session_and_stores_nothing() {
-            let _env = pin_setup_env(None).await;
             let api = stub_github().await;
             let (app, state, temp) = engine(&api).await;
             let (session, link) = open_link(&app, &state).await;
@@ -2222,10 +2237,10 @@ mod tests {
 
         #[tokio::test]
         async fn a_second_app_is_refused_unless_add_is_asked_for() {
-            let _env = pin_setup_env(None).await;
             let (app, state, _temp) = engine_with_config(
                 "http://127.0.0.1:1",
                 "credential_store = \"file\"\n\n[[github.apps]]\napp_id = \"4242\"\n",
+                test_startup(),
             )
             .await;
             let refused = send(&app, open_request(&state, json!({"public_url": PUBLIC}))).await;
@@ -2252,12 +2267,19 @@ mod tests {
 
         #[tokio::test]
         async fn a_process_lifetime_credential_store_is_refused_by_the_hosted_flow() {
-            let _env = pin_setup_env(None).await;
-            // The env lock `pin_setup_env` holds is what makes this safe: the
-            // store selection is process-wide, so no other test can resolve a
-            // store while this one has `memory` selected.
-            let _store = crate::state::TestEnvVar::set("PRELOOP_CREDENTIAL_STORE", "memory");
-            let (app, state, _temp) = engine("http://127.0.0.1:1").await;
+            // The store selection is startup state, so this test builds an
+            // engine that selected `memory` — the config file itself is fine,
+            // and the override is what the refusal is about.
+            let memory = crate::config::StartupConfig {
+                credential_store: Some("memory".to_owned()),
+                ..test_startup()
+            };
+            let (app, state, _temp) = engine_with_config(
+                "http://127.0.0.1:1",
+                "credential_store = \"file\"\n",
+                memory,
+            )
+            .await;
 
             let refused = send(&app, open_request(&state, json!({"public_url": PUBLIC}))).await;
             assert_eq!(
@@ -2272,18 +2294,24 @@ mod tests {
                 "the refusal has to say GitHub has not been told anything: {body}"
             );
 
-            // The same request succeeds on a store that persists.
-            {
-                let _unset = crate::state::TestEnvVar::unset("PRELOOP_CREDENTIAL_STORE");
-                let allowed = send(&app, open_request(&state, json!({"public_url": PUBLIC}))).await;
-                assert_eq!(allowed.status(), StatusCode::CREATED);
-            }
+            // The same request succeeds on an engine on a store that persists.
+            let (app, state, _temp) = engine("http://127.0.0.1:1").await;
+            let allowed = send(&app, open_request(&state, json!({"public_url": PUBLIC}))).await;
+            assert_eq!(allowed.status(), StatusCode::CREATED);
         }
 
         #[tokio::test]
         async fn a_setup_for_another_origin_is_refused() {
-            let _env = pin_setup_env(Some(PUBLIC)).await;
-            let (app, state, _temp) = engine("http://127.0.0.1:1").await;
+            let published = crate::config::StartupConfig {
+                public_url: Some(PUBLIC.to_owned()),
+                ..test_startup()
+            };
+            let (app, state, _temp) = engine_with_config(
+                "http://127.0.0.1:1",
+                "credential_store = \"file\"\n",
+                published,
+            )
+            .await;
             let elsewhere = send(
                 &app,
                 open_request(&state, json!({"public_url": "https://attacker.example"})),
@@ -2299,7 +2327,6 @@ mod tests {
 
         #[tokio::test]
         async fn a_non_loopback_http_setup_is_refused() {
-            let _env = pin_setup_env(None).await;
             let (app, state, _temp) = engine("http://127.0.0.1:1").await;
             let refused = send(
                 &app,

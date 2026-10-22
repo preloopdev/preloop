@@ -211,7 +211,11 @@ impl Runtime {
             .map(PathBuf::from);
         let data_dir = std::env::var_os("SMOLVM_DATA_DIR")
             .map(PathBuf::from)
-            .or_else(|| crate::effective_preloop_home().map(|home| home.join("smolvm")));
+            .or_else(|| {
+                crate::VmPathConfig::resolve()
+                    .effective_preloop_home()
+                    .map(|home| home.join("smolvm"))
+            });
         Self {
             host_home,
             data_dir,
@@ -442,7 +446,8 @@ fn probe_host_version(binary: &Path) -> Option<String> {
     command.arg("--version");
     // The macOS wrapper exports `DYLD_LIBRARY_PATH` itself, but a bare
     // `smolvm-bin` path needs the same variables the engine would export.
-    crate::apply_smolvm_runtime_env(&mut command, Some(binary)).ok()?;
+    crate::apply_smolvm_runtime_env(&mut command, Some(binary), &crate::VmPathConfig::resolve())
+        .ok()?;
     let output = command.output().ok()?;
     if !output.status.success() {
         return None;

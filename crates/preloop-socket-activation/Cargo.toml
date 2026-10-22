@@ -6,11 +6,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[lints.rust]
-unsafe_code = "allow"
-missing_docs = "warn"
+[lints]
+workspace = true
 
 [dependencies]
 anyhow.workspace = true
-tokio.workspace = true
 listenfd = "1"
+tokio.workspace = true

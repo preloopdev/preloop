@@ -138,6 +138,7 @@ pub async fn push_run_to_github(
 ) -> Result<SyncResponse, ApiError> {
     // Snapshot everything the sync needs under one lock, then work outside
     // it: the GitHub calls are slow and must not hold the state mutex.
+    let api_base = shared.state.github_api_base();
     let run = shared
         .state
         .backend
@@ -156,13 +157,9 @@ pub async fn push_run_to_github(
             return Ok(SyncResponse {
                 status: "pushed",
                 pr_number: state.pr_number,
-                pr_url: state.pr_number.map(|number| {
-                    pr_web_url(
-                        &crate::github::github_api_base(),
-                        &run.submission.repository,
-                        number,
-                    )
-                }),
+                pr_url: state
+                    .pr_number
+                    .map(|number| pr_web_url(&api_base, &run.submission.repository, number)),
             });
         }
 
@@ -412,7 +409,9 @@ pub async fn push_run_to_github(
              - Tested tree: `{push_tree}`\n\
              - Actor: `{actor}`\n\
              - Details: {}",
-            crate::github::run_details_url(run_id)
+            shared
+                .state
+                .run_details_url(run_id)
                 .unwrap_or_else(|| "local server (no public URL configured)".to_owned())
         );
         match github_json(
@@ -525,7 +524,7 @@ pub async fn push_run_to_github(
         status: "pushed",
         pr_number,
         pr_url: pr_number
-            .map(|number| pr_web_url(&crate::github::github_api_base(), &repository, number)),
+            .map(|number| pr_web_url(&shared.state.github_api_base(), &repository, number)),
     })
 }
 
@@ -583,6 +582,7 @@ pub async fn push_credential(
     shared: &Arc<SharedState>,
     repository: &str,
 ) -> Option<GithubCredential> {
+    let api_base = shared.state.github_api_base();
     let permissions = std::collections::BTreeMap::from([
         ("checks".to_owned(), "write".to_owned()),
         ("pull_requests".to_owned(), "write".to_owned()),
@@ -592,7 +592,9 @@ pub async fn push_credential(
     // the owner may hold an installation that cannot reach this repository
     // (e.g. a selected-repositories installation), and a later App can.
     for app_creds in crate::github_app::candidate_apps_for_repo(shared, repository).await {
-        match crate::github_app::get_or_mint_token(&app_creds, repository, &permissions).await {
+        match crate::github_app::get_or_mint_token(&api_base, &app_creds, repository, &permissions)
+            .await
+        {
             Ok(token) => {
                 let bucket = match app_creds.mint_ledger.lookup(&token) {
                     Some(entry) => GithubCredentialBucket::Installation(entry.installation_id),
@@ -628,7 +630,7 @@ pub async fn github_json(
 ) -> anyhow::Result<serde_json::Value> {
     let url = format!(
         "{}/repos/{}{}",
-        crate::github::github_api_base(),
+        shared.state.github_api_base(),
         repository,
         if path.is_empty() {
             String::new()

@@ -802,14 +802,14 @@ pub async fn register_runner_compat(
         "createdOn": "2026-01-01T00:00:00Z",
         "labels": result.labels.iter().enumerate().map(|(i, l)| json!({"id": i + 1, "name": l, "type": "user"})).collect::<Vec<_>>(),
         "authorization": {
-            "authorizationUrl": format!("{}/_apis/v1/oauth2/token", runner_server_url()),
+            "authorizationUrl": format!("{}/_apis/v1/oauth2/token", shared.state.runner_server_url()),
             "clientId": client_id,
             "publicKey": public_key_object
         },
         "properties": {
             "RequireFipsCryptography": {"$type": "System.Boolean", "$value": false},
-            "ServerUrl": {"$type": "System.String", "$value": runner_server_url()},
-            "ServerUrlV2": {"$type": "System.String", "$value": runner_server_url()},
+            "ServerUrl": {"$type": "System.String", "$value": shared.state.runner_server_url()},
+            "ServerUrlV2": {"$type": "System.String", "$value": shared.state.runner_server_url()},
             "UseV2Flow": {"$type": "System.Boolean", "$value": true}
         }
     })))
@@ -913,8 +913,8 @@ pub(crate) async fn update_agent(
         "runnerGroupName": runner.runner_group_name,
         "labels": runner.labels.iter().enumerate().map(|(i, l)| json!({"id": i + 1, "name": l, "type": "user"})).collect::<Vec<_>>(),
         "properties": {
-            "ServerUrl": {"$type": "System.String", "$value": runner_server_url()},
-            "ServerUrlV2": {"$type": "System.String", "$value": runner_server_url()},
+            "ServerUrl": {"$type": "System.String", "$value": shared.state.runner_server_url()},
+            "ServerUrlV2": {"$type": "System.String", "$value": shared.state.runner_server_url()},
             "UseV2Flow": {"$type": "System.Boolean", "$value": true}
         }
     })))

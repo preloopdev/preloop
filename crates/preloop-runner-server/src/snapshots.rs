@@ -315,7 +315,8 @@ async fn resolve_github_repo_meta(
             .to_owned();
         if let Some(app) = crate::github_app::select_app_for_repo(shared, slug).await {
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-            if let Ok(token) = crate::github_app::get_or_mint_token(&app, slug, &permissions).await
+            if let Ok(token) =
+                crate::github_app::get_or_mint_token(&api_url, &app, slug, &permissions).await
             {
                 // The mint ledger names the installation locally, so the call
                 // is observed on the installation that minted it; an
@@ -786,7 +787,8 @@ async fn resolve_cache_upstream_credential(
 
     if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await {
         let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-        let token = crate::github_app::get_or_mint_token(&app, repository, &permissions)
+        let api_base = shared.state.github_api_base();
+        let token = crate::github_app::get_or_mint_token(&api_base, &app, repository, &permissions)
             .await
             .map_err(|error| {
                 ApiError::internal(format!("failed to mint checkout-cache token: {error:#}"))
@@ -2606,11 +2608,12 @@ async fn lfs_batch_response(
     authorization_header: Option<&str>,
     body: &[u8],
     fetch: Option<LfsFetch<'_>>,
+    runner_base: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let request: LfsBatchRequest = serde_json::from_slice(body)
         .map_err(|error| ApiError::bad_request(format!("invalid Git LFS batch body: {error}")))?;
     let operation = request.operation.as_deref().unwrap_or("download");
-    let base = runner_base_url();
+    let base = runner_base;
     if operation == "download" {
         populate_missing_lfs_objects(repository, &request.objects, fetch).await;
     }
@@ -3726,8 +3729,9 @@ fn scoped_fetch_auth_header(upstream_url: &str, token: &str) -> Option<(String, 
 pub(crate) async fn forge_read_token(shared: &SharedState, repository: &str) -> Option<String> {
     if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await {
         let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        let api_base = shared.state.github_api_base();
         if let Ok(token) =
-            crate::github_app::get_or_mint_token(&app, repository, &permissions).await
+            crate::github_app::get_or_mint_token(&api_base, &app, repository, &permissions).await
         {
             return Some(token);
         }
@@ -5994,6 +5998,7 @@ pub async fn snapshot_git_http(
             authorization_header.as_deref(),
             &request_body,
             lfs_fetch,
+            &shared.state.runner_base_url(),
         )
         .await?;
         return Ok(Response::builder()
@@ -6794,7 +6799,9 @@ mod auth_scoping_tests {
     #[tokio::test]
     async fn results_snapshot_auth_preserves_malformed_claim_errors() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job_id = uuid::Uuid::new_v4();
         let cases = [
             (
@@ -7406,6 +7413,7 @@ mod lfs_batch_tests {
             Some("Bearer job-token"),
             body.as_bytes(),
             None,
+            "http://127.0.0.1:9090",
         )
         .await
         .unwrap();
@@ -7415,10 +7423,7 @@ mod lfs_batch_tests {
         assert_eq!(response["objects"][0]["size"], 9);
         assert_eq!(
             response["objects"][0]["actions"]["download"]["href"],
-            format!(
-                "{}/snapshots/{run_id}/info/lfs/objects/{oid}",
-                runner_base_url()
-            )
+            format!("http://127.0.0.1:9090/snapshots/{run_id}/info/lfs/objects/{oid}")
         );
         assert_eq!(
             response["objects"][0]["actions"]["download"]["header"]["Authorization"],
@@ -7439,9 +7444,16 @@ mod lfs_batch_tests {
         })
         .to_string();
 
-        let response = lfs_batch_response(&repository, run_id, None, body.as_bytes(), None)
-            .await
-            .unwrap();
+        let response = lfs_batch_response(
+            &repository,
+            run_id,
+            None,
+            body.as_bytes(),
+            None,
+            "http://127.0.0.1:9090",
+        )
+        .await
+        .unwrap();
         assert_eq!(response["objects"][0]["error"]["code"], 404);
         assert!(
             response["objects"][0]["actions"].is_null()
@@ -7462,9 +7474,16 @@ mod lfs_batch_tests {
         })
         .to_string();
 
-        let response = lfs_batch_response(&repository, run_id, None, body.as_bytes(), None)
-            .await
-            .unwrap();
+        let response = lfs_batch_response(
+            &repository,
+            run_id,
+            None,
+            body.as_bytes(),
+            None,
+            "http://127.0.0.1:9090",
+        )
+        .await
+        .unwrap();
         assert_eq!(response["objects"][0]["error"]["code"], 403);
     }
 }
@@ -7542,7 +7561,9 @@ mod remote_checkout_cache_tests {
         let upstream_root = temp.path().join("upstream");
         std::fs::create_dir_all(&upstream_root).unwrap();
         let commit = upstream_repository(&upstream_root);
-        let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+        let mut state = AppState::new_for_tests(temp.path().join("state"))
+            .await
+            .unwrap();
         state.checkout_cache = crate::config::CheckoutCacheConfig {
             mode,
             ..Default::default()
@@ -8061,7 +8082,9 @@ mod remote_checkout_cache_tests {
         forge_base: &str,
         max_bytes: u64,
     ) -> Arc<SharedState> {
-        let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+        let mut state = AppState::new_for_tests(temp.path().join("state"))
+            .await
+            .unwrap();
         state.github_app = None;
         state.github_apps = None;
         state.github_pat = None;
@@ -8117,15 +8140,13 @@ mod remote_checkout_cache_tests {
             Some("Bearer job-token"),
             &body,
             Some(fetch()),
+            "http://127.0.0.1:9090",
         )
         .await
         .unwrap();
         assert_eq!(
             first["objects"][0]["actions"]["download"]["href"],
-            format!(
-                "{}/snapshots/{run_id}/info/lfs/objects/{oid}",
-                runner_base_url()
-            )
+            format!("http://127.0.0.1:9090/snapshots/{run_id}/info/lfs/objects/{oid}")
         );
         assert!(
             forge.authed_downloads.load(Ordering::SeqCst) >= 1,
@@ -8138,6 +8159,7 @@ mod remote_checkout_cache_tests {
             Some("Bearer job-token"),
             &body,
             Some(fetch()),
+            "http://127.0.0.1:9090",
         )
         .await
         .unwrap();
@@ -8177,6 +8199,7 @@ mod remote_checkout_cache_tests {
                 upstream_repository_id: None,
                 upstream_private: false,
             }),
+            "http://127.0.0.1:9090",
         )
         .await
         .unwrap();
@@ -8213,6 +8236,7 @@ mod remote_checkout_cache_tests {
                 upstream_repository_id: None,
                 upstream_private: true,
             }),
+            "http://127.0.0.1:9090",
         )
         .await
         .unwrap();
@@ -8252,6 +8276,7 @@ mod remote_checkout_cache_tests {
                 upstream_repository_id: Some(12345),
                 upstream_private: false,
             }),
+            "http://127.0.0.1:9090",
         )
         .await
         .unwrap();
@@ -8332,6 +8357,7 @@ mod remote_checkout_cache_tests {
                 upstream_repository_id: None,
                 upstream_private: false,
             }),
+            "http://127.0.0.1:9090",
         )
         .await
         .unwrap();
@@ -8376,6 +8402,7 @@ mod remote_checkout_cache_tests {
                 upstream_repository_id: None,
                 upstream_private: false,
             }),
+            "http://127.0.0.1:9090",
         )
         .await
         .unwrap();
@@ -8428,7 +8455,9 @@ mod snapshot_sweep_tests {
 
     async fn fixture(retention_seconds: u64) -> (tempfile::TempDir, Arc<SharedState>) {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+        let mut state = AppState::new_for_tests(temp.path().join("state"))
+            .await
+            .unwrap();
         state.snapshot_retention_seconds = retention_seconds;
         let shared = Arc::new(SharedState {
             state,
@@ -10173,7 +10202,9 @@ mod archive_tests {
             .unwrap();
         let upstream = format!("{forge_base}/repos/owner/repo/tarball/main");
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         // An exhausted anonymous REST budget must not refuse the relay: it is
         // a different dependency from the anonymous API bucket.
         let anonymous = state
@@ -10310,7 +10341,7 @@ mod lfs_accounting_tests {
 
     async fn lfs_shared(batch_base: &str) -> (tempfile::TempDir, std::sync::Arc<SharedState>) {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().join("state").to_path_buf())
+        let mut state = AppState::new_for_tests(temp.path().join("state").to_path_buf())
             .await
             .unwrap();
         state.github_urls = crate::state::GitHubUrls {

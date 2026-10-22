@@ -1,6 +1,3 @@
-// SAFETY: edition-2024 env mutation; each test serializes via GITHUB_ENV_LOCK.
-#![allow(unsafe_code)]
-
 //! preloop-runner-server integration tests — recovery group.
 //! Split from the former `lib_tests.rs` unit; see `tests/common/mod.rs`.
 
@@ -15,7 +12,9 @@ use common::*;
 async fn preserve_on_failure_reaches_the_job_message_only_when_requested() {
     for (requested, expected) in [(true, Some(true)), (false, None)] {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
 
         request_json(
@@ -52,7 +51,9 @@ async fn preserve_on_failure_reaches_the_job_message_only_when_requested() {
 #[tokio::test]
 async fn prebuilt_messages_preserve_monotonic_workflow_run_numbers() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -90,7 +91,9 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
     let (run_id, first_number) = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         let accepted = request_json(
             &app,
@@ -124,7 +127,9 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
         )
     };
 
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     {
         let tx = recovered.test_tx().await;
         assert!(tx.runs.contains_key(&run_id.parse::<RunId>().unwrap()));
@@ -167,7 +172,9 @@ async fn sqlite_recovery_restores_post_restart_state() {
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
 
     let (run_id_str, runner_id, session_id, public_xml) = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
 
         let accepted = request_json(
@@ -251,7 +258,9 @@ async fn sqlite_recovery_restores_post_restart_state() {
     };
 
     // Restart.
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let recovered_tx = recovered.test_tx().await;
     let recovered_inner = recovered.inner.lock().await;
 
@@ -346,11 +355,10 @@ async fn postgres_recovery_restores_post_restart_state() {
     let config_path = crate::config::config_path();
 
     let (run_id_str, runner_id, session_id, public_xml, first_number) = {
-        let state = AppState::new_with_store(
+        let state = AppState::new_for_tests_with_store(
             temp.path().to_path_buf(),
             config_path.clone(),
-            Some(&pg_url),
-            None,
+            Some(pg_url.as_str()),
         )
         .await
         .unwrap();
@@ -437,11 +445,10 @@ async fn postgres_recovery_restores_post_restart_state() {
     };
 
     // Restart against the same database.
-    let recovered = AppState::new_with_store(
+    let recovered = AppState::new_for_tests_with_store(
         temp.path().to_path_buf(),
         config_path.clone(),
-        Some(&pg_url),
-        None,
+        Some(pg_url.as_str()),
     )
     .await
     .unwrap();
@@ -510,7 +517,9 @@ async fn postgres_recovery_restores_post_restart_state() {
 #[tokio::test]
 async fn run_apis_never_return_submitted_secret_values() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -554,7 +563,9 @@ async fn run_apis_never_return_submitted_secret_values() {
 #[tokio::test]
 async fn run_page_is_public_safe_status_page_without_secret_leaks() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state, CancellationToken::new());
 
     let accepted = request_json(
@@ -606,7 +617,9 @@ async fn run_page_is_public_safe_status_page_without_secret_leaks() {
 async fn openapi_document_lists_native_surface_and_excludes_runner_protocol() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let response = app
@@ -647,7 +660,9 @@ async fn openapi_document_lists_native_surface_and_excludes_runner_protocol() {
 #[tokio::test]
 async fn matrix_max_parallel_and_fail_fast_are_enforced() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -709,7 +724,9 @@ jobs:
 #[tokio::test]
 async fn completejob_annotations_are_stored_on_the_job_record() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -776,7 +793,9 @@ async fn completejob_annotations_are_stored_on_the_job_record() {
 #[tokio::test]
 async fn selected_jobs_rejects_unknown_id_without_creating_run() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (status, body) = try_req(
@@ -800,7 +819,9 @@ async fn selected_jobs_rejects_unknown_id_without_creating_run() {
 #[tokio::test]
 async fn selected_jobs_rejects_partial_typo_without_running_valid_subset() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (status, body) = try_req(
@@ -828,7 +849,9 @@ async fn selected_jobs_rejects_partial_typo_without_running_valid_subset() {
 #[tokio::test]
 async fn selected_jobs_runs_transitive_needs_closure_without_independent_jobs() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     request_json(
@@ -858,7 +881,9 @@ async fn selected_jobs_runs_transitive_needs_closure_without_independent_jobs() 
 #[tokio::test]
 async fn selected_reusable_call_expands_children_at_runtime() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     request_json(
@@ -916,7 +941,9 @@ jobs:
 #[tokio::test]
 async fn selected_jobs_empty_runs_all_workflow_jobs() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     request_json(
@@ -950,7 +977,9 @@ async fn selected_jobs_empty_runs_all_workflow_jobs() {
 #[tokio::test]
 async fn agent_request_patch_targets_only_the_request_id() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // Two independent runs, both reach InProgress when their job is pulled.
@@ -1028,7 +1057,9 @@ async fn agent_request_patch_targets_only_the_request_id() {
 #[tokio::test]
 async fn agent_request_get_reports_completion_result() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1092,7 +1123,9 @@ async fn agent_request_get_reports_completion_result() {
 #[tokio::test]
 async fn same_session_waits_for_active_request_before_next_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1194,7 +1227,9 @@ jobs:
 #[tokio::test]
 async fn unacked_messages_are_scoped_to_their_session() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let workflow = json!({
@@ -1271,7 +1306,9 @@ async fn unacked_messages_are_scoped_to_their_session() {
 #[tokio::test]
 async fn finish_job_resolves_plan_timeline_and_agent_job_ids() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1348,7 +1385,9 @@ async fn finish_job_resolves_plan_timeline_and_agent_job_ids() {
 #[tokio::test]
 async fn finish_job_falls_back_to_the_single_active_request_when_unresolved() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1428,7 +1467,9 @@ jobs:
 #[tokio::test]
 async fn matrix_fail_fast_cancels_in_progress_siblings_via_message() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1523,7 +1564,9 @@ jobs:
 #[tokio::test]
 async fn needs_context_includes_completed_job_outputs() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1597,7 +1640,9 @@ jobs:
 #[tokio::test]
 async fn runtime_dynamic_matrix_expansion_fans_out_jobs() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1667,7 +1712,9 @@ async fn invalid_dynamic_matrix_fails_the_run_instead_of_skipping_it() {
     // run, because a run whose only non-success job is skipped summarizes as
     // success.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1746,7 +1793,9 @@ jobs:
 #[tokio::test]
 async fn scenario_06_multi_step_dispatches_all_steps() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1831,7 +1880,9 @@ jobs:
 #[tokio::test]
 async fn scenario_07_step_failure_summarizes_run_failed() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1895,7 +1946,9 @@ jobs:
 #[tokio::test]
 async fn scenario_08_consumer_sees_producer_outputs() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1965,7 +2018,9 @@ jobs:
 #[tokio::test]
 async fn scenario_09_matrix_fail_fast_cancels_siblings() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2068,7 +2123,9 @@ jobs:
 async fn timeline_patch_projects_annotations_to_run_events() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -2170,7 +2227,9 @@ jobs:
 #[tokio::test]
 async fn live_log_key_follows_the_newest_attempt() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, _) = three_step_run_for_log_filters(&app, &state).await;
 
@@ -2218,7 +2277,9 @@ async fn live_log_key_follows_the_newest_attempt() {
 #[tokio::test]
 async fn live_log_websocket_accepts_bearer_and_stores_lines() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2275,7 +2336,9 @@ async fn live_log_websocket_accepts_bearer_and_stores_lines() {
 #[tokio::test]
 async fn live_log_websocket_rejects_unauthenticated() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state, CancellationToken::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2297,7 +2360,9 @@ async fn live_log_websocket_rejects_unauthenticated() {
 #[tokio::test]
 async fn live_log_websocket_accepts_own_job_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
@@ -2363,7 +2428,9 @@ async fn live_log_websocket_accepts_own_job_token() {
 #[tokio::test]
 async fn live_log_websocket_rejects_other_job_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
@@ -2404,7 +2471,9 @@ async fn live_log_websocket_rejects_other_job_token() {
 #[tokio::test]
 async fn live_log_websocket_cross_job_attempt_preserves_history() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
@@ -2508,7 +2577,9 @@ async fn live_log_websocket_cross_job_attempt_preserves_history() {
 #[tokio::test]
 async fn live_log_websocket_rejects_a_settled_jobs_credential() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
@@ -2616,7 +2687,9 @@ async fn live_log_websocket_rejects_a_settled_jobs_credential() {
 #[tokio::test]
 async fn live_log_sse_accepts_own_job_credential() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
@@ -2651,7 +2724,9 @@ async fn live_log_sse_accepts_own_job_credential() {
 #[tokio::test]
 async fn live_log_sse_rejects_other_job_credential() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
@@ -2695,7 +2770,9 @@ async fn live_log_sse_rejects_other_job_credential() {
 #[tokio::test]
 async fn live_log_sse_system_credential_still_reads() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let logical_b = jobs[1].0.clone();
@@ -2713,7 +2790,9 @@ async fn live_log_sse_system_credential_still_reads() {
 #[tokio::test]
 async fn live_log_websocket_survives_malformed_payload() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2776,7 +2855,9 @@ async fn live_log_websocket_survives_malformed_payload() {
 #[tokio::test]
 async fn log_append_persists_payload_bytes() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     request_json(
@@ -2810,7 +2891,9 @@ async fn log_append_persists_payload_bytes() {
 #[tokio::test]
 async fn log_get_run_logs_uses_production_plan_ids_and_numeric_order() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_yaml(
         &app,
@@ -2927,7 +3010,9 @@ results-second
 #[tokio::test]
 async fn log_get_run_logs_falls_back_to_uploaded_step_logs() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_yaml(
         &app,
@@ -2980,7 +3065,9 @@ async fn log_get_run_logs_falls_back_to_uploaded_step_logs() {
 #[tokio::test]
 async fn log_get_run_logs_prefers_larger_step_blobs_over_partial_merged_upload() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
     let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -3010,7 +3097,9 @@ async fn log_get_run_logs_prefers_larger_step_blobs_over_partial_merged_upload()
 #[tokio::test]
 async fn log_get_run_logs_returns_404_for_unknown_run() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let response = app
         .oneshot(
@@ -3031,7 +3120,9 @@ async fn log_get_run_logs_returns_404_for_unknown_run() {
 #[tokio::test]
 async fn log_run_logs_job_filter_returns_only_that_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "build output\n").await;
@@ -3058,7 +3149,9 @@ async fn log_run_logs_job_filter_returns_only_that_job() {
 #[tokio::test]
 async fn log_run_logs_job_filter_accepts_agent_job_uuid() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "build output\n").await;
@@ -3075,7 +3168,9 @@ async fn log_run_logs_job_filter_accepts_agent_job_uuid() {
 #[tokio::test]
 async fn log_run_logs_unknown_job_is_404_not_whole_run() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "build output\n").await;
@@ -3107,7 +3202,9 @@ async fn log_run_logs_unknown_job_is_404_not_whole_run() {
 async fn dispatched_but_unreported_manifests_are_rebuilt_on_restart() {
     let temp = tempfile::tempdir().unwrap();
     let (run_id, plan_id, agent_job_id, ids) = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
         let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -3118,7 +3215,9 @@ async fn dispatched_but_unreported_manifests_are_rebuilt_on_restart() {
         (run_id, jobs[0].1.clone(), jobs[0].2.clone(), ids)
     };
 
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     assert_eq!(
         workflow_step_ids(&state, run_id, "build").await,
@@ -3149,7 +3248,9 @@ async fn dispatched_but_unreported_manifests_are_rebuilt_on_restart() {
 #[tokio::test]
 async fn timeline_path_orders_synthetic_steps_and_skips_the_job_record() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, _) = three_step_run_for_log_filters(&app, &state).await;
     let ids = workflow_step_ids(&state, run_id, "build").await;
@@ -3237,7 +3338,9 @@ async fn timeline_path_orders_synthetic_steps_and_skips_the_job_record() {
 #[tokio::test]
 async fn expansion_purges_the_placeholder_step_manifest() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = submit_yaml(
@@ -3334,7 +3437,9 @@ jobs:
 #[tokio::test]
 async fn expansion_legs_keep_the_baseline_mask_hints() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = submit_yaml(
@@ -3419,7 +3524,9 @@ jobs:
 #[tokio::test]
 async fn live_log_websocket_drops_frames_after_settle() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
@@ -3532,7 +3639,9 @@ async fn live_log_websocket_drops_frames_after_settle() {
 #[tokio::test]
 async fn live_log_websocket_reopen_allowed_while_job_live() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
@@ -3640,7 +3749,9 @@ async fn live_log_websocket_reopen_allowed_while_job_live() {
 #[tokio::test]
 async fn finish_job_plan_token_completes_only_its_bound_request() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
@@ -3687,7 +3798,9 @@ async fn finish_job_plan_token_completes_only_its_bound_request() {
 #[tokio::test]
 async fn finish_job_token_completes_only_its_bound_request() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
@@ -3744,7 +3857,9 @@ async fn finish_job_token_completes_only_its_bound_request() {
 #[tokio::test]
 async fn legacy_timeline_patch_rejects_stale_job_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_simple_run(&app).await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
@@ -3806,7 +3921,9 @@ async fn legacy_timeline_patch_rejects_stale_job_token() {
 #[tokio::test]
 async fn legacy_log_append_rejects_stale_job_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_simple_run(&app).await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
@@ -3884,7 +4001,9 @@ async fn legacy_log_append_rejects_stale_job_token() {
 #[tokio::test]
 async fn legacy_console_log_rejects_stale_job_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_simple_run(&app).await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();

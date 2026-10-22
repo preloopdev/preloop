@@ -421,6 +421,18 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- **The workspace forbids `unsafe`, and nothing mutates the process environment
+  at runtime.** `unsafe_code = "forbid"` now applies to every member, including
+  tests and benchmarks, so `std::env::set_var`/`remove_var` are gone: startup
+  reads the environment once and passes typed configuration, and tests pass
+  explicit values or set a child process's environment with `Command::env`.
+  The App-manifest registration flag (`PRELOOP_ENABLE_APP_REGISTRATION`)
+  resolves into that typed configuration too, instead of being re-read on
+  every request.
+  Raw `libc` calls were replaced with the safe `nix` wrapper, and socket
+  activation now uses `listenfd`. `just test-ci` runs `clippy -D warnings` over
+  the whole workspace plus the structural rules (`just sg-test` and
+  `just sg-scan-strict`).
 - **`preloop serve` (and `preloop init --mode foreground`) is the only way an
   engine starts.** Every command that talks to an
   engine — `run` and `rerun` included, plus `status`, `logs`, `cancel`,

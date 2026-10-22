@@ -1,0 +1,49 @@
+id: no-sensitive-log-fields
+valid:
+  - |
+    fn f() {
+        info!(kind = "blob", size = 3u64, "blob single-shot upload");
+    }
+  - |
+    fn f(path: &Path) {
+        tracing::warn!(path = %path.display(), "failed to scan replay results");
+    }
+  # The word "token" inside the message string is not a field name.
+  - |
+    fn f() {
+        warn!(kind, "rejected blob PUT with invalid kind/token");
+    }
+  - |
+    fn f() {
+        error!(status = 500, "blob commit failed");
+    }
+invalid:
+  # First argument, shorthand form — the known edge case.
+  - |
+    fn f() {
+        info!(token, size = 3u64, "minted");
+    }
+  # Shorthand in middle position, matching the blob PUT shape.
+  - |
+    fn f() {
+        warn!(kind, token, cl, cap, "blob content-length exceeds cap");
+    }
+  # Assigned form, %-display.
+  - |
+    fn f(t: &str) {
+        error!(token = %t, "failed");
+    }
+  # ?-debug shorthand form.
+  - |
+    fn f() {
+        info!(?token, "refreshed");
+    }
+  # Qualified macro + assigned field.
+  - |
+    fn f(h: &str) {
+        tracing::warn!(authorization = %h, "rejected");
+    }
+  - |
+    fn f(u: &str) {
+        info!(signed_url = %u, "uploading");
+    }

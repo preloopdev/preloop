@@ -82,10 +82,48 @@ jobs:
           # bucket and upload nothing. Skip that work instead.
           save-cache: ${{ github.event_name == 'push' }}
       - run: cargo fmt --all --check
-      - run: |
-          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
-          cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
-          cargo clippy --locked -p preloop-runner-server --lib -- -D dead_code
+      # One workspace-wide pass with warnings fatal. The split -p lists this
+      # replaces ran the runner side without -D warnings and never checked
+      # preloop-cli, preloop-observability, preloop-vm, preloop-orchestrator,
+      # preloop-socket-activation or the two benchmark crates at all.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Install ast-grep
+        run: |
+          # ast-grep is not in taiki-e/install-action's supported-tools list
+          # (TOOLS.md at the pinned v2.87.26), so `tool: ast-grep` there would
+          # depend on the unverified cargo-binstall fallback. Install the
+          # pinned release binary directly and verify its sha256, the same way
+          # rust-test installs cargo-nextest. Version matches mise.toml.
+          set -euo pipefail
+          version=0.45.3
+          case "$(uname -m)" in
+            x86_64)
+              asset=app-x86_64-unknown-linux-gnu.zip
+              digest=f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8
+              ;;
+            aarch64|arm64)
+              asset=app-aarch64-unknown-linux-gnu.zip
+              digest=b39cfbc58da4b869a88b8a4bc57bd5deb0d24541e704cf7c257da7b53ec81c8f
+              ;;
+            *)
+              echo "no pinned ast-grep build for $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/ast-grep.zip"
+          curl -fsSL --retry 3 -o "$archive" "https://github.com/ast-grep/ast-grep/releases/download/${version}/${asset}"
+          echo "${digest}  ${archive}" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          # The zip holds `ast-grep` and `sg` at its root; zipfile extraction
+          # drops the exec bit, so restore it explicitly.
+          python3 -m zipfile -e "$archive" "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/ast-grep" "$HOME/.local/bin/sg"
+          "$HOME/.local/bin/ast-grep" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run ast-grep test
+        run: ast-grep test --skip-snapshot-tests
+      - name: Run ast-grep scan --error
+        run: ast-grep scan --error
 
   rust-test:
     # Sharded unit/integration suite. Each shard runs 1/4 of the tests (split

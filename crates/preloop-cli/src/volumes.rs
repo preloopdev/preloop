@@ -87,7 +87,7 @@ struct PruneArgs {
 }
 
 pub(crate) async fn run(args: VolumesArgs) -> anyhow::Result<()> {
-    let provider = AgentEnvProvider::from_environment()
+    let provider = AgentEnvProvider::from_environment(preloop_vm::VmPathConfig::resolve())
         .with_bundle_manifest(preloop_orchestrator::runner_bundle_manifest());
     match args.command {
         VolumesCommand::List => list(&provider).await,

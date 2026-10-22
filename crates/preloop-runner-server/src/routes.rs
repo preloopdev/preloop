@@ -1559,7 +1559,9 @@ mod tests {
     #[tokio::test]
     async fn production_router_builds_and_serves_healthz() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let router = app(state, CancellationToken::new());
         let response = router
             .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
@@ -1854,7 +1856,9 @@ mod tests {
     #[tokio::test]
     async fn webhook_route_reaches_the_handler_through_the_upload_gate() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let router = app(state, CancellationToken::new());
 
         let response = router
@@ -1876,7 +1880,9 @@ mod tests {
     #[tokio::test]
     async fn flow_recording_skips_webhook_uploads() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let flows_path = temp.path().join("flows.jsonl");
         state.inner.lock().await.flows_file = Some(std::fs::File::create(&flows_path).unwrap());
 

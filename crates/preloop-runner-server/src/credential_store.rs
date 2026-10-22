@@ -395,11 +395,14 @@ fn macos_keychain_writable() -> Result<()> {
 }
 /// Resolve the storage directory used for the engine administrator token.
 ///
-/// Managed engines set `PRELOOP_HOME` and use that engine home as the token
-/// storage scope; standalone servers use their state directory directly.
-pub fn engine_token_dir(state_dir: &Path) -> PathBuf {
-    std::env::var_os("PRELOOP_HOME")
-        .filter(|path| !path.is_empty())
+/// Managed engines pass their engine home (the resolved `PRELOOP_HOME`) and
+/// use it as the token storage scope; standalone servers pass `None` and use
+/// their state directory directly. The environment is resolved once at
+/// process startup ([`crate::config::StartupConfig::engine_home`]), never
+/// here.
+pub fn engine_token_dir(state_dir: &Path, engine_home: Option<&Path>) -> PathBuf {
+    engine_home
+        .filter(|path| !path.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.to_path_buf())
 }
@@ -427,8 +430,12 @@ pub fn engine_token_reference(storage_dir: &Path) -> Result<CredentialRef> {
 ///
 /// The selected store is authoritative when reachable. A private `engine.token`
 /// file remains the fallback for headless and service environments.
-pub fn load_engine_token(storage_dir: &Path) -> Result<Option<String>> {
-    let store = engine_store(storage_dir)?;
+pub fn load_engine_token(
+    storage_dir: &Path,
+    config_path: &Path,
+    credential_store_env: Option<&str>,
+) -> Result<Option<String>> {
+    let store = engine_store(storage_dir, config_path, credential_store_env)?;
     load_engine_token_with_store(storage_dir, store.as_ref())
 }
 
@@ -1204,9 +1211,12 @@ pub enum CredentialStoreKind {
 /// `file`), then `file`. Both sources are validated even when the environment
 /// wins, so a typo in the file never hides behind an override. An unknown value
 /// is an error that names the valid ones; it never selects the OS store.
-pub fn selected_kind(configured: Option<&str>) -> Result<CredentialStoreKind> {
-    let env = std::env::var(CREDENTIAL_STORE_ENV).ok();
-    kind_from(env.as_deref(), configured)
+///
+/// `env` is the resolved `PRELOOP_CREDENTIAL_STORE` value (the startup
+/// boundary reads it once — see [`crate::config::StartupConfig`]); it is an
+/// explicit input so precedence is testable without process env.
+pub fn selected_kind(env: Option<&str>, configured: Option<&str>) -> Result<CredentialStoreKind> {
+    kind_from(env, configured)
 }
 
 /// [`selected_kind`] over explicit inputs, so precedence can be tested without
@@ -1247,9 +1257,10 @@ fn kind_from(env: Option<&str>, configured: Option<&str>) -> Result<CredentialSt
 /// file store as a read/write fallback.
 pub fn selected_store(
     state_dir: &Path,
+    env: Option<&str>,
     configured: Option<&str>,
 ) -> Result<Arc<dyn CredentialStore>> {
-    selected_store_at(FileCredentialStore::default_dir(state_dir), configured)
+    selected_store_at(FileCredentialStore::default_dir(state_dir), env, configured)
 }
 
 /// Return the private credential directory associated with a config file.
@@ -1268,17 +1279,19 @@ pub fn credential_store_dir(config_path: &Path) -> PathBuf {
 /// [`selected_store`] using the credential directory beside `config_path`.
 pub fn selected_store_for_config(
     config_path: &Path,
+    env: Option<&str>,
     configured: Option<&str>,
 ) -> Result<Arc<dyn CredentialStore>> {
-    selected_store_at(credential_store_dir(config_path), configured)
+    selected_store_at(credential_store_dir(config_path), env, configured)
 }
 
 fn selected_store_at(
     credentials_dir: PathBuf,
+    env: Option<&str>,
     configured: Option<&str>,
 ) -> Result<Arc<dyn CredentialStore>> {
     let file = FileCredentialStore::new(credentials_dir);
-    Ok(match selected_kind(configured)? {
+    Ok(match selected_kind(env, configured)? {
         // Not cached: a cache would only hide changes made by other processes.
         CredentialStoreKind::File => Arc::new(file.migrating_from(os_credential_store())),
         CredentialStoreKind::Os => {
@@ -1292,17 +1305,19 @@ fn selected_store_at(
     })
 }
 
-/// [`selected_store`] for the engine whose config is active. An explicit
-/// `PRELOOP_CONFIG` wins; otherwise the config is next to `state_dir`, so a
-/// custom `PRELOOP_HOME` does not accidentally read `$HOME/.preloop/config.toml`.
-/// Callers that already hold a parsed config pass its `credential_store` to
-/// [`selected_store`] directly.
-pub fn engine_store(state_dir: &Path) -> Result<Arc<dyn CredentialStore>> {
-    let config_path = std::env::var_os(crate::config::CONFIG_PATH_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state_dir.join("config.toml"));
-    let configured = crate::config::credential_store_setting(&config_path)?;
-    selected_store(state_dir, configured.as_deref())
+/// [`selected_store`] for the engine whose config is active. The caller
+/// resolves the config path (`PRELOOP_CONFIG`-equivalent) and the
+/// `PRELOOP_CREDENTIAL_STORE` value at process startup and passes them
+/// explicitly; the config file's `credential_store` key still comes from
+/// `config_path`, so a custom engine home does not accidentally read
+/// `$HOME/.preloop/config.toml`.
+pub fn engine_store(
+    state_dir: &Path,
+    config_path: &Path,
+    credential_store_env: Option<&str>,
+) -> Result<Arc<dyn CredentialStore>> {
+    let configured = crate::config::credential_store_setting(config_path)?;
+    selected_store(state_dir, credential_store_env, configured.as_deref())
 }
 
 /// Where a credential write landed.
@@ -1333,10 +1348,12 @@ pub struct CredentialWriter {
 
 impl CredentialWriter {
     /// The writer for the engine whose state lives in `state_dir`, under the
-    /// backend [`selected_kind`] picks.
-    pub fn for_home(state_dir: &Path, configured: Option<&str>) -> Result<Self> {
+    /// backend [`selected_kind`] picks (`env` is the resolved
+    /// `PRELOOP_CREDENTIAL_STORE` value; `configured` is the config file key).
+    pub fn for_home(state_dir: &Path, env: Option<&str>, configured: Option<&str>) -> Result<Self> {
         Self::from_file_store(
             FileCredentialStore::new(FileCredentialStore::default_dir(state_dir)),
+            env,
             configured,
         )
     }
@@ -1345,15 +1362,24 @@ impl CredentialWriter {
     ///
     /// The private file fallback is always the `credentials` sibling of the
     /// config file, matching [`selected_store_for_config`].
-    pub fn for_config(config_path: &Path, configured: Option<&str>) -> Result<Self> {
+    pub fn for_config(
+        config_path: &Path,
+        env: Option<&str>,
+        configured: Option<&str>,
+    ) -> Result<Self> {
         Self::from_file_store(
             FileCredentialStore::new(credential_store_dir(config_path)),
+            env,
             configured,
         )
     }
 
-    fn from_file_store(file: FileCredentialStore, configured: Option<&str>) -> Result<Self> {
-        Ok(match selected_kind(configured)? {
+    fn from_file_store(
+        file: FileCredentialStore,
+        env: Option<&str>,
+        configured: Option<&str>,
+    ) -> Result<Self> {
+        Ok(match selected_kind(env, configured)? {
             CredentialStoreKind::Os => Self {
                 store: os_credential_store(),
                 file,
@@ -1589,24 +1615,21 @@ mod tests {
         assert_eq!(store.get(&reference).unwrap(), None);
     }
 
-    /// `selected_store` with `PRELOOP_CREDENTIAL_STORE=memory` hands every caller the same process-wide
+    /// `selected_store` with the `memory` override hands every caller the same process-wide
     /// store: a value written through one selection must be readable through
     /// the next. A fresh instance per call made the config-secrets key
     /// written at seal time unrecoverable when the load path asked a
     /// different empty store for it.
     #[tokio::test]
     async fn env_memory_store_shares_state_across_calls() {
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _env = crate::state::TestEnvVar::set("PRELOOP_CREDENTIAL_STORE", "memory");
-
         let dir = tempfile::tempdir().unwrap();
         let reference = CredentialRef::new("round-trip-across-store-from-env").unwrap();
-        let writer = selected_store(dir.path(), None).unwrap();
+        let writer = selected_store(dir.path(), Some("memory"), None).unwrap();
         writer
             .set(&reference, &SecretString::new("shared-secret"))
             .unwrap();
 
-        let reader = selected_store(dir.path(), None).unwrap();
+        let reader = selected_store(dir.path(), Some("memory"), None).unwrap();
         assert_eq!(
             reader
                 .get(&reference)
@@ -2600,23 +2623,19 @@ mod tests {
     /// Without an OS store there is nothing to fall back to: a failed write is reported.
     #[tokio::test]
     async fn file_writer_reports_its_own_failures() {
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
         let dir = tempfile::tempdir().unwrap();
         // A plain file where the credentials directory belongs makes every write fail.
         std::fs::write(dir.path().join("credentials"), "not a directory").unwrap();
-        let mut writer = CredentialWriter::for_home(dir.path(), None).unwrap();
+        let mut writer = CredentialWriter::for_home(dir.path(), None, None).unwrap();
         let reference = CredentialRef::new("github-pat").unwrap();
         assert!(writer.write(&reference, &SecretString::new("pat")).is_err());
     }
 
     #[tokio::test]
     async fn writer_for_home_defaults_to_the_file_store_under_the_home() {
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
         let dir = tempfile::tempdir().unwrap();
         let reference = CredentialRef::new("github-app-pem-9").unwrap();
-        let mut writer = CredentialWriter::for_home(dir.path(), None).unwrap();
+        let mut writer = CredentialWriter::for_home(dir.path(), None, None).unwrap();
         assert!(matches!(
             writer.write(&reference, &SecretString::new("pem")).unwrap(),
             Written::Selected
@@ -2640,22 +2659,17 @@ mod tests {
     /// the default. Callers reach these through `selected_store`.
     #[tokio::test]
     async fn selected_store_applies_env_then_config_then_default() {
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
-        {
-            let _env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
-            assert_eq!(
-                selected_store(dir.path(), None).unwrap().name(),
-                "file credential store"
-            );
-        }
-        {
-            let _env = crate::state::TestEnvVar::set(CREDENTIAL_STORE_ENV, "memory");
-            assert_eq!(
-                selected_store(dir.path(), Some("file")).unwrap().name(),
-                "memory credential store"
-            );
-        }
+        assert_eq!(
+            selected_store(dir.path(), None, None).unwrap().name(),
+            "file credential store"
+        );
+        assert_eq!(
+            selected_store(dir.path(), Some("memory"), Some("file"))
+                .unwrap()
+                .name(),
+            "memory credential store"
+        );
     }
 
     /// A store that corrupts every write — the motivating failure: a keychain

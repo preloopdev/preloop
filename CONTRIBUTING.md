@@ -25,7 +25,7 @@ Use the right template. Each one collects exactly the evidence a maintainer need
 
 ## Before you open a PR
 
-1. **`just test-ci`** must pass locally (fmt-check + clippy `-D warnings` + zizmor + workspace tests + conform replay).
+1. **`just test-ci`** must pass locally (fmt-check + clippy `-D warnings` + zizmor + ast-grep rule tests + strict scan + workspace tests + control migrations + conform replay).
 2. **Protocol changes** (anything under `/_apis/`, `/broker/`, `/twirp/`, or runner-facing JSON shapes) must be validated against the **official `actions/runner`**, not only unit tests. Use the conformance suite:
    - `just conform` — committed official-runner flow replay (`conform` and
      `conform-server-light` are currently the same replay gate)
@@ -35,6 +35,14 @@ Use the right template. Each one collects exactly the evidence a maintainer need
 3. **Wire-shape changes** to DTOs in `preloop-gha-protocol/src/azdo/` must preserve serde round-trip fidelity. Check golden captures in `.runner-watch/golden/`.
 4. Read the PR template ([`.github/pull_request_template.md`](.github/pull_request_template.md)) and fill in every gate that applies — protocol changes **require** the official-runner validation gate.
 5. **Dependency/policy isolation** — `deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, and `supply-chain/**` may ship only with dependency/policy files, while `Cargo.toml` and `Cargo.lock` join that set only when a third-party lock entry changes; first-party manifest and lockfile edits may ride with code, and a new third-party dependency ships in its own PR first. Run `just supply-chain-guard` before pushing (rule and guard: [`supply-chain/README.md`](supply-chain/README.md)).
+
+## Code conventions
+
+- **No `unsafe`** anywhere — production, tests, benchmarks. The workspace root sets `unsafe_code = "forbid"` (inherited by every crate; `allow`/`expect` cannot lift it), and `std::env::set_var`/`remove_var` — unsafe under edition 2024 — are banned outright, including in tests.
+- **Process env** is read once at startup boundaries, then explicit typed config is passed down; components never use process env as state. Tests take explicit inputs or spawn a child process with `Command::env`/`env_remove`.
+- **Secrets**: `SecretString`, `expose()` only at protocol boundaries. Never log signed URLs at any level (debug/trace included) or raw `GITHUB_ENV` values; new secret fields redact `Debug`.
+- **Lint exceptions** are narrow `#[expect(<lint>, reason = "...")]` only — never for `unsafe_code`. The workspace denies `clippy::{dbg_macro, todo, unimplemented, await_holding_lock}`; no pedantic/unwrap bans.
+- **Tests and fixtures ship with changes**: behavioral tests with explicit inputs (or real child-process env); ast-grep rules need matching and non-matching fixtures — `just sg-test` and `just sg-scan-strict` must pass.
 
 ## Compatibility checklist
 
@@ -100,12 +108,12 @@ has the steps.
 ## Quick start
 
 ```sh
-# Required: Rust 1.97 with rustfmt + clippy (pinned in rust-toolchain.toml)
+# Required: the rust-toolchain.toml toolchain (1.99) with rustfmt + clippy
 just check        # cargo check --workspace
 just fmt          # cargo fmt --all
 just test         # cargo test --workspace --quiet
 just clippy       # cargo clippy --workspace --all-targets -- -D warnings
-just test-ci      # fmt-check + clippy + test (the full CI gate)
+just test-ci      # the full gate: fmt-check + clippy + zizmor + ast-grep + tests + migrations + conform
 ```
 
 Optional: tool versions are pinned in `mise.toml` (zig, cargo-zigbuild, ast-grep, just, cargo-deny). Run `mise install`, then `mise exec -- just <recipe>`. Rust still comes from rustup and `rust-toolchain.toml`. Without mise, the recipes use whatever is on your PATH.

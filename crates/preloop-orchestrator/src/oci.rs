@@ -74,8 +74,12 @@ fn status_error(status: StatusCode) -> OciError {
 /// the tag or digest that identifies one manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OciReference {
+    /// Registry host to talk to (`registry-1.docker.io` for Docker Hub).
     pub registry: String,
+    /// Repository path within the registry; a bare Docker Hub name expands
+    /// into the official `library/` namespace.
     pub repository: String,
+    /// Tag or `sha256:…` digest identifying one manifest; defaults to `latest`.
     pub reference: String,
 }
 
@@ -181,8 +185,11 @@ fn normalize_registry(host: &str) -> String {
 /// The fields of a `Bearer` challenge that drive a token request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BearerChallenge {
+    /// Token endpoint URL to request a bearer token from.
     pub realm: String,
+    /// Registry service name to present in the token request, when named.
     pub service: Option<String>,
+    /// Repository-and-actions scope the token must cover, when named.
     pub scope: Option<String>,
 }
 
@@ -581,6 +588,7 @@ pub fn is_packed_vm_layer(media_type: &str) -> bool {
 /// An OCI manifest: layers for a single image, manifests for an index.
 #[derive(Debug, Deserialize)]
 pub struct OciManifest {
+    /// Layers of the image, in the order they build the rootfs; empty on an index.
     #[serde(default)]
     pub layers: Vec<OciLayer>,
     /// Present on OCI indexes: the listed image manifests to select from.
@@ -588,14 +596,19 @@ pub struct OciManifest {
     pub manifests: Vec<OciDescriptor>,
 }
 
+/// One entry of an OCI index: an image manifest by digest.
 #[derive(Debug, Deserialize)]
 pub struct OciDescriptor {
+    /// Content digest (`sha256:…`) of the referenced manifest.
     pub digest: String,
 }
 
+/// One layer of an image manifest.
 #[derive(Debug, Deserialize)]
 pub struct OciLayer {
+    /// Content digest (`sha256:…`) of the layer blob.
     pub digest: String,
+    /// Layer blob size in bytes, when the manifest reports one.
     #[serde(default)]
     pub size: Option<u64>,
     /// OCI descriptors name this field `mediaType`; without the rename every

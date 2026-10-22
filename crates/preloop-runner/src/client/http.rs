@@ -6,13 +6,29 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use std::path::Path;
 use std::time::Duration;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum HttpError {
-    #[error("HTTP status {status}: {body}")]
+    /// Non-success HTTP status. The raw response body is retained only for
+    /// programmatic classification (e.g. broker `errorKind` checks) and is
+    /// never rendered: response bodies are untrusted and can echo
+    /// credential-bearing request URLs.
+    #[error("HTTP status {status}")]
     Status {
         status: reqwest::StatusCode,
         body: String,
     },
+}
+
+impl std::fmt::Debug for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpError::Status { status, body: _ } => f
+                .debug_struct("Status")
+                .field("status", status)
+                .field("body", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// Runner.Listener reconnect jitter from MessageListener.cs v2.335.1.
@@ -230,15 +246,16 @@ impl HttpClient {
             .header(ACCEPT, "application/json")
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("GET get_json")?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GET {url} returned {status}: {body}");
+            anyhow::bail!("GET get_json returned {status}");
         }
         resp.json()
             .await
-            .with_context(|| format!("parsing GET {url}"))
+            .map_err(|e| e.without_url())
+            .context("parsing GET get_json response")
     }
 
     /// GET request with bearer auth returning JSON.
@@ -254,15 +271,16 @@ impl HttpClient {
             .header(AUTHORIZATION, auth)
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("GET get_json_with_auth")?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GET {url} returned {status}: {body}");
+            anyhow::bail!("GET get_json_with_auth returned {status}");
         }
         resp.json()
             .await
-            .with_context(|| format!("parsing GET {url}"))
+            .map_err(|e| e.without_url())
+            .context("parsing GET get_json_with_auth response")
     }
 
     /// GET request with bearer auth and custom Accept header returning JSON.
@@ -279,15 +297,16 @@ impl HttpClient {
             .header(AUTHORIZATION, auth)
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("GET get_json_with_auth_accept")?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GET {url} returned {status}: {body}");
+            anyhow::bail!("GET get_json_with_auth_accept returned {status}");
         }
         resp.json()
             .await
-            .with_context(|| format!("parsing GET {url}"))
+            .map_err(|e| e.without_url())
+            .context("parsing GET get_json_with_auth_accept response")
     }
 
     /// GET request returning raw bytes.
@@ -297,14 +316,16 @@ impl HttpClient {
             .get(url)
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("GET get_bytes")?;
         let status = resp.status();
         if !status.is_success() {
-            anyhow::bail!("GET {url} returned {status}");
+            anyhow::bail!("GET get_bytes returned {status}");
         }
         resp.bytes()
             .await
-            .with_context(|| format!("reading body of GET {url}"))
+            .map_err(|e| e.without_url())
+            .context("reading body of GET get_bytes")
     }
 
     /// GET request returning raw bytes plus the response headers, so
@@ -319,16 +340,18 @@ impl HttpClient {
             .get(url)
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("GET get_bytes_with_headers")?;
         let status = resp.status();
         if !status.is_success() {
-            anyhow::bail!("GET {url} returned {status}");
+            anyhow::bail!("GET get_bytes_with_headers returned {status}");
         }
         let headers = resp.headers().clone();
         let bytes = resp
             .bytes()
             .await
-            .with_context(|| format!("reading body of GET {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("reading body of GET get_bytes_with_headers")?;
         Ok((bytes, headers))
     }
 
@@ -363,14 +386,17 @@ impl HttpClient {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    last_err = Some(anyhow::anyhow!("POST {url}: {e}"));
+                    last_err = Some(
+                        anyhow::Error::new(e.without_url()).context("POST post_json_with_auth"),
+                    );
                     continue;
                 }
             };
             let status = resp.status();
             if is_transient_status(status) {
-                let body_text = resp.text().await.unwrap_or_default();
-                last_err = Some(anyhow::anyhow!("POST {url} returned {status}: {body_text}"));
+                last_err = Some(anyhow::anyhow!(
+                    "POST post_json_with_auth returned {status}"
+                ));
                 continue;
             }
             if !status.is_success() {
@@ -378,11 +404,14 @@ impl HttpClient {
                 return Err(anyhow::Error::new(HttpError::Status {
                     status,
                     body: body_text,
-                }));
+                })
+                .context("POST post_json_with_auth"));
             }
-            return json_or_null(resp, &format!("parsing POST {url}")).await;
+            return json_or_null(resp, "parsing POST post_json_with_auth response").await;
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("POST {url} failed after 3 retries")))
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("POST post_json_with_auth"))
+            .context("POST post_json_with_auth failed after 3 attempts"))
     }
 
     /// POST JSON with custom authorization, Accept, and Content-Type headers.
@@ -421,13 +450,19 @@ impl HttpClient {
             .json(body)
             .send()
             .await
-            .with_context(|| format!("POST {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("POST post_json_with_auth_headers_extra")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(HttpError::Status { status, body }));
+            return Err(anyhow::Error::new(HttpError::Status { status, body })
+                .context("POST post_json_with_auth_headers_extra"));
         }
-        json_or_null(resp, &format!("parsing POST {url}")).await
+        json_or_null(
+            resp,
+            "parsing POST post_json_with_auth_headers_extra response",
+        )
+        .await
     }
 
     /// POST form-encoded data returning JSON.
@@ -443,15 +478,18 @@ impl HttpClient {
             .header(ACCEPT, "application/json")
             .send()
             .await
-            .with_context(|| format!("POST form {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("POST post_form_json")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(HttpError::Status { status, body }));
+            return Err(anyhow::Error::new(HttpError::Status { status, body })
+                .context("POST post_form_json"));
         }
         resp.json()
             .await
-            .with_context(|| format!("parsing POST form {url}"))
+            .map_err(|e| e.without_url())
+            .context("parsing POST post_form_json response")
     }
 
     /// POST JSON with bearer auth, returning JSON.
@@ -481,15 +519,18 @@ impl HttpClient {
             .json(body)
             .send()
             .await
-            .with_context(|| format!("PATCH {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("PATCH patch_json_bearer")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(HttpError::Status { status, body }));
+            return Err(anyhow::Error::new(HttpError::Status { status, body })
+                .context("PATCH patch_json_bearer"));
         }
         resp.json()
             .await
-            .with_context(|| format!("parsing PATCH {url}"))
+            .map_err(|e| e.without_url())
+            .context("parsing PATCH patch_json_bearer response")
     }
 
     /// DELETE with bearer auth.
@@ -500,11 +541,13 @@ impl HttpClient {
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .send()
             .await
-            .with_context(|| format!("DELETE {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("DELETE delete_with_token")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(HttpError::Status { status, body }));
+            return Err(anyhow::Error::new(HttpError::Status { status, body })
+                .context("DELETE delete_with_token"));
         }
         Ok(())
     }
@@ -524,11 +567,13 @@ impl HttpClient {
             .header(header_name, header_value)
             .send()
             .await
-            .with_context(|| format!("DELETE {url}"))?;
+            .map_err(|e| e.without_url())
+            .context("DELETE delete_with_token_header")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(HttpError::Status { status, body }));
+            return Err(anyhow::Error::new(HttpError::Status { status, body })
+                .context("DELETE delete_with_token_header"));
         }
         Ok(())
     }
@@ -558,23 +603,26 @@ impl HttpClient {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    last_err = Some(anyhow::anyhow!("PUT {url}: {e}"));
+                    last_err = Some(anyhow::Error::new(e.without_url()).context("PUT put_bytes"));
                     continue;
                 }
             };
             let status = resp.status();
             if is_transient_status(status) {
-                let body = resp.text().await.unwrap_or_default();
-                last_err = Some(anyhow::anyhow!("PUT {url} returned {status}: {body}"));
+                last_err = Some(anyhow::anyhow!("PUT put_bytes returned {status}"));
                 continue;
             }
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                return Err(anyhow::Error::new(HttpError::Status { status, body }));
+                return Err(
+                    anyhow::Error::new(HttpError::Status { status, body }).context("PUT put_bytes")
+                );
             }
             return Ok(());
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PUT {url} failed after 3 retries")))
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("PUT put_bytes"))
+            .context("PUT put_bytes failed after 3 attempts"))
     }
 
     /// PUT bytes with Bearer token authentication (for AzDO log append).
@@ -607,23 +655,26 @@ impl HttpClient {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    last_err = Some(anyhow::anyhow!("PUT {url}: {e}"));
+                    last_err =
+                        Some(anyhow::Error::new(e.without_url()).context("PUT put_bytes_bearer"));
                     continue;
                 }
             };
             let status = resp.status();
             if is_transient_status(status) {
-                let body = resp.text().await.unwrap_or_default();
-                last_err = Some(anyhow::anyhow!("PUT {url} returned {status}: {body}"));
+                last_err = Some(anyhow::anyhow!("PUT put_bytes_bearer returned {status}"));
                 continue;
             }
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                return Err(anyhow::Error::new(HttpError::Status { status, body }));
+                return Err(anyhow::Error::new(HttpError::Status { status, body })
+                    .context("PUT put_bytes_bearer"));
             }
             return Ok(());
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PUT {url} failed after 3 retries")))
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("PUT put_bytes_bearer"))
+            .context("PUT put_bytes_bearer failed after 3 attempts"))
     }
 
     /// Build a long-poll GET request with timeout.
@@ -645,7 +696,11 @@ impl HttpClient {
             Ok(r) => {
                 let status = r.status();
                 if status == reqwest::StatusCode::OK {
-                    let body: T = r.json().await?;
+                    let body: T = r
+                        .json()
+                        .await
+                        .map_err(|e| e.without_url())
+                        .context("parsing GET get_long_poll response")?;
                     Ok(Some(body))
                 } else if status == reqwest::StatusCode::ACCEPTED
                     || status == reqwest::StatusCode::NO_CONTENT
@@ -654,11 +709,12 @@ impl HttpClient {
                     Ok(None)
                 } else {
                     let body = r.text().await.unwrap_or_default();
-                    Err(anyhow::Error::new(HttpError::Status { status, body }))
+                    Err(anyhow::Error::new(HttpError::Status { status, body })
+                        .context("GET get_long_poll"))
                 }
             }
             Err(e) if e.is_timeout() => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(anyhow::Error::new(e.without_url()).context("GET get_long_poll")),
         }
     }
 }
@@ -667,7 +723,11 @@ async fn json_or_null<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
     context: &str,
 ) -> Result<T> {
-    let text = resp.text().await.with_context(|| context.to_string())?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| e.without_url())
+        .with_context(|| context.to_string())?;
     if text.trim().is_empty() {
         serde_json::from_value(serde_json::Value::Null).with_context(|| context.to_string())
     } else {
@@ -852,6 +912,62 @@ mod tests {
                 assert_eq!(*status, reqwest::StatusCode::FORBIDDEN);
                 assert_eq!(body, "signed url expired");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn rendered_status_errors_omit_url_tokens_and_response_body() {
+        let (base, _request_rx) =
+            serve_once("403 Forbidden", r#"{"message":"body-SECRET-echo"}"#).await;
+        let url = format!("{base}/twirp-blob/logs/path-SECRET?sig=query-SECRET");
+        let client = HttpClient::new(None).unwrap();
+
+        let err = client
+            .put_bytes(&url, b"log-data".to_vec(), "text/plain")
+            .await
+            .unwrap_err();
+
+        // Typed classification data (status + body) survives for callers.
+        let http_err = err
+            .downcast_ref::<HttpError>()
+            .expect("expected typed HttpError");
+        match http_err {
+            HttpError::Status { status, body } => {
+                assert_eq!(*status, reqwest::StatusCode::FORBIDDEN);
+                assert_eq!(body, r#"{"message":"body-SECRET-echo"}"#);
+            }
+        }
+
+        // Rendered chains carry status + operation, never secrets or the
+        // raw response body.
+        for rendered in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(!rendered.contains("SECRET"), "leaked secret: {rendered}");
+            assert!(rendered.contains("403"), "lost status: {rendered}");
+            assert!(rendered.contains("put_bytes"), "lost operation: {rendered}");
+        }
+        let debug = format!("{http_err:?}");
+        assert!(
+            !debug.contains("body-SECRET-echo"),
+            "Debug leaks body: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rendered_transport_errors_omit_request_url() {
+        // Bind and release a port so the connect fails immediately.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = HttpClient::new(None).unwrap();
+        let err = client
+            .get_bytes(&format!("http://{addr}/blob/path-SECRET?sig=query-SECRET"))
+            .await
+            .unwrap_err();
+
+        for rendered in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(!rendered.contains("SECRET"), "leaked secret: {rendered}");
+            assert!(rendered.contains("get_bytes"), "lost operation: {rendered}");
         }
     }
 

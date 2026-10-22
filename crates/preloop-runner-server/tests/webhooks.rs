@@ -68,7 +68,7 @@ async fn snapshot_before_sha_tracks_working_tree_state() {
 async fn terminal_run_discards_workspace_snapshot_but_preserves_object_cache() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
-    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    let mut state = AppState::new_for_tests(state_dir.clone()).await.unwrap();
     state.local_workspace = Some(workspace);
     state.snapshot_retention_seconds = 0;
     let app = app(state.clone(), CancellationToken::new());
@@ -143,7 +143,9 @@ async fn submit_rejects_invalid_schedule_cron() {
     // GitHub rejects an unparsable `on.schedule` cron at workflow save; aksh
     // rejects it at submit instead of registering a cron job that never fires.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let response = request_json_status(
@@ -543,7 +545,9 @@ async fn claim_remints_expired_snapshot_checkout_tokens() {
         Some(vec!["00000000-0000-0000-0000-000000000020".to_owned()]);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
 
     let refreshed = crate::broker::re_mint_snapshot_credentials(&mut message, &state);
     assert_eq!(refreshed, 1);
@@ -595,7 +599,9 @@ async fn claim_remints_snapshot_origin_credential_without_checkout() {
         });
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     assert_eq!(
         crate::broker::re_mint_snapshot_credentials(&mut message, &state),
         0,
@@ -629,7 +635,7 @@ async fn claim_remints_snapshot_origin_credential_without_checkout() {
 async fn claim_remints_snapshot_tokens_on_the_real_claim_path() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
-    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    let mut state = AppState::new_for_tests(state_dir.clone()).await.unwrap();
     state.local_workspace = Some(workspace.clone());
     let app = app(state.clone(), CancellationToken::new());
 
@@ -746,7 +752,7 @@ jobs:
 async fn snapshot_git_rejects_a_completed_jobs_token() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
-    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    let mut state = AppState::new_for_tests(state_dir.clone()).await.unwrap();
     state.local_workspace = Some(workspace.clone());
     let app = app(state.clone(), CancellationToken::new());
 
@@ -835,7 +841,7 @@ jobs:
 async fn claimed_runtime_token_covers_a_declared_longer_job_timeout() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
-    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    let mut state = AppState::new_for_tests(state_dir.clone()).await.unwrap();
     state.local_workspace = Some(workspace.clone());
     let app = app(state.clone(), CancellationToken::new());
 
@@ -928,7 +934,7 @@ async fn claimed_job_timeout_and_token_are_clamped_to_the_github_maximum() {
 
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
-    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    let mut state = AppState::new_for_tests(state_dir.clone()).await.unwrap();
     state.local_workspace = Some(workspace.clone());
     let app = app(state.clone(), CancellationToken::new());
 
@@ -1028,7 +1034,9 @@ jobs:
 #[tokio::test]
 async fn retry_verdict_carries_a_fresh_snapshot_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1139,11 +1147,10 @@ async fn verdict_poll_releases_inner_before_the_backend_read() {
         return;
     };
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new_with_store(
+    let state = AppState::new_for_tests_with_store(
         temp.path().to_path_buf(),
         crate::config::config_path(),
-        Some(&pg_url),
-        None,
+        Some(pg_url.as_str()),
     )
     .await
     .unwrap();
@@ -1276,7 +1283,7 @@ fn azdo_delivered_body(state: &AppState, message: &Value, session_id: &str) -> V
 async fn azdo_session_delivery_remints_the_pinned_snapshot_token() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
-    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    let mut state = AppState::new_for_tests(state_dir.clone()).await.unwrap();
     state.local_workspace = Some(workspace.clone());
     let app = app(state.clone(), CancellationToken::new());
 
@@ -1337,7 +1344,7 @@ jobs:
 async fn snapshot_origin_rewrite_header_is_reminted_at_delivery() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
-    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    let mut state = AppState::new_for_tests(state_dir.clone()).await.unwrap();
     state.local_workspace = Some(workspace.clone());
     let app = app(state.clone(), CancellationToken::new());
 
@@ -1415,7 +1422,9 @@ jobs:
 #[tokio::test]
 async fn snapshot_401_advertises_a_bearer_challenge() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let response = app
@@ -1449,13 +1458,13 @@ async fn snapshot_401_advertises_a_bearer_challenge() {
 async fn local_workspace_checkout_acquires_synthetic_repository_and_serves_git_http() {
     // `AppState::new` captures `PRELOOP_GITHUB_TOKEN` / `PRELOOP_GITHUB_APP_*`
     // from the process env, and the claim path reads `PRELOOP_GITHUB_API_URL`
-    // live. Hold the env lock so a concurrent env-mutating test cannot make
-    // this job carry a foreign PAT (which would 401 the snapshot Git auth
-    // instead of 403 on the wrong-run probe).
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // live. No PAT is configured on this state, so a foreign credential
+    // cannot make this job 401 the snapshot Git auth instead of 403 on the
+    // wrong-run probe.
+    let startup = stub_startup(None, None);
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
-    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    let mut state = AppState::new(state_dir.clone(), startup).await.unwrap();
     state.local_workspace = Some(workspace.clone());
     let app = app(state.clone(), CancellationToken::new());
 
@@ -1571,7 +1580,7 @@ jobs:
     let server_url = checkout_input(checkout, "github-server-url")
         .expect("checkout server URL should be rewritten");
     assert_eq!(repository, format!("snapshots/{run_id}"));
-    assert_eq!(server_url, public_base_url());
+    assert_eq!(server_url, state.public_base_url());
     assert_eq!(commit.len(), 40);
     assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(acquired["snapshot"], Value::Null);
@@ -1788,10 +1797,10 @@ jobs:
 /// workflow has no `actions/checkout` step to trigger checkout redirection.
 #[tokio::test]
 async fn local_workspace_snapshot_marker_is_sent_without_checkout() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let startup = stub_startup(None, None);
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
-    let mut state = AppState::new(state_dir).await.unwrap();
+    let mut state = AppState::new(state_dir, startup).await.unwrap();
     state.local_workspace = Some(workspace);
     let app = app(state.clone(), CancellationToken::new());
 
@@ -1890,7 +1899,7 @@ jobs:
 /// those objects.
 #[tokio::test]
 async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let startup = stub_startup(None, None);
     let temp = tempfile::tempdir().unwrap();
     let state_dir = temp.path().join("state");
     let upstream_root = temp.path().join("upstream");
@@ -1916,7 +1925,7 @@ async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
         .trim()
         .to_owned();
 
-    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    let mut state = AppState::new(state_dir.clone(), startup).await.unwrap();
     state.checkout_cache = crate::config::CheckoutCacheConfig {
         mode: crate::config::CheckoutCacheMode::RunScoped,
         ..Default::default()
@@ -2019,7 +2028,7 @@ async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
         |name: &str| -> Option<String> { cached_checkout_input(checkout, name).map(str::to_owned) };
     assert_eq!(inputs("ref").as_deref(), Some(commit.as_str()));
     assert_eq!(inputs("repository"), Some(format!("snapshots/{run_id}")));
-    assert_eq!(inputs("github-server-url"), Some(public_base_url()));
+    assert_eq!(inputs("github-server-url"), Some(state.public_base_url()));
     // The forge origin is left alone: the commit exists upstream, and the cache
     // holds only that commit.
     assert_eq!(acquired["snapshotOriginRewrite"], Value::Null);
@@ -2183,7 +2192,9 @@ async fn pull_request_submission_uses_head_sha_not_zeros() {
     // its remote for `0000…` and dies with "not our ref 0000…", which points
     // nowhere near the real cause.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2222,7 +2233,9 @@ async fn pull_request_submission_uses_short_ref_name_and_job_id() {
     // the `system.github.job` variable. Previously `ref_name` leaked the full
     // `refs/pull/7/merge` and `github.job`/`GITHUB_JOB` were empty.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2850,7 +2863,9 @@ async fn strict_non_pool_mode_keeps_a_stale_binding_claimable() {
 async fn permissive_default_keeps_unverified_claims_working() {
     let temp = tempfile::tempdir().unwrap();
     // Pool-management flags stay off — the external-runner default.
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = submit_simple_run(&app).await;
@@ -2939,7 +2954,9 @@ async fn delete_agent_purges_identity_and_requeues_assignment() {
     }
 
     // A restart must not resurrect the deleted identity from a stale snapshot.
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let recovered_inner = recovered.test_tx().await;
     assert!(!recovered_inner.runners.contains_key(&runner_a));
     assert!(
@@ -2953,7 +2970,9 @@ async fn delete_agent_purges_identity_and_requeues_assignment() {
 #[tokio::test]
 async fn control_socket_surface_denies_native_and_test_apis() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     // Mirror the bootstrap wiring: the socket router is the full router plus
     // the runner-surface guard.
     let socket_app = app(state.clone(), CancellationToken::new())
@@ -3132,7 +3151,9 @@ async fn control_socket_surface_denies_native_and_test_apis() {
 #[tokio::test]
 async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let plan = uuid::Uuid::new_v4().to_string();
     let job = uuid::Uuid::new_v4().to_string();
@@ -3243,7 +3264,9 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
 #[tokio::test]
 async fn replay_job_log_upload_is_published_as_one_complete_file() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_yaml(
         &app,
@@ -3342,7 +3365,9 @@ jobs:
 #[tokio::test]
 async fn replay_blob_urls_are_minted_only_for_the_callers_own_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let plan = uuid::Uuid::new_v4().to_string();
     let my_job = uuid::Uuid::new_v4();
@@ -3432,7 +3457,9 @@ async fn replay_blob_urls_are_minted_only_for_the_callers_own_job() {
 #[tokio::test]
 async fn results_uuid_spellings_use_canonical_paths_and_metadata_keys() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let plan = uuid::Uuid::parse_str("fedcba98-7654-4321-89ab-cdef01234567")
         .unwrap()
@@ -3780,7 +3807,9 @@ async fn results_storage_uses_the_tokens_own_plan_not_the_orchestration_spelling
 #[tokio::test]
 async fn alternate_results_job_spelling_preserves_canonical_log_lookup() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (_, plan, canonical) = jobs
@@ -3850,7 +3879,9 @@ async fn alternate_results_job_spelling_preserves_canonical_log_lookup() {
 #[tokio::test]
 async fn results_reject_cross_job_and_malformed_uuid_targets() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let plan = "plan-1";
     let own_job = uuid::Uuid::parse_str("01234567-89ab-4cde-8fab-cdef01234567").unwrap();
@@ -3949,7 +3980,9 @@ async fn results_reject_cross_job_and_malformed_uuid_targets() {
 #[tokio::test]
 async fn system_results_token_preserves_opaque_identifier_compatibility() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let payload = request_json_with_bearer(
         &app,
@@ -3993,7 +4026,9 @@ async fn system_results_token_preserves_opaque_identifier_compatibility() {
 #[tokio::test]
 async fn results_workflow_steps_require_the_calling_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (_, plan_a, agent_a) = jobs
@@ -4114,7 +4149,9 @@ async fn results_workflow_steps_require_the_calling_job() {
 #[tokio::test]
 async fn results_metadata_requires_the_calling_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (_, plan_a, agent_a) = jobs

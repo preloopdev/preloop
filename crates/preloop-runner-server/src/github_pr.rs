@@ -107,7 +107,9 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
         "CI run `{run_id}` completed with `success`.\n\n\
          - Head: `{branch}`\n\
          - Details: {}",
-        crate::github::run_details_url(run_id)
+        shared
+            .state
+            .run_details_url(run_id)
             .unwrap_or_else(|| "local server (no public URL configured)".to_owned())
     );
     let pr = crate::github_push::github_json(
@@ -398,16 +400,16 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, stub).await.unwrap();
         });
-        // The GitHub env vars are process-global; serialize against every
-        // other test that pins them (see the push-back test pattern).
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _api_url =
-            crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://{addr}"));
-
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut state = crate::AppState::new(
+            temp.path().to_path_buf(),
+            crate::config::StartupConfig {
+                github_api_url: Some(format!("http://{addr}")),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         state.github_pat = Some(preloop_gha_protocol::SecretString::new(String::from(
             "test-pat",
         )));
@@ -530,13 +532,16 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, stub).await.unwrap();
         });
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _api_url =
-            crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://{addr}"));
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut state = crate::AppState::new(
+            temp.path().to_path_buf(),
+            crate::config::StartupConfig {
+                github_api_url: Some(format!("http://{addr}")),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         state.github_pat = Some(preloop_gha_protocol::SecretString::new(String::from(
             "test-pat",
         )));
@@ -630,7 +635,7 @@ mod tests {
         let head_tree = git(&["rev-parse", "HEAD^{tree}"]);
         std::fs::write(ws.join("file.txt"), "v2\n").unwrap();
 
-        let state = crate::AppState::new(temp.path().join("state").to_path_buf())
+        let state = crate::AppState::new_for_tests(temp.path().join("state").to_path_buf())
             .await
             .unwrap();
         let app = crate::app(state.clone(), CancellationToken::new());

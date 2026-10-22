@@ -9,7 +9,9 @@ use common::*;
 async fn all_twirp_api_routes_reject_missing_bearer_before_body_validation() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -53,7 +55,9 @@ async fn all_twirp_api_routes_reject_missing_bearer_before_body_validation() {
 #[tokio::test]
 async fn results_cache_and_artifact_routes_reject_inconsistent_bearers() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let subject_job = uuid::Uuid::new_v4();
     let other_job = uuid::Uuid::new_v4();
@@ -198,7 +202,9 @@ async fn results_cache_and_artifact_routes_reject_inconsistent_bearers() {
 #[tokio::test]
 async fn results_metadata_noop_requests_require_strict_identity() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     // The Results route guard validates typed identity before body extraction,
     // so malformed identity tokens cannot take the metadata no-op path.
@@ -236,7 +242,9 @@ async fn results_metadata_noop_requests_require_strict_identity() {
 #[tokio::test]
 async fn twirp_metadata_routes_persist_log_metadata() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let requests = [
         (
@@ -298,7 +306,9 @@ async fn twirp_metadata_routes_persist_log_metadata() {
 #[tokio::test]
 async fn job_results_metadata_cannot_overwrite_another_job_namespace() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let plan_a = uuid::Uuid::new_v4().to_string();
     let plan_b = uuid::Uuid::new_v4().to_string();
@@ -378,7 +388,9 @@ async fn job_results_metadata_cannot_overwrite_another_job_namespace() {
 #[tokio::test]
 async fn job_results_token_cannot_update_another_jobs_steps() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_, jobs) = two_job_run_for_log_filters(&app, &state).await;
     let (_, plan_id, own_agent_job_id) = jobs[0].clone();
@@ -448,7 +460,9 @@ async fn job_results_token_cannot_update_another_jobs_steps() {
 #[tokio::test]
 async fn twirp_step_metadata_rejects_missing_step_backend_id() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let requests = [
         (
@@ -487,7 +501,9 @@ async fn twirp_step_metadata_rejects_missing_step_backend_id() {
 #[tokio::test]
 async fn twirp_diag_route_rejects_runner_listen_scope() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let plan_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4();
@@ -525,7 +541,9 @@ async fn twirp_diag_route_rejects_runner_listen_scope() {
 #[tokio::test]
 async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let plan_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4();
@@ -622,7 +640,9 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
 #[tokio::test]
 async fn blob_single_shot_streams_to_disk_and_roundtrips() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
@@ -684,7 +704,9 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
 #[tokio::test]
 async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
@@ -811,7 +833,9 @@ async fn blob_cache_block_upload_accepts_sdk_sized_blocks() {
     // lives on /tmp (a 512M tmpfs here), so 256 MiB staged + 256 MiB
     // assembled would exhaust it for reasons unrelated to the fix.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
@@ -891,7 +915,9 @@ async fn blob_block_upload_still_rejects_blocks_over_cap() {
     // Blocks larger than the per-block cap are still rejected
     // with 413 via the early Content-Length check.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
@@ -925,7 +951,9 @@ async fn blob_block_upload_midstream_cap_rejects_without_temp_file() {
     // mid-stream with 413 and leave no temp file behind. Memory-light: only
     // one 1 MiB chunk is live at a time.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
@@ -978,7 +1006,9 @@ async fn blob_block_upload_midstream_cap_rejects_without_temp_file() {
 #[tokio::test]
 async fn native_api_rejects_job_runtime_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let token = state.mint_runtime_token("plan", &uuid::Uuid::new_v4());
     let app = app(state, CancellationToken::new());
 
@@ -1016,7 +1046,9 @@ async fn native_api_rejects_job_runtime_token() {
 async fn runner_server_v1_sensitive_routes_require_bearer() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -1070,7 +1102,9 @@ async fn runner_server_v1_sensitive_routes_require_bearer() {
 #[tokio::test]
 async fn admin_deletes_reject_job_tokens_and_confine_runners_to_themselves() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let runtime_token = state.mint_runtime_token("plan-delete-auth", &uuid::Uuid::new_v4());
     let app = app(state, CancellationToken::new());
 
@@ -1149,7 +1183,9 @@ async fn admin_deletes_reject_job_tokens_and_confine_runners_to_themselves() {
 #[tokio::test]
 async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -1365,7 +1401,9 @@ async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
 #[tokio::test]
 async fn update_agent_is_self_only_for_runner_tokens() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (runner_a, token_a) =
@@ -1441,7 +1479,9 @@ async fn update_agent_is_self_only_for_runner_tokens() {
 #[tokio::test]
 async fn disttask_message_delete_stays_reachable_for_protocol_tokens() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (runner_id, listen_token) =
         register_runner_with_token(&app, "message-ack-runner", &["self-hosted"], None).await;
@@ -1468,7 +1508,9 @@ async fn listener_token_lifecycle_calls_require_runtime_token() {
     use std::sync::atomic::Ordering::Relaxed;
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (runner_id, listen_token) =
         register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
@@ -1622,7 +1664,9 @@ async fn listener_token_lifecycle_calls_require_runtime_token() {
 #[tokio::test]
 async fn legacy_runner_aliases_require_registration_and_bound_runner_credentials() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let socket_app = app
         .clone()
@@ -1887,7 +1931,9 @@ async fn legacy_runner_aliases_require_registration_and_bound_runner_credentials
 #[tokio::test]
 async fn legacy_agent_requests_are_bound_to_runner_identity() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (runner_a, token_a) =
@@ -1985,7 +2031,9 @@ async fn legacy_agent_requests_are_bound_to_runner_identity() {
 #[tokio::test]
 async fn legacy_provision_token_is_consumed_atomically() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     stage_provision_token(&state, "concurrent-provision");
 
@@ -2032,7 +2080,9 @@ async fn legacy_provision_token_is_consumed_atomically() {
 #[tokio::test]
 async fn released_agent_requests_are_not_settleable_by_other_runners() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let (runner_a, token_a) =
@@ -2093,7 +2143,9 @@ async fn released_agent_requests_are_not_settleable_by_other_runners() {
 #[tokio::test]
 async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let workflow = json!({
@@ -2187,7 +2239,9 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
 #[tokio::test]
 async fn results_surfaces_agree_on_alternate_uuid_scope_spelling() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     request_json(
@@ -2279,7 +2333,9 @@ async fn results_surfaces_agree_on_alternate_uuid_scope_spelling() {
 #[tokio::test]
 async fn oidc_default_audience_is_owner_url() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let workflow = json!({
@@ -2316,7 +2372,9 @@ async fn oidc_default_audience_is_owner_url() {
 #[tokio::test]
 async fn oidc_forbidden_without_id_token_write() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let workflow = json!({
@@ -2354,7 +2412,9 @@ async fn oidc_forbidden_without_id_token_write() {
 #[tokio::test]
 async fn oidc_discovery_and_jwks_endpoints() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state, CancellationToken::new());
 
     let discovery = request_json(
@@ -2413,7 +2473,9 @@ async fn oidc_discovery_and_jwks_endpoints() {
 #[tokio::test]
 async fn oidc_keypair_persists_across_restarts() {
     let temp = tempfile::tempdir().unwrap();
-    let state1 = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state1 = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let (kid1, x5t1, certificate_der1) = {
         let inner = state1.inner.lock().await;
         let keypair = inner.oidc_keypair.as_ref().unwrap();
@@ -2431,7 +2493,9 @@ async fn oidc_keypair_persists_across_restarts() {
     assert_eq!(x5t1, expected_x5t1);
     drop(state1);
     // Second instance should load the same keypair and certificate.
-    let state2 = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state2 = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
 
     let (kid2, x5t2, certificate_der2) = {
         let inner = state2.inner.lock().await;
@@ -2461,12 +2525,16 @@ async fn oidc_keypair_persists_across_restarts() {
 #[tokio::test]
 async fn oidc_malformed_certificate_sidecar_rejects_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     drop(state);
 
     std::fs::write(temp.path().join("oidc-cert.der"), b"not a DER certificate").unwrap();
     assert!(
-        AppState::new(temp.path().to_path_buf()).await.is_err(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .is_err(),
         "startup must reject a malformed persisted OIDC certificate"
     );
 }
@@ -2475,7 +2543,9 @@ async fn oidc_malformed_certificate_sidecar_rejects_restart() {
 async fn messages_redeliver_until_delete_ack() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -2550,7 +2620,9 @@ jobs:
 async fn cancel_run_delivers_cancellation_message() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -2663,15 +2735,17 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    // `TestEnvVar` restores both on drop, so a panicking assertion below
-    // cannot leak this stub's address (or its token) onto the rest of the run.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _api_url =
-        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "cancel-test-token");
+    // The stub base and token ride the test startup config, so they cannot
+    // leak onto the rest of the run.
+    let startup = stub_startup(
+        Some(&format!("http://127.0.0.1:{port}")),
+        Some("cancel-test-token"),
+    );
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = request_json(
         &app,
@@ -2767,12 +2841,14 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _api_url =
-        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "annotation-test-token");
+    let startup = stub_startup(
+        Some(&format!("http://127.0.0.1:{port}")),
+        Some("annotation-test-token"),
+    );
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_simple_run(&app).await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
@@ -2846,7 +2922,9 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
 #[tokio::test]
 async fn cancel_run_refreshes_runner_pool_queue_metadata() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let first = request_json(
         &app,
@@ -2909,7 +2987,9 @@ async fn cancel_run_refreshes_runner_pool_queue_metadata() {
 #[tokio::test]
 async fn disttask_claim_refreshes_runner_pool_queue_metadata() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     for (runs_on, marker) in [("ubuntu-22.04", "first"), ("ubuntu-24.04", "second")] {
         request_json(
@@ -2978,7 +3058,9 @@ async fn disttask_claim_refreshes_runner_pool_queue_metadata() {
 async fn message_poll_waits_until_work_is_enqueued() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let poll_app = app.clone();
@@ -3026,7 +3108,9 @@ jobs:
 #[tokio::test]
 async fn disttask_poll_surfaces_control_db_failures() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     // The poll's first statement after materializing the implicit compat
     // session reads `session_messages`; dropping it makes the backend fail.
@@ -3061,7 +3145,9 @@ async fn disttask_poll_surfaces_control_db_failures() {
 #[tokio::test]
 async fn timeline_read_surfaces_control_db_failures() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     state
         .test_db_mutate(|tx| {
@@ -3095,7 +3181,9 @@ async fn timeline_read_surfaces_control_db_failures() {
 #[tokio::test]
 async fn settled_job_token_cannot_mutate_timeline_records() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_simple_run(&app).await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
@@ -3166,7 +3254,9 @@ async fn settled_job_token_cannot_mutate_timeline_records() {
 #[tokio::test]
 async fn timeline_patch_surfaces_control_db_failures() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let run = submit_simple_run(&app).await;
     let _ = run;
@@ -3221,7 +3311,9 @@ async fn timeline_patch_surfaces_control_db_failures() {
 #[tokio::test]
 async fn session_message_flow_encrypts_decryptable_job_body() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let _keypair = {
         let inner = state.inner.lock().await;
         inner.agent_keypair.clone().unwrap()
@@ -3289,7 +3381,9 @@ jobs:
 async fn submit_run_uses_branch_and_path_filters() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -3365,7 +3459,9 @@ jobs:
 #[tokio::test]
 async fn test_get_scheduler_history_endpoint() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let scheduler = crate::scheduler::Scheduler::new();
 
     // Add a mock fire to history
@@ -3402,7 +3498,9 @@ async fn test_get_scheduler_history_endpoint() {
 async fn cache_protocol_reserves_uploads_commits_and_restores() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -3473,7 +3571,9 @@ async fn cache_protocol_reserves_uploads_commits_and_restores() {
 async fn artifact_endpoint_stores_and_downloads_payload() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let run_id = RunId::new();
@@ -3511,7 +3611,9 @@ async fn artifact_endpoint_stores_and_downloads_payload() {
 #[tokio::test]
 async fn full_runner_lifecycle_register_session_poll_complete() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // connectionData
@@ -3621,7 +3723,9 @@ async fn the_wire_token_permissions_match_the_declared_policy() {
         ),
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
 
         request_json(
@@ -3664,7 +3768,9 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
 
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         private_key,
@@ -3857,7 +3963,9 @@ async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
 
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let mut creds = GitHubAppCredentials::for_tests("424", private_key, MintFailurePolicy::Pat);
     creds.pat_fallback = Some("github_pat_broad".to_owned());
     state.github_app = Some(creds);
@@ -3971,16 +4079,15 @@ async fn broker_claim_patches_every_official_token_alias_with_the_minted_token()
         );
     tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
-    // `TestEnvVar` restores it even if an assertion below panics — a bare
-    // `remove_var` at the end of the body leaks this stub's address to every
-    // later test when the test fails, which turns one failure into a cascade.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
+    // The stub base rides the test startup config; a failing assertion
+    // cannot leak this stub's address to every later test.
+    let startup = stub_startup(Some(&api_base), None);
 
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         private_key,
@@ -4089,7 +4196,9 @@ async fn replay_step_log_upload_is_masked_before_persist() {
     use base64::engine::Engine as _;
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -4158,7 +4267,9 @@ async fn replay_step_log_upload_is_masked_before_persist() {
 #[tokio::test]
 async fn replay_result_upload_accepts_bodies_above_axum_default_limit() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // Axum's default Bytes extractor limit is 2 MiB. A real step log can
@@ -4201,7 +4312,9 @@ async fn replay_result_upload_accepts_bodies_above_axum_default_limit() {
 #[tokio::test]
 async fn replay_result_upload_rejects_bodies_over_cap() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let path = "/replay/results/plan-too-large/job-too-large/step-too-large.txt";
@@ -4254,7 +4367,9 @@ fn streamed_body(len: usize) -> Body {
 #[tokio::test]
 async fn log_append_accepts_bodies_above_axum_default_limit() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let created = request_json(
         &app,
@@ -4292,7 +4407,9 @@ async fn log_append_accepts_bodies_above_axum_default_limit() {
 #[tokio::test]
 async fn log_append_rejects_bodies_over_cap() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let created = request_json(
         &app,
@@ -4335,7 +4452,9 @@ async fn log_append_rejects_bodies_over_cap() {
 #[tokio::test]
 async fn log_routes_share_one_body_limit_across_every_mount() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let created = request_json(
         &app,
@@ -4430,7 +4549,9 @@ async fn cache_upload_accepts_bodies_above_axum_default_limit() {
     use base64::engine::Engine as _;
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let reserve = request_json(
         &app,
@@ -4480,7 +4601,9 @@ async fn cache_upload_accepts_bodies_above_axum_default_limit() {
 #[tokio::test]
 async fn cache_upload_rejects_bodies_over_cap() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let reserve = request_json(
         &app,
@@ -4560,7 +4683,9 @@ async fn cache_upload_rejects_bodies_over_cap() {
 #[tokio::test]
 async fn cache_upload_cancellation_invalidates_partial_staging() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let reserve = request_json(
         &app,

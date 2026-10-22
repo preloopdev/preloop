@@ -1,6 +1,3 @@
-// SAFETY: edition-2024 env mutation; each test serializes via GITHUB_ENV_LOCK.
-#![allow(unsafe_code)]
-
 //! preloop-runner-server integration tests — broker group.
 //! Split from the former `lib_tests.rs` unit; see `tests/common/mod.rs`.
 
@@ -16,7 +13,9 @@ use common::*;
 #[tokio::test]
 async fn hung_worker_reaped_while_session_still_polls() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -88,7 +87,9 @@ async fn hung_worker_reaped_while_session_still_polls() {
 #[tokio::test]
 async fn dead_session_stale_lease_waits_for_full_lease() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -157,9 +158,7 @@ async fn github_webhook_flows_with_signature_and_check_runs() {
     // This test asserts the mock check-run path (`check_run_id > 0` with no
     // GitHub server involved). A co-scheduled test's `PRELOOP_GITHUB_TOKEN`
     // would flip it to a live API call that fails, leaving zero check runs.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+    let startup = stub_startup(None, None);
 
     let temp = tempfile::tempdir().unwrap();
 
@@ -182,7 +181,9 @@ jobs:
 
     let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir.clone());
 
@@ -290,9 +291,7 @@ async fn github_webhook_fetches_workflow_from_event_sha_not_current_branch() {
     // This is a local-workspace reproduction of the same race as the remote
     // App path: the webhook names an older commit while the branch has already
     // advanced to a different workflow definition.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+    let startup = stub_startup(None, None);
 
     let temp = tempfile::tempdir().unwrap();
     let ws_dir = temp.path().join("workspace");
@@ -342,7 +341,9 @@ jobs:
     let branch_sha = git(&["rev-parse", "HEAD"]);
     assert_ne!(event_sha, branch_sha);
 
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir);
     let app = app(state.clone(), CancellationToken::new());
@@ -411,9 +412,7 @@ jobs:
 
 #[tokio::test]
 async fn github_webhook_rejects_missing_event_sha_without_workspace_fallback() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+    let startup = stub_startup(None, None);
 
     let temp = tempfile::tempdir().unwrap();
     let ws_dir = temp.path().join("workspace");
@@ -434,7 +433,9 @@ jobs:
     commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
     let missing_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir);
     let app = app(state.clone(), CancellationToken::new());
@@ -497,9 +498,7 @@ jobs:
 
 #[tokio::test]
 async fn github_webhook_rejects_pull_request_target_without_base_sha() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+    let startup = stub_startup(None, None);
 
     let temp = tempfile::tempdir().unwrap();
     let ws_dir = temp.path().join("workspace");
@@ -519,7 +518,9 @@ jobs:
 
     commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir);
     let app = app(state.clone(), CancellationToken::new());
@@ -588,12 +589,9 @@ jobs:
 /// with an empty mapping, orphaning the GitHub check in "queued" forever.
 #[tokio::test]
 async fn check_run_ids_survive_a_restart_before_any_job_event() {
-    // Held for the whole test: the GitHub env vars are process-global, and a
-    // parallel test's token would flip the check-run path from mock to a real
-    // GitHub API call. The mock path is the contract under test.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+    // No GitHub API or token is configured on this state: the check-run
+    // path stays on the mock branch, which is the contract under test.
+    let startup = stub_startup(None, None);
 
     let temp = tempfile::tempdir().unwrap();
     let ws_dir = temp.path().join("workspace");
@@ -615,7 +613,9 @@ jobs:
     let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
     let run_id = {
-        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf(), startup.clone())
+            .await
+            .unwrap();
         state.webhook_secret = Some("super-secret".to_owned());
         state.local_workspace = Some(ws_dir.clone());
         let app = app(state.clone(), CancellationToken::new());
@@ -682,7 +682,9 @@ jobs:
     };
 
     // Restart with no job event in between: the mapping must come back.
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let inner = recovered.test_tx().await;
     let run = inner.runs.get(&run_id).expect("run must survive restart");
     assert_eq!(
@@ -695,7 +697,9 @@ jobs:
 #[tokio::test]
 async fn github_check_run_rerequest_reruns_the_owning_run_in_place() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     let app = app(state.clone(), CancellationToken::new());
 
@@ -805,7 +809,7 @@ async fn github_check_run_rerequest_reruns_the_owning_run_in_place() {
 #[tokio::test]
 async fn github_webhook_same_delivery_is_deduped_but_new_delivery_creates_run() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture = WebhookDedupFixture::new(&temp).await;
+    let fixture = WebhookDedupFixture::new(&temp, stub_startup(None, None)).await;
 
     // The same delivery id twice (GitHub redelivery / double-fire) must not
     // create a duplicate run; a genuinely new delivery creates another.
@@ -833,7 +837,7 @@ async fn github_webhook_same_delivery_is_deduped_but_new_delivery_creates_run() 
 #[tokio::test]
 async fn github_webhook_missing_event_does_not_poison_delivery_id() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture = WebhookDedupFixture::new(&temp).await;
+    let fixture = WebhookDedupFixture::new(&temp, stub_startup(None, None)).await;
 
     // The first request is rejected before durable enqueue because its event
     // header is missing.
@@ -870,7 +874,7 @@ async fn github_webhook_missing_event_does_not_poison_delivery_id() {
 #[tokio::test]
 async fn push_webhook_refuses_to_submit_when_the_dedup_read_fails() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture = WebhookDedupFixture::new(&temp).await;
+    let fixture = WebhookDedupFixture::new(&temp, stub_startup(None, None)).await;
     assert_eq!(
         fixture.post("delivery-dedup-fail", Some("push")).await,
         StatusCode::ACCEPTED
@@ -894,7 +898,7 @@ async fn push_webhook_refuses_to_submit_when_the_dedup_read_fails() {
 #[tokio::test]
 async fn github_webhook_concurrent_duplicate_delivery_creates_one_run() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture = WebhookDedupFixture::new(&temp).await;
+    let fixture = WebhookDedupFixture::new(&temp, stub_startup(None, None)).await;
 
     // Two copies of one delivery in flight at once: the in-flight reservation
     // makes the loser a no-op instead of a second run.
@@ -916,7 +920,7 @@ async fn github_webhook_concurrent_duplicate_delivery_creates_one_run() {
 #[tokio::test]
 async fn github_webhook_dedup_survives_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture = WebhookDedupFixture::new(&temp).await;
+    let fixture = WebhookDedupFixture::new(&temp, stub_startup(None, None)).await;
 
     assert_eq!(
         fixture.post("delivery-restart", Some("push")).await,
@@ -930,7 +934,7 @@ async fn github_webhook_dedup_survives_restart() {
     };
 
     // Restart the server: new state instance on the same persisted database.
-    let mut restarted_state = AppState::new(temp.path().join("state").to_path_buf())
+    let mut restarted_state = AppState::new_for_tests(temp.path().join("state").to_path_buf())
         .await
         .unwrap();
     restarted_state.webhook_secret = Some("super-secret".to_owned());
@@ -988,7 +992,7 @@ async fn github_webhook_dedup_survives_restart() {
 #[tokio::test]
 async fn github_webhook_run_reservation_survives_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture = WebhookDedupFixture::new(&temp).await;
+    let fixture = WebhookDedupFixture::new(&temp, stub_startup(None, None)).await;
     let payload: Value = serde_json::from_slice(&fixture.payload_bytes).unwrap();
     let event_sha = payload["after"].as_str().unwrap().to_owned();
     let workflow_yaml =
@@ -1036,7 +1040,7 @@ async fn github_webhook_run_reservation_survives_restart() {
     drop(fixture);
 
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    let mut restarted_state = AppState::new(temp.path().join("state").to_path_buf())
+    let mut restarted_state = AppState::new_for_tests(temp.path().join("state").to_path_buf())
         .await
         .unwrap();
     restarted_state.webhook_secret = Some("super-secret".to_owned());
@@ -1088,11 +1092,9 @@ async fn github_webhook_run_reservation_survives_restart() {
 
 #[tokio::test]
 async fn github_webhook_pull_request_event() {
-    // The webhook path reads `PRELOOP_GITHUB_TOKEN` / `PRELOOP_GITHUB_API_URL`
-    // live for check-run reporting. Hold the env lock so a concurrent
-    // env-mutating test cannot point those at a foreign credential or stub
-    // and turn this 200 into a 502.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // The webhook path's GitHub credentials come from the state's resolved
+    // startup config (none configured here), so no request leaves for
+    // GitHub and this stays a 200.
     let temp = tempfile::tempdir().unwrap();
 
     // Create a dummy workflow file in a local workspace
@@ -1133,7 +1135,9 @@ jobs:
     git(&["commit", "--allow-empty", "-m", "head commit"]);
     let head_sha = git(&["rev-parse", "HEAD"]);
 
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir.clone());
 
@@ -1221,8 +1225,6 @@ jobs:
 /// merge is built against.
 struct PublishEchoFixture {
     _temp: tempfile::TempDir,
-    _token_guard: crate::state::TestEnvVar,
-    _api_guard: crate::state::TestEnvVar,
     state: AppState,
     app: Router,
     workflow: &'static str,
@@ -1235,8 +1237,6 @@ impl PublishEchoFixture {
         // No GitHub API may be reached: an unreachable one opens the breaker,
         // and the webhook drain then defers every delivery, so a missing run
         // could not be told apart from a skipped one.
-        let token_guard = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-        let api_guard = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("workspace");
         tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
@@ -1261,14 +1261,14 @@ impl PublishEchoFixture {
         git(&["commit", "--allow-empty", "-m", "head commit"]);
         let head_sha = git(&["rev-parse", "HEAD"]);
 
-        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         state.webhook_secret = Some("super-secret".to_owned());
         state.local_workspace = Some(ws_dir);
         let app = app(state.clone(), CancellationToken::new());
         Self {
             _temp: temp,
-            _token_guard: token_guard,
-            _api_guard: api_guard,
             state,
             app,
             workflow,
@@ -1391,7 +1391,6 @@ impl PublishEchoFixture {
 /// publish never exercised, so it must still run.
 #[tokio::test]
 async fn publish_echo_dedup_skips_pull_request_but_not_pull_request_target() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let fixture = PublishEchoFixture::new(
         "on:\n  push:\n  pull_request:\n  pull_request_target:\njobs:\n  build:\n    \
          runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
@@ -1442,7 +1441,6 @@ async fn publish_echo_dedup_skips_pull_request_but_not_pull_request_target() {
 /// has performed, so it must run.
 #[tokio::test]
 async fn publish_echo_dedup_leaves_the_pull_request_merge_test_after_a_branch_publish() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     // Only `push` and `pull_request` triggers: a delivery's `pull_request_target`
     // projection would take the one run its workflow file may have per delivery
     // (`runs_delivery`), and the `pull_request` run under test would replay it.
@@ -1505,7 +1503,7 @@ async fn publish_echo_dedup_leaves_the_pull_request_merge_test_after_a_branch_pu
 /// ready queue, letting a runner claim them before the operator approved.
 #[tokio::test]
 async fn fork_pr_needs_empty_job_held_until_approval() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let startup = stub_startup(None, None);
     let temp = tempfile::tempdir().unwrap();
 
     let ws_dir = temp.path().join("workspace");
@@ -1532,7 +1530,9 @@ jobs:
     // event is processed.
     let base_sha = head_sha.clone();
 
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir.clone());
     state.fork_policy.require_approval = true;
@@ -1665,18 +1665,15 @@ async fn github_app_manifest_registration_flow() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    // Configure the mock API URL and enable the registration routes.
-    // Held for the whole test: both variables are process-global.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    unsafe {
-        std::env::set_var(
-            "PRELOOP_GITHUB_API_URL",
-            format!("http://127.0.0.1:{}", port),
-        );
-        std::env::set_var("PRELOOP_ENABLE_APP_REGISTRATION", "1");
-    };
+    // The manifest-conversion flow talks to the mock GitHub API above, and the
+    // registration routes are served only when the flag is on — both typed
+    // startup values (the removed test set them in the process environment).
+    let mut startup = stub_startup(Some(&format!("http://127.0.0.1:{port}")), None);
+    startup.github_app_registration = Some(true);
 
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // The registration page binds the callback to this browser: it sets a signed
@@ -1751,12 +1748,6 @@ async fn github_app_manifest_registration_flow() {
     assert!(html_callback.contains("mock-webhook-secret-xyz"));
     assert!(html_callback.contains("--webhook-secret &#39;mock-webhook-secret-xyz&#39;"));
     assert!(!html_callback.contains("export PRELOOP_WEBHOOK_SECRET"));
-
-    // Clean up
-    unsafe {
-        std::env::remove_var("PRELOOP_GITHUB_API_URL");
-        std::env::remove_var("PRELOOP_ENABLE_APP_REGISTRATION");
-    };
 }
 
 #[tokio::test]
@@ -1765,7 +1756,9 @@ async fn runner_oauth2_token_client_assertion_verification() {
     use serde_json::Value;
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // Generate RSA keypair for the runner using the protocol's library
@@ -1935,16 +1928,22 @@ fn accepts_valid_assertion_claims() {
         now,
         serde_json::json!("http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token"),
     );
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url()).is_ok()
+    );
     // Base URL alone is also accepted.
     let claims = assertion_claims(now, serde_json::json!("http://127.0.0.1:9090"));
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url()).is_ok()
+    );
     // Array form.
     let claims = assertion_claims(
         now,
         serde_json::json!(["https://other.example", "http://127.0.0.1:9090"]),
     );
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url()).is_ok()
+    );
 }
 
 #[test]
@@ -1960,7 +1959,10 @@ fn rejects_expired_assertion() {
         "nbf": now - 600,
         "exp": now - 1,
     });
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
 }
 
 #[test]
@@ -1972,10 +1974,16 @@ fn rejects_wrong_audience() {
     let uri = oauth2_token_uri();
     // Assertion addressed to a different server must not validate here.
     let claims = assertion_claims(now, serde_json::json!("https://preloop.local/oauth"));
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
     // Missing aud is also rejected.
     let claims = serde_json::json!({"sub": "test-client", "nbf": now, "exp": now + 300});
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
 }
 
 #[test]
@@ -1991,7 +1999,10 @@ fn rejects_missing_exp_and_excessive_lifetime() {
         "aud": "http://127.0.0.1:9090",
         "nbf": now,
     });
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
     // Lifetime over the 600s cap.
     let claims = serde_json::json!({
         "sub": "test-client",
@@ -1999,7 +2010,10 @@ fn rejects_missing_exp_and_excessive_lifetime() {
         "nbf": now,
         "exp": now + 3600,
     });
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
     // Future-dated nbf beyond skew.
     let claims = serde_json::json!({
         "sub": "test-client",
@@ -2007,7 +2021,10 @@ fn rejects_missing_exp_and_excessive_lifetime() {
         "nbf": now + 3600,
         "exp": now + 3900,
     });
-    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    assert!(
+        crate::oauth::validate_client_assertion_claims(&claims, &uri, assertion_base_url())
+            .is_err()
+    );
 }
 
 #[test]
@@ -2167,7 +2184,9 @@ fn label_matching_empty_job_matches_all() {
 #[tokio::test]
 async fn dag_build_fails_test_skipped_production() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2230,7 +2249,9 @@ jobs:
 #[tokio::test]
 async fn dag_always_runs_after_failure_production() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2282,7 +2303,9 @@ jobs:
 #[tokio::test]
 async fn dag_failure_condition_runs_after_failure_production() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2335,7 +2358,9 @@ jobs:
 #[tokio::test]
 async fn dag_diamond_settlement_production() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2443,7 +2468,9 @@ jobs:
 async fn dag_cyclic_graph_rejected_production() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -2491,7 +2518,9 @@ jobs:
 #[tokio::test]
 async fn stored_secrets_are_injected_into_native_submissions() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state
         .secrets
         .write()
@@ -2526,7 +2555,9 @@ async fn stored_secrets_are_injected_into_native_submissions() {
 #[tokio::test]
 async fn unreferenced_stored_secrets_stay_out_of_the_job_message() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     {
         let mut secrets = state.secrets.write();
         secrets
@@ -2566,7 +2597,9 @@ async fn unreferenced_stored_secrets_stay_out_of_the_job_message() {
 #[tokio::test]
 async fn dynamic_secret_reads_keep_the_full_scope() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     {
         let mut secrets = state.secrets.write();
         secrets
@@ -2601,7 +2634,9 @@ async fn dynamic_secret_reads_keep_the_full_scope() {
 #[tokio::test]
 async fn archived_run_keeps_run_tier_secrets_for_rerun() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2659,7 +2694,9 @@ async fn archived_run_keeps_run_tier_secrets_for_rerun() {
 #[tokio::test]
 async fn archived_run_partial_rerun_is_409_and_all_resubmits() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2737,7 +2774,9 @@ async fn archived_run_partial_rerun_is_409_and_all_resubmits() {
 #[tokio::test]
 async fn reusable_callee_without_secrets_receives_none() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.secrets.write().repo.insert(
         "owner/repo".to_owned(),
         std::collections::BTreeMap::from([("OTHER".to_owned(), "leak".to_owned())]),
@@ -2771,7 +2810,9 @@ async fn reusable_callee_without_secrets_receives_none() {
 #[tokio::test]
 async fn reusable_callee_secrets_map_resolves_against_caller_scope() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.secrets.write().repo.insert(
         "owner/repo".to_owned(),
         std::collections::BTreeMap::from([("OTHER".to_owned(), "leak".to_owned())]),
@@ -2813,7 +2854,9 @@ async fn reusable_callee_secrets_map_resolves_against_caller_scope() {
 #[tokio::test]
 async fn job_level_env_secret_is_filled_into_environment_variables() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state
         .secrets
         .write()
@@ -2887,22 +2930,27 @@ async fn job_level_env_secret_is_filled_into_environment_variables() {
 /// success while every job silently ran on the local runtime token instead.
 #[tokio::test]
 async fn pat_only_config_supplies_job_github_token() {
-    // Same env-lock discipline: `PRELOOP_GITHUB_TOKEN` writers serialize on
-    // it, and a leaked value would win env-then-config and break the assert.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    // The state carries no env-layer token, so the configured PAT wins and
+    // the assert cannot break.
     // Keep PAT scope introspection hermetic while still letting the PAT be
     // verified: the stub reports read-only scopes, so the configured PAT is
     // embedded rather than withheld.
-    let _live_api = live_pat_scope_api("read:org, read:user").await;
+    let api_base = live_pat_scope_api("read:org, read:user").await;
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
     // Point this engine at the temp config directly. Mutating `PRELOOP_CONFIG`
     // would race every other test that builds an `AppState` concurrently.
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
-        .await
-        .unwrap();
+    let state = AppState::new(
+        temp.path().to_path_buf(),
+        StartupConfig {
+            config_path,
+            github_api_url: Some(api_base),
+            ..StartupConfig::for_tests()
+        },
+    )
+    .await
+    .unwrap();
     assert!(
         state.github_app.is_none(),
         "config declares no app id or pem"
@@ -2933,9 +2981,7 @@ async fn pat_only_config_supplies_job_github_token() {
 /// github.com — and the wire variable discloses the withholding.
 #[tokio::test]
 async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    let _dead_api = dead_pat_scope_api();
+    let api_base = dead_pat_scope_api();
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     // A distinct PAT value, because the scope cache is process-global and keyed
@@ -2946,9 +2992,16 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
         "[github]\npat = \"github_pat_unverifiable_scopes\"\n",
     )
     .unwrap();
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
-        .await
-        .unwrap();
+    let state = AppState::new(
+        temp.path().to_path_buf(),
+        StartupConfig {
+            config_path,
+            github_api_url: Some(api_base),
+            ..StartupConfig::for_tests()
+        },
+    )
+    .await
+    .unwrap();
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown: CancellationToken::new(),
@@ -3032,13 +3085,11 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
 /// into whatever third party a workflow pointed at.
 #[tokio::test]
 async fn tokenless_engine_leaves_the_github_token_surface_empty() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     let temp = tempfile::tempdir().unwrap();
     // An explicit config with no `[github]` section: no PAT, no App.
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "runner_name_prefix = \"tokenless\"\n").unwrap();
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+    let state = AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path)
         .await
         .unwrap();
     assert!(state.github_app.is_none(), "no App is configured");
@@ -3153,21 +3204,12 @@ fn pat_exceeds_declared_scope_matrix() {
 /// broader PAT as the job's `GITHUB_TOKEN`.
 #[tokio::test]
 async fn static_pat_broader_than_declared_permissions_rejects_run() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     // Distinct PAT string per test: introspected scopes are cached by PAT
     // hash process-wide, so sharing one value across tests would leak cached
     // scopes between them.
     std::fs::write(&config_path, "[github]\npat = \"broad-pat\"\n").unwrap();
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
-        .await
-        .unwrap();
-    assert!(
-        state.github_app.is_none(),
-        "config declares no app id or pem"
-    );
 
     // Hermetic scope introspection: the mock API root answers the PAT probe
     // with broad classic scopes.
@@ -3185,7 +3227,21 @@ async fn static_pat_broader_than_declared_permissions_rejects_run() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let state = AppState::new(
+        temp.path().to_path_buf(),
+        StartupConfig {
+            config_path,
+            github_api_url: Some(api_base),
+            ..StartupConfig::for_tests()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        state.github_app.is_none(),
+        "config declares no app id or pem"
+    );
 
     let shared = Arc::new(SharedState {
         state: state.clone(),
@@ -3216,18 +3272,9 @@ async fn static_pat_broader_than_declared_permissions_rejects_run() {
 /// not the declared set the token does not honor.
 #[tokio::test]
 async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"narrow-pat\"\n").unwrap();
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
-        .await
-        .unwrap();
-    assert!(
-        state.github_app.is_none(),
-        "config declares no app id or pem"
-    );
 
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
@@ -3243,7 +3290,21 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let state = AppState::new(
+        temp.path().to_path_buf(),
+        StartupConfig {
+            config_path,
+            github_api_url: Some(api_base),
+            ..StartupConfig::for_tests()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        state.github_app.is_none(),
+        "config declares no app id or pem"
+    );
 
     let shared = Arc::new(SharedState {
         state: state.clone(),
@@ -3302,15 +3363,20 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
 /// submit). Acquire re-verifies the scopes instead of withholding.
 #[tokio::test]
 async fn static_pat_reaches_a_job_claimed_after_the_scope_cache_expired() {
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let api_base = live_pat_scope_api("").await;
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"queued-pat\"\n").unwrap();
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
-        .await
-        .unwrap();
-    let _api_url = live_pat_scope_api("").await;
+    let state = AppState::new(
+        temp.path().to_path_buf(),
+        StartupConfig {
+            config_path,
+            github_api_url: Some(api_base),
+            ..StartupConfig::for_tests()
+        },
+    )
+    .await
+    .unwrap();
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown: CancellationToken::new(),
@@ -3367,7 +3433,7 @@ async fn config_webhook_secret_verifies_signed_deliveries() {
 
     // Explicit config path rather than `PRELOOP_CONFIG`, which would race
     // every other test building an `AppState`.
-    let mut state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+    let mut state = AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path)
         .await
         .unwrap();
     assert_eq!(
@@ -3447,7 +3513,9 @@ async fn config_webhook_secret_verifies_signed_deliveries() {
 #[tokio::test]
 async fn repo_scoped_secrets_override_global_and_stay_scoped() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     {
         let mut secrets = state.secrets.write();
         secrets
@@ -3522,9 +3590,10 @@ async fn live_secrets_api_round_trips_and_persists() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     async {
-        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path.clone())
-            .await
-            .unwrap();
+        let state =
+            AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path.clone())
+                .await
+                .unwrap();
         let app = app(state.clone(), CancellationToken::new());
 
         request_json(
@@ -3634,9 +3703,10 @@ async fn live_secrets_api_env_scope_round_trips() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     async {
-        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path.clone())
-            .await
-            .unwrap();
+        let state =
+            AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path.clone())
+                .await
+                .unwrap();
         let app = app(state.clone(), CancellationToken::new());
 
         request_json(
@@ -3765,9 +3835,10 @@ async fn memory_secrets_store_never_writes_the_config_file() {
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "secrets_store = \"memory\"\n").unwrap();
     async {
-        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path.clone())
-            .await
-            .unwrap();
+        let state =
+            AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path.clone())
+                .await
+                .unwrap();
         let app = app(state.clone(), CancellationToken::new());
 
         request_json(
@@ -3833,9 +3904,10 @@ async fn concurrent_secret_mutations_keep_store_and_file_in_agreement() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     async {
-        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path.clone())
-            .await
-            .unwrap();
+        let state =
+            AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path.clone())
+                .await
+                .unwrap();
         let app = app(state.clone(), CancellationToken::new());
 
         // Seeded so the concurrent burst has something to delete.
@@ -3951,7 +4023,9 @@ async fn completion_step_results_are_authoritative_over_inference() {
     // as "skipped" must not be blanket-terminalized to the job's failure
     // status: the completion's own stepResults win.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_yaml(
         &app,
@@ -4023,7 +4097,9 @@ async fn completion_step_results_are_authoritative_over_inference() {
 #[tokio::test]
 async fn workflow_steps_update_prefers_runner_reported_step_names() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = submit_yaml(
@@ -4086,7 +4162,9 @@ async fn workflow_steps_update_prefers_runner_reported_step_names() {
 #[tokio::test]
 async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = submit_yaml(
@@ -4190,37 +4268,11 @@ async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
 const PARITY_MINTED_TOKEN: &str = "ghs_ParityMintedInstallationTokenAAAAAAAA";
 
 /// A broker whose GitHub App mints [`PARITY_MINTED_TOKEN`] for `owner/repo`.
-/// The guards hold the process-wide GitHub env lock and restore the env on drop.
-/// Tuple fields drop in declaration order, so the lock guard is last and
-/// [`EnvLockStillHeld`] sits between them: the env vars are restored before the
-/// lock is released.
+/// The stub's URL and App live on the state this fixture builds, so it needs no
+/// process-wide environment or env lock.
 struct MintingBroker {
     state: AppState,
     app: Router,
-    _env: (
-        crate::state::TestEnvVar,
-        crate::state::TestEnvVar,
-        EnvLockStillHeld,
-        tokio::sync::MutexGuard<'static, ()>,
-    ),
-}
-
-/// Asserts, on drop, that the process-wide GitHub env lock is still held.
-///
-/// [`MintingBroker`] drops it between its env guards and its lock guard, so
-/// releasing `GITHUB_ENV_LOCK` first — the order this fixture had before the fix
-/// — fails here instead of letting a concurrently scheduled test set its own
-/// base and then have it clobbered by this fixture's late restore.
-struct EnvLockStillHeld;
-
-impl Drop for EnvLockStillHeld {
-    fn drop(&mut self) {
-        assert!(
-            crate::state::GITHUB_ENV_LOCK.try_lock().is_err(),
-            "MintingBroker released GITHUB_ENV_LOCK before its TestEnvVar guards \
-             restored the environment"
-        );
-    }
 }
 
 async fn minting_broker(temp: &tempfile::TempDir) -> MintingBroker {
@@ -4242,22 +4294,23 @@ async fn minting_broker(temp: &tempfile::TempDir) -> MintingBroker {
         );
     tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-    let env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
-    let pat = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    // The stub's base rides the typed startup, the way the removed
+    // `PRELOOP_GITHUB_API_URL` override used to: the claim path mints against
+    // the startup-resolved request base, and `github_urls` follows it.
+    let mut state = AppState::new(
+        temp.path().to_path_buf(),
+        stub_startup(Some(api_base.as_str()), None),
+    )
+    .await
+    .unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         private_key,
         MintFailurePolicy::LocalJwt,
     ));
     let app = app(state.clone(), CancellationToken::new());
-    MintingBroker {
-        state,
-        app,
-        _env: (api_url, pat, EnvLockStillHeld, env_lock),
-    }
+    MintingBroker { state, app }
 }
 
 /// The value `environmentVariables` carries for `name`: the literal once the

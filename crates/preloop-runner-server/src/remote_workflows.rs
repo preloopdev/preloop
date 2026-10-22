@@ -45,10 +45,10 @@ pub async fn resolve_remote_workflows(
 
     let mut client = None;
     let token = github_token;
-    // Mirrors `github::fetch_workflows_at`: tests point this at a local mock,
-    // and GHES installs can point it at their instance.
-    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-        .unwrap_or_else(|_| "https://api.github.com".to_owned());
+    // Mirrors `github::fetch_workflows_at`: tests point this at a local mock
+    // through `StartupConfig::github_api_url`, and GHES installs can point it
+    // at their instance.
+    let api_base = shared.state.github_api_base();
     // Each queued workflow carries the remote reference it was fetched from and
     // the commit that reference is pinned to. `None` marks the submitted
     // repository (the root and its same-repository callees), which is pinned to
@@ -356,7 +356,6 @@ mod observed_sender_tests {
     /// static PAT, invisible to both.
     #[tokio::test]
     async fn remote_workflow_fetches_use_the_labeled_sender() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let sha = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
         let reusable_yaml = "on: push\njobs:\n  inner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
         let content_b64 =
@@ -392,12 +391,17 @@ mod observed_sender_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().join("state").to_path_buf())
-            .await
-            .unwrap();
+        let state = AppState::new(
+            temp.path().join("state").to_path_buf(),
+            crate::config::StartupConfig {
+                github_api_url: Some(api.clone()),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         let shared = Arc::new(SharedState {
             state,
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -461,11 +465,13 @@ mod observed_sender_tests {
     /// gateway error, not a hang.
     #[tokio::test]
     async fn throttled_pat_bucket_fails_remote_workflow_fetch_fast() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().join("state").to_path_buf())
-            .await
-            .unwrap();
+        let state = AppState::new(
+            temp.path().join("state").to_path_buf(),
+            crate::config::StartupConfig::for_tests(),
+        )
+        .await
+        .unwrap();
         let shared = Arc::new(SharedState {
             state,
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -569,11 +575,17 @@ mod same_repository_tests {
         serde_json::json!({ "sha": sha }).to_string()
     }
 
-    async fn test_shared() -> (tempfile::TempDir, Arc<SharedState>) {
+    async fn test_shared(api_base: Option<&str>) -> (tempfile::TempDir, Arc<SharedState>) {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().join("state").to_path_buf())
-            .await
-            .unwrap();
+        let state = AppState::new(
+            temp.path().join("state").to_path_buf(),
+            crate::config::StartupConfig {
+                github_api_url: api_base.map(str::to_owned),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         let shared = Arc::new(SharedState {
             state,
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -586,7 +598,6 @@ mod same_repository_tests {
     /// the submitted commit, so expansion finds it.
     #[tokio::test]
     async fn same_repository_callee_is_fetched_at_the_submitted_commit() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let sha = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
         let callee = "on: workflow_call\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n";
         let api = serve_github(vec![
@@ -597,8 +608,7 @@ mod same_repository_tests {
             ),
         ])
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let (_temp, shared) = test_shared().await;
+        let (_temp, shared) = test_shared(Some(&api)).await;
 
         let yaml = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/build.yml\n";
         let workflow = preloop_gha_parser::parse_workflow(yaml).unwrap();
@@ -635,7 +645,6 @@ mod same_repository_tests {
     /// submitted tree's path.
     #[tokio::test]
     async fn nested_same_repository_call_resolves_in_the_callee_repository() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let pinned = "b2c3d4e5b2c3d4e5b2c3d4e5b2c3d4e5b2c3d4e5";
         let outer =
             "on: workflow_call\njobs:\n  nested:\n    uses: $/.github/workflows/inner.yml\n";
@@ -659,8 +668,7 @@ mod same_repository_tests {
             ),
         ])
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let (_temp, shared) = test_shared().await;
+        let (_temp, shared) = test_shared(Some(&api)).await;
 
         let yaml =
             "on: push\njobs:\n  call:\n    uses: octo/shared/.github/workflows/outer.yml@v1\n";
@@ -698,10 +706,8 @@ mod same_repository_tests {
     /// the forge is unreachable.
     #[tokio::test]
     async fn supplied_same_repository_callee_is_used_without_a_fetch() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         // A closed port: any fetch would fail the resolution.
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", "http://127.0.0.1:1");
-        let (_temp, shared) = test_shared().await;
+        let (_temp, shared) = test_shared(Some("http://127.0.0.1:1")).await;
         let callee = "on: workflow_call\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n";
         let yaml = "on: push\njobs:\n  call:\n    uses: ./.github/workflows/build.yml\n";
         let workflow = preloop_gha_parser::parse_workflow(yaml).unwrap();
@@ -745,7 +751,6 @@ mod same_repository_tests {
     /// serves the endpoint the traversal reaches, so an unchecked path succeeds.
     #[tokio::test]
     async fn top_level_same_repository_path_cannot_leave_the_repository() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let sha = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
         let other = "on: workflow_call\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo other\n";
         let (api, seen) = serve_github_recording(vec![
@@ -757,8 +762,7 @@ mod same_repository_tests {
             ),
         ])
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let (_temp, shared) = test_shared().await;
+        let (_temp, shared) = test_shared(Some(&api)).await;
 
         let yaml = "on: push\njobs:\n  call:\n    uses: $/../../../../repos/other/private/contents/.github/workflows/x.yml\n";
         let workflow = preloop_gha_parser::parse_workflow(yaml).unwrap();
@@ -789,15 +793,13 @@ mod same_repository_tests {
     /// whitespace, and paths outside `.github/workflows/`.
     #[tokio::test]
     async fn top_level_same_repository_path_must_be_plain() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let sha = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
         let (api, seen) = serve_github_recording(vec![(
             format!("/repos/o/r/commits/{sha}"),
             commit_json(sha),
         )])
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let (_temp, shared) = test_shared().await;
+        let (_temp, shared) = test_shared(Some(&api)).await;
         for uses in [
             "$/.github/workflows/../../x.yml",
             "$/../.github/workflows/x.yml",
@@ -857,7 +859,6 @@ mod same_repository_tests {
     /// at the submitted commit. Every other spelling is refused before a request.
     #[tokio::test]
     async fn top_level_same_repository_refs_must_name_a_workflow_file() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let sha = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
         let ci = "on: workflow_call\njobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ci\n";
         let (api, seen) = serve_github_recording(vec![
@@ -868,8 +869,7 @@ mod same_repository_tests {
             ),
         ])
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let (_temp, shared) = test_shared().await;
+        let (_temp, shared) = test_shared(Some(&api)).await;
 
         let yaml = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/ci.yml\n";
         let workflow = preloop_gha_parser::parse_workflow(yaml).unwrap();

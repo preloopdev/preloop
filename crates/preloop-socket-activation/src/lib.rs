@@ -1,14 +1,29 @@
 //! Minimal systemd socket activation support.
+//!
+//! `LISTEN_FDS`/`LISTEN_PID` are the socket-activation protocol itself and
+//! are read here the way `argv` is read at startup. The descriptor is claimed
+//! through the `listenfd` crate — the workspace forbids `unsafe`, which rules
+//! out the raw `BorrowedFd::borrow_raw` conversion this used to do. The
+//! listener is taken exactly once per process, and the returned
+//! `TcpListener` owns its descriptor until it is dropped at shutdown.
 
 use anyhow::{Context, bail};
+
+/// Whether [`take_tcp_listener`] already claimed the systemd listener.
+/// Enforces the take-once ownership contract: a second claim of the same raw
+/// descriptor would give two owners one fd.
+#[cfg(target_os = "linux")]
+static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Take the single TCP listener passed by systemd, if socket activation is
 /// configured for this process.
 ///
 /// systemd reserves descriptors 0, 1, and 2 for stdio and starts listening
-/// descriptors at 3. The descriptor is cloned before conversion so the
-/// original descriptor remains owned by the service process until shutdown.
-/// This is the only raw-descriptor boundary in the project.
+/// descriptors at 3. `LISTEN_FDS` must name exactly one descriptor, and a
+/// `LISTEN_PID` that does not match this process is refused. The listener is
+/// taken **once** per process: a second call is an error rather than a second
+/// conversion of the same descriptor. Off Linux a configured activation is
+/// refused — systemd socket activation is Linux-only.
 pub fn take_tcp_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
     let Some(listen_fds) = std::env::var_os("LISTEN_FDS") else {
         return Ok(None);
@@ -32,17 +47,16 @@ pub fn take_tcp_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
 
     #[cfg(target_os = "linux")]
     {
-        use std::net::TcpListener as StdTcpListener;
-        use std::os::fd::BorrowedFd;
+        use listenfd::ListenFd;
 
-        // SAFETY: systemd guarantees LISTEN_FDS descriptors are open for this
-        // process. We immediately clone descriptor 3 into an OwnedFd, so the
-        // borrowed view never outlives this function.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(3) };
-        let owned = borrowed
-            .try_clone_to_owned()
-            .context("clone systemd listener fd")?;
-        let listener = StdTcpListener::from(owned);
+        if TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            bail!("the systemd listener has already been taken");
+        }
+        let mut listen_fd = ListenFd::from_env();
+        let listener = listen_fd
+            .take_tcp_listener(0)
+            .context("take systemd listener fd")?
+            .context("LISTEN_FDS is set but the systemd listener is missing")?;
         listener
             .set_nonblocking(true)
             .context("set systemd listener nonblocking")?;

@@ -23,6 +23,9 @@ npm-package = "cli"
 name = "preloop"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 preloop-observability = { path = "../preloop-observability" }
 preloop-orchestrator = { path = "../preloop-orchestrator" }
@@ -45,7 +48,6 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
 tokio-tungstenite = { workspace = true }
-libc = "0.2"
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }
 self-replace = { workspace = true }
 semver = { workspace = true }
@@ -59,8 +61,12 @@ tempfile = { workspace = true }
 serde_yaml = { workspace = true }
 rpassword = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["user"] }
-
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# uid/euid checks (`server install`'s root gate, the LaunchAgent gui domain).
+# `nix` is the safe wrapper around those syscalls — raw `libc` and `unsafe`
+# are forbidden workspace-wide. Unix-only, matching every other crate that
+# wraps uid/process calls.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["user"] }

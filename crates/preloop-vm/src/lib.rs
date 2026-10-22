@@ -1,6 +1,7 @@
 //! Typed SmolVM lifecycle primitives for Preloop CI.
 
 use async_trait::async_trait;
+use preloop_gha_protocol::SecretString;
 use preloop_observability::deadline;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -386,13 +387,18 @@ fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static 
 /// Where a guest environment value is resolved from, at launch time.
 ///
 /// SmolVM never persists the value itself, only this reference, so a secret
-/// stays out of the machine record and out of any packed artifact.
+/// stays out of the machine record and out of any packed artifact. A value is
+/// never taken from the process environment at launch: callers resolve
+/// secrets at their startup boundary and pass them explicitly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecretSource {
-    /// Read from a host environment variable of this name.
-    HostEnv(String),
     /// Read from this absolute host file.
     HostFile(PathBuf),
+    /// An already-resolved secret, handed to the guest out-of-band at launch.
+    ///
+    /// [`SecretString`] renders `<redacted>` in `Debug` and `Serialize`, so a
+    /// secret carried here never appears in logs, argv, or records.
+    Value(SecretString),
 }
 
 /// What a machine is for, and where its root filesystem came from.
@@ -1103,10 +1109,15 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
 /// streaming execs (the runner itself) are unaffected.
 const EXEC_TIMEOUT: &str = "30m";
 
+/// [`VmProvider`] implementation driving the smolvm CLI (`machine create`,
+/// `fork`, `exec`, `pack`, …). Each provider owns the resolved CLI path and
+/// the policies probed from it once, so callers never re-derive them.
 #[derive(Debug, Clone)]
 pub struct SmolVmProvider {
     binary: PathBuf,
     capture_limit: usize,
+    /// Engine home and VM paths, resolved once at the startup boundary.
+    paths: VmPathConfig,
     /// Proxy forwarded to smolvm's separate export VM during `pack create`.
     pack_proxy: Option<String>,
     /// Hosts and CIDRs that the pack export VM should bypass the proxy for.
@@ -1145,45 +1156,56 @@ pub struct SmolVmProvider {
     env_lookup: EnvLookup,
 }
 
-impl Default for SmolVmProvider {
-    fn default() -> Self {
-        Self::from_environment("smolvm")
-    }
-}
-
 impl SmolVmProvider {
-    /// Construct a provider and resolve pack-export proxy settings.
+    /// The startup-boundary constructor: resolve pack-export proxy settings
+    /// from the process environment once, then carry them (and `paths`) as
+    /// typed state.
     ///
     /// Preloop-specific variables take precedence over the conventional proxy
     /// variables inherited by the process.
-    pub fn from_environment(binary: impl Into<PathBuf>) -> Self {
-        Self::new(binary).with_pack_network(
-            first_nonempty_env(&[
+    pub fn from_environment(binary: impl Into<PathBuf>, paths: VmPathConfig) -> Self {
+        let (proxy, no_proxy) = pack_network_from(process_env);
+        Self::new(binary, paths).with_pack_network(proxy, no_proxy)
+    }
+}
+
+/// First non-blank value `lookup` reports among `names`, in order.
+fn first_nonempty(lookup: impl Fn(&str) -> Option<String>, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))
+}
+
+/// Pack-export proxy resolution: the Preloop-specific variables win over the
+/// conventional ones, blank values behave unset. Pure so the precedence rule
+/// is tested with explicit inputs instead of a mutated process environment.
+fn pack_network_from(lookup: impl Fn(&str) -> Option<String>) -> (Option<String>, Option<String>) {
+    (
+        first_nonempty(
+            &lookup,
+            &[
                 "PRELOOP_RUNNER_PACK_PROXY",
                 "HTTPS_PROXY",
                 "https_proxy",
                 "HTTP_PROXY",
                 "http_proxy",
-            ]),
-            first_nonempty_env(&["PRELOOP_RUNNER_PACK_NO_PROXY", "NO_PROXY", "no_proxy"]),
-        )
-    }
-}
-
-fn first_nonempty_env(names: &[&str]) -> Option<String> {
-    names.iter().find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    })
+            ],
+        ),
+        first_nonempty(
+            &lookup,
+            &["PRELOOP_RUNNER_PACK_NO_PROXY", "NO_PROXY", "no_proxy"],
+        ),
+    )
 }
 
 impl SmolVmProvider {
-    /// Construct a provider using an explicit SmolVM executable.
-    pub fn new(binary: impl Into<PathBuf>) -> Self {
+    /// Construct a provider using an explicit SmolVM executable and host
+    /// paths. Nothing is read from the process environment here.
+    pub fn new(binary: impl Into<PathBuf>, paths: VmPathConfig) -> Self {
         Self {
             binary: binary.into(),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
+            paths,
             pack_proxy: None,
             pack_no_proxy: None,
             lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -1243,7 +1265,7 @@ impl SmolVmProvider {
             return Err(VmError::GuestAgentMismatch { report });
         }
         let mut command = self.command();
-        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
+        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary), &self.paths)?;
         apply_sandbox_env(&mut command, self.env_lookup)?;
         Ok(command)
     }
@@ -1256,7 +1278,7 @@ impl SmolVmProvider {
     /// the binary and the candidate rootfs trees are unchanged — a repair or a
     /// replacement is picked up without restarting the engine.
     fn agent_mismatch(&self) -> Option<String> {
-        agent_rootfs::check_cached(&agent_rootfs::Runtime::from_env(), &self.binary)
+        agent_rootfs::check_cached(&agent_runtime(&self.paths), &self.binary)
             .err()
             .and_then(|error| match error {
                 VmError::GuestAgentMismatch { report } => Some(report),
@@ -1291,10 +1313,9 @@ impl SmolVmProvider {
             };
         }
         let mut details = vec![format!("resolved smolvm {}", self.binary.display())];
-        if let Some(rootfs) = agent_rootfs::resolve_exported_rootfs(
-            &agent_rootfs::Runtime::from_env(),
-            Some(&self.binary),
-        ) {
+        if let Some(rootfs) =
+            agent_rootfs::resolve_exported_rootfs(&agent_runtime(&self.paths), Some(&self.binary))
+        {
             details.push(format!(
                 "guest-agent rootfs {} ({})",
                 rootfs.display(),
@@ -1340,7 +1361,7 @@ impl SmolVmProvider {
     /// here, so nothing boots unconfined) rather than with garbage.
     fn recovery_command(&self) -> Result<Command, VmError> {
         let mut command = self.command();
-        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
+        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary), &self.paths)?;
         match sandbox_env_with(self.env_lookup) {
             Ok(sandbox) => {
                 for key in sandbox.remove {
@@ -1526,7 +1547,8 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
     ) -> Result<ExecOutput, VmError> {
-        self.checked_with_network(operation, args, None, None).await
+        self.checked_with_network(operation, args, None, None, &[])
+            .await
     }
 
     async fn checked_with_network(
@@ -1535,8 +1557,15 @@ impl SmolVmProvider {
         args: &[String],
         network: Option<&NetworkPolicy>,
         staging_dir: Option<&Path>,
+        secret_env: &[(String, String)],
     ) -> Result<ExecOutput, VmError> {
         let mut command = self.sandboxed_command()?;
+        // Resolved secret values ride the spawned SmolVM process's own
+        // environment — the same channel `--secret-env` has always resolved
+        // from — never argv and never a persisted record.
+        for (key, value) in secret_env {
+            command.env(key, value);
+        }
         match network {
             Some(NetworkPolicy::PublicOnly) => {
                 command.env("SMOLVM_EGRESS_FLOOR", "strict");
@@ -1620,7 +1649,7 @@ impl SmolVmProvider {
         staging_dir: &Path,
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.write().await;
-        self.checked_with_network(operation, args, None, Some(staging_dir))
+        self.checked_with_network(operation, args, None, Some(staging_dir), &[])
             .await
     }
 
@@ -1631,7 +1660,7 @@ impl SmolVmProvider {
         network: &NetworkPolicy,
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.write().await;
-        self.checked_with_network(operation, args, Some(network), None)
+        self.checked_with_network(operation, args, Some(network), None, &[])
             .await
     }
 
@@ -2157,7 +2186,7 @@ impl VmProvider for SmolVmProvider {
             }
             known_dirs.insert(dir);
         }
-        if let Some(root) = machine_data_root() {
+        if let Some(root) = self.paths.machine_data_root() {
             roots.insert(root);
         }
         let roots: Vec<PathBuf> = roots.into_iter().collect();
@@ -2191,7 +2220,7 @@ impl VmProvider for SmolVmProvider {
         // Conventional roots cover the empty-registry case: with no machines
         // left, registered data dirs cannot reveal where orphans live.
         // Only scan the root belonging to the active registry configuration.
-        if let Some(root) = machine_data_root() {
+        if let Some(root) = self.paths.machine_data_root() {
             roots.insert(root);
         }
         let roots: Vec<PathBuf> = roots.into_iter().collect();
@@ -2277,10 +2306,11 @@ impl VmProvider for SmolVmProvider {
             Err(delete_error) => {
                 let data_dir = self.machine_data_dir(name).await.ok();
                 let killed = match data_dir {
-                    Some(dir) => kill_vm_processes_in(&dir).unwrap_or_else(|error| {
-                        warn!(%error, "hypervisor scan before forced delete failed");
-                        0
-                    }),
+                    Some(dir) => kill_vm_processes_in(&dir, &self.paths.machine_data_roots())
+                        .unwrap_or_else(|error| {
+                            warn!(%error, "hypervisor scan before forced delete failed");
+                            0
+                        }),
                     None => 0,
                 };
                 if killed == 0 {
@@ -2302,7 +2332,7 @@ impl VmProvider for SmolVmProvider {
                     if retried.is_ok() {
                         // The dead hypervisor can leave the layer store
                         // mounted under the now-removed data directory.
-                        match detach_orphaned_layer_mounts() {
+                        match detach_orphaned_layer_mounts(&self.paths) {
                             Ok(detached) if detached > 0 => {
                                 info!(detached, "detached layer mounts after forced delete")
                             }
@@ -2409,6 +2439,7 @@ impl VmProvider for SmolVmProvider {
             "--timeout".into(),
             EXEC_TIMEOUT.into(),
         ];
+        let mut secret_env = Vec::new();
         for (guest, source) in secrets {
             if !is_env_identifier(guest) {
                 return Err(VmError::InvalidSpec(
@@ -2416,13 +2447,13 @@ impl VmProvider for SmolVmProvider {
                 ));
             }
             match source {
-                SecretSource::HostEnv(host) => {
-                    if !is_env_identifier(host) {
-                        return Err(VmError::InvalidSpec(
-                            "secret environment names must be non-empty ASCII identifiers".into(),
-                        ));
-                    }
-                    args.extend(["--secret-env".into(), format!("{guest}={host}")]);
+                SecretSource::Value(secret) => {
+                    // The resolved value rides the spawned SmolVM process's
+                    // own environment — the channel `--secret-env` has always
+                    // resolved from — and reaches the guest under its own
+                    // name. Never argv, never a persisted record.
+                    args.extend(["--secret-env".into(), format!("{guest}={guest}")]);
+                    secret_env.push((guest.clone(), secret.expose().to_owned()));
                 }
                 SecretSource::HostFile(path) => {
                     // SmolVM resolves the path itself; a relative one would be
@@ -2441,7 +2472,8 @@ impl VmProvider for SmolVmProvider {
         }
         args.push("--".into());
         args.extend_from_slice(argv);
-        self.checked("exec", &args).await
+        self.checked_with_network("exec", &args, None, None, &secret_env)
+            .await
     }
 
     async fn exec_stream(
@@ -2909,34 +2941,111 @@ pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(
     Ok(())
 }
 
-/// Preloop home the helper isolates SmolVM into: the explicit `PRELOOP_HOME`,
-/// else `<HOME>/.preloop` (the CLI's `preloop_home()` default), else the
-/// bare `.preloop` relative directory.
-fn effective_preloop_home() -> Option<PathBuf> {
-    std::env::var_os("PRELOOP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
+/// Host paths the SmolVM integration derives its filesystem view from.
+///
+/// Resolved **once** at the startup boundary ([`VmPathConfig::resolve`]) and
+/// then carried as typed state; nothing below that boundary reads the process
+/// environment for these paths. Explicit fields always win over inherited
+/// env, and the fallback semantics are the historical ones:
+/// `preloop_home` falls back to `<host_home>/.preloop` (the CLI's
+/// `preloop_home()` default), `smolvm_data_dir` to `<preloop_home>/smolvm`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmPathConfig {
+    /// Engine home (env `PRELOOP_HOME`).
+    pub preloop_home: Option<PathBuf>,
+    /// Host user home (env `HOME`); probes SmolVM's installation assets.
+    pub host_home: Option<PathBuf>,
+    /// SmolVM registry data dir (env `SMOLVM_DATA_DIR`).
+    pub smolvm_data_dir: Option<PathBuf>,
+    /// Guest agent rootfs (env `SMOLVM_AGENT_ROOTFS`).
+    pub smolvm_agent_rootfs: Option<PathBuf>,
+    /// SmolVM library dir (env `SMOLVM_LIB_DIR`).
+    pub smolvm_lib_dir: Option<PathBuf>,
 }
 
-/// Directory SmolVM keeps per-machine data dirs under for the active registry
-/// configuration. On macOS SmolVM derives it from `HOME`
-/// (`<isolated smolvm-home>/Library/Caches/smolvm/vms`) and ignores
-/// `SMOLVM_DATA_DIR` — see `smolvm_runtime_env`, which is why the isolated home
-/// is pushed unconditionally on that platform. Everywhere else
-/// `$SMOLVM_DATA_DIR/vms` wins over the isolated home's `smolvm/vms`.
-/// This is where golden and job-VM disks land, so it is the filesystem
-/// disk-space checks must measure.
-#[cfg(target_os = "macos")]
-pub fn machine_data_root() -> Option<PathBuf> {
-    Some(effective_preloop_home()?.join("smolvm-home/Library/Caches/smolvm/vms"))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn machine_data_root() -> Option<PathBuf> {
-    if let Some(data_dir) = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from) {
-        return Some(data_dir.join("vms"));
+impl VmPathConfig {
+    /// The startup boundary: capture `PRELOOP_HOME`, `HOME`,
+    /// `SMOLVM_DATA_DIR`, `SMOLVM_AGENT_ROOTFS`, and `SMOLVM_LIB_DIR` from the
+    /// process environment exactly once. A blank value behaves like an unset
+    /// one. Callers with explicit values construct the struct directly —
+    /// explicit fields override anything inherited here.
+    pub fn resolve() -> Self {
+        fn path(key: &str) -> Option<PathBuf> {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .filter(|value| !value.as_os_str().is_empty())
+        }
+        Self {
+            preloop_home: path("PRELOOP_HOME"),
+            host_home: path("HOME"),
+            smolvm_data_dir: path("SMOLVM_DATA_DIR"),
+            smolvm_agent_rootfs: path("SMOLVM_AGENT_ROOTFS"),
+            smolvm_lib_dir: path("SMOLVM_LIB_DIR"),
+        }
     }
-    effective_preloop_home().map(|home| home.join("smolvm/vms"))
+
+    /// Preloop home the helper isolates SmolVM into: the explicit
+    /// `preloop_home`, else `<host_home>/.preloop`, else the bare `.preloop`
+    /// relative directory is not invented — `None` means no home is known.
+    pub fn effective_preloop_home(&self) -> Option<PathBuf> {
+        self.preloop_home
+            .clone()
+            .or_else(|| self.host_home.clone().map(|home| home.join(".preloop")))
+    }
+
+    /// SmolVM registry data dir: the explicit `smolvm_data_dir`, else
+    /// `<preloop_home>/smolvm`.
+    pub fn effective_smolvm_data_dir(&self) -> Option<PathBuf> {
+        self.smolvm_data_dir.clone().or_else(|| {
+            self.effective_preloop_home()
+                .map(|home| home.join("smolvm"))
+        })
+    }
+
+    /// Directory SmolVM keeps per-machine data dirs under for the active
+    /// registry configuration. On macOS SmolVM derives it from `HOME`
+    /// (`<isolated smolvm-home>/Library/Caches/smolvm/vms`) and ignores
+    /// `SMOLVM_DATA_DIR` — see `smolvm_runtime_env`, which is why the isolated
+    /// home is pushed unconditionally on that platform. Everywhere else
+    /// `$SMOLVM_DATA_DIR/vms` wins over the isolated home's `smolvm/vms`.
+    /// This is where golden and job-VM disks land, so it is the filesystem
+    /// disk-space checks must measure.
+    pub fn machine_data_root(&self) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            Some(
+                self.effective_preloop_home()?
+                    .join("smolvm-home/Library/Caches/smolvm/vms"),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.effective_smolvm_data_dir().map(|dir| dir.join("vms"))
+        }
+    }
+
+    /// The [`Self::machine_data_root`] in both the configured and the
+    /// canonical form.
+    ///
+    /// Everything that identifies this home's machines — `_boot-vm` argv, the
+    /// mount table — is matched against a *complete path prefix* of one of
+    /// these roots, never as a substring: `/tmp` and `/private/tmp` name the
+    /// same directory on macOS, an argv carries whichever the caller passed,
+    /// and `mount` prints the canonical one, while a neighboring home whose
+    /// name merely shares a prefix (`/homes/smolvm` vs
+    /// `/homes/smolvm-vm-other`) must never be claimed as ours.
+    pub fn machine_data_roots(&self) -> Vec<PathBuf> {
+        let Some(root) = self.machine_data_root() else {
+            return Vec::new();
+        };
+        let mut roots = vec![root.clone()];
+        if let Ok(canonical) = root.canonicalize()
+            && canonical != root
+        {
+            roots.push(canonical);
+        }
+        roots
+    }
 }
 
 /// Bytes available to an unprivileged writer on the filesystem holding
@@ -3065,28 +3174,6 @@ enum MachineDataState {
     /// live: the mid-flight purge only kills what it can positively identify
     /// as orphaned, because the other answer is to kill a running machine.
     Unknown,
-}
-
-/// The [`machine_data_root`] in both the configured and the canonical form.
-///
-/// Everything that identifies this home's machines — `_boot-vm` argv, the
-/// mount table — is matched against a *complete path prefix* of one of these
-/// roots, never as a substring: `/tmp` and `/private/tmp` name the same
-/// directory on macOS, an argv carries whichever the caller passed, and
-/// `mount` prints the canonical one, while a neighboring home whose name
-/// merely shares a prefix (`/homes/smolvm` vs `/homes/smolvm-vm-other`) must
-/// never be claimed as ours.
-fn machine_data_roots() -> Vec<PathBuf> {
-    let Some(root) = machine_data_root() else {
-        return Vec::new();
-    };
-    let mut roots = vec![root.clone()];
-    if let Ok(canonical) = root.canonicalize()
-        && canonical != root
-    {
-        roots.push(canonical);
-    }
-    roots
 }
 
 /// Machine data directory one token's argv names, when it names the boot
@@ -3231,30 +3318,57 @@ fn orphan_layer_store_mounts(
 /// machine is never disturbed. A mount `hdiutil` refuses is left in place
 /// (its hypervisor may have started between the scan and the detach). No-op
 /// where the layer store is not a host mount.
-pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
+pub fn detach_orphaned_layer_mounts(paths: &VmPathConfig) -> Result<usize, VmError> {
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = paths;
         Ok(0)
     }
     #[cfg(target_os = "macos")]
     {
-        let roots = machine_data_roots();
-        if roots.is_empty() {
-            return Ok(0);
-        }
-        // launchd's PATH has no /sbin, so the mount table tool is named absolutely.
-        let mounts = bounded_orphan_child(
-            std::process::Command::new("/sbin/mount"),
-            "orphaned layer-mount table (/sbin/mount)",
-        )?;
-        detach_orphaned_layer_mounts_in(&roots, &String::from_utf8_lossy(&mounts.stdout))
+        detach_orphaned_layer_mounts_with(&paths.machine_data_roots(), None)
+    }
+}
+
+/// The scan → decide → detach pass behind [`detach_orphaned_layer_mounts`],
+/// with the `mount`/`hdiutil` tools taken from `tool_dir` when one is given
+/// (tests substitute recording stand-ins there instead of rewriting the
+/// process `PATH`); `None` resolves the host tools. `ps` is always the host's
+/// own: the fixture's processes must be real.
+#[cfg(target_os = "macos")]
+fn detach_orphaned_layer_mounts_with(
+    roots: &[PathBuf],
+    tool_dir: Option<&Path>,
+) -> Result<usize, VmError> {
+    if roots.is_empty() {
+        return Ok(0);
+    }
+    let mounts = bounded_orphan_child(
+        std::process::Command::new(host_tool(tool_dir, "mount", "/sbin/mount")),
+        "orphaned layer-mount table (mount)",
+    )?;
+    detach_orphaned_layer_mounts_in(roots, &String::from_utf8_lossy(&mounts.stdout), tool_dir)
+}
+
+/// Resolve a host tool: from `tool_dir` when the caller supplied one, else from
+/// `fallback`, which names `mount` absolutely because launchd's `PATH` has no
+/// `/sbin`.
+#[cfg(target_os = "macos")]
+fn host_tool(tool_dir: Option<&Path>, name: &str, fallback: &str) -> PathBuf {
+    match tool_dir {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(fallback),
     }
 }
 
 /// The scan → decide → detach pass over one `mount` table, split from the
 /// shell-out above so a test can drive it with a fixture table.
 #[cfg(target_os = "macos")]
-fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Result<usize, VmError> {
+fn detach_orphaned_layer_mounts_in(
+    roots: &[PathBuf],
+    mount_table: &str,
+    tool_dir: Option<&Path>,
+) -> Result<usize, VmError> {
     let ps = bounded_orphan_child(
         {
             let mut scan = std::process::Command::new("ps");
@@ -3266,7 +3380,7 @@ fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Resu
     let mut detached = 0usize;
     for mount in orphan_layer_store_mounts(roots, &String::from_utf8_lossy(&ps.stdout), mount_table)
     {
-        let mut detach = std::process::Command::new("hdiutil");
+        let mut detach = std::process::Command::new(host_tool(tool_dir, "hdiutil", "hdiutil"));
         detach.args(["detach", "-quiet"]).arg(&mount);
         match deadline::run_command_blocking(
             detach,
@@ -3357,15 +3471,15 @@ pub enum OrphanPurge {
 /// until the process exits. The `_boot-vm` argv names its
 /// `boot-config.json` under the data dir, so orphaned processes are
 /// identifiable by path: only a token naming a boot config under one of
-/// [`machine_data_roots`] makes a process ours — a neighboring home whose
+/// [`VmPathConfig::machine_data_roots`] makes a process ours — a neighboring home whose
 /// path merely shares a prefix is never matched.
 ///
 /// `scope` decides which of those processes may be killed; see
 /// [`OrphanPurge`]. Called at pool startup (crash recovery, `All`) and on an
 /// interval while the pool serves (`RemovedDataDir`). Returns the number of
 /// processes killed.
-pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
-    let roots = machine_data_roots();
+pub fn purge_orphaned_vms(scope: OrphanPurge, paths: &VmPathConfig) -> Result<usize, VmError> {
+    let roots = paths.machine_data_roots();
     if roots.is_empty() {
         return Ok(0);
     }
@@ -3427,10 +3541,9 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
 /// `pack/layers-cs` mount on macOS) until it dies. Attribution is the argv
 /// boot-config path compared against the canonical data directory, so only
 /// this machine's own hypervisor matches; a process whose argv names no
-/// boot config under [`machine_data_roots`] is never touched. Returns the
+/// boot config under [`VmPathConfig::machine_data_roots`] is never touched. Returns the
 /// number of processes killed.
-fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
-    let roots = machine_data_roots();
+fn kill_vm_processes_in(data_dir: &Path, roots: &[PathBuf]) -> Result<usize, VmError> {
     if roots.is_empty() {
         return Ok(0);
     }
@@ -3463,7 +3576,7 @@ fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
             continue;
         }
         let attributed = needles.iter().any(|needle| line.contains(needle))
-            || boot_config_dirs(line, &roots)
+            || boot_config_dirs(line, roots)
                 .iter()
                 .any(|dir| canonical_path(dir) == target);
         if !attributed {
@@ -3518,28 +3631,39 @@ fn is_shutdown_refusal(message: &str) -> bool {
 /// official golden's sparse disk sizes, still finite.
 const PACK_MAX_EXTRACT_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 
-fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
-    let host_home = std::env::var_os("HOME").map(PathBuf::from);
+/// The guest-agent guard's typed inputs for one [`VmPathConfig`].
+///
+/// The guard (`check_cached`, `resolve_exported_rootfs`) and the child
+/// environment (`smolvm_runtime_env`) must agree on which rootfs is exported,
+/// so both derive their [`agent_rootfs::Runtime`] here from the paths resolved
+/// at the startup boundary — neither reads the process environment.
+fn agent_runtime(paths: &VmPathConfig) -> agent_rootfs::Runtime {
+    agent_rootfs::Runtime {
+        host_home: paths.host_home.clone(),
+        data_dir: paths.effective_smolvm_data_dir(),
+        explicit_rootfs: paths.smolvm_agent_rootfs.clone(),
+    }
+}
+
+fn smolvm_runtime_env(
+    binary: Option<&Path>,
+    paths: &VmPathConfig,
+) -> Vec<(String, std::ffi::OsString)> {
     let mut env = Vec::new();
-    let explicit_data_dir = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from);
-    let data_dir = explicit_data_dir
-        .clone()
-        .or_else(|| effective_preloop_home().map(|home| home.join("smolvm")));
+    let data_dir = paths.effective_smolvm_data_dir();
     // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its registry
     // from HOME. Keep each Preloop home isolated whether or not
     // SMOLVM_DATA_DIR is set, so every engine finds its own machines under
     // `<home>/smolvm-home` and never a foreign registry — `machine_data_root`
     // resolves the same directory on that platform.
     #[cfg(target_os = "macos")]
-    if let Some(preloop_home) = effective_preloop_home() {
+    if let Some(preloop_home) = paths.effective_preloop_home() {
         env.push((
             "HOME".to_owned(),
             preloop_home.join("smolvm-home").into_os_string(),
         ));
     }
-    if explicit_data_dir.is_none()
-        && let Some(data_dir) = &data_dir
-    {
+    if let Some(data_dir) = &data_dir {
         env.push((
             "SMOLVM_DATA_DIR".to_owned(),
             data_dir.clone().into_os_string(),
@@ -3551,11 +3675,10 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
     // REAL host's platform data dir, which the isolated HOME would miss. The
     // rootfs that ships next to the resolved binary outranks a data-dir copy
     // that disagrees with it, so a stale copy can never pin an old guest
-    // agent (see [`agent_rootfs`]).
-    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none()
-        && let Some(path) =
-            agent_rootfs::exported_rootfs_cached(&agent_rootfs::Runtime::from_env(), binary)
-    {
+    // agent (see [`agent_rootfs`]). The inputs are the typed ones this
+    // process resolved once — the guard reads no process environment here.
+    let runtime = agent_runtime(paths);
+    if let Some(path) = agent_rootfs::exported_rootfs_cached(&runtime, binary) {
         env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
     }
 
@@ -3575,8 +3698,8 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
     #[cfg(target_os = "macos")]
     {
         let mut candidates = Vec::new();
-        if let Some(path) = std::env::var_os("SMOLVM_LIB_DIR") {
-            candidates.push(PathBuf::from(path));
+        if let Some(path) = &paths.smolvm_lib_dir {
+            candidates.push(path.clone());
         }
         if let Some(binary) = binary {
             let resolved = binary
@@ -3587,7 +3710,7 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
                 candidates.push(parent.join("lib"));
             }
         }
-        if let Some(home) = host_home {
+        if let Some(home) = &paths.host_home {
             candidates.push(home.join(".smolvm/lib"));
         }
         let Some(lib_dir) = candidates
@@ -3622,10 +3745,10 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
 /// standard per-user install location.
 /// Directories derived from the effective Preloop home that must exist before
 /// SmolVM starts (it does not create a missing data dir itself).
-fn runtime_dirs_to_create() -> Vec<PathBuf> {
+fn runtime_dirs_to_create(paths: &VmPathConfig) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if std::env::var_os("SMOLVM_DATA_DIR").is_none()
-        && let Some(home) = effective_preloop_home()
+    if paths.smolvm_data_dir.is_none()
+        && let Some(home) = paths.effective_preloop_home()
     {
         dirs.push(home.join("smolvm"));
     }
@@ -3633,7 +3756,7 @@ fn runtime_dirs_to_create() -> Vec<PathBuf> {
     // SMOLVM_DATA_DIR (see `smolvm_runtime_env`), so the isolated smolvm home
     // must always exist.
     #[cfg(target_os = "macos")]
-    if let Some(home) = effective_preloop_home() {
+    if let Some(home) = paths.effective_preloop_home() {
         dirs.push(home.join("smolvm-home"));
     }
     dirs
@@ -3651,11 +3774,12 @@ fn runtime_dirs_to_create() -> Vec<PathBuf> {
 pub fn apply_smolvm_runtime_env(
     command: &mut std::process::Command,
     binary: Option<&Path>,
+    paths: &VmPathConfig,
 ) -> Result<(), VmError> {
-    for dir in runtime_dirs_to_create() {
+    for dir in runtime_dirs_to_create(paths) {
         std::fs::create_dir_all(&dir).map_err(|source| VmError::RuntimeIo { source })?;
     }
-    for (key, value) in smolvm_runtime_env(binary) {
+    for (key, value) in smolvm_runtime_env(binary, paths) {
         command.env(key, value);
     }
     Ok(())
@@ -3664,11 +3788,12 @@ pub fn apply_smolvm_runtime_env(
 fn apply_smolvm_runtime_env_async(
     command: &mut Command,
     binary: Option<&Path>,
+    paths: &VmPathConfig,
 ) -> Result<(), VmError> {
-    for dir in runtime_dirs_to_create() {
+    for dir in runtime_dirs_to_create(paths) {
         std::fs::create_dir_all(&dir).map_err(|source| VmError::RuntimeIo { source })?;
     }
-    for (key, value) in smolvm_runtime_env(binary) {
+    for (key, value) in smolvm_runtime_env(binary, paths) {
         command.env(key, value);
     }
     Ok(())
@@ -4075,32 +4200,14 @@ async fn stream_output(
 #[cfg(test)]
 mod tests {
 
-    /// Serializes the tests that rewrite `PRELOOP_HOME`: `purge_orphaned_vms`
-    /// resolves the Preloop home from the process environment, so two of them
-    /// running concurrently would purge each other's scratch home.
-    static PRELOOP_HOME_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-    /// Sets `PRELOOP_HOME` for the test's scope and restores it on drop.
-    struct PreloopHomeGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl PreloopHomeGuard {
-        fn set(home: &std::path::Path) -> Self {
-            let previous = std::env::var_os("PRELOOP_HOME");
-            // SAFETY: single-threaded test section under `PRELOOP_HOME_LOCK`.
-            unsafe { std::env::set_var("PRELOOP_HOME", home) };
-            Self { previous }
-        }
-    }
-
-    impl Drop for PreloopHomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                // SAFETY: single-threaded test section under `PRELOOP_HOME_LOCK`.
-                Some(value) => unsafe { std::env::set_var("PRELOOP_HOME", value) },
-                None => unsafe { std::env::remove_var("PRELOOP_HOME") },
-            }
+    /// Explicit paths for a scratch Preloop home: these tests feed the home
+    /// in as an input instead of rewriting the process environment, so they
+    /// no longer serialize against each other (or leak into the developer's
+    /// real `~/.preloop`).
+    fn scratch_paths(home: &std::path::Path) -> super::VmPathConfig {
+        super::VmPathConfig {
+            preloop_home: Some(home.to_path_buf()),
+            ..Default::default()
         }
     }
 
@@ -4341,10 +4448,11 @@ mod tests {
 
     #[test]
     fn kill_vm_processes_in_kills_only_the_named_machines_hypervisor() {
-        let _guard = PRELOOP_HOME_LOCK.lock();
         let home = std::env::temp_dir().join(format!("preloop-kill-{}", uuid::Uuid::new_v4()));
-        let _home = PreloopHomeGuard::set(&home);
-        let root = super::machine_data_root().expect("this home resolves to a data root");
+        let paths = scratch_paths(&home);
+        let root = paths
+            .machine_data_root()
+            .expect("this home resolves to a data root");
         let target_dir = root.join("target-machine");
         let neighbor_dir = root.join("neighbor-machine");
         std::fs::create_dir_all(target_dir.join("pack/layers-cs")).expect("target dir");
@@ -4357,7 +4465,8 @@ mod tests {
         let target_pid = target.id() as i32;
         let neighbor_pid = neighbor.id() as i32;
 
-        let killed = super::kill_vm_processes_in(&target_dir).expect("scoped kill");
+        let killed = super::kill_vm_processes_in(&target_dir, &paths.machine_data_roots())
+            .expect("scoped kill");
 
         assert_eq!(killed, 1, "only the named machine's hypervisor may die");
         let _ = target.wait();
@@ -4379,19 +4488,14 @@ mod tests {
     /// whitespace in a PRELOOP_HOME or worktree path.
     #[cfg(unix)]
     #[tokio::test]
-    // The PRELOOP_HOME guard must stay held across the delete's awaits:
-    // `kill_vm_processes_in` reads PRELOOP_HOME via `machine_data_root`, and
-    // releasing it mid-test would let a parallel env-mutating test redirect
-    // this test's kills. Sync locking across awaits is the established
-    // pattern for the env-mutating suite.
-    #[allow(clippy::await_holding_lock)]
     async fn refused_delete_kills_the_hypervisor_and_retries() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = PRELOOP_HOME_LOCK.lock();
         let home = std::env::temp_dir().join(format!("preloop-refused-{}", uuid::Uuid::new_v4()));
-        let _home = PreloopHomeGuard::set(&home);
-        let root = super::machine_data_root().expect("this home resolves to a data root");
+        let paths = scratch_paths(&home);
+        let root = paths
+            .machine_data_root()
+            .expect("this home resolves to a data root");
         let data_dir = root.join("vm with space");
         std::fs::create_dir_all(&data_dir).expect("machine data dir");
 
@@ -4414,7 +4518,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let provider = SmolVmProvider::new(&binary);
+        let provider = SmolVmProvider::new(&binary, paths);
         provider
             .delete(&MachineName::new("runner").unwrap())
             .await
@@ -4431,10 +4535,9 @@ mod tests {
 
     #[test]
     fn purge_orphaned_vms_kills_matching_boot_vm_processes() {
-        let _guard = PRELOOP_HOME_LOCK.lock();
         let home = std::env::temp_dir().join(format!("preloop-purge-{}", uuid::Uuid::new_v4()));
-        let _home = PreloopHomeGuard::set(&home);
-        let boot_config = super::machine_data_root()
+        let boot_config = scratch_paths(&home)
+            .machine_data_root()
             .expect("this home resolves to a data root")
             .join("deadbeef/boot-config.json");
         // A process that looks like an orphaned _boot-vm for this home: the
@@ -4442,7 +4545,7 @@ mod tests {
         // line.
         let mut child = spawn_fake_boot_vm(&[boot_config.to_str().unwrap()]);
         let pid = child.id() as i32;
-        let killed = purge_orphaned_vms(OrphanPurge::All).expect("purge");
+        let killed = purge_orphaned_vms(OrphanPurge::All, &scratch_paths(&home)).expect("purge");
         assert!(killed >= 1, "purge should have killed the matching process");
         // Reap the SIGKILLed child so it is not a zombie (kill -0 on a
         // zombie still succeeds until it is reaped).
@@ -4457,24 +4560,20 @@ mod tests {
     /// down a different engine's running job.
     #[test]
     fn purge_never_touches_a_neighboring_homes_hypervisor() {
-        let _guard = PRELOOP_HOME_LOCK.lock();
         let home =
             std::env::temp_dir().join(format!("preloop-purge-neighbor-{}", uuid::Uuid::new_v4()));
         // The neighbor's home is spelled so that this home's data root prefix
         // is a string prefix of its machine paths, but not a path-component
         // prefix: exactly the shape old substring matches claimed as ours.
-        let neighbor_boot_config = {
-            let _neighbor = PreloopHomeGuard::set(&home.join("smolvm-vm-other"));
-            super::machine_data_root()
-                .expect("the neighbor home resolves to a data root")
-                .join("deadbeef/boot-config.json")
-        };
+        let neighbor_boot_config = scratch_paths(&home.join("smolvm-vm-other"))
+            .machine_data_root()
+            .expect("the neighbor home resolves to a data root")
+            .join("deadbeef/boot-config.json");
         let mut neighbor_child = spawn_fake_boot_vm(&[neighbor_boot_config.to_str().unwrap()]);
         let neighbor_pid = neighbor_child.id() as i32;
-        let _home = PreloopHomeGuard::set(&home);
 
         assert_eq!(
-            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            purge_orphaned_vms(OrphanPurge::All, &scratch_paths(&home)).expect("purge"),
             0,
             "a neighboring home's hypervisor is not ours to kill"
         );
@@ -4495,11 +4594,12 @@ mod tests {
     /// process match, the protection for live machines.
     #[test]
     fn removed_data_dir_purge_spares_live_data_dirs_and_unowned_argvs() {
-        let _guard = PRELOOP_HOME_LOCK.lock();
         let home =
             std::env::temp_dir().join(format!("preloop-purge-live-{}", uuid::Uuid::new_v4()));
-        let _home = PreloopHomeGuard::set(&home);
-        let vms = super::machine_data_root().expect("this home resolves to a data root");
+        let paths = scratch_paths(&home);
+        let vms = paths
+            .machine_data_root()
+            .expect("this home resolves to a data root");
         // A live machine's directory, in the shape a running machine leaves on
         // disk: smolvm consumes `boot-config.json` at boot, so only the
         // directory — not that file — is durable evidence of the machine.
@@ -4521,7 +4621,7 @@ mod tests {
         let unknown_pid = unknown_child.id() as i32;
 
         assert_eq!(
-            purge_orphaned_vms(OrphanPurge::RemovedDataDir).expect("purge"),
+            purge_orphaned_vms(OrphanPurge::RemovedDataDir, &paths).expect("purge"),
             1,
             "only the hypervisor whose data directory is gone may be killed"
         );
@@ -4540,7 +4640,7 @@ mod tests {
         );
 
         assert_eq!(
-            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            purge_orphaned_vms(OrphanPurge::All, &paths).expect("purge"),
             1,
             "the startup scope kills the hypervisor the mid-flight scope spared"
         );
@@ -4555,44 +4655,6 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Serializes the tests that rewrite `PATH`: fake `mount`/`hdiutil`
-    /// stand-ins resolve through it, and `PATH` is process-global.
-    #[cfg(target_os = "macos")]
-    static PATH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-    /// Prepends `directory` to `PATH` for the test's scope, restoring the
-    /// previous value on drop.
-    #[cfg(target_os = "macos")]
-    struct PathPrependGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(target_os = "macos")]
-    impl PathPrependGuard {
-        fn prepend(directory: &std::path::Path) -> Self {
-            let previous = std::env::var_os("PATH");
-            let mut path = directory.as_os_str().to_owned();
-            path.push(":");
-            if let Some(previous) = &previous {
-                path.push(previous);
-            }
-            // SAFETY: serialized by `PATH_LOCK`.
-            unsafe { std::env::set_var("PATH", path) };
-            Self { previous }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    impl Drop for PathPrependGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialized by `PATH_LOCK`.
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var("PATH", value) },
-                None => unsafe { std::env::remove_var("PATH") },
-            }
-        }
-    }
-
     /// A layer-store mount belongs to this home when it hangs off this home's
     /// machine data root — in either the raw or the canonical form of the path
     /// (`mount` prints `/private/tmp/...` for a `/tmp/...` home) — and only
@@ -4601,30 +4663,29 @@ mod tests {
     /// mount that is not a layer store, must never be selected.
     #[test]
     fn orphan_layer_store_mounts_spare_machines_with_a_live_hypervisor() {
-        let _guard = PRELOOP_HOME_LOCK.lock();
         // Under `/tmp` on purpose: on macOS that is a path *through a
         // symlink*, so the argv form and the mount-table form differ unless
         // the scan canonicalizes both sides.
         let home = std::path::PathBuf::from("/tmp")
             .join(format!("preloop-layer-mounts-{}", uuid::Uuid::new_v4()));
-        let _home = PreloopHomeGuard::set(&home);
-        let vms = super::machine_data_root().expect("this home resolves to a data root");
+        let paths = scratch_paths(&home);
+        let vms = paths
+            .machine_data_root()
+            .expect("this home resolves to a data root");
         let live = vms.join("aaaaaaaaaaaaaaaa");
         let orphan = vms.join("bbbbbbbbbbbbbbbb");
         for dir in [&live, &orphan] {
             std::fs::create_dir_all(dir.join("pack/layers-cs")).unwrap();
         }
-        let roots = super::machine_data_roots();
+        let roots = paths.machine_data_roots();
         let canonical_vms = std::fs::canonicalize(&vms).unwrap();
         // A neighboring home whose path shares this home's data-root prefix
         // as a *string* but not as a path component (`…/smolvm` vs
         // `…/smolvm-vm-other`): its mount is not ours to detach.
-        let neighbor_mount = {
-            let _neighbor = PreloopHomeGuard::set(&home.join("smolvm-vm-other"));
-            super::machine_data_root()
-                .expect("the neighbor home resolves to a data root")
-                .join("cccccccccccccccc/pack/layers-cs")
-        };
+        let neighbor_mount = scratch_paths(&home.join("smolvm-vm-other"))
+            .machine_data_root()
+            .expect("the neighbor home resolves to a data root")
+            .join("cccccccccccccccc/pack/layers-cs");
         let mount_table = format!(
             "/dev/disk3s5 on / (apfs, local, read-only, sealed)\n\
              /dev/disk11s1 on {live}/pack/layers-cs (apfs, local, journaled, nobrowse)\n\
@@ -4652,19 +4713,18 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// The detach pass reads the `mount` table it is handed and shells out to
-    /// `hdiutil`; a fake `hdiutil` on `PATH` records the exact argv, so the
-    /// whole scan → decide → detach path is covered without attaching a disk
-    /// image. The table is passed in because `mount` is named absolutely
-    /// (`/sbin/mount`), so it cannot be faked on `PATH`.
+    /// The detach pass shells out to `hdiutil`; a fake one in an explicit tool
+    /// dir records the exact argv, so the whole scan → decide → detach path is
+    /// covered without attaching a disk image or rewriting the process `PATH`.
+    /// The `mount` table is passed in because the host tool is named
+    /// absolutely (`/sbin/mount`) and so cannot be faked there.
     #[cfg(target_os = "macos")]
     #[test]
     fn detach_orphaned_layer_mounts_detaches_each_mount_without_a_hypervisor() {
-        let _path_guard = PATH_LOCK.lock();
-        let _home_guard = PRELOOP_HOME_LOCK.lock();
         let home = std::env::temp_dir().join(format!("preloop-detach-{}", uuid::Uuid::new_v4()));
-        let _home = PreloopHomeGuard::set(&home);
-        let orphan = super::machine_data_root()
+        let paths = scratch_paths(&home);
+        let orphan = paths
+            .machine_data_root()
             .expect("this home resolves to a data root")
             .join("bbbbbbbbbbbbbbbb");
         std::fs::create_dir_all(orphan.join("pack/layers-cs")).unwrap();
@@ -4685,12 +4745,15 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hdiutil, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _path = PathPrependGuard::prepend(&bin);
 
         // The real `ps` runs: no `_boot-vm` names this fixture home, so the
         // mount is provably orphaned.
-        let detached =
-            detach_orphaned_layer_mounts_in(&machine_data_roots(), &mount_table).expect("detach");
+        let detached = super::detach_orphaned_layer_mounts_in(
+            &paths.machine_data_roots(),
+            &mount_table,
+            Some(&bin),
+        )
+        .expect("detach");
         assert_eq!(detached, 1, "the orphaned layer mount must be detached");
         assert_eq!(
             std::fs::read_to_string(&log).expect("fake hdiutil log"),
@@ -4729,10 +4792,9 @@ mod tests {
     /// while the create runs, which is exactly the reported failure.
     #[test]
     fn sweep_waits_for_a_create_in_flight_and_spares_its_data_dir() {
-        let _guard = PRELOOP_HOME_LOCK.lock();
         let home = tempfile::tempdir().expect("home");
-        let _home = PreloopHomeGuard::set(home.path());
-        let root = super::machine_data_root().expect("data root");
+        let paths = scratch_paths(home.path());
+        let root = paths.machine_data_root().expect("data root");
         let dir = root.join("59cc3c416f4b6d5e");
         let orphan = root.join("0000000000000000");
         for path in [&dir, &orphan] {
@@ -4766,7 +4828,7 @@ mod tests {
             release = release.display(),
         );
         let binary = fake_smolvm(scratch.path(), &script);
-        let provider = super::SmolVmProvider::new(&binary);
+        let provider = super::SmolVmProvider::new(&binary, paths);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -4837,10 +4899,9 @@ mod tests {
     /// orphan and must still be reclaimed, or a restart would leak it forever.
     #[test]
     fn sweep_reclaims_a_leftover_unregistered_dir() {
-        let _guard = PRELOOP_HOME_LOCK.lock();
         let home = tempfile::tempdir().expect("home");
-        let _home = PreloopHomeGuard::set(home.path());
-        let root = super::machine_data_root().expect("data root");
+        let paths = scratch_paths(home.path());
+        let root = paths.machine_data_root().expect("data root");
         let dir = root.join("59cc3c416f4b6d5e");
         std::fs::create_dir_all(&dir).expect("create leftover dir");
         std::fs::write(dir.join("name"), b"runner-0").expect("name file");
@@ -4851,9 +4912,7 @@ mod tests {
             scratch.path(),
             "#!/bin/sh\n[ \"$1 $2\" = \"machine ls\" ] && echo '[]'\nexit 0\n",
         );
-        let provider = super::SmolVmProvider::new(&binary);
-        // A synchronous runtime keeps the sync `PRELOOP_HOME` lock out of
-        // any await, where clippy's `await_holding_lock` would object.
+        let provider = super::SmolVmProvider::new(&binary, paths);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4894,6 +4953,47 @@ mod tests {
             .find(|path| path.is_dir())
             .expect("explicit candidate exists");
         assert_eq!(found, explicit);
+    }
+
+    /// Pack-export proxy resolution: the Preloop-specific variables win over
+    /// the conventional ones, a blank value behaves unset (falling through,
+    /// lowercase conventional spellings included), and nothing configured
+    /// forwards no proxy configuration at all. Pure: the precedence rule is
+    /// exercised with explicit lookup inputs instead of a mutated process
+    /// environment.
+    #[test]
+    fn pack_network_prefers_preloop_proxy_variables() {
+        let values: std::collections::HashMap<&str, &str> = [
+            ("PRELOOP_RUNNER_PACK_PROXY", "http://preloop.proxy:8080"),
+            ("PRELOOP_RUNNER_PACK_NO_PROXY", ".preloop.internal"),
+            ("HTTPS_PROXY", "http://standard.proxy:8080"),
+            ("NO_PROXY", ".standard.internal"),
+        ]
+        .into_iter()
+        .collect();
+        let (proxy, no_proxy) =
+            super::pack_network_from(|key: &str| values.get(key).map(|value| (*value).to_owned()));
+        assert_eq!(proxy.as_deref(), Some("http://preloop.proxy:8080"));
+        assert_eq!(no_proxy.as_deref(), Some(".preloop.internal"));
+
+        let values: std::collections::HashMap<&str, &str> = [
+            ("PRELOOP_RUNNER_PACK_PROXY", "  "),
+            ("PRELOOP_RUNNER_PACK_NO_PROXY", ""),
+            ("https_proxy", "http://lowercase.proxy:8080"),
+            ("no_proxy", ".lowercase.internal"),
+        ]
+        .into_iter()
+        .collect();
+        let (proxy, no_proxy) =
+            super::pack_network_from(|key: &str| values.get(key).map(|value| (*value).to_owned()));
+        assert_eq!(proxy.as_deref(), Some("http://lowercase.proxy:8080"));
+        assert_eq!(no_proxy.as_deref(), Some(".lowercase.internal"));
+
+        assert_eq!(
+            super::pack_network_from(|_: &str| None),
+            (None, None),
+            "no proxy variables configured means nothing is forwarded"
+        );
     }
 
     /// The rootfs shipped next to the resolved binary is a candidate, and on
@@ -5146,7 +5246,8 @@ mod tests {
         fn rejected(key: &str) -> Option<String> {
             (key == "SMOLVM_SECCOMP").then(|| "Enforce".to_owned())
         }
-        let provider = SmolVmProvider::new(&binary).with_env_lookup(rejected);
+        let provider =
+            SmolVmProvider::new(&binary, VmPathConfig::default()).with_env_lookup(rejected);
 
         // Boot-capable path: fails closed.
         let spec = MachineSpec {
@@ -5215,7 +5316,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let provider = SmolVmProvider::new(&binary);
+        let provider = SmolVmProvider::new(&binary, VmPathConfig::default());
         provider
             .delete(&MachineName::new("runner").unwrap())
             .await
@@ -5278,7 +5379,8 @@ mod tests {
             workload_init: None,
         };
 
-        let provider = SmolVmProvider::new(&binary).with_env_lookup(rejected);
+        let provider =
+            SmolVmProvider::new(&binary, VmPathConfig::default()).with_env_lookup(rejected);
         let error = provider.create(&spec).await.unwrap_err();
         assert!(
             matches!(
@@ -5730,15 +5832,9 @@ mod tests {
     /// actionable message rather than smolvm's bare `EINVAL`.
     #[cfg(unix)]
     #[tokio::test]
-    // The PRELOOP_HOME guard must stay held across the awaits: `create` and
-    // `start` resolve the runtime environment through `effective_preloop_home`.
-    // Sync locking across awaits is the established pattern for the
-    // env-mutating suite.
-    #[allow(clippy::await_holding_lock)]
     async fn start_failure_with_the_irq_signature_becomes_the_dedicated_variant() {
-        let _home_guard = PRELOOP_HOME_LOCK.lock();
         let home = tempfile::tempdir().expect("home");
-        let _home = PreloopHomeGuard::set(home.path());
+        let paths = scratch_paths(home.path());
         let scratch = tempfile::tempdir().expect("scratch");
         // The failure text lives in a file: it carries quotes of its own, so
         // it cannot be inlined into the fake's shell script safely.
@@ -5759,7 +5855,7 @@ mod tests {
                 failure = failure.display()
             ),
         );
-        let provider = super::SmolVmProvider::new(&binary);
+        let provider = super::SmolVmProvider::new(&binary, paths);
         let bundle = scratch.path().join("bundle");
         let control = scratch.path().join("control");
         for dir in [&bundle, &control] {
@@ -5851,11 +5947,9 @@ mod tests {
     /// held-disk/corrupt-image diagnosis is untouched.
     #[cfg(unix)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn start_failure_without_the_signature_keeps_its_command_error() {
-        let _home_guard = PRELOOP_HOME_LOCK.lock();
         let home = tempfile::tempdir().expect("home");
-        let _home = PreloopHomeGuard::set(home.path());
+        let paths = scratch_paths(home.path());
         let scratch = tempfile::tempdir().expect("scratch");
         let held_disk = scratch.path().join("held-disk.txt");
         std::fs::write(
@@ -5881,7 +5975,7 @@ mod tests {
                 held_disk = held_disk.display()
             ),
         );
-        let provider = super::SmolVmProvider::new(&binary);
+        let provider = super::SmolVmProvider::new(&binary, paths);
         let error = provider
             .start(&MachineName::new("runner-0").unwrap())
             .await
@@ -5907,11 +6001,9 @@ mod tests {
     /// shutdown; it boots the same launcher and must classify identically.
     #[cfg(unix)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn start_forkable_failures_are_classified_too() {
-        let _home_guard = PRELOOP_HOME_LOCK.lock();
         let home = tempfile::tempdir().expect("home");
-        let _home = PreloopHomeGuard::set(home.path());
+        let paths = scratch_paths(home.path());
         let scratch = tempfile::tempdir().expect("scratch");
         let binary = fake_smolvm(
             scratch.path(),
@@ -5922,7 +6014,7 @@ mod tests {
              echo 'libkrun detail: build microVM: no more IRQs are available' >&2\n\
              exit 1\n",
         );
-        let provider = super::SmolVmProvider::new(&binary);
+        let provider = super::SmolVmProvider::new(&binary, paths);
         let error = provider
             .start_forkable(&MachineName::new("preloop-runner-golden").unwrap())
             .await

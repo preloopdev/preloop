@@ -1165,7 +1165,9 @@ mod tests {
     #[tokio::test]
     async fn job_backend_id_from_bearer_accepts_matching_runtime_token() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job_id = uuid::Uuid::new_v4();
         let token = state
             .local_jwt(json!({
@@ -1188,7 +1190,9 @@ mod tests {
     #[tokio::test]
     async fn job_backend_id_from_bearer_rejects_mismatched_and_malformed_scopes() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let subject_job = uuid::Uuid::new_v4();
         let other_job = uuid::Uuid::new_v4();
         let cases = [
@@ -1238,7 +1242,9 @@ mod tests {
     #[tokio::test]
     async fn job_backend_id_from_bearer_leaves_system_credential_unscoped() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let headers = HeaderMap::from_iter([(
             header::AUTHORIZATION,
             format!("Bearer {}", state.system_token).parse().unwrap(),
@@ -1315,7 +1321,9 @@ mod tests {
     #[tokio::test]
     async fn plan_completed_run_trim_keeps_the_newest_terminal_runs() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let base = 1_700_000_000_000_000i64;
         let newest = MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE;
         let mut terminal = Vec::new();
