@@ -40,6 +40,10 @@ mod unix {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
+    use preloop_sandbox::Driver as _;
+    use preloop_sandbox::api::{ExecEvent, ExecRequest};
+    use preloop_sandbox::drivers::smolvm::SmolvmDriver;
+
     static TEST_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn write_executable(path: &Path, contents: &str) {
@@ -128,6 +132,15 @@ case "${1-}:${2-}" in
     printf '[{"name":"alpha"},{"name":"beta-2"},{"kind":"other"}]\n'
     ;;
   machine:exec)
+    if [ "${3-}" = "--stream" ] && [ -f "$0.hang-stream" ]; then
+      printf 'stream-started\n' >> "$0.exec-log"
+      exec sleep 300
+    fi
+    if [ "${3-}" != "--stream" ] && [ -f "$0.hang-stream" ]; then
+      printf 'guest-kill\n' >> "$0.exec-log"
+      for arg in "$@"; do printf '%s\n' "$arg" >> "$0.exec-log"; done
+      exit 0
+    fi
     if [ "${3-}" = "--stream" ]; then
       printf 'stream-out\n'
       printf 'stream-err\n' >&2
@@ -1554,6 +1567,75 @@ exit 0
                 .expect("the marker was written")
                 .trim(),
             native
+        );
+    }
+
+    /// SmolVM's guest agent does not reap a command when the host-side
+    /// `machine exec` client goes away. At the deadline the driver must also
+    /// kill it in the guest, through the PID file its wrapper recorded.
+    #[tokio::test]
+    async fn deadline_kills_the_guest_command_with_a_second_exec() {
+        let (_directory, executable) = fake_smolvm();
+        fs::write(executable.with_extension("hang-stream"), b"").unwrap();
+        let driver = SmolvmDriver::new(SmolVmProvider::new(&executable), 0);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ExecEvent>(16);
+        let request = ExecRequest {
+            argv: vec!["sleep".to_owned(), "300".to_owned()],
+            timeout_secs: 1,
+            ..ExecRequest::default()
+        };
+
+        let code = driver
+            .exec("runner", "exe-deadline", &request, tx)
+            .await
+            .unwrap();
+
+        assert_eq!(code, 124, "the deadline is reported");
+        let log = fs::read_to_string(executable.with_extension("exec-log")).unwrap();
+        assert!(log.contains("guest-kill"), "no guest-side kill in {log:?}");
+        assert!(
+            log.contains("/var/tmp/.psbx-exec-exe-deadline.pid"),
+            "the kill does not target this exec: {log:?}"
+        );
+        assert!(log.contains("kill -TERM"), "{log:?}");
+    }
+
+    /// A cancel kills the host-side client; the guest command must die too.
+    #[tokio::test]
+    async fn cancel_kills_the_guest_command_with_a_second_exec() {
+        let (_directory, executable) = fake_smolvm();
+        fs::write(executable.with_extension("hang-stream"), b"").unwrap();
+        let log_path = executable.with_extension("exec-log");
+        let driver = std::sync::Arc::new(SmolvmDriver::new(SmolVmProvider::new(&executable), 0));
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ExecEvent>(16);
+        let request = ExecRequest {
+            argv: vec!["sleep".to_owned(), "300".to_owned()],
+            timeout_secs: 300,
+            ..ExecRequest::default()
+        };
+        let running = {
+            let driver = driver.clone();
+            tokio::spawn(async move { driver.exec("runner", "exe-cancel", &request, tx).await })
+        };
+        // Cancel only once the streaming exec really started.
+        let mut started = false;
+        for _ in 0..200 {
+            if fs::read_to_string(&log_path).is_ok_and(|log| log.contains("stream-started")) {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(started, "the streaming exec never started");
+
+        driver.cancel_exec("runner", "exe-cancel").await.unwrap();
+
+        assert_eq!(running.await.unwrap().unwrap(), 130);
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("guest-kill"), "no guest-side kill in {log:?}");
+        assert!(
+            log.contains("/var/tmp/.psbx-exec-exe-cancel.pid"),
+            "the kill does not target this exec: {log:?}"
         );
     }
 }

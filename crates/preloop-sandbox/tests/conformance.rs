@@ -3072,3 +3072,68 @@ async fn a_snapshot_wait_is_bounded_by_the_work_timeout() {
     assert_eq!(error.code, Code::Unavailable);
     assert!(error.message.contains("snapshot"), "{}", error.message);
 }
+
+/// The caller is a network client, so its disconnect is observed through the
+/// response body, not through a shared channel. Dropping the stream must
+/// still queue `CancelExec` for the provider while the service stays alive.
+#[tokio::test]
+async fn dropping_a_remote_exec_stream_cancels_the_command() {
+    use preloop_sandbox::SandboxApi as _;
+    let dir = tempfile::tempdir().unwrap();
+    let service = Service::open(
+        store::open("memory:").await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = router(service.clone(), Auth::default());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let shutdown = CancellationToken::new();
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    let fake = Arc::new(FakeDriver::new(
+        "fake",
+        dir.path().join("host"),
+        FakeDriver::full_capabilities(),
+    ));
+    let agent = Agent::new(
+        Arc::new(RemoteLink::new(&base, None)) as Arc<dyn ProviderLink>,
+        vec![fake.clone() as Arc<dyn Driver>],
+        AgentConfig::new("remote-host", dir.path().join("scratch")),
+    );
+    tokio::spawn(agent.run(shutdown.clone()));
+    let client = SandboxClient::new(&base, None);
+    wait_for(|| !service.list_providers().is_empty()).await;
+    client.put_template(template("alpine")).await.unwrap();
+    let lease = client
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let stream = client
+        .exec(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            argv: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    // Let the work reach the agent, then walk away while the service lives.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(stream);
+    wait_for(|| fake.cancel_calls.load(Ordering::Acquire) > 0).await;
+    // The sandbox is still usable: the dropped exec left no state behind.
+    let (code, _, _) = client
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id,
+            argv: vec!["true".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+}
