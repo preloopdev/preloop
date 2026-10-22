@@ -20,7 +20,7 @@ contract is byte-for-byte fidelity with the official runner (v2.336.0).
 ## Required gates
 
 - [ ] `just test-ci` passes locally (fmt-check + clippy `-D` + full test suite + runner-watch conformance)
-- [ ] Supply-chain isolation: this PR carries no dependency/policy file, or it carries only those (`just supply-chain-guard` is green). Dependency/policy files are `deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, `supply-chain/**`, and any `Cargo.toml` or `Cargo.lock` anywhere in the tree; code that needs a new dependency ships in a follow-up PR once theirs merges (`supply-chain/README.md`)
+- [ ] Supply-chain isolation (`just supply-chain-guard` is green): strict policy files (`deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, `supply-chain/**`) ship only with dependency files, and `Cargo.toml`/`Cargo.lock` count as dependency files only when a third-party lock entry changes — otherwise they are first-party and may ship with code. A new third-party dependency ships in a follow-up PR once its dependency PR merges (`supply-chain/README.md`).
 - [ ] If protocol/wire shapes changed: the change is validated against the official runner (golden replay via `runner-watch`, or a live capture showing the official bytes), not only unit tests
 - [ ] If the touched subsystem has property tests (`concurrency_properties`, scheduling, matrix expansion, …): they are extended for the changed contract and pass (`PROPTEST_CASES=256 cargo test -p preloop-runner-server`)
 - [ ] New wire fields/events are additive and serde-defaulted where the official runner would not send them

@@ -98,6 +98,7 @@ use cache_artifacts::*;
 pub mod bundles;
 pub mod merge_builder;
 pub mod recording;
+pub mod sarif;
 pub mod snapshots;
 use recording::*;
 use snapshots::*;
