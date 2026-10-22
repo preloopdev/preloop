@@ -1,0 +1,32 @@
+ preloop  ctx cpane ● healthy  0.21.0 · up 3d04h              queue 2 ready · 0 claimable   pool 3/1   sbx ● 2 prov
+  1 Overview  ▌2 Runs   3 Fleet   4 Debug   5 Webhooks   6 Sandboxes   7 Stack
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ / status:failure,running  workflow:ci  3 of 41
+┌─ Runs ───────────────────────┐┌─ Jobs · 8f3a91c2 ──────┐┌─ Steps ────────────┐┌─ cargo test · ◉ follow ──────────────┐
+│✗ #412 ci                   6m││ ✓ fmt                38││ ✓ Set up job     1s││1322    7: std::sys::backtrace::__rust│
+│  #619 sandbox-service        ││ ✓ clippy           3m02││ ✓ checkout       2s││1323    8: std::sys::backtrace::__rust│
+│                              ││ ▾ test         matrix 2││ ✓ rust cache    11s││1324    9: std::panicking::begin_panic│
+│● #411 ci                   4m││   ✓ runner         6m11││ ✗ cargo test   4m21││1325   10: core::panicking::panic_fmt │
+│  #751 sbx-observability      ││   ✗ sandbox        5m46││ ⊘ upload junit     ││1326   11: core::panicking::panic     │
+│                              ││ ◌ e2e                  ││ ✓ Complete job   0s││1327   12: preloop_sandbox::service::t│
+│✗ #398 ci                   2h││ ◌ dogfood              ││                    ││1328              at ./src/service.rs:│
+│  #754 sbx-mtls               ││                        ││                    ││1329   13: test::__rust_begin_short_ba│
+│                              ││                        ││                    ││1330 note: Some details are omitted, r│
+│                              ││                        ││                    ││1331                                  │
+│                              ││                        ││                    ││1332 failures:                        │
+│                              ││                        ││                    ││1333                                  │
+│                              ││                        ││                    ││1334 ---- reconcile_orphan stdout ----│
+│                              ││                        ││                    ││1335                                  │
+│                              ││                        ││                    ││1336 assertion `left == right` failed │
+│                              ││                        ││                    ││1337   left: Failed                   │
+│                              ││                        ││                    ││1338  right: Gone                     │
+│                              ││                        ││                    ││1339 error: test failed, to rerun pass│
+│                              ││                        ││                    ││1340 test result: FAILED. 52 passed; 1│
+│                              ││                        ││                    ││1341 ##[error]Process completed with e│
+│                              ││                        ││                    │┌─ Debug ──────────────────────────────┐
+│                              ││                        ││                    ││ ◆ session ds-7c1e paused 14m         │
+│                              ││ check run —            ││                    ││ VM plr-cpane-4 · a attach  r retry  x│
+│                              ││ runner plr-cpane-4     ││                    ││                                      │
+└──────────────────────────────┘└────────────────────────┘└────────────────────┘└──────────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ enter drill · esc back · / filter · f follow · n/N search · c cancel · R rerun · A approve · a attach · o github

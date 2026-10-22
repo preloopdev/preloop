@@ -29,6 +29,7 @@ mod push;
 mod sandbox;
 mod server_install;
 mod store;
+mod tui;
 mod update;
 mod webhooks;
 
@@ -756,6 +757,9 @@ enum Command {
     /// RUN_ID, a single machine-readable status word for scripts.
     Status(StatusArgs),
 
+    /// Open the terminal UI for the engine and the Sandbox Service.
+    Tui(tui::TuiArgs),
+
     Logs(LogsArgs),
 
     /// Cancel the current run.
@@ -1188,6 +1192,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor(args) => github_setup::cmd_doctor(args).await,
         Command::Secret(args) => github_setup::cmd_secret(args).await,
         Command::Server(args) => server_install::run(args),
+        // The TUI resolves its own contexts and can start the engine itself
+        // through its `start_engine` hook, so it never probes for one here.
+        Command::Tui(args) => tui::run(args),
         // Schema administration and the legacy import are explicit and
         // offline; never bootstrap (or migrate) the engine for them.
         Command::Store(args) => store::run(args).await,
@@ -1228,7 +1235,8 @@ async fn main() -> anyhow::Result<()> {
                     | Command::Doctor(_)
                     | Command::Secret(_)
                     | Command::Server(_)
-                    | Command::Store(_) => {
+                    | Command::Store(_)
+                    | Command::Tui(_) => {
                         unreachable!("daemon commands handled before client startup")
                     }
                 },

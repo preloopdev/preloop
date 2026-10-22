@@ -1,0 +1,32 @@
+{
+  "count": 5,
+  "runners": [
+    {
+      "id": 1,
+      "name": "plr-cpane-1",
+      "labels": ["linux", "x64"]
+    },
+    {
+      "id": 2,
+      "name": "plr-cpane-2",
+      "labels": ["linux", "x64"]
+    },
+    {
+      "id": 3,
+      "name": "plr-cpane-3",
+      "labels": ["linux", "x64"]
+    },
+    {
+      "id": 4,
+      "name": "plr-cpane-4",
+      "labels": ["linux", "x64"]
+    },
+    {
+      "id": 5,
+      "name": "plr-main-1",
+      "labels": ["linux", "x64", "main"]
+    }
+  ],
+  "queued": 2,
+  "claimable": 0
+}

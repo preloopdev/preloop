@@ -1,0 +1,41 @@
+{
+  "bindings": [
+    {
+      "run_id": "8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01",
+      "job_id": "test (sandbox)",
+      "state": "running",
+      "runner_id": 4,
+      "runner_name": "plr-cpane-4",
+      "since_seconds": 840,
+      "waitlist_position": null
+    },
+    {
+      "run_id": "c01d77e4-2b7a-4c1e-8f30-5a9d0e6c2b11",
+      "job_id": "test (runner)",
+      "state": "running",
+      "runner_id": 1,
+      "runner_name": "plr-cpane-1",
+      "since_seconds": 240,
+      "waitlist_position": null
+    },
+    {
+      "run_id": "c01d77e4-2b7a-4c1e-8f30-5a9d0e6c2b11",
+      "job_id": "e2e",
+      "state": "ready",
+      "runner_id": null,
+      "runner_name": null,
+      "since_seconds": 42,
+      "waitlist_position": 1
+    },
+    {
+      "run_id": "5be2a0f9-0c4e-4d7a-b1e2-66f0c3d9a410",
+      "job_id": "dogfood",
+      "state": "provisioning",
+      "runner_id": null,
+      "runner_name": null,
+      "since_seconds": 38,
+      "waitlist_position": 2
+    }
+  ],
+  "observed_at": "2026-10-22T12:20:00Z"
+}

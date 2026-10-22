@@ -1,0 +1,25 @@
+[
+  {
+    "stepId": "9b2f4c10-7e3d-4a55-8c21-0d6e1f7a3c42",
+    "startLine": 1,
+    "count": 5,
+    "value": [
+      "   Compiling preloop-sandbox v0.21.0",
+      "    Finished test profile in 41.2s",
+      "running 9 tests",
+      "test acquire_idempotent ... ok",
+      "test warm_pool_refill ... ok"
+    ]
+  },
+  {
+    "stepId": "9b2f4c10-7e3d-4a55-8c21-0d6e1f7a3c42",
+    "startLine": 6,
+    "count": 4,
+    "value": [
+      "test lease_expiry_destroys ... ok",
+      "test reconcile_orphan ... ok",
+      "test fork_override_shape ... ok",
+      "test golden_image_lookup ... ok"
+    ]
+  }
+]

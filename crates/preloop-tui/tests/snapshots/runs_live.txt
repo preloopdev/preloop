@@ -1,0 +1,32 @@
+ preloop  ctx cpane ● healthy  0.21.0 · up 3d04h              queue 2 ready · 0 claimable   pool 3/1   sbx ● 2 prov
+  1 Overview  ▌2 Runs   3 Fleet   4 Debug   5 Webhooks   6 Sandboxes   7 Stack
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ / status:failure,running  workflow:ci  3 of 41
+┌─ Runs ───────────────────────┐┌─ Jobs · c01d77e4 ──────┐┌─ Steps ────────────┐┌─ cargo test · ◉ follow ──────────────┐
+│✗ #412 ci                   6m││ ✓ fmt                39││ ✓ Set up job     1s││1    Compiling preloop-sandbox v0.21.0│
+│  #619 sandbox-service        ││ ✓ clippy           3m03││ ✓ checkout       2s││2     Finished test profile in 41.2s  │
+│                              ││ ▾ test         matrix 1││ ✓ rust cache    11s││3 running 9 tests                     │
+│● #411 ci                   4m││   ● runner         3m58││ ● cargo test   3m30││4 test acquire_idempotent ... ok      │
+│  #751 sbx-observability      ││ ◌ e2e                  ││                    ││5 test warm_pool_refill ... ok        │
+│                              ││                        ││                    ││6 test lease_expiry_destroys ... ok   │
+│✗ #398 ci                   2h││                        ││                    ││7 test reconcile_orphan ... ok        │
+│  #754 sbx-mtls               ││                        ││                    ││8 test fork_override_shape ... ok     │
+│                              ││                        ││                    ││9 test golden_image_lookup ... ok     │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    ││                                      │
+│                              ││                        ││                    │┌─ Debug ──────────────────────────────┐
+│                              ││                        ││                    ││ ◆ session ds-21aa attached 3m        │
+│                              ││ check run —            ││                    ││ VM plr-cpane-2 · a attach  r retry  x│
+│                              ││ runner plr-cpane-1     ││                    ││                                      │
+└──────────────────────────────┘└────────────────────────┘└────────────────────┘└──────────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ enter drill · esc back · / filter · f follow · n/N search · c cancel · R rerun · A approve · a attach · o github

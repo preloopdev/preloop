@@ -3110,8 +3110,8 @@ dependencies = [
  "preloop-orchestrator",
  "preloop-runner-server",
  "preloop-sandbox",
+ "preloop-tui",
  "rand 0.10.2",
- "ratatui",
  "reqwest",
  "rpassword",
  "rsa",
@@ -3517,6 +3517,24 @@ dependencies = [
  "anyhow",
  "listenfd",
  "tokio",
+]
+
+[[package]]
+name = "preloop-tui"
+version = "0.35.5"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures",
+ "preloop-sandbox",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,120 @@
+{
+  "schema_version": 2,
+  "observed_at": "2026-10-22T12:20:00Z",
+  "snapshot_age_seconds": 0.4,
+  "overall": "ok",
+  "service": {
+    "version": "0.21.0",
+    "instance_id": "cpane-7",
+    "uptime_seconds": 273600,
+    "shutdown_requested": false
+  },
+  "runs": {
+    "queued": 1,
+    "in_progress": 3,
+    "completed": 388
+  },
+  "active_runs": [
+    {
+      "run_id": "c01d77e4-2b7a-4c1e-8f30-5a9d0e6c2b11",
+      "workflow": "ci.yml",
+      "status": "running",
+      "event": "pull_request",
+      "started_at": "2026-10-22T12:16:02Z",
+      "assigned_runners": ["plr-cpane-1"]
+    },
+    {
+      "run_id": "b7d3e912-4a6c-4f28-9e51-0c8d2a7f3b21",
+      "workflow": "supply-chain.yml",
+      "status": "running",
+      "event": "push",
+      "started_at": "2026-10-22T12:11:30Z",
+      "assigned_runners": ["plr-cpane-3"]
+    },
+    {
+      "run_id": "3c9f0a54-8d17-4b6e-a2f9-51e7c0b4d9a2",
+      "workflow": "docs.yml",
+      "status": "running",
+      "event": "pull_request",
+      "started_at": "2026-10-22T12:07:00Z",
+      "assigned_runners": ["plr-cpane-2"]
+    }
+  ],
+  "jobs": {
+    "ready": 2,
+    "dependency_blocked": 3,
+    "concurrency_blocked": 1,
+    "pending_expansion": 0,
+    "expanding": 0,
+    "claimable": 0,
+    "unclaimable": 2,
+    "oldest_ready_seconds": 42.0
+  },
+  "runners": {
+    "registered": 5,
+    "sessions": 5,
+    "idle": 3,
+    "busy": 1,
+    "stale": 0,
+    "max_poll_age_seconds": 3.0,
+    "max_lease_age_seconds": 840.0,
+    "assignments": [
+      {
+        "runner_id": 4,
+        "run_id": "8f3a91c2-5d10-4b7e-9a10-2c4e7f1a9b01",
+        "job_id": "test (sandbox)",
+        "assigned_seconds_ago": 840.0
+      }
+    ]
+  },
+  "pool": {
+    "mode": "warm",
+    "desired": 4,
+    "preparing": false,
+    "building": 0,
+    "provisioning": 0,
+    "idle": 3,
+    "busy": 1,
+    "paused": 0,
+    "consecutive_provision_failures": 0,
+    "queue_depth": 2,
+    "pending_registrations": 0,
+    "released_bindings": 0,
+    "labels": ["linux", "x64"]
+  },
+  "vms": {
+    "count": {
+      "runner": 5,
+      "golden": 1,
+      "unavailable": 0
+    },
+    "host_usage": {
+      "cpu_cores": 9.2,
+      "mem_total_bytes": 68719476736,
+      "mem_available_bytes": 24696061952
+    }
+  },
+  "github": {
+    "configured": true,
+    "last_webhook_at": "2026-10-22T12:19:42Z",
+    "pending_check_updates": 0,
+    "rate_limit": {
+      "resource": "core",
+      "limit": 5000,
+      "remaining": 4812,
+      "reset_at": "2026-10-22T13:00:00Z"
+    }
+  },
+  "debug": {
+    "active_sessions": 1,
+    "oldest_session_seconds": 846.0
+  },
+  "conditions": [
+    {
+      "code": "webhook_dead_letters",
+      "severity": "error",
+      "message": "2 deliveries dead-lettered (oldest 3h12m)",
+      "exemplars": []
+    }
+  ]
+}
