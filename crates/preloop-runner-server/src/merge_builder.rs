@@ -1261,7 +1261,7 @@ mod tests {
             forge_host: None,
         };
         let error = fetch_into_mirror_within(
-            program,
+            &program,
             std::time::Duration::from_millis(750),
             &source,
             "https://github.com/owner/repo.git",
@@ -1288,15 +1288,24 @@ mod tests {
             leftovers.is_empty(),
             "a bounded fetch must not leave locks behind: {leftovers:?}"
         );
-        let pid = crate::snapshots::bounded_git_tests::wait_for_pid(&pid_file).await;
-        assert!(
-            crate::snapshots::bounded_git_tests::wait_until_finished(
-                &pid,
-                std::time::Duration::from_secs(10)
-            )
-            .await,
-            "the fake git child {pid} outlived the deadline"
-        );
+        // The child may be killed before its first line runs — a loaded runner
+        // can keep it queued past the deadline — so a missing pid file is not
+        // evidence of a failed kill. Observe the process instead: the pid it
+        // recorded when it got that far, else the process table.
+        match crate::snapshots::bounded_git_tests::wait_for_pid(&pid_file).await {
+            Some(pid) => assert!(
+                crate::snapshots::bounded_git_tests::wait_until_finished(
+                    &pid,
+                    std::time::Duration::from_secs(10)
+                )
+                .await,
+                "the fake git child {pid} outlived the deadline"
+            ),
+            None => assert!(
+                crate::snapshots::bounded_git_tests::running_from(&program).is_none(),
+                "the fake git outlived the deadline without recording a pid"
+            ),
+        }
     }
 
     /// A `git` killed at its deadline leaves the lock file it held behind —

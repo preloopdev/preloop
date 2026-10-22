@@ -10452,21 +10452,41 @@ pub(crate) mod bounded_git_tests {
         }
     }
 
-    /// The pid the fake `git` recorded, waiting for the script to get there.
-    pub(crate) async fn wait_for_pid(pid_file: &FsPath) -> String {
+    /// Wait up to five seconds for the fake `git` to record its pid.
+    ///
+    /// `None` means it never got the chance: a runner under load can keep the
+    /// child queued for scheduling past the deadline and kill it before its
+    /// first line runs. That is not evidence the kill failed — there is simply
+    /// no child left to announce itself — so callers treat absence as "nothing
+    /// to wait on" and ask the process table instead.
+    pub(crate) async fn wait_for_pid(pid_file: &FsPath) -> Option<String> {
         for _ in 0..250 {
             if let Ok(pid) = std::fs::read_to_string(pid_file) {
                 let pid = pid.trim().to_owned();
                 if !pid.is_empty() {
-                    return pid;
+                    return Some(pid);
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        panic!(
-            "the fake git never recorded its pid at {}",
-            pid_file.display()
-        );
+        None
+    }
+
+    /// Whether a process started from `program` is still running, asked of the
+    /// process table rather than of the child.
+    ///
+    /// A child killed before its first line runs leaves no pid file to read;
+    /// this is the observable that does not depend on it getting scheduled.
+    pub(crate) fn running_from(program: &FsPath) -> Option<String> {
+        let output = std::process::Command::new("ps")
+            .args(["-Aww", "-o", "pid=,command="])
+            .output()
+            .ok()?;
+        let needle = program.to_string_lossy();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains(needle.as_ref()))
+            .find_map(|line| line.split_whitespace().next().map(str::to_owned))
     }
 
     /// Wait until `pid` is no longer running, up to `within`.
@@ -10613,7 +10633,7 @@ pub(crate) mod bounded_git_tests {
     async fn a_hung_git_is_killed_at_the_deadline() {
         let temp = tempfile::tempdir().unwrap();
         let (program, pid_file) = hanging_git(temp.path());
-        let command = Command::new(program);
+        let command = Command::new(&program);
         let started = std::time::Instant::now();
         let error = run_git_within(
             command,
@@ -10635,11 +10655,21 @@ pub(crate) mod bounded_git_tests {
             message.contains("killed the hung"),
             "the error must name the process that hung: {message}"
         );
-        let pid = wait_for_pid(&pid_file).await;
-        assert!(
-            wait_until_finished(&pid, std::time::Duration::from_secs(10)).await,
-            "the fake git child {pid} outlived the deadline; kill_on_drop did not fire"
-        );
+        // The child may be killed before its first line runs — a loaded runner
+        // can keep it queued past the deadline — so a missing pid file is not
+        // evidence of a failed kill. Observe the process instead: the pid it
+        // recorded when it got that far, else the process table.
+        match wait_for_pid(&pid_file).await {
+            Some(pid) => assert!(
+                wait_until_finished(&pid, std::time::Duration::from_secs(10)).await,
+                "the fake git child {pid} outlived the deadline; kill_on_drop did not fire"
+            ),
+            None => assert!(
+                running_from(&program).is_none(),
+                "the fake git outlived the deadline without recording a pid; \
+                 kill_on_drop did not fire"
+            ),
+        }
     }
 
     /// The checkout-cache fetch runs under the per-repository cache lock, so a
