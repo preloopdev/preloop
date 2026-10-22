@@ -3515,7 +3515,19 @@ pub const SANDBOX_OWNER_MARKER: &str = ".preloop-sandbox";
 /// `data_dir` is the machine's resolved data directory (smolvm's
 /// `machine data-dir`); `native` is recorded in the file for operators
 /// reading a host by hand.
+///
+/// The directory is created when missing: `machine create` only records the
+/// machine, and smolvm materialises the hash-derived data directory later,
+/// from `machine start`. The marker is written before the boot so the engine's
+/// sweep can never observe a live, unmarked sandbox, so this is the first
+/// writer and creating it is its job.
 pub fn mark_sandbox_owned(data_dir: &Path, native: &str) -> Result<(), VmError> {
+    std::fs::create_dir_all(data_dir).map_err(|error| {
+        VmError::Protocol(format!(
+            "creating the sandbox machine data dir {}: {error}",
+            data_dir.display()
+        ))
+    })?;
     std::fs::write(data_dir.join(SANDBOX_OWNER_MARKER), format!("{native}\n")).map_err(|error| {
         VmError::Protocol(format!(
             "writing the sandbox owner marker in {}: {error}",
@@ -4949,6 +4961,26 @@ mod tests {
         let _ = child.wait();
         assert!(!process_alive(pid), "the unmarked hypervisor must be dead");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `machine create` does not create the machine data directory: smolvm
+    /// only materialises the hash-derived path in `machine start`. The marker
+    /// is written before that boot, so the write must create the directory.
+    #[test]
+    fn the_owner_marker_creates_a_missing_machine_data_dir() {
+        let root = std::env::temp_dir().join(format!("preloop-marker-{}", uuid::Uuid::new_v4()));
+        let data_dir = root.join("0123456789abcdef");
+        assert!(!data_dir.exists(), "nothing has created the data dir");
+
+        super::mark_sandbox_owned(&data_dir, "psbx-3f2a9c").expect("write the marker");
+
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join(super::SANDBOX_OWNER_MARKER))
+                .expect("read the marker")
+                .trim(),
+            "psbx-3f2a9c"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Serializes the tests that rewrite `PATH`: fake `mount`/`hdiutil`
