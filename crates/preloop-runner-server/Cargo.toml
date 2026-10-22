@@ -171,6 +171,11 @@ path = "tests/runner_deprecations.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "sarif"
+path = "tests/sarif.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "store_env"
 path = "tests/store_env.rs"
 required-features = ["test-support"]

@@ -50,7 +50,20 @@ new_repo() {
   seed "$dir" README.md seed
   seed "$dir" CHANGELOG.md seed
   seed "$dir" justfile seed
-  seed "$dir" Cargo.lock 'version = 3'
+  # A realistic lockfile: one workspace member (no `source`) and one registry
+  # entry (with `source`), so a case can change either kind.
+  seed "$dir" Cargo.lock 'version = 3
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaa"
+dependencies = ["serde_derive"]'
   seed "$dir" Cargo.toml '[workspace]'
   seed "$dir" crates/demo/Cargo.toml 'name = "demo"'
   seed "$dir" crates/demo/src/lib.rs '// demo'
@@ -75,6 +88,13 @@ modify() {
   local dir="$1" path="$2" content="${3:-changed}"
   mkdir -p "$dir/$(dirname "$path")"
   printf '%s\n' "$content" >>"$dir/$path"
+}
+
+# replace <dir> <path>: rewrite a path from stdin, e.g. with a heredoc.
+replace() {
+  local dir="$1" path="$2"
+  mkdir -p "$dir/$(dirname "$path")"
+  cat >"$dir/$path"
 }
 
 # run_guard <dir> [guard args...]: run the guard inside <dir>; sets $out, $status.
@@ -172,8 +192,9 @@ expect "Cargo.lock only -> OK" 0 "$dir" "$base" "$head" \
 case_start manifest-only
 modify "$dir" crates/demo/Cargo.toml 'new = "1.0.0"'
 commit_change "$dir" manifest
-expect "crates/demo/Cargo.toml alone -> OK" 0 "$dir" "$base" "$head" \
-  "Dependency/policy PR detected: OK" "- crates/demo/Cargo.toml"
+expect "crates/demo/Cargo.toml alone -> OK (first-party)" 0 "$dir" "$base" "$head" \
+  "Policy file guard: OK (manifests/lockfiles classified as first-party: no third-party lock entry changed)" \
+  "- crates/demo/Cargo.toml"
 
 case_start guard-self
 seed "$dir" supply-chain/guard-policy-files.sh '#!/usr/bin/env bash'
@@ -227,9 +248,10 @@ case_start packaging-manifest-and-doc
 modify "$dir" packaging/crates-io/preloop/Cargo.toml 'publish = true'
 modify "$dir" README.md 'docs'
 commit_change "$dir" packaging-docs
-expect "packaging manifest + README.md -> FAIL" 1 "$dir" "$base" "$head" \
-  "ERROR: this PR mixes dependency/policy files with other files" \
-  "- packaging/crates-io/preloop/Cargo.toml" "- README.md"
+expect "packaging manifest + README.md, no third-party change -> OK (first-party)" 0 \
+  "$dir" "$base" "$head" \
+  "Policy file guard: OK (manifests/lockfiles classified as first-party" \
+  "- packaging/crates-io/preloop/Cargo.toml"
 
 case_start nested-lockfile-and-source
 modify "$dir" packaging/crates-io/preloop/Cargo.lock 'standalone = "1.0.0"'
@@ -243,9 +265,10 @@ case_start benchmarks-manifest-and-source
 modify "$dir" benchmarks/preloop-perf/Cargo.toml 'criterion = "0.5"'
 modify "$dir" benchmarks/preloop-perf/src/main.rs 'fn main() { /* bench */ }'
 commit_change "$dir" bench-manifest-src
-expect "benchmarks manifest + its source -> FAIL" 1 "$dir" "$base" "$head" \
-  "ERROR: this PR mixes dependency/policy files with other files" \
-  "- benchmarks/preloop-perf/src/main.rs"
+expect "benchmarks manifest + its source, no third-party change -> OK (first-party)" 0 \
+  "$dir" "$base" "$head" \
+  "Policy file guard: OK (manifests/lockfiles classified as first-party" \
+  "- benchmarks/preloop-perf/Cargo.toml"
 
 # --- FAIL: a dependency/policy file plus anything else -----------------------
 case_start lock-and-source
@@ -355,6 +378,216 @@ commit_change "$dir" mainline
 mainline="$head"
 expect "policy-only branch over a moved main -> OK" 0 "$dir" "$mainline" "$topic" \
   "Dependency/policy PR detected: OK" "- deny.toml"
+
+# --- first-party manifest and lockfile edits are ordinary files --------------
+# A new workspace crate, its path dependency, and a [[test]] target rewrite
+# Cargo.toml and Cargo.lock without touching a third-party entry: the guard
+# must let them ship with their source.
+
+case_start first-party-crate
+replace "$dir" Cargo.lock <<'EOF'
+version = 3
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+
+[[package]]
+name = "preloop-vm"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaa"
+dependencies = ["serde_derive"]
+EOF
+modify "$dir" Cargo.toml 'preloop-vm = { path = "crates/preloop-vm" }'
+seed "$dir" crates/preloop-vm/Cargo.toml 'name = "preloop-vm"'
+seed "$dir" crates/preloop-vm/src/lib.rs '// new crate'
+modify "$dir" crates/demo/src/lib.rs 'use preloop_vm;'
+commit_change "$dir" new-path-crate
+expect "new path crate + first-party lock + manifests + source -> OK" 0 \
+  "$dir" "$base" "$head" \
+  "Policy file guard: OK (manifests/lockfiles classified as first-party: no third-party lock entry changed)" \
+  "- Cargo.lock" "- Cargo.toml" "- crates/preloop-vm/Cargo.toml"
+
+case_start manifest-test-target
+replace "$dir" crates/demo/Cargo.toml <<'EOF'
+[package]
+name = "demo"
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+EOF
+seed "$dir" crates/demo/tests/smoke.rs '// smoke'
+commit_change "$dir" test-target
+expect "[[test]] manifest + source, no lock change -> OK" 0 \
+  "$dir" "$base" "$head" \
+  "Policy file guard: OK (manifests/lockfiles classified as first-party" \
+  "- crates/demo/Cargo.toml"
+
+# --- a changed third-party entry makes every manifest a dependency file ------
+
+case_start third-party-bump
+replace "$dir" Cargo.lock <<'EOF'
+version = 3
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb"
+dependencies = ["serde_derive"]
+EOF
+modify "$dir" crates/demo/src/lib.rs '// use serde 1.0.1'
+commit_change "$dir" third-party-bump
+expect "third-party version bump + source -> FAIL" 1 "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "A third-party lock entry changed" "- Cargo.lock" "- crates/demo/src/lib.rs"
+
+case_start third-party-added
+replace "$dir" Cargo.lock <<'EOF'
+version = 3
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaa"
+dependencies = ["serde_derive"]
+
+[[package]]
+name = "tokio"
+version = "1.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cccc"
+EOF
+modify "$dir" crates/demo/src/lib.rs '// use tokio'
+commit_change "$dir" third-party-added
+expect "third-party block added + source -> FAIL" 1 "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "- Cargo.lock" "- crates/demo/src/lib.rs"
+
+case_start third-party-dependencies
+replace "$dir" Cargo.lock <<'EOF'
+version = 3
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaa"
+dependencies = ["serde_derive", "serde_core"]
+EOF
+modify "$dir" crates/demo/src/lib.rs '// serde_core'
+commit_change "$dir" third-party-deps
+expect "third-party dependencies list changed + source -> FAIL" 1 \
+  "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "- Cargo.lock"
+
+# A dependency PR may still carry manifests and the strict policy set.
+case_start dependency-pr
+replace "$dir" Cargo.lock <<'EOF'
+version = 3
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb"
+dependencies = ["serde_derive"]
+EOF
+modify "$dir" Cargo.toml 'new = "1.0.1"'
+modify "$dir" crates/demo/Cargo.toml 'serde = "1.0.1"'
+modify "$dir" supply-chain/config.toml '[policy]'
+commit_change "$dir" dependency-pr
+expect "third-party change + manifests + supply-chain -> OK (dependency PR)" 0 \
+  "$dir" "$base" "$head" \
+  "Dependency/policy PR detected: OK" "- supply-chain/config.toml" \
+  "- Cargo.lock" "- Cargo.toml" "reason: third-party lock entries changed"
+
+# A strict policy file still isolates, even when the lockfile change itself is
+# first-party only.
+case_start policy-with-first-party-lock
+replace "$dir" Cargo.lock <<'EOF'
+version = 3
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+
+[[package]]
+name = "preloop-vm"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaa"
+dependencies = ["serde_derive"]
+EOF
+modify "$dir" supply-chain/audits.toml '[[audits]]'
+modify "$dir" crates/demo/src/lib.rs '// code'
+commit_change "$dir" policy-and-first-party
+expect "supply-chain/ + first-party lock + source -> FAIL" 1 \
+  "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "No third-party lock entry changed" "- supply-chain/audits.toml" "- Cargo.lock"
+
+# --no-renames puts both sides of a rename in the diff, so neither a policy
+# file nor a lockfile can move out of the set.
+case_start renamed-policy
+git -C "$dir" mv supply-chain/config.toml supply-chain/renamed.toml
+modify "$dir" crates/demo/src/lib.rs '// code'
+commit_change "$dir" rename-policy
+expect "renamed supply-chain/ file + source -> FAIL" 1 "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "- supply-chain/config.toml" "- supply-chain/renamed.toml"
+
+case_start renamed-lockfile
+git -C "$dir" mv Cargo.lock crates/demo/Cargo.lock
+modify "$dir" crates/demo/src/lib.rs '// code'
+commit_change "$dir" rename-lock
+expect "renamed lockfile + source -> FAIL" 1 "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "- Cargo.lock" "- crates/demo/Cargo.lock"
+
+case_start new-third-party-lockfile
+seed "$dir" packaging/extra/Cargo.lock 'version = 3
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaa"'
+modify "$dir" crates/demo/src/lib.rs '// code'
+commit_change "$dir" new-lock
+expect "new lockfile with a third-party entry + source -> FAIL" 1 \
+  "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "- packaging/extra/Cargo.lock"
 
 # --- fail-closed paths ------------------------------------------------------
 case_start fail-closed
