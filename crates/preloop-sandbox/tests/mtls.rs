@@ -281,6 +281,53 @@ async fn removing_a_provider_revokes_its_certificate() {
 }
 
 #[tokio::test]
+async fn an_identity_from_an_old_service_ca_reports_re_enrollment() {
+    let first = TestService::start().await;
+    let link = first.enroll("host-a").await;
+    link.register(register("host-a")).await.unwrap();
+    let identity_dir = first.dir.path().join("identity").join("host-a");
+
+    // A second service is a re-keyed service: its certificate does not chain
+    // to the ca.pem stored with the identity.
+    let second = TestService::start().await;
+    let link = RemoteLink::connect(&identity_dir, Some(&second.base), None, "host-a")
+        .await
+        .unwrap();
+    let error = link.register(register("host-a")).await.unwrap_err();
+    assert_eq!(error.code, Code::Unauthenticated, "{}", preloop_sandbox::error::message(&error));
+    assert!(preloop_sandbox::error::message(&error).contains("different CA"), "{}", preloop_sandbox::error::message(&error));
+    assert!(preloop_sandbox::error::message(&error).contains("--join"), "{}", preloop_sandbox::error::message(&error));
+    assert!(preloop_sandbox::error::message(&error).contains("--token"), "{}", preloop_sandbox::error::message(&error));
+}
+
+#[tokio::test]
+async fn an_identity_the_service_does_not_know_reports_re_enrollment() {
+    let first = TestService::start().await;
+    let link = first.enroll("host-a").await;
+    link.register(register("host-a")).await.unwrap();
+    let identity_dir = first.dir.path().join("identity").join("host-a");
+
+    // The agent trusts the new service CA but keeps a certificate the new
+    // service never issued, so only the server side of the handshake fails.
+    let second = TestService::start().await;
+    let ca_pem = second.ca_pem();
+    let mut identity = preloop_sandbox::AgentIdentity::load(&identity_dir)
+        .unwrap()
+        .expect("stored identity");
+    identity.metadata.base = second.base.clone();
+    identity.metadata.ca_sha256 = preloop_sandbox::tls::pem_fingerprint(&ca_pem).unwrap();
+    identity.ca_pem = ca_pem;
+    identity.save().unwrap();
+
+    let link = RemoteLink::connect(&identity_dir, None, None, "host-a")
+        .await
+        .unwrap();
+    let error = link.register(register("host-a")).await.unwrap_err();
+    assert_eq!(error.code, Code::Unauthenticated, "{}", preloop_sandbox::error::message(&error));
+    assert!(preloop_sandbox::error::message(&error).contains("re-enroll"), "{}", preloop_sandbox::error::message(&error));
+}
+
+#[tokio::test]
 async fn the_caller_token_is_still_required_over_tls() {
     let t = TestService::start().await;
     let ca = t.ca_pem();

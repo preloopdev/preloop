@@ -24,7 +24,7 @@ use axum::serve::{IncomingStream, Listener};
 use base64::Engine as _;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
-    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
 };
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -231,6 +231,11 @@ fn ca_params() -> CertificateParams {
         KeyUsagePurpose::CrlSign,
         KeyUsagePurpose::DigitalSignature,
     ];
+    // Leaves signed by this CA derive their Authority Key Identifier from
+    // this method; pinning it keeps the AKI equal to the CA's Subject Key
+    // Identifier even when the CA was loaded from disk rather than created
+    // here.
+    params.key_identifier_method = KeyIdMethod::Sha256;
     params
 }
 
@@ -328,9 +333,14 @@ impl ServiceCa {
         let mut params = csr.params;
         params.distinguished_name = DistinguishedName::new();
         params.distinguished_name.push(DnType::CommonName, name);
-        params.is_ca = IsCa::NoCa;
+        // `ExplicitNoCa` writes `basicConstraints CA:false` *and* the Subject
+        // Key Identifier; rcgen omits the SKI for a plain `NoCa` leaf.
+        params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        // OpenSSL 3 clients reject a chain whose leaf has no AKI.
+        params.use_authority_key_identifier_extension = true;
+        params.key_identifier_method = KeyIdMethod::Sha256;
         params.subject_alt_names.clear();
         let issued_at = OffsetDateTime::now_utc();
         params.not_before = issued_at - time::Duration::minutes(5);
@@ -355,9 +365,13 @@ impl ServiceCa {
         params
             .distinguished_name
             .push(DnType::CommonName, "preloop-sandbox");
-        params.is_ca = IsCa::NoCa;
+        // As for client leaves: `ExplicitNoCa` is what makes rcgen emit the
+        // Subject Key Identifier on a non-CA certificate.
+        params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.use_authority_key_identifier_extension = true;
+        params.key_identifier_method = KeyIdMethod::Sha256;
         let issued_at = OffsetDateTime::now_utc();
         params.not_before = issued_at - time::Duration::minutes(5);
         params.not_after =
@@ -507,6 +521,7 @@ impl TlsListener {
                 let acceptor = acceptor.clone();
                 let sender = sender.clone();
                 tokio::spawn(async move {
+                    let peer_addr = stream.peer_addr().ok();
                     match acceptor.accept(stream).await {
                         Ok(tls) => {
                             let peer = PeerIdentity::from_certificates(
@@ -517,7 +532,15 @@ impl TlsListener {
                             let _ = sender.send((tls, info)).await;
                         }
                         Err(error) => {
-                            tracing::debug!(%error, "sandbox API TLS handshake failed");
+                            // A handshake failure never reaches a handler, so
+                            // this is the only place it can be logged. The
+                            // common cause in the field is a client identity
+                            // issued by a CA the service no longer uses.
+                            tracing::warn!(
+                                ?peer_addr,
+                                %error,
+                                "sandbox API TLS handshake failed"
+                            );
                         }
                     }
                 });
@@ -668,6 +691,67 @@ pub fn client_config(
         None => builder.with_no_client_auth(),
     };
     Ok(Arc::new(config))
+}
+
+/// Whether `error` is a TLS handshake failure because the server's
+/// certificate does not chain to the CA this client trusts.
+///
+/// An agent sees this after the service was re-keyed: its stored `ca.pem` and
+/// certificate belong to the old CA. Callers must not retry it blindly — it
+/// needs a fresh enrollment (or a new `--ca`).
+///
+/// Both variants occur: a new CA with a different subject is `UnknownIssuer`,
+/// while a new CA reusing the subject name (every service uses the same CA
+/// common name) makes path building pick the stored CA and fail its signature
+/// check, which webpki reports as `BadSignature`.
+pub fn is_untrusted_service_ca(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if let Some(rustls::Error::InvalidCertificate(certificate_error)) =
+            error.downcast_ref::<rustls::Error>()
+            && matches!(
+                certificate_error,
+                rustls::CertificateError::UnknownIssuer | rustls::CertificateError::BadSignature
+            )
+        {
+            return true;
+        }
+        // `hyper-rustls` wraps rustls errors in `io::Error`, which keeps the
+        // cause in its `Display` even when `source()` is gone.
+        let text = error.to_string();
+        if text.contains("UnknownIssuer") || text.contains("BadSignature") {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+/// Whether the server refused the client certificate during the handshake
+/// (an identity the service does not know, e.g. one issued before a re-key).
+pub fn is_client_certificate_rejected(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if let Some(rustls::Error::AlertReceived(alert)) = error.downcast_ref::<rustls::Error>() {
+            return matches!(
+                alert,
+                rustls::AlertDescription::BadCertificate
+                    | rustls::AlertDescription::UnknownCA
+                    // rustls reports a client certificate the server's
+                    // verifier cannot build a path for as `decrypt_error`.
+                    | rustls::AlertDescription::DecryptError
+            );
+        }
+        let text = error.to_string();
+        if text.contains("BadCertificate")
+            || text.contains("UnknownCA")
+            || text.contains("DecryptError")
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// Fetch the service CA over TLS without verifying it.
@@ -853,5 +937,129 @@ mod tests {
         assert_eq!(signed.sha256.len(), 64);
         assert_eq!(pem_certificates(&signed.cert_pem).len(), 1);
         assert!(signed.expires_at > OffsetDateTime::now_utc().unix_timestamp());
+    }
+
+    fn parse(der: &[u8]) -> x509_parser::certificate::X509Certificate<'_> {
+        let (rest, certificate) =
+            x509_parser::parse_x509_certificate(der).expect("certificate parses");
+        assert!(rest.is_empty(), "trailing data after certificate");
+        certificate
+    }
+
+    fn subject_key_identifier(der: &[u8]) -> Vec<u8> {
+        use x509_parser::extensions::ParsedExtension;
+        parse(der)
+            .iter_extensions()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(id) => Some(id.0.to_vec()),
+                _ => None,
+            })
+            .expect("certificate has no Subject Key Identifier")
+    }
+
+    fn authority_key_identifier(der: &[u8]) -> Vec<u8> {
+        use x509_parser::extensions::ParsedExtension;
+        parse(der)
+            .iter_extensions()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                    aki.key_identifier.as_ref().map(|id| id.0.to_vec())
+                }
+                _ => None,
+            })
+            .expect("certificate has no Authority Key Identifier")
+    }
+
+    /// OpenSSL 3 (and strict verifiers such as Python's `ssl`) reject a leaf
+    /// without an AKI, so every issued certificate must carry SKI/AKI.
+    #[test]
+    fn issued_certificates_carry_key_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = ServiceCa::load_or_create(&dir.path().join(CA_DIR)).unwrap();
+        let ca_der = ca.der().as_ref();
+        let ca_cert = parse(ca_der);
+        let ca_ski = subject_key_identifier(ca_der);
+        assert!(!ca_ski.is_empty());
+        let constraints = ca_cert.basic_constraints().unwrap().unwrap();
+        assert!(constraints.value.ca);
+        let usage = ca_cert.key_usage().unwrap().unwrap().value;
+        assert!(usage.key_cert_sign(), "CA must sign certificates");
+        assert!(usage.crl_sign(), "CA must sign CRLs");
+
+        let (_, csr) = generate_csr("host-a").unwrap();
+        let signed = ca
+            .sign_client(&csr, "host-a", CLIENT_CERT_LIFETIME)
+            .unwrap();
+        let leaf_der = pem_certificates(&signed.cert_pem)[0].as_ref().to_vec();
+        let leaf = parse(&leaf_der);
+        assert!(!leaf.basic_constraints().unwrap().unwrap().value.ca);
+        assert!(
+            leaf.extended_key_usage()
+                .unwrap()
+                .unwrap()
+                .value
+                .client_auth
+        );
+        assert_eq!(
+            authority_key_identifier(&leaf_der),
+            ca_ski,
+            "leaf AKI must name the CA's SKI"
+        );
+        let leaf_ski = subject_key_identifier(&leaf_der);
+        assert!(!leaf_ski.is_empty());
+        assert_ne!(leaf_ski, ca_ski, "each key gets its own identifier");
+    }
+
+    #[test]
+    fn server_certificate_carries_key_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = ServiceCa::load_or_create(&dir.path().join(CA_DIR)).unwrap();
+        let (chain, _key) = ca.issue_server(&["localhost".to_owned()]).unwrap();
+        let der = chain[0].as_ref();
+        assert!(!subject_key_identifier(der).is_empty());
+        assert_eq!(
+            authority_key_identifier(der),
+            subject_key_identifier(ca.der().as_ref())
+        );
+        assert!(
+            parse(der)
+                .extended_key_usage()
+                .unwrap()
+                .unwrap()
+                .value
+                .server_auth
+        );
+    }
+
+    /// `openssl verify -CAfile` must accept the chain. Skipped where the
+    /// binary is absent; the unit assertions above are the real gate.
+    #[test]
+    fn openssl_verifies_the_issued_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = ServiceCa::load_or_create(&dir.path().join(CA_DIR)).unwrap();
+        let (_, csr) = generate_csr("host-a").unwrap();
+        let signed = ca
+            .sign_client(&csr, "host-a", CLIENT_CERT_LIFETIME)
+            .unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        let leaf_path = dir.path().join("leaf.pem");
+        std::fs::write(&ca_path, ca.pem()).unwrap();
+        std::fs::write(&leaf_path, &signed.cert_pem).unwrap();
+        let output = std::process::Command::new("openssl")
+            .arg("verify")
+            .arg("-CAfile")
+            .arg(&ca_path)
+            .arg(&leaf_path)
+            .output();
+        let Ok(output) = output else {
+            eprintln!("openssl is not installed; skipping the chain check");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "openssl verify failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::api::*;
+use crate::driver::EXEC_TIMED_OUT;
 use crate::error::{Code, Error, Result};
 use crate::placement::{Candidate, CandidateId, LeastLoaded, Placement, PlacementRequest};
 use crate::store::{Kind, Store};
@@ -119,7 +120,9 @@ const MAX_DESTROY_ATTEMPTS: u32 = 3;
 /// How long after its deadline an exec is swept. The driver enforces the
 /// deadline itself (exit 124) and its clock starts after delivery, so the
 /// sweep waits out the delivery and report latency before ending the caller's
-/// stream as a backstop.
+/// stream as a backstop. The sweep reports the same timeout exit as the
+/// driver: whichever path gets there first, the caller sees `124`, never an
+/// error that depends on scheduling.
 const EXEC_SWEEP_GRACE: Duration = Duration::from_secs(5);
 
 /// The provider a client certificate authenticates, resolved from the leaf's
@@ -819,8 +822,10 @@ impl Service {
                 self.config.metrics.record_create_failure("timeout");
             }
             // Execs past their deadline: the driver should have killed the
-            // command already; this is the backstop for a lost provider. The
-            // caller gets an error and the guest command is cancelled.
+            // command already; this is the backstop for a lost provider or a
+            // delayed report. The caller gets the same timeout exit the
+            // driver reports, so a slow report cannot turn its `124` into an
+            // error.
             let over_deadline: Vec<String> = state
                 .execs
                 .iter()
@@ -828,11 +833,8 @@ impl Service {
                 .map(|(exec_id, _)| exec_id.clone())
                 .collect();
             for exec_id in over_deadline {
-                self.fail_exec_locked(
-                    &mut state,
-                    &exec_id,
-                    Error::new(Code::DeadlineExceeded, "exec timed out"),
-                );
+                warn!(exec_id, "exec passed its deadline; reporting the timeout");
+                self.expire_exec_locked(&mut state, &exec_id);
             }
             // Work nobody will ever acknowledge: fail whatever still waits
             // on it so nothing leaks when a provider loses a report.
@@ -1582,14 +1584,23 @@ impl Service {
         }
     }
 
-    /// Stop forwarding an exec: end the caller's stream with `error`, forget
-    /// its work, and ask the provider to kill the guest command.
-    fn fail_exec_locked(&self, state: &mut State, exec_id: &str, error: Error) {
+    /// End an exec whose deadline passed without a report: close the caller's
+    /// stream with the timeout exit ([`EXEC_TIMED_OUT`]), forget its work,
+    /// and ask the provider to kill the guest command. This is the backstop,
+    /// so it must land on the same result the driver would have reported.
+    fn expire_exec_locked(&self, state: &mut State, exec_id: &str) {
         let Some(exec) = state.execs.remove(exec_id) else {
             return;
         };
         exec.finished.cancel();
-        let _ = exec.tx.try_send(Err(error));
+        let tx = exec.tx;
+        let exit = ExecEvent::exit(EXEC_TIMED_OUT);
+        // Queue the exit after any output already buffered. A full channel
+        // must not cost the caller its exit status (`try_send` would), so
+        // this waits its turn off the state lock.
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(exit)).await;
+        });
         let Some(sandbox) = state.sandboxes.get(&exec.sandbox_id).cloned() else {
             if let Some(pending) = state.pending.get(&exec.work_id) {
                 let provider_id = pending.provider_id.clone();

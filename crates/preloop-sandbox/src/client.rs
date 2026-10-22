@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 
 use crate::api::*;
-use crate::error::{Error, Result};
+use crate::error::{Code, Error, Result};
 use crate::service::{Service, collect_exec};
 
 /// Everything a caller (CI fleet adapter, CLI, agents) can do.
@@ -189,7 +189,7 @@ impl SandboxApi for InProcess {
 /// codec, same wire shape as before) and uses the reqwest client only for the
 /// ticketed data plane, whose tar bodies are not RPC messages.
 pub struct SandboxClient {
-    inner: rpc::SandboxesClient<connectrpc::client::HttpClient>,
+    inner: rpc::SandboxesClient<ClassifiedTransport<connectrpc::client::HttpClient>>,
     http: reqwest::Client,
     base: String,
 }
@@ -233,7 +233,7 @@ impl SandboxClient {
         {
             config = config.with_default_header(axum::http::header::AUTHORIZATION, value);
         }
-        let transport = connectrpc::client::HttpClient::with_tls(tls);
+        let transport = ClassifiedTransport(connectrpc::client::HttpClient::with_tls(tls));
         Self {
             inner: rpc::SandboxesClient::new(transport, config),
             http,
@@ -257,6 +257,52 @@ impl SandboxClient {
         } else {
             ticket.url.clone()
         }
+    }
+}
+
+/// Map a generated-client transport failure through the TLS identity checks.
+///
+/// A stale CA is an identity problem, not a network blip: an agent whose
+/// `ca.pem` predates a service re-key must re-enroll instead of retrying (and
+/// reporting `HTTPS request failed` forever). The generated transport keeps
+/// the `reqwest::Error` as the `ConnectError` source, so the rustls cause is
+/// still reachable here.
+pub(crate) fn classify_transport(error: Error) -> Error {
+    let Some(source) = error.source_arc() else {
+        return error;
+    };
+    let hint = if crate::tls::is_untrusted_service_ca(source.as_ref()) {
+        "identity was issued by a different CA (the service certificate does not chain to the \
+         stored ca.pem); re-enroll with `--join <service-url> --token <join-token>`"
+    } else if crate::tls::is_client_certificate_rejected(source.as_ref()) {
+        "the service rejected the client certificate (the identity is unknown or was issued by \
+         a different CA); re-enroll with `--join <service-url> --token <join-token>`"
+    } else {
+        return error;
+    };
+    let message = error.message.as_deref().unwrap_or("transport failure");
+    Error::new(Code::Unauthenticated, format!("{message}: {hint}")).with_shared_source(source)
+}
+
+/// A generated transport that classifies TLS identity failures.
+#[derive(Clone)]
+pub(crate) struct ClassifiedTransport<T>(pub(crate) T);
+
+impl<T: connectrpc::client::ClientTransport<Error = Error>>
+    connectrpc::client::ClientTransport for ClassifiedTransport<T>
+{
+    type ResponseBody = T::ResponseBody;
+    type Error = Error;
+
+    fn send(
+        &self,
+        request: axum::http::Request<connectrpc::client::ClientBody>,
+    ) -> connectrpc::client::BoxFuture<
+        'static,
+        std::result::Result<axum::http::Response<Self::ResponseBody>, Self::Error>,
+    > {
+        let inner = self.0.clone();
+        Box::pin(async move { inner.send(request).await.map_err(classify_transport) })
     }
 }
 

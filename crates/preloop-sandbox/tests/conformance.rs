@@ -3279,6 +3279,66 @@ async fn exec_without_a_timeout_gets_the_service_deadline() {
 }
 
 #[tokio::test]
+async fn a_swept_exec_reports_the_timeout_exit_not_an_error() {
+    // A provider that takes the work but never reports (a lost agent, or one
+    // stalled long enough that the backstop wins): the caller must still see
+    // the driver's timeout exit, not a scheduler-dependent error.
+    let (service, _dir, provider, store) =
+        manual_service(|config| config.exec_timeout = Duration::from_secs(1)).await;
+    acquire_unreported(&service, "k").await;
+    let create = poll_now(&service, &provider).await;
+    assert_eq!(create.len(), 1);
+    service
+        .report(ReportRequest {
+            provider_id: provider.provider_id.clone(),
+            generation: provider.generation,
+            work_id: create[0].id.clone(),
+            ok: true,
+            native_ref: "psbx-manual-i1".into(),
+            error: String::new(),
+            ..ReportRequest::default()
+        })
+        .await
+        .unwrap();
+    let sandbox_id = service.list()[0].id.clone();
+    let lease_id = store
+        .load(Kind::Leases)
+        .await
+        .unwrap()
+        .first()
+        .and_then(|row| row["id"].as_str().map(str::to_owned))
+        .expect("the acquire left a lease row");
+    let stream = service
+        .exec(ExecRequest {
+            sandbox_id,
+            lease_id,
+            argv: vec!["sleep".into(), "30".into()],
+            ..ExecRequest::default()
+        })
+        .unwrap();
+    // Delivered but never run: no exit report will ever arrive.
+    let work = poll_now(&service, &provider).await;
+    assert_eq!(work.len(), 1);
+    assert!(matches!(
+        work[0].work,
+        Some(preloop_sandbox::api::work_item::Work::Exec(_))
+    ));
+    // The sweep fires once the deadline and its grace have passed.
+    tokio::time::sleep(Duration::from_millis(6_100)).await;
+    service.maintain().await;
+    let (code, stdout, stderr) = collect_exec(stream).await.unwrap();
+    assert_eq!(code, 124);
+    assert!(stdout.is_empty() && stderr.is_empty());
+    // The backstop also asks the provider to kill the guest command.
+    let cancel = poll_now(&service, &provider).await;
+    assert_eq!(cancel.len(), 1);
+    assert!(matches!(
+        cancel[0].work,
+        Some(preloop_sandbox::api::work_item::Work::CancelExec(_))
+    ));
+}
+
+#[tokio::test]
 async fn dropping_an_exec_stream_cancels_the_command() {
     let h = harness().await;
     h.service.put_template(template("alpine")).await.unwrap();

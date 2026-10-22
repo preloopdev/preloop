@@ -3,7 +3,7 @@
 Preloop gets every VM from a Sandbox Service: a generic service that hands out
 running machines from pluggable backends. The CI runner pool is one client;
 `preloop sandbox …` The contract is
-[`proto/preloop/sandbox/v1/sandbox.proto`](../proto/preloop/sandbox/v1/sandbox.proto);
+`proto/preloop/sandbox/v1/sandbox.proto` (in the repository root);
 the implementation is `crates/preloop-sandbox`, which never depends on the CI
 control plane.
 
@@ -68,7 +68,9 @@ response stream, the service queues `CancelExec` for the provider and drops
 the exec; the agent calls the driver's optional `cancel_exec` (SmolVM kills the
 host-side `machine exec` client and, with a second `machine exec`, the guest
 command it left behind) and reports exit code 130. The service also sweeps
-execs and pending work past their deadlines; `Acquire` is bounded by its wait
+execs and pending work past their deadlines; a swept exec ends the caller's
+stream with the same exit code 124 the driver reports, so a late report can
+never turn the caller's result into an error. `Acquire` is bounded by its wait
 window, and every request that waits on a provider to report (`Snapshot`,
 copy, power) is bounded by the same work timeout.
 
@@ -222,10 +224,13 @@ certificate. There is no plaintext mode and no loopback exemption.
 * **Providers** authenticate with a client certificate issued by the service
   CA. Every `Providers` RPC except `Enroll` requires one; the service maps the
   leaf's SHA-256 fingerprint to a provider record, so no X.509 parsing happens
-  past the handshake. A certificate only acts as the provider it was enrolled
-  for: `Register`'s `name` must equal the enrolled name and every other RPC may
-  only name its own provider id. Removed providers and expired certificates are
-  rejected with `permission_denied`. `PRELOOP_SANDBOX_PROVIDER_TOKEN` is gone.
+  past the handshake. The CA and the leaves it issues carry Subject and
+  Authority Key Identifiers (plus `basicConstraints` and the matching EKU), so
+  OpenSSL 3 verifiers — Python `ssl`, `curl` — accept the chain. A certificate
+  only acts as the provider it was enrolled for: `Register`'s `name` must equal
+  the enrolled name and every other RPC may only name its own provider id.
+  Removed providers and expired certificates are rejected with
+  `permission_denied`. `PRELOOP_SANDBOX_PROVIDER_TOKEN` is gone.
 * **The lease is the capability.** Every sandbox-scoped RPC presents the
   `leaseId` `Acquire` returned, and the service checks it is that sandbox's
   active lease. A missing or foreign lease is `PERMISSION_DENIED`; an unknown
@@ -253,6 +258,14 @@ certificate. There is no plaintext mode and no loopback exemption.
   unless that CA hashes to the token's pin. The identity (`key.pem`, `cert.pem`,
   `ca.pem`, `identity.json`, all 0600) lives under
   `<home>/state/sandbox-identity/`; later starts reuse it with no token.
+  `--join` is recorded in `identity.json`, and a restart without it dials that
+  stored URL — the global `--service` default never overrides it; passing
+  `--join` again does. If the service was re-keyed, the identity's `ca.pem` no
+  longer matches: the agent reports that the identity was issued by a different
+  CA and asks for a re-enroll with `--join … --token …` (backing off at 30s
+  rather than retrying the handshake in a loop), and the service logs the
+  rejected TLS handshake — or, when the certificate chains to its CA but is not
+  enrolled, the rejected RPC with the client certificate's fingerprint.
   Re-enrolling an existing name with a new token replaces its fingerprints.
 * **Renewal** is automatic: the agent asks for a new certificate once two
   thirds of the lifetime have passed and hot-reloads its client identity. The
@@ -470,6 +483,7 @@ or `preloop sandbox agent` uses only those variables.
 preloop sandbox serve --listen 0.0.0.0:9191            # standalone service (+ local SmolVM)
 preloop sandbox token create --ttl 1h                  # join token for a provider
 preloop sandbox agent --join https://hub:9191 --token plj1.…  # enroll, then reuse the identity
+preloop sandbox agent                                         # later starts reuse the stored URL
 preloop sandbox template put --name alpine --artifact \
   format=oci-image,arch=aarch64,ref=alpine@sha256:…,digest=sha256:…
 preloop sandbox pool put --name alpine --template alpine --warm 2

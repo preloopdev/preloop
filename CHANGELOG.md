@@ -42,6 +42,54 @@ Releases before v0.27.0 predate the changelog.
   `VmTelemetryRegistry`, `VmRuntimeInfo`, and `build_fleet_snapshot` are
   removed; the runner pool no longer pushes VM identities into telemetry.
 
+### Added
+- **Code-scanning SARIF ingestion.** `github/codeql-action/upload-sarif` now
+  completes on an engine-hosted run: the GitHub shim serves the legacy
+  `POST /api/v3/repos/{owner}/{repo}/code-scanning/sarifs` upload, the
+  `PUT …/code-scanning/analysis` endpoint current action releases use, and the
+  status/analyses reads the action follows, all authenticated with the job
+  runtime token and bound to the token's repository (another repository's
+  token is refused, and an id under another repository reads as 404). The
+  Actions run read the action makes while deriving its analysis key is
+  answered from the same credential, so the step no longer stops on a 404
+  before uploading. A native
+  surface, `POST /api/v1/runs/{run_id}/sarif`, takes the raw
+  `application/sarif+json` document or a JSON wrapper and exposes
+  `GET /api/v1/runs/{run_id}/sarif`, `GET /api/v1/sarif/{analysis_id}` and
+  `GET /api/v1/sarif/{analysis_id}/raw`; a job token may only touch its own
+  run. Uploads are capped at 24 MiB of request body, 10 MiB of compressed
+  SARIF and 32 MiB decompressed, and at 25,000 normalized findings; malformed
+  base64/gzip/JSON or a non-2.1.0 version is rejected with a GitHub-shaped
+  error. Normalized findings carry tool, rule, level, message, path, line and
+  column range, fingerprint and suppression state, raw SARIF is stored
+  gzip-compressed beside the run store, and metadata/findings are persisted in
+  the control database (`sarif_analyses` / `sarif_findings`, new migration
+  `2026102101`). Re-uploads dedupe on a content fingerprint over the
+  repository, commit, ref, tool and sorted finding fingerprints — not on raw
+  bytes — so the same analysis is returned instead of stored twice.
+
+### Changed
+
+- **CI's `/api/v1/status` `vms` section and host-memory-pressure conditions
+  now come from the Sandbox Service.** They are built from the service's
+  `Stats` inventory — sandboxes across registered providers, plus the pool
+  provider's latest host sample and sample age — instead of sampling the
+  engine process and reading a pool-fed VM telemetry registry.
+  `VmTelemetryRegistry`, `VmRuntimeInfo`, and `build_fleet_snapshot` are
+  removed; the runner pool no longer pushes VM identities into telemetry.
+
+### Security
+
+- **CI security gates cover PRs, main, dependencies, and the runner image.**
+  Semgrep runs on every pull request (`p/github-actions`, `p/secrets`)
+  and fails on findings; CodeQL runs on merge to `main` for
+  Actions and Rust; dependency review blocks high-severity additions; and
+  OpenSSF Scorecard runs weekly. The published runner image is now signed with
+  keyless cosign and has a registry-backed provenance attestation. The golden
+  scan also requires the aarch64 apt SBOM and scans it with Grype, and the
+  main ruleset no longer allows direct pushes (admins may still merge a PR),
+  and the release-tag ruleset restricts tag creation.
+
 ### Fixed
 
 - **Sandbox telemetry is shareable and bounded.** `Stats` carries aggregates
@@ -60,6 +108,19 @@ Releases before v0.27.0 predate the changelog.
   reaping whichever provider reports it; deleting the template still releases
   it through its owning provider.
 
+- **Sandbox Service certificates verify under OpenSSL 3, and an agent with a
+  stale identity recovers cleanly.** The generated CA and its server/client
+  leaves now carry Subject and Authority Key Identifiers (plus
+  `basicConstraints` and matching EKUs), so strict verifiers such as Python
+  `ssl` and `curl` accept the chain instead of failing with `Missing Authority
+  Key Identifier`. `preloop sandbox agent` without `--join` now dials the
+  service URL recorded with its identity instead of the `https://127.0.0.1:9191`
+  default (`--join` still overrides it). A registration rejected because the
+  service was re-keyed now reports that the identity was issued by a different
+  CA and how to re-enroll, backing off at 30 seconds instead of retrying in a
+  loop; the service logs the rejected TLS handshake, or the rejected RPC with
+  the client certificate's fingerprint when the certificate chains but is not
+  enrolled.
 - **The runner pool's golden-release GitHub calls now go through the engine's
   circuit breaker.** `resolve_latest_golden_tag` (the `/releases` listing), the
   OCI manifest and token lookups, the `.sha256` sidecars and the golden
