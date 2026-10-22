@@ -351,7 +351,8 @@ pub struct FileSpec {
     /// Contents.
     #[serde(with = "b64")]
     pub data: Vec<u8>,
-    /// Octal mode (0 = 0644).
+    /// Octal mode (0 = 0600: only the guest owner reads it). Set an explicit
+    /// mode when a non-root guest user must read the file.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub mode: u32,
 }

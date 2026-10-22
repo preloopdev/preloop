@@ -103,6 +103,43 @@ fn new_id(prefix: &str) -> String {
     )
 }
 
+/// Build the inject tar readable only by its owner: its payload can carry
+/// secrets, and the guest owner is the only intended reader.
+fn build_inject_tar(tar_path: &Path, files: &[FileSpec]) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tar_path)
+        .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+    // `mode` only applies to a newly created file; a stale tar left by an
+    // earlier attempt must not keep its wider mode.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+    let mut builder = tar::Builder::new(file);
+    for spec in files {
+        let path = spec.path.trim_start_matches('/');
+        if path.is_empty() || path.split('/').any(|p| p == "..") {
+            return Err(Error::invalid(format!("bad inject path `{}`", spec.path)));
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(spec.data.len() as u64);
+        header.set_mode(if spec.mode == 0 { 0o600 } else { spec.mode });
+        header.set_mtime(now() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, spec.data.as_slice())
+            .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+    }
+    builder
+        .finish()
+        .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+    Ok(())
+}
+
 /// sha256 of the canonical JSON of a template spec.
 pub fn template_digest(spec: &TemplateSpec) -> String {
     let canonical = serde_json::to_vec(spec).unwrap_or_default();
@@ -1353,28 +1390,11 @@ impl Service {
             .config
             .blob_dir
             .join(format!("inject-{}.tar", lease.id));
-        {
-            let file = std::fs::File::create(&tar_path)
-                .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
-            let mut builder = tar::Builder::new(file);
-            for spec in &inject.files {
-                let path = spec.path.trim_start_matches('/');
-                if path.is_empty() || path.split('/').any(|p| p == "..") {
-                    return Err(Error::invalid(format!("bad inject path `{}`", spec.path)));
-                }
-                let mut header = tar::Header::new_gnu();
-                header.set_size(spec.data.len() as u64);
-                header.set_mode(if spec.mode == 0 { 0o644 } else { spec.mode });
-                header.set_mtime(now() as u64);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, path, spec.data.as_slice())
-                    .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
-            }
-            builder
-                .finish()
-                .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
-        }
+        let files = inject.files.clone();
+        let build_path = tar_path.clone();
+        tokio::task::spawn_blocking(move || build_inject_tar(&build_path, &files))
+            .await
+            .map_err(|e| Error::internal(format!("inject tar: {e}")))??;
         let result = self.upload_path(&sandbox.id, "/", &tar_path).await;
         let _ = std::fs::remove_file(&tar_path);
         result?;

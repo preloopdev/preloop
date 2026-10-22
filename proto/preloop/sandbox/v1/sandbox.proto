@@ -127,7 +127,7 @@ enum Purpose {
 message FileSpec {
   string path = 1;
   bytes data = 2;                   // base64 in JSON
-  uint32 mode = 3;
+  uint32 mode = 3;                  // octal; 0 = 0600 (guest owner only)
 }
 
 message Inject {
