@@ -461,6 +461,10 @@ pub struct Lease {
     pub idempotency_key: String,
     /// Unix seconds.
     pub expires_at: i64,
+    /// TTL the caller asked for. A lease persisted before this field existed
+    /// has 0 and is already delivered: its expiry is left alone.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub requested_ttl_secs: u64,
     /// Environment merged into every exec on this lease.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,

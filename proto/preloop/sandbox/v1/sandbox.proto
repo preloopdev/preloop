@@ -172,6 +172,7 @@ message Lease {
   string idempotency_key = 4;
   int64 expires_at = 5;
   map<string, string> env = 6;      // merged into every Exec on this lease
+  uint64 requested_ttl_secs = 7;    // caller's TTL; delivery restores it
 }
 
 // ─── Sandboxes (callers) ──────────────────────────────────────────────

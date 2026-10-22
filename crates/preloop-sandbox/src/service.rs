@@ -29,6 +29,10 @@ use crate::store::{Kind, Store};
 pub struct ServiceConfig {
     /// Default lease TTL.
     pub lease_ttl: Duration,
+    /// How long an acquired-but-never-returned lease (one whose `Acquire` is
+    /// still provisioning, or timed out) may live before maintenance releases
+    /// it. A waiting `Acquire` keeps its lease past this window.
+    pub unclaimed_lease_ttl: Duration,
     /// Default time `Acquire` waits for a ready sandbox.
     pub acquire_wait: Duration,
     /// A provider silent this long is not placed on.
@@ -54,6 +58,7 @@ impl ServiceConfig {
     pub fn new(blob_dir: PathBuf) -> Self {
         Self {
             lease_ttl: Duration::from_secs(3600),
+            unclaimed_lease_ttl: Duration::from_secs(600),
             acquire_wait: Duration::from_secs(900),
             provider_timeout: Duration::from_secs(45),
             create_timeout: Duration::from_secs(1800),
@@ -201,6 +206,9 @@ struct State {
     created_at: HashMap<String, Instant>,
     leases: BTreeMap<String, Lease>,
     lease_by_key: HashMap<String, String>,
+    /// In-process `Acquire` calls waiting for a lease, by idempotency key.
+    /// Maintenance must not expire a lease while its caller is still waiting.
+    waiting: HashMap<String, usize>,
     injected: HashSet<String>,
     providers: BTreeMap<String, ProviderRec>,
     pending: HashMap<String, PendingWork>,
@@ -220,6 +228,42 @@ pub struct Service {
     seq: std::sync::atomic::AtomicU64,
     /// Highest sequence already written, per record.
     persisted: tokio::sync::Mutex<HashMap<(Kind, String), u64>>,
+}
+
+/// An `Acquire` call waiting in this process, keyed by idempotency key.
+///
+/// Maintenance skips an expired lease while its waiter is alive: a boot or a
+/// golden unpack can outlast the unclaimed lease window.
+struct AcquireWaiter {
+    service: Arc<Service>,
+    key: String,
+}
+
+impl AcquireWaiter {
+    fn register(service: &Arc<Service>, key: &str) -> Self {
+        *service
+            .state
+            .lock()
+            .waiting
+            .entry(key.to_owned())
+            .or_default() += 1;
+        Self {
+            service: service.clone(),
+            key: key.to_owned(),
+        }
+    }
+}
+
+impl Drop for AcquireWaiter {
+    fn drop(&mut self) {
+        let mut state = self.service.state.lock();
+        if let Some(count) = state.waiting.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.waiting.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// One store write, stamped with the order it was decided in.
@@ -251,6 +295,8 @@ impl Service {
             state.sandboxes.insert(sandbox.id.clone(), sandbox);
         }
         for lease in load::<Lease>(&*store, Kind::Leases).await? {
+            // A lease persisted before `requested_ttl_secs` existed has 0 and
+            // counts as delivered: `claim` will not rewrite its expiry.
             state
                 .lease_by_key
                 .insert(lease.idempotency_key.clone(), lease.id.clone());
@@ -385,11 +431,16 @@ impl Service {
             let mut state = self.state.lock();
             let mut ops = Vec::new();
             let t = now();
-            // Expired leases and preservation windows.
+            // Expired leases and preservation windows. A lease whose caller is
+            // still waiting in this process is not expired: a real boot or a
+            // golden unpack can outlast the unclaimed window.
+            let waiting = &state.waiting;
             let expired: Vec<String> = state
                 .leases
                 .values()
-                .filter(|lease| lease.expires_at <= t)
+                .filter(|lease| {
+                    lease.expires_at <= t && !waiting.contains_key(&lease.idempotency_key)
+                })
                 .map(|lease| lease.id.clone())
                 .collect();
             for lease_id in expired {
@@ -1065,6 +1116,7 @@ impl Service {
                 Step::Ready(ready) => {
                     let (lease, sandbox) = *ready;
                     self.inject(&lease, &sandbox, &request.inject).await?;
+                    let lease = self.claim(&lease).await?;
                     return Ok(AcquireResponse { lease, sandbox });
                 }
                 Step::Wait(last) => {
@@ -1235,7 +1287,10 @@ impl Service {
             sandbox_id: sandbox_id.clone(),
             pool: request.pool.clone(),
             idempotency_key: request.idempotency_key.clone(),
-            expires_at: now() + ttl as i64,
+            // Until the lease reaches a caller it may only live for the
+            // unclaimed window; delivery restores the requested TTL.
+            expires_at: now() + ttl.min(self.config.unclaimed_lease_ttl.as_secs()) as i64,
+            requested_ttl_secs: ttl,
             env: request.inject.env.clone(),
         };
         let sandbox = state
@@ -1261,6 +1316,27 @@ impl Service {
         } else {
             Step::Wait(None)
         })
+    }
+
+    /// Mark a lease delivered when `Acquire` returns it: its expiry becomes
+    /// the caller's full TTL. A lease persisted before `requested_ttl_secs`
+    /// existed has 0 and is already delivered, so its expiry is left alone.
+    async fn claim(&self, lease: &Lease) -> Result<Lease> {
+        let (claimed, ops) = {
+            let mut state = self.state.lock();
+            let Some(current) = state.leases.get_mut(&lease.id) else {
+                return Ok(lease.clone());
+            };
+            if current.requested_ttl_secs == 0 {
+                return Ok(current.clone());
+            }
+            current.expires_at = now() + current.requested_ttl_secs as i64;
+            let current = current.clone();
+            let op = self.put(Kind::Leases, &current.id, &current);
+            (current, vec![op])
+        };
+        self.persist(ops).await;
+        Ok(claimed)
     }
 
     async fn inject(
