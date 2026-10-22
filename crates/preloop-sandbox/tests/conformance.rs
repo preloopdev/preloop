@@ -3534,3 +3534,510 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
         .unwrap();
     assert_eq!(code, 0);
 }
+
+// ─── Lifecycle pentest regressions (2026-10-22) ──────────────────────
+
+/// Pentest W4-F1: an idempotent `Acquire` replay against a STOPPED
+/// sandbox destroyed it (record and disk) and the next retry silently
+/// provisioned a different sandbox. A retry must hand the stopped
+/// sandbox back so the caller can `Start` it.
+#[tokio::test]
+async fn replayed_acquire_returns_a_stopped_sandbox_instead_of_destroying_it() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let request = AcquireRequest {
+        idempotency_key: "golden-bake".into(),
+        template: "alpine".into(),
+        ..AcquireRequest::default()
+    };
+    let lease = h.service.acquire(request.clone()).await.unwrap();
+    // State on the disk the caller cannot afford to lose to a retry.
+    let (code, _, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            argv: vec!["sh".into(), "-c".into(), "echo precious > marker".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    h.service
+        .stop(&lease.sandbox.id, &lease.lease.id)
+        .await
+        .unwrap();
+    // The retry (network blip, client restart, reconcile loop) returns
+    // the same stopped sandbox and lease.
+    let replayed = h.service.acquire(request).await.unwrap();
+    assert_eq!(replayed.sandbox.id, lease.sandbox.id);
+    assert_eq!(replayed.lease.id, lease.lease.id);
+    assert_eq!(replayed.sandbox.state, SandboxState::Stopped);
+    // And it still starts, with its disk intact.
+    h.service
+        .start(&lease.sandbox.id, &lease.lease.id, false)
+        .await
+        .unwrap();
+    let (_, stdout, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            argv: vec!["cat".into(), "marker".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(stdout, b"precious\n");
+}
+
+/// Pentest W4-F2: `Release(PRESERVE)` on a paused or stopped sandbox
+/// silently destroyed it under a success response. Preserve now applies
+/// from those states (the machine keeps its power state; the window and
+/// the lease work as they do from `Leased`).
+#[tokio::test]
+async fn preserve_release_keeps_paused_and_stopped_sandboxes() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let acquire = |key: &str| {
+        let service = h.service.clone();
+        let key = key.to_owned();
+        async move {
+            service
+                .acquire(AcquireRequest {
+                    idempotency_key: key,
+                    template: "alpine".into(),
+                    ..AcquireRequest::default()
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let preserve = |lease_id: String| {
+        let service = h.service.clone();
+        async move {
+            service
+                .release(ReleaseRequest {
+                    lease_id,
+                    mode: ReleaseMode::Preserve.into(),
+                    preserve_ttl_secs: 60,
+                    ..ReleaseRequest::default()
+                })
+                .await
+        }
+    };
+
+    // Stopped: preserve keeps the record, the lease and the disk.
+    let stopped = acquire("keep-stopped").await;
+    h.service
+        .stop(&stopped.sandbox.id, &stopped.lease.id)
+        .await
+        .unwrap();
+    preserve(stopped.lease.id.clone()).await.unwrap();
+    let kept = h
+        .service
+        .get(&stopped.sandbox.id, &stopped.lease.id)
+        .unwrap();
+    assert_eq!(kept.state, SandboxState::Preserved);
+    // The machine stayed stopped: it must be started before it executes.
+    let error = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: stopped.sandbox.id.clone(),
+            lease_id: stopped.lease.id.clone(),
+            argv: vec!["true".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Unavailable);
+    h.service
+        .start(&stopped.sandbox.id, &stopped.lease.id, false)
+        .await
+        .unwrap();
+    let (code, _, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: stopped.sandbox.id.clone(),
+            lease_id: stopped.lease.id.clone(),
+            argv: vec!["true".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+
+    // Paused: same story, resumed through the preserved lease.
+    let paused = acquire("keep-paused").await;
+    h.service
+        .pause(&paused.sandbox.id, &paused.lease.id)
+        .await
+        .unwrap();
+    preserve(paused.lease.id.clone()).await.unwrap();
+    let kept = h.service.get(&paused.sandbox.id, &paused.lease.id).unwrap();
+    assert_eq!(kept.state, SandboxState::Preserved);
+    h.service
+        .resume(&paused.sandbox.id, &paused.lease.id)
+        .await
+        .unwrap();
+    let (code, _, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: paused.sandbox.id.clone(),
+            lease_id: paused.lease.id.clone(),
+            argv: vec!["true".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+}
+
+/// Pentest W4-F2 (negative side): a sandbox that cannot be preserved —
+/// here one still provisioning — fails `Release(PRESERVE)` with
+/// `failed_precondition` and is left exactly as it was, instead of being
+/// destroyed under a success response.
+#[tokio::test]
+async fn preserve_release_from_provisioning_fails_and_changes_nothing() {
+    let (service, _dir, _provider, store) = manual_service(|_| {}).await;
+    acquire_unreported(&service, "k").await;
+    let lease_id = store
+        .load(Kind::Leases)
+        .await
+        .unwrap()
+        .first()
+        .and_then(|row| row["id"].as_str().map(str::to_owned))
+        .expect("the acquire left a lease row");
+    let error = service
+        .release(ReleaseRequest {
+            lease_id: lease_id.clone(),
+            mode: ReleaseMode::Preserve.into(),
+            preserve_ttl_secs: 60,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", message(&error));
+    assert!(message(&error).contains("cannot be preserved"));
+    // Nothing was destroyed or preserved: the lease and the provisioning
+    // sandbox are both still there, and a DESTROY release still works.
+    assert_eq!(service.list().len(), 1);
+    assert_eq!(service.list()[0].state, SandboxState::Provisioning);
+    service
+        .release(ReleaseRequest {
+            lease_id,
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// Pentest W4-F4: `Snapshot` removed the sandbox but never closed its
+/// in-flight execs, so the caller's stream hung until the exec deadline
+/// (3600 s by default). Snapshot now ends them like destroy does, and
+/// asks the provider to stop the commands.
+#[tokio::test]
+async fn snapshot_closes_in_flight_execs() {
+    use futures::StreamExt as _;
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "bake".into(),
+            template: "alpine".into(),
+            purpose: Purpose::Build.into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut stream = h
+        .service
+        .exec(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            argv: vec!["sh".into(), "-c".into(), "sleep 300".into()],
+            ..ExecRequest::default()
+        })
+        .unwrap();
+    // Let the exec reach the agent, then snapshot the sandbox away.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    h.service
+        .snapshot(SnapshotRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            name: "golden".into(),
+            ..SnapshotRequest::default()
+        })
+        .await
+        .unwrap();
+    let error = loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.next()).await {
+            Ok(Some(Err(error))) => break error,
+            Ok(Some(Ok(_))) => continue,
+            Ok(None) => panic!("stream ended without an error"),
+            Err(_) => panic!("exec stream hung after the sandbox was snapshotted"),
+        }
+    };
+    assert_eq!(error.code, Code::Unavailable);
+    assert!(
+        message(&error).contains("snapshotted"),
+        "{}",
+        message(&error)
+    );
+    // The provider was told to stop the orphaned command.
+    wait_for(|| {
+        h.fake
+            .cancel_calls
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    })
+    .await;
+}
+
+/// Pentest W5-F1: an `Acquire` queued behind a full pool waited without
+/// any server-side bound (≥600 s against the 900 s default wait). The
+/// capacity wait is bounded separately from the provisioning wait: the
+/// waiter fails with `resource_exhausted` in time to fail over — and
+/// still succeeds when a slot frees inside the bound.
+#[tokio::test]
+async fn over_capacity_acquire_fails_at_the_capacity_bound() {
+    let (service, _dir, provider, _store) = manual_service(|config| {
+        config.acquire_wait = Duration::from_secs(60);
+        config.acquire_capacity_wait = Duration::from_millis(300);
+    })
+    .await;
+    service
+        .put_pool(PoolSpec {
+            name: "tiny".into(),
+            template: "alpine".into(),
+            warm: 0,
+            max: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    // Fill the pool's only slot (manual provider: report the create).
+    let error = service
+        .acquire(AcquireRequest {
+            idempotency_key: "one".into(),
+            pool: "tiny".into(),
+            wait_secs: Some(0),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::DeadlineExceeded);
+    let create = poll_now(&service, &provider).await;
+    assert_eq!(create.len(), 1);
+    service
+        .report(ReportRequest {
+            provider_id: provider.provider_id.clone(),
+            generation: provider.generation,
+            work_id: create[0].id.clone(),
+            ok: true,
+            native_ref: "psbx-tiny-1".into(),
+            error: String::new(),
+            ..ReportRequest::default()
+        })
+        .await
+        .unwrap();
+    let first = service
+        .acquire(AcquireRequest {
+            idempotency_key: "one".into(),
+            pool: "tiny".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.sandbox.state, SandboxState::Leased);
+
+    // Over capacity: the wait ends at the capacity bound (300 ms), far
+    // inside the 60 s provisioning wait, with the overload error itself.
+    let started = std::time::Instant::now();
+    let error = service
+        .acquire(AcquireRequest {
+            idempotency_key: "two".into(),
+            pool: "tiny".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::ResourceExhausted, "{}", message(&error));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "capacity wait overran its bound: {:?}",
+        started.elapsed()
+    );
+
+    // A waiter that is parked when a slot frees inside the bound still
+    // gets the sandbox.
+    let waiting = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .acquire(AcquireRequest {
+                    idempotency_key: "three".into(),
+                    pool: "tiny".into(),
+                    ..AcquireRequest::default()
+                })
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    service
+        .release(ReleaseRequest {
+            lease_id: first.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    // The freed slot is refilled by a fresh create; report it when it
+    // reaches the provider. (The release also queued a destroy for the
+    // old member — report whatever arrives, but only the create counts.)
+    let mut reported = false;
+    for _ in 0..200 {
+        if reported {
+            break;
+        }
+        let work = poll_now(&service, &provider).await;
+        for item in work {
+            let is_create = matches!(
+                item.work.as_ref(),
+                Some(preloop_sandbox::api::work_item::Work::Create(_))
+            );
+            service
+                .report(ReportRequest {
+                    provider_id: provider.provider_id.clone(),
+                    generation: provider.generation,
+                    work_id: item.id.clone(),
+                    ok: true,
+                    native_ref: if is_create {
+                        "psbx-tiny-2".into()
+                    } else {
+                        String::new()
+                    },
+                    error: String::new(),
+                    ..ReportRequest::default()
+                })
+                .await
+                .unwrap();
+            reported |= is_create;
+        }
+        if !reported {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    assert!(reported, "the waiter's create never reached the provider");
+    let third = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the waiter hung past its create report")
+        .unwrap()
+        .unwrap();
+    assert_eq!(third.sandbox.state, SandboxState::Leased);
+}
+
+/// Pentest W4-F6 / W5-F2: an exec redelivered after the agent process
+/// died was executed a second time from scratch, and the caller saw one
+/// clean success. The restarted agent fences the redelivery from its
+/// durable started-set: the command runs once, the caller gets an error.
+#[tokio::test]
+async fn a_restarted_agent_refuses_to_run_an_exec_twice() {
+    use futures::StreamExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let host = dir.path().join("host");
+    let scratch = dir.path().join("scratch");
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    config.acquire_wait = Duration::from_secs(10);
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+
+    // First agent process: its own driver instance (its cancel registry
+    // dies with it, like the real process) over the shared host root.
+    let fake1 = Arc::new(FakeDriver::new(
+        "fake",
+        host.clone(),
+        FakeDriver::full_capabilities(),
+    ));
+    let agent1 = Agent::new(
+        Arc::new(service.clone()) as Arc<dyn ProviderLink>,
+        vec![fake1 as Arc<dyn Driver>],
+        AgentConfig::new("host-a", scratch.clone()),
+    );
+    let agent1_shutdown = CancellationToken::new();
+    tokio::spawn(agent1.run(agent1_shutdown.clone()));
+    wait_for_registered(&service).await;
+
+    service.put_template(template("alpine")).await.unwrap();
+    let lease = service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let marker = dir.path().join("marker.log");
+    let script = format!("echo run >> {}; sleep 30", marker.display());
+    let mut stream = service
+        .exec(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            argv: vec!["sh".into(), "-c".into(), script],
+            timeout_secs: 120,
+            ..ExecRequest::default()
+        })
+        .unwrap();
+    wait_for(|| std::fs::read_to_string(&marker).is_ok_and(|content| content.contains("run")))
+        .await;
+
+    // The agent process dies. (Its session ends here; the orphaned guest
+    // command keeps running, and the exec work stays unacknowledged.)
+    agent1_shutdown.cancel();
+
+    // The replacement process: new driver instance, same host root, same
+    // scratch — so the durable started-set is the one the dead process
+    // wrote.
+    let fake2 = Arc::new(FakeDriver::new(
+        "fake",
+        host.clone(),
+        FakeDriver::full_capabilities(),
+    ));
+    let agent2 = Agent::new(
+        Arc::new(service.clone()) as Arc<dyn ProviderLink>,
+        vec![fake2 as Arc<dyn Driver>],
+        AgentConfig::new("host-a", scratch.clone()),
+    );
+    let agent2_shutdown = CancellationToken::new();
+    tokio::spawn(agent2.run(agent2_shutdown.clone()));
+
+    // Re-registration redelivers the exec; the new agent refuses it and
+    // the caller's stream ends with the fencing error, promptly.
+    let error = loop {
+        match tokio::time::timeout(Duration::from_secs(20), stream.next()).await {
+            Ok(Some(Err(error))) => break error,
+            Ok(Some(Ok(_))) => continue,
+            Ok(None) => panic!("stream ended without an error"),
+            Err(_) => panic!("exec stream hung after the agent restarted"),
+        }
+    };
+    assert!(
+        message(&error).contains("refusing to run it twice"),
+        "{}",
+        message(&error)
+    );
+    // The command ran exactly once.
+    let runs = std::fs::read_to_string(&marker)
+        .unwrap()
+        .lines()
+        .filter(|line| *line == "run")
+        .count();
+    assert_eq!(runs, 1, "the redelivered exec executed again");
+    agent2_shutdown.cancel();
+    shutdown.cancel();
+}

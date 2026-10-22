@@ -72,7 +72,25 @@ execs and pending work past their deadlines; a swept exec ends the caller's
 stream with the same exit code 124 the driver reports, so a late report can
 never turn the caller's result into an error. `Acquire` is bounded by its wait
 window, and every request that waits on a provider to report (`Snapshot`,
-copy, power) is bounded by the same work timeout.
+copy, power) is bounded by the same work timeout. A wait that is blocked only
+because the pool is at capacity — not on provisioning — is bounded separately
+and much more tightly (30 s by default): the acquire then fails with
+`resource_exhausted`, the overload error itself, so the caller can fail over
+instead of queueing behind a full pool.
+
+Exec work is the one redelivery that must not replay: an exec is a command,
+and running it twice is a side effect, not a retry. The agent records every
+exec it starts in a durable started-set beside its identity state
+(`started-execs/` in its scratch directory) *before* running it, and refuses
+a redelivery of an exec id already in the set, reporting it as a failed
+attempt; the service closes the caller's stream with that error rather than
+a phantom second run. The service counts each delivery on the exec record,
+so redeliveries are visible where the exec lives. The fence is host-local
+and lasts as long as the agent's scratch directory does: wiping the scratch,
+or redelivering the exec to a different host, reopens the window — and an
+exec that ran to completion but whose every report was lost ends the
+caller's stream with the fencing error instead of the lost success, the
+conservative direction, never a duplicate run.
 
 The Connect layer is generated from the proto, not hand-written.
 `scripts/gen-sandbox-proto.sh` runs `protoc` with two plugins:
@@ -131,11 +149,18 @@ The generated types speak the proto3 JSON mapping:
   shape, requirements, purpose, network, mounts, sockets, options and name of
   the request that first used it, and a reuse with any of those different is
   `invalid_argument`. TTL, wait and injected files are call tactics, not
-  identity: they may change on a retry. Lease environment is merged into every
+  identity: they may change on a retry. A replay returns the recorded sandbox
+  in whatever state its owner left it — including `Stopped`: a retry can
+  never destroy a sandbox that was stopped on purpose, and the caller starts
+  it again itself. Lease environment is merged into every
   exec; injected files are written before the lease is returned. Leases expire
   (the sandbox is destroyed); `Release(PRESERVE)` keeps a sandbox for debugging
   until its window ends, and the lease id keeps working as the debugging
-  capability until then.
+  capability until then. Preserve applies from `Leased`, `Preserved`, `Paused`
+  and `Stopped` — the machine keeps its power state, so a stopped sandbox
+  must be started before it executes — and from any other state it fails with
+  `failed_precondition` and changes nothing; a successful release response
+  never means the sandbox was destroyed.
 
 Capabilities decide placement; nothing branches on driver names. A request no
 registered provider can satisfy fails with the unmet requirement named

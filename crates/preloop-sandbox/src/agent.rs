@@ -551,6 +551,10 @@ const BACKOFF_CAP: Duration = Duration::from_secs(15);
 /// it again. Longer than the service's delivery timeout.
 const DONE_RETENTION: Duration = Duration::from_secs(600);
 
+/// Directory under the agent's scratch holding one file per exec this host
+/// has started (see [`Agent::mark_exec_started`]).
+const STARTED_EXECS_DIR: &str = "started-execs";
+
 /// The result of one work item, kept so a redelivery can re-report it
 /// instead of re-executing.
 #[derive(Debug, Clone)]
@@ -873,8 +877,11 @@ impl Agent {
                         continue;
                     };
                     info!(native = %target.native_ref, "reconcile: destroying orphan");
-                    if let Err(error) = driver.destroy(&target.native_ref).await {
-                        warn!(native = %target.native_ref, %error, "orphan destroy failed");
+                    match driver.destroy(&target.native_ref).await {
+                        Ok(()) => self.forget_started_execs(&target.native_ref),
+                        Err(error) => {
+                            warn!(native = %target.native_ref, %error, "orphan destroy failed");
+                        }
                     }
                 }
             }
@@ -929,6 +936,73 @@ impl Agent {
         self.active
             .lock()
             .insert(native_ref.to_owned(), Instant::now());
+    }
+
+    /// Record `exec_id` as started on this host, durably, before the
+    /// command runs: one small file per exec in the scratch directory,
+    /// created exclusively and synced. Returns `false` when a previous
+    /// agent process on this host already recorded the exec — the mark,
+    /// not the attempt, is what survives a crash, so an exec whose first
+    /// attempt finished but whose reports were all lost is still never
+    /// run twice; its caller gets the fencing error instead of a phantom
+    /// second run (or a first success reported as a failure's twin).
+    ///
+    /// The record lives in the agent's scratch: an operator who wipes the
+    /// scratch of a host whose guests can outlive the agent reopens the
+    /// window this closes. Entries are dropped when their sandbox is
+    /// destroyed, which bounds the directory by the execs of live
+    /// sandboxes.
+    fn mark_exec_started(&self, exec_id: &str, native_ref: &str) -> Result<bool> {
+        let dir = self.config.scratch.join(STARTED_EXECS_DIR);
+        std::fs::create_dir_all(&dir).map_err(|error| {
+            Error::internal(format!("recording started exec {exec_id}: {error}"))
+        })?;
+        // Exec ids are service-generated (`exe-…`); keep the file name
+        // inside the directory whatever a future id scheme allows.
+        let name: String = exec_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(native_ref.as_bytes())
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| {
+                        Error::internal(format!("recording started exec {exec_id}: {error}"))
+                    })?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(Error::internal(format!(
+                "recording started exec {exec_id}: {error}"
+            ))),
+        }
+    }
+
+    /// Drop the started-exec records of a sandbox that no longer exists.
+    fn forget_started_execs(&self, native_ref: &str) {
+        let dir = self.config.scratch.join(STARTED_EXECS_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let recorded = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            if recorded == native_ref {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     fn driver(&self, name: &str) -> Result<Arc<dyn Driver>> {
@@ -1043,10 +1117,37 @@ impl Agent {
                     driver.drop_snapshot(snapshot).await?;
                 } else {
                     driver.destroy(&target.native_ref).await?;
+                    self.forget_started_execs(&target.native_ref);
                 }
                 Ok(String::new())
             }
             work_item::Work::Exec(exec) => {
+                // Fence re-execution across agent restarts. The in-memory
+                // work map dedupes redelivery within this process, but it
+                // dies with the process — and a guest command can outlive
+                // it (an orphaned process on a process-backed driver, a VM
+                // on a machine-backed one). Delivery is at-least-once, so
+                // without a durable record the restarted agent ran the
+                // command a second time while the caller saw one success.
+                // A started exec is therefore never started again on this
+                // host: the redelivery is reported as failed and the
+                // service ends the caller's stream with the error.
+                match self.mark_exec_started(&exec.exec_id, &exec.target.native_ref) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(Error::new(
+                            Code::Aborted,
+                            format!(
+                                "exec {} was already started on this host by an earlier \
+                                 delivery; refusing to run it twice",
+                                exec.exec_id
+                            ),
+                        ));
+                    }
+                    // Unrecorded is unfenced: fail rather than risk the
+                    // duplicate run the record exists to prevent.
+                    Err(error) => return Err(error),
+                }
                 self.run_exec(session, stop, *exec).await?;
                 Ok(String::new())
             }

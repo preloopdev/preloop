@@ -35,6 +35,17 @@ pub struct ServiceConfig {
     pub lease_ttl: Duration,
     /// Default time `Acquire` waits for a ready sandbox.
     pub acquire_wait: Duration,
+    /// How long an `Acquire` may wait *for capacity* — the pool is at
+    /// `max`, or placement reports `resource_exhausted` — before the wait
+    /// fails with that `resource_exhausted` error. Provisioning waits are
+    /// bounded by `acquire_wait` instead: a cold create legitimately takes
+    /// minutes, but a full pool does not free up faster for waiting longer,
+    /// and a caller that cannot hear about overload within this window
+    /// cannot fail over to another pool or provider either. Without the
+    /// bound, an over-capacity `Acquire` parked for the whole
+    /// `acquire_wait` (observed ≥600 s against a 900 s default), pinning a
+    /// handler and a connection per parked caller.
+    pub acquire_capacity_wait: Duration,
     /// A provider silent this long is not placed on.
     pub provider_timeout: Duration,
     /// A create not reported within this window fails.
@@ -80,6 +91,7 @@ impl ServiceConfig {
         Self {
             lease_ttl: Duration::from_secs(3600),
             acquire_wait: Duration::from_secs(900),
+            acquire_capacity_wait: Duration::from_secs(30),
             provider_timeout: Duration::from_secs(45),
             create_timeout: Duration::from_secs(1800),
             preserve_ttl: Duration::from_secs(600),
@@ -344,6 +356,13 @@ struct Exec {
     sandbox_id: String,
     /// The `Report`-acknowledged work item that started it.
     work_id: String,
+    /// How many times the exec's work item has been delivered. Delivery is
+    /// at-least-once; a count above one means the previous delivery's
+    /// report never arrived (the agent crashed, or the visibility timeout
+    /// lapsed mid-run). The agent fences re-execution from its durable
+    /// started-set; this counter is the service-side record of the attempt
+    /// dimension, kept with the exec for its whole life.
+    attempts: u32,
     tx: mpsc::Sender<Result<ExecEvent>>,
     /// Last `ReportExec` batch sequence applied.
     sequence: u64,
@@ -790,7 +809,9 @@ impl Service {
                 .collect();
             for lease_id in expired {
                 info!(%lease_id, "lease expired; destroying sandbox");
-                self.release_locked(&mut state, &lease_id, ReleaseMode::Destroy, 0, &mut ops);
+                // `Destroy` releases never fail.
+                let _ =
+                    self.release_locked(&mut state, &lease_id, ReleaseMode::Destroy, 0, &mut ops);
                 self.config.metrics.record_lease_transition("expired");
             }
             // A stopped sandbox holds no host capacity, but it does hold
@@ -1767,9 +1788,9 @@ impl Service {
         mode: ReleaseMode,
         preserve_ttl: u64,
         ops: &mut Vec<Op>,
-    ) {
+    ) -> Result<()> {
         let Some(lease) = state.leases.get(lease_id).cloned() else {
-            return;
+            return Ok(());
         };
         let preserve = mode == ReleaseMode::Preserve;
         let failed = state
@@ -1779,15 +1800,41 @@ impl Service {
         // Preservation is the one way a lease outlives `Release`: the id keeps
         // working as the debugging capability until the window closes. A
         // second preserve extends that window instead of destroying.
-        if preserve
-            && !failed
-            && state.sandboxes.get(&lease.sandbox_id).is_some_and(|s| {
-                matches!(
-                    s.state.known(),
-                    SandboxState::Leased | SandboxState::Preserved
-                )
-            })
-        {
+        //
+        // A stopped or paused sandbox preserves too: `Stop` exists to keep a
+        // machine and its disk around, and the debug flow is exactly "stop
+        // it, preserve-release it, inspect it later". The record moves to
+        // `Preserved`; the machine's power state is the driver's and is not
+        // touched (a stopped sandbox stays stopped and must be `Start`ed
+        // before it executes again). Anything that cannot be preserved —
+        // a failed sandbox, one still provisioning — fails the call instead
+        // of falling through to destroy under a success response, which is
+        // what this gate used to do.
+        if preserve {
+            let sandbox_state = state
+                .sandboxes
+                .get(&lease.sandbox_id)
+                .map(|s| s.state.known());
+            let preservable = !failed
+                && matches!(
+                    sandbox_state,
+                    Some(
+                        SandboxState::Leased
+                            | SandboxState::Preserved
+                            | SandboxState::Paused
+                            | SandboxState::Stopped
+                    )
+                );
+            if !preservable {
+                let state_name = sandbox_state
+                    .map(|state| format!("{state:?}"))
+                    .unwrap_or_else(|| "gone".to_owned());
+                return Err(Error::failed_precondition(format!(
+                    "sandbox {} cannot be preserved from state {state_name}; \
+                     release with DESTROY to give it up",
+                    lease.sandbox_id
+                )));
+            }
             let ttl = if preserve_ttl == 0 {
                 self.config.preserve_ttl.as_secs()
             } else {
@@ -1809,7 +1856,7 @@ impl Service {
                 ops.push(self.put(Kind::Leases, lease_id, &*lease));
             }
             self.config.metrics.record_lease_transition("preserved");
-            return;
+            return Ok(());
         }
         state.leases.remove(lease_id);
         state.lease_by_key.remove(&lease.idempotency_key);
@@ -1821,6 +1868,7 @@ impl Service {
         // Failed sandboxes may still hold a native machine: destroy_locked
         // handles both cases.
         self.destroy_locked(state, &lease.sandbox_id, ops);
+        Ok(())
     }
 
     // ─── Leases ────────────────────────────────────────────────────
@@ -1861,6 +1909,11 @@ impl Service {
             Some(secs) => Duration::from_secs(secs),
         };
         let deadline = tokio::time::Instant::now() + wait;
+        // The capacity clock starts at the first capacity-blocked step and
+        // is never reset: it bounds the total time this acquire spends
+        // unable to place for lack of room, however the steps interleave.
+        let mut capacity_deadline: Option<tokio::time::Instant> = None;
+        let mut capacity_error: Option<Error> = None;
         // Hashed once: the request cannot change across a wait loop.
         let fingerprint = acquire_fingerprint(&request);
         loop {
@@ -1878,7 +1931,32 @@ impl Service {
                     });
                 }
                 Step::Wait(last) => {
-                    if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                    let mut wake_deadline = deadline;
+                    if let Some(error) = &last
+                        && error.code == Code::ResourceExhausted
+                    {
+                        let started = *capacity_deadline.get_or_insert(
+                            tokio::time::Instant::now() + self.config.acquire_capacity_wait,
+                        );
+                        capacity_error = Some(Error::new(
+                            error.code,
+                            crate::error::message(error).to_owned(),
+                        ));
+                        wake_deadline = wake_deadline.min(started);
+                    }
+                    if tokio::time::timeout_at(wake_deadline, changed)
+                        .await
+                        .is_err()
+                    {
+                        // Whichever bound ran out, report the failure that
+                        // bound is about: an overload the caller waited out
+                        // in full is `resource_exhausted`, not a generic
+                        // deadline — the caller fails over on it.
+                        if let Some(error) = capacity_error.take_if(|_| {
+                            capacity_deadline.is_some_and(|at| tokio::time::Instant::now() >= at)
+                        }) {
+                            return Err(error);
+                        }
                         return Err(last.unwrap_or_else(|| {
                             Error::new(Code::DeadlineExceeded, "sandbox not ready in time")
                         }));
@@ -1931,9 +2009,16 @@ impl Service {
                 .cloned()
                 .ok_or_else(|| Error::not_found("leased sandbox is gone"))?;
             return match sandbox.state.known() {
-                SandboxState::Leased | SandboxState::Paused | SandboxState::Preserved => {
-                    Ok(Step::Ready(Box::new((lease, sandbox))))
-                }
+                // A stopped sandbox is a live sandbox the caller powered
+                // off on purpose: hand the lease back so the retry can
+                // `Start` it. Destroying it here made an idempotent retry —
+                // the operation whose whole point is being safe to repeat —
+                // permanently delete a machine and its disk, and the next
+                // retry then silently provisioned a different sandbox.
+                SandboxState::Leased
+                | SandboxState::Paused
+                | SandboxState::Preserved
+                | SandboxState::Stopped => Ok(Step::Ready(Box::new((lease, sandbox)))),
                 SandboxState::Provisioning => Ok(Step::Wait(None)),
                 _ => {
                     // Failed/gone: release so a retry with the same key can
@@ -1943,7 +2028,7 @@ impl Service {
                     } else {
                         sandbox.error.clone()
                     };
-                    self.release_locked(state, &lease_id, ReleaseMode::Destroy, 0, ops);
+                    let _ = self.release_locked(state, &lease_id, ReleaseMode::Destroy, 0, ops);
                     Err(Error::unavailable(error))
                 }
             };
@@ -2207,7 +2292,7 @@ impl Service {
                 request.mode.as_known().unwrap_or_default(),
                 request.preserve_ttl_secs,
                 &mut ops,
-            );
+            )?;
             ops
         };
         self.persist(ops).await;
@@ -2404,6 +2489,7 @@ impl Service {
             Exec {
                 sandbox_id: sandbox.id.clone(),
                 work_id: work_id.clone(),
+                attempts: 0,
                 tx,
                 sequence: 0,
                 deadline,
@@ -2803,6 +2889,24 @@ impl Service {
             // The source sandbox now backs the snapshot (or was freed by the
             // driver): end its lease without destroying it.
             if let Some(source) = state.sandboxes.remove(&sandbox.id) {
+                // End its execs the way destroy does: close the callers'
+                // streams (a stream left open would hang until the exec
+                // deadline, up to an hour) and tell the provider to stop
+                // the commands, which otherwise keep running against a
+                // sandbox the driver just consumed.
+                let open: Vec<(String, String)> = state
+                    .execs
+                    .iter()
+                    .filter(|(_, exec)| exec.sandbox_id == source.id)
+                    .map(|(exec_id, exec)| (exec_id.clone(), exec.work_id.clone()))
+                    .collect();
+                if !open.is_empty() {
+                    close_execs(&mut state, &source.id, "sandbox was snapshotted");
+                    for (exec_id, work_id) in open {
+                        Self::forget_work_locked(&mut state, &source.provider_id, &work_id);
+                        self.request_cancel_locked(&mut state, &source, &exec_id);
+                    }
+                }
                 if let Some(lease) = state.leases.remove(&source.lease_id) {
                     state.lease_by_key.remove(&lease.idempotency_key);
                     ops.push(self.remove(Kind::Leases, &lease.id));
@@ -3510,48 +3614,77 @@ impl Service {
             let (wake, next_visible) = {
                 let mut state = self.state.lock();
                 self.fence(&state, &request.provider_id, request.generation)?;
-                let rec = state
-                    .providers
-                    .get_mut(&request.provider_id)
-                    .ok_or_else(|| Error::not_found("provider not registered"))?;
-                rec.seen = Instant::now();
-                rec.provider.last_seen = now();
-                let at = Instant::now();
-                // Visibility timeout: unacknowledged work is delivered again.
-                let expired: Vec<String> = rec
-                    .in_flight
-                    .iter()
-                    .filter(|(_, item)| item.visible_at <= at)
-                    .map(|(work_id, _)| work_id.clone())
-                    .collect();
-                for work_id in expired {
-                    if let Some(item) = rec.in_flight.remove(&work_id) {
-                        rec.queue.push_back(item.work);
+                let mut delivered: Vec<WorkItem> = Vec::new();
+                let (wake, next) = {
+                    let rec = state
+                        .providers
+                        .get_mut(&request.provider_id)
+                        .ok_or_else(|| Error::not_found("provider not registered"))?;
+                    rec.seen = Instant::now();
+                    rec.provider.last_seen = now();
+                    let at = Instant::now();
+                    // Visibility timeout: unacknowledged work is delivered again.
+                    let expired: Vec<String> = rec
+                        .in_flight
+                        .iter()
+                        .filter(|(_, item)| item.visible_at <= at)
+                        .map(|(work_id, _)| work_id.clone())
+                        .collect();
+                    for work_id in expired {
+                        if let Some(item) = rec.in_flight.remove(&work_id) {
+                            rec.queue.push_back(item.work);
+                        }
                     }
-                }
-                let batch = self.config.poll_batch.max(1);
-                let mut work = Vec::with_capacity(batch.min(rec.queue.len()));
-                while work.len() < batch {
-                    let Some(item) = rec.queue.pop_front() else {
-                        break;
-                    };
-                    rec.in_flight.insert(
-                        item.id.clone(),
-                        InFlight {
-                            work: item.clone(),
-                            visible_at: at + self.config.delivery_timeout,
-                        },
-                    );
-                    work.push(item);
-                }
-                if !work.is_empty() {
+                    let batch = self.config.poll_batch.max(1);
+                    while delivered.len() < batch {
+                        let Some(item) = rec.queue.pop_front() else {
+                            break;
+                        };
+                        rec.in_flight.insert(
+                            item.id.clone(),
+                            InFlight {
+                                work: item.clone(),
+                                visible_at: at + self.config.delivery_timeout,
+                            },
+                        );
+                        delivered.push(item);
+                    }
+                    let next = rec.in_flight.values().map(|item| item.visible_at).min();
+                    (rec.wake.clone(), next)
+                };
+                if !delivered.is_empty() {
+                    // Stamp the attempt on every exec this delivery carries:
+                    // the record of how many times the work went out, kept
+                    // with the exec. Re-execution itself is fenced by the
+                    // agent's durable started-set (see `agent.rs`).
+                    let exec_ids: Vec<String> = delivered
+                        .iter()
+                        .filter_map(|item| match state.pending.get(&item.id) {
+                            Some(pending) => match &pending.kind {
+                                Pending::Exec { exec_id } => Some(exec_id.clone()),
+                                _ => None,
+                            },
+                            None => None,
+                        })
+                        .collect();
+                    for exec_id in &exec_ids {
+                        if let Some(exec) = state.execs.get_mut(exec_id) {
+                            exec.attempts += 1;
+                            if exec.attempts > 1 {
+                                warn!(
+                                    exec_id,
+                                    attempts = exec.attempts,
+                                    "exec work redelivered; the agent fences re-execution"
+                                );
+                            }
+                        }
+                    }
                     return Ok(PollResponse {
-                        work,
+                        work: delivered,
                         ..PollResponse::default()
                     });
                 }
-                let next = rec.in_flight.values().map(|item| item.visible_at).min();
-                (rec.wake.clone(), next)
+                (wake, next)
             };
             let wake = wake.notified();
             tokio::pin!(wake);
@@ -4216,5 +4349,118 @@ mod tests {
         };
         let error = paginate("sandbox", items(3), &request).unwrap_err();
         assert_eq!(error.code, Code::InvalidArgument);
+    }
+
+    /// Pentest W4-F6 / W5-F2 (service half): every delivery of an exec's
+    /// work item is counted on the exec record, so a redelivery — the
+    /// attempt that must never become a second execution — is recorded
+    /// where the exec lives. (Re-execution itself is fenced by the
+    /// agent's durable started-set; see `agent.rs`.)
+    #[tokio::test]
+    async fn exec_deliveries_are_counted_on_the_exec_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ServiceConfig::new(dir.path().join("blobs"));
+        config.delivery_timeout = Duration::from_millis(50);
+        let service = Service::open(crate::store::open("memory:").await.unwrap(), config)
+            .await
+            .unwrap();
+        let digest = format!("sha256:{}", "0".repeat(64));
+        service
+            .put_template(TemplateSpec {
+                name: "alpine".into(),
+                os: "linux".into(),
+                artifacts: vec![Artifact {
+                    format: Artifact::OCI_IMAGE.into(),
+                    arch: std::env::consts::ARCH.into(),
+                    r#ref: format!("ghcr.io/preloop/alpine@{digest}"),
+                    digest,
+                    ..Artifact::default()
+                }],
+                ..TemplateSpec::default()
+            })
+            .await
+            .unwrap();
+        let provider = service
+            .register(RegisterRequest {
+                name: "manual".into(),
+                drivers: vec![DriverInfo {
+                    driver: "fake".into(),
+                    capabilities: crate::drivers::fake::FakeDriver::full_capabilities().into(),
+                    ..DriverInfo::default()
+                }],
+                protocol_version: crate::PROTOCOL_VERSION,
+                ..RegisterRequest::default()
+            })
+            .await
+            .unwrap();
+        async fn poll_work(service: &Service, provider: &RegisterResponse) -> Vec<WorkItem> {
+            service
+                .poll(PollRequest {
+                    provider_id: provider.provider_id.clone(),
+                    generation: provider.generation,
+                    wait_secs: 0,
+                    ..PollRequest::default()
+                })
+                .await
+                .unwrap()
+                .work
+        }
+        // Provision one sandbox by hand (no agent): queue the create,
+        // report it, then pick the lease up with the same key.
+        let error = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                template: "alpine".into(),
+                wait_secs: Some(0),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::DeadlineExceeded);
+        let create = poll_work(&service, &provider).await;
+        assert_eq!(create.len(), 1);
+        service
+            .report(ReportRequest {
+                provider_id: provider.provider_id.clone(),
+                generation: provider.generation,
+                work_id: create[0].id.clone(),
+                ok: true,
+                native_ref: "psbx-unit-1".into(),
+                error: String::new(),
+                ..ReportRequest::default()
+            })
+            .await
+            .unwrap();
+        let lease = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                template: "alpine".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        let _stream = service
+            .exec(ExecRequest {
+                sandbox_id: lease.sandbox.id.clone(),
+                lease_id: lease.lease.id.clone(),
+                argv: vec!["true".into()],
+                ..ExecRequest::default()
+            })
+            .unwrap();
+        let delivered = poll_work(&service, &provider).await;
+        assert_eq!(delivered.len(), 1);
+        let exec_id = match delivered[0].work.as_ref().expect("exec work") {
+            work_item::Work::Exec(exec) => exec.exec_id.clone(),
+            other => panic!("expected exec work, got {other:?}"),
+        };
+        let attempts = |service: &Service| service.state.lock().execs[&exec_id].attempts;
+        assert_eq!(attempts(&service), 1, "the first delivery is attempt 1");
+        // The report never arrives; past the visibility timeout the work
+        // is delivered again and the record shows the second attempt.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let redelivered = poll_work(&service, &provider).await;
+        assert_eq!(redelivered.len(), 1);
+        assert_eq!(redelivered[0].id, delivered[0].id, "same work, redelivered");
+        assert_eq!(attempts(&service), 2, "the redelivery is attempt 2");
     }
 }

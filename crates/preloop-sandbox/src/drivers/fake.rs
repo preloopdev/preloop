@@ -3,10 +3,13 @@
 //! Guest absolute paths map under the sandbox root (`/x` → `<root>/x`), and
 //! commands receive the root as `SANDBOX_ROOT`.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +32,9 @@ pub struct FakeDriver {
     /// How many `cancel_exec` calls the agent delivered (disconnect tests).
     pub cancel_calls: AtomicU32,
     cancels: ExecCancels,
+    /// Exec ids currently running, per sandbox native ref, so `destroy`
+    /// can stop a sandbox's commands instead of orphaning them.
+    running: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl FakeDriver {
@@ -44,6 +50,7 @@ impl FakeDriver {
             create_calls: AtomicU32::new(0),
             cancel_calls: AtomicU32::new(0),
             cancels: ExecCancels::default(),
+            running: Mutex::new(HashMap::new()),
         }
     }
 
@@ -127,6 +134,11 @@ impl FakeDriver {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // The command leads its own process group, so a cancel, a timeout
+        // or a destroy can take down the whole tree: a shell's children
+        // hold the output pipes and outlive the shell otherwise.
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command.spawn().map_err(io("spawn"))?;
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt as _;
@@ -188,7 +200,14 @@ impl FakeDriver {
         };
         // Dropping the wait on cancel (or on the deadline) leaves the child
         // running; kill it before returning so nothing outlives the exec.
+        // The whole group goes, not just the shell: its children inherited
+        // the output pipes and would hold this exec (and, after a destroy,
+        // the host) open until they exit on their own.
         if !matches!(end, WaitEnd::Status(_)) {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                kill_process_group(pid);
+            }
             let _ = child.kill().await;
         }
         let _ = stdout.await;
@@ -206,6 +225,23 @@ enum WaitEnd {
     TimedOut,
     Cancelled,
 }
+
+/// SIGKILLs the process group led by `pid`.
+///
+/// SAFETY: the caller passes the pid of a child this driver just spawned
+/// and made a group leader (see `exec_inner`), so the group id is the pid
+/// and every member of the group is part of that exec's tree.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_process_group(pid: u32) {
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+/// How long `destroy` waits for a sandbox's cancelled execs to die before
+/// removing the directory anyway.
+const DESTROY_KILL_WAIT: Duration = Duration::from_secs(10);
 
 fn io(context: &str) -> impl Fn(std::io::Error) -> Error + '_ {
     move |error| Error::internal(format!("fake {context}: {error}"))
@@ -241,6 +277,32 @@ impl Driver for FakeDriver {
     }
 
     async fn destroy(&self, native_ref: &str) -> Result<()> {
+        // Stop the sandbox's commands before removing anything: destroy
+        // used to only delete the directory, leaving the exec processes
+        // running on the host, orphaned, with their working directory
+        // deleted under them. Cancellation is delivered to the exec task,
+        // which kills the command's process group; wait for it to land so
+        // "destroyed" means the processes are gone — bounded, so one stuck
+        // exec cannot wedge the destroy (and the pool slot) forever.
+        let running: Vec<String> = self
+            .running
+            .lock()
+            .get(native_ref)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default();
+        for exec_id in &running {
+            self.cancels.cancel(exec_id);
+        }
+        let deadline = std::time::Instant::now() + DESTROY_KILL_WAIT;
+        while std::time::Instant::now() < deadline
+            && self
+                .running
+                .lock()
+                .get(native_ref)
+                .is_some_and(|ids| !ids.is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         let dir = self.dir(native_ref)?;
         match std::fs::remove_dir_all(dir) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io("destroy")(error)),
@@ -256,8 +318,22 @@ impl Driver for FakeDriver {
         output: mpsc::Sender<ExecEvent>,
     ) -> Result<i32> {
         let cancel = self.cancels.start(exec_id);
+        self.running
+            .lock()
+            .entry(native_ref.to_owned())
+            .or_default()
+            .insert(exec_id.to_owned());
         let result = self.exec_inner(native_ref, request, output, cancel).await;
         self.cancels.finish(exec_id);
+        {
+            let mut running = self.running.lock();
+            if let Some(ids) = running.get_mut(native_ref) {
+                ids.remove(exec_id);
+                if ids.is_empty() {
+                    running.remove(native_ref);
+                }
+            }
+        }
         result
     }
 
@@ -395,4 +471,106 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// True while `pid` names a live (not zombie) process.
+    #[cfg(unix)]
+    fn running(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // The state letter follows the parenthesised command name.
+        stat.rsplit(')')
+            .next()
+            .and_then(|rest| rest.trim_start().chars().next())
+            .is_some_and(|state| state != 'Z' && state != 'X')
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        for _ in 0..200 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Pentest W4-F7: `destroy` used to only delete the directory,
+    /// leaving the sandbox's exec processes running on the host under a
+    /// native ref the service had already forgotten. Destroy now
+    /// cancels the sandbox's execs and waits for their process groups —
+    /// children included — to die before removing the directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destroy_kills_the_sandboxes_running_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(FakeDriver::new(
+            "fake",
+            dir.path().join("host"),
+            FakeDriver::full_capabilities(),
+        ));
+        let native = driver
+            .create(&CreateWork {
+                sandbox_id: "sbx-destroy".into(),
+                driver: "fake".into(),
+                ..CreateWork::default()
+            })
+            .await
+            .unwrap();
+        // The pid files live outside the sandbox root, which destroy
+        // deletes: the shell records itself and a background child.
+        let child_pid_file = dir.path().join("child.pid");
+        let shell_pid_file = dir.path().join("shell.pid");
+        let script = format!(
+            "sleep 60 & echo $! > {}; echo $$ > {}; wait",
+            child_pid_file.display(),
+            shell_pid_file.display()
+        );
+        let (tx, _rx) = mpsc::channel(64);
+        let exec_driver = driver.clone();
+        let exec_native = native.clone();
+        let exec = tokio::spawn(async move {
+            exec_driver
+                .exec(
+                    &exec_native,
+                    "exe-destroy",
+                    &ExecRequest {
+                        argv: vec!["sh".into(), "-c".into(), script],
+                        ..ExecRequest::default()
+                    },
+                    tx,
+                )
+                .await
+        });
+        let read_pid = |path: &Path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+        };
+        wait_until(
+            || read_pid(&child_pid_file).is_some() && read_pid(&shell_pid_file).is_some(),
+            "the exec to start",
+        )
+        .await;
+        let child_pid = read_pid(&child_pid_file).unwrap();
+        let shell_pid = read_pid(&shell_pid_file).unwrap();
+        assert!(running(child_pid) && running(shell_pid));
+
+        driver.destroy(&native).await.unwrap();
+
+        assert!(!running(shell_pid), "the shell survived destroy");
+        assert!(!running(child_pid), "the shell's child survived destroy");
+        tokio::time::timeout(Duration::from_secs(5), exec)
+            .await
+            .expect("the exec task outlived destroy")
+            .unwrap()
+            .unwrap();
+        assert!(!driver.dir(&native).unwrap().exists());
+    }
 }
