@@ -1110,3 +1110,356 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
         .expect("a failed sandbox must not block its name");
     assert_ne!(lease.sandbox.id, sandbox_id);
 }
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A service with a registered provider that never polls: acquires create
+/// sandboxes and leases, but nothing ever finishes provisioning them.
+async fn unclaimed_service(dir: &tempfile::TempDir, unclaimed: Duration) -> Arc<Service> {
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    config.unclaimed_lease_ttl = unclaimed;
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    service
+        .register(RegisterRequest {
+            name: "host-a".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities(),
+            }],
+        })
+        .await
+        .unwrap();
+    service.put_template(template("alpine")).await.unwrap();
+    service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    service
+}
+
+#[tokio::test]
+async fn pool_acquire_rejects_template_placement_fields() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let base = || AcquireRequest {
+        idempotency_key: "k".into(),
+        pool: "p".into(),
+        ..AcquireRequest::default()
+    };
+    let cases: Vec<(&str, AcquireRequest)> = vec![
+        (
+            "shape",
+            AcquireRequest {
+                shape: Shape {
+                    cpus: 2,
+                    ..Shape::default()
+                },
+                ..base()
+            },
+        ),
+        (
+            "network",
+            AcquireRequest {
+                network: NetworkPolicy {
+                    mode: NetworkMode::Unrestricted,
+                    ..NetworkPolicy::default()
+                },
+                ..base()
+            },
+        ),
+        (
+            "mounts",
+            AcquireRequest {
+                mounts: vec![Mount {
+                    host: "/tmp".into(),
+                    guest: "/mnt".into(),
+                    readonly: true,
+                }],
+                ..base()
+            },
+        ),
+        (
+            "sockets",
+            AcquireRequest {
+                sockets: vec![SocketMount {
+                    host: "/tmp/sock".into(),
+                    guest: "/run/sock".into(),
+                }],
+                ..base()
+            },
+        ),
+        (
+            "options",
+            AcquireRequest {
+                options: [("dns".to_owned(), "8.8.8.8".to_owned())].into(),
+                ..base()
+            },
+        ),
+    ];
+    for (field, request) in cases {
+        let error = h.service.acquire(request).await.unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument);
+        assert!(error.message.contains(field), "{}", error.message);
+        assert!(
+            error
+                .message
+                .contains("set these on the pool, or acquire from the template"),
+            "{}",
+            error.message
+        );
+    }
+    assert!(h.service.list().is_empty(), "nothing was created");
+}
+
+#[tokio::test]
+async fn abandoned_unclaimed_lease_is_released_after_the_unclaimed_ttl() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = unclaimed_service(&dir, Duration::ZERO).await;
+    let error = service
+        .acquire(AcquireRequest {
+            idempotency_key: "abandoned".into(),
+            pool: "p".into(),
+            wait_secs: Some(0),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::DeadlineExceeded);
+    assert_eq!(service.list().len(), 1, "the lease is provisioning");
+    service.maintain().await;
+    assert!(
+        service.list().is_empty(),
+        "the abandoned lease was released"
+    );
+}
+
+#[tokio::test]
+async fn waiting_acquire_keeps_its_lease_past_the_unclaimed_ttl() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = unclaimed_service(&dir, Duration::ZERO).await;
+    let handle = tokio::spawn({
+        let service = service.clone();
+        async move {
+            service
+                .acquire(AcquireRequest {
+                    idempotency_key: "waiting".into(),
+                    pool: "p".into(),
+                    ..AcquireRequest::default()
+                })
+                .await
+        }
+    });
+    wait_for(|| service.list().len() == 1).await;
+    service.maintain().await;
+    assert_eq!(service.list().len(), 1, "a waiting caller keeps its lease");
+    handle.abort();
+    let _ = handle.await;
+    service.maintain().await;
+    assert!(
+        service.list().is_empty(),
+        "once no caller waits the lease expires"
+    );
+}
+
+#[tokio::test]
+async fn delivered_lease_gets_the_full_ttl() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let response = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "delivered".into(),
+            pool: "p".into(),
+            ttl_secs: 3600,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.lease.requested_ttl_secs, 3600);
+    let remaining = response.lease.expires_at - unix_now();
+    assert!(
+        remaining > 3000,
+        "delivery restores the full TTL, got {remaining}s"
+    );
+}
+
+#[tokio::test]
+async fn injected_files_default_to_owner_only_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = dir.path().join("host");
+    let h = harness_with_host(
+        store::open("memory:").await.unwrap(),
+        tempfile::tempdir().unwrap(),
+        host.clone(),
+        FakeDriver::full_capabilities(),
+    )
+    .await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let mut request = AcquireRequest {
+        idempotency_key: "mode".into(),
+        template: "alpine".into(),
+        ..AcquireRequest::default()
+    };
+    request.inject.files.push(FileSpec {
+        path: "/run/secret".into(),
+        data: b"token".to_vec(),
+        mode: 0,
+    });
+    let lease = h.service.acquire(request).await.unwrap();
+    let path = host
+        .join("sandboxes")
+        .join(&lease.sandbox.native_ref)
+        .join("run/secret");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "injected files are owner-only by default");
+}
+
+#[tokio::test]
+async fn restart_keeps_the_requested_lease_ttl() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    {
+        let mut config = ServiceConfig::new(dir.path().join("blobs"));
+        config.unclaimed_lease_ttl = Duration::from_secs(5);
+        let service = Service::open(store::open(db.to_str().unwrap()).await.unwrap(), config)
+            .await
+            .unwrap();
+        service
+            .register(RegisterRequest {
+                name: "host-a".into(),
+                drivers: vec![DriverInfo {
+                    driver: "fake".into(),
+                    capabilities: FakeDriver::full_capabilities(),
+                }],
+            })
+            .await
+            .unwrap();
+        service.put_template(template("alpine")).await.unwrap();
+        service
+            .put_pool(PoolSpec {
+                name: "p".into(),
+                template: "alpine".into(),
+                ..PoolSpec::default()
+            })
+            .await
+            .unwrap();
+        let error = service
+            .acquire(AcquireRequest {
+                idempotency_key: "kept".into(),
+                pool: "p".into(),
+                ttl_secs: 3600,
+                wait_secs: Some(0),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::DeadlineExceeded);
+    }
+    let store = store::open(db.to_str().unwrap()).await.unwrap();
+    let leases: Vec<Lease> = store
+        .load(Kind::Leases)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].requested_ttl_secs, 3600);
+    let remaining = leases[0].expires_at - unix_now();
+    assert!(
+        remaining <= 6,
+        "an unclaimed lease expires in the short window, got {remaining}s"
+    );
+    let restored = Service::open(store, ServiceConfig::new(dir.path().join("blobs2")))
+        .await
+        .unwrap();
+    assert_eq!(restored.list().len(), 1);
+}
+
+#[tokio::test]
+async fn leases_persisted_before_requested_ttls_are_treated_as_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let expires = unix_now() + 100;
+    {
+        let store = store::open(db.to_str().unwrap()).await.unwrap();
+        store
+            .put(
+                Kind::Leases,
+                "lse-old",
+                &serde_json::json!({
+                    "id": "lse-old",
+                    "sandboxId": "sbx-old",
+                    "idempotencyKey": "legacy",
+                    "expiresAt": expires,
+                }),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                Kind::Sandboxes,
+                "sbx-old",
+                &serde_json::json!({
+                    "id": "sbx-old",
+                    "template": "alpine",
+                    "pool": "p",
+                    "providerId": "prv-x",
+                    "driver": "fake",
+                    "state": "LEASED",
+                    "leaseId": "lse-old",
+                    "createdAt": unix_now(),
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let service = Service::open(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let response = service
+        .acquire(AcquireRequest {
+            idempotency_key: "legacy".into(),
+            template: "gone".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.lease.id, "lse-old");
+    assert_eq!(response.lease.requested_ttl_secs, 0);
+    assert_eq!(
+        response.lease.expires_at, expires,
+        "a pre-change lease keeps its expiry"
+    );
+}
