@@ -272,8 +272,21 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     if inputs.has_bindings {
         match shared.state.backend.sweep_stale_bindings().await {
             Ok(0) => {}
-            Ok(swept) => debug!(swept, "swept stale job bindings"),
+            Ok(swept) => info!(swept, "swept stale job bindings"),
             Err(error) => warn!(?error, "stale-binding sweep failed"),
+        }
+    }
+    // Dispatch-intent backstop: under strict assignments a ready job with
+    // neither a `job_assignments` nor a `provision_requests` row is
+    // unclaimable forever. `has_bindings` cannot see that shape (there is no
+    // row at all), so this runs from the ready snapshot instead. A non-zero
+    // count means an enqueue/requeue/promote path is still leaking intent —
+    // the repair keeps the queue moving while that path is found.
+    if !inputs.ready.is_empty() {
+        match shared.state.backend.reconcile_dispatch_intent().await {
+            Ok(0) => {}
+            Ok(repaired) => info!(repaired, "repaired leaked dispatch intent for ready jobs"),
+            Err(error) => warn!(?error, "dispatch-intent reconcile failed"),
         }
     }
     // ── Node-local inputs: pool flags + start time ──────────────────────
@@ -2916,5 +2929,79 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("It is serving"), "{message}");
+    }
+
+    /// The reaper's dispatch-intent backstop repairs a ready job with no
+    /// assignment and no pool-pending row in one tick and reports it at info.
+    /// The stale-binding sweep cannot see this shape (`has_bindings` is false
+    /// when no row exists), so the repair must run even with no bindings.
+    #[tokio::test]
+    async fn reap_repairs_a_ready_job_without_dispatch_intent() {
+        use crate::control::backend::ControlBackend as _;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        struct RecordingWriter(StdArc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = StdArc::new(StdMutex::new(Vec::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || RecordingWriter(sink.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        // Enqueue under the default policy: on_job_enqueued writes nothing,
+        // leaving the exact leaked shape strict assignments cannot claim.
+        state
+            .backend
+            .set_config(false, false, Duration::from_secs(300));
+        let run_id = RunId::new();
+        state
+            .backend
+            .submit_run(crate::control::tests::submit_run(
+                run_id,
+                vec![crate::control::tests::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+
+        // The effective config now requires assignments: one reaper tick must
+        // derive the missing intent.
+        state
+            .backend
+            .set_config(false, true, Duration::from_secs(300));
+        reap_once(&shared).await;
+
+        let key = (run_id, JobId("build".to_owned()));
+        let working = state.backend.test_working_set().await.unwrap();
+        assert!(
+            working.job_assignments.contains_key(&key) || working.pool_pending.contains_key(&key),
+            "the reaper must write dispatch intent for the leaked ready job"
+        );
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("repaired leaked dispatch intent"),
+            "the repair must be visible at info level, got: {logs}"
+        );
+        assert!(
+            logs.contains("repaired=1"),
+            "the log must carry the repair count, got: {logs}"
+        );
     }
 }
