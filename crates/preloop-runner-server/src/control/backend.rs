@@ -587,6 +587,43 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Upsert a finalized v1 artifact row (native uploads and imports).
     async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError>;
 
+    // ── Code-scanning SARIF ───────────────────────────────────────────
+
+    /// Persist one analysis and its normalized findings, or return the
+    /// analysis already stored under the same `(run_id, dedupe_key)`.
+    ///
+    /// `Ok((record, true))` means this call inserted the analysis;
+    /// `Ok((record, false))` means an earlier upload of the same
+    /// tool/commit/ref/findings set won and `record` is that row — the
+    /// idempotency contract for re-uploads. Findings are inserted only on a
+    /// winning insert and dedupe within the analysis on `fingerprint`.
+    async fn put_sarif_analysis(
+        &self,
+        analysis: NewSarifAnalysis,
+        findings: Vec<SarifFinding>,
+    ) -> Result<(SarifAnalysisRecord, bool), ControlError>;
+
+    /// One analysis by id, regardless of run. Authorization is the caller's.
+    async fn sarif_analysis(
+        &self,
+        analysis_id: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError>;
+
+    /// One analysis by its idempotency slot, for the pre-write dedupe check.
+    async fn sarif_analysis_by_dedupe(
+        &self,
+        run_id: RunId,
+        dedupe_key: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError>;
+
+    /// A run's analyses, newest first.
+    async fn sarif_analyses(&self, run_id: RunId)
+    -> Result<Vec<SarifAnalysisRecord>, ControlError>;
+
+    /// One analysis's normalized findings, ordered by path and line so a UI
+    /// renders a stable list across reads.
+    async fn sarif_findings(&self, analysis_id: &str) -> Result<Vec<SarifFinding>, ControlError>;
+
     // ── Live log recovery ─────────────────────────────────────────────
 
     /// Allocate a plan-local log id and create its empty durable row.
@@ -3383,6 +3420,55 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.put_artifact_catalog(row).await,
             Self::Postgres(b) => b.put_artifact_catalog(row).await,
+        }
+    }
+
+    async fn put_sarif_analysis(
+        &self,
+        analysis: NewSarifAnalysis,
+        findings: Vec<SarifFinding>,
+    ) -> Result<(SarifAnalysisRecord, bool), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.put_sarif_analysis(analysis, findings).await,
+            Self::Postgres(b) => b.put_sarif_analysis(analysis, findings).await,
+        }
+    }
+
+    async fn sarif_analysis(
+        &self,
+        analysis_id: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sarif_analysis(analysis_id).await,
+            Self::Postgres(b) => b.sarif_analysis(analysis_id).await,
+        }
+    }
+
+    async fn sarif_analysis_by_dedupe(
+        &self,
+        run_id: RunId,
+        dedupe_key: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sarif_analysis_by_dedupe(run_id, dedupe_key).await,
+            Self::Postgres(b) => b.sarif_analysis_by_dedupe(run_id, dedupe_key).await,
+        }
+    }
+
+    async fn sarif_analyses(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<SarifAnalysisRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sarif_analyses(run_id).await,
+            Self::Postgres(b) => b.sarif_analyses(run_id).await,
+        }
+    }
+
+    async fn sarif_findings(&self, analysis_id: &str) -> Result<Vec<SarifFinding>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sarif_findings(analysis_id).await,
+            Self::Postgres(b) => b.sarif_findings(analysis_id).await,
         }
     }
 }
