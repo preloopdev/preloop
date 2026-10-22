@@ -2628,7 +2628,7 @@ dependencies = [
 
 [[package]]
 name = "preloop-cli"
-version = "0.35.5"
+version = "0.35.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -2930,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "preloop-runner-server"
-version = "0.35.5"
+version = "0.35.6"
 dependencies = [
  "anyhow",
  "async-trait",
