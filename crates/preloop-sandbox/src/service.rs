@@ -2512,15 +2512,29 @@ impl Service {
                 }
             }
             // Machines no record owns (orphans).
-            let snapshots: HashSet<&str> = state
+            //
+            // A template's `native_ref` is its fork base (SmolVM's golden):
+            // a live machine with no sandbox record. It is never an orphan,
+            // whichever provider reports it. Two agents can share one host's
+            // engine home and each lists every machine there, and the base
+            // belongs to the template rather than to the agent that happened
+            // to create it. Reaping it wedges every later fork ("cannot be
+            // re-launched while … live clone(s)"); the owning provider
+            // destroys it when the template is deleted, and nowhere else.
+            //
+            // Narrowing the driver's inventory to machines carrying this
+            // agent's ownership marker would not do instead: the marker names
+            // the machine, not the agent, and a provider must still see the
+            // other agent's genuinely orphaned machines to reap them.
+            let goldens: HashSet<&str> = state
                 .templates
                 .values()
-                .filter(|t| t.provider_id == request.provider_id)
                 .map(|t| t.native_ref.as_str())
+                .filter(|native_ref| !native_ref.is_empty())
                 .collect();
             let mut destroy = Vec::new();
             for item in &request.sandboxes {
-                if snapshots.contains(item.native_ref.as_str()) {
+                if goldens.contains(item.native_ref.as_str()) {
                     continue;
                 }
                 let owned = state.sandboxes.values().any(|s| {

@@ -29,13 +29,13 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 #[cfg(unix)]
 mod unix {
     use super::*;
+    use preloop_sandbox::Driver as _;
     use preloop_sandbox::api::{CreateWork, Template, TemplateSpec};
     use preloop_sandbox::drivers::smolvm::SmolvmDriver;
     use preloop_sandbox::drivers::smolvm::cli::{
         ExecOutput, GuestVolume, MachineRole, MachineSpec, MachineState, NetworkPolicy,
-        SmolVmProvider, SocketMount, VmProvider, VolumeMount, SANDBOX_OWNER_MARKER,
+        SANDBOX_OWNER_MARKER, SmolVmProvider, SocketMount, VmProvider, VolumeMount,
     };
-    use preloop_sandbox::Driver as _;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
