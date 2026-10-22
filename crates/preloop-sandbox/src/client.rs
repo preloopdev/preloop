@@ -386,7 +386,7 @@ impl SandboxApi for SandboxClient {
         .await
     }
     async fn stats(&self) -> Result<StatsResponse> {
-        self.call("Stats", &ListRequest {}).await
+        self.call("Stats", &ListRequest::default()).await
     }
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         Ok(self

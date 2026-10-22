@@ -1715,7 +1715,6 @@ impl Service {
         ops.push(self.remove(Kind::Leases, lease_id));
         if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
             sandbox.lease_id.clear();
-
         }
         // Failed sandboxes may still hold a native machine: destroy_locked
         // handles both cases.
@@ -3192,7 +3191,11 @@ impl Service {
                     provider: provider.clone(),
                     seen,
                     queue,
+                    in_flight: HashMap::new(),
                     wake,
+                    host: None,
+                    host_sampled_at: None,
+                    sandbox_stats: HashMap::new(),
                 },
             );
             ops.push(self.put(Kind::Providers, &id, &provider));

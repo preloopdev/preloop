@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-
 /// Exit status reported when a driver killed the command at its deadline
 /// (the same convention as the shell's `timeout`).
 pub const EXEC_TIMED_OUT: i32 = 124;

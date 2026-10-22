@@ -810,7 +810,8 @@ for arg in "$@"; do
   printf 'ARG:%s\n' "$arg" >> "$0.log"
 done
 if [ "${1-}:${2-}" = "machine:data-dir" ]; then
-  printf '/nonexistent\n'
+  mkdir -p "$0.data"
+  printf '%s\n' "$0.data"
 fi
 exit 0
 "##,

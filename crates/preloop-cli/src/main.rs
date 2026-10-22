@@ -2235,12 +2235,8 @@ async fn cmd_engine(
     let shutdown = tokio_util::sync::CancellationToken::new();
 
     // The runner pool gets its machines from the embedded Sandbox Service.
-    let sandboxes = sandbox::LocalSandboxes::start(
-        &home,
-        pool_config.as_ref(),
-        observability.clone(),
-    )
-    .await?;
+    let sandboxes =
+        sandbox::LocalSandboxes::start(&home, pool_config.as_ref(), observability.clone()).await?;
     // Publish the service (and the provider whose host sample is this
     // engine's host) to the already-running server for status and host
     // metrics.

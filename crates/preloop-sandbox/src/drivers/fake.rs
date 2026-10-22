@@ -221,7 +221,7 @@ impl Driver for FakeDriver {
             return Err(Error::unavailable("injected create failure"));
         }
         self.create_calls.fetch_add(1, Ordering::AcqRel);
-        let name = native_name(&work.sandbox_id, work.incarnation);
+        let name = native_name(&work.sandbox_id);
         let dir = self.dir(&name)?;
         std::fs::create_dir_all(&dir).map_err(io("create"))?;
         if !work.template.native_ref.is_empty() {

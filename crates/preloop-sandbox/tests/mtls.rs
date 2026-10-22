@@ -61,6 +61,7 @@ async fn enroll_binds_a_name_and_issues_a_provider_certificate() {
         link.heartbeat(HeartbeatRequest {
             provider_id: session.provider_id,
             generation: session.generation,
+            ..HeartbeatRequest::default()
         })
         .await
         .is_ok()
@@ -159,6 +160,7 @@ async fn provider_calls_without_a_client_certificate_are_denied() {
             &HeartbeatRequest {
                 provider_id: "prv-missing".into(),
                 generation: 1,
+                ..HeartbeatRequest::default()
             },
         )
         .await
@@ -194,6 +196,7 @@ async fn renewal_keeps_the_previous_certificate_valid_until_it_expires() {
         link.heartbeat(HeartbeatRequest {
             provider_id: first.provider_id.clone(),
             generation: first.generation,
+            ..HeartbeatRequest::default()
         })
         .await
         .is_ok()

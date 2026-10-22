@@ -6,9 +6,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink, RemoteLink};
+use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::fake::FakeDriver;
+use preloop_sandbox::server::{Auth, router};
 use preloop_sandbox::store::{self, Kind, Store};
 use preloop_sandbox::{Code, Driver, SandboxClient, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -995,38 +996,21 @@ async fn remote_agent_and_client_over_connect() {
 #[tokio::test]
 async fn remote_agent_heartbeat_feeds_the_stats_api() {
     use preloop_sandbox::SandboxApi as _;
-    let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
-    let auth = Auth {
-        client_token: Some("client-secret".into()),
-        provider_token: Some("provider-secret".into()),
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = router(service.clone(), auth);
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    let shutdown = CancellationToken::new();
-    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    let t = common::TestService::start().await;
+    let service = t.service.clone();
+    let dir = t.dir.path().to_path_buf();
     let fake = Arc::new(FakeDriver::new(
         "fake",
-        dir.path().join("host"),
+        dir.join("host"),
         FakeDriver::full_capabilities(),
     ));
-    let mut agent_config = AgentConfig::new("remote-host", dir.path().join("scratch"));
+    let mut agent_config = AgentConfig::new("remote-host", dir.join("scratch"));
     agent_config.heartbeat = Duration::from_millis(50);
-    let agent = Agent::new(
-        Arc::new(RemoteLink::new(&base, Some("provider-secret".into()))),
-        vec![fake as Arc<dyn Driver>],
-        agent_config,
-    );
-    tokio::spawn(agent.run(shutdown.clone()));
+    let link = t.enroll("remote-host").await;
+    let agent = Agent::new(Arc::new(link), vec![fake as Arc<dyn Driver>], agent_config);
+    tokio::spawn(agent.run(t.shutdown_token()));
 
-    let client = SandboxClient::new(&base, Some("client-secret".into()));
+    let client = t.client();
     wait_for(|| !Service::list_providers(&service).is_empty()).await;
     let provider_id = Service::list_providers(&service)[0].id.clone();
     client.put_template(template("alpine")).await.unwrap();
@@ -1093,7 +1077,6 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
         })
         .await
         .unwrap();
-    shutdown.cancel();
 }
 
 #[tokio::test]
@@ -1898,7 +1881,7 @@ async fn agent_denies_all_host_mounts_by_default() {
 async fn serve(service: Arc<Service>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = router(service, Auth::default());
+    let app = router(service, Auth::new("test-token"));
     tokio::spawn(async move { axum::serve(listener, app).await });
     base
 }
@@ -2004,7 +1987,7 @@ async fn connect_unary_bodies_are_capped_at_four_mib() {
     )
     .await
     .unwrap();
-    let response = router(service, Auth::default())
+    let response = router(service, Auth::new("test-token"))
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
@@ -2124,7 +2107,7 @@ async fn list_pagination_round_trips_across_250_items() {
 
     // The network client follows the same tokens.
     let base = serve(service).await;
-    let client = SandboxClient::new(&base, None);
+    let client = SandboxClient::new(&base, Some("test-token".into()));
     assert_eq!(client.list_templates().await.unwrap().len(), 250);
 }
 
@@ -2375,7 +2358,13 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
         FakeDriver::full_capabilities(),
     )
     .await;
-    wait_for(|| h.service.list().iter().all(|sandbox| sandbox.id != sandbox_id)).await;
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .all(|sandbox| sandbox.id != sandbox_id)
+    })
+    .await;
     assert!(
         h.fake
             .inventory()

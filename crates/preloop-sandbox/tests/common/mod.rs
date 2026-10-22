@@ -115,10 +115,18 @@ impl TestService {
 
 /// A registered template spec used by the network tests.
 pub fn template(name: &str) -> preloop_sandbox::api::TemplateSpec {
+    use preloop_sandbox::api::Artifact;
+    const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
     preloop_sandbox::api::TemplateSpec {
         name: name.into(),
         os: "linux".into(),
-        image: Some("alpine:3.20".into()),
+        artifacts: vec![Artifact {
+            format: Artifact::OCI_IMAGE.into(),
+            arch: preloop_sandbox::api::host_arch().into(),
+            reference: format!("ghcr.io/preloop/alpine@{DIGEST}"),
+            digest: DIGEST.into(),
+            size_bytes: 0,
+        }],
         ..preloop_sandbox::api::TemplateSpec::default()
     }
 }

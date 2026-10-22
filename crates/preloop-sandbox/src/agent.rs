@@ -1373,6 +1373,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn heartbeat_report_is_capped_and_orders_activity_first() {
         let now = Instant::now();
         let mut active = HashMap::new();
