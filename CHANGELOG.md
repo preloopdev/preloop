@@ -140,7 +140,9 @@ Releases before v0.27.0 predate the changelog.
   different reason (an unhostable row was written terminal before the
   settle that was meant to emit its event, which then saw it as an
   already-settled duplicate and emitted nothing); the settle now owns the
-  terminal write instead of replaying over a pre-written one.
+  terminal write instead of replaying over a pre-written one. That settle
+  does not run matrix fail-fast (Postgres's settle path never does), so an
+  unhostable leg cannot cancel a sibling registered ahead of it.
 - **SQLite: the reusable-caller fold skips its whole-run reload when a run
   has no reusable caller**: `fold_settled_callers` ran `finalize_reusable_callers`
   (and its `jobs::run_record` load of the entire run) after every settling
