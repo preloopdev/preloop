@@ -67,7 +67,7 @@ async fn harness_with_host(
         vec![fake.clone() as Arc<dyn Driver>],
         agent_config,
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     // A restored provider row is listed before the new agent registers, so
     // wait for the registration itself (generation bump), not for presence.
@@ -445,7 +445,7 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
 }
 
 #[tokio::test]
-async fn reconcile_destroys_orphans_and_fails_lost_sandboxes() {
+async fn reconcile_spares_foreign_orphans_and_fails_lost_sandboxes() {
     let h = harness().await;
     h.service.put_template(template("alpine")).await.unwrap();
     let lease = h
@@ -476,19 +476,18 @@ async fn reconcile_destroys_orphans_and_fails_lost_sandboxes() {
             .is_ok_and(|s| s.state == SandboxState::Failed)
     })
     .await;
-    for _ in 0..100 {
-        if h.fake
+    // The orphan is not ours (another service sharing this host registry may
+    // have created it), so reconcile must leave it alone.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        h.fake
             .inventory()
             .await
             .unwrap()
             .iter()
-            .all(|o| o.native_ref != orphan)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("orphan was not destroyed");
+            .any(|o| o.native_ref == orphan),
+        "a foreign machine was reaped"
+    );
 }
 
 #[tokio::test]
@@ -584,6 +583,7 @@ async fn remote_agent_and_client_over_connect() {
     let auth = Auth {
         client_token: Some("client-secret".into()),
         provider_token: Some("provider-secret".into()),
+        loopback_only: true,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -601,7 +601,7 @@ async fn remote_agent_and_client_over_connect() {
         vec![fake as Arc<dyn Driver>],
         AgentConfig::new("remote-host", dir.path().join("scratch")),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
 
     // Wrong token is rejected.
     let bad = SandboxClient::new(&base, Some("nope".into()));
@@ -692,6 +692,109 @@ async fn remote_agent_and_client_over_connect() {
 }
 
 #[tokio::test]
+async fn loopback_auth_requires_tokens_and_a_loopback_host() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn raw_status(
+        addr: std::net::SocketAddr,
+        host: &str,
+        path: &str,
+        bearer: Option<&str>,
+        body: &str,
+    ) -> u16 {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = bearer
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Content-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let head = String::from_utf8_lossy(&response);
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {head:?}"))
+    }
+
+    async fn serve(service: Arc<Service>, auth: Auth) -> (std::net::SocketAddr, CancellationToken) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, router(service, auth))
+                .with_graceful_shutdown(async move { stop.cancelled().await })
+                .await
+                .unwrap();
+        });
+        (addr, shutdown)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let service = Service::open(
+        store::open("memory:").await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let (addr, shutdown) = serve(
+        service.clone(),
+        Auth {
+            client_token: Some("client-secret".into()),
+            provider_token: Some("provider-secret".into()),
+            loopback_only: true,
+        },
+    )
+    .await;
+    let list = "/preloop.sandbox.v1.Sandboxes/List";
+    let providers = "/preloop.sandbox.v1.Providers/Poll";
+
+    // No bearer on either API: rejected.
+    assert_eq!(raw_status(addr, "127.0.0.1", list, None, "{}").await, 401);
+    assert_eq!(
+        raw_status(addr, "127.0.0.1", providers, None, "{}").await,
+        401
+    );
+    // A token for the other role is not accepted either.
+    assert_eq!(
+        raw_status(addr, "127.0.0.1", providers, Some("client-secret"), "{}").await,
+        401
+    );
+    // DNS rebinding: the bearer is valid, the Host is not.
+    assert_eq!(
+        raw_status(addr, "evil.example", list, Some("client-secret"), "{}").await,
+        403
+    );
+    // Loopback names and ports are fine.
+    for host in [
+        "127.0.0.1",
+        "127.0.0.1:9191",
+        "localhost:9191",
+        "[::1]:9191",
+    ] {
+        assert_eq!(
+            raw_status(addr, host, list, Some("client-secret"), "{}").await,
+            200,
+            "Host {host} must be accepted"
+        );
+    }
+    shutdown.cancel();
+
+    // A listener built without tokens fails closed instead of authorizing.
+    let (addr, shutdown) = serve(service, Auth::default()).await;
+    assert_eq!(
+        raw_status(addr, "127.0.0.1", list, Some("anything"), "{}").await,
+        401
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn destroying_a_sandbox_closes_open_exec_streams() {
     use futures::StreamExt as _;
     let h = harness().await;
@@ -734,6 +837,35 @@ async fn destroying_a_sandbox_closes_open_exec_streams() {
     };
     assert_eq!(error.code, Code::Unavailable);
     assert!(error.message.contains("destroyed"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn exec_rejects_a_shell_metacharacter_env_key() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "env-key".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let marker = h._dir.path().join("pwned");
+    let key = format!("A; touch {}", marker.display());
+    let error = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            argv: vec!["true".into()],
+            env: [(key, "1".into())].into_iter().collect(),
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(!marker.exists(), "the env key injected a command");
 }
 
 #[tokio::test]
@@ -1016,7 +1148,8 @@ async fn reconcile_never_destroys_another_providers_machine() {
         SandboxState::Leased
     );
 
-    // An unowned orphan from nobody is still reaped.
+    // A machine this service never created is foreign: another service may
+    // share the host registry, so it must not be reaped.
     let orphan = h
         .fake
         .create(&CreateWork {
@@ -1032,13 +1165,47 @@ async fn reconcile_never_destroys_another_providers_machine() {
     let response = h
         .service
         .reconcile(ReconcileRequest {
-            provider_id: other.provider_id,
+            provider_id: other.provider_id.clone(),
             generation: other.generation,
             sandboxes: observed,
         })
         .await
         .unwrap();
-    assert!(response.destroy.iter().any(|w| w.native_ref == orphan));
+    assert!(
+        !response.destroy.iter().any(|w| w.native_ref == orphan),
+        "an unknown machine was reaped: {:?}",
+        response.destroy
+    );
+
+    // A stale incarnation of a sandbox this service did create is ours.
+    let stale = h
+        .fake
+        .create(&CreateWork {
+            sandbox_id: sandbox_id.clone(),
+            incarnation: 7,
+            driver: "fake".into(),
+            ..CreateWork::default()
+        })
+        .await
+        .unwrap();
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id,
+            generation: other.generation,
+            sandboxes: vec![Observed {
+                driver: "fake".into(),
+                native_ref: stale.clone(),
+                sandbox_id: sandbox_id.clone(),
+                incarnation: 7,
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(
+        response.destroy.iter().any(|w| w.native_ref == stale),
+        "a stale incarnation of our own sandbox must be reaped"
+    );
 }
 
 #[tokio::test]
@@ -1462,4 +1629,545 @@ async fn leases_persisted_before_requested_ttls_are_treated_as_delivered() {
         response.lease.expires_at, expires,
         "a pre-change lease keeps its expiry"
     );
+}
+
+#[tokio::test]
+async fn replayed_acquire_of_a_failed_sandbox_persists_its_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    {
+        let h = harness_with(
+            store::open(db.to_str().unwrap()).await.unwrap(),
+            tempfile::tempdir().unwrap(),
+            FakeDriver::full_capabilities(),
+        )
+        .await;
+        h.service.put_template(template("alpine")).await.unwrap();
+        h.fake
+            .fail_creates
+            .store(1, std::sync::atomic::Ordering::Release);
+        let error = h
+            .service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                template: "alpine".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Unavailable);
+    }
+    // The replay's failure path removed the lease in memory. That removal
+    // must reach the store, or a restart resurrects a dead key.
+    let store = store::open(db.to_str().unwrap()).await.unwrap();
+    assert!(
+        store.load(Kind::Leases).await.unwrap().is_empty(),
+        "the failed replay's lease release was not persisted"
+    );
+    assert!(
+        store.load(Kind::Sandboxes).await.unwrap().is_empty(),
+        "the failed replay's sandbox delete was not persisted"
+    );
+}
+
+#[tokio::test]
+async fn paused_pool_member_resumes_to_ready_and_survives_maintenance() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            warm: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .any(|s| s.pool == "p" && s.state == SandboxState::Ready)
+    })
+    .await;
+    let idle = h.service.list()[0].clone();
+    let error = h.service.pause(&idle.id).await.unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+
+    let lease = h.service.acquire(acquire("k", "p")).await.unwrap();
+    let id = lease.sandbox.id.clone();
+    h.service.pause(&id).await.unwrap();
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id,
+            mode: ReleaseMode::Preserve,
+            preserve_ttl_secs: 60,
+        })
+        .await
+        .unwrap();
+    let paused = h.service.get(&id).unwrap();
+    assert_eq!(
+        paused.state,
+        SandboxState::Paused,
+        "PRESERVE kept power state"
+    );
+    assert!(paused.preserve_until > unix_now());
+    h.service.resume(&id).await.unwrap();
+    let resumed = h.service.get(&id).unwrap();
+    assert_eq!(resumed.state, SandboxState::Ready);
+    assert_eq!(resumed.preserve_until, 0);
+    h.service.maintain().await;
+    assert_eq!(
+        h.service.get(&id).unwrap().state,
+        SandboxState::Ready,
+        "the resumed warm member must not be swept"
+    );
+}
+
+#[tokio::test]
+async fn paused_and_stopped_debug_sandboxes_expire_from_the_preserve_window() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let mut request = AcquireRequest {
+        idempotency_key: "pause".into(),
+        template: "alpine".into(),
+        ..AcquireRequest::default()
+    };
+    let paused = h.service.acquire(request.clone()).await.unwrap();
+    h.service.pause(&paused.sandbox.id).await.unwrap();
+    h.service
+        .release(ReleaseRequest {
+            lease_id: paused.lease.id,
+            mode: ReleaseMode::Preserve,
+            preserve_ttl_secs: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.service.get(&paused.sandbox.id).unwrap().state,
+        SandboxState::Paused
+    );
+
+    request.idempotency_key = "stop".into();
+    let stopped = h.service.acquire(request).await.unwrap();
+    h.service.stop(&stopped.sandbox.id).await.unwrap();
+    h.service
+        .release(ReleaseRequest {
+            lease_id: stopped.lease.id,
+            mode: ReleaseMode::Preserve,
+            preserve_ttl_secs: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.service.get(&stopped.sandbox.id).unwrap().state,
+        SandboxState::Stopped
+    );
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    h.service.maintain().await;
+    wait_for(|| h.service.get(&paused.sandbox.id).is_err()).await;
+    wait_for(|| h.service.get(&stopped.sandbox.id).is_err()).await;
+}
+
+#[tokio::test]
+async fn renew_keeps_the_acquired_ttl() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ttl_secs: 120,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let renewed = h
+        .service
+        .renew(RenewRequest {
+            lease_id: lease.lease.id,
+            ttl_secs: 0,
+        })
+        .await
+        .unwrap();
+    let now = unix_now();
+    assert_eq!(renewed.requested_ttl_secs, 120);
+    assert!(
+        renewed.expires_at >= now + 115 && renewed.expires_at <= now + 125,
+        "renew without a TTL used the service default: {}",
+        renewed.expires_at - now
+    );
+
+    // A pool lease keeps the pool's TTL.
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            lease_ttl_secs: 90,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let pooled = h.service.acquire(acquire("pooled", "p")).await.unwrap();
+    let renewed = h
+        .service
+        .renew(RenewRequest {
+            lease_id: pooled.lease.id,
+            ttl_secs: 0,
+        })
+        .await
+        .unwrap();
+    let now = unix_now();
+    assert!(
+        renewed.expires_at >= now + 85 && renewed.expires_at <= now + 95,
+        "renew lost the pool TTL: {}",
+        renewed.expires_at - now
+    );
+}
+
+#[tokio::test]
+async fn delete_template_refuses_while_a_clone_is_live() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let source = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "source".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    h.service
+        .snapshot(SnapshotRequest {
+            sandbox_id: source.sandbox.id.clone(),
+            name: "golden".into(),
+        })
+        .await
+        .unwrap();
+    let clone = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "clone".into(),
+            template: "golden".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let error = h.service.delete_template("golden").await.unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    assert!(
+        error.message.contains(&clone.sandbox.id),
+        "{}",
+        error.message
+    );
+    h.service
+        .release(ReleaseRequest {
+            lease_id: clone.lease.id,
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    wait_for(|| Service::list(&h.service).is_empty()).await;
+    h.service.delete_template("golden").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_snapshot_in_flight_reserves_its_source() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let id = lease.sandbox.id.clone();
+    h.fake
+        .snapshot_delay_ms
+        .store(300, std::sync::atomic::Ordering::Release);
+    let snapshot = tokio::spawn({
+        let service = h.service.clone();
+        let id = id.clone();
+        async move {
+            service
+                .snapshot(SnapshotRequest {
+                    sandbox_id: id,
+                    name: "golden".into(),
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // A second snapshot and a release must fail while the first is in flight.
+    let second = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: id.clone(),
+            name: "other".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(second.code, Code::FailedPrecondition);
+    let release = h
+        .service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id,
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(release.code, Code::FailedPrecondition);
+
+    // A lifecycle change (pause) during the capture invalidates the result.
+    h.service.pause(&id).await.unwrap();
+    let error = snapshot.await.unwrap().unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", error.message);
+    assert!(
+        h.service
+            .list_templates()
+            .iter()
+            .all(|t| t.spec.name != "golden")
+    );
+}
+
+#[tokio::test]
+async fn a_reconfigured_pool_never_serves_an_old_warm_member() {
+    let h = harness().await;
+    h.service
+        .put_template(TemplateSpec {
+            name: "one".into(),
+            os: "linux".into(),
+            image: Some("alpine:3.20".into()),
+            ..TemplateSpec::default()
+        })
+        .await
+        .unwrap();
+    h.service
+        .put_template(TemplateSpec {
+            name: "two".into(),
+            os: "linux".into(),
+            image: Some("alpine:3.21".into()),
+            ..TemplateSpec::default()
+        })
+        .await
+        .unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "one".into(),
+            warm: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .any(|s| s.state == SandboxState::Ready && s.template == "one")
+    })
+    .await;
+    let old = h.service.list()[0].id.clone();
+
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "two".into(),
+            warm: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    h.service.maintain().await;
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .any(|s| s.state == SandboxState::Ready && s.template == "two")
+    })
+    .await;
+    assert!(
+        h.service.get(&old).is_err(),
+        "the old-revision warm member was not retired"
+    );
+    let lease = h.service.acquire(acquire("k", "p")).await.unwrap();
+    assert_eq!(lease.sandbox.template, "two");
+}
+
+#[tokio::test]
+async fn replayed_acquire_of_a_stopped_sandbox_returns_it() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    h.service.stop(&lease.sandbox.id).await.unwrap();
+    let replay = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(replay.sandbox.id, lease.sandbox.id);
+    assert_eq!(replay.sandbox.state, SandboxState::Stopped);
+}
+
+#[tokio::test]
+async fn a_ticket_authorises_exactly_one_transfer() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let ticket = h
+        .service
+        .open_stream(OpenStreamRequest {
+            sandbox_id: lease.sandbox.id,
+            kind: StreamKind::Download,
+            path: "/work".into(),
+        })
+        .unwrap();
+    let id = ticket.url.rsplit('/').next().unwrap();
+    h.service.claim_ticket(id, &ticket.token).unwrap();
+    let error = h.service.claim_ticket(id, &ticket.token).unwrap_err();
+    assert_eq!(error.code, Code::NotFound);
+}
+
+#[tokio::test]
+async fn pool_acquire_rejects_a_build_purpose() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let error = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            pool: "p".into(),
+            purpose: Purpose::Build,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(error.message.contains("build"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn reconcile_protects_snapshot_bases_from_any_provider() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let source = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "source".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let golden = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: source.sandbox.id,
+            name: "golden".into(),
+        })
+        .await
+        .unwrap();
+    let other = h
+        .service
+        .register(RegisterRequest {
+            name: "host-b".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities(),
+            }],
+        })
+        .await
+        .unwrap();
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id,
+            generation: other.generation,
+            sandboxes: vec![Observed {
+                driver: "fake".into(),
+                native_ref: golden.native_ref.clone(),
+                sandbox_id: String::new(),
+                incarnation: 0,
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(
+        response.destroy.is_empty(),
+        "another provider reaped the snapshot base: {:?}",
+        response.destroy
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_key_acquires_inject_once() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let request = AcquireRequest {
+        idempotency_key: "same".into(),
+        template: "alpine".into(),
+        inject: Inject {
+            files: vec![FileSpec {
+                path: "/work/value".into(),
+                data: b"injected".to_vec(),
+                mode: 0,
+            }],
+            ..Inject::default()
+        },
+        ..AcquireRequest::default()
+    };
+    let (first, second) = tokio::join!(
+        h.service.acquire(request.clone()),
+        h.service.acquire(request)
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.sandbox.id, second.sandbox.id);
+    let (code, stdout, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: first.sandbox.id,
+            argv: vec!["cat".into(), "work/value".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, b"injected");
 }

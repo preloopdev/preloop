@@ -441,10 +441,20 @@ pub struct Sandbox {
     /// Preserved sandboxes expire at this Unix second (0 = n/a).
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub preserve_until: i64,
+    /// State before `Pause`/`Stop`; `Resume`/`Start` restores it.
+    #[serde(skip_serializing_if = "is_unspecified_state")]
+    pub prior_state: SandboxState,
+    /// Pool + template configuration this warm member was built for.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub pool_revision: String,
 }
 
 fn is_zero_i64(value: &i64) -> bool {
     *value == 0
+}
+
+fn is_unspecified_state(state: &SandboxState) -> bool {
+    *state == SandboxState::SandboxStateUnspecified
 }
 
 /// A lease on a sandbox.

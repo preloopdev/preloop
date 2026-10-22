@@ -163,6 +163,8 @@ message Sandbox {
   int64 created_at = 12;
   string name = 13;
   int64 preserve_until = 14;
+  SandboxState prior_state = 15;    // state before Pause/Stop; Resume/Start restores it
+  string pool_revision = 16;        // pool+template configuration this member was built for
 }
 
 message Lease {
