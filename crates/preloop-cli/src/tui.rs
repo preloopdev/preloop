@@ -337,11 +337,19 @@ fn run_wizard(port: preloop_tui::wizard::WizardPort) -> anyhow::Result<()> {
     std::thread::spawn(move || {
         let mut prompter = TuiPrompter { port };
         let options = init::WizardOptions::embedded(init::InitArgs::default());
-        init::run_wizard(&mut prompter, options)
+        let result = init::run_wizard(&mut prompter, options);
+        let (ok, summary) = match &result {
+            Ok(_) => (
+                true,
+                "setup completed; restart the engine to apply it".to_owned(),
+            ),
+            Err(error) => (false, format!("setup failed: {error:#}")),
+        };
+        let _ = prompter.send(preloop_tui::wizard::WizardRequest::Done { ok, summary });
+        result.map(|_| ())
     })
     .join()
-    .map_err(|_| anyhow::anyhow!("setup wizard thread panicked"))??;
-    Ok(())
+    .map_err(|_| anyhow::anyhow!("setup wizard thread panicked"))?
 }
 
 /// Run this same binary with `args` in the foreground and return its exit
