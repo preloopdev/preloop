@@ -2312,15 +2312,19 @@ impl Service {
                     .sandboxes
                     .values()
                     .filter(|sandbox| sandbox.provider_id == rec.provider.id)
-                    .map(|sandbox| SandboxStats {
-                        sandbox: sandbox.clone().into(),
-                        runtime: rec
-                            .sandbox_stats
-                            .get(&sandbox.native_ref)
-                            .cloned()
-                            .unwrap_or_default()
-                            .into(),
-                        ..SandboxStats::default()
+                    .map(|sandbox| {
+                        let mut redacted = sandbox.clone();
+                        redacted.lease_id.clear();
+                        SandboxStats {
+                            sandbox: redacted.into(),
+                            runtime: rec
+                                .sandbox_stats
+                                .get(&sandbox.native_ref)
+                                .cloned()
+                                .unwrap_or_default()
+                                .into(),
+                            ..SandboxStats::default()
+                        }
                     })
                     .collect();
                 ProviderStats {

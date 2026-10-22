@@ -239,9 +239,10 @@ impl RemoteLink {
             .map_err(|e| Error::invalid_argument(format!("sandbox API URL: {e}")))?;
         let config = connectrpc::client::ClientConfig::new(uri).json();
         Ok(rpc::ProvidersClient::new(
-            crate::client::ClassifiedTransport(connectrpc::client::HttpClient::with_tls(
-                self.tls.read().clone(),
-            )),
+            crate::client::ClassifiedTransport(
+                connectrpc::client::HttpClient::with_tls(self.tls.read().clone()),
+                true,
+            ),
             config,
         ))
     }
