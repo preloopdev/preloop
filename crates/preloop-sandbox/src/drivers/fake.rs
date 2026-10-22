@@ -87,8 +87,27 @@ impl FakeDriver {
         Ok(self.root.join("sandboxes").join(native_ref))
     }
 
-    fn guest(root: &Path, guest: &str) -> PathBuf {
-        root.join(guest.trim_start_matches('/'))
+    /// Resolve a guest path under the sandbox root. The result is
+    /// confined lexically: `..` components may move within the root but
+    /// never above it. Drivers that resolve guest paths on the host get
+    /// no other confinement, so an escaping path is an error, not a
+    /// location.
+    fn guest(root: &Path, guest: &str) -> Result<PathBuf> {
+        let mut resolved = root.to_path_buf();
+        for component in guest.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    if resolved == root || !resolved.pop() {
+                        return Err(Error::invalid_argument(format!(
+                            "guest path `{guest}` escapes the sandbox root"
+                        )));
+                    }
+                }
+                name => resolved.push(name),
+            }
+        }
+        Ok(resolved)
     }
 
     /// The command half of [`Driver::exec`], split out so the cancel registry
@@ -121,7 +140,7 @@ impl FakeDriver {
             .current_dir(if request.workdir.is_empty() {
                 root.clone()
             } else {
-                Self::guest(&root, &request.workdir)
+                Self::guest(&root, &request.workdir)?
             })
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -269,7 +288,7 @@ impl Driver for FakeDriver {
 
     async fn copy_in(&self, native_ref: &str, tar: &Path, guest_dir: &str) -> Result<()> {
         let root = self.dir(native_ref)?;
-        let dest = Self::guest(&root, guest_dir);
+        let dest = Self::guest(&root, guest_dir)?;
         std::fs::create_dir_all(&dest).map_err(io("copy_in"))?;
         let file = std::fs::File::open(tar).map_err(io("copy_in"))?;
         tar::Archive::new(file).unpack(&dest).map_err(io("copy_in"))
@@ -277,9 +296,23 @@ impl Driver for FakeDriver {
 
     async fn copy_out(&self, native_ref: &str, guest_path: &str, tar: &Path) -> Result<()> {
         let root = self.dir(native_ref)?;
-        let source = Self::guest(&root, guest_path);
+        let source = Self::guest(&root, guest_path)?;
+        // Lexical confinement is not enough on its own: a guest-planted
+        // symlink inside the root can point anywhere on the host. Refuse
+        // a source that resolves outside the root, and store symlinks
+        // within the tree as links instead of following them, so the
+        // copy can never dereference a guest-controlled target.
+        if let Ok(resolved) = std::fs::canonicalize(&source) {
+            let canonical_root = std::fs::canonicalize(&root).map_err(io("copy_out"))?;
+            if !resolved.starts_with(&canonical_root) {
+                return Err(Error::invalid_argument(
+                    "guest path resolves outside the sandbox root",
+                ));
+            }
+        }
         let file = std::fs::File::create(tar).map_err(io("copy_out"))?;
         let mut builder = tar::Builder::new(file);
+        builder.follow_symlinks(false);
         let name = source
             .file_name()
             .map(|n| n.to_owned())
@@ -395,4 +428,121 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_paths_are_confined_to_the_sandbox_root() {
+        let root = Path::new("/sandboxes/ref-1");
+        assert_eq!(
+            FakeDriver::guest(root, "/etc/passwd").unwrap(),
+            root.join("etc/passwd")
+        );
+        // `..` may move within the root…
+        assert_eq!(FakeDriver::guest(root, "/a/../b").unwrap(), root.join("b"));
+        assert_eq!(FakeDriver::guest(root, "/").unwrap(), root.to_path_buf());
+        // …but never above it.
+        assert!(FakeDriver::guest(root, "/../secret").is_err());
+        assert!(FakeDriver::guest(root, "/a/../../secret").is_err());
+        assert!(FakeDriver::guest(root, "..").is_err());
+        assert!(FakeDriver::guest(root, "/a/b/../../../secret").is_err());
+    }
+
+    fn driver_with_sandbox(dir: &tempfile::TempDir) -> (FakeDriver, PathBuf) {
+        let root = dir.path().join("host");
+        let driver = FakeDriver::new("fake", root.clone(), FakeDriver::full_capabilities());
+        let sandbox = root.join("sandboxes").join("ref-1");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        (driver, sandbox)
+    }
+
+    fn tar_with_file(dir: &tempfile::TempDir, name: &str, content: &[u8]) -> PathBuf {
+        let source = dir.path().join("source.txt");
+        std::fs::write(&source, content).unwrap();
+        let tar_path = dir.path().join("in.tar");
+        let file = std::fs::File::create(&tar_path).unwrap();
+        let mut builder = tar::Builder::new(file);
+        builder.append_path_with_name(&source, name).unwrap();
+        builder.finish().unwrap();
+        tar_path
+    }
+
+    #[tokio::test]
+    async fn copy_in_refuses_an_escaping_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, sandbox) = driver_with_sandbox(&dir);
+        let tar = tar_with_file(&dir, "hello.txt", b"hello");
+        // The pre-fix join resolved this outside the sandbox entirely.
+        assert!(driver.copy_in("ref-1", &tar, "/../escape").await.is_err());
+        assert!(
+            !dir.path().join("host").join("escape").exists(),
+            "copy_in extracted outside the sandbox root"
+        );
+        // A destination inside the root still works.
+        driver.copy_in("ref-1", &tar, "/ok").await.unwrap();
+        assert_eq!(
+            std::fs::read(sandbox.join("ok/hello.txt")).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_out_does_not_follow_a_planted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, sandbox) = driver_with_sandbox(&dir);
+        let data = sandbox.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("real.txt"), b"guest-data").unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"host-secret").unwrap();
+        std::os::unix::fs::symlink(&secret, data.join("link")).unwrap();
+
+        let tar_path = dir.path().join("out.tar");
+        driver.copy_out("ref-1", "/data", &tar_path).await.unwrap();
+        let mut archive = tar::Archive::new(std::fs::File::open(&tar_path).unwrap());
+        let mut saw_real = false;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().ends_with("real.txt") {
+                saw_real = true;
+            }
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
+            let secret: &[u8] = b"host-secret";
+            assert!(
+                !content.windows(secret.len()).any(|w| w == secret),
+                "copy_out leaked a host file through a guest symlink"
+            );
+        }
+        assert!(saw_real, "copy_out must still copy the real guest files");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_out_refuses_a_source_resolving_outside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, sandbox) = driver_with_sandbox(&dir);
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"host-secret").unwrap();
+        std::os::unix::fs::symlink(&secret, sandbox.join("link")).unwrap();
+        let tar_path = dir.path().join("out.tar");
+        assert!(driver.copy_out("ref-1", "/link", &tar_path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exec_workdir_cannot_escape_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, _sandbox) = driver_with_sandbox(&dir);
+        let (tx, _rx) = mpsc::channel(1);
+        let request = ExecRequest {
+            argv: vec!["true".into()],
+            workdir: "/../..".into(),
+            ..ExecRequest::default()
+        };
+        assert!(driver.exec("ref-1", "exec-1", &request, tx).await.is_err());
+    }
 }
