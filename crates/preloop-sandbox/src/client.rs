@@ -217,10 +217,10 @@ use crate::generated::preloop::sandbox::v1 as rpc;
 
 impl SandboxClient {
     /// `base` like `https://127.0.0.1:9191` (system trust store).
-    pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
+    pub fn new(base: impl Into<String>, token: Option<String>) -> Result<Self> {
         let base = base.into().trim_end_matches('/').to_owned();
-        let tls = native_tls_config();
-        Self::build(base, token, tls, reqwest::Client::new())
+        let tls = native_tls_config()?;
+        Ok(Self::build(base, token, tls, reqwest::Client::new()))
     }
 
     /// `base` like `https://127.0.0.1:9191`, trusting only `ca_pem`.
@@ -325,14 +325,14 @@ impl<T: connectrpc::client::ClientTransport<Error = Error>> connectrpc::client::
 }
 
 /// A rustls configuration trusting the system roots.
-fn native_tls_config() -> Arc<rustls::ClientConfig> {
+fn native_tls_config() -> Result<Arc<rustls::ClientConfig>> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-    Arc::new(
-        rustls::ClientConfig::builder()
+    Ok(Arc::new(
+        crate::tls::client_config_builder()?
             .with_root_certificates(roots)
             .with_no_client_auth(),
-    )
+    ))
 }
 
 #[async_trait]
