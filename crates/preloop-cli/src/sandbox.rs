@@ -226,11 +226,16 @@ impl LocalSandboxes {
             drivers,
             agent_config,
         );
-        let session = agent.register().await.ok();
-        let provider_id = session
-            .as_ref()
-            .map(|session| session.provider_id.clone())
-            .unwrap_or_default();
+        // A failed registration here (as opposed to inside `agent.run`'s own
+        // retry loop below) means this host's local pool driver never gets a
+        // provider id: every pool operation pinned to `self.provider_id`
+        // would silently target the wrong (empty) provider. Fail the engine
+        // start instead (B7).
+        let session = agent
+            .register()
+            .await
+            .context("registering this host's local sandbox agent")?;
+        let provider_id = session.provider_id;
         tokio::spawn(agent.run(shutdown.clone()));
 
         let listen =
@@ -349,11 +354,20 @@ fn env_path(key: &str) -> Option<PathBuf> {
 
 /// The client token: `PRELOOP_SANDBOX_TOKEN`, else one generated on first
 /// start into `<state>/sandbox-client-token` (mode 0600).
+///
+/// When `PRELOOP_SANDBOX_TOKEN` is set, the file is refreshed to match it.
+/// `preloop sandbox` (the CLI) reads this same file as its local-service
+/// fallback (`local_client_token`); without the refresh, a token supplied
+/// only through the environment would leave that file holding a stale
+/// token from an earlier run (or none), and the CLI would authenticate
+/// with the wrong credential (B12).
 fn resolve_client_token(state: &Path) -> anyhow::Result<String> {
+    let path = state.join("sandbox-client-token");
     if let Some(token) = env_nonempty("PRELOOP_SANDBOX_TOKEN") {
+        tls::write_private(&path, token.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
         return Ok(token);
     }
-    let path = state.join("sandbox-client-token");
     if let Ok(token) = std::fs::read_to_string(&path) {
         let token = token.trim();
         if !token.is_empty() {
@@ -380,19 +394,68 @@ fn local_ca(home: &Path) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Whether `host` names a loopback address this process itself listens on
+/// (`127.0.0.1`, `::1`, or `localhost`).
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether `service` names this host's own engine — the only case where the
+/// local `state/sandbox-client-token` and `state/sandbox-ca/ca.pem` files
+/// are a safe implicit credential (B6). Those files belong to whichever
+/// engine this process's `PRELOOP_HOME` points at; a `--service` naming any
+/// other host (even another local port) is a different trust domain and
+/// must bring its own `--token`/`--ca` (or their env vars).
+fn is_local_sandbox_service(service: &str) -> bool {
+    let Ok(uri) = service.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let Some(port) = uri.port_u16() else {
+        return false;
+    };
+    // The documented default (`DEFAULT_SANDBOX_URL`): loopback on 9191.
+    if is_loopback_host(host) && port == 9191 {
+        return true;
+    }
+    // Or the exact address this process's own engine was told to listen on.
+    let Some(listen) = env_nonempty("PRELOOP_SANDBOX_LISTEN") else {
+        return false;
+    };
+    let Ok(listen_addr) = listen.parse::<SocketAddr>() else {
+        return false;
+    };
+    port == listen_addr.port()
+        && (is_loopback_host(host) && listen_addr.ip().is_loopback()
+            || host == listen_addr.ip().to_string())
+}
+
 /// Build the caller client, resolving the token and CA from flags, the
-/// environment, then the local state directory.
+/// environment, then — only for this host's own local engine — the local
+/// state directory (B6: any other `--service` must bring its own
+/// credentials).
 fn sandbox_client(
     service: &str,
     token: Option<String>,
     ca: Option<PathBuf>,
 ) -> anyhow::Result<SandboxClient> {
     let home = crate::preloop_home();
-    let token = token.or_else(|| local_client_token(&home)).context(
-        "set --token (or PRELOOP_SANDBOX_TOKEN), or run against a local service that wrote \
-         state/sandbox-client-token",
-    )?;
-    match ca.or_else(|| local_ca(&home)) {
+    let local = is_local_sandbox_service(service);
+    let token = token
+        .or_else(|| local.then(|| local_client_token(&home)).flatten())
+        .context(
+            "set --token (or PRELOOP_SANDBOX_TOKEN); the local state/sandbox-client-token is \
+             only used for the local default sandbox URL",
+        )?;
+    match ca.or_else(|| local.then(|| local_ca(&home)).flatten()) {
         Some(path) => {
             let pem = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading sandbox CA {}", path.display()))?;
@@ -924,7 +987,15 @@ async fn run_client(
             request
                 .inject
                 .modify(|inject| inject.env.extend(acquire.env));
-            print_json(&client.acquire(request).await?)
+            let mut response = client.acquire(request).await?;
+            // B11: `lease.env` echoes back the `--env` values the caller
+            // passed in (secrets, in the common case); keep the keys so the
+            // output still shows what was injected, but never print the
+            // values to the terminal/log.
+            response
+                .lease
+                .modify(|lease| lease.env.values_mut().for_each(|v| *v = "***".into()));
+            print_json(&response)
         }
         SandboxCommand::Exec(exec) => {
             let mut interrupt = Interrupt::install()?;
@@ -1400,6 +1471,76 @@ mod tests {
 
         let default = conformance_options(&[]).unwrap();
         assert!(default.template.spec.into_option().is_none());
+    }
+
+    #[test]
+    fn is_local_sandbox_service_matches_the_documented_default() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        unsafe { std::env::remove_var("PRELOOP_SANDBOX_LISTEN") };
+        assert!(is_local_sandbox_service("https://127.0.0.1:9191"));
+        assert!(is_local_sandbox_service("https://localhost:9191"));
+        assert!(is_local_sandbox_service("https://[::1]:9191"));
+        assert!(!is_local_sandbox_service("https://127.0.0.1:9192"));
+        assert!(!is_local_sandbox_service("https://example.com:9191"));
+        assert!(!is_local_sandbox_service("not a url"));
+    }
+
+    #[test]
+    fn is_local_sandbox_service_honors_a_configured_listen_address() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        unsafe { std::env::set_var("PRELOOP_SANDBOX_LISTEN", "127.0.0.1:9777") };
+        assert!(is_local_sandbox_service("https://127.0.0.1:9777"));
+        // A different remote host on the same port is still a different
+        // trust domain (B6): the listen address does not widen the match to
+        // any port, only the exact local address the engine bound.
+        assert!(!is_local_sandbox_service("https://example.com:9777"));
+        unsafe { std::env::remove_var("PRELOOP_SANDBOX_LISTEN") };
+    }
+
+    #[test]
+    fn sandbox_client_requires_explicit_credentials_for_a_remote_service() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        unsafe { std::env::remove_var("PRELOOP_SANDBOX_LISTEN") };
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        std::fs::write(
+            home.path().join("state/sandbox-client-token"),
+            "local-secret-token",
+        )
+        .unwrap();
+        let previous = std::env::var_os("PRELOOP_HOME");
+        unsafe { std::env::set_var("PRELOOP_HOME", home.path()) };
+        // B6: a remote --service must not pick up the local token file.
+        let error = match sandbox_client("https://remote.example:9191", None, None) {
+            Ok(_) => panic!("a remote service must not resolve the local token"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--token"), "{error}");
+        // The local default URL still resolves it.
+        sandbox_client("https://127.0.0.1:9191", None, None).unwrap();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("PRELOOP_HOME", value) },
+            None => unsafe { std::env::remove_var("PRELOOP_HOME") },
+        }
+    }
+
+    #[test]
+    fn resolve_client_token_refreshes_the_file_from_the_env_token() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sandbox-client-token"), "stale-token").unwrap();
+        let previous = std::env::var_os("PRELOOP_SANDBOX_TOKEN");
+        unsafe { std::env::set_var("PRELOOP_SANDBOX_TOKEN", "fresh-token") };
+        let token = resolve_client_token(dir.path()).unwrap();
+        assert_eq!(token, "fresh-token");
+        // B12: the on-disk file (the CLI's local-fallback source) must be
+        // refreshed to match, not left holding the stale token.
+        let on_disk = std::fs::read_to_string(dir.path().join("sandbox-client-token")).unwrap();
+        assert_eq!(on_disk.trim(), "fresh-token");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("PRELOOP_SANDBOX_TOKEN", value) },
+            None => unsafe { std::env::remove_var("PRELOOP_SANDBOX_TOKEN") },
+        }
     }
 
     #[tokio::test]
