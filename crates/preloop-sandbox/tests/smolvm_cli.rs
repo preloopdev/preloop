@@ -29,10 +29,13 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 #[cfg(unix)]
 mod unix {
     use super::*;
+    use preloop_sandbox::api::{CreateWork, Template, TemplateSpec};
+    use preloop_sandbox::drivers::smolvm::SmolvmDriver;
     use preloop_sandbox::drivers::smolvm::cli::{
         ExecOutput, GuestVolume, MachineRole, MachineSpec, MachineState, NetworkPolicy,
-        SmolVmProvider, SocketMount, VmProvider, VolumeMount,
+        SmolVmProvider, SocketMount, VmProvider, VolumeMount, SANDBOX_OWNER_MARKER,
     };
+    use preloop_sandbox::Driver as _;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -1479,5 +1482,72 @@ exit 0
                 "{needle:?} missing from {message}"
             );
         }
+    }
+
+    /// The Sandbox Service marks every machine it serves for a caller outside
+    /// the CI pool so the engine's `OrphanPurge::All` sweep spares it. On a
+    /// real host `machine create` does not create the machine data directory —
+    /// smolvm only materialises the hash-derived path in `machine start` — so
+    /// the marker write must create it, or every driver create fails.
+    #[tokio::test]
+    async fn the_driver_marks_a_machine_before_its_data_dir_exists() {
+        let _env_guard = TEST_ENV_MUTEX.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        // The guard accepts the guest agent shipped beside the binary.
+        write_agent_rootfs(&directory.path().join("agent-rootfs"), "1.30.1", true);
+        let data_dir = directory.path().join("vms").join("0123456789abcdef");
+        let executable = directory.path().join("smolvm");
+        write_executable(
+            &executable,
+            &format!(
+                r##"#!/bin/sh
+if [ "${{1-}}" = "--version" ]; then
+  printf 'smolvm 1.30.1\n'
+fi
+case "${{1-}}:${{2-}}" in
+  machine:data-dir) printf '%s\n' '{dir}' ;;
+esac
+exit 0
+"##,
+                dir = data_dir.display()
+            ),
+        );
+        let saved = std::env::var_os("SMOLVM_AGENT_ROOTFS");
+        unsafe { std::env::remove_var("SMOLVM_AGENT_ROOTFS") };
+
+        let driver = SmolvmDriver::new(SmolVmProvider::new(&executable), 0);
+        let work = CreateWork {
+            sandbox_id: "sbx-3f2a9c".into(),
+            driver: "smolvm".into(),
+            template: Template {
+                spec: TemplateSpec {
+                    name: "alpine".into(),
+                    os: "linux".into(),
+                    image: Some("alpine:3.20".into()),
+                    ..TemplateSpec::default()
+                },
+                ..Template::default()
+            },
+            ..CreateWork::default()
+        };
+        // The fake never creates the data dir on `machine create`, exactly
+        // like smolvm; the driver must not need it to exist.
+        let result = driver.create(&work).await;
+
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("SMOLVM_AGENT_ROOTFS", value),
+                None => std::env::remove_var("SMOLVM_AGENT_ROOTFS"),
+            }
+        }
+
+        let native = result.expect("a missing data dir must not fail the create");
+        assert_eq!(native, "psbx-3f2a9c");
+        assert_eq!(
+            fs::read_to_string(data_dir.join(SANDBOX_OWNER_MARKER))
+                .expect("the marker was written")
+                .trim(),
+            native
+        );
     }
 }
