@@ -145,8 +145,8 @@
     {
       "customType": "regex",
       "description": "Official actions/runner release pin in versions.toml. The bump PR is the tripwire: it is labeled protocol-sync, and .github/workflows/runner-sync.yml runs watch-pipeline stages on it and opens the tiered PRs (docs/contributing/conformance.md). It must never auto-merge.",
-      "fileMatch": [
-        "^versions\\.toml$"
+      "managerFilePatterns": [
+        "/^versions\\.toml$/"
       ],
       "matchStrings": [
         "runner_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
@@ -159,8 +159,8 @@
     {
       "customType": "regex",
       "description": "SmolVM release the golden workflow builds with. The bump PR is gated by .github/workflows/smolvm-release-verify.yml, which installs the candidate and runs the real-VM E2E on GitHub-hosted KVM; green runs auto-merge.",
-      "fileMatch": [
-        "^versions\\.toml$"
+      "managerFilePatterns": [
+        "/^versions\\.toml$/"
       ],
       "matchStrings": [
         "smolvm_golden_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
@@ -173,8 +173,8 @@
     {
       "customType": "regex",
       "description": "Node 20 externals pin in versions.toml. Tracks nodejs.org dist (node-version datasource) for the Node.js bundled with the runner externals; bumps are gated by supply-chain.yml (OSV + SBOM) and must not auto-merge.",
-      "fileMatch": [
-        "^versions\\.toml$"
+      "managerFilePatterns": [
+        "/^versions\\.toml$/"
       ],
       "matchStrings": [
         "node20_externals_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
@@ -186,8 +186,8 @@
     {
       "customType": "regex",
       "description": "Node 24 externals pin in versions.toml. Tracks nodejs.org dist (node-version datasource) for the Node.js bundled with the runner externals; bumps are gated by supply-chain.yml (OSV + SBOM) and must not auto-merge.",
-      "fileMatch": [
-        "^versions\\.toml$"
+      "managerFilePatterns": [
+        "/^versions\\.toml$/"
       ],
       "matchStrings": [
         "node24_externals_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""

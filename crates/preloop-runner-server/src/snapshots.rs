@@ -6239,7 +6239,13 @@ fn snapshot_storage_repository(snapshot: &WorkspaceSnapshot) -> &str {
         .unwrap_or(&snapshot.repository)
 }
 
-fn snapshot_authorization_token(value: &str) -> Option<String> {
+/// Extract the credential from a `Bearer` or Basic (`user:token`) header.
+///
+/// Shared by the snapshot Git endpoint, the forge relay and the code-scanning
+/// SARIF shim: `actions/checkout` sends Basic `x-access-token:<token>` while
+/// Octokit-based actions send `Bearer <token>` (or `token <token>`, which
+/// [`sarif_authorization_token`](crate::sarif::authorization_token) accepts).
+pub(crate) fn snapshot_authorization_token(value: &str) -> Option<String> {
     let (scheme, credentials) = value.split_once(' ')?;
     if scheme.eq_ignore_ascii_case("bearer") {
         return Some(credentials.to_owned());
