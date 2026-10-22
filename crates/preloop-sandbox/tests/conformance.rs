@@ -363,18 +363,19 @@ async fn sandbox_shape_is_the_effective_size() {
     );
 
     // Get and List report the record's shape, not a recomputation.
-    for (id, expected) in [
-        (&defaulted.sandbox.id, defaults),
-        (&shaped.sandbox.id, explicit),
+    for (id, lease_id, expected) in [
+        (&defaulted.sandbox.id, &defaulted.lease.id, defaults),
+        (&shaped.sandbox.id, &shaped.lease.id, explicit),
         (
             &partial.sandbox.id,
+            &partial.lease.id,
             Shape {
                 cpus: 4,
                 ..defaults
             },
         ),
     ] {
-        assert_eq!(h.service.get(id).unwrap().shape, expected);
+        assert_eq!(h.service.get(id, lease_id).unwrap().shape, expected);
         assert_eq!(
             h.service
                 .list()
@@ -1615,6 +1616,7 @@ async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
         .service
         .exec_collect(ExecRequest {
             sandbox_id: build.sandbox.id.clone(),
+            lease_id: build.lease.id.clone(),
             argv: vec![
                 "sh".into(),
                 "-c".into(),
@@ -1629,6 +1631,7 @@ async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
         .service
         .snapshot(SnapshotRequest {
             sandbox_id: build.sandbox.id.clone(),
+            lease_id: build.lease.id.clone(),
             name: "golden".into(),
         })
         .await
@@ -1698,6 +1701,7 @@ async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
         .service
         .exec_collect(ExecRequest {
             sandbox_id: fork.sandbox.id,
+            lease_id: fork.lease.id,
             argv: vec!["cat".into(), "marker".into()],
             ..ExecRequest::default()
         })
@@ -3340,31 +3344,22 @@ async fn a_snapshot_wait_is_bounded_by_the_work_timeout() {
 #[tokio::test]
 async fn dropping_a_remote_exec_stream_cancels_the_command() {
     use preloop_sandbox::SandboxApi as _;
-    let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = router(service.clone(), Auth::default());
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    let shutdown = CancellationToken::new();
-    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    let t = common::TestService::start().await;
+    let service = t.service.clone();
+    let dir = t.dir.path().to_path_buf();
     let fake = Arc::new(FakeDriver::new(
         "fake",
-        dir.path().join("host"),
+        dir.join("host"),
         FakeDriver::full_capabilities(),
     ));
+    let link = t.enroll("remote-host").await;
     let agent = Agent::new(
-        Arc::new(RemoteLink::new(&base, None)) as Arc<dyn ProviderLink>,
+        Arc::new(link),
         vec![fake.clone() as Arc<dyn Driver>],
-        AgentConfig::new("remote-host", dir.path().join("scratch")),
+        AgentConfig::new("remote-host", dir.join("scratch")),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
-    let client = SandboxClient::new(&base, None);
+    tokio::spawn(agent.run(t.shutdown_token()));
+    let client = t.client();
     wait_for(|| !service.list_providers().is_empty()).await;
     client.put_template(template("alpine")).await.unwrap();
     let lease = client
@@ -3378,6 +3373,7 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
     let stream = client
         .exec(ExecRequest {
             sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
             argv: vec!["sh".into(), "-c".into(), "sleep 30".into()],
             ..ExecRequest::default()
         })
@@ -3391,6 +3387,7 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
     let (code, _, _) = client
         .exec_collect(ExecRequest {
             sandbox_id: lease.sandbox.id,
+            lease_id: lease.lease.id,
             argv: vec!["true".into()],
             ..ExecRequest::default()
         })

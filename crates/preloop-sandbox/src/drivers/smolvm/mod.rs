@@ -1063,7 +1063,13 @@ exit 0
                 spec: TemplateSpec {
                     name: "alpine".into(),
                     os: "linux".into(),
-                    image: Some("alpine:3.20".into()),
+                    artifacts: vec![crate::api::Artifact {
+                        format: crate::api::Artifact::OCI_IMAGE.into(),
+                        arch: crate::api::host_arch().into(),
+                        reference: format!("alpine@sha256:{}", "0".repeat(64)),
+                        digest: format!("sha256:{}", "0".repeat(64)),
+                        size_bytes: 0,
+                    }],
                     ..TemplateSpec::default()
                 },
                 ..Template::default()
@@ -1225,11 +1231,7 @@ exit 0
         assert!(calls[fork].1.contains(&"--branchable".to_owned()));
         assert_eq!(index_of(&calls, "update"), None);
     }
-}
 
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
     use std::time::Duration;
 
     /// The wrapper records a PID that `guest_kill_script` can terminate; this

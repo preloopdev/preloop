@@ -40,9 +40,7 @@ mod unix {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    use preloop_sandbox::Driver as _;
     use preloop_sandbox::api::{ExecEvent, ExecRequest};
-    use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 
     static TEST_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
