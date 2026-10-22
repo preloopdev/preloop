@@ -41,7 +41,7 @@ pub struct ContextConfig {
 }
 
 /// The `[stack]` table, used by the stack view.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct StackConfig {
     /// Repositories to scan, as `owner/name`.

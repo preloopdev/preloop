@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 
 use crate::api::{
     Annotation, DebugSession, LiveLogChunk, OperationalSnapshot, PoolBindings, RunRecord,
-    RunnersList, WebhookDeliveries, WebhookHealth,
+    RunnersList, StackSnapshot, WebhookDeliveries, WebhookHealth,
 };
 use crate::client::sandbox::SandboxSummary;
 
@@ -144,6 +144,8 @@ pub struct Store {
     pub debug: Loadable<Vec<DebugSession>>,
     /// Sandbox Service summary, when the context has a sandbox.
     pub sandbox: Loadable<SandboxSummary>,
+    /// GitHub pull requests and stack topology.
+    pub stack: Loadable<StackSnapshot>,
     /// Ready-job counts over time, for the queue sparkline.
     pub ready_history: VecDeque<(DateTime<Utc>, u32)>,
 }

@@ -36,7 +36,8 @@ pub(crate) fn run(args: TuiArgs) -> anyhow::Result<()> {
         anyhow::bail!("preloop tui needs an interactive terminal");
     }
     let home = crate::preloop_home();
-    let contexts = resolve_contexts(&home)?;
+    let config = preloop_tui::config::load(&home.join("tui.toml"))?.unwrap_or_default();
+    let contexts = resolve_contexts_from_config(&config, &home);
     let index = select_context(&contexts, args.context.as_deref())?;
     let options = Options {
         contexts,
@@ -46,6 +47,7 @@ pub(crate) fn run(args: TuiArgs) -> anyhow::Result<()> {
             None => StartView::Overview,
         },
         read_only: args.read_only,
+        stack: config.stack.clone(),
     };
     let hooks = Hooks {
         start_engine: Box::new(move || start_engine(&home)),
@@ -60,15 +62,15 @@ pub(crate) fn run(args: TuiArgs) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("the TUI thread panicked"))?
 }
 
-/// The contexts the TUI offers: those in `tui.toml` when it names any, else
-/// the single local default.
-fn resolve_contexts(home: &Path) -> anyhow::Result<Vec<Context>> {
-    let config = preloop_tui::config::load(&home.join("tui.toml"))?;
-    match config {
-        Some(config) if !config.contexts.is_empty() => {
-            Ok(config.contexts.iter().map(context_from_config).collect())
-        }
-        _ => Ok(vec![local_context(home)]),
+/// Resolve contexts from the already-loaded TUI configuration.
+fn resolve_contexts_from_config(
+    config: &preloop_tui::config::TuiConfig,
+    home: &Path,
+) -> Vec<Context> {
+    if !config.contexts.is_empty() {
+        config.contexts.iter().map(context_from_config).collect()
+    } else {
+        vec![local_context(home)]
     }
 }
 

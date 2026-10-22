@@ -76,6 +76,8 @@ pub struct Options {
     pub start: StartView,
     /// Disable every action that changes state.
     pub read_only: bool,
+    /// Stack repositories and mirror configuration.
+    pub stack: crate::config::StackConfig,
 }
 
 /// Hook used to run a foreground command after the TUI suspends the terminal.

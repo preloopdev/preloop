@@ -107,6 +107,7 @@ async fn async_main(options: Options, hooks: Hooks) -> anyhow::Result<()> {
         theme,
         Utc::now(),
     );
+    app.set_stack_config(options.stack.clone());
     let mut executor = Executor {
         tx: tx.clone(),
         clients,
@@ -412,6 +413,7 @@ async fn run_fetch(fetch: Fetch, clients: ContextClients) -> Msg {
         Fetch::WebhookHealth => Fetched::WebhookHealth(engine.webhook_health().await.map_err(text)),
         Fetch::Debug => Fetched::Debug(engine.debug_sessions().await.map_err(text)),
         Fetch::Runners => Fetched::Runners(engine.runners(None).await.map_err(text)),
+        Fetch::Stack(config) => Fetched::Stack(crate::client::github::stack(&config).await.map_err(|error| format!("{error:#}"))),
         Fetch::Sandbox => {
             if !clients.has_sandbox {
                 Fetched::Sandbox(Err("no sandbox configured".to_owned()))

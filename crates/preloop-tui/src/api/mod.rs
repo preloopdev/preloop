@@ -8,6 +8,7 @@
 pub mod feed;
 pub mod ops;
 pub mod run;
+pub mod stack;
 pub mod status;
 
 pub use feed::{Annotation, FeedEvent, LiveLogChunk, StepStatus, parse_feed_line};
@@ -17,4 +18,5 @@ pub use ops::{
     WebhookDeliveries, WebhookHealth, WebhookStats, Watchdog,
 };
 pub use run::{ExecStatus, JobDetail, PushState, RunRecord, StepRecord, Submission, sort_steps};
+pub use stack::{CheckSummary, StackPullRequest, StackRepository, StackSnapshot};
 pub use status::{Condition, Exemplar, OperationalSnapshot, Overall};

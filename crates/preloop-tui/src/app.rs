@@ -11,14 +11,16 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::actions::{Action, Danger};
 use crate::api::{
     DebugSession, ExecStatus, FeedEvent, JobDetail, LiveLogChunk, OperationalSnapshot,
-    PoolBindings, RunRecord, RunnersList, StepRecord, WebhookDeliveries, WebhookHealth,
+    PoolBindings, RunRecord, RunnersList, StackSnapshot, StepRecord, WebhookDeliveries,
+    WebhookHealth,
 };
 use crate::client::sandbox::SandboxSummary;
+use crate::config::StackConfig;
 use crate::detectors::{self, LeakedBindingTracker, fmt_age};
 use crate::options::StartView;
 use crate::store::{LogKey, Store};
 use crate::theme::{Theme, Tone};
-use crate::views::{ViewKind, overview, runs};
+use crate::views::{ViewKind, overview, runs, stack};
 use crate::widgets::chrome::HeaderInfo;
 use crate::widgets::modal::Confirm;
 use crate::widgets::palette::{Outcome, Palette, PaletteEntry};
@@ -74,6 +76,8 @@ pub enum Fetched {
     Sandbox(Result<SandboxSummary, String>),
     /// Registered runners.
     Runners(Result<RunnersList, String>),
+    /// GitHub pull requests and stack topology.
+    Stack(Result<StackSnapshot, String>),
 }
 
 /// Everything that can happen to the app.
@@ -155,6 +159,8 @@ pub enum Fetch {
     Sandbox,
     /// `GET /api/v1/runners`.
     Runners,
+    /// GitHub pull requests configured for the Stack view.
+    Stack(StackConfig),
 }
 
 /// Which kind of live stream.
@@ -248,6 +254,9 @@ pub struct App {
     pub overview: overview::State,
     /// Runs screen state.
     pub runs: runs::State,
+    /// Stack screen configuration and cursor state.
+    pub stack_config: StackConfig,
+    pub stack: stack::State,
     /// Leaked-binding tracker, fed by every status snapshot.
     pub tracker: LeakedBindingTracker,
     /// Streams the app wants open.
@@ -288,6 +297,8 @@ impl App {
             store: Store::default(),
             overview: overview::State::default(),
             runs: runs::State::default(),
+            stack_config: StackConfig::default(),
+            stack: stack::State::default(),
             tracker: LeakedBindingTracker::default(),
             streams: Streams::default(),
             engine_down: None,
@@ -303,6 +314,11 @@ impl App {
             app.runs.pending = Some(prefix);
         }
         app
+    }
+
+    /// Install the stack configuration resolved by the CLI.
+    pub fn set_stack_config(&mut self, config: StackConfig) {
+        self.stack_config = config;
     }
 
     /// The effects that load the first screen. Call once, after `new`.
@@ -557,6 +573,11 @@ impl App {
             }
             Fetched::Runners(result) => {
                 settle(&mut self.store.runners, result, self.now);
+                Vec::new()
+            }
+            Fetched::Stack(result) => {
+                settle(&mut self.store.stack, result, self.now);
+                self.stack.clamp(self.store.stack.get(), &self.stack_config);
                 Vec::new()
             }
         }
@@ -868,6 +889,9 @@ impl App {
         if self.store.runners.begin() {
             effects.push(Effect::Fetch(Fetch::Runners));
         }
+        if self.store.stack.begin() {
+            effects.push(Effect::Fetch(Fetch::Stack(self.stack_config.clone())));
+        }
         if let Some(run_id) = self.runs.run.clone()
             && self.store.details.entry(run_id.clone()).or_default().begin()
         {
@@ -1104,6 +1128,7 @@ impl App {
         self.engine_down = None;
         self.runs = runs::State::default();
         self.overview = overview::State::default();
+        self.stack = stack::State::default();
         self.last_refresh = None;
         self.toast(format!("context {}", self.current().name), Tone::Accent);
         let mut effects = vec![Effect::SwitchContext(index)];
