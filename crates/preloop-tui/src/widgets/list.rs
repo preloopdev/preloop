@@ -31,7 +31,11 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
 
     let query_chars: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
     let cand_chars: Vec<char> = candidate.chars().collect();
-    let cand_lower: Vec<char> = cand_chars.iter().copied().flat_map(char::to_lowercase).collect();
+    let cand_lower: Vec<char> = cand_chars
+        .iter()
+        .copied()
+        .flat_map(char::to_lowercase)
+        .collect();
 
     let mut score: i64 = 0;
     let mut search_from = 0usize;
@@ -39,7 +43,10 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
     let mut last_match = 0usize;
 
     for &qc in &query_chars {
-        let found = cand_lower.get(search_from..)?.iter().position(|&c| c == qc)?;
+        let found = cand_lower
+            .get(search_from..)?
+            .iter()
+            .position(|&c| c == qc)?;
         let idx = search_from + found;
 
         score += MATCH_BONUS;
@@ -92,12 +99,18 @@ pub struct ListItem {
 impl ListItem {
     /// A normal, cursor-reachable item.
     pub fn selectable(lines: Vec<Line<'static>>) -> Self {
-        Self { lines, selectable: true }
+        Self {
+            lines,
+            selectable: true,
+        }
     }
 
     /// A section header: drawn, but never selected.
     pub fn header(lines: Vec<Line<'static>>) -> Self {
-        Self { lines, selectable: false }
+        Self {
+            lines,
+            selectable: false,
+        }
     }
 }
 
@@ -137,9 +150,17 @@ pub fn render_list(frame: &mut Frame, area: Rect, items: &[ListItem], cursor: us
             if offset >= height {
                 return;
             }
-            let row_area = Rect { x: area.x, y: area.y + offset as u16, width: area.width, height: 1 };
+            let row_area = Rect {
+                x: area.x,
+                y: area.y + offset as u16,
+                width: area.width,
+                height: 1,
+            };
             if index == cursor_item && item.selectable {
-                frame.render_widget(Paragraph::new(line.clone()).style(theme.selected()), row_area);
+                frame.render_widget(
+                    Paragraph::new(line.clone()).style(theme.selected()),
+                    row_area,
+                );
             } else {
                 frame.render_widget(Paragraph::new(line.clone()), row_area);
             }
@@ -161,7 +182,10 @@ mod tests {
     #[test]
     fn case_insensitive_subsequence_match() {
         assert!(fuzzy_score("UBN", "urbanist").is_some());
-        assert_eq!(fuzzy_score("ban", "urbanist"), fuzzy_score("BAN", "urbanist"));
+        assert_eq!(
+            fuzzy_score("ban", "urbanist"),
+            fuzzy_score("BAN", "urbanist")
+        );
     }
 
     #[test]
@@ -175,7 +199,10 @@ mod tests {
         let contiguous = fuzzy_score("ban", "urbanist").unwrap();
         let scattered = fuzzy_score("ban", "xbyaznx").unwrap();
         assert!(prefix > contiguous, "{prefix} should beat {contiguous}");
-        assert!(contiguous > scattered, "{contiguous} should beat {scattered}");
+        assert!(
+            contiguous > scattered,
+            "{contiguous} should beat {scattered}"
+        );
     }
 
     #[test]
@@ -203,8 +230,7 @@ mod tests {
 
     #[test]
     fn render_list_keeps_cursor_visible_in_small_viewport() {
-        let items: Vec<ListItem> =
-            (0..10).map(|i| item(&format!("Item {i}"))).collect();
+        let items: Vec<ListItem> = (0..10).map(|i| item(&format!("Item {i}"))).collect();
         let backend = TestBackend::new(20, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::monochrome();

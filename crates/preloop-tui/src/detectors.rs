@@ -282,7 +282,11 @@ mod tests {
         let now = at(12, 20, 0);
         let finding = ingress(now, Some(at(12, 0, 0)), Some(at(12, 10, 0)));
         assert_eq!(finding.severity, Severity::Warning);
-        assert!(finding.message.starts_with("runs arriving without deliveries"));
+        assert!(
+            finding
+                .message
+                .starts_with("runs arriving without deliveries")
+        );
         let healthy = ingress(now, Some(at(12, 19, 42)), Some(at(12, 18, 0)));
         assert_eq!(healthy.severity, Severity::Info);
         assert_eq!(healthy.message, "last delivery 18s ago · last run 2m ago");

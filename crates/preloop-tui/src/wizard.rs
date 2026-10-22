@@ -161,8 +161,16 @@ mod tests {
             port.replies.recv().expect("ui replies")
         });
         let request = ui.requests.recv().expect("wizard asked");
-        assert!(matches!(request, WizardRequest::Confirm { default: true, .. }));
-        ui.replies.send(WizardReply::Confirm(false)).expect("wizard waits");
-        assert_eq!(wizard.join().expect("no panic"), WizardReply::Confirm(false));
+        assert!(matches!(
+            request,
+            WizardRequest::Confirm { default: true, .. }
+        ));
+        ui.replies
+            .send(WizardReply::Confirm(false))
+            .expect("wizard waits");
+        assert_eq!(
+            wizard.join().expect("no panic"),
+            WizardReply::Confirm(false)
+        );
     }
 }

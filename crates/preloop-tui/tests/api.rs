@@ -70,10 +70,7 @@ fn status_snapshot_parses() {
     assert_eq!(snapshot.runs.completed, 388);
     assert_eq!(snapshot.active_runs.len(), 3);
     assert!(
-        snapshot
-            .active_runs
-            .iter()
-            .all(|run| run.run_id != RUN_ID),
+        snapshot.active_runs.iter().all(|run| run.run_id != RUN_ID),
         "the failed run is not in flight"
     );
     assert_eq!(snapshot.jobs.ready, 2);
@@ -87,15 +84,25 @@ fn status_snapshot_parses() {
     assert_eq!(snapshot.pool.mode, "warm");
     assert_eq!(snapshot.pool.idle, 3);
     assert_eq!(snapshot.pool.queue_depth, 2);
-    assert_eq!(snapshot.pool.labels, vec!["linux".to_owned(), "x64".to_owned()]);
+    assert_eq!(
+        snapshot.pool.labels,
+        vec!["linux".to_owned(), "x64".to_owned()]
+    );
     assert_eq!(snapshot.vms.count.runner, 5);
     assert_eq!(snapshot.vms.count.golden, 1);
     assert_eq!(snapshot.vms.host_usage.cpu_cores, Some(9.2));
     assert_eq!(snapshot.vms.host_usage.mem_total_bytes, Some(68719476736));
-    assert_eq!(snapshot.vms.host_usage.mem_available_bytes, Some(24696061952));
+    assert_eq!(
+        snapshot.vms.host_usage.mem_available_bytes,
+        Some(24696061952)
+    );
     assert!(snapshot.github.configured);
     assert_eq!(
-        snapshot.github.rate_limit.as_ref().map(|limit| limit.remaining),
+        snapshot
+            .github
+            .rate_limit
+            .as_ref()
+            .map(|limit| limit.remaining),
         Some(4812)
     );
     assert_eq!(snapshot.debug.active_sessions, 1);
@@ -163,9 +170,23 @@ fn runs_fixture_filters_to_the_ci_runs_that_are_red_or_running() {
     assert_eq!(failed.job_status("nothing here"), ExecStatus::Unknown);
     assert_eq!(failed.job_label("test (sandbox)"), "test (sandbox)");
     assert_eq!(failed.job_label("nothing here"), "nothing here");
-    assert_eq!(failed.job_base_ids.get("test (runner)").map(String::as_str), Some("test"));
-    assert_eq!(failed.job_base_ids.get("test (sandbox)").map(String::as_str), Some("test"));
-    assert_eq!(failed.job_detail("test (sandbox)").map(|job| job.steps.len()), Some(6));
+    assert_eq!(
+        failed.job_base_ids.get("test (runner)").map(String::as_str),
+        Some("test")
+    );
+    assert_eq!(
+        failed
+            .job_base_ids
+            .get("test (sandbox)")
+            .map(String::as_str),
+        Some("test")
+    );
+    assert_eq!(
+        failed
+            .job_detail("test (sandbox)")
+            .map(|job| job.steps.len()),
+        Some(6)
+    );
     let dogfood = failed.job_detail("dogfood").expect("dogfood job detail");
     assert_eq!(dogfood.conclusion, "pending");
     assert!(dogfood.steps.iter().all(|step| step.started_at.is_none()));
@@ -196,7 +217,9 @@ fn runs_fixture_filters_to_the_ci_runs_that_are_red_or_running() {
 #[test]
 fn sandbox_steps_sort_into_runner_order_and_time_the_failure() {
     let failed = run(412);
-    let job = failed.job_detail("test (sandbox)").expect("sandbox job detail");
+    let job = failed
+        .job_detail("test (sandbox)")
+        .expect("sandbox job detail");
     assert_eq!(job.conclusion, "failure");
 
     let mut steps: Vec<StepRecord> = job.steps.clone();
@@ -272,7 +295,12 @@ fn live_log_chunks_assemble_the_step_output() {
     assert_eq!(lines.len(), 138);
     assert_eq!(lines.keys().next(), Some(&1204));
     assert_eq!(lines.keys().next_back(), Some(&1341));
-    assert!(lines.get(&1204).expect("line 1204").starts_with("##[group]"));
+    assert!(
+        lines
+            .get(&1204)
+            .expect("line 1204")
+            .starts_with("##[group]")
+    );
     assert_eq!(
         lines.get(&1288).map(String::as_str),
         Some("running 53 tests")
@@ -426,7 +454,10 @@ fn operator_fixtures_parse() {
     assert_eq!(secrets.secrets[0].name, "GH_TOKEN");
     assert_eq!(secrets.secrets[0].repo, None);
     assert_eq!(secrets.secrets[1].name, "DEPLOY_KEY");
-    assert_eq!(secrets.secrets[1].repo.as_deref(), Some("preloopdev/preloop"));
+    assert_eq!(
+        secrets.secrets[1].repo.as_deref(),
+        Some("preloopdev/preloop")
+    );
 }
 
 #[test]
@@ -482,7 +513,9 @@ fn feed_lines_parse_and_the_ndjson_decoder_is_chunk_agnostic() {
                 Some(CARGO_TEST_FINISHED_AT_US)
             );
             assert_eq!(
-                step.finished_at.zip(step.started_at).map(|(end, start)| end - start),
+                step.finished_at
+                    .zip(step.started_at)
+                    .map(|(end, start)| end - start),
                 Some(TimeDelta::seconds(261))
             );
         }
@@ -574,7 +607,11 @@ fn sse_live_log_decodes_and_ignores_comments_and_pings() {
             .collect::<Vec<u64>>(),
         vec![1204, 1251, 1301]
     );
-    assert!(chunks.iter().all(|chunk| chunk.step_id == CARGO_TEST_STEP_ID));
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk.step_id == CARGO_TEST_STEP_ID)
+    );
     assert!(chunks[0].value[0].starts_with("##[group]"));
     assert_eq!(
         chunks[2].value.last().map(String::as_str),

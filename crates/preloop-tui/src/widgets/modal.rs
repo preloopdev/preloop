@@ -94,7 +94,13 @@ pub fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, theme: T
 }
 
 /// Draw a help overlay listing `(keys, description)` rows, centred in `area`.
-pub fn render_help(frame: &mut Frame, area: Rect, title: &str, rows: &[(&str, &str)], theme: Theme) {
+pub fn render_help(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    rows: &[(&str, &str)],
+    theme: Theme,
+) {
     let rect = centered(area, 70, (rows.len() as u16 + 4).max(6));
     frame.render_widget(Clear, rect);
     let title = format!("─ {title} ");
@@ -118,7 +124,9 @@ mod tests {
     #[test]
     fn type_to_confirm_requires_the_exact_id() {
         let mut confirm = Confirm::new(
-            Action::PurgeRunner { name: "plr-4".into() },
+            Action::PurgeRunner {
+                name: "plr-4".into(),
+            },
             Vec::new(),
             Some("plr-4".into()),
         );

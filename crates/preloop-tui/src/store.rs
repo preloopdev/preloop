@@ -192,7 +192,11 @@ mod tests {
         log.apply(&chunk(3, &["c"]));
         assert_eq!(
             log.numbered(),
-            vec![(1, "a".to_owned()), (2, "b".to_owned()), (3, "c".to_owned())]
+            vec![
+                (1, "a".to_owned()),
+                (2, "b".to_owned()),
+                (3, "c".to_owned())
+            ]
         );
     }
 

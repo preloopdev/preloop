@@ -141,13 +141,6 @@ pub trait View: Sync {
     }
 }
 
-/// Draw a one-line placeholder for a screen that is not built yet.
-pub fn placeholder(frame: &mut Frame, area: Rect, name: &str) {
-    use ratatui::widgets::Paragraph;
-    let text = format!(" {name}: not built in this release");
-    frame.render_widget(Paragraph::new(text), area);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

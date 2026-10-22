@@ -136,7 +136,10 @@ impl View for Overview {
         }
 
         let inner = pane(frame, recent, "─ Recent runs ", false, theme);
-        frame.render_widget(Paragraph::new(recent_lines(app, inner.height as usize)), inner);
+        frame.render_widget(
+            Paragraph::new(recent_lines(app, inner.height as usize)),
+            inner,
+        );
     }
 
     fn on_key(&self, app: &mut App, key: KeyEvent) -> Vec<Effect> {
@@ -184,14 +187,23 @@ fn queue_lines(app: &App) -> Vec<Line<'static>> {
     let status = app.store.status.get();
     let jobs = status.map(|s| s.jobs.clone()).unwrap_or_default();
     let runs = status.map(|s| s.runs.clone()).unwrap_or_default();
-    let oldest = jobs
-        .oldest_ready_seconds
-        .map_or_else(|| "—".to_owned(), |seconds| fmt_age(TimeDelta::seconds(seconds as i64)));
+    let oldest = jobs.oldest_ready_seconds.map_or_else(
+        || "—".to_owned(),
+        |seconds| fmt_age(TimeDelta::seconds(seconds as i64)),
+    );
     let rows = [
         Kv::text("jobs ready", jobs.ready.to_string(), theme),
         Kv::text("claimable", jobs.claimable.to_string(), theme),
-        Kv::text("dependency blocked", jobs.dependency_blocked.to_string(), theme),
-        Kv::text("concurrency blocked", jobs.concurrency_blocked.to_string(), theme),
+        Kv::text(
+            "dependency blocked",
+            jobs.dependency_blocked.to_string(),
+            theme,
+        ),
+        Kv::text(
+            "concurrency blocked",
+            jobs.concurrency_blocked.to_string(),
+            theme,
+        ),
         Kv::text("oldest ready", oldest, theme),
         Kv::text(
             "runs queued/active",
@@ -223,15 +235,31 @@ fn pool_lines(app: &App) -> Vec<Line<'static>> {
     let status = app.store.status.get().cloned().unwrap_or_default();
     let pool = &status.pool;
     let rows = [
-        Kv::text("mode / desired", format!("{} / {}", pool.mode, pool.desired), theme),
-        Kv::text("idle / busy", format!("{} / {}", pool.idle, pool.busy), theme),
+        Kv::text(
+            "mode / desired",
+            format!("{} / {}", pool.mode, pool.desired),
+            theme,
+        ),
+        Kv::text(
+            "idle / busy",
+            format!("{} / {}", pool.idle, pool.busy),
+            theme,
+        ),
         Kv::text(
             "building · provis.",
             format!("{} · {}", pool.building, pool.provisioning),
             theme,
         ),
-        Kv::text("held for debug", status.debug.active_sessions.to_string(), theme),
-        Kv::text("released bindings", pool.released_bindings.to_string(), theme),
+        Kv::text(
+            "held for debug",
+            status.debug.active_sessions.to_string(),
+            theme,
+        ),
+        Kv::text(
+            "released bindings",
+            pool.released_bindings.to_string(),
+            theme,
+        ),
         Kv::text(
             "runners reg/stale",
             format!("{} / {}", status.runners.registered, status.runners.stale),
@@ -245,7 +273,10 @@ fn pool_lines(app: &App) -> Vec<Line<'static>> {
     let capacity = f64::from(status.runners.registered.max(1));
     lines.push(Line::from(vec![
         Span::styled(" slots ", theme.muted()),
-        Span::styled(bar(ratio(occupied, capacity), 12), theme.tone(Tone::Success)),
+        Span::styled(
+            bar(ratio(occupied, capacity), 12),
+            theme.tone(Tone::Success),
+        ),
         Span::styled(" idle·busy·held", theme.muted()),
     ]));
     lines
@@ -261,7 +292,10 @@ fn fleet_lines(app: &App) -> Vec<Line<'static>> {
             let used = total.saturating_sub(available);
             let gib = |bytes: u64| bytes as f64 / 1_073_741_824.0;
             Line::from(vec![
-                Span::styled(bar(ratio(used as f64, total as f64), 10), theme.tone(Tone::Success)),
+                Span::styled(
+                    bar(ratio(used as f64, total as f64), 10),
+                    theme.tone(Tone::Success),
+                ),
                 Span::styled(
                     format!(" {:.0}/{:.0}G", gib(used), gib(total)),
                     theme.text(),
@@ -292,7 +326,11 @@ fn fleet_lines(app: &App) -> Vec<Line<'static>> {
         .get()
         .map(|deliveries| deliveries.stats.clone())
         .unwrap_or_default();
-    let dead_tone = if stats.dead_letters > 0 { Tone::Error } else { Tone::Plain };
+    let dead_tone = if stats.dead_letters > 0 {
+        Tone::Error
+    } else {
+        Tone::Plain
+    };
 
     let mut lines = vec![
         Line::from(vec![
@@ -349,7 +387,14 @@ fn recent_lines(app: &App, height: usize) -> Vec<Line<'static>> {
         theme.muted(),
     )];
     let now = app.now;
-    for run in app.store.runs.get().into_iter().flatten().take(height.saturating_sub(2).min(5)) {
+    for run in app
+        .store
+        .runs
+        .get()
+        .into_iter()
+        .flatten()
+        .take(height.saturating_sub(2).min(5))
+    {
         let status_text = format!("{} {}", run.status.glyph(), run.status.label());
         let push = run
             .push_state
@@ -361,7 +406,10 @@ fn recent_lines(app: &App, height: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled(format!(" {:<10}", run.short_id()), theme.text()),
             Span::styled(format!("{:<5}", run.run_number), theme.text()),
-            Span::styled(format!("{status_text:<13}"), theme.tone(status_tone(run.status))),
+            Span::styled(
+                format!("{status_text:<13}"),
+                theme.tone(status_tone(run.status)),
+            ),
             Span::styled(format!("{:<19}", run.workflow_name()), theme.text()),
             Span::styled(format!("{:<15}", run.event), theme.text()),
             Span::styled(format!("{:<34}", run.ref_label()), theme.text()),

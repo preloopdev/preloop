@@ -23,7 +23,7 @@ use crate::store::LogKey;
 use crate::theme::{Theme, Tone};
 use crate::widgets::columns::{fixed_columns, pane, pane_open_bottom};
 use crate::widgets::list::{ListItem, render_list};
-use crate::widgets::log_view::{LogLine, LogView, classify, LineKind};
+use crate::widgets::log_view::{LineKind, LogLine, LogView, classify};
 use crate::widgets::text_input::TextInput;
 
 /// Columns of the four panes, from the mockup.
@@ -116,9 +116,12 @@ pub fn parse_filter(text: &str) -> Filter {
     for token in text.split_whitespace() {
         let lowered = token.to_lowercase();
         match lowered.split_once(':') {
-            Some(("status", value)) => filter
-                .statuses
-                .extend(value.split(',').filter(|v| !v.is_empty()).map(str::to_owned)),
+            Some(("status", value)) => filter.statuses.extend(
+                value
+                    .split(',')
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned),
+            ),
             Some(("workflow" | "wf", value)) => filter.workflows.push(value.to_owned()),
             Some(("event", value)) => filter.events.push(value.to_owned()),
             _ => filter.words.push(lowered),
@@ -156,7 +159,10 @@ pub fn run_matches(run: &RunRecord, filter: &Filter) -> bool {
     status_ok
         && workflow_ok
         && event_ok
-        && filter.words.iter().all(|word| haystack.contains(word.as_str()))
+        && filter
+            .words
+            .iter()
+            .all(|word| haystack.contains(word.as_str()))
 }
 
 /// Ids of the runs that pass the current filter, newest first.
@@ -214,7 +220,11 @@ pub fn default_step(steps: &[StepRecord]) -> Option<&StepRecord> {
     steps
         .iter()
         .find(|step| step.status() == ExecStatus::Failure)
-        .or_else(|| steps.iter().find(|step| step.status() == ExecStatus::InProgress))
+        .or_else(|| {
+            steps
+                .iter()
+                .find(|step| step.status() == ExecStatus::InProgress)
+        })
         .or_else(|| steps.last())
 }
 
@@ -270,7 +280,12 @@ pub enum JobRow {
 /// base id sit under a heading.
 pub fn job_rows(run: &RunRecord, now: DateTime<Utc>) -> Vec<JobRow> {
     let ids = ordered_job_ids(run);
-    let base_of = |id: &str| run.job_base_ids.get(id).cloned().unwrap_or_else(|| id.to_owned());
+    let base_of = |id: &str| {
+        run.job_base_ids
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_owned())
+    };
     let mut rows = Vec::new();
     let mut index = 0;
     while index < ids.len() {
@@ -310,7 +325,13 @@ pub fn job_rows(run: &RunRecord, now: DateTime<Utc>) -> Vec<JobRow> {
 /// `test (runner)` under base `test` shows as `runner`.
 fn leg_label(name: &str, base: &str) -> String {
     name.strip_prefix(base)
-        .map(|rest| rest.trim().trim_start_matches('(').trim_end_matches(')').trim().to_owned())
+        .map(|rest| {
+            rest.trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .trim()
+                .to_owned()
+        })
         .filter(|rest| !rest.is_empty())
         .unwrap_or_else(|| name.to_owned())
 }
@@ -406,7 +427,10 @@ pub fn log_pane(app: &App) -> LogPane {
                     .collect();
             }
             Some(slot) if slot.error.is_some() => {
-                note = Some(format!("log unavailable: {}", slot.error.clone().unwrap_or_default()));
+                note = Some(format!(
+                    "log unavailable: {}",
+                    slot.error.clone().unwrap_or_default()
+                ));
             }
             _ => note = Some("loading log…".to_owned()),
         }
@@ -462,7 +486,9 @@ fn annotation_rows(app: &App, run: &RunRecord, job: &JobDetail, step: &StepRecor
                 _ => String::new(),
             };
             [
-                format!("{marker}⚠ annotation  {location}").trim_end().to_owned(),
+                format!("{marker}⚠ annotation  {location}")
+                    .trim_end()
+                    .to_owned(),
                 format!("{marker}  {}", annotation.message),
             ]
         })
@@ -483,7 +509,8 @@ pub struct Runs;
 
 impl View for Runs {
     fn render(&self, app: &App, frame: &mut Frame, area: Rect) {
-        let [filter_row, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        let [filter_row, body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
         render_filter_bar(app, frame, filter_row);
 
         let theme = app.theme;
@@ -523,7 +550,8 @@ impl View for Runs {
             .iter()
             .position(|row| matches!(row, JobRow::Job { job_id, .. } if Some(job_id) == app.runs.job.as_ref()))
             .unwrap_or(0);
-        let [job_list, job_info] = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(inner_jobs);
+        let [job_list, job_info] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(inner_jobs);
         render_list(frame, job_list, &job_items, job_cursor, theme);
         if let (Some(run), Some(job_id)) = (selected_run, app.runs.job.as_ref()) {
             frame.render_widget(Paragraph::new(job_info_lines(app, run, job_id)), job_info);
@@ -547,19 +575,31 @@ impl View for Runs {
         let debug = selected_run.and_then(|run| debug_for_run(app, &run.run_id));
         let (log_area, debug_area) = match debug {
             Some(_) => {
-                let [top, bottom] = Layout::vertical([
-                    Constraint::Min(0),
-                    Constraint::Length(DEBUG_PANEL_ROWS),
-                ])
-                .areas(columns[3]);
+                let [top, bottom] =
+                    Layout::vertical([Constraint::Min(0), Constraint::Length(DEBUG_PANEL_ROWS)])
+                        .areas(columns[3]);
                 (top, Some(bottom))
             }
             None => (columns[3], None),
         };
-        let log_title = match app.runs.step.as_ref().and_then(|id| steps.iter().find(|s| &s.id == id)) {
+        let log_title = match app
+            .runs
+            .step
+            .as_ref()
+            .and_then(|id| steps.iter().find(|s| &s.id == id))
+        {
             Some(step) => {
-                let follow = if app.runs.log.follow { "◉ follow" } else { "○ follow" };
-                let search = app.runs.log.match_status().map(|status| format!(" · {status}")).unwrap_or_default();
+                let follow = if app.runs.log.follow {
+                    "◉ follow"
+                } else {
+                    "○ follow"
+                };
+                let search = app
+                    .runs
+                    .log
+                    .match_status()
+                    .map(|status| format!(" · {status}"))
+                    .unwrap_or_default();
                 format!("─ {} · {follow}{search} ", step.name)
             }
             None => "─ Log ".to_owned(),
@@ -712,7 +752,9 @@ fn move_selection(app: &mut App, delta: isize) -> Vec<Effect> {
     match app.runs.focus {
         Pane::Runs => {
             let visible = visible_run_ids(app);
-            let current = visible.iter().position(|id| Some(id) == app.runs.run.as_ref());
+            let current = visible
+                .iter()
+                .position(|id| Some(id) == app.runs.run.as_ref());
             let next = step_index(current, visible.len(), delta);
             app.runs.run = next.and_then(|index| visible.get(index).cloned());
             app.runs.job = None;
@@ -740,7 +782,9 @@ fn move_selection(app: &mut App, delta: isize) -> Vec<Effect> {
                 (Some(run), Some(job)) => steps_of(run, &job),
                 _ => Vec::new(),
             };
-            let current = steps.iter().position(|step| Some(&step.id) == app.runs.step.as_ref());
+            let current = steps
+                .iter()
+                .position(|step| Some(&step.id) == app.runs.step.as_ref());
             let next = step_index(current, steps.len(), delta);
             app.runs.step = next.and_then(|index| steps.get(index).map(|step| step.id.clone()));
             app.runs.reset_log();
@@ -807,7 +851,10 @@ fn open_github(app: &mut App) -> Vec<Effect> {
     let repo = run.submission.repository.clone();
     let url = match run.pr_number() {
         Some(number) => format!("https://github.com/{repo}/pull/{number}/checks"),
-        None => format!("https://github.com/{repo}/commit/{}/checks", run.submission.sha),
+        None => format!(
+            "https://github.com/{repo}/commit/{}/checks",
+            run.submission.sha
+        ),
     };
     app.run_action(Action::OpenUrl { url })
 }
@@ -831,19 +878,34 @@ fn render_filter_bar(app: &App, frame: &mut Frame, area: Rect) {
     let total = app.store.runs.get().map_or(0, Vec::len);
     let mut spans = vec![Span::styled(" / ", theme.muted())];
     spans.extend(app.runs.filter.line(theme, app.runs.filter_editing).spans);
-    spans.push(Span::styled(format!("  {visible} of {total}"), theme.muted()));
+    spans.push(Span::styled(
+        format!("  {visible} of {total}"),
+        theme.muted(),
+    ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn run_item(run: &RunRecord, now: DateTime<Utc>, theme: Theme) -> ListItem {
     let width: usize = 30;
-    let left = format!("{} #{} {}", run.status.glyph(), run.run_number, run.workflow_name().trim_end_matches(".yml").trim_end_matches(".yaml"));
+    let left = format!(
+        "{} #{} {}",
+        run.status.glyph(),
+        run.run_number,
+        run.workflow_name()
+            .trim_end_matches(".yml")
+            .trim_end_matches(".yaml")
+    );
     let age = run
         .created_at
         .map_or_else(String::new, |created| fmt_age(now - created));
-    let gap = width.saturating_sub(left.chars().count() + age.chars().count()).max(1);
+    let gap = width
+        .saturating_sub(left.chars().count() + age.chars().count())
+        .max(1);
     let first = Line::from(vec![
-        Span::styled(left, theme.tone(crate::views::overview::status_tone(run.status))),
+        Span::styled(
+            left,
+            theme.tone(crate::views::overview::status_tone(run.status)),
+        ),
         Span::styled(" ".repeat(gap), theme.text()),
         Span::styled(age, theme.muted()),
     ]);
@@ -855,7 +917,14 @@ fn job_item(row: &JobRow, theme: Theme) -> ListItem {
     match row {
         JobRow::Header { base, legs } => ListItem::header(vec![Line::from(vec![
             Span::styled(format!(" ▾ {base}"), theme.text()),
-            Span::styled(format!("{:>width$}", format!("matrix {legs}"), width = 21usize.saturating_sub(base.chars().count())), theme.muted()),
+            Span::styled(
+                format!(
+                    "{:>width$}",
+                    format!("matrix {legs}"),
+                    width = 21usize.saturating_sub(base.chars().count())
+                ),
+                theme.muted(),
+            ),
         ])]),
         JobRow::Job {
             label,
@@ -868,7 +937,10 @@ fn job_item(row: &JobRow, theme: Theme) -> ListItem {
             let duration = elapsed.map_or_else(String::new, fmt_clock);
             let label_width = 24usize.saturating_sub(prefix.len() + 2 + duration.len() + 1);
             let line = Line::from(vec![
-                Span::styled(format!("{prefix}{} ", status.glyph()), theme.tone(crate::views::overview::status_tone(*status))),
+                Span::styled(
+                    format!("{prefix}{} ", status.glyph()),
+                    theme.tone(crate::views::overview::status_tone(*status)),
+                ),
                 Span::styled(format!("{label:<label_width$}"), theme.text()),
                 Span::styled(format!("{duration:>5}"), theme.muted()),
             ]);
@@ -914,7 +986,10 @@ fn step_item(step: &StepRecord, now: DateTime<Utc>, theme: Theme) -> ListItem {
         .map_or_else(String::new, fmt_clock);
     let name: String = step.name.chars().take(12).collect();
     let line = Line::from(vec![
-        Span::styled(format!(" {} ", status.glyph()), theme.tone(crate::views::overview::status_tone(status))),
+        Span::styled(
+            format!(" {} ", status.glyph()),
+            theme.tone(crate::views::overview::status_tone(status)),
+        ),
         Span::styled(format!("{name:<12}"), theme.text()),
         Span::styled(format!("{duration:>5}"), theme.muted()),
     ]);
@@ -948,7 +1023,10 @@ fn render_log(app: &App, frame: &mut Frame, area: Rect) {
     let pane = log_pane(app);
     if pane.lines.is_empty() {
         let text = pane.note.unwrap_or_default();
-        frame.render_widget(Paragraph::new(Line::styled(format!(" {text}"), app.theme.muted())), area);
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!(" {text}"), app.theme.muted())),
+            area,
+        );
         return;
     }
     app.runs.log.render(frame, area, &pane.lines, app.theme);
@@ -961,7 +1039,9 @@ mod tests {
     use chrono::TimeZone;
 
     fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 10, 22, 12, 20, 0).single().expect("valid")
+        Utc.with_ymd_and_hms(2026, 10, 22, 12, 20, 0)
+            .single()
+            .expect("valid")
     }
 
     fn matrix_run() -> RunRecord {
@@ -981,8 +1061,10 @@ mod tests {
             run.jobs.insert(id.into(), status);
             run.job_names.insert(id.into(), name.into());
         }
-        run.job_base_ids.insert("test (runner)".into(), "test".into());
-        run.job_base_ids.insert("test (sandbox)".into(), "test".into());
+        run.job_base_ids
+            .insert("test (runner)".into(), "test".into());
+        run.job_base_ids
+            .insert("test (sandbox)".into(), "test".into());
         run
     }
 
@@ -1009,7 +1091,9 @@ mod tests {
             .iter()
             .map(|row| match row {
                 JobRow::Header { base, legs } => format!("{base} x{legs}"),
-                JobRow::Job { label, leg, .. } => format!("{}{label}", if *leg { "  " } else { "" }),
+                JobRow::Job { label, leg, .. } => {
+                    format!("{}{label}", if *leg { "  " } else { "" })
+                }
             })
             .collect();
         assert_eq!(labels, ["e2e", "fmt", "test x2", "  runner", "  sandbox"]);
@@ -1017,15 +1101,30 @@ mod tests {
 
     #[test]
     fn default_job_prefers_the_failure() {
-        assert_eq!(default_job(&matrix_run()).as_deref(), Some("test (sandbox)"));
+        assert_eq!(
+            default_job(&matrix_run()).as_deref(),
+            Some("test (sandbox)")
+        );
     }
 
     #[test]
     fn default_step_prefers_the_failed_step() {
         let steps = vec![
-            StepRecord { id: "a".into(), conclusion: "success".into(), ..Default::default() },
-            StepRecord { id: "b".into(), conclusion: "failure".into(), ..Default::default() },
-            StepRecord { id: "c".into(), conclusion: "skipped".into(), ..Default::default() },
+            StepRecord {
+                id: "a".into(),
+                conclusion: "success".into(),
+                ..Default::default()
+            },
+            StepRecord {
+                id: "b".into(),
+                conclusion: "failure".into(),
+                ..Default::default()
+            },
+            StepRecord {
+                id: "c".into(),
+                conclusion: "skipped".into(),
+                ..Default::default()
+            },
         ];
         assert_eq!(default_step(&steps).map(|s| s.id.as_str()), Some("b"));
     }

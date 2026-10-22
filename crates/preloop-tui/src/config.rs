@@ -112,7 +112,10 @@ mod tests {
 
         assert_eq!(config.contexts.len(), 2);
         assert_eq!(config.contexts[0].name, "cpane");
-        assert_eq!(config.contexts[0].engine_token_env.as_deref(), Some("CPANE_TOKEN"));
+        assert_eq!(
+            config.contexts[0].engine_token_env.as_deref(),
+            Some("CPANE_TOKEN")
+        );
         assert_eq!(config.contexts[1].engine_url, None);
         assert_eq!(config.stack.repos, vec!["preloopdev/preloop".to_owned()]);
         assert_eq!(
@@ -125,7 +128,10 @@ mod tests {
     fn rejects_duplicate_names() {
         let error = parse("[[context]]\nname = \"a\"\n[[context]]\nname = \"a\"\n")
             .expect_err("duplicate names must fail");
-        assert!(error.to_string().contains("duplicate context name"), "{error}");
+        assert!(
+            error.to_string().contains("duplicate context name"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -134,7 +140,10 @@ mod tests {
             "[[context]]\nname = \"a\"\nengine_token_env = \"X\"\nengine_token_file = \"/x\"\n",
         )
         .expect_err("two token sources must fail");
-        assert!(error.to_string().contains("both engine_token_env"), "{error}");
+        assert!(
+            error.to_string().contains("both engine_token_env"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -23,7 +23,10 @@ impl TextInput {
     /// Builds a field holding `value`, with the cursor at the end.
     pub fn new(value: &str) -> Self {
         let cursor = value.chars().count();
-        Self { value: value.to_string(), cursor }
+        Self {
+            value: value.to_string(),
+            cursor,
+        }
     }
 
     /// The current contents, without any cursor marker.

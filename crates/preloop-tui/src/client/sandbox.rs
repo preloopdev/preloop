@@ -1,56 +1,96 @@
 //! Sandbox Service access for the header, overview and sandboxes screen.
-use crate::options::SandboxTarget;
+
 use anyhow::{Context as _, anyhow};
 use preloop_sandbox::api::SandboxStateExt;
 use preloop_sandbox::{SandboxApi, SandboxClient};
 
+use crate::options::SandboxTarget;
+
+/// What the header, overview and sandboxes screen read from the service.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxSummary {
+    /// Providers the service knows.
     pub providers: Vec<ProviderRow>,
+    /// Sandboxes across all providers.
     pub sandboxes: usize,
+    /// Host memory from the first provider that reported a sample.
     pub host_mem: Option<HostMem>,
+    /// Warm pools the service defines.
     pub pools: Vec<PoolRow>,
+    /// Templates registered with the service.
     pub templates: Vec<TemplateRow>,
+    /// Sandboxes the service currently reports.
     pub sandboxes_rows: Vec<SandboxRow>,
 }
+
+/// One provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRow {
+    /// Provider name.
     pub name: String,
+    /// True while new work is refused to this provider.
     pub cordoned: bool,
+    /// Sandboxes this provider hosts.
     pub sandboxes: usize,
 }
+
+/// One warm pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolRow {
+    /// Pool name.
     pub name: String,
+    /// Template the pool provisions from.
     pub template: String,
+    /// Warm sandboxes currently available.
     pub warm: u32,
+    /// Maximum sandboxes the pool may hold.
     pub max: u32,
+    /// Sandboxes leased from this pool.
     pub leased: usize,
+    /// Lease time-to-live in seconds.
     pub lease_ttl_secs: u64,
 }
+
+/// One template.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateRow {
+    /// Template name.
     pub name: String,
+    /// One-line description (the operating system or image reference).
     pub description: String,
 }
+
+/// One sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxRow {
+    /// Sandbox id.
     pub id: String,
+    /// Upper-case state name.
     pub state: String,
+    /// Upper-case purpose name.
     pub purpose: String,
+    /// Pool the sandbox belongs to, when any.
     pub pool: String,
+    /// Last provisioning error, when any.
     pub error: String,
 }
+
+/// Host memory from a provider's last sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostMem {
+    /// Total memory in bytes.
     pub total_bytes: u64,
+    /// Memory available in bytes.
     pub available_bytes: u64,
 }
 
+/// A connected Sandbox Service client.
 pub struct SandboxHandle {
     client: SandboxClient,
 }
+
 impl SandboxHandle {
+    /// Connect to `target`. A CA, when given, is the only root trusted.
     pub fn connect(target: &SandboxTarget) -> anyhow::Result<Self> {
         let token = target.token.as_ref().map(|token| token.expose().to_owned());
         let client = match target.ca_pem.as_deref() {
@@ -61,6 +101,8 @@ impl SandboxHandle {
         .with_context(|| format!("connecting to the sandbox service at {}", target.url))?;
         Ok(Self { client })
     }
+
+    /// Providers, pools, templates, sandboxes and host memory.
     pub async fn summary(&self) -> anyhow::Result<SandboxSummary> {
         let providers = self
             .client

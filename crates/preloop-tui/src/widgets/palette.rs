@@ -212,7 +212,10 @@ mod tests {
         palette.handle_key(key(KeyCode::Down));
         palette.handle_key(key(KeyCode::Down));
         palette.handle_key(key(KeyCode::Down));
-        assert_eq!(palette.selected().map(|entry| entry.action), Some("release"));
+        assert_eq!(
+            palette.selected().map(|entry| entry.action),
+            Some("release")
+        );
         assert_eq!(palette.handle_key(key(KeyCode::Esc)), Outcome::Close);
     }
 }

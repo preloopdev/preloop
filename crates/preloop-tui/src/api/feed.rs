@@ -300,10 +300,9 @@ mod tests {
 
     #[test]
     fn live_log_chunk_is_camel_case() {
-        let chunk: LiveLogChunk = serde_json::from_str(
-            r#"{"stepId":"s","startLine":1204,"count":1,"value":["hello"]}"#,
-        )
-        .expect("camelCase wire");
+        let chunk: LiveLogChunk =
+            serde_json::from_str(r#"{"stepId":"s","startLine":1204,"count":1,"value":["hello"]}"#)
+                .expect("camelCase wire");
         assert_eq!(chunk.start_line, 1204);
         assert_eq!(chunk.value, vec!["hello".to_owned()]);
     }

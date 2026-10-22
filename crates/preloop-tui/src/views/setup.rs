@@ -8,7 +8,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use super::View;
 use crate::app::{App, Effect};
-use crate::theme::{Theme, Tone};
+use crate::theme::Tone;
 use crate::widgets::columns::pane;
 use crate::widgets::text_input::TextInput;
 use crate::wizard::{NoteLevel, WizardReply, WizardRequest};
@@ -49,7 +49,7 @@ impl State {
             WizardRequest::Choice {
                 options, default, ..
             } => {
-                self.cursor = default
+                self.cursor = (*default)
                     .min(options.len().saturating_sub(1))
                     .min(enabled_last(options));
                 self.input.clear();
@@ -192,14 +192,24 @@ impl View for Setup {
                     },
                     theme.accent(),
                 ));
-                prompt_lines.push(Line::styled("waiting for the next question…", theme.muted()));
+                prompt_lines.push(Line::styled(
+                    "waiting for the next question…",
+                    theme.muted(),
+                ));
+            }
+            Some(WizardRequest::Note { .. }) => {
+                prompt_lines.push(Line::styled("working…", theme.muted()));
             }
             Some(WizardRequest::Choice {
                 prompt, options, ..
             }) => {
                 prompt_lines.push(Line::styled(prompt.clone(), theme.accent()));
                 for (index, option) in options.iter().enumerate() {
-                    let marker = if index == app.setup.cursor { "›" } else { " " };
+                    let marker = if index == app.setup.cursor {
+                        "›"
+                    } else {
+                        " "
+                    };
                     let style = if !option.enabled {
                         theme.muted()
                     } else if index == app.setup.cursor {
@@ -208,18 +218,44 @@ impl View for Setup {
                         theme.text()
                     };
                     prompt_lines.push(Line::styled(
-                        format!("{marker} {}{}", option.label, option.detail.as_deref().map_or(String::new(), |detail| format!(" — {detail}"))),
+                        format!(
+                            "{marker} {}{}",
+                            option.label,
+                            option
+                                .detail
+                                .as_deref()
+                                .map_or(String::new(), |detail| format!(" — {detail}"))
+                        ),
                         style,
                     ));
                 }
             }
-            Some(WizardRequest::Confirm { prompt, default, .. }) => {
+            Some(WizardRequest::Confirm {
+                prompt, default, ..
+            }) => {
                 prompt_lines.push(Line::styled(prompt.clone(), theme.accent()));
                 let selected = if app.setup.cursor == 1 { "yes" } else { "no" };
                 prompt_lines.push(Line::from(vec![
-                    Span::styled("  y/yes  ", theme.tone(if selected == "yes" { Tone::Accent } else { Tone::Muted })),
-                    Span::styled("n/no", theme.tone(if selected == "no" { Tone::Accent } else { Tone::Muted })),
-                    Span::styled(format!("  (default: {})", if *default { "yes" } else { "no" }), theme.muted()),
+                    Span::styled(
+                        "  y/yes  ",
+                        theme.tone(if selected == "yes" {
+                            Tone::Accent
+                        } else {
+                            Tone::Muted
+                        }),
+                    ),
+                    Span::styled(
+                        "n/no",
+                        theme.tone(if selected == "no" {
+                            Tone::Accent
+                        } else {
+                            Tone::Muted
+                        }),
+                    ),
+                    Span::styled(
+                        format!("  (default: {})", if *default { "yes" } else { "no" }),
+                        theme.muted(),
+                    ),
                 ]));
             }
             Some(WizardRequest::Text { prompt, help, .. }) => {
@@ -245,17 +281,26 @@ impl View for Setup {
                     summary.clone(),
                     theme.tone(if *ok { Tone::Success } else { Tone::Error }),
                 ));
-                prompt_lines.push(Line::styled("press s to run setup again, or choose another view", theme.muted()));
+                prompt_lines.push(Line::styled(
+                    "press s to run setup again, or choose another view",
+                    theme.muted(),
+                ));
             }
             None if app.setup.running => {
                 prompt_lines.push(Line::styled("starting setup wizard…", theme.accent()));
             }
             None => {
                 prompt_lines.push(Line::styled("Setup is ready.", theme.accent()));
-                prompt_lines.push(Line::styled("Press s or choose “setup wizard” from the palette.", theme.muted()));
+                prompt_lines.push(Line::styled(
+                    "Press s or choose “setup wizard” from the palette.",
+                    theme.muted(),
+                ));
             }
         }
-        frame.render_widget(Paragraph::new(prompt_lines).wrap(Wrap { trim: true }), prompt);
+        frame.render_widget(
+            Paragraph::new(prompt_lines).wrap(Wrap { trim: true }),
+            prompt,
+        );
     }
 
     fn on_key(&self, app: &mut App, key: KeyEvent) -> Vec<Effect> {
@@ -331,7 +376,10 @@ mod tests {
             default: 1,
         });
         assert_eq!(state.cursor, 1);
-        assert_eq!(state.on_key(key(KeyCode::Enter)), Some((WizardReply::Choice(1), false)));
+        assert_eq!(
+            state.on_key(key(KeyCode::Enter)),
+            Some((WizardReply::Choice(1), false))
+        );
     }
 
     #[test]
@@ -343,6 +391,9 @@ mod tests {
             default: None,
             help: None,
         });
-        assert_eq!(state.on_key(key(KeyCode::Esc)), Some((WizardReply::Cancel, true)));
+        assert_eq!(
+            state.on_key(key(KeyCode::Esc)),
+            Some((WizardReply::Cancel, true))
+        );
     }
 }

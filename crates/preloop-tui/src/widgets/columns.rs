@@ -19,7 +19,11 @@ pub fn fixed_columns(area: Rect, widths: &[u16]) -> Vec<Rect> {
     for (index, width) in widths.iter().enumerate() {
         let remaining = right.saturating_sub(x);
         let is_last = index + 1 == widths.len();
-        let width = if is_last { remaining } else { (*width).min(remaining) };
+        let width = if is_last {
+            remaining
+        } else {
+            (*width).min(remaining)
+        };
         out.push(Rect::new(x, area.y, width, area.height));
         x = x.saturating_add(width);
     }
@@ -55,7 +59,11 @@ pub fn pane_open_bottom(
 }
 
 fn pane_block<'a>(title: &'a str, focused: bool, theme: Theme, borders: Borders) -> Block<'a> {
-    let title_style = if focused { theme.accent() } else { theme.text() };
+    let title_style = if focused {
+        theme.accent()
+    } else {
+        theme.text()
+    };
     Block::default()
         .borders(borders)
         .border_type(BorderType::Plain)

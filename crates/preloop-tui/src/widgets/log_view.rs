@@ -88,7 +88,11 @@ fn skip_one_sgr(s: &str) -> Option<&str> {
     while idx < bytes.len() && (bytes[idx].is_ascii_digit() || bytes[idx] == b';') {
         idx += 1;
     }
-    if idx < bytes.len() && bytes[idx] == b'm' { Some(&s[idx + 1..]) } else { None }
+    if idx < bytes.len() && bytes[idx] == b'm' {
+        Some(&s[idx + 1..])
+    } else {
+        None
+    }
 }
 
 /// Parses `text` for ANSI CSI escapes (`ESC [ params final-byte`). Only
@@ -126,7 +130,10 @@ pub fn parse_ansi(text: &str, base: Style, color: bool) -> Vec<Span<'static>> {
 
         if style != current_style {
             if !current_text.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut current_text), current_style));
+                spans.push(Span::styled(
+                    std::mem::take(&mut current_text),
+                    current_style,
+                ));
             }
             current_style = style;
         }
@@ -149,7 +156,10 @@ fn apply_sgr(style: Style, base: Style, params: &str, color: bool) -> Style {
     let codes: Vec<i64> = if params.is_empty() {
         vec![0]
     } else {
-        params.split(';').map(|p| p.parse::<i64>().unwrap_or(0)).collect()
+        params
+            .split(';')
+            .map(|p| p.parse::<i64>().unwrap_or(0))
+            .collect()
     };
 
     let mut style = style;
@@ -162,7 +172,11 @@ fn apply_sgr(style: Style, base: Style, params: &str, color: bool) -> Style {
             3 => style = style.add_modifier(Modifier::ITALIC),
             4 => style = style.add_modifier(Modifier::UNDERLINED),
             7 => style = style.add_modifier(Modifier::REVERSED),
-            22 => style = style.remove_modifier(Modifier::BOLD).remove_modifier(Modifier::DIM),
+            22 => {
+                style = style
+                    .remove_modifier(Modifier::BOLD)
+                    .remove_modifier(Modifier::DIM)
+            }
             23 => style = style.remove_modifier(Modifier::ITALIC),
             24 => style = style.remove_modifier(Modifier::UNDERLINED),
             27 => style = style.remove_modifier(Modifier::REVERSED),
@@ -205,7 +219,14 @@ fn extended_color(codes: &[i64], idx: usize, color: bool) -> Option<(usize, Opti
         Some(5) => {
             let n = codes.get(idx + 2).copied()?;
             let indexed = u8::try_from(n).ok();
-            Some((idx + 2, if color { indexed.map(Color::Indexed) } else { None }))
+            Some((
+                idx + 2,
+                if color {
+                    indexed.map(Color::Indexed)
+                } else {
+                    None
+                },
+            ))
         }
         Some(2) => {
             let r = codes.get(idx + 2).copied()?;
@@ -215,7 +236,14 @@ fn extended_color(codes: &[i64], idx: usize, color: bool) -> Option<(usize, Opti
                 (Ok(r), Ok(g), Ok(b)) => Some((r, g, b)),
                 _ => None,
             };
-            Some((idx + 4, if color { rgb.map(|(r, g, b)| Color::Rgb(r, g, b)) } else { None }))
+            Some((
+                idx + 4,
+                if color {
+                    rgb.map(|(r, g, b)| Color::Rgb(r, g, b))
+                } else {
+                    None
+                },
+            ))
         }
         _ => None,
     }
@@ -368,7 +396,11 @@ impl LogView {
     pub fn scroll(&mut self, delta: isize, lines: &[LogLine], height: usize) {
         let rows = self.visible_rows(lines);
         let max_top = rows.len().saturating_sub(height);
-        let effective = if self.follow { max_top } else { self.top.min(max_top) };
+        let effective = if self.follow {
+            max_top
+        } else {
+            self.top.min(max_top)
+        };
         let next = effective.saturating_add_signed(delta).min(max_top);
         self.top = next;
         self.follow = false;
@@ -423,8 +455,11 @@ impl LogView {
         if self.matches.is_empty() {
             return;
         }
-        self.match_cursor =
-            if self.match_cursor == 0 { self.matches.len() - 1 } else { self.match_cursor - 1 };
+        self.match_cursor = if self.match_cursor == 0 {
+            self.matches.len() - 1
+        } else {
+            self.match_cursor - 1
+        };
         let index = self.matches[self.match_cursor];
         self.reveal(lines, index);
     }
@@ -462,9 +497,18 @@ impl LogView {
         }
         let height = area.height as usize;
         let max_top = rows.len().saturating_sub(height);
-        let top = if self.follow { max_top } else { self.top.min(max_top) };
+        let top = if self.follow {
+            max_top
+        } else {
+            self.top.min(max_top)
+        };
 
-        let number_width = lines.iter().map(|l| l.number.to_string().len()).max().unwrap_or(1).max(1);
+        let number_width = lines
+            .iter()
+            .map(|l| l.number.to_string().len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
         let current_match_row = self.matches.get(self.match_cursor).copied();
 
         for (screen_row, &row_index) in rows.iter().enumerate().skip(top).take(height) {
@@ -472,8 +516,10 @@ impl LogView {
             let line = &lines[row_index];
             let kind = classify(&line.text);
 
-            let mut spans: Vec<Span<'static>> =
-                vec![Span::styled(format!("{:>number_width$} ", line.number), theme.muted())];
+            let mut spans: Vec<Span<'static>> = vec![Span::styled(
+                format!("{:>number_width$} ", line.number),
+                theme.muted(),
+            )];
 
             match kind {
                 LineKind::GroupStart => {
@@ -489,16 +535,27 @@ impl LogView {
                         spans.push(Span::styled(format!(" ({count} lines)"), theme.muted()));
                     }
                 }
-                LineKind::Error => spans.push(Span::styled(line.text.clone(), theme.tone(Tone::Error))),
+                LineKind::Error => {
+                    spans.push(Span::styled(line.text.clone(), theme.tone(Tone::Error)))
+                }
                 LineKind::Warning => {
                     spans.push(Span::styled(line.text.clone(), theme.tone(Tone::Warning)));
                 }
-                LineKind::Notice => spans.push(Span::styled(line.text.clone(), theme.tone(Tone::Accent))),
-                LineKind::Plain => spans.extend(parse_ansi(&line.text, theme.text(), theme.is_color())),
+                LineKind::Notice => {
+                    spans.push(Span::styled(line.text.clone(), theme.tone(Tone::Accent)))
+                }
+                LineKind::Plain => {
+                    spans.extend(parse_ansi(&line.text, theme.text(), theme.is_color()))
+                }
                 LineKind::GroupEnd => {}
             }
 
-            let row_area = Rect { x: area.x, y: area.y + offset as u16, width: area.width, height: 1 };
+            let row_area = Rect {
+                x: area.x,
+                y: area.y + offset as u16,
+                width: area.width,
+                height: 1,
+            };
             let paragraph = if current_match_row == Some(row_index) {
                 Paragraph::new(Line::from(spans)).style(theme.selected())
             } else {
@@ -520,7 +577,10 @@ mod tests {
     use super::*;
 
     fn line(number: u64, text: &str) -> LogLine {
-        LogLine { number, text: text.to_string() }
+        LogLine {
+            number,
+            text: text.to_string(),
+        }
     }
 
     fn span_text(spans: &[Span<'static>]) -> String {

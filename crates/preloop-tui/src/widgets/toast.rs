@@ -36,8 +36,11 @@ pub fn render_toasts(frame: &mut Frame, area: Rect, toasts: &[Toast], theme: The
         let rect = Rect::new(x, y, width, 1);
         frame.render_widget(Clear, rect);
         frame.render_widget(
-            Paragraph::new(Line::styled(text, theme.tone(toast.tone).bg(crate::theme::SELECTION)))
-                .alignment(ratatui::layout::Alignment::Right),
+            Paragraph::new(Line::styled(
+                text,
+                theme.tone(toast.tone).bg(crate::theme::SELECTION),
+            ))
+            .alignment(ratatui::layout::Alignment::Right),
             rect,
         );
     }

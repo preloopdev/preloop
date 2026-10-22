@@ -143,7 +143,12 @@ mod tests {
     fn monochrome_drops_colour_but_keeps_emphasis() {
         let theme = Theme::monochrome();
         assert_eq!(theme.tone(Tone::Error).fg, None);
-        assert!(theme.tone(Tone::Error).add_modifier.contains(Modifier::BOLD));
+        assert!(
+            theme
+                .tone(Tone::Error)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert!(theme.selected().add_modifier.contains(Modifier::REVERSED));
     }
 

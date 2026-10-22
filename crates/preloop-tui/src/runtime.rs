@@ -12,9 +12,8 @@
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Stdout};
-use std::sync::Arc;
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once, mpsc as std_mpsc};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -40,6 +39,7 @@ use crate::options::{Hooks, Options};
 use crate::theme::Theme;
 use crate::views::ViewKind;
 use crate::widgets::{chrome, modal, palette, toast};
+use crate::wizard::WizardReply;
 
 /// Period of the `Msg::Tick` the app uses for its clock and refresh timers.
 const TICK: Duration = Duration::from_millis(250);
@@ -117,6 +117,7 @@ async fn async_main(options: Options, hooks: Hooks) -> anyhow::Result<()> {
         streams: HashMap::new(),
         hooks: Arc::new(hooks),
         paused: Arc::clone(&paused),
+        wizard_replies: None,
     };
     let startup = app.startup();
     let mut quit = executor.run(startup, &mut terminal);
@@ -266,6 +267,7 @@ struct Executor {
     streams: HashMap<StreamKind, JoinHandle<()>>,
     hooks: Arc<Hooks>,
     paused: Arc<AtomicBool>,
+    wizard_replies: Option<std_mpsc::Sender<WizardReply>>,
 }
 
 impl Executor {
@@ -284,6 +286,11 @@ impl Executor {
                 Effect::SwitchContext(index) => {
                     self.close_all();
                     self.current = index;
+                }
+                Effect::WizardReply(reply) => {
+                    if let Some(sender) = &self.wizard_replies {
+                        let _ = sender.send(reply);
+                    }
                 }
                 Effect::Quit => return true,
             }
@@ -359,10 +366,23 @@ impl Executor {
             }
             Action::RunWizard => {
                 let hooks = Arc::clone(&self.hooks);
+                let tx_requests = self.tx.clone();
+                let tx_done = tx.clone();
+                let (port, ui) = crate::wizard::channel();
+                self.wizard_replies = Some(ui.replies.clone());
                 tokio::task::spawn_blocking(move || {
-                    let (port, _ui) = crate::wizard::channel();
+                    while let Ok(request) = ui.requests.recv() {
+                        if tx_requests.send(Msg::WizardRequest(request)).is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::task::spawn_blocking(move || {
                     let result = (hooks.run_wizard)(port).map_err(|error| format!("{error:#}"));
-                    let _ = tx.send(Msg::Hook { label, result });
+                    let _ = tx_done.send(Msg::Hook {
+                        label: "setup wizard".to_owned(),
+                        result,
+                    });
                 });
             }
             Action::OpenUrl { url } => {
@@ -418,7 +438,11 @@ async fn run_fetch(fetch: Fetch, clients: ContextClients) -> Msg {
         Fetch::WebhookHealth => Fetched::WebhookHealth(engine.webhook_health().await.map_err(text)),
         Fetch::Debug => Fetched::Debug(engine.debug_sessions().await.map_err(text)),
         Fetch::Runners => Fetched::Runners(engine.runners(None).await.map_err(text)),
-        Fetch::Stack(config) => Fetched::Stack(crate::client::github::stack(&config).await.map_err(|error| format!("{error:#}"))),
+        Fetch::Stack(config) => Fetched::Stack(
+            crate::client::github::stack(&config)
+                .await
+                .map_err(|error| format!("{error:#}")),
+        ),
         Fetch::Sandbox => {
             if !clients.has_sandbox {
                 Fetched::Sandbox(Err("no sandbox configured".to_owned()))

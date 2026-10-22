@@ -332,13 +332,12 @@ impl EngineClient {
         operation: &str,
         step_index: Option<usize>,
     ) -> Result<Value, EngineError> {
-        let base = self.url(&["api", "v1", "debug", "sessions", session_id]);
+        let lease_url = self.url(&["api", "v1", "debug", "sessions", session_id, "lease"]);
+        let operations_url =
+            self.url(&["api", "v1", "debug", "sessions", session_id, "operations"]);
         let lease: Value = self
             .send_json(
-                self.post(base.join("lease").map_err(|e| EngineError::Url {
-                    url: base.to_string(),
-                    reason: e.to_string(),
-                })?)
+                self.post(lease_url.clone())
                 .json(&json!({
                     "controller": "preloop-tui",
                     "capabilities": ["step.retry", "job.retry_from", "job.continue", "job.abort"]
@@ -365,24 +364,16 @@ impl EngineClient {
         }
         let response = self
             .send_json(
-                self.post(base.join("operations").map_err(|e| EngineError::Url {
-                    url: base.to_string(),
-                    reason: e.to_string(),
-                })?)
-                .json(&body)
-                .timeout(REQUEST_TIMEOUT),
+                self.post(operations_url)
+                    .json(&body)
+                    .timeout(REQUEST_TIMEOUT),
             )
             .await;
         let _ = self
             .send_json::<Value>(
-                self.authorize(self.http.delete(base.join("lease").map_err(|e| {
-                    EngineError::Url {
-                        url: base.to_string(),
-                        reason: e.to_string(),
-                    }
-                })?))
-                .json(&json!({"lease_id": lease_id}))
-                .timeout(REQUEST_TIMEOUT),
+                self.authorize(self.http.delete(lease_url))
+                    .json(&json!({"lease_id": lease_id}))
+                    .timeout(REQUEST_TIMEOUT),
             )
             .await;
         response

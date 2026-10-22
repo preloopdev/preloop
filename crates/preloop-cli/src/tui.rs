@@ -6,6 +6,8 @@
 //! default context, and the environment overrides for the local Sandbox
 //! Service. The hooks cover the three actions that need the CLI binary.
 
+use crate::init;
+use crate::prompter::{self, ChoiceOption, NoteLevel, Prompter};
 use std::io::IsTerminal as _;
 use std::path::Path;
 
@@ -81,12 +83,23 @@ fn resolve_contexts_from_config(
 /// Service and must not be sent to a remote one.
 fn context_from_config(config: &ContextConfig) -> Context {
     let engine_token = match &config.engine_token_env {
-        Some(name) => std::env::var(name).ok().and_then(non_empty).map(Secret::new),
-        None => config.engine_token_file.as_deref().and_then(read_secret).map(Secret::new),
+        Some(name) => std::env::var(name)
+            .ok()
+            .and_then(non_empty)
+            .map(Secret::new),
+        None => config
+            .engine_token_file
+            .as_deref()
+            .and_then(read_secret)
+            .map(Secret::new),
     };
     let sandbox = config.sandbox_url.as_ref().map(|url| SandboxTarget {
         url: url.clone(),
-        token: config.sandbox_token_file.as_deref().and_then(read_secret).map(Secret::new),
+        token: config
+            .sandbox_token_file
+            .as_deref()
+            .and_then(read_secret)
+            .map(Secret::new),
         ca_pem: config.sandbox_ca_file.as_deref().and_then(read_text),
     });
     Context {
@@ -204,9 +217,131 @@ fn start_engine(home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The setup wizard is not part of this build yet.
-fn run_wizard(_port: preloop_tui::wizard::WizardPort) -> anyhow::Result<()> {
-    anyhow::bail!("the setup wizard is not available in this build yet")
+struct TuiPrompter {
+    port: preloop_tui::wizard::WizardPort,
+}
+
+impl TuiPrompter {
+    fn send(&self, request: preloop_tui::wizard::WizardRequest) -> anyhow::Result<()> {
+        self.port
+            .requests
+            .send(request)
+            .map_err(|_| prompter::cancelled_with("setup wizard UI closed"))
+    }
+
+    fn receive(&mut self) -> anyhow::Result<preloop_tui::wizard::WizardReply> {
+        self.port
+            .replies
+            .recv()
+            .map_err(|_| prompter::cancelled_with("setup wizard UI closed"))
+    }
+}
+
+impl Prompter for TuiPrompter {
+    fn section(&mut self, step: usize, total: usize, title: &str) {
+        let _ = self.send(preloop_tui::wizard::WizardRequest::Section {
+            title: title.to_owned(),
+            step,
+            total,
+        });
+    }
+
+    fn note(&mut self, level: NoteLevel, text: &str) {
+        let level = match level {
+            NoteLevel::Info => preloop_tui::wizard::NoteLevel::Info,
+            NoteLevel::Success => preloop_tui::wizard::NoteLevel::Success,
+            NoteLevel::Warning => preloop_tui::wizard::NoteLevel::Warning,
+            NoteLevel::Error => preloop_tui::wizard::NoteLevel::Error,
+        };
+        let _ = self.send(preloop_tui::wizard::WizardRequest::Note {
+            text: text.to_owned(),
+            level,
+        });
+    }
+
+    fn choice(
+        &mut self,
+        prompt: &str,
+        options: &[ChoiceOption],
+        default: usize,
+    ) -> anyhow::Result<usize> {
+        let options = options
+            .iter()
+            .map(|option| preloop_tui::wizard::WizardOption {
+                label: option.label.clone(),
+                detail: (!option.detail.is_empty()).then(|| option.detail.clone()),
+                enabled: option.enabled,
+            })
+            .collect();
+        self.send(preloop_tui::wizard::WizardRequest::Choice {
+            prompt: prompt.to_owned(),
+            options,
+            default,
+        })?;
+        match self.receive()? {
+            preloop_tui::wizard::WizardReply::Choice(index) => Ok(index),
+            preloop_tui::wizard::WizardReply::Cancel => Err(prompter::cancelled()),
+            _ => anyhow::bail!("setup wizard received an invalid choice reply"),
+        }
+    }
+
+    fn confirm(&mut self, prompt: &str, default: bool) -> anyhow::Result<bool> {
+        self.send(preloop_tui::wizard::WizardRequest::Confirm {
+            prompt: prompt.to_owned(),
+            default,
+        })?;
+        match self.receive()? {
+            preloop_tui::wizard::WizardReply::Confirm(value) => Ok(value),
+            preloop_tui::wizard::WizardReply::Cancel => Err(prompter::cancelled()),
+            _ => anyhow::bail!("setup wizard received an invalid confirm reply"),
+        }
+    }
+
+    fn text(
+        &mut self,
+        prompt: &str,
+        default: Option<&str>,
+        help: Option<&str>,
+    ) -> anyhow::Result<String> {
+        self.send(preloop_tui::wizard::WizardRequest::Text {
+            prompt: prompt.to_owned(),
+            default: default.map(str::to_owned),
+            help: help.map(str::to_owned),
+        })?;
+        match self.receive()? {
+            preloop_tui::wizard::WizardReply::Text(value) => Ok(value),
+            preloop_tui::wizard::WizardReply::Cancel => Err(prompter::cancelled()),
+            _ => anyhow::bail!("setup wizard received an invalid text reply"),
+        }
+    }
+
+    fn secret(&mut self, prompt: &str) -> anyhow::Result<String> {
+        self.send(preloop_tui::wizard::WizardRequest::Secret {
+            prompt: prompt.to_owned(),
+        })?;
+        match self.receive()? {
+            preloop_tui::wizard::WizardReply::Secret(value) => Ok(value),
+            preloop_tui::wizard::WizardReply::Cancel => Err(prompter::cancelled()),
+            _ => anyhow::bail!("setup wizard received an invalid secret reply"),
+        }
+    }
+
+    fn progress(&mut self, label: &str) {
+        let _ = self.send(preloop_tui::wizard::WizardRequest::Progress {
+            label: label.to_owned(),
+        });
+    }
+}
+
+fn run_wizard(port: preloop_tui::wizard::WizardPort) -> anyhow::Result<()> {
+    std::thread::spawn(move || {
+        let mut prompter = TuiPrompter { port };
+        let options = init::WizardOptions::embedded(init::InitArgs::default());
+        init::run_wizard(&mut prompter, options)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("setup wizard thread panicked"))??;
+    Ok(())
 }
 
 /// Run this same binary with `args` in the foreground and return its exit

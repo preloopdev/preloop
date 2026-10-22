@@ -48,7 +48,10 @@ pub fn header(frame: &mut Frame, area: Rect, info: &HeaderInfo, theme: Theme) {
         Span::styled(info.context.clone(), theme.text()),
         Span::styled(" ● ", theme.tone(dot_tone)),
         Span::styled(health_word, theme.tone(dot_tone)),
-        Span::styled(format!("  {} · up {}", info.version, info.uptime), theme.text()),
+        Span::styled(
+            format!("  {} · up {}", info.version, info.uptime),
+            theme.text(),
+        ),
     ];
 
     let mut right = vec![Span::styled(
@@ -152,7 +155,10 @@ mod tests {
             .draw(|frame| header(frame, frame.area(), &info, Theme::monochrome()))
             .expect("draw");
         let text = row_text(&terminal, 0);
-        assert!(text.starts_with(" preloop  ctx cpane ● healthy  0.21.0 · up 3d04h"), "{text:?}");
+        assert!(
+            text.starts_with(" preloop  ctx cpane ● healthy  0.21.0 · up 3d04h"),
+            "{text:?}"
+        );
         assert!(text.ends_with("sbx ● 2 prov     "), "{text:?}");
         assert_eq!(text.chars().count(), 120);
         assert_eq!(text.chars().position(|c| c == 'q'), Some(62));
@@ -162,7 +168,14 @@ mod tests {
     fn banner_names_the_setup_keys() {
         let mut terminal = Terminal::new(TestBackend::new(60, 1)).expect("test terminal");
         terminal
-            .draw(|frame| banner(frame, frame.area(), "no engine at http://x", Theme::monochrome()))
+            .draw(|frame| {
+                banner(
+                    frame,
+                    frame.area(),
+                    "no engine at http://x",
+                    Theme::monochrome(),
+                )
+            })
             .expect("draw");
         assert!(row_text(&terminal, 0).contains("no engine at http://x"));
     }

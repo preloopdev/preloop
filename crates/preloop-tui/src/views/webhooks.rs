@@ -116,17 +116,16 @@ impl View for Webhooks {
         );
     }
     fn on_key(&self, app: &mut App, key: KeyEvent) -> Vec<Effect> {
-        if key.code == KeyCode::Char('R') {
-            if let Some(d) = app
+        if key.code == KeyCode::Char('R')
+            && let Some(d) = app
                 .store
                 .webhooks
                 .get()
                 .and_then(|x| x.deliveries.iter().find(|d| d.state == "failed"))
-            {
-                return app.run_action(Action::ReplayDelivery {
-                    delivery_id: d.delivery_id.clone(),
-                });
-            }
+        {
+            return app.run_action(Action::ReplayDelivery {
+                delivery_id: d.delivery_id.clone(),
+            });
         }
         Vec::new()
     }

@@ -332,7 +332,10 @@ mod tests {
     #[test]
     fn conclusions_map_to_statuses() {
         assert_eq!(ExecStatus::from_conclusion("failed"), ExecStatus::Failure);
-        assert_eq!(ExecStatus::from_conclusion("in_progress"), ExecStatus::InProgress);
+        assert_eq!(
+            ExecStatus::from_conclusion("in_progress"),
+            ExecStatus::InProgress
+        );
         assert_eq!(ExecStatus::from_conclusion("weird"), ExecStatus::Unknown);
     }
 
@@ -346,9 +349,21 @@ mod tests {
     #[test]
     fn sort_steps_orders_by_runner_number_then_index() {
         let mut steps = vec![
-            StepRecord { id: "b".into(), runner_number: Some(3), ..Default::default() },
-            StepRecord { id: "a".into(), runner_number: Some(2), ..Default::default() },
-            StepRecord { id: "setup".into(), runner_number: Some(1), ..Default::default() },
+            StepRecord {
+                id: "b".into(),
+                runner_number: Some(3),
+                ..Default::default()
+            },
+            StepRecord {
+                id: "a".into(),
+                runner_number: Some(2),
+                ..Default::default()
+            },
+            StepRecord {
+                id: "setup".into(),
+                runner_number: Some(1),
+                ..Default::default()
+            },
         ];
         sort_steps(&mut steps);
         let order: Vec<&str> = steps.iter().map(|step| step.id.as_str()).collect();

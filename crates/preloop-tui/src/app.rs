@@ -20,11 +20,12 @@ use crate::detectors::{self, LeakedBindingTracker, fmt_age};
 use crate::options::StartView;
 use crate::store::{LogKey, Store};
 use crate::theme::{Theme, Tone};
-use crate::views::{ViewKind, overview, runs, stack};
+use crate::views::{ViewKind, overview, runs, setup, stack};
 use crate::widgets::chrome::HeaderInfo;
 use crate::widgets::modal::Confirm;
 use crate::widgets::palette::{Outcome, Palette, PaletteEntry};
 use crate::widgets::toast::Toast;
+use crate::wizard::{WizardReply, WizardRequest};
 
 /// How often the data behind the open screen is refreshed.
 pub const REFRESH_EVERY: TimeDelta = TimeDelta::seconds(5);
@@ -134,6 +135,8 @@ pub enum Msg {
     },
     /// The debug shell-out returned.
     ShellOutDone(Result<i32, String>),
+    /// A request from the setup wizard thread.
+    WizardRequest(WizardRequest),
 }
 
 /// A one-shot read the runtime performs.
@@ -208,6 +211,8 @@ pub enum Effect {
     SwitchContext(usize),
     /// Leave the TUI.
     Quit,
+    /// Reply to the setup wizard's current prompt.
+    WizardReply(WizardReply),
 }
 
 /// What the palette can run.
@@ -257,6 +262,8 @@ pub struct App {
     /// Stack screen configuration and cursor state.
     pub stack_config: StackConfig,
     pub stack: stack::State,
+    /// Setup wizard state and the current request/reply form.
+    pub setup: setup::State,
     /// Leaked-binding tracker, fed by every status snapshot.
     pub tracker: LeakedBindingTracker,
     /// Streams the app wants open.
@@ -299,6 +306,7 @@ impl App {
             runs: runs::State::default(),
             stack_config: StackConfig::default(),
             stack: stack::State::default(),
+            setup: setup::State::default(),
             tracker: LeakedBindingTracker::default(),
             streams: Streams::default(),
             engine_down: None,
@@ -455,6 +463,12 @@ impl App {
                     Ok(()) => self.toast(format!("{label} started"), Tone::Success),
                     Err(error) => self.toast(format!("{label}: {error}"), Tone::Error),
                 }
+                Vec::new()
+            }
+            Msg::WizardRequest(request) => {
+                self.setup.receive(request);
+                self.view = ViewKind::Setup;
+                self.dirty = true;
                 Vec::new()
             }
             Msg::ShellOutDone(result) => {
@@ -616,7 +630,9 @@ impl App {
             }
             FeedEvent::RunAccepted { .. } | FeedEvent::Other(_) => {}
         }
-        if let Some(events) = self.streams.events.as_mut() && events.0 == run_id {
+        if let Some(events) = self.streams.events.as_mut()
+            && events.0 == run_id
+        {
             events.1 = 0;
         }
     }
@@ -730,20 +746,20 @@ impl App {
         if let Some(prefix) = self.runs.pending.clone()
             && let Some(runs) = self.store.runs.get()
         {
-                let found = runs
-                    .iter()
-                    .find(|run| run.run_id.starts_with(&prefix))
-                    .map(|run| run.run_id.clone());
-                self.runs.pending = None;
-                match found {
-                    Some(id) => {
-                        self.runs.run = Some(id);
-                        self.runs.job = None;
-                        self.runs.step = None;
-                    }
-                    None => self.toast(format!("no run matches {prefix}"), Tone::Error),
+            let found = runs
+                .iter()
+                .find(|run| run.run_id.starts_with(&prefix))
+                .map(|run| run.run_id.clone());
+            self.runs.pending = None;
+            match found {
+                Some(id) => {
+                    self.runs.run = Some(id);
+                    self.runs.job = None;
+                    self.runs.step = None;
                 }
+                None => self.toast(format!("no run matches {prefix}"), Tone::Error),
             }
+        }
 
         let visible = runs::visible_run_ids(self);
         let selected_visible = self
@@ -757,20 +773,11 @@ impl App {
             self.runs.step = None;
         }
 
-        let Some(run) = self
-            .runs
-            .run
-            .as_deref()
-            .and_then(|id| self.store.run(id))
-        else {
+        let Some(run) = self.runs.run.as_deref().and_then(|id| self.store.run(id)) else {
             return;
         };
         let jobs = runs::leaf_job_ids(run);
-        let job_known = self
-            .runs
-            .job
-            .as_ref()
-            .is_some_and(|job| jobs.contains(job));
+        let job_known = self.runs.job.as_ref().is_some_and(|job| jobs.contains(job));
         if !job_known {
             self.runs.job = runs::default_job(run);
             self.runs.step = None;
@@ -852,7 +859,14 @@ impl App {
             .details
             .get(&run_id)
             .is_none_or(|slot| slot.data.is_none() && slot.error.is_none());
-        if detail_missing && self.store.details.entry(run_id.clone()).or_default().begin() {
+        if detail_missing
+            && self
+                .store
+                .details
+                .entry(run_id.clone())
+                .or_default()
+                .begin()
+        {
             effects.push(Effect::Fetch(Fetch::RunDetail(run_id.clone())));
         }
         if let Some(key) = runs::finished_log_key(self) {
@@ -893,7 +907,12 @@ impl App {
             effects.push(Effect::Fetch(Fetch::Stack(self.stack_config.clone())));
         }
         if let Some(run_id) = self.runs.run.clone()
-            && self.store.details.entry(run_id.clone()).or_default().begin()
+            && self
+                .store
+                .details
+                .entry(run_id.clone())
+                .or_default()
+                .begin()
         {
             effects.push(Effect::Fetch(Fetch::RunDetail(run_id)));
         }
@@ -906,7 +925,12 @@ impl App {
             effects.push(Effect::Fetch(Fetch::Runs));
         }
         if let Some(run_id) = self.runs.run.clone()
-            && self.store.details.entry(run_id.clone()).or_default().begin()
+            && self
+                .store
+                .details
+                .entry(run_id.clone())
+                .or_default()
+                .begin()
         {
             effects.push(Effect::Fetch(Fetch::RunDetail(run_id)));
         }
@@ -958,7 +982,7 @@ impl App {
                 return Vec::new();
             }
             KeyCode::Char('r') if !ctrl => return self.refresh_all(),
-            KeyCode::Char('s') if self.engine_down.is_some() => {
+            KeyCode::Char('s') => {
                 return self.run_action(Action::RunWizard);
             }
             KeyCode::Char('S') if self.engine_down.is_some() => {
@@ -1011,7 +1035,12 @@ impl App {
         }
         for run in self.store.runs.get().into_iter().flatten().take(50) {
             entries.push(PaletteEntry {
-                label: format!("run {} #{} {}", run.short_id(), run.run_number, run.workflow_name()),
+                label: format!(
+                    "run {} #{} {}",
+                    run.short_id(),
+                    run.run_number,
+                    run.workflow_name()
+                ),
                 detail: run.ref_label(),
                 danger: false,
                 action: PaletteAction::SelectRun(run.run_id.clone()),
@@ -1019,9 +1048,16 @@ impl App {
         }
         if let Some(run) = self.selected_run() {
             let run_id = run.run_id.clone();
-            let mut actions = vec![Action::RerunRun { run_id: run_id.clone() }];
+            let mut actions = vec![Action::RerunRun {
+                run_id: run_id.clone(),
+            }];
             if run.status.is_active() {
-                actions.insert(0, Action::CancelRun { run_id: run_id.clone() });
+                actions.insert(
+                    0,
+                    Action::CancelRun {
+                        run_id: run_id.clone(),
+                    },
+                );
             }
             for action in actions {
                 entries.push(PaletteEntry {
@@ -1162,13 +1198,20 @@ impl App {
     /// Run an action, asking for confirmation first when it needs it.
     pub fn run_action(&mut self, action: Action) -> Vec<Effect> {
         if action.mutates() && self.read_only {
-            self.toast(format!("read-only: {} is disabled", action.label()), Tone::Warning);
+            self.toast(
+                format!("read-only: {} is disabled", action.label()),
+                Tone::Warning,
+            );
             return Vec::new();
         }
         match action.danger() {
             Danger::None => self.execute(action),
             Danger::Confirm => {
-                self.confirm = Some(Confirm::new(action.clone(), confirm_lines(self, &action), None));
+                self.confirm = Some(Confirm::new(
+                    action.clone(),
+                    confirm_lines(self, &action),
+                    None,
+                ));
                 Vec::new()
             }
             Danger::TypeToConfirm(id) => {
@@ -1183,6 +1226,10 @@ impl App {
     }
 
     fn execute(&mut self, action: Action) -> Vec<Effect> {
+        if matches!(action, Action::RunWizard) {
+            self.setup.begin();
+            self.view = ViewKind::Setup;
+        }
         vec![Effect::Act(action)]
     }
 
@@ -1211,7 +1258,11 @@ fn settle<T>(slot: &mut crate::store::Loadable<T>, result: Result<T, String>, no
 
 /// Apply a `step_status` event to a run's job detail, creating what is missing.
 fn apply_step(run: &mut RunRecord, event: &crate::api::StepStatus) {
-    let job_index = match run.jobs_list.iter().position(|job| job.job_id == event.job_id) {
+    let job_index = match run
+        .jobs_list
+        .iter()
+        .position(|job| job.job_id == event.job_id)
+    {
         Some(index) => index,
         None => {
             run.jobs_list.push(JobDetail {
@@ -1269,16 +1320,22 @@ fn confirm_lines(app: &App, action: &Action) -> Vec<String> {
             lines
         }
         Action::ApproveJob { job_id, .. } => {
-            vec![format!("job {job_id} runs with the run's secrets once approved")]
+            vec![format!(
+                "job {job_id} runs with the run's secrets once approved"
+            )]
         }
         Action::ApproveFork { .. } => {
             vec!["fork code runs with secrets once approved".to_owned()]
         }
         Action::PurgeRunner { name } => {
-            vec![format!("{name} is removed from the engine and its VM is released")]
+            vec![format!(
+                "{name} is removed from the engine and its VM is released"
+            )]
         }
         Action::ReplayDelivery { delivery_id } => {
-            vec![format!("delivery {delivery_id} is queued again for processing")]
+            vec![format!(
+                "delivery {delivery_id} is queued again for processing"
+            )]
         }
         _ => Vec::new(),
     }
@@ -1330,7 +1387,9 @@ mod tests {
             run_number: number,
             status,
             workflow_path_str: ".github/workflows/ci.yml".into(),
-            jobs: [("test".to_owned(), ExecStatus::InProgress)].into_iter().collect(),
+            jobs: [("test".to_owned(), ExecStatus::InProgress)]
+                .into_iter()
+                .collect(),
             jobs_list: vec![JobDetail {
                 job_id: "test".into(),
                 name: "test".into(),
@@ -1356,7 +1415,11 @@ mod tests {
         let mut app = app();
         let effects = app.update(key(KeyCode::Char('2')));
         assert_eq!(app.view, ViewKind::Runs);
-        assert!(effects.iter().any(|effect| matches!(effect, Effect::Fetch(Fetch::Runs))));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Fetch(Fetch::Runs)))
+        );
         let quit = app.update(key(KeyCode::Char('q')));
         assert!(matches!(quit.as_slice(), [Effect::Quit]));
     }
@@ -1384,7 +1447,10 @@ mod tests {
             effect,
             Effect::Subscribe(Subscription::RunEvents { run_id, .. }) if run_id == "bbbbbbbb-2"
         )));
-        assert_eq!(app.streams.events.as_ref().map(|s| s.0.as_str()), Some("bbbbbbbb-2"));
+        assert_eq!(
+            app.streams.events.as_ref().map(|s| s.0.as_str()),
+            Some("bbbbbbbb-2")
+        );
     }
 
     #[test]
@@ -1444,24 +1510,38 @@ mod tests {
         assert!(effects.is_empty());
         assert!(app.confirm.is_some());
         let effects = app.update(key(KeyCode::Enter));
-        assert!(matches!(effects.as_slice(), [Effect::Act(Action::CancelRun { .. })]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Act(Action::CancelRun { .. })]
+        ));
 
         app.read_only = true;
-        assert!(app.run_action(Action::RerunRun { run_id: "r".into() }).is_empty());
+        assert!(
+            app.run_action(Action::RerunRun { run_id: "r".into() })
+                .is_empty()
+        );
         assert!(app.confirm.is_none());
     }
 
     #[test]
     fn purge_requires_typing_the_runner_name() {
         let mut app = app();
-        app.run_action(Action::PurgeRunner { name: "plr-4".into() });
+        app.run_action(Action::PurgeRunner {
+            name: "plr-4".into(),
+        });
         app.update(key(KeyCode::Enter));
-        assert!(app.confirm.is_some(), "enter does nothing until the name matches");
+        assert!(
+            app.confirm.is_some(),
+            "enter does nothing until the name matches"
+        );
         for c in "plr-4".chars() {
             app.update(key(KeyCode::Char(c)));
         }
         let effects = app.update(key(KeyCode::Enter));
-        assert!(matches!(effects.as_slice(), [Effect::Act(Action::PurgeRunner { .. })]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Act(Action::PurgeRunner { .. })]
+        ));
     }
 
     #[test]
@@ -1477,7 +1557,10 @@ mod tests {
         });
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Subscribe(Subscription::RunEvents { attempt: 1, .. })]
+            [Effect::Subscribe(Subscription::RunEvents {
+                attempt: 1,
+                ..
+            })]
         ));
 
         app.update(Msg::Feed {
@@ -1500,11 +1583,22 @@ mod tests {
     fn tick_refreshes_every_five_seconds() {
         let mut app = app();
         let first = app.startup();
-        assert!(first.iter().any(|effect| matches!(effect, Effect::Fetch(Fetch::Status))));
+        assert!(
+            first
+                .iter()
+                .any(|effect| matches!(effect, Effect::Fetch(Fetch::Status)))
+        );
         app.store.status.loading = false;
-        assert!(app.update(Msg::Tick(now() + TimeDelta::seconds(1))).is_empty());
+        assert!(
+            app.update(Msg::Tick(now() + TimeDelta::seconds(1)))
+                .is_empty()
+        );
         let later = app.update(Msg::Tick(now() + TimeDelta::seconds(6)));
-        assert!(later.iter().any(|effect| matches!(effect, Effect::Fetch(Fetch::Status))));
+        assert!(
+            later
+                .iter()
+                .any(|effect| matches!(effect, Effect::Fetch(Fetch::Status)))
+        );
     }
 
     #[test]
@@ -1522,9 +1616,14 @@ mod tests {
     #[test]
     fn engine_down_shows_the_setup_keys_and_s_starts_the_wizard() {
         let mut app = app();
-        app.update(Msg::Fetched(Fetched::Status(Box::new(Err("connection refused".into())))));
+        app.update(Msg::Fetched(Fetched::Status(Box::new(Err(
+            "connection refused".into(),
+        )))));
         assert!(app.engine_down.is_some());
         let effects = app.update(key(KeyCode::Char('s')));
-        assert!(matches!(effects.as_slice(), [Effect::Act(Action::RunWizard)]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Act(Action::RunWizard)]
+        ));
     }
 }

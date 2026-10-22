@@ -1,7 +1,7 @@
 //! Sandbox providers and sandbox inventory screen.
 use super::View;
 use crate::app::{App, Effect};
-use crate::client::sandbox::{ProviderRow, SandboxSummary};
+use crate::client::sandbox::SandboxSummary;
 use crate::theme::{Theme, Tone};
 use ratatui::style::Modifier;
 use ratatui::{
@@ -223,7 +223,7 @@ fn clip(v: &str, n: usize) -> String {
 fn ttl(v: u64) -> String {
     if v == 0 {
         "—".into()
-    } else if v % 3600 == 0 {
+    } else if v.is_multiple_of(3600) {
         format!("{}h", v / 3600)
     } else {
         format!("{}m", v / 60)
