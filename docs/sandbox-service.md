@@ -3,7 +3,7 @@
 Preloop gets every VM from a Sandbox Service: a generic service that hands out
 running machines from pluggable backends. The CI runner pool is one client;
 `preloop sandbox …` The contract is
-[`proto/preloop/sandbox/v1/sandbox.proto`](../proto/preloop/sandbox/v1/sandbox.proto);
+`proto/preloop/sandbox/v1/sandbox.proto` (in the repository root);
 the implementation is `crates/preloop-sandbox`, which never depends on the CI
 control plane.
 
