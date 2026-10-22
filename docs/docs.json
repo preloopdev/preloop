@@ -100,7 +100,7 @@
           },
           {
             "group": "Reference",
-            "pages": ["control-plane/reference/cli", "control-plane/reference/environment"]
+            "pages": ["control-plane/reference/cli", "control-plane/reference/environment", "control-plane/reference/sarif"]
           }
         ]
       },

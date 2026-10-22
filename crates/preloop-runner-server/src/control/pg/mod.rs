@@ -28,6 +28,7 @@ mod outbox;
 mod reaper;
 mod rerun;
 mod runners;
+mod sarif;
 #[cfg(test)]
 mod tests;
 #[cfg(any(test, feature = "test-support"))]
