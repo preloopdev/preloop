@@ -94,14 +94,19 @@ fn loaded_app() -> App {
             ProviderRow {
                 name: "cpane".into(),
                 cordoned: false,
+                sandboxes: 2,
             },
             ProviderRow {
                 name: "macstudio".into(),
                 cordoned: true,
+                sandboxes: 0,
             },
         ],
         sandboxes: 2,
         host_mem: None,
+        pools: vec![],
+        templates: vec![],
+        sandboxes_rows: vec![],
     }))));
     let recent_runs: Vec<RunRecord> = parse("runs.json");
     app.update(Msg::Fetched(Fetched::Runs(Ok(recent_runs))));
@@ -112,7 +117,8 @@ fn loaded_app() -> App {
 fn runs_app() -> App {
     let mut app = loaded_app();
     app.update(key(KeyCode::Char('2')));
-    app.runs.filter = crate::widgets::text_input::TextInput::new("status:failure,running  workflow:ci");
+    app.runs.filter =
+        crate::widgets::text_input::TextInput::new("status:failure,running  workflow:ci");
     let runs: Vec<RunRecord> = parse("runs.json");
     let failed = runs
         .iter()
@@ -227,7 +233,10 @@ fn check(name: &str, actual: &str) {
         return;
     }
     let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
-        panic!("missing golden {} — run with UPDATE_SNAPSHOTS=1", path.display())
+        panic!(
+            "missing golden {} — run with UPDATE_SNAPSHOTS=1",
+            path.display()
+        )
     });
     if expected != actual {
         let mut diff = String::new();
