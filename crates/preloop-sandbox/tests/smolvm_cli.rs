@@ -1537,14 +1537,17 @@ exit 0
                     artifacts: vec![preloop_sandbox::api::Artifact {
                         format: preloop_sandbox::api::Artifact::OCI_IMAGE.into(),
                         arch: preloop_sandbox::api::host_arch().into(),
-                        reference: format!("alpine@sha256:{}", "0".repeat(64)),
+                        r#ref: format!("alpine@sha256:{}", "0".repeat(64)),
                         digest: format!("sha256:{}", "0".repeat(64)),
                         size_bytes: 0,
+                        ..preloop_sandbox::api::Artifact::default()
                     }],
                     ..TemplateSpec::default()
-                },
+                }
+                .into(),
                 ..Template::default()
-            },
+            }
+            .into(),
             ..CreateWork::default()
         };
         // The fake never creates the data dir on `machine create`, exactly

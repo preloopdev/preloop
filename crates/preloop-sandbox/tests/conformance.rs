@@ -9,6 +9,7 @@ use std::time::Duration;
 use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::fake::FakeDriver;
+use preloop_sandbox::error::message;
 use preloop_sandbox::server::{Auth, router};
 use preloop_sandbox::store::{self, Kind, Store};
 use preloop_sandbox::{Code, Driver, SandboxClient, Service, ServiceConfig};
@@ -35,9 +36,10 @@ fn oci_artifact() -> Artifact {
     Artifact {
         format: Artifact::OCI_IMAGE.into(),
         arch: host_arch().into(),
-        reference: format!("ghcr.io/preloop/alpine@{TEST_DIGEST}"),
+        r#ref: format!("ghcr.io/preloop/alpine@{TEST_DIGEST}"),
         digest: TEST_DIGEST.into(),
         size_bytes: 0,
+        ..Artifact::default()
     }
 }
 
@@ -173,7 +175,7 @@ fn acquire(key: &str, pool: &str) -> AcquireRequest {
     AcquireRequest {
         idempotency_key: key.into(),
         pool: pool.into(),
-        purpose: Purpose::Runner,
+        purpose: Purpose::Runner.into(),
         ..AcquireRequest::default()
     }
 }
@@ -193,12 +195,14 @@ async fn acquire_is_idempotent_and_injects_identity() {
     let mut request = acquire("run-1/job-a/1", "linux");
     request
         .inject
+        .get_or_insert_default()
         .env
         .insert("RUNNER_TOKEN".into(), "tok-123".into());
-    request.inject.files.push(FileSpec {
+    request.inject.get_or_insert_default().files.push(FileSpec {
         path: "/run/preloop/bootstrap".into(),
         data: b"hello".to_vec(),
         mode: 0o600,
+        ..FileSpec::default()
     });
     let first = h.service.acquire(request.clone()).await.unwrap();
     let second = h.service.acquire(request).await.unwrap();
@@ -227,7 +231,7 @@ async fn acquire_is_idempotent_and_injects_identity() {
     h.service
         .release(ReleaseRequest {
             lease_id: first.lease.id.clone(),
-            mode: ReleaseMode::Destroy,
+            mode: ReleaseMode::Destroy.into(),
             ..ReleaseRequest::default()
         })
         .await
@@ -281,7 +285,7 @@ async fn placement_rejects_unsatisfiable_requirements_by_name() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::FailedPrecondition);
-    assert!(error.message.contains("os=macos"), "{}", error.message);
+    assert!(message(&error).contains("os=macos"), "{}", message(&error));
     let error = h
         .service
         .acquire(AcquireRequest {
@@ -304,6 +308,7 @@ async fn sandbox_shape_is_the_effective_size() {
         cpus: 2,
         memory_mib: 1024,
         disk_gib: 10,
+        ..Shape::default()
     };
 
     let defaulted = h
@@ -316,7 +321,8 @@ async fn sandbox_shape_is_the_effective_size() {
         .await
         .unwrap();
     assert_eq!(
-        defaulted.sandbox.shape, defaults,
+        defaulted.sandbox.shape.as_option(),
+        Some(&defaults),
         "an empty request reports the driver's effective size"
     );
 
@@ -324,19 +330,21 @@ async fn sandbox_shape_is_the_effective_size() {
         cpus: 4,
         memory_mib: 2048,
         disk_gib: 20,
+        ..Shape::default()
     };
     let shaped = h
         .service
         .acquire(AcquireRequest {
             idempotency_key: "shape-explicit".into(),
             template: "alpine".into(),
-            shape: explicit,
+            shape: explicit.clone().into(),
             ..AcquireRequest::default()
         })
         .await
         .unwrap();
     assert_eq!(
-        shaped.sandbox.shape, explicit,
+        shaped.sandbox.shape.as_option(),
+        Some(&explicit),
         "a requested shape is reported verbatim"
     );
 
@@ -349,41 +357,37 @@ async fn sandbox_shape_is_the_effective_size() {
             shape: Shape {
                 cpus: 4,
                 ..Shape::default()
-            },
+            }
+            .into(),
             ..AcquireRequest::default()
         })
         .await
         .unwrap();
-    assert_eq!(
-        partial.sandbox.shape,
-        Shape {
-            cpus: 4,
-            ..defaults
-        }
-    );
+    let partial_expected = Shape {
+        cpus: 4,
+        ..defaults.clone()
+    };
+    assert_eq!(partial.sandbox.shape.as_option(), Some(&partial_expected));
 
     // Get and List report the record's shape, not a recomputation.
     for (id, lease_id, expected) in [
-        (&defaulted.sandbox.id, &defaulted.lease.id, defaults),
-        (&shaped.sandbox.id, &shaped.lease.id, explicit),
-        (
-            &partial.sandbox.id,
-            &partial.lease.id,
-            Shape {
-                cpus: 4,
-                ..defaults
-            },
-        ),
+        (&defaulted.sandbox.id, &defaulted.lease.id, defaults.clone()),
+        (&shaped.sandbox.id, &shaped.lease.id, explicit.clone()),
+        (&partial.sandbox.id, &partial.lease.id, partial_expected),
     ] {
-        assert_eq!(h.service.get(id, lease_id).unwrap().shape, expected);
+        assert_eq!(
+            h.service.get(id, lease_id).unwrap().shape.as_option(),
+            Some(&expected)
+        );
         assert_eq!(
             h.service
                 .list()
                 .into_iter()
                 .find(|sandbox| &sandbox.id == id)
                 .unwrap()
-                .shape,
-            expected
+                .shape
+                .as_option(),
+            Some(&expected)
         );
     }
 }
@@ -405,16 +409,17 @@ async fn placement_rejects_a_shape_the_provider_cannot_host() {
             shape: Shape {
                 cpus: 4,
                 ..Shape::default()
-            },
+            }
+            .into(),
             ..AcquireRequest::default()
         })
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::FailedPrecondition);
     assert!(
-        error.message.contains("shape=4cpus/0mib"),
+        message(&error).contains("shape=4cpus/0mib"),
         "{}",
-        error.message
+        message(&error)
     );
 
     let error = h
@@ -425,16 +430,17 @@ async fn placement_rejects_a_shape_the_provider_cannot_host() {
             shape: Shape {
                 memory_mib: 4096,
                 ..Shape::default()
-            },
+            }
+            .into(),
             ..AcquireRequest::default()
         })
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::FailedPrecondition);
     assert!(
-        error.message.contains("shape=0cpus/4096mib"),
+        message(&error).contains("shape=0cpus/4096mib"),
         "{}",
-        error.message
+        message(&error)
     );
 
     // A shape inside both ceilings still places.
@@ -447,7 +453,8 @@ async fn placement_rejects_a_shape_the_provider_cannot_host() {
                 cpus: 2,
                 memory_mib: 2048,
                 ..Shape::default()
-            },
+            }
+            .into(),
             ..AcquireRequest::default()
         })
         .await
@@ -484,6 +491,7 @@ async fn unsupported_operations_fail_instead_of_being_emulated() {
             sandbox_id: lease.sandbox.id.clone(),
             lease_id: lease.lease.id.clone(),
             name: "x".into(),
+            ..SnapshotRequest::default()
         })
         .await
         .unwrap_err();
@@ -494,7 +502,7 @@ async fn unsupported_operations_fail_instead_of_being_emulated() {
         .acquire(AcquireRequest {
             idempotency_key: "b".into(),
             template: "alpine".into(),
-            purpose: Purpose::Build,
+            purpose: Purpose::Build.into(),
             ..AcquireRequest::default()
         })
         .await
@@ -511,7 +519,7 @@ async fn snapshot_becomes_a_template_that_starts_with_the_captured_state() {
         .acquire(AcquireRequest {
             idempotency_key: "bake".into(),
             template: "alpine".into(),
-            purpose: Purpose::Build,
+            purpose: Purpose::Build.into(),
             ..AcquireRequest::default()
         })
         .await
@@ -537,14 +545,12 @@ async fn snapshot_becomes_a_template_that_starts_with_the_captured_state() {
             sandbox_id: build.sandbox.id.clone(),
             lease_id: build.lease.id.clone(),
             name: "golden".into(),
+            ..SnapshotRequest::default()
         })
         .await
         .unwrap();
     assert!(!golden.native_ref.is_empty());
-    assert_eq!(
-        golden.spec.snapshot_of.as_deref(),
-        Some(build.sandbox.id.as_str())
-    );
+    assert_eq!(golden.spec.snapshot_of(), Some(build.sandbox.id.as_str()));
     // The source is consumed.
     assert!(h.service.get(&build.sandbox.id, &build.lease.id).is_err());
     h.service
@@ -600,7 +606,7 @@ async fn create_failure_surfaces_and_same_key_retries_cleanly() {
         .store(1, std::sync::atomic::Ordering::Release);
     let error = h.service.acquire(acquire("k", "p")).await.unwrap_err();
     assert_eq!(error.code, Code::Unavailable);
-    assert!(error.message.contains("injected create failure"));
+    assert!(message(&error).contains("injected create failure"));
     let lease = h.service.acquire(acquire("k", "p")).await.unwrap();
     assert_eq!(lease.sandbox.state, SandboxState::Leased);
 }
@@ -624,8 +630,9 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
     h.service
         .release(ReleaseRequest {
             lease_id: lease.lease.id.clone(),
-            mode: ReleaseMode::Preserve,
+            mode: ReleaseMode::Preserve.into(),
             preserve_ttl_secs: 1,
+            ..ReleaseRequest::default()
         })
         .await
         .unwrap();
@@ -754,11 +761,11 @@ async fn stats_follow_reconcile_state_changes() {
     };
     assert_eq!(
         state_of(&h.service, &lease.sandbox.id),
-        Some(SandboxState::Leased)
+        Some(SandboxState::Leased.into())
     );
     // The leased machine disappears behind the service's back.
     h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
-    wait_for(|| state_of(&h.service, &lease.sandbox.id) == Some(SandboxState::Failed)).await;
+    wait_for(|| state_of(&h.service, &lease.sandbox.id) == Some(SandboxState::Failed.into())).await;
     // The count follows the state: the sandbox is still tracked, once, as
     // failed.
     let sandboxes: Vec<_> = h
@@ -781,6 +788,8 @@ async fn stale_generation_is_fenced() {
         .register(RegisterRequest {
             name: "host-b".into(),
             drivers: vec![],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
         })
         .await
         .unwrap();
@@ -789,6 +798,8 @@ async fn stale_generation_is_fenced() {
         .register(RegisterRequest {
             name: "host-b".into(),
             drivers: vec![],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
         })
         .await
         .unwrap();
@@ -800,6 +811,7 @@ async fn stale_generation_is_fenced() {
             provider_id: first.provider_id.clone(),
             generation: first.generation,
             wait_secs: 0,
+            ..PollRequest::default()
         })
         .await
         .unwrap_err();
@@ -810,6 +822,7 @@ async fn stale_generation_is_fenced() {
             provider_id: first.provider_id,
             generation: first.generation,
             sandboxes: vec![],
+            ..ReconcileRequest::default()
         })
         .await
         .unwrap_err();
@@ -910,11 +923,14 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
     // Never reported anything: succeeds and invents nothing.
     Service::heartbeat(&service, old_shape()).unwrap();
     let first = provider_stats();
-    assert_eq!(first.host, HostSample::default());
+    assert_eq!(&*first.host, &HostSample::default());
     assert_eq!(first.host_sample_age_secs, 0);
     assert_eq!(first.sandboxes.len(), 1);
     assert_eq!(first.sandboxes[0].sandbox.id, sandbox.id);
-    assert_eq!(first.sandboxes[0].runtime, SandboxRuntimeStats::default());
+    assert_eq!(
+        &*first.sandboxes[0].runtime,
+        &SandboxRuntimeStats::default()
+    );
 
     // A new agent reports host + runtime facts...
     let reported = SandboxRuntimeStats {
@@ -930,21 +946,26 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
             host: Some(HostSample {
                 mem_total_bytes: Some(8 << 30),
                 ..HostSample::default()
-            }),
+            })
+            .into(),
             sandboxes: vec![reported.clone()],
+            ..HeartbeatRequest::default()
         },
     )
     .unwrap();
     let second = provider_stats();
     assert_eq!(second.host.mem_total_bytes, Some(8 << 30));
-    assert_eq!(second.sandboxes[0].runtime, reported);
+    assert_eq!(&*second.sandboxes[0].runtime, &reported);
 
     // ...and a later old-shape heartbeat clears the runtime report (it is
     // replaced wholesale) but cannot clear a host sample it did not send.
     Service::heartbeat(&service, old_shape()).unwrap();
     let third = provider_stats();
     assert_eq!(third.host.mem_total_bytes, Some(8 << 30));
-    assert_eq!(third.sandboxes[0].runtime, SandboxRuntimeStats::default());
+    assert_eq!(
+        &*third.sandboxes[0].runtime,
+        &SandboxRuntimeStats::default()
+    );
 }
 
 /// The same flows across a real TLS server with a remote agent.
@@ -1009,7 +1030,7 @@ async fn remote_agent_and_client_over_connect() {
             .await
             .unwrap()
             .id,
-        lease.sandbox.id
+        lease.sandbox.id.clone()
     );
     // Streaming exec with large output crosses batching.
     let (code, stdout, stderr) = client
@@ -1075,8 +1096,8 @@ async fn remote_agent_and_client_over_connect() {
     assert_eq!(error.code, Code::NotFound);
     client
         .release(ReleaseRequest {
-            lease_id: lease.lease.id,
-            mode: ReleaseMode::Destroy,
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
             ..ReleaseRequest::default()
         })
         .await
@@ -1146,7 +1167,7 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
     // `sample_host` reads `/proc`; other platforms report "unmeasured"
     // rather than a fabricated sample, and the service stores nothing.
     if cfg!(target_os = "linux") {
-        assert_ne!(provider.host, HostSample::default());
+        assert_ne!(&*provider.host, &HostSample::default());
     }
     // The wire carries aggregates only: no host PIDs, process names or
     // data-directory paths, which the provider measured for itself.
@@ -1165,8 +1186,8 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
 
     client
         .release(ReleaseRequest {
-            lease_id: lease.lease.id,
-            mode: ReleaseMode::Destroy,
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
             ..ReleaseRequest::default()
         })
         .await
@@ -1202,7 +1223,7 @@ async fn destroying_a_sandbox_closes_open_exec_streams() {
     h.service
         .release(ReleaseRequest {
             lease_id: lease.lease.id.clone(),
-            mode: ReleaseMode::Destroy,
+            mode: ReleaseMode::Destroy.into(),
             ..ReleaseRequest::default()
         })
         .await
@@ -1216,7 +1237,7 @@ async fn destroying_a_sandbox_closes_open_exec_streams() {
         }
     };
     assert_eq!(error.code, Code::Unavailable);
-    assert!(error.message.contains("destroyed"), "{}", error.message);
+    assert!(message(&error).contains("destroyed"), "{}", message(&error));
 }
 
 #[tokio::test]
@@ -1253,25 +1274,29 @@ async fn templates_require_digest_pinned_artifacts() {
     let base = template("alpine");
 
     let mut tag = base.clone();
-    tag.artifacts[0].reference = "ghcr.io/preloop/alpine:3.20".into();
+    tag.artifacts[0].r#ref = "ghcr.io/preloop/alpine:3.20".into();
     let error = h.service.put_template(tag).await.unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
-    assert!(error.message.contains("digest-pinned"), "{}", error.message);
+    assert!(
+        message(&error).contains("digest-pinned"),
+        "{}",
+        message(&error)
+    );
 
     let mut undigested = base.clone();
     undigested.artifacts[0].digest = "sha256:not-a-digest".into();
     let error = h.service.put_template(undigested).await.unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
-    assert!(error.message.contains("sha256"), "{}", error.message);
+    assert!(message(&error).contains("sha256"), "{}", message(&error));
 
     let mut mismatched = base.clone();
     mismatched.artifacts[0].digest = format!("sha256:{}", "b".repeat(64));
     let error = h.service.put_template(mismatched).await.unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
     assert!(
-        error.message.contains("does not match"),
+        message(&error).contains("does not match"),
         "{}",
-        error.message
+        message(&error)
     );
 
     let mut unknown_format = base.clone();
@@ -1279,13 +1304,15 @@ async fn templates_require_digest_pinned_artifacts() {
     let error = h.service.put_template(unknown_format).await.unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
     assert!(
-        error.message.contains("unsupported artifact format"),
+        message(&error).contains("unsupported artifact format"),
         "{}",
-        error.message
+        message(&error)
     );
 
     let mut both_sources = base.clone();
-    both_sources.recipe = Some("smolmachine:/tmp/runner.smolmachine".into());
+    both_sources.source = Some(template_spec::Source::Recipe(
+        "smolmachine:/tmp/runner.smolmachine".into(),
+    ));
     let error = h.service.put_template(both_sources).await.unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
 
@@ -1293,7 +1320,7 @@ async fn templates_require_digest_pinned_artifacts() {
     duplicate.artifacts.push(duplicate.artifacts[0].clone());
     let error = h.service.put_template(duplicate).await.unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
-    assert!(error.message.contains("twice"), "{}", error.message);
+    assert!(message(&error).contains("twice"), "{}", message(&error));
 
     // A local pack needs a digest, not a registry pin.
     h.service
@@ -1303,9 +1330,10 @@ async fn templates_require_digest_pinned_artifacts() {
             artifacts: vec![Artifact {
                 format: Artifact::SMOLMACHINE.into(),
                 arch: host_arch().into(),
-                reference: "file:///tmp/runner.smolmachine".into(),
+                r#ref: "file:///tmp/runner.smolmachine".into(),
                 digest: format!("sha256:{}", "c".repeat(64)),
                 size_bytes: 4096,
+                ..Artifact::default()
             }],
             ..TemplateSpec::default()
         })
@@ -1321,16 +1349,21 @@ async fn templates_require_digest_pinned_artifacts() {
             artifacts: vec![Artifact {
                 format: Artifact::SMOLMACHINE.into(),
                 arch: host_arch().into(),
-                reference: "ghcr.io/preloop/runner:latest".into(),
+                r#ref: "ghcr.io/preloop/runner:latest".into(),
                 digest: format!("sha256:{}", "d".repeat(64)),
                 size_bytes: 0,
+                ..Artifact::default()
             }],
             ..TemplateSpec::default()
         })
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
-    assert!(error.message.contains("digest-pinned"), "{}", error.message);
+    assert!(
+        message(&error).contains("digest-pinned"),
+        "{}",
+        message(&error)
+    );
 }
 
 #[tokio::test]
@@ -1353,10 +1386,11 @@ async fn restored_leases_re_inject_their_files() {
             template: "alpine".into(),
             ..AcquireRequest::default()
         };
-        request.inject.files.push(FileSpec {
+        request.inject.get_or_insert_default().files.push(FileSpec {
             path: "/run/first".into(),
             data: b"one".to_vec(),
             mode: 0o600,
+            ..FileSpec::default()
         });
         let lease = h.service.acquire(request).await.unwrap();
         let (_, stdout, _) = h
@@ -1391,10 +1425,11 @@ async fn restored_leases_re_inject_their_files() {
         template: "alpine".into(),
         ..AcquireRequest::default()
     };
-    request.inject.files.push(FileSpec {
+    request.inject.get_or_insert_default().files.push(FileSpec {
         path: "/run/second".into(),
         data: b"two".to_vec(),
         mode: 0o600,
+        ..FileSpec::default()
     });
     let lease = h.service.acquire(request).await.unwrap();
     assert_eq!(lease.lease.id, first.lease.id, "same key, same lease");
@@ -1431,8 +1466,11 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
             name: "ghost".into(),
             drivers: vec![DriverInfo {
                 driver: "ghost".into(),
-                capabilities: FakeDriver::full_capabilities(),
+                capabilities: FakeDriver::full_capabilities().into(),
+                ..DriverInfo::default()
             }],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
         })
         .await
         .unwrap();
@@ -1444,7 +1482,8 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
             requires: Requirements {
                 driver: "ghost".into(),
                 ..Requirements::default()
-            },
+            }
+            .into(),
             ..TemplateSpec::default()
         })
         .await
@@ -1508,7 +1547,7 @@ async fn stop_and_start_round_trip_a_sandbox() {
     h.service.stop(&id, &lease_id).await.unwrap();
     let error = exec(vec!["true".into()]).await.unwrap_err();
     assert_eq!(error.code, Code::FailedPrecondition);
-    assert!(error.message.contains("stopped"), "{}", error.message);
+    assert!(message(&error).contains("stopped"), "{}", message(&error));
     assert_eq!(
         h.service.get(&id, &lease_id).unwrap().state,
         SandboxState::Stopped
@@ -1545,8 +1584,11 @@ async fn reconcile_never_destroys_another_providers_machine() {
             name: "host-b".into(),
             drivers: vec![DriverInfo {
                 driver: "fake".into(),
-                capabilities: FakeDriver::full_capabilities(),
+                capabilities: FakeDriver::full_capabilities().into(),
+                ..DriverInfo::default()
             }],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
         })
         .await
         .unwrap();
@@ -1558,6 +1600,7 @@ async fn reconcile_never_destroys_another_providers_machine() {
             provider_id: other.provider_id.clone(),
             generation: other.generation,
             sandboxes: observed,
+            ..ReconcileRequest::default()
         })
         .await
         .unwrap();
@@ -1589,6 +1632,7 @@ async fn reconcile_never_destroys_another_providers_machine() {
             provider_id: other.provider_id,
             generation: other.generation,
             sandboxes: observed,
+            ..ReconcileRequest::default()
         })
         .await
         .unwrap();
@@ -1607,7 +1651,7 @@ async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
         .acquire(AcquireRequest {
             idempotency_key: "bake".into(),
             template: "alpine".into(),
-            purpose: Purpose::Build,
+            purpose: Purpose::Build.into(),
             ..AcquireRequest::default()
         })
         .await
@@ -1633,6 +1677,7 @@ async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
             sandbox_id: build.sandbox.id.clone(),
             lease_id: build.lease.id.clone(),
             name: "golden".into(),
+            ..SnapshotRequest::default()
         })
         .await
         .unwrap();
@@ -1654,8 +1699,11 @@ async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
             name: "host-b".into(),
             drivers: vec![DriverInfo {
                 driver: "fake".into(),
-                capabilities: FakeDriver::full_capabilities(),
+                capabilities: FakeDriver::full_capabilities().into(),
+                ..DriverInfo::default()
             }],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
         })
         .await
         .unwrap();
@@ -1670,6 +1718,7 @@ async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
             provider_id: other.provider_id,
             generation: other.generation,
             sandboxes: observed,
+            ..ReconcileRequest::default()
         })
         .await
         .unwrap();
@@ -1700,8 +1749,8 @@ async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
     let (_, stdout, _) = h
         .service
         .exec_collect(ExecRequest {
-            sandbox_id: fork.sandbox.id,
-            lease_id: fork.lease.id,
+            sandbox_id: fork.sandbox.id.clone(),
+            lease_id: fork.lease.id.clone(),
             argv: vec!["cat".into(), "marker".into()],
             ..ExecRequest::default()
         })
@@ -1733,7 +1782,7 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
             })
             .await
             .unwrap();
-        lease.sandbox.id
+        lease.sandbox.id.clone()
     };
     // Simulate the crash window: the sandbox row survives, its lease does not.
     let raw = store::open(db.to_str().unwrap()).await.unwrap();
@@ -1830,8 +1879,9 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
             .open_stream(OpenStreamRequest {
                 sandbox_id: sandbox_id.clone(),
                 lease_id: lease_id.to_owned(),
-                kind: StreamKind::Download,
+                kind: StreamKind::Download.into(),
                 path: "/etc".into(),
+                ..OpenStreamRequest::default()
             })
             .unwrap_err();
         assert_eq!(stream.code, Code::PermissionDenied, "{stream}");
@@ -1853,6 +1903,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
                 sandbox_id: sandbox_id.clone(),
                 lease_id: lease_id.to_owned(),
                 name: "stolen".into(),
+                ..SnapshotRequest::default()
             })
             .await
             .unwrap_err();
@@ -1881,16 +1932,16 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
     assert_eq!(missing.code, Code::NotFound, "{missing}");
     h.service
         .release(ReleaseRequest {
-            lease_id: a.lease.id,
-            mode: ReleaseMode::Destroy,
+            lease_id: a.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
             ..ReleaseRequest::default()
         })
         .await
         .unwrap();
     h.service
         .release(ReleaseRequest {
-            lease_id: b.lease.id,
-            mode: ReleaseMode::Destroy,
+            lease_id: b.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
             ..ReleaseRequest::default()
         })
         .await
@@ -1952,6 +2003,7 @@ fn mounted(key: &str, host: &std::path::Path) -> AcquireRequest {
             host: host.display().to_string(),
             guest: "/mnt".into(),
             readonly: true,
+            ..Mount::default()
         }],
         ..AcquireRequest::default()
     }
@@ -1964,6 +2016,7 @@ fn socketed(key: &str, host: &std::path::Path) -> AcquireRequest {
         sockets: vec![SocketMount {
             host: host.display().to_string(),
             guest: "/run/host.sock".into(),
+            ..SocketMount::default()
         }],
         ..AcquireRequest::default()
     }
@@ -2002,8 +2055,8 @@ async fn agent_enforces_the_host_mount_and_socket_allowlist() {
         let response = h.service.acquire(mounted(key, &host)).await.unwrap();
         h.service
             .release(ReleaseRequest {
-                lease_id: response.lease.id,
-                mode: ReleaseMode::Destroy,
+                lease_id: response.lease.id.clone(),
+                mode: ReleaseMode::Destroy.into(),
                 ..ReleaseRequest::default()
             })
             .await
@@ -2016,9 +2069,9 @@ async fn agent_enforces_the_host_mount_and_socket_allowlist() {
         .await
         .unwrap_err();
     assert!(
-        error.message.contains("outside this agent's allowlist"),
+        message(&error).contains("outside this agent's allowlist"),
         "{}",
-        error.message
+        message(&error)
     );
     // `..` cannot climb out of the allowed prefix.
     let escape = allowed.join("..").join("outside");
@@ -2028,9 +2081,9 @@ async fn agent_enforces_the_host_mount_and_socket_allowlist() {
         .await
         .unwrap_err();
     assert!(
-        error.message.contains("outside this agent's allowlist"),
+        message(&error).contains("outside this agent's allowlist"),
         "{}",
-        error.message
+        message(&error)
     );
     // Sockets use their own prefix list.
     let response = h
@@ -2040,8 +2093,8 @@ async fn agent_enforces_the_host_mount_and_socket_allowlist() {
         .unwrap();
     h.service
         .release(ReleaseRequest {
-            lease_id: response.lease.id,
-            mode: ReleaseMode::Destroy,
+            lease_id: response.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
             ..ReleaseRequest::default()
         })
         .await
@@ -2052,9 +2105,9 @@ async fn agent_enforces_the_host_mount_and_socket_allowlist() {
         .await
         .unwrap_err();
     assert!(
-        error.message.contains("outside this agent's allowlist"),
+        message(&error).contains("outside this agent's allowlist"),
         "{}",
-        error.message
+        message(&error)
     );
 }
 
@@ -2070,9 +2123,9 @@ async fn agent_denies_all_host_mounts_by_default() {
         .await
         .unwrap_err();
     assert!(
-        error.message.contains("exports no mount paths"),
+        message(&error).contains("exports no mount paths"),
         "{}",
-        error.message
+        message(&error)
     );
     let error = h
         .service
@@ -2080,9 +2133,9 @@ async fn agent_denies_all_host_mounts_by_default() {
         .await
         .unwrap_err();
     assert!(
-        error.message.contains("exports no socket paths"),
+        message(&error).contains("exports no socket paths"),
         "{}",
-        error.message
+        message(&error)
     );
 }
 
@@ -2123,9 +2176,9 @@ async fn cordoned_provider_receives_no_placements() {
     .await
     .expect("a cordoned provider must not be waited for")
     .unwrap_err();
-    assert_eq!(error.code, Code::FailedPrecondition, "{}", error.message);
-    assert!(error.message.contains(&name), "{}", error.message);
-    assert!(error.message.contains("cordoned"), "{}", error.message);
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", message(&error));
+    assert!(message(&error).contains(&name), "{}", message(&error));
+    assert!(message(&error).contains("cordoned"), "{}", message(&error));
     assert!(h.fake.inventory().await.unwrap().is_empty());
 
     let provider = h.service.set_provider_cordon(&name, false).await.unwrap();
@@ -2275,10 +2328,11 @@ async fn blob_upload_cap_rejects_and_removes_the_partial_file() {
         .unwrap();
     let ticket = service
         .open_stream(OpenStreamRequest {
-            sandbox_id: lease.sandbox.id,
-            lease_id: lease.lease.id,
-            kind: StreamKind::Upload,
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            kind: StreamKind::Upload.into(),
             path: "/work".into(),
+            ..OpenStreamRequest::default()
         })
         .unwrap();
     let ticket_id = ticket.url.rsplit('/').next().unwrap().to_owned();
@@ -2304,13 +2358,8 @@ async fn blob_upload_cap_rejects_and_removes_the_partial_file() {
 #[tokio::test]
 async fn list_pagination_round_trips_across_250_items() {
     use preloop_sandbox::SandboxApi as _;
-    let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
+    let t = common::TestService::start().await;
+    let service = t.service.clone();
     for index in 0..250 {
         service
             .put_template(TemplateSpec {
@@ -2327,12 +2376,13 @@ async fn list_pagination_round_trips_across_250_items() {
     let mut request = ListRequest {
         page_size: 100,
         page_token: String::new(),
+        ..ListRequest::default()
     };
     let mut names = Vec::new();
     loop {
         let page = service.list_templates_page(&request).unwrap();
         assert!(page.templates.len() <= 100);
-        names.extend(page.templates.into_iter().map(|t| t.spec.name));
+        names.extend(page.templates.into_iter().map(|t| t.spec.name.clone()));
         if page.next_page_token.is_empty() {
             break;
         }
@@ -2350,15 +2400,17 @@ async fn list_pagination_round_trips_across_250_items() {
         .list_templates_page(&ListRequest {
             page_size: 100,
             page_token: "bm90LWEtc2FuZGJveA".into(),
+            ..ListRequest::default()
         })
         .unwrap_err();
-    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+    assert_eq!(error.code, Code::InvalidArgument, "{}", message(&error));
 
     // A token minted for another listing is not a cursor for this one.
     let foreign = service
         .list_templates_page(&ListRequest {
             page_size: 100,
             page_token: String::new(),
+            ..ListRequest::default()
         })
         .unwrap()
         .next_page_token;
@@ -2366,13 +2418,13 @@ async fn list_pagination_round_trips_across_250_items() {
         .list_pools_page(&ListRequest {
             page_size: 100,
             page_token: foreign,
+            ..ListRequest::default()
         })
         .unwrap_err();
-    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+    assert_eq!(error.code, Code::InvalidArgument, "{}", message(&error));
 
     // The network client follows the same tokens.
-    let base = serve(service).await;
-    let client = SandboxClient::new(&base, Some("test-token".into()));
+    let client = t.client();
     assert_eq!(client.list_templates().await.unwrap().len(), 250);
 }
 
@@ -2417,8 +2469,11 @@ async fn restart_fences_the_agent_and_it_re_registers() {
                 name: "host-a".into(),
                 drivers: vec![DriverInfo {
                     driver: "fake".into(),
-                    capabilities: FakeDriver::full_capabilities(),
+                    capabilities: FakeDriver::full_capabilities().into(),
+                    ..DriverInfo::default()
                 }],
+                protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+                ..RegisterRequest::default()
             })
             .await
             .unwrap();
@@ -2438,10 +2493,11 @@ async fn restart_fences_the_agent_and_it_re_registers() {
             provider_id: provider_id.clone(),
             generation,
             wait_secs: 0,
+            ..PollRequest::default()
         })
         .await
         .unwrap_err();
-    assert_eq!(error.code, Code::Aborted, "{}", error.message);
+    assert_eq!(error.code, Code::Aborted, "{}", message(&error));
     let bumped = restored
         .list_providers()
         .into_iter()
@@ -2502,8 +2558,11 @@ async fn a_creating_record_is_failed_after_restart() {
                 name: "ghost".into(),
                 drivers: vec![DriverInfo {
                     driver: "ghost".into(),
-                    capabilities: FakeDriver::full_capabilities(),
+                    capabilities: FakeDriver::full_capabilities().into(),
+                    ..DriverInfo::default()
                 }],
+                protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+                ..RegisterRequest::default()
             })
             .await
             .unwrap();
@@ -2515,7 +2574,8 @@ async fn a_creating_record_is_failed_after_restart() {
                 requires: Requirements {
                     driver: "ghost".into(),
                     ..Requirements::default()
-                },
+                }
+                .into(),
                 ..TemplateSpec::default()
             })
             .await
@@ -2580,7 +2640,7 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
             })
             .await
             .unwrap();
-        (lease.sandbox.id, lease.sandbox.native_ref)
+        (lease.sandbox.id.clone(), lease.sandbox.native_ref.clone())
     };
     // Acquire returns once the in-memory record is leased, which a reconcile
     // notification can deliver before the create report's store write lands.
@@ -2607,7 +2667,7 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
     // the machine outlived the process that asked for it.
     for value in raw.load(Kind::Sandboxes).await.unwrap() {
         let mut sandbox: Sandbox = serde_json::from_value(value).unwrap();
-        sandbox.state = SandboxState::Terminating;
+        sandbox.state = SandboxState::Terminating.into();
         raw.put(
             Kind::Sandboxes,
             &sandbox.id,
@@ -2684,10 +2744,11 @@ async fn a_lost_provider_releases_its_leases() {
         .renew(RenewRequest {
             lease_id: lease.lease.id.clone(),
             ttl_secs: 60,
+            ..RenewRequest::default()
         })
         .await
         .unwrap_err();
-    assert_eq!(error.code, Code::NotFound, "{}", error.message);
+    assert_eq!(error.code, Code::NotFound, "{}", message(&error));
     assert!(
         store.load(Kind::Leases).await.unwrap().is_empty(),
         "the lease row must be released, not left to expire"
@@ -2729,12 +2790,13 @@ async fn renew_on_a_failed_sandbox_is_rejected() {
     let error = h
         .service
         .renew(RenewRequest {
-            lease_id: lease.lease.id,
+            lease_id: lease.lease.id.clone(),
             ttl_secs: 60,
+            ..RenewRequest::default()
         })
         .await
         .unwrap_err();
-    assert_eq!(error.code, Code::FailedPrecondition, "{}", error.message);
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", message(&error));
 }
 
 /// An idempotency key names one request: reusing it for a different payload
@@ -2764,7 +2826,7 @@ async fn a_reused_idempotency_key_with_a_different_payload_is_rejected() {
         })
         .await
         .unwrap_err();
-    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+    assert_eq!(error.code, Code::InvalidArgument, "{}", message(&error));
     // The lease is untouched and still answers the original request.
     let same = h
         .service
@@ -2970,8 +3032,11 @@ async fn manual_service(
             name: "manual".into(),
             drivers: vec![DriverInfo {
                 driver: "fake".into(),
-                capabilities: FakeDriver::full_capabilities(),
+                capabilities: FakeDriver::full_capabilities().into(),
+                ..DriverInfo::default()
             }],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
         })
         .await
         .unwrap();
@@ -2984,6 +3049,7 @@ async fn poll_now(service: &Arc<Service>, provider: &RegisterResponse) -> Vec<Wo
             provider_id: provider.provider_id.clone(),
             generation: provider.generation,
             wait_secs: 0,
+            ..PollRequest::default()
         })
         .await
         .unwrap()
@@ -3039,6 +3105,7 @@ async fn unacknowledged_work_is_redelivered_and_re_registering_releases_it() {
             ok: true,
             native_ref: "psbx-manual-i1".into(),
             error: String::new(),
+            ..ReportRequest::default()
         })
         .await
         .unwrap();
@@ -3050,6 +3117,7 @@ async fn unacknowledged_work_is_redelivered_and_re_registering_releases_it() {
             ok: true,
             native_ref: "psbx-manual-i1".into(),
             error: String::new(),
+            ..ReportRequest::default()
         })
         .await
         .unwrap_err();
@@ -3065,8 +3133,11 @@ async fn unacknowledged_work_is_redelivered_and_re_registering_releases_it() {
             name: "manual".into(),
             drivers: vec![DriverInfo {
                 driver: "fake".into(),
-                capabilities: FakeDriver::full_capabilities(),
+                capabilities: FakeDriver::full_capabilities().into(),
+                ..DriverInfo::default()
             }],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
         })
         .await
         .unwrap();
@@ -3090,6 +3161,7 @@ async fn report_exec_orders_by_sequence_and_closes_on_exit() {
             ok: true,
             native_ref: "psbx-manual-i1".into(),
             error: String::new(),
+            ..ReportRequest::default()
         })
         .await
         .unwrap();
@@ -3111,13 +3183,17 @@ async fn report_exec_orders_by_sequence_and_closes_on_exit() {
         .unwrap();
     let work = poll_now(&service, &provider).await;
     assert_eq!(work.len(), 1);
-    let exec_id = work[0].exec.as_ref().unwrap().exec_id.clone();
+    let exec_id = match work[0].work.as_ref().expect("exec work") {
+        work_item::Work::Exec(exec) => exec.exec_id.clone(),
+        other => panic!("expected exec work, got {other:?}"),
+    };
     let report = |events: Vec<ExecEvent>, sequence: u64| ReportExecRequest {
         provider_id: provider.provider_id.clone(),
         generation: provider.generation,
         exec_id: exec_id.clone(),
         events,
         sequence,
+        ..ReportExecRequest::default()
     };
     service
         .report_exec(report(vec![ExecEvent::stdout(b"a".to_vec())], 1))
@@ -3157,6 +3233,7 @@ async fn report_exec_orders_by_sequence_and_closes_on_exit() {
             ok: true,
             native_ref: String::new(),
             error: String::new(),
+            ..ReportRequest::default()
         })
         .await
         .unwrap();
@@ -3315,6 +3392,7 @@ async fn a_snapshot_wait_is_bounded_by_the_work_timeout() {
             ok: true,
             native_ref: "psbx-manual-i1".into(),
             error: String::new(),
+            ..ReportRequest::default()
         })
         .await
         .unwrap();
@@ -3331,11 +3409,12 @@ async fn a_snapshot_wait_is_bounded_by_the_work_timeout() {
             sandbox_id,
             lease_id,
             name: "golden".into(),
+            ..SnapshotRequest::default()
         })
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Unavailable);
-    assert!(error.message.contains("snapshot"), "{}", error.message);
+    assert!(message(&error).contains("snapshot"), "{}", message(&error));
 }
 
 /// The caller is a network client, so its disconnect is observed through the
@@ -3386,8 +3465,8 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
     // The sandbox is still usable: the dropped exec left no state behind.
     let (code, _, _) = client
         .exec_collect(ExecRequest {
-            sandbox_id: lease.sandbox.id,
-            lease_id: lease.lease.id,
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
             argv: vec!["true".into()],
             ..ExecRequest::default()
         })

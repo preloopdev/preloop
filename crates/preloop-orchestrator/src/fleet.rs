@@ -26,8 +26,9 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use preloop_sandbox::api::{
     AcquireRequest, Artifact, ExecRequest, Mount, NetworkMode, NetworkPolicy as SbxNetwork,
-    Purpose, ReleaseMode, ReleaseRequest, RenewRequest, Requirements, SandboxState, Shape,
-    SnapshotRequest, SocketMount, TemplateSpec, host_arch,
+    Purpose, ReleaseMode, ReleaseRequest, RenewRequest, Requirements, SandboxState,
+    SandboxStateExt as _, Shape, SnapshotRequest, SocketMount, StringMap, TemplateSpec, exec_event,
+    host_arch, template_spec,
 };
 use preloop_sandbox::drivers::smolvm::cli::{
     ExecOutput, MachineName, MachineRole, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
@@ -166,15 +167,16 @@ fn local_image_recipe(image: &str, driver: &str) -> Option<TemplateSpec> {
     Some(TemplateSpec {
         name: format!("image-{}", &digest[..16]),
         os: "linux".into(),
-        recipe: Some(format!(
+        source: Some(template_spec::Source::Recipe(format!(
             "{}{}",
             preloop_sandbox::drivers::smolvm::IMAGE_RECIPE,
             path.display()
-        )),
+        ))),
         requires: Requirements {
             driver: driver.to_owned(),
             ..Requirements::default()
-        },
+        }
+        .into(),
         ..TemplateSpec::default()
     })
 }
@@ -191,9 +193,10 @@ async fn local_pack_artifact(path: &Path) -> Result<Artifact, VmError> {
     Ok(Artifact {
         format: Artifact::SMOLMACHINE.into(),
         arch: host_arch().into(),
-        reference: format!("file://{}", path.display()),
+        r#ref: format!("file://{}", path.display()),
         digest: format!("sha256:{digest}"),
         size_bytes,
+        ..Artifact::default()
     })
 }
 
@@ -272,20 +275,22 @@ async fn oci_artifacts(image: &str) -> Result<Vec<Artifact>, VmError> {
         return Ok(vec![Artifact {
             format: Artifact::SMOLMACHINE.into(),
             arch: host_arch().into(),
-            reference: pinned,
+            r#ref: pinned,
             digest: digest.to_owned(),
             size_bytes: layer
                 .get("size")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
+            ..Artifact::default()
         }]);
     }
     Ok(vec![Artifact {
         format: Artifact::OCI_IMAGE.into(),
         arch: host_arch().into(),
-        reference: pinned,
+        r#ref: pinned,
         digest: manifest_digest,
         size_bytes: 0,
+        ..Artifact::default()
     }])
 }
 
@@ -360,7 +365,7 @@ fn image_template_name(artifacts: &[Artifact]) -> String {
         canonical.push('\u{0}');
         canonical.push_str(&artifact.digest);
         canonical.push('\u{0}');
-        canonical.push_str(&artifact.reference);
+        canonical.push_str(artifact.reference());
         canonical.push('\n');
     }
     let digest = hex::encode(Sha256::digest(canonical.as_bytes()));
@@ -423,6 +428,7 @@ impl SandboxMachines {
                 .renew(RenewRequest {
                     lease_id: lease_id.clone(),
                     ttl_secs: LEASE_TTL.as_secs(),
+                    ..RenewRequest::default()
                 })
                 .await
             {
@@ -513,10 +519,10 @@ impl SandboxMachines {
                 SbxNetwork::default(),
                 Vec::new(),
                 Vec::new(),
-                std::collections::BTreeMap::new(),
+                StringMap::default(),
             )
         } else {
-            let mut options = std::collections::BTreeMap::new();
+            let mut options = StringMap::default();
             if let Some(dns) = &spec.dns {
                 options.insert("dns".to_owned(), dns.clone());
             }
@@ -542,6 +548,7 @@ impl SandboxMachines {
                     cpus: u32::from(spec.cpus),
                     memory_mib: spec.memory_mib,
                     disk_gib: spec.storage_gib,
+                    ..Shape::default()
                 },
                 network(&spec.network),
                 spec.volumes
@@ -550,6 +557,7 @@ impl SandboxMachines {
                         host: v.host.display().to_string(),
                         guest: v.guest.display().to_string(),
                         readonly: v.read_only,
+                        ..Mount::default()
                     })
                     .collect(),
                 spec.sockets
@@ -557,6 +565,7 @@ impl SandboxMachines {
                     .map(|s| SocketMount {
                         host: s.host.display().to_string(),
                         guest: s.guest.display().to_string(),
+                        ..SocketMount::default()
                     })
                     .collect(),
                 options,
@@ -572,11 +581,11 @@ impl SandboxMachines {
                 ),
                 name: name.as_str().to_owned(),
                 template,
-                shape,
-                purpose,
-                requires: self.requires.clone(),
+                shape: shape.into(),
+                purpose: purpose.into(),
+                requires: self.requires.clone().into(),
                 ttl_secs: LEASE_TTL.as_secs(),
-                network,
+                network: network.into(),
                 mounts,
                 sockets,
                 options,
@@ -585,13 +594,13 @@ impl SandboxMachines {
             .await
             .map_err(|e| sandbox_error("start", e))?;
         Ok(Entry::Live {
-            sandbox_id: response.sandbox.id,
-            provider_id: response.sandbox.provider_id,
-            lease_id: response.lease.id,
-            native_ref: response.sandbox.native_ref,
+            sandbox_id: response.sandbox.id.clone(),
+            provider_id: response.sandbox.provider_id.clone(),
+            lease_id: response.lease.id.clone(),
+            native_ref: response.sandbox.native_ref.clone(),
             spec: spec.clone(),
             forkable: purpose == Purpose::Build,
-            state: response.sandbox.state,
+            state: response.sandbox.state.known(),
         })
     }
 
@@ -662,7 +671,7 @@ impl SandboxMachines {
                     "machine `{}` is {} but this pool holds no lease for it; \
                      the sandbox must be released before the name can be reused",
                     name.as_str(),
-                    state_name(sandbox.state)
+                    state_name(sandbox.state.known())
                 )));
             }
         };
@@ -704,8 +713,7 @@ impl SandboxMachines {
                 template.spec.name == expected
                     && template
                         .spec
-                        .snapshot_of
-                        .as_deref()
+                        .snapshot_of()
                         .is_some_and(|sandbox_id| !sandbox_id.is_empty())
                     && !template.provider_id.is_empty()
                     && !template.driver.is_empty()
@@ -717,7 +725,7 @@ impl SandboxMachines {
             }
         }?;
         Some(Entry::Golden {
-            template: template.spec.name,
+            template: template.spec.name.clone(),
             // Snapshot templates intentionally do not duplicate the original
             // machine request. Fork acquires directly from the snapshot, and
             // zero shape fields let the owning driver apply its defaults.
@@ -744,7 +752,7 @@ impl SandboxMachines {
         &self,
         name: &MachineName,
         argv: &[String],
-        env: std::collections::BTreeMap<String, String>,
+        env: StringMap,
         output: mpsc::Sender<OutputChunk>,
     ) -> Result<i32, VmError> {
         if argv.is_empty() {
@@ -764,16 +772,15 @@ impl SandboxMachines {
             .map_err(|e| sandbox_error("exec", e))?;
         while let Some(event) = stream.next().await {
             let event = event.map_err(|e| sandbox_error("exec", e))?;
-            if let Some(bytes) = event.stdout
-                && output.send(OutputChunk::Stdout(bytes)).await.is_err()
-            {
-                continue;
-            }
-            if let Some(bytes) = event.stderr {
-                let _ = output.send(OutputChunk::Stderr(bytes)).await;
-            }
-            if let Some(code) = event.exit_code {
-                return Ok(code);
+            match event.event {
+                Some(exec_event::Event::Stdout(bytes)) => {
+                    let _ = output.send(OutputChunk::Stdout(bytes)).await;
+                }
+                Some(exec_event::Event::Stderr(bytes)) => {
+                    let _ = output.send(OutputChunk::Stderr(bytes)).await;
+                }
+                Some(exec_event::Event::ExitCode(code)) => return Ok(code),
+                None => {}
             }
         }
         Err(VmError::Protocol(
@@ -786,7 +793,7 @@ impl SandboxMachines {
         operation: &'static str,
         name: &MachineName,
         argv: &[String],
-        env: std::collections::BTreeMap<String, String>,
+        env: StringMap,
     ) -> Result<ExecOutput, VmError> {
         let (tx, mut rx) = mpsc::channel(64);
         let collect = tokio::spawn(async move {
@@ -901,21 +908,22 @@ fn json_option<T: serde::Serialize>(value: &T) -> Result<String, VmError> {
 fn network(policy: &NetworkPolicy) -> SbxNetwork {
     match policy {
         NetworkPolicy::Disabled => SbxNetwork {
-            mode: NetworkMode::Disabled,
+            mode: NetworkMode::Disabled.into(),
             ..SbxNetwork::default()
         },
         NetworkPolicy::Unrestricted => SbxNetwork {
-            mode: NetworkMode::Unrestricted,
+            mode: NetworkMode::Unrestricted.into(),
             ..SbxNetwork::default()
         },
         NetworkPolicy::PublicOnly => SbxNetwork {
-            mode: NetworkMode::PublicOnly,
+            mode: NetworkMode::PublicOnly.into(),
             ..SbxNetwork::default()
         },
         NetworkPolicy::Restricted { hosts, cidrs } => SbxNetwork {
-            mode: NetworkMode::Restricted,
+            mode: NetworkMode::Restricted.into(),
             hosts: hosts.clone(),
             cidrs: cidrs.clone(),
+            ..SbxNetwork::default()
         },
     }
 }
@@ -1021,6 +1029,7 @@ impl VmProvider for SandboxMachines {
                             sandbox_id,
                             lease_id,
                             name: template.clone(),
+                            ..SnapshotRequest::default()
                         })
                         .await
                         .map_err(|e| sandbox_error("fork", e))?;
@@ -1119,7 +1128,7 @@ impl VmProvider for SandboxMachines {
                     .api
                     .release(ReleaseRequest {
                         lease_id,
-                        mode: ReleaseMode::Destroy,
+                        mode: ReleaseMode::Destroy.into(),
                         ..ReleaseRequest::default()
                     })
                     .await
@@ -1159,7 +1168,7 @@ impl VmProvider for SandboxMachines {
                 if let Some(sandbox) = self.remote_by_name(name.as_str()).await.into_iter().next() {
                     debug!(
                         machine = name.as_str(),
-                        state = state_name(sandbox.state),
+                        state = state_name(sandbox.state.known()),
                         "leaving a sandbox this pool holds no lease for to its lease expiry"
                     );
                 }
@@ -1188,7 +1197,7 @@ impl VmProvider for SandboxMachines {
             // projection is unscoped, so this works without a lease.
             None => {
                 if let Some(sandbox) = self.remote_by_name(name.as_str()).await.into_iter().next() {
-                    return Ok(match sandbox.state {
+                    return Ok(match sandbox.state.known() {
                         SandboxState::Leased | SandboxState::Preserved | SandboxState::Ready => {
                             MachineState::Running
                         }
@@ -1208,7 +1217,7 @@ impl VmProvider for SandboxMachines {
             }
         };
         match self.api.get(&sandbox_id, &lease_id).await {
-            Ok(sandbox) => Ok(match sandbox.state {
+            Ok(sandbox) => Ok(match sandbox.state.known() {
                 SandboxState::Leased | SandboxState::Preserved | SandboxState::Ready => {
                     MachineState::Running
                 }
@@ -1403,7 +1412,7 @@ mod tests {
             format!("sha256:{}", hex::encode(Sha256::digest(b"first pack")))
         );
         assert_eq!(
-            artifact.reference,
+            artifact.reference(),
             format!("file://{}", std::fs::canonicalize(&pack).unwrap().display())
         );
         assert_eq!(artifact.size_bytes, b"first pack".len() as u64);
@@ -1434,11 +1443,10 @@ mod tests {
         assert!(template.artifacts.is_empty());
         assert!(
             template
-                .recipe
-                .as_deref()
+                .recipe()
                 .is_some_and(|recipe| recipe.starts_with("image:")),
             "{:?}",
-            template.recipe
+            template.recipe()
         );
         assert_eq!(template.requires.driver, "smolvm");
 
@@ -1446,7 +1454,7 @@ mod tests {
         std::fs::create_dir_all(&rootfs).unwrap();
         let template = local_image_recipe(rootfs.to_str().unwrap(), "smolvm").unwrap();
         assert!(template.artifacts.is_empty());
-        assert!(template.recipe.is_some());
+        assert!(template.recipe().is_some());
 
         assert!(local_image_recipe("alpine:3.20", "smolvm").is_none());
     }

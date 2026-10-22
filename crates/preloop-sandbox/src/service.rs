@@ -4125,6 +4125,7 @@ mod tests {
         let request = ListRequest {
             page_size: 5000,
             page_token: String::new(),
+            ..ListRequest::default()
         };
         let (page, _) = paginate("widget", items(1500), &request).unwrap();
         assert_eq!(page.len(), MAX_PAGE_SIZE as usize);
@@ -4143,22 +4144,35 @@ mod tests {
         let request = ListRequest {
             page_size: 2,
             page_token: "bm90LWEtc2FuZGJveA".into(),
+            ..ListRequest::default()
         };
         let error = paginate("sandbox", items(4), &request).unwrap_err();
-        assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+        assert_eq!(
+            error.code,
+            Code::InvalidArgument,
+            "{}",
+            crate::error::message(&error)
+        );
 
         // A cursor minted for another listing is not a cursor for this one.
         let first = ListRequest {
             page_size: 2,
             page_token: String::new(),
+            ..ListRequest::default()
         };
         let (_, token) = paginate("template", items(4), &first).unwrap();
         let request = ListRequest {
             page_size: 2,
             page_token: token,
+            ..ListRequest::default()
         };
         let error = paginate("sandbox", items(4), &request).unwrap_err();
-        assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+        assert_eq!(
+            error.code,
+            Code::InvalidArgument,
+            "{}",
+            crate::error::message(&error)
+        );
     }
 
     #[test]
@@ -4166,6 +4180,7 @@ mod tests {
         let request = ListRequest {
             page_size: 2,
             page_token: String::new(),
+            ..ListRequest::default()
         };
         let (_, token) = paginate("widget", items(4), &request).unwrap();
         // The token names `id-0001`, which is gone by the second page.
@@ -4176,6 +4191,7 @@ mod tests {
         let request = ListRequest {
             page_size: 2,
             page_token: token,
+            ..ListRequest::default()
         };
         let (page, _) = paginate("widget", remaining, &request).unwrap();
         assert_eq!(page, vec![2, 3]);

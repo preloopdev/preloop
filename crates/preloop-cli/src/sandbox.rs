@@ -691,7 +691,7 @@ fn parse_artifact(raw: &str) -> anyhow::Result<Artifact> {
         match key.trim() {
             "format" => artifact.format = value.trim().to_owned(),
             "arch" => artifact.arch = value.trim().to_owned(),
-            "ref" => artifact.reference = value.trim().to_owned(),
+            "ref" => artifact.r#ref = value.trim().to_owned(),
             "digest" => artifact.digest = value.trim().to_owned(),
             "size" => {
                 artifact.size_bytes = value
@@ -785,11 +785,12 @@ async fn run_client(
                         .iter()
                         .map(|raw| parse_artifact(raw))
                         .collect::<anyhow::Result<Vec<_>>>()?,
-                    recipe,
+                    source: recipe.map(template_spec::Source::Recipe),
                     requires: Requirements {
                         driver: driver.unwrap_or_default(),
                         ..Requirements::default()
-                    },
+                    }
+                    .into(),
                     ..TemplateSpec::default()
                 })
                 .await?,
@@ -819,11 +820,14 @@ async fn run_client(
                         cpus,
                         memory_mib: memory,
                         disk_gib: disk,
-                    },
+                        ..Shape::default()
+                    }
+                    .into(),
                     network: NetworkPolicy {
-                        mode: NetworkMode::Unrestricted,
+                        mode: NetworkMode::UNRESTRICTED.into(),
                         ..NetworkPolicy::default()
-                    },
+                    }
+                    .into(),
                     ..PoolSpec::default()
                 })
                 .await?,
@@ -839,26 +843,33 @@ async fn run_client(
                 template: acquire.template.unwrap_or_default(),
                 ttl_secs: acquire.ttl,
                 purpose: if acquire.build {
-                    Purpose::Build
+                    Purpose::BUILD
                 } else {
-                    Purpose::Exec
-                },
+                    Purpose::EXEC
+                }
+                .into(),
                 shape: Shape {
                     cpus: acquire.cpus,
                     memory_mib: acquire.memory,
                     disk_gib: 0,
-                },
+                    ..Shape::default()
+                }
+                .into(),
                 requires: Requirements {
                     os: acquire.os.unwrap_or_default(),
                     ..Requirements::default()
-                },
+                }
+                .into(),
                 network: NetworkPolicy {
-                    mode: NetworkMode::Unrestricted,
+                    mode: NetworkMode::UNRESTRICTED.into(),
                     ..NetworkPolicy::default()
-                },
+                }
+                .into(),
                 ..AcquireRequest::default()
             };
-            request.inject.env.extend(acquire.env);
+            request
+                .inject
+                .modify(|inject| inject.env.extend(acquire.env));
             print_json(&client.acquire(request).await?)
         }
         SandboxCommand::Exec(exec) => {
@@ -889,11 +900,13 @@ async fn run_client(
             .release(ReleaseRequest {
                 lease_id: release.lease,
                 mode: if release.preserve.is_some() {
-                    ReleaseMode::Preserve
+                    ReleaseMode::PRESERVE
                 } else {
-                    ReleaseMode::Destroy
-                },
+                    ReleaseMode::DESTROY
+                }
+                .into(),
                 preserve_ttl_secs: release.preserve.unwrap_or_default(),
+                ..ReleaseRequest::default()
             })
             .await?),
         SandboxCommand::Snapshot(snapshot) => print_json(
@@ -902,6 +915,7 @@ async fn run_client(
                     sandbox_id: snapshot.sandbox,
                     lease_id: lease_id()?,
                     name: snapshot.name,
+                    ..SnapshotRequest::default()
                 })
                 .await?,
         ),
@@ -1002,15 +1016,16 @@ where
             anyhow::bail!("exec stream ended without an exit status");
         };
         let event = event?;
-        if let Some(bytes) = event.stdout {
-            std::io::stdout().write_all(&bytes)?;
-            std::io::stdout().flush()?;
-        }
-        if let Some(bytes) = event.stderr {
-            std::io::stderr().write_all(&bytes)?;
-        }
-        if let Some(code) = event.exit_code {
-            return Ok(Some(code));
+        match event.event {
+            Some(exec_event::Event::Stdout(bytes)) => {
+                std::io::stdout().write_all(&bytes)?;
+                std::io::stdout().flush()?;
+            }
+            Some(exec_event::Event::Stderr(bytes)) => {
+                std::io::stderr().write_all(&bytes)?;
+            }
+            Some(exec_event::Event::ExitCode(code)) => return Ok(Some(code)),
+            None => {}
         }
     }
 }

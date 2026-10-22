@@ -1354,7 +1354,7 @@ fn vm_fleet_snapshot(
     Option<preloop_sandbox::api::HostSample>,
 ) {
     use preloop_observability::status::{VmConfigured, VmCount, VmFleetSnapshot, VmSource};
-    use preloop_sandbox::api::Purpose;
+    use preloop_sandbox::api::{Purpose, SandboxStateExt};
 
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -1370,7 +1370,8 @@ fn vm_fleet_snapshot(
             None,
         );
     };
-    let host = chosen_provider(&stats, pool_provider_id).map(|provider| provider.host.clone());
+    let host = chosen_provider(&stats, pool_provider_id)
+        .and_then(|provider| provider.host.as_option().cloned());
 
     let mut count = VmCount::default();
     let mut configured = VmConfigured::default();
@@ -1382,9 +1383,9 @@ fn vm_fleet_snapshot(
         .filter(|entry| !entry.sandbox.state.is_terminal())
     {
         let sandbox = &entry.sandbox;
-        match sandbox.purpose {
-            Purpose::Build => count.golden += 1,
-            Purpose::Runner => count.runner += 1,
+        match sandbox.purpose.as_known() {
+            Some(Purpose::Build) => count.golden += 1,
+            Some(Purpose::Runner) => count.runner += 1,
             // Exec/session/unspecified sandboxes hold capacity but are not
             // one of the two fleet roles the snapshot reports.
             _ => {}
@@ -1525,7 +1526,7 @@ async fn publish_snapshot(
     let host_sample = sandbox_stats
         .as_ref()
         .and_then(|stats| chosen_provider(stats, &pool_provider_id))
-        .map(|provider| &provider.host)
+        .and_then(|provider| provider.host.as_option())
         .filter(|host| host_sample_measured(host))
         .map(observability_host_sample);
     // The storage bytes are a synchronous filesystem read; run it on the
@@ -2864,19 +2865,23 @@ mod tests {
             ProviderStats, Purpose, Sandbox, SandboxState, SandboxStats, Shape, StatsResponse,
         };
 
-        let entry = |purpose, state, cpus, memory_mib, disk_gib| SandboxStats {
-            sandbox: Sandbox {
-                purpose,
-                state,
-                shape: Shape {
-                    cpus,
-                    memory_mib,
-                    disk_gib,
-                },
+        let entry =
+            |purpose: Purpose, state: SandboxState, cpus, memory_mib, disk_gib| SandboxStats {
+                sandbox: Sandbox {
+                    purpose: purpose.into(),
+                    state: state.into(),
+                    shape: Shape {
+                        cpus,
+                        memory_mib,
+                        disk_gib,
+                        ..Shape::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                }
+                .into(),
                 ..Default::default()
-            },
-            ..Default::default()
-        };
+            };
         StatsResponse {
             providers: vec![
                 ProviderStats {
@@ -2886,7 +2891,7 @@ mod tests {
                 },
                 ProviderStats {
                     provider_id: "pool".to_owned(),
-                    host,
+                    host: host.into(),
                     sandboxes: vec![
                         entry(Purpose::Build, SandboxState::Ready, 2, 2048, 10),
                         entry(Purpose::Runner, SandboxState::Leased, 4, 4096, 20),
@@ -2896,6 +2901,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         }
     }
 
@@ -2910,6 +2916,7 @@ mod tests {
             swap_free_bytes: Some(80),
             engine_rss_bytes: Some(11),
             vm_rss_bytes: Some(22),
+            ..Default::default()
         };
         let (vms, host) = vm_fleet_snapshot(Some(sandbox_stats_fixture(sample)), "pool");
         assert_eq!(

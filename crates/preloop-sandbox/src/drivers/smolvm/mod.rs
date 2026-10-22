@@ -1037,10 +1037,12 @@ exit 0
                     name: "golden".into(),
                     os: "linux".into(),
                     ..TemplateSpec::default()
-                },
+                }
+                .into(),
                 native_ref: "golden".into(),
                 ..Template::default()
-            },
+            }
+            .into(),
             ..CreateWork::default()
         }
     }
@@ -1055,11 +1057,12 @@ exit 0
         let driver = driver(&directory);
         let defaults = driver.capabilities().default_shape;
         assert_eq!(
-            defaults,
+            *defaults,
             Shape {
                 cpus: 2,
                 memory_mib: 4096,
                 disk_gib: 20,
+                ..Shape::default()
             }
         );
         let work = CreateWork {
@@ -1072,14 +1075,17 @@ exit 0
                     artifacts: vec![crate::api::Artifact {
                         format: crate::api::Artifact::OCI_IMAGE.into(),
                         arch: crate::api::host_arch().into(),
-                        reference: format!("alpine@sha256:{}", "0".repeat(64)),
+                        r#ref: format!("alpine@sha256:{}", "0".repeat(64)),
                         digest: format!("sha256:{}", "0".repeat(64)),
                         size_bytes: 0,
+                        ..crate::api::Artifact::default()
                     }],
                     ..TemplateSpec::default()
-                },
+                }
+                .into(),
                 ..Template::default()
-            },
+            }
+            .into(),
             ..CreateWork::default()
         };
 
@@ -1109,19 +1115,23 @@ exit 0
         let driver = driver(&directory);
         let mut work = fork_work();
         work.network = NetworkPolicy {
-            mode: NetworkMode::Disabled,
+            mode: NetworkMode::Disabled.into(),
             ..NetworkPolicy::default()
-        };
+        }
+        .into();
         work.mounts = vec![Mount {
             host: host.display().to_string(),
             guest: "/workspace".into(),
             readonly: true,
+            ..Mount::default()
         }];
         work.shape = Shape {
             cpus: 4,
             memory_mib: 2048,
             disk_gib: 0,
-        };
+            ..Shape::default()
+        }
+        .into();
 
         driver.create(&work).await.unwrap();
 
@@ -1154,9 +1164,10 @@ exit 0
         let driver = driver(&directory);
         let mut work = fork_work();
         work.network = NetworkPolicy {
-            mode: NetworkMode::PublicOnly,
+            mode: NetworkMode::PublicOnly.into(),
             ..NetworkPolicy::default()
-        };
+        }
+        .into();
 
         driver.create(&work).await.unwrap();
 
@@ -1176,6 +1187,7 @@ exit 0
                     work.sockets = vec![SocketMount {
                         host: "/tmp/engine.sock".into(),
                         guest: "/run/engine.sock".into(),
+                        ..SocketMount::default()
                     }];
                 }) as Box<dyn Fn(&mut CreateWork)>,
             ),
@@ -1199,7 +1211,11 @@ exit 0
             mutate(&mut work);
             let error = driver.create(&work).await.unwrap_err();
             assert_eq!(error.code, Code::FailedPrecondition, "{field}");
-            assert!(error.message.contains(field), "{field}: {}", error.message);
+            assert!(
+                crate::error::message(&error).contains(field),
+                "{field}: {}",
+                crate::error::message(&error)
+            );
             assert!(
                 calls(&directory.path().join("smolvm")).is_empty(),
                 "{field}: nothing may reach smolvm"

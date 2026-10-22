@@ -123,9 +123,10 @@ pub fn template(name: &str) -> preloop_sandbox::api::TemplateSpec {
         artifacts: vec![Artifact {
             format: Artifact::OCI_IMAGE.into(),
             arch: preloop_sandbox::api::host_arch().into(),
-            reference: format!("ghcr.io/preloop/alpine@{DIGEST}"),
+            r#ref: format!("ghcr.io/preloop/alpine@{DIGEST}"),
             digest: DIGEST.into(),
             size_bytes: 0,
+            ..Artifact::default()
         }],
         ..preloop_sandbox::api::TemplateSpec::default()
     }

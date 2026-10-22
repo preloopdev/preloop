@@ -1269,6 +1269,7 @@ mod tests {
             host: host.display().to_string(),
             guest: "/mnt".into(),
             readonly: true,
+            ..Mount::default()
         }
     }
 
@@ -1276,7 +1277,12 @@ mod tests {
         SocketMount {
             host: host.display().to_string(),
             guest: "/run/socket".into(),
+            ..SocketMount::default()
         }
+    }
+
+    fn text(error: &Error) -> &str {
+        crate::error::message(error)
     }
 
     fn stats(native_ref: impl Into<String>, start_time: i64) -> SandboxRuntimeStats {
@@ -1311,17 +1317,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, Code::FailedPrecondition);
         assert!(
-            error.message.contains("exports no mount paths"),
+            text(&error).contains("exports no mount paths"),
             "{}",
-            error.message
+            text(&error)
         );
         let error = access
             .check_create(&create(vec![], vec![socket(dir.path())]))
             .unwrap_err();
         assert!(
-            error.message.contains("exports no socket paths"),
+            text(&error).contains("exports no socket paths"),
             "{}",
-            error.message
+            text(&error)
         );
         // No mounts means nothing to check.
         access.check_create(&create(vec![], vec![])).unwrap();
@@ -1353,9 +1359,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, Code::FailedPrecondition);
         assert!(
-            error.message.contains("outside this agent's allowlist"),
+            text(&error).contains("outside this agent's allowlist"),
             "{}",
-            error.message
+            text(&error)
         );
         // `..` resolves before the prefix check, so it cannot escape.
         let escape = allowed.join("..").join("outside");
@@ -1363,9 +1369,9 @@ mod tests {
             .check_create(&create(vec![mount(&escape)], vec![]))
             .unwrap_err();
         assert!(
-            error.message.contains("outside this agent's allowlist"),
+            text(&error).contains("outside this agent's allowlist"),
             "{}",
-            error.message
+            text(&error)
         );
         // A symlink inside the tree that points out of it is denied too.
         #[cfg(unix)]
@@ -1376,9 +1382,9 @@ mod tests {
                 .check_create(&create(vec![mount(&link)], vec![]))
                 .unwrap_err();
             assert!(
-                error.message.contains("outside this agent's allowlist"),
+                text(&error).contains("outside this agent's allowlist"),
                 "{}",
-                error.message
+                text(&error)
             );
         }
         // A path that does not exist cannot be resolved, so it is denied.
@@ -1386,9 +1392,9 @@ mod tests {
             .check_create(&create(vec![mount(&allowed.join("missing"))], vec![]))
             .unwrap_err();
         assert!(
-            error.message.contains("cannot be resolved"),
+            text(&error).contains("cannot be resolved"),
             "{}",
-            error.message
+            text(&error)
         );
     }
 
@@ -1441,23 +1447,20 @@ mod tests {
             sandbox_id: "sbx-1".into(),
             driver: "fake".into(),
             native_ref: "native-1".into(),
+            ..SandboxWork::default()
         };
-        let exec = WorkItem {
-            id: "w1".into(),
-            exec: Some(ExecWork {
+        let exec = WorkItem::new(
+            "w1",
+            work_item::Work::Exec(Box::new(ExecWork {
                 exec_id: "e1".into(),
-                target: target.clone(),
-                request: ExecRequest::default(),
-            }),
-            ..WorkItem::default()
-        };
+                target: target.clone().into(),
+                request: ExecRequest::default().into(),
+                ..ExecWork::default()
+            })),
+        );
         assert_eq!(item_native_ref(&exec), Some("native-1"));
         assert_eq!(item_native_ref(&WorkItem::default()), None);
-        let create = WorkItem {
-            id: "w2".into(),
-            create: Some(CreateWork::default()),
-            ..WorkItem::default()
-        };
+        let create = WorkItem::new("w2", work_item::Work::Create(Box::default()));
         assert_eq!(item_native_ref(&create), None);
     }
 

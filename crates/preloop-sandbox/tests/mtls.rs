@@ -12,7 +12,7 @@ use std::time::Duration;
 use common::TestService;
 use preloop_sandbox::agent::{ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
-use preloop_sandbox::error::Client as ConnectClient;
+use preloop_sandbox::generated::preloop::sandbox::v1 as rpc;
 use preloop_sandbox::{Code, SandboxApi, SandboxClient};
 
 fn register(name: &str) -> RegisterRequest {
@@ -20,9 +20,24 @@ fn register(name: &str) -> RegisterRequest {
         name: name.into(),
         drivers: vec![DriverInfo {
             driver: "fake".into(),
-            capabilities: Capabilities::default(),
+            capabilities: Capabilities::default().into(),
+            ..DriverInfo::default()
         }],
+        protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+        ..RegisterRequest::default()
     }
+}
+
+fn anonymous_providers(
+    base: &str,
+    ca_pem: &str,
+) -> rpc::ProvidersClient<connectrpc::client::HttpClient> {
+    let uri: axum::http::Uri = base.parse().unwrap();
+    let config = connectrpc::client::ClientConfig::new(uri).json();
+    let transport = connectrpc::client::HttpClient::with_tls(
+        preloop_sandbox::tls::client_config(ca_pem, None).unwrap(),
+    );
+    rpc::ProvidersClient::new(transport, config)
 }
 
 fn copy_identity(from: &Path, to: &Path) {
@@ -31,6 +46,34 @@ fn copy_identity(from: &Path, to: &Path) {
         let entry = entry.unwrap();
         std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
     }
+}
+
+#[tokio::test]
+async fn register_with_a_mismatched_protocol_version_is_rejected() {
+    let t = TestService::start().await;
+    let link = t.enroll("host-a").await;
+    let agent_version = preloop_sandbox::PROTOCOL_VERSION + 1;
+    let error = link
+        .register(RegisterRequest {
+            name: "host-a".into(),
+            protocol_version: agent_version,
+            ..RegisterRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    let message = preloop_sandbox::error::message(&error);
+    // The caller is told both versions: what it spoke and what to speak.
+    assert!(
+        message.contains(&agent_version.to_string()),
+        "agent version missing from {message:?}"
+    );
+    assert!(
+        message.contains(&preloop_sandbox::PROTOCOL_VERSION.to_string()),
+        "service version missing from {message:?}"
+    );
+    // A matching version still registers.
+    link.register(register("host-a")).await.unwrap();
 }
 
 #[tokio::test]
@@ -79,7 +122,8 @@ async fn join_tokens_are_single_use() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
-    assert!(error.message.contains("join token"), "{}", error.message);
+    let message = preloop_sandbox::error::message(&error);
+    assert!(message.contains("join token"), "{message}");
 }
 
 #[tokio::test]
@@ -93,7 +137,8 @@ async fn expired_join_tokens_are_rejected() {
     assert_eq!(error.code, Code::Unauthenticated);
     // Maintenance may already have pruned it, so "expired" and "unknown" are
     // both correct rejects.
-    assert!(error.message.contains("join token"), "{}", error.message);
+    let message = preloop_sandbox::error::message(&error);
+    assert!(message.contains("join token"), "{message}");
 }
 
 #[tokio::test]
@@ -107,7 +152,10 @@ async fn a_wrong_ca_pin_is_rejected_before_the_csr_is_sent() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
-    assert!(error.message.contains("pin"), "{}", error.message);
+    assert!(
+        preloop_sandbox::error::message(&error).contains("pin"),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -118,20 +166,21 @@ async fn a_token_pinned_to_another_ca_is_rejected_by_the_service() {
     let tampered = format!("{head}.{}", "00".repeat(32));
     // Go straight to the service: the agent would refuse the pin before
     // sending, so only a raw call exercises the service-side check.
-    let anonymous = ConnectClient::with_tls(&t.base, None, &t.ca_pem(), None).unwrap();
+    let anonymous = anonymous_providers(&t.base, &t.ca_pem());
     let error = anonymous
-        .unary::<_, EnrollResponse>(
-            "preloop.sandbox.v1.Providers/Enroll",
-            &EnrollRequest {
-                token: tampered,
-                name: "host-a".into(),
-                csr_pem: String::new(),
-            },
-        )
+        .enroll(EnrollRequest {
+            token: tampered,
+            name: "host-a".into(),
+            csr_pem: String::new(),
+            ..EnrollRequest::default()
+        })
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
-    assert!(error.message.contains("CA"), "{}", error.message);
+    assert!(
+        preloop_sandbox::error::message(&error).contains("CA"),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -140,7 +189,10 @@ async fn register_with_a_mismatched_name_is_denied() {
     let link = t.enroll("host-a").await;
     let error = link.register(register("host-b")).await.unwrap_err();
     assert_eq!(error.code, Code::PermissionDenied);
-    assert!(error.message.contains("name"), "{}", error.message);
+    assert!(
+        preloop_sandbox::error::message(&error).contains("name"),
+        "{error:?}"
+    );
     // The name from the certificate still works.
     link.register(register("host-a")).await.unwrap();
 }
@@ -148,35 +200,27 @@ async fn register_with_a_mismatched_name_is_denied() {
 #[tokio::test]
 async fn provider_calls_without_a_client_certificate_are_denied() {
     let t = TestService::start().await;
-    let anonymous = ConnectClient::with_tls(&t.base, None, &t.ca_pem(), None).unwrap();
-    let error = anonymous
-        .unary::<_, RegisterResponse>("preloop.sandbox.v1.Providers/Register", &register("ghost"))
-        .await
-        .unwrap_err();
+    let anonymous = anonymous_providers(&t.base, &t.ca_pem());
+    let error = anonymous.register(register("ghost")).await.unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
     let error = anonymous
-        .unary::<_, Empty>(
-            "preloop.sandbox.v1.Providers/Heartbeat",
-            &HeartbeatRequest {
-                provider_id: "prv-missing".into(),
-                generation: 1,
-                ..HeartbeatRequest::default()
-            },
-        )
+        .heartbeat(HeartbeatRequest {
+            provider_id: "prv-missing".into(),
+            generation: 1,
+            ..HeartbeatRequest::default()
+        })
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
     // Enroll is the one method that does not need a client certificate; it
     // still needs a valid token.
     let error = anonymous
-        .unary::<_, EnrollResponse>(
-            "preloop.sandbox.v1.Providers/Enroll",
-            &EnrollRequest {
-                token: "plj1.missing.secret".into(),
-                name: "ghost".into(),
-                csr_pem: String::new(),
-            },
-        )
+        .enroll(EnrollRequest {
+            token: "plj1.missing.secret".into(),
+            name: "ghost".into(),
+            csr_pem: String::new(),
+            ..EnrollRequest::default()
+        })
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
@@ -230,7 +274,10 @@ async fn removing_a_provider_revokes_its_certificate() {
     assert!(t.service.list_providers().is_empty());
     let error = link.register(register("host-a")).await.unwrap_err();
     assert_eq!(error.code, Code::PermissionDenied);
-    assert!(error.message.contains("not enrolled"), "{}", error.message);
+    assert!(
+        preloop_sandbox::error::message(&error).contains("not enrolled"),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

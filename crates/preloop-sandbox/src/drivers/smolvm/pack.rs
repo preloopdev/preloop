@@ -708,9 +708,10 @@ mod tests {
         Artifact {
             format: Artifact::SMOLMACHINE.into(),
             arch: crate::api::host_arch().into(),
-            reference: format!("file://{}", path.display()),
+            r#ref: format!("file://{}", path.display()),
             digest: format!("sha256:{}", hex::encode(Sha256::digest(&bytes))),
             size_bytes: bytes.len() as u64,
+            ..Artifact::default()
         }
     }
 
@@ -761,9 +762,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, Code::FailedPrecondition);
         assert!(
-            error.message.contains("sha256 mismatch"),
+            crate::error::message(&error).contains("sha256 mismatch"),
             "{}",
-            error.message
+            crate::error::message(&error)
         );
         assert!(!cache.path_for(&artifact.digest).exists());
     }
@@ -822,9 +823,10 @@ mod tests {
         let arm = |format: &str| Artifact {
             format: format.into(),
             arch: "arm64".into(),
-            reference: format!("ghcr.io/preloop/base@sha256:{}", "a".repeat(64)),
+            r#ref: format!("ghcr.io/preloop/base@sha256:{}", "a".repeat(64)),
             digest: format!("sha256:{}", "a".repeat(64)),
             size_bytes: 0,
+            ..Artifact::default()
         };
         let artifacts = vec![arm("unknown"), arm(Artifact::OCI_IMAGE)];
         let (artifact, format) = select_artifact(&artifacts, &formats, "aarch64").unwrap();
