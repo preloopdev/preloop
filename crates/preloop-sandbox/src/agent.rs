@@ -576,6 +576,25 @@ fn jittered(base: Duration) -> Duration {
     Duration::from_nanos(low + rand::random::<u64>() % (nanos - low + 1))
 }
 
+/// First delay between registration attempts.
+const REGISTER_BACKOFF_MIN: Duration = Duration::from_millis(500);
+/// Ceiling for ordinary transport failures.
+const REGISTER_BACKOFF_MAX: Duration = Duration::from_secs(15);
+/// Certificate failures (`unauthenticated`, `permission_denied`) cannot fix
+/// themselves: hold the retry cadence at this delay until an operator
+/// re-enrolls the agent, instead of hammering the service.
+const REGISTER_AUTH_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Delay before the next registration attempt.
+fn registration_delay(backoff: Duration, error: Option<&Error>) -> Duration {
+    match error {
+        Some(error) if matches!(error.code, Code::Unauthenticated | Code::PermissionDenied) => {
+            backoff.max(REGISTER_AUTH_BACKOFF)
+        }
+        _ => backoff,
+    }
+}
+
 /// The host agent.
 pub struct Agent {
     link: Arc<dyn ProviderLink>,
@@ -636,24 +655,29 @@ impl Agent {
     /// Run until `shutdown`, re-registering after fencing or link failures.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
         std::fs::create_dir_all(&self.config.scratch).ok();
-        let mut backoff = Duration::from_millis(500);
+        let mut backoff = REGISTER_BACKOFF_MIN;
         while !shutdown.is_cancelled() {
+            let mut failed = None;
             match self.register().await {
                 Ok(session) => {
                     info!(provider = %session.provider_id, generation = session.generation, "agent registered");
-                    backoff = Duration::from_millis(500);
+                    backoff = REGISTER_BACKOFF_MIN;
                     let error = self.clone().session(session, shutdown.clone()).await;
                     if let Some(error) = error {
                         warn!(%error, "agent session ended; re-registering");
                     }
                 }
-                Err(error) => warn!(%error, "agent registration failed"),
+                Err(error) => {
+                    warn!(%error, "agent registration failed");
+                    failed = Some(error);
+                }
             }
+            let delay = registration_delay(backoff, failed.as_ref());
             tokio::select! {
                 _ = shutdown.cancelled() => return,
-                _ = tokio::time::sleep(backoff) => {}
+                _ = tokio::time::sleep(delay) => {}
             }
-            backoff = (backoff * 2).min(Duration::from_secs(15));
+            backoff = (backoff * 2).min(REGISTER_BACKOFF_MAX);
         }
     }
 
@@ -1447,5 +1471,32 @@ mod tests {
         assert!(fenced(&Error::aborted("stale generation")));
         assert!(fenced(&Error::not_found("exec not found")));
         assert!(!fenced(&Error::unavailable("try again")));
+    }
+
+    #[test]
+    fn certificate_failures_back_off_further_than_transport_errors() {
+        let unauthenticated = Error::new(Code::Unauthenticated, "different CA");
+        let denied = Error::new(Code::PermissionDenied, "not enrolled");
+        let unavailable = Error::new(Code::Unavailable, "connection refused");
+        assert_eq!(
+            registration_delay(REGISTER_BACKOFF_MIN, Some(&unauthenticated)),
+            REGISTER_AUTH_BACKOFF
+        );
+        assert_eq!(
+            registration_delay(REGISTER_BACKOFF_MIN, Some(&denied)),
+            REGISTER_AUTH_BACKOFF
+        );
+        assert_eq!(
+            registration_delay(REGISTER_BACKOFF_MIN, Some(&unavailable)),
+            REGISTER_BACKOFF_MIN
+        );
+        // A session that ended after a successful registration is not an
+        // identity problem: retry on the ordinary cadence.
+        assert_eq!(
+            registration_delay(REGISTER_BACKOFF_MIN, None),
+            REGISTER_BACKOFF_MIN
+        );
+        let doubled = (REGISTER_BACKOFF_MIN * 2).min(REGISTER_BACKOFF_MAX);
+        assert_eq!(registration_delay(doubled, Some(&unavailable)), doubled);
     }
 }

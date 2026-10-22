@@ -46,3 +46,4 @@ opentelemetry_sdk.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util", "net"] }
 tower = { workspace = true, features = ["util"] }
+x509-parser = "0.18"
