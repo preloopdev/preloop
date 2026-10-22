@@ -229,10 +229,52 @@ pub fn app_with_test_api(
     build_app(state, shutdown, Some(token.into()))
 }
 
+/// Build the in-process test router with webhook upload budgets sized for a
+/// test instead of for a network transfer.
+///
+/// The gate charges elapsed wall time from admission, and a client that hands
+/// this router a body already in memory never uploads anything: the only thing
+/// the budgets can measure here is how long a loaded machine took to schedule
+/// the handler. A delivery the suite expects to be accepted can spend the
+/// production ten-second ingest budget before the handler is polled once, so
+/// the tests that deliver webhooks in process pass budgets they can wait out.
+/// The gate's own tests below build their router and keep the production
+/// values.
+#[cfg(test)]
+pub(crate) fn app_with_test_api_and_upload_budgets(
+    state: AppState,
+    shutdown: CancellationToken,
+    token: impl Into<String>,
+    ingest_budget: Duration,
+    idle_budget: Duration,
+) -> Router {
+    let gate = WebhookUploadGate {
+        slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WEBHOOK_UPLOADS)),
+        ingest_budget,
+        idle_budget,
+        admission_wait: WEBHOOK_ADMISSION_WAIT,
+    };
+    build_app_with_upload_gate(state, shutdown, Some(token.into()), Arc::new(gate))
+}
+
 pub fn build_app(
     state: AppState,
     shutdown: CancellationToken,
     test_api_token: Option<String>,
+) -> Router {
+    build_app_with_upload_gate(
+        state,
+        shutdown,
+        test_api_token,
+        Arc::new(WebhookUploadGate::new(MAX_CONCURRENT_WEBHOOK_UPLOADS)),
+    )
+}
+
+fn build_app_with_upload_gate(
+    state: AppState,
+    shutdown: CancellationToken,
+    test_api_token: Option<String>,
+    webhook_upload_gate: Arc<WebhookUploadGate>,
 ) -> Router {
     let shared = Arc::new(SharedState {
         state: state.clone(),
@@ -571,9 +613,6 @@ pub fn build_app(
             shared.clone(),
             require_native_bearer,
         ));
-
-    // Shared by the webhook route's gate: see `limit_webhook_uploads`.
-    let webhook_upload_gate = Arc::new(WebhookUploadGate::new(MAX_CONCURRENT_WEBHOOK_UPLOADS));
 
     let router = Router::new()
         .route("/healthz", get(healthz))
