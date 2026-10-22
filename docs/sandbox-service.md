@@ -184,7 +184,7 @@ sandbox still references.
 ## Security
 
 Every listener speaks TLS. On first start the service creates a CA in
-`<state>/sandbox-ca/` (`ca.pem`, `ca.key`, mode 0600) and reuses it, issuing its
+`<state>/sandbox-ca/` (`ca.pem` public, `ca.key` mode 0600) and reuses it, issuing its
 own server certificate with SANs from `PRELOOP_SANDBOX_TLS_SANS` (default: the
 hostname, `localhost`, `127.0.0.1`, `::1`).
 `PRELOOP_SANDBOX_TLS_CERT` / `PRELOOP_SANDBOX_TLS_KEY` replace the server
