@@ -296,11 +296,13 @@ fn register_built_jobs(
         let queued = built_queued_job(run_id, &built);
         let kind = submit::kind_of(&queued);
         let parent = node_parent(&plan, &job_id);
-        let (status, queue_state) = if unhostable.is_some() {
-            (ExecutionStatus::Failure, "none")
-        } else {
-            (ExecutionStatus::Pending, "blocked")
-        };
+        // Every row starts `pending`/`blocked`, even an unhostable one:
+        // `settle::settle_node` below is the single place that writes its
+        // terminal row and emits its `job.completed.v1`. Pre-writing it
+        // terminal here would make that call see an already-terminal row
+        // and treat it as a replayed duplicate — settling nothing and
+        // emitting no event for this job at all.
+        let (status, queue_state) = (ExecutionStatus::Pending, "blocked");
         jobs::insert_job(
             tx,
             run_id,
@@ -336,7 +338,18 @@ fn register_built_jobs(
                 job = %job_id.0,
                 "materialized callee job is unhostable: no {platform} runner"
             );
-            settle::settle_node(tx, backend, run_id, &job_id, ExecutionStatus::Failure)?;
+            // No fail-fast: the subtree's other legs are still being
+            // registered one at a time and have not had a chance to
+            // dispatch, so cancelling them here would settle jobs that
+            // never ran, matching PG's `settle_unrun` (never fail-fasts).
+            settle::settle_node(
+                tx,
+                backend,
+                run_id,
+                &job_id,
+                ExecutionStatus::Failure,
+                false,
+            )?;
             continue;
         }
         // Strip secret values before persistence; the acquire path rebuilds
@@ -567,8 +580,11 @@ impl LiteBackend {
             let built = match claim.built {
                 Ok(built) => built,
                 Err(status) => {
-                    settle::settle_node(tx, self, run_id, &node_id, status)?;
+                    settle::settle_node(tx, self, run_id, &node_id, status, true)?;
                     outcome.failed.push((run_id, node_id));
+                    // The settled node may have been its caller's last open
+                    // inner job.
+                    super::dispatch::fold_settled_callers(tx, self, run_id)?;
                     // Children materialize *after* the caller's own needs may have
                     // settled (they inherit them): recompute before promoting, same
                     // as the submit path.
@@ -580,7 +596,14 @@ impl LiteBackend {
             match built {
                 BuiltExpansion::Matrix { jobs } if jobs.is_empty() => {
                     // An empty matrix concludes the node as skipped.
-                    settle::settle_node(tx, self, run_id, &node_id, ExecutionStatus::Skipped)?;
+                    settle::settle_node(
+                        tx,
+                        self,
+                        run_id,
+                        &node_id,
+                        ExecutionStatus::Skipped,
+                        true,
+                    )?;
                     outcome.skipped.push((run_id, node_id));
                 }
                 BuiltExpansion::Matrix { jobs } => {
@@ -663,6 +686,10 @@ impl LiteBackend {
                     )?;
                 }
             }
+            // Jobs settled while the subtree registered (an empty matrix, an
+            // unhostable job) may have been a caller's last open inner jobs;
+            // the caller's `inner_job_ids` name the subtree by now.
+            super::dispatch::fold_settled_callers(tx, self, run_id)?;
             // Children materialize *after* the caller's own needs may have
             // settled (they inherit them): recompute before promoting, same
             // as the submit path.

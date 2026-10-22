@@ -193,6 +193,38 @@ and a deferred matrix parent named in a caller's list is replaced by its legs
 when it expands. These are lite's `write_reusable_meta` and
 `splice_matrix_parents`. Without them a deferred caller never folds on PG.
 
+The fold runs for every settle that turns an inner job terminal, not only a
+completion: `settle_unrun` (a skip or error cascade, a job that fails its label,
+environment or gate check at promotion, a failed or empty expansion, an
+unhostable job) walks up the callers right after the job's own terminal write
+(`Sweep::settle_folded_callers`), refreshes the folded callers' dependents and
+emits their `job.completed.v1`, so a caller whose last open inner job settled
+that way folds in the same transaction, and the dependents it unblocks join the
+promotion queue. An expansion registers its unhostable jobs only after the
+caller's `inner_job_ids` / the matrix splice name the subtree, so their settles
+can fold it. The fold stays idempotent: resolved `outputs` mark a folded caller.
+Lite folds after each promotion pass and after an expansion apply
+(`fold_settled_callers`).
+
+An expansion that registers several unhostable jobs in one subtree settles
+every row first (terminal write + its own `job.completed.v1`, no fold), then
+folds each settled id in order, then concludes the run once — so every inner
+job's own event precedes the caller it completes, which precedes
+`run.completed.v1`. Folding mid-batch (settle, fold, settle, fold, …) would
+let the first settle's fold see a sibling's row already written terminal
+(by registration, ahead of that sibling's own settle) and fold early, before
+that sibling's own event ever landed.
+
+`Sweep::settle_node`, the in-memory-graph settle behind `promote_ready_jobs`
+(a parked environment gate's release — a timeout or a denial — and the
+reaper's wall-clock starvation sweep) and `resume_held_run` (jobs a
+`concurrency:` waiter parked behind its own gate), now folds too: it flushes
+the settling job's row ahead of the fold (the fold reads rows, not the
+graph), then mirrors a folded caller and the dependents it unblocks back
+into the graph so the same sweep's fixpoint loop keeps going. Rerun/reset —
+which settle rows while rebuilding a run, not as a live run's own outcome —
+still do not fold; proving that safe is open work.
+
 ## If: Condition Evaluation (Per Newly-Unblocked Job)
 
 When the conditional UPDATE unblocks a dependent, evaluate its `if:` before
@@ -320,7 +352,9 @@ Registration inserts every row of the subtree first, then counts
 dependents). A leg inherits its node's `needs:`, which settled before the node
 expanded, and a need may name several legs, so the count at insert time
 (`needs.len()`) is not the outstanding count. Jobs no runner can host settle
-`failure` after that, so a later job of the subtree sees them as terminal.
+`failure` after that — once the caller's `inner_job_ids` or the matrix splice
+name the subtree, so a later job of the subtree sees them as terminal and a
+subtree that is entirely unhostable folds its caller.
 
 The jobs the subtree can start — those with no outstanding needs, plus the
 dependents the unhostable settles unblocked — go through `promote_dependents`

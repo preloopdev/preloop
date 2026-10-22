@@ -118,6 +118,52 @@ Releases before v0.27.0 predate the changelog.
   leaving them pending; an unhostable leg no longer trips a debug assertion
   at registration and settles after the rest of its subtree exists, so a
   dependent registered later in the subtree sees it as terminal.
+- **Reusable callers fold when their last inner job settles without a
+  completion**: a callee job skipped or failed by a promotion cascade, one that
+  fails its label, environment or gate check at promotion, an unhostable one, and
+  a failed or empty deferred expansion inside a callee never folded the caller,
+  so the caller never got its status and outputs, its dependents and the run
+  never finished, and its concurrency stayed held. Every settle now runs the
+  same fold (nested callers included), refreshes the folded callers' dependents
+  and emits their `job.completed.v1`; SQLite folds after each promotion pass
+  and expansion apply likewise.
+- **Postgres: unhostable inner jobs of a reusable caller emit their own
+  `job.completed.v1` before the caller folds**: a subtree whose expansion
+  registered several unhostable jobs wrote every sibling's row terminal
+  before settling any of them, so the first settle's fold saw every sibling
+  already terminal and folded the caller immediately — `job.completed.v1`
+  for the caller and `run.completed.v1` could land before a later sibling's
+  own `job.completed.v1`. Registration now settles every unhostable row
+  first, then folds each settled id (and concludes the run) once the whole
+  batch's own events are emitted, so inner jobs always precede the caller,
+  which always precedes `run.completed.v1`. SQLite had the same gap for a
+  different reason (an unhostable row was written terminal before the
+  settle that was meant to emit its event, which then saw it as an
+  already-settled duplicate and emitted nothing); the settle now owns the
+  terminal write instead of replaying over a pre-written one. That settle
+  does not run matrix fail-fast (Postgres's settle path never does), so an
+  unhostable leg cannot cancel a sibling registered ahead of it.
+- **SQLite: the reusable-caller fold skips its whole-run reload when a run
+  has no reusable caller**: `fold_settled_callers` ran `finalize_reusable_callers`
+  (and its `jobs::run_record` load of the entire run) after every settling
+  promotion pass, even for runs with no `uses:` job. A cheap indexed
+  existence check now gates the reload.
+- **Postgres: the reusable-caller fold's candidate scan is pushed into SQL**:
+  `try_fold_reusable_caller` pulled every reusable-caller spec of the run
+  over the wire and deserialized each one to test whether it listed the
+  settled job, instead of letting Postgres filter by `inner_job_ids`
+  containment.
+- **Postgres: a parked environment-gate failure or a starved ready job now
+  folds its reusable caller too**: `Sweep::settle_node` (the in-memory-graph
+  settle behind `promote_ready_jobs` — a job's environment-protection gate
+  that times out or is denied, and the reaper's wall-clock starvation sweep
+  over unmatched ready jobs) and a run resuming jobs parked behind a
+  `concurrency:` gate (`resume_held_run`) never folded a reusable caller
+  whose last open inner job they settled, leaving the caller (and the run)
+  stuck. These three live-run settle paths now fold, same as every other
+  settle. Rerun/reset, which settle rows while rebuilding a run rather than
+  as a live run's own outcome, still do not fold — folding there is a
+  separate, open gap.
 - A completion that reports a non-terminal status is rejected with a bad
   request before anything is written.
 
