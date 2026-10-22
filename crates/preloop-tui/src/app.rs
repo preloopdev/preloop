@@ -45,7 +45,7 @@ pub struct ContextInfo {
 #[derive(Debug)]
 pub enum Fetched {
     /// The operational snapshot. An error means the engine is unreachable.
-    Status(Result<OperationalSnapshot, String>),
+    Status(Box<Result<OperationalSnapshot, String>>),
     /// The recent runs list.
     Runs(Result<Vec<RunRecord>, String>),
     /// One full run record.
@@ -495,19 +495,21 @@ impl App {
 
     fn on_fetched(&mut self, fetched: Fetched) -> Vec<Effect> {
         match fetched {
-            Fetched::Status(Ok(status)) => {
-                let observed = status.observed_at.unwrap_or(self.now);
-                self.store.push_ready(observed, status.jobs.ready);
-                self.tracker.observe(observed, &status);
-                self.engine_down = None;
-                self.store.status.succeed(status, self.now);
-                Vec::new()
-            }
-            Fetched::Status(Err(error)) => {
-                self.engine_down = Some(error.clone());
-                self.store.status.fail(error);
-                Vec::new()
-            }
+            Fetched::Status(result) => match *result {
+                Ok(status) => {
+                    let observed = status.observed_at.unwrap_or(self.now);
+                    self.store.push_ready(observed, status.jobs.ready);
+                    self.tracker.observe(observed, &status);
+                    self.engine_down = None;
+                    self.store.status.succeed(status, self.now);
+                    Vec::new()
+                }
+                Err(error) => {
+                    self.engine_down = Some(error.clone());
+                    self.store.status.fail(error);
+                    Vec::new()
+                }
+            },
             Fetched::Runs(Ok(mut runs)) => {
                 runs.sort_by_key(|run| std::cmp::Reverse(run.run_number));
                 self.store.runs.succeed(runs, self.now);
@@ -618,10 +620,11 @@ impl App {
             .entry(chunk.step_id.clone())
             .or_default()
             .apply(chunk);
-        if let Some(live) = self.streams.live.as_mut() {
-            if live.0 == run_id && live.1 == job_id {
-                live.2 = 0;
-            }
+        if let Some(live) = self.streams.live.as_mut()
+            && live.0 == run_id
+            && live.1 == job_id
+        {
+            live.2 = 0;
         }
     }
 
@@ -1494,7 +1497,7 @@ mod tests {
     #[test]
     fn engine_down_shows_the_setup_keys_and_s_starts_the_wizard() {
         let mut app = app();
-        app.update(Msg::Fetched(Fetched::Status(Err("connection refused".into()))));
+        app.update(Msg::Fetched(Fetched::Status(Box::new(Err("connection refused".into())))));
         assert!(app.engine_down.is_some());
         let effects = app.update(key(KeyCode::Char('s')));
         assert!(matches!(effects.as_slice(), [Effect::Act(Action::RunWizard)]));

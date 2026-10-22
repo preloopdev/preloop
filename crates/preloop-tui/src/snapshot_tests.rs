@@ -72,8 +72,8 @@ fn loaded_app() -> App {
     // Two snapshots five minutes apart, so the leaked-binding window reads 4m12s.
     let earlier: OperationalSnapshot = parse("status_earlier.json");
     let status: OperationalSnapshot = parse("status.json");
-    app.update(Msg::Fetched(Fetched::Status(Ok(earlier))));
-    app.update(Msg::Fetched(Fetched::Status(Ok(status))));
+    app.update(Msg::Fetched(Fetched::Status(Box::new(Ok(earlier)))));
+    app.update(Msg::Fetched(Fetched::Status(Box::new(Ok(status)))));
 
     // Ready-queue history for the sparkline, as the mockup shows it.
     for (index, value) in [0, 0, 1, 2, 4, 2, 1, 0, 0, 1, 4, 1].into_iter().enumerate() {
@@ -271,9 +271,9 @@ fn runs_live_matches_golden() {
 #[test]
 fn engine_down_banner_names_the_setup_keys() {
     let mut app = loaded_app();
-    app.update(Msg::Fetched(Fetched::Status(Err(
+    app.update(Msg::Fetched(Fetched::Status(Box::new(Err(
         "connection refused".into(),
-    ))));
+    )))));
     let (plain, _) = render_screen(&app);
     assert!(
         plain.contains("no engine at http://127.0.0.1:9090 — s: setup wizard, S: start engine"),

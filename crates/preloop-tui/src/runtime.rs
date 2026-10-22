@@ -383,7 +383,7 @@ async fn run_fetch(fetch: Fetch, clients: ContextClients) -> Msg {
     let engine = clients.engine;
     let text = |error: crate::client::EngineError| error.to_string();
     let fetched = match fetch {
-        Fetch::Status => Fetched::Status(engine.status().await.map_err(text)),
+        Fetch::Status => Fetched::Status(Box::new(engine.status().await.map_err(text))),
         Fetch::Runs => Fetched::Runs(
             engine
                 .runs(&RunsQuery {
