@@ -70,7 +70,6 @@ parties integrate by implementing the Providers protocol.
 |---|---|---|
 | `smolvm` | public | CLI. Golden-fork: a build sandbox starts `--branchable`; `Snapshot` keeps it as the fork base; sandboxes from the snapshot template are `machine branch` clones. |
 | `fake` | public | Process-backed, for tests and conformance. |
-| Private drivers | private build | See the private repository for driver-specific implementations. |
 
 `smolvm serve` has native fork pools, but its clones lose `--mount-socket`
 relays (the CLI's branches keep them), so the driver stays on the CLI and pools

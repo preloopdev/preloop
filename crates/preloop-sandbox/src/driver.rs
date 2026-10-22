@@ -16,7 +16,7 @@ use crate::connect::{Error, Result};
 /// A sandbox backend on one host (or one remote endpoint, for connectors).
 #[async_trait]
 pub trait Driver: Send + Sync {
-    /// Stable driver name (`smolvm`, `fake`, or a private downstream driver).
+    /// Stable driver name (`smolvm`, `fake`, or another driver).
     fn name(&self) -> &str;
 
     /// What this backend can do.

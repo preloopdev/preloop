@@ -11,7 +11,7 @@ Releases before v0.27.0 predate the changelog.
 
 - **Sandbox Service** (`preloop-sandbox`) replaces `preloop-vm`; the
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
-  service. The AgentENV backend moved to the private build.
+  service.
 
 ## [0.35.6] - 2026-10-21
 
@@ -117,7 +117,7 @@ Releases before v0.27.0 predate the changelog.
   the CLI through `bootstrap::serve` into `AppState` and the runner pool, so
   golden traffic is admitted on the anonymous bucket and attributed to the new
   `golden` subsystem. A one-shot CLI bake, with no engine to share a funnel
-  with, keeps a private one instead of leaving a call unobserved. Behaviour: an
+  with, keeps its own instead of leaving a call unobserved. Behaviour: an
   open breaker refuses the metadata lookup before it opens a connection — none
   of its 30-second deadline is spent, and the refusal is not cached as a
   negative tag — while the transfers keep their one-hour budget and only their

@@ -186,7 +186,7 @@ fn spec(name: &str) -> MachineSpec {
 }
 
 #[tokio::test]
-async fn secret_env_upload_archives_private_script_content() {
+async fn secret_env_upload_archives_secret_script_content() {
     let dir = tempfile::tempdir().unwrap();
     let uploaded = Arc::new(tokio::sync::Mutex::new(None));
     let inner = Arc::new(FakeDriver::new(

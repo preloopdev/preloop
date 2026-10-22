@@ -1388,7 +1388,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         github: None,
     };
     let payload = artifact_payload(&output, &config.base_image);
-    // The bake runs through a private, in-process sandbox service with this
+    // The bake runs through an in-process sandbox service with this
     // host's SmolVM driver: `pack` writes a portable `.smolmachine`.
     let sandboxes = crate::sandbox::LocalSandboxes::start(&preloop_home()).await?;
     RunnerPool::new(sandboxes.machines(), config)?
