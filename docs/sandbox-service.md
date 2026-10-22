@@ -31,7 +31,8 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
   fencing generation), `Heartbeat`, `Poll` (long-poll for work), `Report` /
   `ReportExec` (fenced by generation), `Reconcile` (full inventory: lost
   sandboxes fail, orphans are destroyed, and a `Terminating` machine that is
-  still there gets its destroy re-queued), `RenewCertificate`.
+  still there gets its destroy re-queued; a template's fork base is never an
+  orphan, whichever provider reports it), `RenewCertificate`.
 
 Both are served with the Connect protocol, JSON codec, over one HTTPS port:
 `POST /preloop.sandbox.v1.<Service>/<Method>`. Every RPC is unary or
@@ -85,7 +86,10 @@ from the `.proto` interoperates.
   architecture it supports, so one template can serve several hosts. Formats
   are `oci-image` (the backend pulls the registry image itself) and
   `smolmachine` (a monolithic pack at `file://…` or a digest-pinned OCI
-  artifact on GHCR).
+  artifact on GHCR). The captured machine stays live as the template's fork
+  base. It has no sandbox record, but it is never an orphan: any provider that
+  reports it — including a second agent sharing the host's engine home — must
+  leave it alone, and only deleting the template destroys it.
 * **Pool** — template + shape + network + mounts + warm target + max. The
   service keeps `warm` idle sandboxes per pool (the generic warm pool) and
   refills after each claim, backing off after creation failures.

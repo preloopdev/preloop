@@ -1501,6 +1501,118 @@ async fn reconcile_never_destroys_another_providers_machine() {
     assert!(response.destroy.iter().any(|w| w.native_ref == orphan));
 }
 
+/// A golden is a template's fork base, not a sandbox: it has no record, so
+/// reconcile would call it an orphan. Every agent sharing the host's engine
+/// home reports it, and none of them may reap it.
+#[tokio::test]
+async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let build = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "bake".into(),
+            template: "alpine".into(),
+            purpose: Purpose::Build,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let (code, _, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: build.sandbox.id.clone(),
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo baked > \"$SANDBOX_ROOT/marker\"".into(),
+            ],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    let golden = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: build.sandbox.id.clone(),
+            name: "golden".into(),
+        })
+        .await
+        .unwrap();
+    // SmolVM keeps the snapped machine running as the fork base, so it is in
+    // every agent's inventory even though no sandbox record names it.
+    let golden_dir = h
+        ._dir
+        .path()
+        .join("host")
+        .join("sandboxes")
+        .join(&golden.native_ref);
+    std::fs::create_dir_all(&golden_dir).unwrap();
+
+    // A second agent on the same host, over the same driver, reports the
+    // whole inventory — the golden included.
+    let other = h
+        .service
+        .register(RegisterRequest {
+            name: "host-b".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities(),
+            }],
+        })
+        .await
+        .unwrap();
+    let observed = h.fake.inventory().await.unwrap();
+    assert!(
+        observed.iter().any(|o| o.native_ref == golden.native_ref),
+        "the golden is not in the shared inventory"
+    );
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id,
+            generation: other.generation,
+            sandboxes: observed,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !response
+            .destroy
+            .iter()
+            .any(|w| w.native_ref == golden.native_ref),
+        "another provider reaped the golden: {:?}",
+        response.destroy
+    );
+    // What the agent does with the answer still leaves the base alone.
+    for work in &response.destroy {
+        h.fake.destroy(&work.native_ref).await.unwrap();
+    }
+    assert!(golden_dir.is_dir(), "the golden was destroyed");
+
+    // The template still forks the captured state.
+    let fork = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "fork".into(),
+            template: "golden".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let (_, stdout, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: fork.sandbox.id,
+            argv: vec!["cat".into(), "marker".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(stdout, b"baked\n");
+}
+
 #[tokio::test]
 async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
     let dir = tempfile::tempdir().unwrap();
