@@ -19,15 +19,15 @@
 //! save` produce a tar that *is* the base image — there is no engine path that
 //! would build it later, so `init` builds it and records the tar.
 
-use crate::github_setup::{self, GithubSetupArgs, Via};
+use crate::github_setup::{self, AppPublicUrl, GithubSetupArgs, Via};
 use crate::preloop_home;
+use crate::prompter::{CapturePrompter, ChoiceOption, NoteLevel, Prompter, StdioPrompter};
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use preloop_runner_server::config::{ConfigFile, GoldenConfig, load_config, write_config};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::future::Future;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -61,7 +61,7 @@ impl std::fmt::Display for InitError {
 
 impl std::error::Error for InitError {}
 
-fn usage_error(message: impl Into<String>) -> anyhow::Error {
+pub(crate) fn usage_error(message: impl Into<String>) -> anyhow::Error {
     InitError {
         code: EXIT_USAGE,
         message: message.into(),
@@ -271,6 +271,9 @@ impl RunMode {
     }
 }
 
+/// The number of steps the wizard numbers its sections with.
+pub(crate) const WIZARD_STEPS: usize = 5;
+
 /// `preloop init`, entered from the CLI.
 pub(crate) async fn run(
     args: InitArgs,
@@ -279,21 +282,20 @@ pub(crate) async fn run(
     if args.probe {
         return print_probe().await;
     }
-    // The wizard owns the terminal; `--json` output is one object per line, so
-    // it is never mixed with prompts.
-    let interactive =
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !args.json;
-    let json = args.json;
-    let session = Session {
-        interactive,
-        json,
-        yes: args.yes,
-        from_serve: false,
-    };
-    match session.execute(args, observability, false).await {
-        // The resolved URL matters to the `serve` caller, which is already
-        // running the engine the wizard configured; an `init` run starts its
-        // mode itself and has nothing left to hand it to.
+    let opts = WizardOptions::from_cli(args);
+    let json = opts.json;
+    let mut prompter = StdioPrompter::new();
+    match run_wizard_async(&mut prompter, opts).await {
+        Ok(WizardOutcome::StartServe { public_url, .. }) => {
+            // The foreground engine owns this terminal and blocks until it is
+            // stopped; the wizard only said it was about to start. First-run
+            // preparation (state dir, brand-new control database) lives in
+            // `cmd_engine`.
+            let observability = observability.ok_or_else(|| {
+                anyhow::anyhow!("internal: foreground mode without the engine's telemetry handle")
+            })?;
+            crate::cmd_engine(serve_args_for(public_url.as_deref()), observability).await
+        }
         Ok(_) => Ok(()),
         Err(error) => {
             // A coded failure is a *step* failing, so `--json` reports it as
@@ -326,17 +328,183 @@ pub(crate) async fn run(
 /// resolution. The caller hands it to the engine it is already running — see
 /// [`apply_engine_public_url`].
 pub(crate) async fn run_from_serve() -> anyhow::Result<Option<String>> {
-    let args = InitArgs {
-        mode: Some(RunMode::Configure),
-        ..InitArgs::default()
-    };
+    let opts = WizardOptions::from_serve();
+    let mut prompter = StdioPrompter::new();
+    let outcome = run_wizard_async(&mut prompter, opts).await?;
+    Ok(match outcome {
+        WizardOutcome::Configured { public_url, .. }
+        // The mode is forced to configure-only, so only `Configured` can
+        // really come back; the others are handled rather than unreachable!()d.
+        | WizardOutcome::StartServe { public_url, .. }
+        | WizardOutcome::ServiceInstalled { public_url, .. }
+        | WizardOutcome::ServiceInstallRequired { public_url, .. } => public_url,
+        WizardOutcome::ServiceNeedsRoot => None,
+    })
+}
+
+/// How the wizard was entered. It decides what the wizard may do itself and
+/// how much output the caller expects back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WizardLaunch {
+    /// `preloop init` in this terminal: the caller acts on the outcome, and
+    /// the wizard may prepare a service's own state directory.
+    Cli,
+    /// `preloop serve`'s first-run offer: configure only, and never print the
+    /// "start `serve` later" hints (that process *is* the engine).
+    FromServe,
+    /// A host program (the TUI) drives the prompts: nothing is started or
+    /// installed in-process, because the host owns the terminal and its own
+    /// threads. Constructed by [`WizardOptions::embedded`], which this binary
+    /// does not call yet — the host program does.
+    Embedded,
+}
+
+/// Everything the wizard needs that is not a prompt.
+#[derive(Debug)]
+pub(crate) struct WizardOptions {
+    /// The `preloop init` flags, resolved by the same parser the CLI uses.
+    pub args: InitArgs,
+    pub launch: WizardLaunch,
+    /// A human is at the prompts. A host program always has one.
+    pub interactive: bool,
+    /// One JSON object per step, and no prompts at all.
+    pub json: bool,
+    /// `--yes`: keep every suggested answer.
+    pub yes: bool,
+}
+
+impl WizardOptions {
+    /// The options a `preloop init` run in this terminal gets: prompts only
+    /// when a human is on both ends, and never in `--json` mode (its output is
+    /// one object per line, so it is never mixed with prompts).
+    pub(crate) fn from_cli(args: InitArgs) -> Self {
+        let json = args.json;
+        let yes = args.yes;
+        let interactive =
+            !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        Self {
+            args,
+            launch: WizardLaunch::Cli,
+            interactive,
+            json,
+            yes,
+        }
+    }
+
+    /// The options a host program (the TUI) drives the wizard with: it can
+    /// prompt, it prints nothing itself, and it starts nothing.
+    // Dead until a host program calls it: this binary is the CLI, and
+    // `from_cli`/`from_serve` are what it uses.
+    #[allow(dead_code)]
+    pub(crate) fn embedded(args: InitArgs) -> Self {
+        let yes = args.yes;
+        Self {
+            args,
+            launch: WizardLaunch::Embedded,
+            interactive: true,
+            json: false,
+            yes,
+        }
+    }
+
+    fn from_serve() -> Self {
+        Self {
+            args: InitArgs {
+                mode: Some(RunMode::Configure),
+                ..InitArgs::default()
+            },
+            launch: WizardLaunch::FromServe,
+            interactive: true,
+            json: false,
+            yes: false,
+        }
+    }
+}
+
+/// What the wizard did, for the caller that has to act on it.
+///
+/// The wizard never starts an engine: the foreground engine blocks the calling
+/// thread and owns the terminal, which is exactly what a host program cannot
+/// give it. Whoever can (the CLI) starts it from [`WizardOutcome::StartServe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WizardOutcome {
+    /// The config was written and nothing was started.
+    Configured {
+        config_path: PathBuf,
+        public_url: Option<String>,
+    },
+    /// The caller must start `preloop serve` itself, with `public_url` as its
+    /// own public origin when it resolved one.
+    StartServe {
+        config_path: PathBuf,
+        public_url: Option<String>,
+    },
+    /// The control plane was installed as a service by this call.
+    ServiceInstalled {
+        config_path: PathBuf,
+        public_url: Option<String>,
+    },
+    /// The chosen mode installs a service, which a host program reports
+    /// instead of doing behind its own UI: run `preloop server install`.
+    ServiceInstallRequired {
+        config_path: PathBuf,
+        public_url: Option<String>,
+    },
+    /// The chosen mode installs a service and this process is not root.
+    ServiceNeedsRoot,
+}
+
+/// The wizard, driven by a host program's prompts.
+///
+/// Synchronous on purpose: a host (the TUI) runs it on a blocking thread and
+/// answers each prompt from its own event loop. It builds the runtime the
+/// wizard's registry, GitHub and container work needs, so it must not be
+/// called from inside an async runtime.
+// Dead until a host program calls it (see `WizardOptions::embedded`): the CLI
+// drives the same wizard through `run_wizard_async` on its own runtime.
+#[allow(dead_code)]
+pub(crate) fn run_wizard(
+    prompter: &mut dyn Prompter,
+    opts: WizardOptions,
+) -> anyhow::Result<WizardOutcome> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        anyhow::bail!(
+            "run_wizard blocks on the wizard's own runtime; call it from a blocking thread, not \
+             from inside an async runtime"
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the wizard's runtime")?;
+    runtime.block_on(run_wizard_async(prompter, opts))
+}
+
+/// [`run_wizard`] for callers that are already async (the CLI, and `serve`).
+pub(crate) async fn run_wizard_async(
+    prompter: &mut dyn Prompter,
+    opts: WizardOptions,
+) -> anyhow::Result<WizardOutcome> {
     let session = Session {
-        interactive: true,
-        json: false,
-        yes: false,
-        from_serve: true,
+        interactive: opts.interactive,
+        json: opts.json,
+        yes: opts.yes,
+        from_serve: opts.launch == WizardLaunch::FromServe,
     };
-    session.execute(args, None, true).await
+    session.execute(prompter, opts).await
+}
+
+/// Whether `preloop init` has already run for this config.
+///
+/// The official golden is a *kind* with no base image, so
+/// [`preloop_runner_server::config::golden_base_image`] alone cannot answer
+/// this: an official choice would look unconfigured and `serve` would offer
+/// the wizard again on every start. A recorded kind — or a base image, or a
+/// `PRELOOP_RUNNER_BASE_IMAGE` override the engine honours — means the
+/// question was already answered.
+pub(crate) fn wizard_configured(config: &ConfigFile) -> bool {
+    preloop_runner_server::config::golden_base_image(config).is_some()
+        || config.golden.kind.is_some()
 }
 
 struct Session {
@@ -484,9 +652,39 @@ fn mark_stored(rows: &mut [workflows::SecretRow], name: &str, repo: Option<&str>
 }
 
 impl Session {
-    fn section(&self, title: &str) {
+    fn section(&self, prompter: &mut dyn Prompter, step: usize, title: &str) {
         if !self.json {
-            println!("\n{}", escape_control(title));
+            prompter.section(step, WIZARD_STEPS, &escape_control(title));
+        }
+    }
+
+    /// One of the wizard's own lines: indented, and never in `--json` mode
+    /// (the step object already carries the same decision there).
+    fn note(&self, prompter: &mut dyn Prompter, line: &str) {
+        self.emit_line(
+            prompter,
+            NoteLevel::Info,
+            &format!("    {}", escape_control(line)),
+        );
+    }
+
+    /// A line the operator has to act on, or one that says a check did not
+    /// pass.
+    fn warn(&self, prompter: &mut dyn Prompter, line: &str) {
+        self.emit_line(
+            prompter,
+            NoteLevel::Warning,
+            &format!("    {}", escape_control(line)),
+        );
+    }
+
+    /// One line of a reused flow's own output, emitted verbatim: the terminal
+    /// already formats those, and the wizard must not indent them a second
+    /// time. Suppressed in `--json` mode, where the reused flow's output is
+    /// captured into the step's `log` field instead.
+    fn emit_line(&self, prompter: &mut dyn Prompter, level: NoteLevel, line: &str) {
+        if !self.json {
+            prompter.note(level, line);
         }
     }
 
@@ -498,54 +696,82 @@ impl Session {
         }
     }
 
-    fn note(&self, line: &str) {
-        if !self.json {
-            println!("    {}", escape_control(line));
+    /// A confirmation. `--yes` keeps the suggested answer without asking.
+    fn confirm(
+        &self,
+        prompter: &mut dyn Prompter,
+        prompt: &str,
+        default: bool,
+    ) -> anyhow::Result<bool> {
+        if self.yes {
+            return Ok(default);
         }
+        prompter.confirm(prompt, default)
     }
 
-    /// Run every step and apply the answers. Returns the public URL the run
-    /// resolved for the engine it configured (the App flow's answer, or the
-    /// flag/environment when the credential was kept): `serve` offering the
-    /// wizard is already running that engine, so it needs the answer back to
-    /// install it in-process.
+    /// A menu, re-checked here: a host that answers with an index it cannot
+    /// use must not be able to configure something unavailable.
+    fn choice(
+        &self,
+        prompter: &mut dyn Prompter,
+        prompt: &str,
+        options: &[ChoiceOption],
+        default: usize,
+    ) -> anyhow::Result<usize> {
+        let chosen = prompter.choice(prompt, options, default)?;
+        anyhow::ensure!(
+            chosen < options.len(),
+            "the prompt host answered {chosen}, which is not one of the {} choices",
+            options.len()
+        );
+        anyhow::ensure!(
+            options[chosen].enabled,
+            "the prompt host chose `{}`, which is unavailable here: {}",
+            options[chosen].label,
+            options[chosen].detail
+        );
+        Ok(chosen)
+    }
+
+    /// Run every step and apply the answers.
+    ///
+    /// The steps are asked in their numbered order and then *applied* in the
+    /// order that keeps a failure from leaving a half-written setup: the
+    /// golden is resolved first, then the host is checked against it, and only
+    /// then are credentials written (a preflight failure must not leave a
+    /// credential on disk for a host that cannot run the engine).
     async fn execute(
         mut self,
-        args: InitArgs,
-        observability: Option<preloop_observability::Observability>,
-        from_serve: bool,
-    ) -> anyhow::Result<Option<String>> {
+        prompter: &mut dyn Prompter,
+        opts: WizardOptions,
+    ) -> anyhow::Result<WizardOutcome> {
+        let args = &opts.args;
+        let from_serve = opts.launch == WizardLaunch::FromServe;
         let config = load_config().context("reading the engine config")?;
-        let answers = self.resolve(&args, &config, from_serve)?;
+        let answers = self.resolve(prompter, args, &config, from_serve)?;
 
         // A system service reads its own state dir, so when the operator did
         // not pin one, the credentials and the golden must be written there or
-        // the installed service would start with neither.
-        if answers.mode == RunMode::Service {
-            self.prepare_service_home()?;
+        // the installed service would start with neither. Only the CLI
+        // installs a service in this process (a host program is told to), and
+        // only it may repoint the config path.
+        if answers.mode == RunMode::Service && opts.launch == WizardLaunch::Cli {
+            self.prepare_service_home(prompter)?;
         }
 
-        self.section("Applying your answers:");
-        // The URL the App flow resolved is also the engine's own public origin:
-        // Check Run detail links and the webhook drift check read
-        // `PRELOOP_PUBLIC_URL`, and the run mode that starts is the only thing
-        // that can carry the answer there (for the service, its environment
-        // file is written now — it does not inherit this shell).
-        let public_url = if answers.auth_unchanged {
-            self.report_stored_credentials(&config, &args).await?;
-            engine_public_url(&args, None)
-        } else {
-            let answer = self.configure_credentials(&args, answers.auth).await?;
-            engine_public_url(&args, answer.as_ref())
-        };
+        self.section(prompter, 0, "Applying your answers:");
         let decision = if answers.golden_unchanged {
             let decision = decision_from_config(&config, &answers.golden).ok_or_else(|| {
                 anyhow::anyhow!(
                     "internal: no stored golden to keep — re-run `preloop init` and pick one"
                 )
             })?;
-            self.section(&format!("2/5 Golden: {} (kept)", decision.kind.as_str()));
-            self.note(&format!("kept: {}", decision.label));
+            self.section(
+                prompter,
+                2,
+                &format!("Golden: {} (kept)", decision.kind.as_str()),
+            );
+            self.note(prompter, &format!("kept: {}", decision.label));
             self.emit(json!({
                 "step": "golden",
                 "decision": decision.kind.as_str(),
@@ -553,14 +779,33 @@ impl Session {
             }));
             decision
         } else {
-            self.configure_golden(&answers.golden).await?
+            self.configure_golden(prompter, &answers.golden).await?
         };
-        self.workflow_step(&args, &decision).await?;
-        self.section(&format!(
-            "4/5 Run mode: {}",
-            describe_mode(answers.mode, &decision.label)
-        ));
-        let preflight = self.preflight(&decision, answers.mode)?;
+        // Before any credential is written: a host that cannot run the chosen
+        // golden has to say so while the config is still untouched.
+        let preflight = self.preflight(prompter, &decision, answers.mode)?;
+
+        // The URL the App flow resolved is also the engine's own public origin:
+        // Check Run detail links and the webhook drift check read
+        // `PRELOOP_PUBLIC_URL`, and the run mode that starts is the only thing
+        // that can carry the answer there (for the service, its environment
+        // file is written now — it does not inherit this shell).
+        let public_url = if answers.auth_unchanged {
+            self.report_stored_credentials(prompter, &config, args)
+                .await?;
+            engine_public_url(args, None)
+        } else {
+            let answer = self
+                .configure_credentials(prompter, args, answers.auth)
+                .await?;
+            engine_public_url(args, answer.as_ref())
+        };
+        self.workflow_step(prompter, args, &decision).await?;
+        self.section(
+            prompter,
+            4,
+            &format!("Run mode: {}", describe_mode(answers.mode, &decision.label)),
+        );
 
         // Re-read: the credentials step rewrote the file (or created it).
         let mut config = load_config().context("re-reading the engine config")?;
@@ -571,7 +816,7 @@ impl Session {
         };
         let written = write_config(&config).context("writing the engine config")?;
         if !self.json {
-            println!("\nwrote {}", written.display());
+            prompter.section(0, 0, &format!("wrote {}", written.display()));
         }
         // `PRELOOP_RUNNER_BASE_IMAGE` is the first source of the engine's own
         // golden precedence, so a non-blank override is what the mode this run
@@ -584,10 +829,13 @@ impl Session {
         if let Some(image) = &env_override {
             // `note` escapes control characters, so a crafted environment
             // value cannot move the cursor in the report.
-            self.note(&format!(
-                "golden override: PRELOOP_RUNNER_BASE_IMAGE={image} wins over the choice above — \
-                 the engine (and any service installed from this shell) forks from it"
-            ));
+            self.note(
+                prompter,
+                &format!(
+                    "golden override: PRELOOP_RUNNER_BASE_IMAGE={image} wins over the choice above \
+                     — the engine (and any service installed from this shell) forks from it"
+                ),
+            );
         }
         self.emit(json!({
             "step": "done",
@@ -610,15 +858,15 @@ impl Session {
             },
             "preflight": preflight,
         }));
-        self.start_mode(answers.mode, observability, &written, public_url.as_deref())
-            .await?;
-        Ok(public_url)
+        self.finish(prompter, opts.launch, answers.mode, &written, public_url)
+            .await
     }
 
     // -- step 0: answers -------------------------------------------------
 
     fn resolve(
         &mut self,
+        prompter: &mut dyn Prompter,
         args: &InitArgs,
         config: &ConfigFile,
         from_serve: bool,
@@ -627,19 +875,27 @@ impl Session {
             return self.resolve_from_flags(args);
         }
         if !self.json {
-            println!(
-                "preloop init — configuring {}\n\
-                 Five steps; press Enter to keep the current answer.",
-                preloop_runner_server::config::config_path().display()
+            prompter.section(
+                0,
+                0,
+                &format!(
+                    "preloop init — configuring {}\n\
+                     Five steps; press Enter to keep the current answer.",
+                    preloop_runner_server::config::config_path().display()
+                ),
             );
         }
-        let (auth, auth_unchanged) = self.ask_auth(args, config)?;
-        let (golden, golden_unchanged) = self.ask_golden(args, config)?;
+        let (auth, auth_unchanged) = self.ask_auth(prompter, args, config)?;
+        let (golden, golden_unchanged) = self.ask_golden(prompter, args, config)?;
         let mode = if from_serve {
-            self.section("4/5 Run mode: none (configure only — this engine keeps running)");
+            self.section(
+                prompter,
+                4,
+                "Run mode: none (configure only — this engine keeps running)",
+            );
             RunMode::Configure
         } else {
-            self.ask_mode(args)?
+            self.ask_mode(prompter, args)?
         };
         Ok(Answers {
             auth,
@@ -707,33 +963,39 @@ impl Session {
     /// Returns the step-1 answer and whether it is the stored one.
     fn ask_auth(
         &mut self,
+        prompter: &mut dyn Prompter,
         args: &InitArgs,
         config: &ConfigFile,
     ) -> anyhow::Result<(AuthChoice, bool)> {
-        self.section("1/5 Credentials");
+        self.section(prompter, 1, "Credentials");
         if let Some(auth) = args.auth {
-            self.note(&format!("using --auth {}", describe_auth(auth)));
+            self.note(prompter, &format!("using --auth {}", describe_auth(auth)));
             return Ok((auth, false));
         }
         if let Some((prior, summary)) = credential_prior(config) {
-            self.note(&format!("current: {summary}"));
-            if !self.ask_bool("    change? [y/N] ", false)? {
+            self.note(prompter, &format!("current: {summary}"));
+            if !self.confirm(prompter, "change? [y/N] ", false)? {
                 return Ok((prior, true));
             }
         }
         let items = [
-            MenuItem::enabled(
+            ChoiceOption::new(
                 "GitHub App",
                 "recommended — tokens are minted per job and scoped to each workflow's permissions",
             ),
-            MenuItem::enabled(
+            ChoiceOption::new(
                 "fine-grained PAT",
                 "for orgs that gate App installations; check runs stay local",
             ),
-            MenuItem::enabled("none", "local only — jobs get local tokens"),
+            ChoiceOption::new("none", "local only — jobs get local tokens"),
         ];
         Ok((
-            match self.ask_choice(&items, 0)? {
+            match self.choice(
+                prompter,
+                "How should jobs authenticate to GitHub?",
+                &items,
+                0,
+            )? {
                 0 => AuthChoice::App,
                 1 => AuthChoice::Pat,
                 _ => AuthChoice::None,
@@ -745,20 +1007,21 @@ impl Session {
     /// Returns the step-2 answer and whether it is the stored one.
     fn ask_golden(
         &mut self,
+        prompter: &mut dyn Prompter,
         args: &InitArgs,
         config: &ConfigFile,
     ) -> anyhow::Result<(GoldenAnswer, bool)> {
-        self.section("2/5 Golden — the VM image every job forks from");
+        self.section(prompter, 2, "Golden — the VM image every job forks from");
         if let Some(kind) = args.golden {
-            self.note(&format!("using --golden {}", kind.as_str()));
+            self.note(prompter, &format!("using --golden {}", kind.as_str()));
             reject_mismatched_flags(kind, args)?;
             return match kind {
                 GoldenChoice::Oci => Ok((
                     GoldenAnswer {
                         base_image: Some(require_interactive_flag(
+                            prompter,
                             args.base_image.clone(),
                             "--base-image <ref>",
-                            &mut |prompt| self.read_line(prompt),
                         )?),
                         ..GoldenAnswer::of(kind)
                     },
@@ -767,9 +1030,9 @@ impl Session {
                 GoldenChoice::File => Ok((
                     GoldenAnswer {
                         path: Some(PathBuf::from(require_interactive_flag(
+                            prompter,
                             args.path.clone().map(|path| path.display().to_string()),
                             "--path <file-or-dir>",
-                            &mut |prompt| self.read_line(prompt),
                         )?)),
                         ..GoldenAnswer::of(kind)
                     },
@@ -789,8 +1052,8 @@ impl Session {
             };
         }
         if let Some((kind, configured)) = golden_prior(config) {
-            self.note(&format!("current: {configured}"));
-            if !self.ask_bool("    change? [y/N] ", false)? {
+            self.note(prompter, &format!("current: {configured}"));
+            if !self.confirm(prompter, "change? [y/N] ", false)? {
                 return Ok((
                     GoldenAnswer {
                         base_image: config.golden.base_image.clone(),
@@ -803,37 +1066,51 @@ impl Session {
         }
         let dockerfile = args.dockerfile.clone().unwrap_or_else(default_dockerfile);
         let items = [
-            MenuItem::enabled(
+            ChoiceOption::new(
                 "Official GitHub image",
-                &format!(
+                format!(
                     "drop-in parity with GitHub-hosted runners; ~{} on disk \
                      (≈{} download + the unpacked golden + per-job VM space)",
                     gib(OFFICIAL_GOLDEN_WORKING_SET_BYTES),
                     gib(OFFICIAL_GOLDEN_DOWNLOAD_BYTES),
                 ),
             ),
-            MenuItem::enabled(
+            ChoiceOption::new(
                 "OCI image reference",
                 "any registry — Docker Hub, GHCR, private; pin @sha256: for reproducibility",
             ),
-            MenuItem {
-                label: "Dockerfile in this repo".to_owned(),
-                description: "build it here and use the saved tar as the base image".to_owned(),
-                disabled: dockerfile_unavailable_reason(&dockerfile),
+            match dockerfile_unavailable_reason(&dockerfile) {
+                Some(reason) => ChoiceOption::unavailable(
+                    "Dockerfile in this repo",
+                    "build it here and use the saved tar as the base image",
+                    reason,
+                ),
+                None => ChoiceOption::new(
+                    "Dockerfile in this repo",
+                    "build it here and use the saved tar as the base image",
+                ),
             },
-            MenuItem::enabled(
+            ChoiceOption::new(
                 "Local .smolmachine / rootfs dir",
                 "a pack or rootfs directory you already have",
             ),
         ];
-        match self.ask_choice(&items, 0)? {
+        match self.choice(
+            prompter,
+            "Which base image should jobs fork from?",
+            &items,
+            0,
+        )? {
             0 => Ok((GoldenAnswer::of(GoldenChoice::Official), false)),
             1 => {
                 let reference = loop {
-                    let reference =
-                        self.read_line("    image reference (registry/repo:tag or @sha256:…): ")?;
+                    let reference = prompter.text(
+                        "image reference (registry/repo:tag or @sha256:…): ",
+                        None,
+                        None,
+                    )?;
                     if reference.is_empty() {
-                        self.note("a registry reference is required");
+                        self.note(prompter, "a registry reference is required");
                         continue;
                     }
                     break reference;
@@ -856,13 +1133,12 @@ impl Session {
                     Some(context) => context,
                     None => {
                         let hint = dockerfile_context(&dockerfile);
-                        let answer =
-                            self.read_line(&format!("    build context [{}]: ", hint.display()))?;
-                        if answer.is_empty() {
-                            hint
-                        } else {
-                            PathBuf::from(answer)
-                        }
+                        let answer = prompter.text(
+                            &format!("build context [{}]: ", hint.display()),
+                            Some(&hint.display().to_string()),
+                            None,
+                        )?;
+                        PathBuf::from(answer)
                     }
                 };
                 Ok((
@@ -876,10 +1152,13 @@ impl Session {
             }
             _ => {
                 let path = loop {
-                    let answer =
-                        self.read_line("    path to the .smolmachine pack or rootfs dir: ")?;
+                    let answer = prompter.text(
+                        "path to the .smolmachine pack or rootfs dir: ",
+                        None,
+                        None,
+                    )?;
                     if answer.is_empty() {
-                        self.note("a path is required");
+                        self.note(prompter, "a path is required");
                         continue;
                     }
                     break PathBuf::from(answer);
@@ -895,25 +1174,31 @@ impl Session {
         }
     }
 
-    fn ask_mode(&mut self, args: &InitArgs) -> anyhow::Result<RunMode> {
-        self.section("4/5 Run mode — not persisted, chosen each run");
+    fn ask_mode(
+        &mut self,
+        prompter: &mut dyn Prompter,
+        args: &InitArgs,
+    ) -> anyhow::Result<RunMode> {
+        self.section(prompter, 4, "Run mode — not persisted, chosen each run");
         if let Some(mode) = args.mode {
-            self.note(&format!("using --mode {}", mode.as_str()));
+            self.note(prompter, &format!("using --mode {}", mode.as_str()));
             return Ok(mode);
         }
         let items = [
-            MenuItem::enabled("foreground now", "`preloop serve` in this terminal"),
-            MenuItem::enabled(
+            ChoiceOption::new("foreground now", "`preloop serve` in this terminal"),
+            ChoiceOption::new(
                 "install as a service",
                 "systemd (Linux) / launchd (macOS); needs root",
             ),
-            MenuItem::enabled("configure only", "write the config and start nothing"),
+            ChoiceOption::new("configure only", "write the config and start nothing"),
         ];
-        Ok(match self.ask_choice(&items, 0)? {
-            0 => RunMode::Foreground,
-            1 => RunMode::Service,
-            _ => RunMode::Configure,
-        })
+        Ok(
+            match self.choice(prompter, "How should the engine run?", &items, 0)? {
+                0 => RunMode::Foreground,
+                1 => RunMode::Service,
+                _ => RunMode::Configure,
+            },
+        )
     }
 
     // -- step 1: credentials ---------------------------------------------
@@ -925,14 +1210,16 @@ impl Session {
     /// credential breaks jobs silently and costs one API call to notice.
     async fn report_stored_credentials(
         &mut self,
+        prompter: &mut dyn Prompter,
         config: &ConfigFile,
         args: &InitArgs,
     ) -> anyhow::Result<()> {
-        self.section("1/5 Credentials: (kept)");
+        self.section(prompter, 1, "Credentials: (kept)");
         let summary = credential_summary(config).unwrap_or_else(|| "none — local only".to_owned());
-        self.note(&format!("kept: {summary}"));
+        self.note(prompter, &format!("kept: {summary}"));
         if args.public_url.is_some() {
             self.note(
+                prompter,
                 "the kept credential is not reconfigured, but the engine this run starts will \
                  use --public-url; to point the kept App's webhook at it: \
                  preloop setup github --via app --public-url <URL>",
@@ -941,7 +1228,7 @@ impl Session {
         let verify = if args.repos.is_empty() {
             json!({"skipped": "no --repo"})
         } else {
-            self.verify_credentials(config, args).await?
+            self.verify_credentials(prompter, config, args).await?
         };
         self.emit(json!({
             "step": "credentials",
@@ -955,24 +1242,27 @@ impl Session {
     /// this run starts needs it too (see [`engine_public_url`]).
     async fn configure_credentials(
         &mut self,
+        prompter: &mut dyn Prompter,
         args: &InitArgs,
         auth: AuthChoice,
     ) -> anyhow::Result<Option<PublicUrlAnswer>> {
-        self.section("1/5 Credentials:");
+        self.section(prompter, 1, "Credentials:");
         match auth {
             AuthChoice::None => {
                 self.note(
+                    prompter,
                     "local only — no GitHub credential written; existing ones are left alone",
                 );
                 self.emit(json!({"step": "credentials", "decision": "none", "result": {}}));
                 return Ok(None);
             }
-            AuthChoice::App => self.note("GitHub App"),
-            AuthChoice::Pat => self.note("fine-grained PAT"),
+            AuthChoice::App => self.note(prompter, "GitHub App"),
+            AuthChoice::Pat => self.note(prompter, "fine-grained PAT"),
         }
         // The stable URL is asked only for an App: a PAT has no webhook to feed.
         let stable_url = match auth {
-            AuthChoice::App => Some(self.public_url_answer(
+            AuthChoice::App => Some(self.public_url_answer_with(
+                prompter,
                 args.public_url.as_deref(),
                 std::env::var("PRELOOP_PUBLIC_URL").ok().as_deref(),
             )?),
@@ -1021,7 +1311,7 @@ impl Session {
             add: false,
             org: args.org.clone(),
             port: args.port,
-            public_url,
+            public_url: public_url.clone(),
             app_name: "preloop-local".to_owned(),
             no_browser: args.no_browser,
             webhook_secret: args.webhook_secret.clone(),
@@ -1029,21 +1319,25 @@ impl Session {
             repos: Vec::new(),
             workspace: None,
         };
+        // This wizard already asked the URL question — including "skip it" —
+        // so the reused flow must not read `PRELOOP_PUBLIC_URL` again: an
+        // answer that left webhooks off on purpose has to stay off, even when
+        // the environment carries a URL `init` refused.
+        let dispatch = AppPublicUrl::Fixed(public_url.clone());
         // In `--json` the reused flow's human output would land between our
         // one-object-per-line steps, so it is captured and attached instead.
         let log = if self.json {
-            let (result, captured) =
-                capture_stdout(github_setup::cmd_setup_github(setup_args)).await;
-            result?;
-            captured
+            let mut capture = CapturePrompter::new();
+            github_setup::cmd_setup_github_with(setup_args, &mut capture, dispatch).await?;
+            capture.log()
         } else {
-            github_setup::cmd_setup_github(setup_args).await?;
+            github_setup::cmd_setup_github_with(setup_args, prompter, dispatch).await?;
             String::new()
         };
         let config = load_config().context("re-reading the engine config")?;
         let summary = credential_summary(&config).unwrap_or_else(|| "configured".to_owned());
-        self.note(&format!("configured: {summary}"));
-        let verified = self.verify_credentials(&config, args).await?;
+        self.note(prompter, &format!("configured: {summary}"));
+        let verified = self.verify_credentials(prompter, &config, args).await?;
         let mut result = json!({"summary": summary, "verify": verified});
         if let Some(answer) = &stable_url {
             result["public_url"] = json!({"url": answer.url, "source": answer.source});
@@ -1064,6 +1358,7 @@ impl Session {
     /// a network call the caller did not ask for.
     async fn verify_credentials(
         &mut self,
+        prompter: &mut dyn Prompter,
         config: &ConfigFile,
         args: &InitArgs,
     ) -> anyhow::Result<Value> {
@@ -1073,8 +1368,9 @@ impl Session {
             // "local/<dir>" is the fallback when there is no origin remote:
             // GitHub has never heard of that repository, so do not offer it.
             if !detected.starts_with("local/")
-                && self.ask_bool(
-                    &format!("    verify the credential against {detected}? [Y/n] "),
+                && self.confirm(
+                    prompter,
+                    &format!("verify the credential against {detected}? [Y/n] "),
                     true,
                 )?
             {
@@ -1082,48 +1378,60 @@ impl Session {
             }
         }
         if repos.is_empty() {
-            self.note("credential check skipped (pass --repo owner/name to verify against GitHub)");
+            self.note(
+                prompter,
+                "credential check skipped (pass --repo owner/name to verify against GitHub)",
+            );
             return Ok(json!({"skipped": "no --repo and no detected remote"}));
         }
-        let result = match (
+        let (checks, what) = match (
             config.github.app_id.as_deref(),
             config.github.app_pem(),
             config.github.pat(),
         ) {
-            (Some(app_id), Some(pem), _) => github_setup::doctor_app(app_id, pem, &repos).await,
-            (_, _, Some(token)) => github_setup::doctor_pat(token, &repos).await,
+            (Some(app_id), Some(pem), _) => {
+                (github_setup::check_app(app_id, pem, &repos).await, "App")
+            }
+            (_, _, Some(token)) => (github_setup::check_pat(token, &repos).await, "PAT"),
             _ => {
-                self.note("no credential is configured to verify");
+                self.note(prompter, "no credential is configured to verify");
                 return Ok(json!({"skipped": "no credential"}));
             }
         };
-        match result {
-            Ok(()) => Ok(json!({"repos": repos, "ok": true})),
-            Err(error) => {
-                let message = format!("{error:#}");
-                if !self.json {
-                    println!("    credential check failed: {message}");
-                }
-                if self.yes || !self.interactive {
-                    if self.yes {
-                        self.note("continuing anyway (--yes)");
-                        return Ok(json!({"repos": repos, "ok": false, "error": message}));
-                    }
-                    return Err(anyhow::anyhow!(
-                        "credential check failed: {message}\n\
-                         The credential is stored; re-run `preloop init` once GitHub can reach \
-                         it, or pass --yes to configure anyway."
-                    ));
-                }
-                if self.ask_bool("    continue anyway? [y/N] ", false)? {
-                    Ok(json!({"repos": repos, "ok": false, "error": message}))
+        for check in &checks {
+            self.emit_line(
+                prompter,
+                if check.ok {
+                    NoteLevel::Success
                 } else {
-                    Err(anyhow::anyhow!(
-                        "credential check failed: {message}\n\
-                         The credential is stored; fix it and re-run `preloop init`."
-                    ))
-                }
+                    NoteLevel::Error
+                },
+                &check.line,
+            );
+        }
+        if checks.iter().all(|check| check.ok) {
+            return Ok(json!({"repos": repos, "ok": true}));
+        }
+        let message = format!("{}", github_setup::verification_failed(what));
+        self.note(prompter, &format!("credential check failed: {message}"));
+        if self.yes || !self.interactive {
+            if self.yes {
+                self.note(prompter, "continuing anyway (--yes)");
+                return Ok(json!({"repos": repos, "ok": false, "error": message}));
             }
+            return Err(anyhow::anyhow!(
+                "credential check failed: {message}\n\
+                 The credential is stored; re-run `preloop init` once GitHub can reach \
+                 it, or pass --yes to configure anyway."
+            ));
+        }
+        if self.confirm(prompter, "continue anyway? [y/N] ", false)? {
+            Ok(json!({"repos": repos, "ok": false, "error": message}))
+        } else {
+            Err(anyhow::anyhow!(
+                "credential check failed: {message}\n\
+                 The credential is stored; fix it and re-run `preloop init`."
+            ))
         }
     }
 
@@ -1132,8 +1440,13 @@ impl Session {
     /// URL directly, a Funnel-published tailnet name on Enter, or `-` to skip
     /// — and an App created without a webhook never triggers on pushes or pull
     /// requests.
-    fn public_url_answer(
+    ///
+    /// A skipped answer is an *answer*: the caller must pass it on
+    /// ([`AppPublicUrl::Fixed`]) so the reused setup flow cannot read
+    /// `PRELOOP_PUBLIC_URL` behind the operator's back.
+    fn public_url_answer_with(
         &mut self,
+        prompter: &mut dyn Prompter,
         flag: Option<&str>,
         env: Option<&str>,
     ) -> anyhow::Result<PublicUrlAnswer> {
@@ -1147,21 +1460,22 @@ impl Session {
         if let Some(raw) = env.map(str::trim).filter(|raw| !raw.is_empty()) {
             match validate_public_url(raw) {
                 Ok(url) => {
-                    self.note(&format!("using PRELOOP_PUBLIC_URL={url}"));
+                    self.note(prompter, &format!("using PRELOOP_PUBLIC_URL={url}"));
                     return Ok(PublicUrlAnswer {
                         url: Some(url),
                         source: "env",
                     });
                 }
                 Err(reason) => {
-                    self.note(&format!(
-                        "PRELOOP_PUBLIC_URL is not used for webhooks: {reason}"
-                    ));
+                    self.note(
+                        prompter,
+                        &format!("PRELOOP_PUBLIC_URL is not used for webhooks: {reason}"),
+                    );
                 }
             }
         }
         if !self.interactive || self.yes {
-            self.note_no_public_url();
+            self.note_no_public_url(prompter);
             return Ok(PublicUrlAnswer {
                 url: None,
                 source: "skipped",
@@ -1173,11 +1487,10 @@ impl Session {
         // suggestion, and a tailnet-only name is shown as a hint Enter does not
         // accept.
         let suggestion = detected_public_url();
-        for line in public_url_help(suggestion.as_ref()) {
-            self.note(&line);
-        }
+        let help = public_url_help(suggestion.as_ref()).join("\n");
         loop {
-            let answer = self.read_line(&public_url_prompt(suggestion.as_ref()))?;
+            let answer =
+                prompter.text(&public_url_prompt(suggestion.as_ref()), None, Some(&help))?;
             match read_public_url(&answer, suggestion.as_ref()) {
                 UrlInput::Use { url, source } => {
                     return Ok(PublicUrlAnswer {
@@ -1186,29 +1499,37 @@ impl Session {
                     });
                 }
                 UrlInput::Skip => {
-                    self.note_no_public_url();
+                    self.note_no_public_url(prompter);
                     return Ok(PublicUrlAnswer {
                         url: None,
                         source: "skipped",
                     });
                 }
-                UrlInput::Retry(reason) => self.note(&reason),
+                UrlInput::Retry(reason) => self.note(prompter, &reason),
             }
         }
     }
 
-    fn note_no_public_url(&self) {
+    fn note_no_public_url(&self, prompter: &mut dyn Prompter) {
         self.note(
+            prompter,
             "no public URL: the App gets no webhook, so pushes and pull requests will not \
              start runs and PR checks will not report",
         );
-        self.note("add one later with: preloop setup github --via app --public-url <URL>");
+        self.note(
+            prompter,
+            "add one later with: preloop setup github --via app --public-url <URL>",
+        );
     }
 
     // -- step 2: golden ---------------------------------------------------
 
-    async fn configure_golden(&mut self, answer: &GoldenAnswer) -> anyhow::Result<GoldenDecision> {
-        self.section(&format!("2/5 Golden: {}", answer.kind.as_str()));
+    async fn configure_golden(
+        &mut self,
+        prompter: &mut dyn Prompter,
+        answer: &GoldenAnswer,
+    ) -> anyhow::Result<GoldenDecision> {
+        self.section(prompter, 2, &format!("Golden: {}", answer.kind.as_str()));
         let decision = match answer.kind {
             GoldenChoice::Official => Ok(GoldenDecision {
                 kind: GoldenChoice::Official,
@@ -1230,7 +1551,7 @@ impl Session {
                     .base_image
                     .clone()
                     .ok_or_else(|| usage_error("--golden oci needs --base-image <ref>"))?;
-                self.record_oci(reference).await
+                self.record_oci(prompter, reference).await
             }
             GoldenChoice::Dockerfile => {
                 let dockerfile = answer.dockerfile.clone().unwrap_or_else(default_dockerfile);
@@ -1238,14 +1559,15 @@ impl Session {
                     .docker_context
                     .clone()
                     .unwrap_or_else(|| dockerfile_context(&dockerfile));
-                self.record_dockerfile(&dockerfile, &context).await
+                self.record_dockerfile(prompter, &dockerfile, &context)
+                    .await
             }
             GoldenChoice::File => {
                 let path = answer
                     .path
                     .clone()
                     .ok_or_else(|| usage_error("--golden file needs --path <file-or-dir>"))?;
-                self.record_local_path(&path)
+                self.record_local_path(prompter, &path)
             }
         }?;
         // A configured image is baked by the pool on the next serve. The
@@ -1254,13 +1576,14 @@ impl Session {
         // cannot be: an official decision carries no base image).
         if decision.base_image.is_some() {
             self.note(
+                prompter,
                 "serve builds this golden locally on the first run (a builder VM, then a \
                  packed artifact); nothing is baked now",
             );
         }
-        self.note(&format!("chosen: {}", decision.label));
+        self.note(prompter, &format!("chosen: {}", decision.label));
         for warning in &decision.warnings {
-            self.note(&format!("warning: {warning}"));
+            self.warn(prompter, &format!("warning: {warning}"));
         }
         let mut detail = decision.detail.clone();
         if !decision.warnings.is_empty()
@@ -1276,56 +1599,53 @@ impl Session {
         Ok(decision)
     }
 
-    async fn record_oci(&mut self, reference: String) -> anyhow::Result<GoldenDecision> {
-        if reference.starts_with('/')
-            || reference.starts_with('.')
-            || Path::new(&reference).exists()
-        {
-            return Err(usage_error(format!(
-                "`{reference}` is a filesystem path, not a registry reference — use \
-                 --golden file for a local .smolmachine/rootfs, or --golden dockerfile to \
-                 build one here"
-            )));
-        }
-        let trimmed = reference.trim();
-        if trimmed.is_empty() {
-            return Err(usage_error("--base-image must not be empty"));
-        }
-        if trimmed.contains(char::is_whitespace) {
-            return Err(usage_error(format!(
-                "`{trimmed}` is not a valid image reference (whitespace)"
-            )));
-        }
+    async fn record_oci(
+        &mut self,
+        prompter: &mut dyn Prompter,
+        reference: String,
+    ) -> anyhow::Result<GoldenDecision> {
+        let trimmed = oci_reference_answer(&reference)?;
         let parsed =
-            OciReference::parse(trimmed).map_err(|error| usage_error(error.to_string()))?;
+            OciReference::parse(&trimmed).map_err(|error| usage_error(error.to_string()))?;
         if !parsed.is_digest_pinned() {
             self.note(
+                prompter,
                 "tip: pin the reference with @sha256:… so a retag cannot change what your \
                  jobs run",
             );
         }
         let client = oci_client()?;
+        prompter.progress(&format!("resolving {}", parsed.display()));
         let probe = resolve_manifest(&parsed, &client).await?;
         let arch_ok = probe.supports_host_arch();
         if arch_ok == Some(false) {
-            self.note(&format!(
-                "warning: {} publishes no image for this host ({})",
-                parsed.display(),
-                probe.platforms.join(", ")
-            ));
+            self.warn(
+                prompter,
+                &format!(
+                    "warning: {} publishes no image for this host ({})",
+                    parsed.display(),
+                    probe.platforms.join(", ")
+                ),
+            );
         }
         let layers = probe.layers_bytes;
-        self.note(&format!(
-            "resolved {}{}",
-            parsed.display(),
-            match layers {
-                Some(bytes) => format!(" ({} of layers)", gib(bytes)),
-                None => String::new(),
-            }
-        ));
+        self.note(
+            prompter,
+            &format!(
+                "resolved {}{}",
+                parsed.display(),
+                match layers {
+                    Some(bytes) => format!(" ({} of layers)", gib(bytes)),
+                    None => String::new(),
+                }
+            ),
+        );
         Ok(GoldenDecision {
             kind: GoldenChoice::Oci,
-            base_image: Some(reference),
+            // The *trimmed* reference is what is persisted: it is the one that
+            // was validated and resolved above, and a trailing space would be
+            // part of the stored image name forever.
+            base_image: Some(trimmed),
             dockerfile: None,
             label: format!("OCI image {}", parsed.display()),
             artifact_bytes: layers,
@@ -1344,6 +1664,7 @@ impl Session {
 
     async fn record_dockerfile(
         &mut self,
+        prompter: &mut dyn Prompter,
         dockerfile: &Path,
         context: &Path,
     ) -> anyhow::Result<GoldenDecision> {
@@ -1353,18 +1674,25 @@ impl Session {
             )));
         }
         let engine = container_engine().expect("checked by dockerfile_unavailable_reason");
+        prompter.progress(&format!(
+            "building {} into a local image tar",
+            dockerfile.display()
+        ));
         let built = build_base_tar(engine, dockerfile, context, self.json).await?;
         let arch_ok = built_image_arch(engine, &built.tag, self.json).await;
         let archive_warnings: Vec<String> =
             oversized_archive_warning(built.bytes, "the saved image tar")
                 .into_iter()
                 .collect();
-        self.note(&format!(
-            "built {} and saved it to {} ({})",
-            built.dockerfile.display(),
-            built.tar.display(),
-            human_bytes(built.bytes)
-        ));
+        self.note(
+            prompter,
+            &format!(
+                "built {} and saved it to {} ({})",
+                built.dockerfile.display(),
+                built.tar.display(),
+                human_bytes(built.bytes)
+            ),
+        );
         let detail = json!({
             "dockerfile": built.dockerfile.display().to_string(),
             "context": built.context.display().to_string(),
@@ -1385,7 +1713,11 @@ impl Session {
         })
     }
 
-    fn record_local_path(&mut self, path: &Path) -> anyhow::Result<GoldenDecision> {
+    fn record_local_path(
+        &mut self,
+        prompter: &mut dyn Prompter,
+        path: &Path,
+    ) -> anyhow::Result<GoldenDecision> {
         let path = std::fs::canonicalize(path).map_err(|error| {
             usage_error(format!(
                 "--path {}: {error} (give an existing .smolmachine pack or rootfs directory)",
@@ -1413,10 +1745,13 @@ impl Session {
         }
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         if !(name.ends_with(".smolmachine") || name.ends_with(".tar")) {
-            self.note(&format!(
-                "note: `{name}` is neither *.smolmachine nor *.tar, and smolvm reads any other \
-                 file as a pack — rename it to .tar if it is an image archive"
-            ));
+            self.note(
+                prompter,
+                &format!(
+                    "note: `{name}` is neither *.smolmachine nor *.tar, and smolvm reads any \
+                     other file as a pack — rename it to .tar if it is an image archive"
+                ),
+            );
         }
         let path_warnings: Vec<String> = name
             .ends_with(".tar")
@@ -1448,10 +1783,11 @@ impl Session {
     /// be read is reported and skipped: it never fails the run.
     async fn workflow_step(
         &mut self,
+        prompter: &mut dyn Prompter,
         args: &InitArgs,
         golden: &GoldenDecision,
     ) -> anyhow::Result<()> {
-        self.section("3/5 Workflows: secrets and runner labels");
+        self.section(prompter, 3, "Workflows: secrets and runner labels");
         let config = load_config().context("reading the engine config")?;
         let checkout = workflows::checkout_root();
         // A checkout with no `origin` keeps its `local/<dir>` identity: it is
@@ -1462,6 +1798,7 @@ impl Session {
         let targets = workflows::targets(&args.repos, checkout.as_deref(), origin.as_deref());
         if targets.is_empty() {
             self.note(
+                prompter,
                 "no repository in scope: run inside a git checkout, or pass --repo owner/name",
             );
             self.emit(json!({
@@ -1481,12 +1818,13 @@ impl Session {
             scans.push(workflows::read_target(target, &config).await);
         }
         for scan in &scans {
-            self.note(&workflows::describe(scan));
+            self.note(prompter, &workflows::describe(scan));
             for note in &scan.notes {
-                self.note(&format!("note: {note}"));
+                self.note(prompter, &format!("note: {note}"));
             }
         }
-        self.workflow_secrets(args, &config, &scans).await?;
+        self.workflow_secrets(prompter, args, &config, &scans)
+            .await?;
         // The pool's golden is the image the engine will actually fork jobs
         // from: `PRELOOP_RUNNER_BASE_IMAGE`, else this run's choice, else the
         // official golden. Classifying the labels against the wizard's choice
@@ -1497,7 +1835,7 @@ impl Session {
             std::env::consts::ARCH,
             &effective_base_image(golden.base_image.as_deref()),
         );
-        self.workflow_labels(&scans, &pool);
+        self.workflow_labels(prompter, &scans, &pool);
         Ok(())
     }
 
@@ -1506,12 +1844,13 @@ impl Session {
     /// each can be set now, through the same hidden prompt as `preloop secret set`.
     async fn workflow_secrets(
         &mut self,
+        prompter: &mut dyn Prompter,
         args: &InitArgs,
         config: &ConfigFile,
         scans: &[workflows::Scan],
     ) -> anyhow::Result<()> {
         if args.no_secrets_scan {
-            self.note("secrets: not scanned (--no-secrets-scan)");
+            self.note(prompter, "secrets: not scanned (--no-secrets-scan)");
             self.emit(json!({
                 "step": "secrets",
                 "decision": "skipped",
@@ -1525,13 +1864,19 @@ impl Session {
             .filter(|scan| scan.skipped.is_none())
             .map(|scan| (scan, workflows::secret_rows(scan, &stored)))
             .collect();
-        self.note(&format!("secrets (checked against the {stored_in}):"));
+        self.note(
+            prompter,
+            &format!("secrets (checked against the {stored_in}):"),
+        );
         for (scan, rows) in &per_target {
             if rows.is_empty() {
-                self.note(&format!("{}: none read", workflows::target_name(scan)));
+                self.note(
+                    prompter,
+                    &format!("{}: none read", workflows::target_name(scan)),
+                );
                 continue;
             }
-            self.note(&format!("{}:", workflows::target_name(scan)));
+            self.note(prompter, &format!("{}:", workflows::target_name(scan)));
             let cells: Vec<Vec<String>> = rows
                 .iter()
                 .map(|row| {
@@ -1543,7 +1888,7 @@ impl Session {
                 })
                 .collect();
             for line in workflows::table(&["SECRET", "READ IN", "CONFIGURED"], &cells) {
-                self.note(&format!("  {line}"));
+                self.note(prompter, &format!("  {line}"));
             }
         }
         // A row the engine holds only in an environment tier is missing for
@@ -1553,10 +1898,10 @@ impl Session {
         // to every job of the repository. What to do instead is said here.
         for (scan, rows) in &per_target {
             for row in rows.iter().filter(|row| row.environment_scope.is_some()) {
-                self.note(&workflows::environment_only_advice(
-                    row,
-                    scan.target.repo.as_deref(),
-                ));
+                self.note(
+                    prompter,
+                    &workflows::environment_only_advice(row, scan.target.repo.as_deref()),
+                );
             }
         }
         // The rows the interactive pass can fix, by position in `per_target`.
@@ -1589,8 +1934,8 @@ impl Session {
                     || "globally".to_owned(),
                     |repo| format!("for {}", escape_control(repo)),
                 );
-                let prompt = format!("    set {} {scope} now? [y/N] ", escape_control(&name));
-                if !self.ask_bool(&prompt, false)? {
+                let prompt = format!("set {} {scope} now? [y/N] ", escape_control(&name));
+                if !self.confirm(prompter, &prompt, false)? {
                     continue;
                 }
                 let command = github_setup::SecretCommand::Set {
@@ -1599,7 +1944,9 @@ impl Session {
                     repo: repo.clone(),
                     env: None,
                 };
-                match github_setup::cmd_secret(github_setup::SecretArgs { command }).await {
+                match github_setup::cmd_secret_with(github_setup::SecretArgs { command }, prompter)
+                    .await
+                {
                     Ok(()) => {
                         // The write succeeded, so the row is configured at the
                         // scope it was written to: the table, the JSON entries,
@@ -1607,7 +1954,7 @@ impl Session {
                         let (_, rows) = &mut per_target[target_index];
                         mark_stored(rows, &name, repo.as_deref());
                     }
-                    Err(error) => self.note(&format!("not set: {error:#}")),
+                    Err(error) => self.warn(prompter, &format!("not set: {error:#}")),
                 }
             }
         }
@@ -1638,9 +1985,9 @@ impl Session {
             })
             .collect();
         if !commands.is_empty() {
-            self.note("store the missing secrets with:");
+            self.note(prompter, "store the missing secrets with:");
             for command in &commands {
-                self.note(&format!("  {command}"));
+                self.note(prompter, &format!("  {command}"));
             }
         }
         self.emit(json!({
@@ -1662,12 +2009,20 @@ impl Session {
 
     /// The `runs-on` labels the workflows request, each with the verdict the
     /// engine's own matching gives it on this host.
-    fn workflow_labels(&mut self, scans: &[workflows::Scan], pool: &workflows::Pool) {
+    fn workflow_labels(
+        &mut self,
+        prompter: &mut dyn Prompter,
+        scans: &[workflows::Scan],
+        pool: &workflows::Pool,
+    ) {
         let report = workflows::label_report(scans, pool);
         if report.rows.is_empty() {
-            self.note("runner labels: none requested");
+            self.note(prompter, "runner labels: none requested");
         } else {
-            self.note(&format!("runner labels ({} distinct):", report.rows.len()));
+            self.note(
+                prompter,
+                &format!("runner labels ({} distinct):", report.rows.len()),
+            );
             let cells: Vec<Vec<String>> = report
                 .rows
                 .iter()
@@ -1681,19 +2036,23 @@ impl Session {
                 })
                 .collect();
             for line in workflows::table(&["STATUS", "LABEL", "USED IN", "MEANING"], &cells) {
-                self.note(&format!("  {line}"));
+                self.note(prompter, &format!("  {line}"));
             }
         }
         for (path, error) in &report.unparsed {
-            self.note(&format!(
-                "could not parse {path} ({error}); its runs-on was not checked"
-            ));
+            self.warn(
+                prompter,
+                &format!("could not parse {path} ({error}); its runs-on was not checked"),
+            );
         }
         let declare = workflows::declare_line(pool, &report);
         if let Some(line) = &declare {
-            self.note(&format!(
-                "this host needs {line} where `preloop serve` runs (it adds to the base labels)"
-            ));
+            self.note(
+                prompter,
+                &format!(
+                    "this host needs {line} where `preloop serve` runs (it adds to the base labels)"
+                ),
+            );
         }
         self.emit(json!({
             "step": "runner_labels",
@@ -1744,149 +2103,107 @@ impl Session {
     /// The *recommended* number is what the golden settles into (the unpacked
     /// official image and per-job VM space; the same builder rule otherwise)
     /// and only ever warns — the engine warns about the unpack too.
-    fn preflight(&mut self, decision: &GoldenDecision, mode: RunMode) -> anyhow::Result<Value> {
-        self.section("5/5 Preflight");
-        let starting = matches!(mode, RunMode::Foreground | RunMode::Service);
-        let data_root = preloop_sandbox::drivers::smolvm::cli::machine_data_root();
-        let free = data_root.as_deref().and_then(|root| {
-            match preloop_sandbox::drivers::smolvm::cli::filesystem_available_bytes(root) {
-                Ok(free) => Some(free),
-                Err(error) => {
-                    // Mirror the engine: a volume `df` cannot measure is not a
-                    // refusal, the check exists to fail early.
-                    if !self.json {
-                        println!(
-                            "    disk: cannot measure {} ({error}); skipping",
-                            root.display()
-                        );
-                    }
-                    None
-                }
-            }
-        });
-        // The engine's own builder rule: builder disk + pack staging.
-        let builder_gib = u64::from(golden_builder_storage_gib(crate::runner_storage_gib()));
-        let bake_bytes = (builder_gib + GOLDEN_BUILD_DISK_HEADROOM_GIB) * GIB;
-        let download_bytes = decision
-            .artifact_bytes
-            .map(|bytes| bytes + GOLDEN_DOWNLOAD_DISK_MARGIN)
-            .unwrap_or(0);
-        let (required, advisory) = match decision.kind {
-            GoldenChoice::Official => (download_bytes, OFFICIAL_GOLDEN_WORKING_SET_BYTES),
-            _ if starting => (bake_bytes, bake_bytes),
-            _ => (0, bake_bytes),
-        };
-        let (hypervisor, hypervisor_detail) = hypervisor_state();
-
-        let mut shortfalls: Vec<Value> = Vec::new();
-        if let (Some(free), Some(root)) = (free, data_root.as_deref())
-            && required > 0
-            && free < required
+    ///
+    /// "Configure only" places nothing and starts nothing, so it has no hard
+    /// requirement at all: its checks are reported as warnings. Failing a run
+    /// that only writes a config file for a host that cannot boot a VM would
+    /// leave the file unwritten for a problem the operator may not even be
+    /// configuring this host for.
+    fn preflight(
+        &mut self,
+        prompter: &mut dyn Prompter,
+        decision: &GoldenDecision,
+        mode: RunMode,
+    ) -> anyhow::Result<Value> {
+        self.section(prompter, 5, "Preflight");
+        let (facts, disk_error) = host_facts();
+        if let Some(error) = &disk_error
+            && let Some(root) = facts.data_root.as_deref()
         {
-            shortfalls.push(json!({
-                "resource": "disk",
-                "purpose": if decision.kind == GoldenChoice::Official {
-                    "the official golden download"
-                } else {
-                    "the local golden build the engine will run on the first serve"
-                },
-                "path": root.display().to_string(),
-                "required_bytes": required,
-                "available_bytes": free,
-            }));
+            self.emit_line(
+                prompter,
+                NoteLevel::Warning,
+                &format!(
+                    "    disk: cannot measure {} ({error}); skipping",
+                    root.display()
+                ),
+            );
         }
-        if decision.arch_ok == Some(false) {
-            shortfalls.push(json!({
-                "resource": "architecture",
-                "host": std::env::consts::ARCH,
-                "detail": format!("{} does not publish an image for this host", decision.label),
-            }));
-        }
-        if !hypervisor {
-            shortfalls.push(json!({
-                "resource": "hypervisor",
-                "host": std::env::consts::OS,
-                "detail": hypervisor_detail,
-            }));
-        }
+        let outcome = evaluate_preflight(&facts, decision, mode);
 
         if !self.json {
-            match (free, data_root.as_deref()) {
-                (Some(free), Some(root)) => println!(
-                    "    disk: {} free on {}{}",
-                    gib(free),
-                    root.display(),
-                    if required > 0 {
-                        format!(" (needs {} to place the base image)", gib(required))
-                    } else {
-                        String::new()
+            match (facts.free, facts.data_root.as_deref()) {
+                (Some(free), Some(root)) => self.emit_line(
+                    prompter,
+                    NoteLevel::Info,
+                    &format!(
+                        "    disk: {} free on {}{}",
+                        gib(free),
+                        root.display(),
+                        if outcome.required > 0 {
+                            format!(" (needs {} to place the base image)", gib(outcome.required))
+                        } else {
+                            String::new()
+                        }
+                    ),
+                ),
+                _ => self.emit_line(
+                    prompter,
+                    NoteLevel::Info,
+                    "    disk: unknown (the SmolVM data volume is not resolvable)",
+                ),
+            }
+            self.emit_line(
+                prompter,
+                NoteLevel::Info,
+                &format!(
+                    "    arch: {}{}",
+                    facts.arch,
+                    match decision.arch_ok {
+                        Some(true) => " (image supports it)",
+                        Some(false) => " (image does NOT support it)",
+                        None => "",
                     }
                 ),
-                _ => println!("    disk: unknown (the SmolVM data volume is not resolvable)"),
-            }
-            println!(
-                "    arch: {}{}",
-                std::env::consts::ARCH,
-                match decision.arch_ok {
-                    Some(true) => " (image supports it)",
-                    Some(false) => " (image does NOT support it)",
-                    None => "",
-                }
             );
-            println!("    hypervisor: {hypervisor_detail}");
-        }
-        // Reported, never fatal: the engine enforces these itself at bake
-        // time, and by then the decision is made. Saying it here is what turns
-        // "the first serve refused to build a golden" into a warning the user
-        // saw while configuring.
-        let mut warnings: Vec<String> = Vec::new();
-        if let Some(free) = free
-            && free < advisory
-        {
-            warnings.push(match decision.kind {
-                GoldenChoice::Official => format!(
-                    "{} free now; the official golden wants about {} (the download, the unpacked \
-                     golden, and per-job VM space)",
-                    gib(free),
-                    gib(advisory)
-                ),
-                _ => format!(
-                    "{} free now; the engine's first local golden build wants about {} ({} builder \
-                     disk + {} pack staging) and refuses below that — free space or lower \
-                     PRELOOP_RUNNER_STORAGE_GB",
-                    gib(free),
-                    gib(advisory),
-                    gib(builder_gib * GIB),
-                    gib(GOLDEN_BUILD_DISK_HEADROOM_GIB * GIB),
-                ),
-            });
+            self.emit_line(
+                prompter,
+                NoteLevel::Info,
+                &format!("    hypervisor: {}", facts.hypervisor_detail),
+            );
         }
         let report = json!({
-            "data_root": data_root.as_deref().map(|root| root.display().to_string()),
-            "disk_free_bytes": free,
-            "disk_required_bytes": required,
-            "disk_recommended_bytes": advisory,
-            "arch": std::env::consts::ARCH,
+            "data_root": facts.data_root.as_deref().map(|root| root.display().to_string()),
+            "disk_free_bytes": facts.free,
+            "disk_required_bytes": outcome.required,
+            "disk_recommended_bytes": outcome.advisory,
+            "arch": facts.arch,
             "arch_ok": decision.arch_ok,
-            "hypervisor": hypervisor,
-            "hypervisor_detail": hypervisor_detail,
-            "shortfalls": shortfalls,
-            "warnings": warnings,
+            "hypervisor": facts.hypervisor,
+            "hypervisor_detail": facts.hypervisor_detail,
+            "shortfalls": outcome.shortfalls,
+            "warnings": outcome.warnings,
         });
 
-        if !shortfalls.is_empty() {
-            let disk_only = shortfalls.iter().all(|short| short["resource"] == "disk");
+        if !outcome.shortfalls.is_empty() {
+            let disk_only = outcome
+                .shortfalls
+                .iter()
+                .all(|short| short["resource"] == "disk");
             if disk_only && disk_preflight_overridden() {
                 self.emit(json!({"step": "preflight", "decision": "overridden", "result": report}));
-                if !self.json {
-                    println!(
+                self.emit_line(
+                    prompter,
+                    NoteLevel::Warning,
+                    &format!(
                         "    {DISK_PREFLIGHT_OVERRIDE} is set; continuing despite the disk shortfall"
-                    );
-                }
+                    ),
+                );
                 return Ok(report);
             }
             self.emit(json!({"step": "preflight", "decision": "failed", "result": report}));
-            let detail = shortfalls
+            let detail = outcome
+                .shortfalls
                 .iter()
                 .map(describe_shortfall)
                 .collect::<Vec<_>>()
@@ -1896,15 +2213,13 @@ impl Session {
                     "preflight failed: {detail}. Free space, lower PRELOOP_RUNNER_STORAGE_GB, or \
                      set {DISK_PREFLIGHT_OVERRIDE}=1 to proceed anyway."
                 ),
-                Value::Array(shortfalls.clone()),
+                Value::Array(outcome.shortfalls.clone()),
             ));
         }
         self.emit(json!({"step": "preflight", "decision": "ok", "result": report}));
-        if !self.json {
-            println!("    ok");
-        }
-        for warning in &warnings {
-            self.note(&format!("warning: {warning}"));
+        self.emit_line(prompter, NoteLevel::Success, "    ok");
+        for warning in &outcome.warnings {
+            self.warn(prompter, &format!("warning: {warning}"));
         }
         Ok(report)
     }
@@ -1914,7 +2229,12 @@ impl Session {
     /// A system service reads its own state dir; write the config there when
     /// the operator did not pin `PRELOOP_HOME` (which the service would then
     /// be told to use, because `install` gets the same value).
-    fn prepare_service_home(&self) -> anyhow::Result<()> {
+    ///
+    /// This repoints the process's config path, so it is only ever done for a
+    /// `preloop init` run that installs the service itself. A host program
+    /// (the TUI) installs nothing in-process and must not have this process's
+    /// environment changed under it.
+    fn prepare_service_home(&self, prompter: &mut dyn Prompter) -> anyhow::Result<()> {
         ensure_service_root()?;
         let service_home = std::env::var_os("PRELOOP_HOME")
             .map(PathBuf::from)
@@ -1923,27 +2243,40 @@ impl Session {
             return Ok(());
         }
         let target = service_home.join("config.toml");
-        self.note(&format!(
-            "service state dir: {} — the installed service reads this file, so the answers below \
-             are written there (not {})",
-            target.display(),
-            preloop_runner_server::config::config_path().display(),
-        ));
-        // SAFETY: the CLI is single-threaded here and nothing else reads the
-        // environment concurrently; `main` sets the same variable the same way.
+        self.note(
+            prompter,
+            &format!(
+                "service state dir: {} — the installed service reads this file, so the answers \
+                 below are written there (not {})",
+                target.display(),
+                preloop_runner_server::config::config_path().display(),
+            ),
+        );
+        // SAFETY: only a `preloop init` run that installs the service itself
+        // reaches this, and nothing else reads the environment concurrently
+        // there; `main` sets the same variable the same way. A host program
+        // never gets here (`execute` gates on the launch kind).
         unsafe {
             std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, &target);
         }
         Ok(())
     }
 
-    async fn start_mode(
+    /// Hand the caller what the resolved run mode means for it.
+    ///
+    /// The wizard itself never starts an engine: the foreground engine blocks
+    /// the calling thread and owns the terminal, which is exactly what a host
+    /// program cannot give it. The CLI acts on [`WizardOutcome::StartServe`];
+    /// a host program spawns `preloop serve` from it.
+    async fn finish(
         &self,
+        prompter: &mut dyn Prompter,
+        launch: WizardLaunch,
         mode: RunMode,
-        observability: Option<preloop_observability::Observability>,
         config_path: &Path,
-        public_url: Option<&str>,
-    ) -> anyhow::Result<()> {
+        public_url: Option<String>,
+    ) -> anyhow::Result<WizardOutcome> {
+        let config_path = config_path.to_path_buf();
         match mode {
             RunMode::Configure => {
                 // From `serve` the caller says it is continuing with the new
@@ -1953,104 +2286,78 @@ impl Session {
                 // is already running ([`apply_engine_public_url`]). An `init`
                 // run starts nothing, so it still says both.
                 if !self.json && !self.from_serve {
-                    for line in configure_only_hint(config_path, public_url) {
-                        println!("{line}");
+                    for line in configure_only_hint(&config_path, public_url.as_deref()) {
+                        self.emit_line(prompter, NoteLevel::Info, &line);
                     }
                 }
-                Ok(())
+                Ok(WizardOutcome::Configured {
+                    config_path,
+                    public_url,
+                })
             }
             RunMode::Foreground => {
-                let observability = observability.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "internal: foreground mode without the engine's telemetry handle"
-                    )
-                })?;
                 if !self.json {
-                    println!("starting the engine in the foreground (Ctrl-C to stop)");
+                    let line = match launch {
+                        WizardLaunch::Cli => {
+                            "starting the engine in the foreground (Ctrl-C to stop)"
+                        }
+                        // A host program cannot run the blocking engine in its
+                        // own process, so it starts one itself.
+                        _ => "start the engine with `preloop serve` to use this configuration",
+                    };
+                    self.emit_line(prompter, NoteLevel::Info, line);
                 }
-                // First-run preparation (state dir, brand-new control
-                // database) lives in `cmd_engine`.
-                crate::cmd_engine(serve_args_for(public_url), observability).await
+                Ok(WizardOutcome::StartServe {
+                    config_path,
+                    public_url,
+                })
             }
             RunMode::Service => {
+                if launch != WizardLaunch::Cli {
+                    // Installing a service writes system paths and needs root;
+                    // a host program reports it instead of doing it behind its
+                    // own UI.
+                    if unsafe { libc::geteuid() } != 0 {
+                        return Ok(WizardOutcome::ServiceNeedsRoot);
+                    }
+                    return Ok(WizardOutcome::ServiceInstallRequired {
+                        config_path,
+                        public_url,
+                    });
+                }
                 ensure_service_root()?;
                 if !self.json {
-                    println!("installing the control plane as a service…");
+                    self.emit_line(
+                        prompter,
+                        NoteLevel::Info,
+                        "installing the control plane as a service…",
+                    );
                 }
                 let home = std::env::var_os("PRELOOP_HOME").map(PathBuf::from);
                 crate::server_install::run(crate::server_install::install_args(
                     home,
-                    public_url.map(str::to_owned),
-                ))
+                    public_url.clone(),
+                ))?;
+                Ok(WizardOutcome::ServiceInstalled {
+                    config_path,
+                    public_url,
+                })
             }
         }
     }
+}
 
-    // -- prompts ----------------------------------------------------------
-
-    fn read_line(&self, prompt: &str) -> anyhow::Result<String> {
-        print!("{prompt}");
-        std::io::stdout().flush().context("flushing stdout")?;
-        let mut line = String::new();
-        let read = std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .context("reading stdin")?;
-        if read == 0 {
-            anyhow::bail!("input closed before the wizard finished");
-        }
-        Ok(line.trim().to_owned())
-    }
-
-    fn ask_bool(&self, prompt: &str, default: bool) -> anyhow::Result<bool> {
-        if self.yes {
-            return Ok(default);
-        }
-        loop {
-            let answer = self.read_line(prompt)?;
-            match answer.to_ascii_lowercase().as_str() {
-                "" => return Ok(default),
-                "y" | "yes" => return Ok(true),
-                "n" | "no" => return Ok(false),
-                _ => println!("    answer y or n"),
-            }
-        }
-    }
-
-    fn ask_choice(&self, items: &[MenuItem], default: usize) -> anyhow::Result<usize> {
-        loop {
-            for (index, item) in items.iter().enumerate() {
-                // A choice that cannot run here is shown, not hidden: the
-                // reason ("no Dockerfile at ./Dockerfile", "docker is not on
-                // PATH") is what tells the operator how to get it.
-                match &item.disabled {
-                    Some(reason) => println!(
-                        "    {}) {} — {} [unavailable: {reason}]",
-                        index + 1,
-                        item.label,
-                        item.description
-                    ),
-                    None => println!("    {}) {} — {}", index + 1, item.label, item.description),
-                }
-            }
-            let answer = self.read_line(&format!("    choice [{}]: ", default + 1))?;
-            let chosen = if answer.is_empty() {
-                default
-            } else {
-                match answer.trim().parse::<usize>() {
-                    Ok(value) if value >= 1 && value <= items.len() => value - 1,
-                    _ => {
-                        println!("    enter a number between 1 and {}", items.len());
-                        continue;
-                    }
-                }
-            };
-            if let Some(reason) = &items[chosen].disabled {
-                println!("    {} is unavailable: {reason}", items[chosen].label);
-                continue;
-            }
-            return Ok(chosen);
-        }
+/// Test-only seams: the wizard's own prompts, driven by a terminal prompter
+/// that the tests never let reach a real terminal (they exercise the
+/// non-interactive answers, where nothing is asked).
+#[cfg(test)]
+impl Session {
+    fn public_url_answer(
+        &mut self,
+        flag: Option<&str>,
+        env: Option<&str>,
+    ) -> anyhow::Result<PublicUrlAnswer> {
+        self.public_url_answer_with(&mut StdioPrompter::new(), flag, env)
     }
 }
 
@@ -2062,24 +2369,6 @@ impl GoldenAnswer {
             dockerfile: None,
             docker_context: None,
             path: None,
-        }
-    }
-}
-
-struct MenuItem {
-    label: String,
-    description: String,
-    /// `Some(reason)` renders the item but refuses it, so the wizard can say
-    /// *why* a choice is unavailable instead of hiding it.
-    disabled: Option<String>,
-}
-
-impl MenuItem {
-    fn enabled(label: &str, description: &str) -> Self {
-        Self {
-            label: label.to_owned(),
-            description: description.to_owned(),
-            disabled: None,
         }
     }
 }
@@ -2111,21 +2400,46 @@ fn reject_mismatched_flags(kind: GoldenChoice, args: &InitArgs) -> anyhow::Resul
     )))
 }
 
-/// A flag the wizard still needs, asked for on the terminal.
+/// The OCI reference `--base-image`/the OCI prompt names, as it will be
+/// validated and *persisted*: trimmed, and refused when it is a filesystem
+/// path, empty, or carries whitespace. The persisted value has to be the one
+/// that was checked — a stored reference with a stray space is an image name
+/// no registry knows.
+fn oci_reference_answer(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if raw.starts_with('/') || raw.starts_with('.') || Path::new(raw).exists() {
+        return Err(usage_error(format!(
+            "`{raw}` is a filesystem path, not a registry reference — use \
+             --golden file for a local .smolmachine/rootfs, or --golden dockerfile to \
+             build one here"
+        )));
+    }
+    if trimmed.is_empty() {
+        return Err(usage_error("--base-image must not be empty"));
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err(usage_error(format!(
+            "`{trimmed}` is not a valid image reference (whitespace)"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// A flag the wizard still needs, asked for through the prompter.
 fn require_interactive_flag(
+    prompter: &mut dyn Prompter,
     value: Option<String>,
     flag: &str,
-    ask: &mut impl FnMut(&str) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
     if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
         return Ok(value);
     }
     loop {
-        let answer = ask(&format!("    {flag}: "))?;
+        let answer = prompter.text(&format!("{flag}: "), None, None)?;
         if !answer.is_empty() {
             return Ok(answer);
         }
-        println!("    a value is required");
+        prompter.note(NoteLevel::Info, "    a value is required");
     }
 }
 
@@ -2812,7 +3126,7 @@ fn foreground_touches(funnel_status: &Value, host: &str) -> bool {
 /// trailing slash. Refused: anything but https, a loopback or `localhost` host
 /// (GitHub cannot reach those), credentials, a query, or a fragment. The error
 /// names the rule that failed.
-fn validate_public_url(raw: &str) -> Result<String, String> {
+pub(crate) fn validate_public_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     let url = reqwest::Url::parse(trimmed)
         .map_err(|error| format!("`{trimmed}` is not a URL ({error})"))?;
@@ -3026,6 +3340,164 @@ fn hypervisor_state() -> (bool, String) {
             false,
             format!("no microVM hypervisor on {}", std::env::consts::OS),
         )
+    }
+}
+
+/// The host facts the preflight check needs, gathered once so the decision
+/// itself is a pure function of them — and so a test can state a host with no
+/// hypervisor without owning one.
+#[derive(Debug)]
+struct HostFacts {
+    data_root: Option<PathBuf>,
+    /// Free bytes on the SmolVM data volume; `None` when it cannot be measured.
+    free: Option<u64>,
+    hypervisor: bool,
+    hypervisor_detail: String,
+    arch: &'static str,
+}
+
+/// Read the host facts, and the error that stopped the disk probe when one
+/// did (a volume `df` cannot measure is not a refusal: the check exists to
+/// fail early, exactly as the engine treats it).
+fn host_facts() -> (HostFacts, Option<String>) {
+    let data_root = preloop_sandbox::drivers::smolvm::cli::machine_data_root();
+    let (free, error) = match data_root.as_deref() {
+        Some(root) => {
+            match preloop_sandbox::drivers::smolvm::cli::filesystem_available_bytes(root) {
+                Ok(free) => (Some(free), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        }
+        None => (None, None),
+    };
+    let (hypervisor, hypervisor_detail) = hypervisor_state();
+    (
+        HostFacts {
+            data_root,
+            free,
+            hypervisor,
+            hypervisor_detail,
+            arch: std::env::consts::ARCH,
+        },
+        error,
+    )
+}
+
+/// What the preflight check found: the shortfalls that stop the run, the
+/// numbers the operator has to see, and the warnings that only inform.
+#[derive(Debug)]
+struct PreflightOutcome {
+    shortfalls: Vec<Value>,
+    warnings: Vec<String>,
+    /// Bytes the chosen mode has to place before it can start.
+    required: u64,
+    /// Bytes the golden settles into; over this the run warns and continues.
+    advisory: u64,
+}
+
+/// Check `facts` against the chosen golden and run mode.
+///
+/// The hard requirement is what the engine itself refuses to proceed without,
+/// so `init` never blocks something `serve` would accept and never accepts
+/// something `serve` would refuse. It only exists for a mode that starts the
+/// engine now: "configure only" writes a file and places nothing, so the
+/// hypervisor, the host architecture and the disk it would need are warnings
+/// there — a config for a host that is not this one is a legitimate answer.
+fn evaluate_preflight(
+    facts: &HostFacts,
+    decision: &GoldenDecision,
+    mode: RunMode,
+) -> PreflightOutcome {
+    let starting = matches!(mode, RunMode::Foreground | RunMode::Service);
+    // The engine's own builder rule: builder disk + pack staging.
+    let builder_gib = u64::from(golden_builder_storage_gib(crate::runner_storage_gib()));
+    let bake_bytes = (builder_gib + GOLDEN_BUILD_DISK_HEADROOM_GIB) * GIB;
+    let download_bytes = decision
+        .artifact_bytes
+        .map(|bytes| bytes + GOLDEN_DOWNLOAD_DISK_MARGIN)
+        .unwrap_or(0);
+    let (required, advisory) = match decision.kind {
+        GoldenChoice::Official if starting => (download_bytes, OFFICIAL_GOLDEN_WORKING_SET_BYTES),
+        GoldenChoice::Official => (0, OFFICIAL_GOLDEN_WORKING_SET_BYTES),
+        _ if starting => (bake_bytes, bake_bytes),
+        _ => (0, bake_bytes),
+    };
+
+    let mut shortfalls: Vec<Value> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    if let (Some(free), Some(root)) = (facts.free, facts.data_root.as_deref())
+        && required > 0
+        && free < required
+    {
+        shortfalls.push(json!({
+            "resource": "disk",
+            "purpose": if decision.kind == GoldenChoice::Official {
+                "the official golden download"
+            } else {
+                "the local golden build the engine will run on the first serve"
+            },
+            "path": root.display().to_string(),
+            "required_bytes": required,
+            "available_bytes": free,
+        }));
+    }
+    if decision.arch_ok == Some(false) {
+        let detail = format!("{} does not publish an image for this host", decision.label);
+        if starting {
+            shortfalls.push(json!({
+                "resource": "architecture",
+                "host": facts.arch,
+                "detail": detail,
+            }));
+        } else {
+            warnings.push(format!("{detail} ({})", facts.arch));
+        }
+    }
+    if !facts.hypervisor {
+        if starting {
+            shortfalls.push(json!({
+                "resource": "hypervisor",
+                "host": std::env::consts::OS,
+                "detail": facts.hypervisor_detail,
+            }));
+        } else {
+            warnings.push(format!(
+                "no microVM hypervisor: {} — configure only writes the config, but `preloop \
+                 serve` needs one to run jobs",
+                facts.hypervisor_detail
+            ));
+        }
+    }
+    // Reported, never fatal: the engine enforces these itself at bake time,
+    // and by then the decision is made. Saying it here is what turns "the
+    // first serve refused to build a golden" into a warning the user saw while
+    // configuring.
+    if let Some(free) = facts.free
+        && free < advisory
+    {
+        warnings.push(match decision.kind {
+            GoldenChoice::Official => format!(
+                "{} free now; the official golden wants about {} (the download, the unpacked \
+                 golden, and per-job VM space)",
+                gib(free),
+                gib(advisory)
+            ),
+            _ => format!(
+                "{} free now; the engine's first local golden build wants about {} ({} builder \
+                 disk + {} pack staging) and refuses below that — free space or lower \
+                 PRELOOP_RUNNER_STORAGE_GB",
+                gib(free),
+                gib(advisory),
+                gib(builder_gib * GIB),
+                gib(GOLDEN_BUILD_DISK_HEADROOM_GIB * GIB),
+            ),
+        });
+    }
+    PreflightOutcome {
+        shortfalls,
+        warnings,
+        required,
+        advisory,
     }
 }
 
@@ -3452,92 +3924,53 @@ fn github_pat_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-// -- stdout capture -------------------------------------------------------
-
-/// Run `future` with this process's stdout redirected into a temporary file,
-/// and return what it printed there. Used so the reused `preloop setup` flow's
-/// human output cannot corrupt `--json`'s one-object-per-line contract.
-async fn capture_stdout<F: Future>(future: F) -> (F::Output, String) {
-    #[cfg(unix)]
-    {
-        let Ok(capture) = StdoutCapture::begin() else {
-            return (future.await, String::new());
-        };
-        let output = future.await;
-        (output, capture.finish())
-    }
-    #[cfg(not(unix))]
-    {
-        (future.await, String::new())
-    }
-}
-
-/// Restores fd 1 on drop, so an unwinding future cannot leave the process
-/// writing its output into the capture file.
-#[cfg(unix)]
-struct StdoutCapture {
-    saved: libc::c_int,
-    file: std::fs::File,
-    active: bool,
-}
-
-#[cfg(unix)]
-impl StdoutCapture {
-    fn begin() -> anyhow::Result<Self> {
-        use std::os::fd::AsRawFd;
-        std::io::stdout().flush().context("flushing stdout")?;
-        let file = tempfile::tempfile().context("creating the capture file")?;
-        // SAFETY: dup/dup2 operate on this process's own descriptor table, and
-        // the guard restores fd 1 when it is dropped.
-        let saved = unsafe { libc::dup(1) };
-        if saved < 0 {
-            anyhow::bail!("dup(1) failed");
-        }
-        if unsafe { libc::dup2(file.as_raw_fd(), 1) } < 0 {
-            unsafe { libc::close(saved) };
-            anyhow::bail!("dup2(2) failed");
-        }
-        Ok(Self {
-            saved,
-            file,
-            active: true,
-        })
-    }
-
-    fn finish(mut self) -> String {
-        self.restore();
-        use std::io::{Read, Seek, SeekFrom};
-        let mut text = String::new();
-        if self.file.seek(SeekFrom::Start(0)).is_ok() {
-            let _ = self.file.read_to_string(&mut text);
-        }
-        text
-    }
-
-    fn restore(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.active = false;
-        let _ = std::io::stdout().flush();
-        // SAFETY: same descriptor table; `saved` is the fd dup'd in `begin`.
-        unsafe {
-            libc::dup2(self.saved, 1);
-            libc::close(self.saved);
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for StdoutCapture {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The environment a wizard test runs against: its own config file and
+    /// home, and the file credential store so nothing touches the developer's
+    /// real config, home or keychain.
+    #[allow(unsafe_code)]
+    fn pin_wizard_env(
+        config_path: &Path,
+        home: &Path,
+    ) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        let keys = [
+            preloop_runner_server::config::CONFIG_PATH_ENV,
+            "PRELOOP_HOME",
+            preloop_runner_server::credential_store::CREDENTIAL_STORE_ENV,
+        ];
+        let previous: Vec<(&'static str, Option<std::ffi::OsString>)> = keys
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        // SAFETY: TEST_ENV_LOCK serializes this process-global env access
+        // across tests; every value read above is restored below.
+        unsafe {
+            std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, config_path);
+            std::env::set_var("PRELOOP_HOME", home);
+            std::env::set_var(
+                preloop_runner_server::credential_store::CREDENTIAL_STORE_ENV,
+                "file",
+            );
+        }
+        previous
+    }
+
+    /// Put back every value [`pin_wizard_env`] read.
+    #[allow(unsafe_code)]
+    fn restore_wizard_env(previous: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        // SAFETY: TEST_ENV_LOCK was held from the capture through the restore.
+        unsafe {
+            for (key, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn non_interactive_run_requires_every_step_flag() {
@@ -3700,6 +4133,249 @@ mod tests {
             preloop_runner_server::config::golden_base_image(&config).as_deref(),
             Some("ghcr.io/x/y:1")
         );
+    }
+
+    /// The wizard a host program (the TUI) drives: the same answers a flags
+    /// run resolves, written to the config the caller is told about, with
+    /// every line going through the host's own prompter and nothing started.
+    #[test]
+    fn a_host_program_can_drive_the_wizard() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("config.toml");
+        let previous = pin_wizard_env(&config_path, home.path());
+        let rootfs = home.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        let args = InitArgs {
+            auth: Some(AuthChoice::None),
+            golden: Some(GoldenChoice::File),
+            path: Some(rootfs.clone()),
+            mode: Some(RunMode::Configure),
+            no_secrets_scan: true,
+            ..InitArgs::default()
+        };
+        let mut prompter = crate::prompter::test_support::TestPrompter::new([]);
+        let outcome = run_wizard(&mut prompter, WizardOptions::embedded(args));
+        restore_wizard_env(previous);
+
+        let outcome = outcome.expect("the wizard must resolve the flags it was given");
+        match outcome {
+            WizardOutcome::Configured {
+                config_path: written,
+                public_url,
+            } => {
+                assert_eq!(written, config_path);
+                assert_eq!(public_url, None);
+                let config = preloop_runner_server::config::load_config_from(&config_path).unwrap();
+                assert_eq!(config.golden.kind.as_deref(), Some("file"));
+                assert_eq!(
+                    config.golden.base_image.as_deref(),
+                    Some(rootfs.canonicalize().unwrap().to_string_lossy().as_ref())
+                );
+            }
+            other => panic!("a host program starts nothing itself: {other:?}"),
+        }
+        let log = prompter.log();
+        assert!(log.contains("1/5 Credentials"), "{log}");
+        assert!(log.contains("wrote"), "{log}");
+        assert_eq!(
+            prompter.remaining_answers(),
+            0,
+            "the flags answered every step: {}",
+            prompter.prompts().join(", ")
+        );
+    }
+
+    /// A host that cancels stops the wizard before anything is written: the
+    /// caller is told "nothing was written", not handed a half-configured
+    /// engine.
+    #[test]
+    fn a_cancelled_wizard_writes_nothing() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("config.toml");
+        let previous = pin_wizard_env(&config_path, home.path());
+        let mut prompter = crate::prompter::test_support::TestPrompter::new([
+            crate::prompter::test_support::Answer::Cancel,
+        ]);
+        // No --auth: the wizard has to ask, and the host answers "cancel".
+        let error = run_wizard(&mut prompter, WizardOptions::embedded(InitArgs::default()))
+            .expect_err("a cancelled wizard must not report success");
+        let cancelled = crate::prompter::is_cancelled(&error);
+        restore_wizard_env(previous);
+        assert!(cancelled, "{error}");
+        assert!(
+            !config_path.exists(),
+            "a cancelled wizard must not write a config"
+        );
+    }
+
+    /// B3: the official golden persists a *kind* with no base image, so
+    /// `serve` cannot use `golden_base_image` to tell "init already ran" from
+    /// "nothing is configured" — it would offer the wizard on every start.
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_recorded_official_golden_counts_as_configured() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let previous = std::env::var_os(preloop_runner_server::config::BASE_IMAGE_ENV);
+        // SAFETY: TEST_ENV_LOCK serializes this process-global env access, and
+        // the value read above is restored below.
+        unsafe { std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV) };
+
+        let untouched = ConfigFile::default();
+        assert!(
+            !wizard_configured(&untouched),
+            "a machine that never ran `preloop init` must be offered the wizard"
+        );
+        let official = ConfigFile {
+            golden: GoldenConfig {
+                kind: Some(GoldenChoice::Official.as_str().to_owned()),
+                base_image: None,
+                dockerfile: None,
+            },
+            ..ConfigFile::default()
+        };
+        assert!(
+            wizard_configured(&official),
+            "an official choice is a complete answer: `serve` must not ask again"
+        );
+        // A base image without a kind (hand-written config, or an older
+        // version) is just as configured.
+        let image = ConfigFile {
+            golden: GoldenConfig {
+                kind: None,
+                base_image: Some("ghcr.io/acme/base:1".to_owned()),
+                dockerfile: None,
+            },
+            ..ConfigFile::default()
+        };
+        assert!(wizard_configured(&image));
+        // An environment override is what the engine forks from, so it
+        // answers the question too.
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var(
+                preloop_runner_server::config::BASE_IMAGE_ENV,
+                "ghcr.io/acme/override:1",
+            )
+        };
+        assert!(wizard_configured(&untouched));
+        // SAFETY: restores the value read above.
+        unsafe {
+            match previous {
+                Some(value) => {
+                    std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, value)
+                }
+                None => std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV),
+            }
+        }
+    }
+
+    /// B4: "configure only" writes a config and places nothing, so a host
+    /// without a hypervisor — or one whose disk cannot hold the golden, or one
+    /// whose architecture the image does not publish — must not fail it. The
+    /// same host in a mode that starts the engine now must.
+    #[test]
+    fn configure_only_warns_about_a_host_it_does_not_need() {
+        let decision = GoldenDecision {
+            kind: GoldenChoice::Official,
+            base_image: None,
+            dockerfile: None,
+            label: "official GitHub runner image".to_owned(),
+            artifact_bytes: Some(OFFICIAL_GOLDEN_DOWNLOAD_BYTES),
+            arch_ok: Some(false),
+            warnings: Vec::new(),
+            detail: json!({}),
+        };
+        let facts = HostFacts {
+            data_root: Some(PathBuf::from("/var/lib/preloop")),
+            free: Some(1024),
+            hypervisor: false,
+            hypervisor_detail: "/dev/kvm (No such file or directory)".to_owned(),
+            arch: "aarch64",
+        };
+
+        let configure_only = evaluate_preflight(&facts, &decision, RunMode::Configure);
+        assert!(
+            configure_only.shortfalls.is_empty(),
+            "configure-only must not fail on checks it does not need: {:?}",
+            configure_only.shortfalls
+        );
+        assert_eq!(
+            configure_only.required, 0,
+            "nothing is placed by a run that starts nothing"
+        );
+        let warnings = configure_only.warnings.join("\n");
+        assert!(warnings.contains("no microVM hypervisor"), "{warnings}");
+        assert!(warnings.contains("/dev/kvm"), "{warnings}");
+        assert!(
+            warnings.contains("does not publish an image for this host"),
+            "{warnings}"
+        );
+        assert!(
+            warnings.contains("free now"),
+            "the disk numbers are still reported: {warnings}"
+        );
+
+        let foreground = evaluate_preflight(&facts, &decision, RunMode::Foreground);
+        let resources: Vec<&str> = foreground
+            .shortfalls
+            .iter()
+            .filter_map(|short| short["resource"].as_str())
+            .collect();
+        assert!(
+            resources.contains(&"hypervisor")
+                && resources.contains(&"architecture")
+                && resources.contains(&"disk"),
+            "a mode that starts the engine still fails: {resources:?}"
+        );
+        assert_eq!(
+            foreground.required,
+            OFFICIAL_GOLDEN_DOWNLOAD_BYTES + GOLDEN_DOWNLOAD_DISK_MARGIN
+        );
+
+        // A service install is a start too, and a local golden's builder disk
+        // is only required by the modes that will run it.
+        let service = evaluate_preflight(&facts, &decision, RunMode::Service);
+        assert!(!service.shortfalls.is_empty());
+        let local = GoldenDecision {
+            kind: GoldenChoice::Oci,
+            base_image: Some("ghcr.io/acme/base:1".to_owned()),
+            ..decision
+        };
+        let idle = evaluate_preflight(&facts, &local, RunMode::Configure);
+        assert!(idle.shortfalls.is_empty(), "{:?}", idle.shortfalls);
+        assert_eq!(idle.required, 0);
+        assert_eq!(
+            idle.advisory,
+            (u64::from(golden_builder_storage_gib(crate::runner_storage_gib()))
+                + GOLDEN_BUILD_DISK_HEADROOM_GIB)
+                * GIB
+        );
+        let running = evaluate_preflight(&facts, &local, RunMode::Foreground);
+        assert_eq!(running.required, idle.advisory);
+    }
+
+    /// B15: the reference that gets persisted is the trimmed one that was
+    /// validated, never the raw answer with a stray space in it.
+    #[test]
+    fn the_oci_reference_that_is_persisted_is_the_trimmed_one() {
+        assert_eq!(
+            oci_reference_answer("  ghcr.io/acme/base:1  ").unwrap(),
+            "ghcr.io/acme/base:1"
+        );
+        assert_eq!(
+            oci_reference_answer("ghcr.io/acme/base@sha256:abc").unwrap(),
+            "ghcr.io/acme/base@sha256:abc"
+        );
+        for refused in ["   ", "/tmp/base.tar", "./base.tar", "ghcr.io/a b:1"] {
+            let error = oci_reference_answer(refused)
+                .expect_err("`{refused}` must be refused before anything is persisted");
+            assert!(
+                exit_code(&error) == Some(EXIT_USAGE) || error.to_string().contains("path"),
+                "{refused}: {error}"
+            );
+        }
     }
 
     /// The official choice is `kind` alone — no base image — and that is a

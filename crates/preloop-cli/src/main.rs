@@ -25,6 +25,7 @@ mod github_auth;
 mod github_setup;
 mod init;
 
+mod prompter;
 mod push;
 mod sandbox;
 mod server_install;

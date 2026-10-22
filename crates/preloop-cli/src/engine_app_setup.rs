@@ -7,6 +7,7 @@
 //! pass through this process.
 
 use crate::github_setup::GithubSetupArgs;
+use crate::prompter::{NoteLevel, Prompter};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -21,7 +22,11 @@ const WAIT_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// Create the App on the engine at `public_url`. Returns once the engine
 /// reports the setup completed, or an error saying why it did not.
-pub(crate) async fn setup_app_via_engine(args: &GithubSetupArgs, public_url: &str) -> Result<()> {
+pub(crate) async fn setup_app_via_engine(
+    args: &GithubSetupArgs,
+    public_url: &str,
+    prompter: &mut dyn Prompter,
+) -> Result<()> {
     if let Some(error) = insecure_public_url_error(public_url) {
         bail!("{error}");
     }
@@ -56,27 +61,41 @@ pub(crate) async fn setup_app_via_engine(args: &GithubSetupArgs, public_url: &st
         .as_str()
         .context("the engine's reply has no session id")?;
 
-    println!(
-        "Open this link in a browser that can reach the engine. It works once and expires in about ten minutes:\n\n  {setup_url}\n"
+    prompter.note(
+        NoteLevel::Info,
+        &format!(
+            "Open this link in a browser that can reach the engine. It works once and expires in about ten minutes:\n\n  {setup_url}\n"
+        ),
     );
-    println!(
-        "Approve the App on GitHub. The engine creates it and stores its credentials; this terminal waits for that."
+    prompter.note(
+        NoteLevel::Info,
+        "Approve the App on GitHub. The engine creates it and stores its credentials; this terminal waits for that.",
     );
     if !args.repos.is_empty() {
-        println!(
-            "Install the App on {} as soon as GitHub offers the install page: the engine waits \
-             up to five minutes for it, then verifies each one.",
-            args.repos.join(", ")
+        prompter.note(
+            NoteLevel::Info,
+            &format!(
+                "Install the App on {} as soon as GitHub offers the install page: the engine waits \
+                 up to five minutes for it, then verifies each one.",
+                args.repos.join(", ")
+            ),
         );
     }
     if !args.no_browser && crate::app_manifest::open_in_browser(setup_url).is_err() {
-        println!("(could not open a browser automatically — open the link above)");
+        prompter.note(
+            NoteLevel::Warning,
+            "(could not open a browser automatically — open the link above)",
+        );
     }
-    wait_for_completion(engine, session).await
+    wait_for_completion(engine, session, prompter).await
 }
 
 /// Poll the session until the engine reports a terminal status.
-async fn wait_for_completion(engine: &str, session: &str) -> Result<()> {
+async fn wait_for_completion(
+    engine: &str,
+    session: &str,
+    prompter: &mut dyn Prompter,
+) -> Result<()> {
     let client = crate::build_client();
     let started = Instant::now();
     let mut announced = String::new();
@@ -107,7 +126,14 @@ async fn wait_for_completion(engine: &str, session: &str) -> Result<()> {
             "completed" => {
                 let (lines, failed) = completion_report(&status);
                 for line in lines {
-                    println!("{line}");
+                    prompter.note(
+                        if failed {
+                            NoteLevel::Warning
+                        } else {
+                            NoteLevel::Success
+                        },
+                        &line,
+                    );
                 }
                 anyhow::ensure!(!failed, "one or more App verification checks failed");
                 return Ok(());
@@ -130,15 +156,17 @@ async fn wait_for_completion(engine: &str, session: &str) -> Result<()> {
             _ if state != announced => {
                 announced = state.to_owned();
                 match state {
-                    "awaiting_link" => println!("Waiting for the link to be opened…"),
-                    "awaiting_approval" => {
-                        println!(
-                            "The form was opened. Waiting for the App to be approved on GitHub…"
-                        )
+                    "awaiting_link" => {
+                        prompter.note(NoteLevel::Info, "Waiting for the link to be opened…")
                     }
-                    "converting" => {
-                        println!("GitHub approved the App. Storing its credentials on the engine…")
-                    }
+                    "awaiting_approval" => prompter.note(
+                        NoteLevel::Info,
+                        "The form was opened. Waiting for the App to be approved on GitHub…",
+                    ),
+                    "converting" => prompter.note(
+                        NoteLevel::Info,
+                        "GitHub approved the App. Storing its credentials on the engine…",
+                    ),
                     _ => {}
                 }
             }

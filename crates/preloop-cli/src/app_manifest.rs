@@ -26,6 +26,7 @@
 //! | `/callback`  | manifest code → credentials, then redirect to the install  |
 //! | `/installed` | GitHub's post-install redirect; reports the installation   |
 
+use crate::prompter::{NoteLevel, Prompter};
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::{Query, State};
@@ -88,6 +89,12 @@ struct Flow {
     credentials_tx: Mutex<Option<oneshot::Sender<Result<AppCredentials>>>>,
     /// Fires once, with the installation id GitHub redirects back with.
     installed_tx: Mutex<Option<oneshot::Sender<u64>>>,
+    /// Whether GitHub's one-time code was already converted. The route is
+    /// documented as one shot and has to *be* one: a second request carrying
+    /// the same state nonce is a replay, and converting again would trade a
+    /// code GitHub has already spent for an error page (or, worse, race the
+    /// real callback for the credentials).
+    converted: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +125,7 @@ pub(crate) async fn register_with_persist<F, T>(
     port: u16,
     guidance: Option<&str>,
     open_browser: bool,
+    prompter: &mut dyn Prompter,
     persist: F,
 ) -> Result<(Registration, T)>
 where
@@ -131,8 +139,11 @@ where
         .context("reading the local listener address")?;
     let base = format!("http://127.0.0.1:{}", local.port());
     match guidance {
-        Some(text) => println!("{text}"),
-        None => println!("Open this URL to create the GitHub App:\n  {base}"),
+        Some(text) => prompter.note(NoteLevel::Info, text),
+        None => prompter.note(
+            NoteLevel::Info,
+            &format!("Open this URL to create the GitHub App:\n  {base}"),
+        ),
     }
     let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
         .ok()
@@ -144,9 +155,12 @@ where
     // socket no one is serving yet.
     register_on_with_persist(listener, name, org, &api_base, persist, |base| {
         if open_browser && open_in_browser(base).is_err() {
-            println!("(could not open a browser automatically — open the URL above)");
+            prompter.note(
+                NoteLevel::Warning,
+                "(could not open a browser automatically — open the URL above)",
+            );
         }
-        println!("Waiting for GitHub to redirect back…");
+        prompter.note(NoteLevel::Info, "Waiting for GitHub to redirect back…");
     })
     .await
 }
@@ -195,6 +209,7 @@ where
         install_url: Mutex::new(None),
         credentials_tx: Mutex::new(Some(credentials_tx)),
         installed_tx: Mutex::new(Some(installed_tx)),
+        converted: std::sync::atomic::AtomicBool::new(false),
     });
     let org = org.map(str::to_owned);
     let router = Router::new()
@@ -280,6 +295,23 @@ async fn page_callback(
             Html(error_page(
                 "State mismatch",
                 "This callback did not come from the form this command served.",
+            )),
+        )
+            .into_response();
+    }
+    // The code GitHub sends is one-time, and this route has to be too: a
+    // second request with the same nonce is a replay. Claim it before the
+    // conversion, so two requests racing cannot both trade it.
+    if flow
+        .converted
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Html(error_page(
+                "Callback already used",
+                "This link was already used once. Re-run `preloop setup github --via app` to \
+                 create the App again.",
             )),
         )
             .into_response();
@@ -690,6 +722,28 @@ mod tests {
                 && !callback_body.contains("BEGIN RSA PRIVATE KEY")
                 && !callback_body.contains("hook-secret"),
             "the callback page must not echo code, PEM, or webhook secret: {callback_body}"
+        );
+
+        // B10: the code GitHub sends is one-time and so is the route. A second
+        // request carrying the same nonce is a replay, and must not convert
+        // again — the conversion endpoint is single-use at GitHub's end, so a
+        // replay would only race the real callback for the credentials.
+        let replay = client
+            .get(format!(
+                "{base}/callback?code=conversion-code&state={state}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "the loopback callback is single-use"
+        );
+        let replay_body = replay.text().await.unwrap();
+        assert!(
+            replay_body.contains("already used"),
+            "the operator is told why: {replay_body}"
         );
 
         client
