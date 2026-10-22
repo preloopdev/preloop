@@ -3206,7 +3206,7 @@ async fn a_swept_exec_reports_the_timeout_exit_not_an_error() {
     // A provider that takes the work but never reports (a lost agent, or one
     // stalled long enough that the backstop wins): the caller must still see
     // the driver's timeout exit, not a scheduler-dependent error.
-    let (service, _dir, provider) =
+    let (service, _dir, provider, store) =
         manual_service(|config| config.exec_timeout = Duration::from_secs(1)).await;
     acquire_unreported(&service, "k").await;
     let create = poll_now(&service, &provider).await;
@@ -3222,9 +3222,18 @@ async fn a_swept_exec_reports_the_timeout_exit_not_an_error() {
         })
         .await
         .unwrap();
+    let sandbox_id = service.list()[0].id.clone();
+    let lease_id = store
+        .load(Kind::Leases)
+        .await
+        .unwrap()
+        .first()
+        .and_then(|row| row["id"].as_str().map(str::to_owned))
+        .expect("the acquire left a lease row");
     let stream = service
         .exec(ExecRequest {
-            sandbox_id: service.list()[0].id.clone(),
+            sandbox_id,
+            lease_id,
             argv: vec!["sleep".into(), "30".into()],
             ..ExecRequest::default()
         })
