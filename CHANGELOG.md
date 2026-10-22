@@ -9,6 +9,13 @@ Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 ### Added
 
+- **`preloop init` and `preloop setup github` write through a prompt
+  interface instead of the terminal.** Every question and every line of
+  output goes through a `Prompter` — the terminal's own prompts for the CLI, a
+  capturing host for `--json`, or a host program's widgets — so the setup
+  wizard can be driven by the TUI (`init::run_wizard`). The wizard never
+  starts the engine itself: it reports what the caller should start.
+
 - **Sandbox Service** (`preloop-sandbox`) replaces `preloop-vm`; the
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
   service. The AgentENV backend moved to the private build.
@@ -91,6 +98,38 @@ Releases before v0.27.0 predate the changelog.
   and the release-tag ruleset restricts tag creation.
 
 ### Fixed
+
+- **`preloop init --mode none` no longer fails on checks it does not need.**
+  A configure-only run places nothing and starts nothing, so a missing
+  hypervisor, an image with no build for this host, or a data volume too small
+  for the golden are reported as warnings; they are still refusals for
+  `foreground`/`service`. The golden is resolved and the host checked *before*
+  the credential step, so a preflight failure no longer leaves a credential on
+  disk with no golden beside it.
+- **`preloop serve` stops asking "run `preloop init` first?" after the
+  official golden was chosen.** The official choice is a kind with no base
+  image, and "configured" was decided by a base image resolving — so every
+  start offered the wizard again. A recorded kind (or a base image, or
+  `PRELOOP_RUNNER_BASE_IMAGE`) is now what counts as answered.
+- **`preloop setup github` validates `--public-url` the way `init` does.**
+  A loopback or plain-http URL is refused outright, and an unusable
+  `PRELOOP_PUBLIC_URL` is reported and ignored instead of quietly pointing an
+  App's webhook at an address GitHub cannot deliver to. A URL the wizard
+  skipped stays skipped: the answer is passed to the reused flow, so the
+  environment cannot override it.
+- **A PAT stored beside an App no longer changes the engine's App-mint
+  failure policy.** `mint_failure = "pat"` is set only when the PAT *is* the
+  engine's credential; with an App configured, a failed App mint is not
+  silently retried with an account-wide PAT (the command says so).
+- **`preloop setup github` without `--via` exits non-zero** with its usage
+  instead of exiting 0 as if it had configured something.
+- **The loopback App-manifest callback is single-use**, as its own docs say:
+  a second request carrying the same state nonce is refused without
+  converting the code again.
+- **`preloop init` persists the trimmed OCI reference** it validated, not the
+  raw answer with a stray space in it.
+- **Install summaries name a command that exists** (`preloop setup github
+  --via app`), instead of `setup github --save`, which is a `serve` flag.
 
 - **Sandbox telemetry is shareable and bounded.** `Stats` carries aggregates
   only — host process names, PIDs and data-directory paths stay on the
