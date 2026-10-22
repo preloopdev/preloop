@@ -409,6 +409,10 @@ pub struct SchedulingOutcome {
     pub promoted: usize,
     pub skipped: Vec<(RunId, JobId)>,
     pub failed: Vec<(RunId, JobId)>,
+    /// `StepStatus` events persisted while settling the jobs above (a
+    /// skipped or failed job closes its unfinished steps). The handler
+    /// broadcasts them; they are already in the outbox.
+    pub events: Vec<preloop_gha_protocol::NdjsonEvent>,
 }
 
 impl SchedulingOutcome {
@@ -418,6 +422,7 @@ impl SchedulingOutcome {
         self.promoted += other.promoted;
         self.skipped.extend(other.skipped);
         self.failed.extend(other.failed);
+        self.events.extend(other.events);
     }
 }
 

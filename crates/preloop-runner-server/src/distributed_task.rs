@@ -830,6 +830,7 @@ pub(crate) async fn complete_job_settling(
         newly_terminal_success,
         live_log_key,
         next_runs_on: tx_next_labels,
+        events: step_events,
     } = settled;
 
     // Node-local bookkeeping that does not belong to the scheduling tx:
@@ -848,6 +849,14 @@ pub(crate) async fn complete_job_settling(
     // that the guard is released, and fold the result into the outcome the
     // notify and event fan-out below reports on.
     scheduling.merge(drain_expansions(&shared).await);
+
+    // Step status changes this settle persisted (the attempt's closed steps
+    // and any skipped/failed dependent's) are already in the outbox; publish
+    // them on the live stream so a watching client updates the step rows in
+    // place instead of waiting for the next snapshot.
+    for event in step_events.into_iter().chain(scheduling.events.drain(..)) {
+        shared.state.emit_persisted(event).await;
+    }
 
     // Deferred expansion runs after the snapshot point above and can mutate
     // the run record: an empty dynamic matrix concludes its node as Skipped, a

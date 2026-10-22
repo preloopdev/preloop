@@ -3744,6 +3744,7 @@ pub(crate) async fn cancel_run_inner(
         record,
         cancelled_jobs,
         next_runs_on,
+        events: step_events,
         ..
     } = shared
         .state
@@ -3760,6 +3761,11 @@ pub(crate) async fn cancel_run_inner(
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
         shared.state.sampler_notify.notify_waiters();
+    }
+    // The cancelled steps' events were persisted inside the transition; the
+    // live stream only needs them broadcast.
+    for event in step_events {
+        shared.state.emit_persisted(event).await;
     }
     shared
         .state

@@ -1678,7 +1678,7 @@ fn golden_runner_version_for(scenario: &str) -> Option<String> {
         .filter(|version| version.starts_with(|c: char| c.is_ascii_digit()))
         .filter(|version| has(version))
         .collect();
-    versions.sort_by(|a, b| version_key(a).cmp(&version_key(b)));
+    versions.sort_by_key(|version| version_key(version));
     versions.pop()
 }
 
@@ -1965,8 +1965,12 @@ async fn composite_input_from_secrets_github_token_is_the_minted_token() {
     let message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
     let mut job = claimed_job(&message);
     job.workspace = Some(workspace.path().to_string_lossy().to_string());
-    let mut ctx =
-        crate::worker::execution_context::StepContext::new(&mut job, "step".into(), "Step".into());
+    let mut ctx = crate::worker::execution_context::StepContext::new(
+        &mut job,
+        "step".into(),
+        "step".into(),
+        "Step".into(),
+    );
     let (_tx, rx) = tokio::sync::watch::channel(false);
     let manifest = crate::worker::handlers::factory::load_action_manifest(&action_dir).unwrap();
     crate::worker::handlers::composite::run_composite_action(

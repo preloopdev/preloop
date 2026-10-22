@@ -431,7 +431,12 @@ mod tests {
             "ruby/setup-ruby@6e5d382445ae5590b7449d8b3bc8cb1c2c27f617".to_owned(),
             staged.to_string_lossy().into_owned(),
         );
-        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let mut ctx = StepContext::new(
+            &mut job,
+            "composite".into(),
+            "composite".into(),
+            "Composite".into(),
+        );
         let resolved = crate::worker::handlers::action::ensure_remote_action_staged(
             "ruby/setup-ruby@6e5d382445ae5590b7449d8b3bc8cb1c2c27f617",
             workspace.path().to_str().unwrap(),
@@ -462,7 +467,7 @@ mod tests {
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "step".into(), "step".into(), "Step".into());
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let error = run_action(
             "$/.github/actions/probe",
@@ -534,6 +539,7 @@ mod tests {
         let ctx = crate::worker::execution_context::StepContext::new(
             &mut job,
             "step1".into(),
+            "step1".into(),
             "Step".into(),
         );
 
@@ -563,6 +569,7 @@ mod tests {
         );
         let ctx = crate::worker::execution_context::StepContext::new(
             &mut job,
+            "step1".into(),
             "step1".into(),
             "Step".into(),
         );
@@ -598,6 +605,7 @@ mod tests {
         let ctx = crate::worker::execution_context::StepContext::new(
             &mut job,
             "step1".into(),
+            "step1".into(),
             "Step".into(),
         );
 
@@ -619,6 +627,7 @@ mod tests {
         );
         let ctx = crate::worker::execution_context::StepContext::new(
             &mut job,
+            "step1".into(),
             "step1".into(),
             "Step".into(),
         );
@@ -646,6 +655,7 @@ mod tests {
         let ctx = crate::worker::execution_context::StepContext::new(
             &mut job,
             "step1".into(),
+            "step1".into(),
             "Step".into(),
         );
 
@@ -668,6 +678,7 @@ mod tests {
         );
         let mut ctx = crate::worker::execution_context::StepContext::new(
             &mut job,
+            "step1".into(),
             "step1".into(),
             "Step".into(),
         );
@@ -698,6 +709,7 @@ mod tests {
         let mut ctx = crate::worker::execution_context::StepContext::new(
             &mut job,
             "step1".into(),
+            "step1".into(),
             "Step".into(),
         );
 
@@ -720,6 +732,7 @@ mod tests {
         let mut ctx = crate::worker::execution_context::StepContext::new(
             &mut job,
             "my_step_id".into(),      // step ID (context_name)
+            "record-id".into(),       // timeline-record GUID
             "My Display Name".into(), // step display name — must NOT appear in github.action
         );
 
@@ -760,7 +773,7 @@ mod tests {
                 ]},
             }),
         );
-        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "step1".into(), "Step".into());
 
         set_action_repository_context(&mut ctx, "$/.github/actions/setup");
         let field = |ctx: &StepContext<'_>, key: &str| {

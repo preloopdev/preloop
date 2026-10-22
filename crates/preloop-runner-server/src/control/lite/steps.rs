@@ -2,10 +2,12 @@
 
 use super::codec;
 use super::{LiteBackend, db};
-use crate::control::types::{ControlError, StepPatch, step_report};
+use crate::control::types::{
+    ControlError, StepPatch, StepReportOutcome, StoredStep, merge_step_patch, step_report,
+};
 use crate::models::{StepKind, StepRecord};
-use preloop_gha_protocol::RunId;
-use rusqlite::{OptionalExtension, params};
+use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
 /// Step columns in [`step_row`] order; valid for `job_steps` and
@@ -51,65 +53,59 @@ const INSERT_SYNTHETIC: &str = "INSERT INTO job_steps (agent_job_id, step_id, po
      WHERE EXISTS (SELECT 1 FROM job_requests WHERE agent_job_id = ?1)";
 
 impl LiteBackend {
-    /// Upsert runner-reported steps for one attempt: an existing step takes
-    /// the new name/conclusion and only fills in missing timestamps; a new
-    /// step is appended as synthetic (start defaults to the observation
-    /// time). Unknown attempts write nothing.
+    /// Upsert runner-reported steps for one attempt. Each patch merges into
+    /// the stored row through [`merge_step_patch`] — the terminal guard and
+    /// the "fill in only when missing" timing rules live there — and a new
+    /// step is appended as synthetic. Unknown attempts write nothing.
+    ///
+    /// Every row that actually changed also appends its `StepStatus` event to
+    /// the outbox in this same transaction, so the event is in the run's
+    /// `events.ndjson` snapshot the moment the row is readable, and the
+    /// caller only broadcasts.
     pub(crate) async fn patch_steps(
         &self,
         agent_job_id: uuid::Uuid,
         patches: Vec<StepPatch>,
-    ) -> Result<(), ControlError> {
+    ) -> Result<Vec<NdjsonEvent>, ControlError> {
+        if patches.is_empty() {
+            return Ok(Vec::new());
+        }
         let agent = agent_job_id.to_string();
         self.write(|tx| {
-            for p in &patches {
-                let updated = tx
-                    .prepare_cached(
-                        "UPDATE job_steps SET name = ?3, conclusion = ?4, \
-                             started_at = COALESCE(?5, started_at), \
-                             finished_at = COALESCE(?6, finished_at) \
-                         WHERE agent_job_id = ?1 AND step_id = ?2",
-                    )
-                    .map_err(db)?
-                    .execute(params![
-                        agent,
-                        p.id,
-                        p.name,
-                        p.conclusion,
-                        p.started_at_us,
-                        p.finished_at_us
-                    ])
-                    .map_err(db)?;
-                if updated == 0 {
-                    tx.prepare_cached(INSERT_SYNTHETIC)
-                        .map_err(db)?
-                        .execute(params![
-                            agent,
-                            p.id,
-                            None::<i64>,
-                            p.name,
-                            p.conclusion,
-                            p.started_at_us.unwrap_or(p.observed_us),
-                            p.finished_at_us
-                        ])
-                        .map_err(db)?;
+            let Some((run_id, job_id)) = step_attempt(tx, &agent)? else {
+                return Ok(Vec::new());
+            };
+            let mut events = Vec::new();
+            for patch in &patches {
+                let current = stored_step(tx, &agent, &patch.id)?;
+                let Some(merged) = merge_step_patch(current.as_ref(), patch) else {
+                    continue;
+                };
+                write_step(tx, &agent, current.is_some(), &merged.row)?;
+                if merged.changed {
+                    let event = merged.row.event(run_id, &job_id);
+                    super::lifecycle::append_event_tx(tx, &event)?;
+                    events.push(event);
                 }
             }
-            Ok(())
+            Ok(events)
         })
     }
 
     /// Reconcile a `WorkflowStepsUpdate` report. The attempt resolves by
-    /// plan id (= agent job id) first, then `agent_job_id`; `false` when
-    /// neither matches. Each report updates the stored step (a `NULL` name
-    /// or runner number keeps the stored value; timestamps only fill in) or
-    /// appends it as synthetic. Steps are written under `agent_job_id`.
+    /// plan id (= agent job id) first, then `agent_job_id`; `matched: false`
+    /// when neither matches. Each report updates the stored step (an empty
+    /// name or absent number keeps the stored value; the wire's own
+    /// `started_at`/`completed_at` win while the step is unfinished) or
+    /// appends it as synthetic. Steps are written under `agent_job_id`, and
+    /// changed rows append their `StepStatus` event to the outbox in the same
+    /// transaction.
     pub(crate) async fn report_steps(
         &self,
         plan_id: &str,
         agent_job_id: uuid::Uuid,
         steps: Vec<serde_json::Value>,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<StepReportOutcome, ControlError> {
         let agent = agent_job_id.to_string();
         let plan = codec::plan_agent_job_id(plan_id).map(|id| id.to_string());
         self.write(|tx| {
@@ -128,49 +124,34 @@ impl LiteBackend {
                 .optional()
                 .map_err(db)?;
             let Some((run_id, job_id, job_cancelled)) = resolved else {
-                return Ok(false);
+                return Ok(StepReportOutcome::default());
             };
+            let run_id = codec::run_id(&run_id);
+            let job_id = JobId(job_id);
             let observed = chrono::Utc::now();
+            let mut events = Vec::new();
             for step in &steps {
                 let Some(report) = step_report(step, job_cancelled, observed) else {
-                    tracing::warn!(run_id, job = %job_id, "dropping step report with no external_id");
+                    tracing::warn!(%run_id, job = %job_id.0, "dropping step report with no external_id");
                     continue;
                 };
-                let updated = tx
-                    .prepare_cached(
-                        "UPDATE job_steps SET runner_number = COALESCE(?3, runner_number), \
-                             name = COALESCE(?4, name), conclusion = ?5, \
-                             started_at = COALESCE(started_at, ?6), \
-                             finished_at = COALESCE(finished_at, ?7) \
-                         WHERE agent_job_id = ?1 AND step_id = ?2",
-                    )
-                    .map_err(db)?
-                    .execute(params![
-                        agent,
-                        report.step_id,
-                        report.runner_number,
-                        report.name,
-                        report.conclusion,
-                        report.started_at_us,
-                        report.finished_at_us
-                    ])
-                    .map_err(db)?;
-                if updated == 0 {
-                    tx.prepare_cached(INSERT_SYNTHETIC)
-                        .map_err(db)?
-                        .execute(params![
-                            agent,
-                            report.step_id,
-                            report.runner_number,
-                            report.name.as_deref().unwrap_or(""),
-                            report.conclusion,
-                            report.started_at_us,
-                            report.finished_at_us
-                        ])
-                        .map_err(db)?;
+                let current = stored_step(tx, &agent, &report.id)?;
+                let Some(merged) =
+                    merge_step_patch(current.as_ref(), &report)
+                else {
+                    continue;
+                };
+                write_step(tx, &agent, current.is_some(), &merged.row)?;
+                if merged.changed {
+                    let event = merged.row.event(run_id, &job_id);
+                    super::lifecycle::append_event_tx(tx, &event)?;
+                    events.push(event);
                 }
             }
-            Ok(true)
+            Ok(StepReportOutcome {
+                matched: true,
+                events,
+            })
         })
     }
 
@@ -205,6 +186,197 @@ impl LiteBackend {
             Ok(manifests)
         })
     }
+}
+
+/// The run and logical job an attempt (`agent_job_id`) belongs to.
+fn step_attempt(tx: &Transaction<'_>, agent: &str) -> Result<Option<(RunId, JobId)>, ControlError> {
+    tx.prepare_cached("SELECT run_id, job_id FROM job_requests WHERE agent_job_id = ?1")
+        .map_err(db)?
+        .query_row([agent], |row| {
+            Ok((codec::run_id(&row.get::<_, String>(0)?), JobId(row.get(1)?)))
+        })
+        .optional()
+        .map_err(db)
+}
+
+/// One stored step row of an attempt, in the merge's neutral shape.
+fn stored_step(
+    tx: &Transaction<'_>,
+    agent: &str,
+    step_id: &str,
+) -> Result<Option<StoredStep>, ControlError> {
+    let row = tx
+        .prepare_cached(&format!(
+            "SELECT {STEP_COLUMNS} FROM job_steps WHERE agent_job_id = ?1 AND step_id = ?2"
+        ))
+        .map_err(db)?
+        .query_row(params![agent, step_id], step_row)
+        .optional()
+        .map_err(db)?;
+    Ok(row.map(|(_, record)| StoredStep::from_record(&record)))
+}
+
+/// Store a merged step row: an update of every merged column, or a new
+/// synthetic row at the manifest's tail.
+fn write_step(
+    tx: &Transaction<'_>,
+    agent: &str,
+    existed: bool,
+    row: &StoredStep,
+) -> Result<(), ControlError> {
+    let runner_number = row.runner_number.map(i64::from);
+    if existed {
+        tx.prepare_cached(
+            "UPDATE job_steps SET name = ?3, runner_number = ?4, conclusion = ?5, \
+                 started_at = ?6, finished_at = ?7 \
+             WHERE agent_job_id = ?1 AND step_id = ?2",
+        )
+        .map_err(db)?
+        .execute(params![
+            agent,
+            row.id,
+            row.name,
+            runner_number,
+            row.conclusion,
+            row.started_at_us,
+            row.finished_at_us
+        ])
+        .map_err(db)?;
+        return Ok(());
+    }
+    tx.prepare_cached(INSERT_SYNTHETIC)
+        .map_err(db)?
+        .execute(params![
+            agent,
+            row.id,
+            runner_number,
+            row.name,
+            row.conclusion,
+            row.started_at_us,
+            row.finished_at_us
+        ])
+        .map_err(db)?;
+    Ok(())
+}
+
+/// Apply one `completejob` `stepResults` conclusion to an attempt's
+/// manifest, through the same terminal guard and change comparison as every
+/// other step update. Returns the `StepStatus` event when the row changed.
+///
+/// `completejob` only refines a step the manifest already holds: an unknown
+/// id is runner bookkeeping ("Complete job", a hook), not a manifest entry.
+pub(super) fn apply_step_result(
+    tx: &Transaction<'_>,
+    agent: &str,
+    run_id: RunId,
+    job_id: &JobId,
+    step_id: &str,
+    conclusion: &str,
+    runner_number: Option<u32>,
+) -> Result<Vec<NdjsonEvent>, ControlError> {
+    let Some(current) = stored_step(tx, agent, step_id)? else {
+        return Ok(Vec::new());
+    };
+    let patch = StepPatch {
+        id: step_id.to_owned(),
+        name: String::new(),
+        conclusion: Some(conclusion.to_owned()),
+        runner_number,
+        started_at_us: None,
+        finished_at_us: Some(codec::now_us()),
+        observed_us: None,
+    };
+    let Some(merged) = merge_step_patch(Some(&current), &patch) else {
+        return Ok(Vec::new());
+    };
+    write_step(tx, agent, true, &merged.row)?;
+    if !merged.changed {
+        return Ok(Vec::new());
+    }
+    let event = merged.row.event(run_id, job_id);
+    super::lifecycle::append_event_tx(tx, &event)?;
+    Ok(vec![event])
+}
+
+/// Close the unfinished steps of a settled job (`job: Some`) or of every
+/// attempt of a cancelled run (`job: None`) with that job's outcome.
+///
+/// Settle used to close only `in_progress` rows, so a job that settled or was
+/// cancelled while steps were still `pending` kept them `pending` forever —
+/// a cancelled job could show work that never ran as still waiting to.
+/// Returns the `StepStatus` events for the rows that changed.
+pub(super) fn close_unfinished_steps(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job: Option<&JobId>,
+    outcome: ExecutionStatus,
+) -> Result<Vec<NdjsonEvent>, ControlError> {
+    let run = codec::run_key(run_id);
+    // The attempts to close: one job's newest attempt (settle addresses what
+    // the runner last ran), or every attempt of the run (cancel kills all).
+    let attempts: Vec<(String, JobId)> = {
+        let (sql, args): (&str, Vec<&dyn rusqlite::ToSql>) = match job {
+            Some(job_id) => (
+                "SELECT agent_job_id, job_id FROM job_requests \
+                 WHERE run_id = ?1 AND job_id = ?2 \
+                   AND request_id = (SELECT MAX(request_id) FROM job_requests \
+                                     WHERE run_id = ?1 AND job_id = ?2)",
+                vec![&run, &job_id.0],
+            ),
+            None => (
+                "SELECT agent_job_id, job_id FROM job_requests WHERE run_id = ?1",
+                vec![&run],
+            ),
+        };
+        let mut stmt = tx.prepare_cached(sql).map_err(db)?;
+        let rows = stmt
+            .query_map(args.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, JobId(row.get::<_, String>(1)?)))
+            })
+            .map_err(db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db)?
+    };
+    let finished_us = codec::now_us();
+    let mut events = Vec::new();
+    for (agent, job_id) in attempts {
+        let steps: Vec<StoredStep> = {
+            let mut stmt = tx
+                .prepare_cached(&format!(
+                    "SELECT {STEP_COLUMNS} FROM job_steps WHERE agent_job_id = ?1 \
+                     AND conclusion NOT IN ('success', 'failure', 'cancelled', 'skipped', 'failed') \
+             ORDER BY position"
+                ))
+                .map_err(db)?;
+            let rows = stmt.query_map([agent.as_str()], step_row).map_err(db)?;
+            rows.map(|row| row.map(|(_, record)| StoredStep::from_record(&record)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db)?
+        };
+        for current in steps {
+            let patch = StepPatch {
+                id: current.id.clone(),
+                name: String::new(),
+                conclusion: Some(crate::control::types::settled_step_conclusion(
+                    &current.conclusion,
+                    outcome,
+                )),
+                runner_number: None,
+                started_at_us: None,
+                finished_at_us: Some(finished_us),
+                observed_us: None,
+            };
+            let Some(merged) = merge_step_patch(Some(&current), &patch) else {
+                continue;
+            };
+            write_step(tx, &agent, true, &merged.row)?;
+            if merged.changed {
+                let event = merged.row.event(run_id, &job_id);
+                super::lifecycle::append_event_tx(tx, &event)?;
+                events.push(event);
+            }
+        }
+    }
+    Ok(events)
 }
 
 /// The latest attempt's step manifest for one logical job (dispatch info).

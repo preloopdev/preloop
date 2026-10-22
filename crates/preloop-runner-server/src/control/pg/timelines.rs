@@ -9,12 +9,13 @@
 use super::codec::{self, ts, us};
 use super::{PgBackend, db};
 use crate::control::types::{
-    ControlError, MAX_TIMELINE_RECORDS, StepPatch, step_report, timeline_record_bytes,
+    ControlError, MAX_TIMELINE_RECORDS, StepPatch, StepReportOutcome, StoredStep, merge_step_patch,
+    step_report, timeline_record_bytes,
 };
 use crate::memory_caps::MAX_TIMELINE_BYTES_PER_TIMELINE;
 use crate::models::{StepKind, StepRecord};
-use preloop_gha_protocol::RunId;
 use preloop_gha_protocol::azdo::TimelineRecord;
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use std::collections::BTreeMap;
 
 /// Bounded retries for the per-plan log id race (two appenders computing the
@@ -300,82 +301,76 @@ impl PgBackend {
             .map_err(db)
     }
 
-    /// Upsert runner-reported steps for one attempt. A new step is appended
-    /// as `synthetic` after the current last position; an existing step
-    /// takes the reported name/conclusion, and its timestamps only ever fill
-    /// in. An unknown attempt writes nothing.
+    /// Upsert runner-reported steps for one attempt. Each patch merges into
+    /// the stored row through [`merge_step_patch`] — the terminal guard and
+    /// the "fill in only when missing" timing rules live there — and a new
+    /// step is appended as `synthetic` after the current last position. An
+    /// unknown attempt writes nothing.
+    ///
+    /// Every row that actually changed also appends its `StepStatus` event to
+    /// the outbox in this same transaction, so the event is in the run's
+    /// `events.ndjson` snapshot the moment the row is readable; the caller
+    /// only broadcasts.
     ///
     /// Statements (one transaction): `SELECT 1 FROM job_requests WHERE
-    /// agent_job_id = $1 FOR NO KEY UPDATE` (serializes position
-    /// allocation per attempt); per patch `INSERT INTO job_steps .. SELECT
-    /// COALESCE(MAX(position) + 1, 0) .. ON CONFLICT DO UPDATE`.
+    /// agent_job_id = $1 FOR NO KEY UPDATE` (serializes position allocation
+    /// per attempt); per patch one row read plus `UPDATE job_steps ..` or
+    /// `INSERT INTO job_steps .. SELECT COALESCE(MAX(position) + 1, 0)`.
     pub(super) async fn patch_steps(
         &self,
         agent_job_id: uuid::Uuid,
         patches: Vec<StepPatch>,
-    ) -> Result<(), ControlError> {
+    ) -> Result<Vec<preloop_gha_protocol::NdjsonEvent>, ControlError> {
         if patches.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let agent = agent_job_id.to_string();
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
-        if !lock_attempt(&tx, &agent).await? {
-            return Ok(());
+        let Some((run_id, job_id)) = step_attempt(&tx, &agent).await? else {
+            return Ok(Vec::new());
+        };
+        let mut events = Vec::new();
+        for patch in &patches {
+            let current = stored_step(&tx, &agent, &patch.id).await?;
+            let Some(merged) = merge_step_patch(current.as_ref(), patch) else {
+                continue;
+            };
+            write_step(&tx, &agent, current.is_some(), &merged.row).await?;
+            if merged.changed {
+                let event = merged.row.event(run_id, &job_id);
+                super::dispatch::append_event_tx(&tx, &event).await?;
+                events.push(event);
+            }
         }
-        for p in &patches {
-            tx.execute(
-                concat!(
-                    "INSERT INTO job_steps (agent_job_id, step_id, position, kind, name, \
-                     conclusion, started_at, finished_at) \
-                     SELECT $1::text::uuid, $2, COALESCE(MAX(position) + 1, 0), 'synthetic', \
-                     $3, $4, ",
-                    ts!("COALESCE($5::int8, $7::int8)"),
-                    ", ",
-                    ts!("$6"),
-                    " FROM job_steps WHERE agent_job_id = $1::text::uuid \
-                     ON CONFLICT (agent_job_id, step_id) DO UPDATE SET \
-                     name = EXCLUDED.name, conclusion = EXCLUDED.conclusion, \
-                     started_at = COALESCE(",
-                    ts!("$5"),
-                    ", job_steps.started_at), finished_at = COALESCE(",
-                    ts!("$6"),
-                    ", job_steps.finished_at)"
-                ),
-                &[
-                    &agent,
-                    &p.id,
-                    &p.name,
-                    &p.conclusion,
-                    &p.started_at_us,
-                    &p.finished_at_us,
-                    &p.observed_us,
-                ],
-            )
-            .await
-            .map_err(db)?;
-        }
-        tx.commit().await.map_err(db)
+        tx.commit().await.map_err(db)?;
+        Ok(events)
     }
 
     /// Reconcile a `WorkflowStepsUpdate` report into `job_steps`. The
     /// attempt resolves by `plan_id` (= its `agent_job_id`) first, then by
-    /// `agent_job_id`; `false` when neither matches. Each reported step
-    /// merges into its row: a `NULL` name/number keeps the stored value, a
-    /// timestamp only fills in; an unknown step is appended as synthetic.
+    /// `agent_job_id`; `matched: false` when neither matches. Each reported
+    /// step merges into its row (an empty name or absent number keeps the
+    /// stored value; the wire's own `started_at`/`completed_at` win while the
+    /// step is unfinished); an unknown step is appended as synthetic. Changed
+    /// rows append their `StepStatus` event to the outbox in the same
+    /// transaction.
     ///
     /// Statements (one transaction): `SELECT q.agent_job_id, j.status =
     /// 'cancelled' FROM job_requests q JOIN jobs j .. WHERE q.agent_job_id =
-    /// $1 FOR NO KEY UPDATE OF q`; per step `UPDATE job_steps ..` and, when
-    /// no row matched, `INSERT INTO job_steps .. SELECT MAX(position) + 1`.
+    /// $1 FOR NO KEY UPDATE OF q`; per step one row read plus `UPDATE
+    /// job_steps ..` or `INSERT INTO job_steps .. SELECT MAX(position) + 1`.
     pub(super) async fn report_steps(
         &self,
         plan_id: &str,
         agent_job_id: uuid::Uuid,
         steps: Vec<serde_json::Value>,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<StepReportOutcome, ControlError> {
         if steps.is_empty() {
-            return Ok(true);
+            return Ok(StepReportOutcome {
+                matched: true,
+                events: Vec::new(),
+            });
         }
         let mut candidates = Vec::with_capacity(2);
         if let Ok(plan) = plan_id.parse::<uuid::Uuid>() {
@@ -388,81 +383,51 @@ impl PgBackend {
         for candidate in &candidates {
             if let Some(row) = tx
                 .query_opt(
-                    "SELECT q.agent_job_id::text, j.status = 'cancelled' \
-                     FROM job_requests q JOIN jobs j ON j.run_id = q.run_id AND j.job_id = q.job_id \
+                    "SELECT q.agent_job_id::text, q.run_id::text, q.job_id, \
+                     j.status = 'cancelled' \
+                     FROM job_requests q JOIN jobs j ON j.run_id = q.run_id \
+                       AND j.job_id = q.job_id \
                      WHERE q.agent_job_id = $1::text::uuid FOR NO KEY UPDATE OF q",
                     &[candidate],
                 )
                 .await
                 .map_err(db)?
             {
-                resolved = Some((row.get::<_, String>(0), row.get::<_, bool>(1)));
+                resolved = Some((
+                    row.get::<_, String>(0),
+                    codec::run_id(row.get::<_, &str>(1))?,
+                    JobId(row.get::<_, String>(2)),
+                    row.get::<_, bool>(3),
+                ));
                 break;
             }
         }
-        let Some((agent, job_cancelled)) = resolved else {
-            return Ok(false);
+        let Some((agent, run_id, job_id, job_cancelled)) = resolved else {
+            return Ok(StepReportOutcome::default());
         };
         let observed = chrono::Utc::now();
+        let mut events = Vec::new();
         for step in &steps {
             let Some(report) = step_report(step, job_cancelled, observed) else {
                 tracing::warn!(agent_job_id = %agent, "dropping step report with no external_id");
                 continue;
             };
-            let runner_number = report
-                .runner_number
-                .map(|n| n.clamp(0, i64::from(i32::MAX)) as i32);
-            let updated = tx
-                .execute(
-                    concat!(
-                        "UPDATE job_steps SET runner_number = COALESCE($3::int4, runner_number), \
-                         name = COALESCE($4::text, name), conclusion = $5, \
-                         started_at = COALESCE(started_at, ",
-                        ts!("$6"),
-                        "), finished_at = COALESCE(finished_at, ",
-                        ts!("$7"),
-                        ") WHERE agent_job_id = $1::text::uuid AND step_id = $2"
-                    ),
-                    &[
-                        &agent,
-                        &report.step_id,
-                        &runner_number,
-                        &report.name,
-                        &report.conclusion,
-                        &report.started_at_us,
-                        &report.finished_at_us,
-                    ],
-                )
-                .await
-                .map_err(db)?;
-            if updated == 0 {
-                tx.execute(
-                    concat!(
-                        "INSERT INTO job_steps (agent_job_id, step_id, position, kind, \
-                         runner_number, name, conclusion, started_at, finished_at) \
-                         SELECT $1::text::uuid, $2, COALESCE(MAX(position) + 1, 0), 'synthetic', \
-                         $3::int4, COALESCE($4::text, ''), $5, ",
-                        ts!("$6"),
-                        ", ",
-                        ts!("$7"),
-                        " FROM job_steps WHERE agent_job_id = $1::text::uuid"
-                    ),
-                    &[
-                        &agent,
-                        &report.step_id,
-                        &runner_number,
-                        &report.name,
-                        &report.conclusion,
-                        &report.started_at_us,
-                        &report.finished_at_us,
-                    ],
-                )
-                .await
-                .map_err(db)?;
+            let current = stored_step(&tx, &agent, &report.id).await?;
+            let Some(merged) = merge_step_patch(current.as_ref(), &report) else {
+                continue;
+            };
+            write_step(&tx, &agent, current.is_some(), &merged.row).await?;
+            if merged.changed {
+                let event = merged.row.event(run_id, &job_id);
+                super::dispatch::append_event_tx(&tx, &event).await?;
+                events.push(event);
             }
         }
         tx.commit().await.map_err(db)?;
-        Ok(true)
+        Ok(StepReportOutcome {
+            matched: true,
+            events,
+        })
     }
 
     /// A run's stored step manifests keyed by attempt, each in position
@@ -574,4 +539,168 @@ async fn lock_attempt(
         .await
         .map_err(db)?
         .is_some())
+}
+
+// ── Step rows: shared by the two reporting paths and the settle closures ──
+
+/// The run and logical job an attempt (`agent_job_id`) belongs to.
+pub(super) async fn step_attempt(
+    tx: &tokio_postgres::Transaction<'_>,
+    agent: &str,
+) -> Result<Option<(RunId, JobId)>, ControlError> {
+    let row = tx
+        .query_opt(
+            "SELECT run_id::text, job_id FROM job_requests WHERE agent_job_id = $1::text::uuid",
+            &[&agent],
+        )
+        .await
+        .map_err(db)?;
+    Ok(match row {
+        Some(row) => Some((codec::run_id(row.get::<_, &str>(0))?, JobId(row.get(1)))),
+        None => None,
+    })
+}
+
+/// One stored step row of an attempt, in the merge's neutral shape.
+pub(super) async fn stored_step(
+    tx: &tokio_postgres::Transaction<'_>,
+    agent: &str,
+    step_id: &str,
+) -> Result<Option<StoredStep>, ControlError> {
+    let sql = format!(
+        "SELECT {STEP_COLUMNS} FROM job_steps \
+         WHERE agent_job_id = $1::text::uuid AND step_id = $2"
+    );
+    let row = tx.query_opt(&sql, &[&agent, &step_id]).await.map_err(db)?;
+    match row {
+        Some(row) => Ok(Some(StoredStep::from_record(&step_from_row(&row)?.1))),
+        None => Ok(None),
+    }
+}
+
+/// Store a merged step row: an update of every merged column, or a new
+/// synthetic row at the manifest's tail.
+pub(super) async fn write_step(
+    tx: &tokio_postgres::Transaction<'_>,
+    agent: &str,
+    existed: bool,
+    row: &StoredStep,
+) -> Result<(), ControlError> {
+    let runner_number = row.runner_number.map(|n| n.min(i32::MAX as u32) as i32);
+    if existed {
+        tx.execute(
+            concat!(
+                "UPDATE job_steps SET name = $3, runner_number = $4::int4, conclusion = $5, \
+                 started_at = ",
+                ts!("$6"),
+                ", finished_at = ",
+                ts!("$7"),
+                " WHERE agent_job_id = $1::text::uuid AND step_id = $2"
+            ),
+            &[
+                &agent,
+                &row.id,
+                &row.name,
+                &runner_number,
+                &row.conclusion,
+                &row.started_at_us,
+                &row.finished_at_us,
+            ],
+        )
+        .await
+        .map_err(db)?;
+        return Ok(());
+    }
+    tx.execute(
+        concat!(
+            "INSERT INTO job_steps (agent_job_id, step_id, position, kind, runner_number, \
+             name, conclusion, started_at, finished_at) \
+             SELECT $1::text::uuid, $2, COALESCE(MAX(position) + 1, 0), 'synthetic', \
+             $3::int4, $4, $5, ",
+            ts!("$6"),
+            ", ",
+            ts!("$7"),
+            " FROM job_steps WHERE agent_job_id = $1::text::uuid"
+        ),
+        &[
+            &agent,
+            &row.id,
+            &runner_number,
+            &row.name,
+            &row.conclusion,
+            &row.started_at_us,
+            &row.finished_at_us,
+        ],
+    )
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+/// Close the unfinished steps of a settled job (`job: Some`, its newest
+/// attempt) or of every attempt of a cancelled run (`job: None`).
+///
+/// Settle used to close only `in_progress` rows, so a job that settled or was
+/// cancelled while steps were still `pending` kept them `pending` forever.
+/// Returns the `StepStatus` events for the rows that changed.
+pub(super) async fn close_unfinished_steps(
+    tx: &tokio_postgres::Transaction<'_>,
+    run_id: RunId,
+    job: Option<&JobId>,
+    outcome: ExecutionStatus,
+) -> Result<Vec<preloop_gha_protocol::NdjsonEvent>, ControlError> {
+    let sql = match job {
+        Some(_) => {
+            "SELECT q.agent_job_id::text, q.job_id FROM job_requests q \
+             WHERE q.run_id = $1::text::uuid AND q.job_id = $2 \
+               AND q.request_id = (SELECT MAX(request_id) FROM job_requests \
+                                   WHERE run_id = $1::text::uuid AND job_id = $2)"
+        }
+        None => "SELECT agent_job_id::text, job_id FROM job_requests WHERE run_id = $1::text::uuid",
+    };
+    let run = run_id.0.to_string();
+    let rows = match job {
+        Some(job_id) => tx.query(sql, &[&run, &job_id.0]).await.map_err(db)?,
+        None => tx.query(sql, &[&run]).await.map_err(db)?,
+    };
+    let attempts: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect();
+    let finished_us = codec::now_us();
+    let mut events = Vec::new();
+    for (agent, job_id) in attempts {
+        let sql = format!(
+            "SELECT {STEP_COLUMNS} FROM job_steps \
+             WHERE agent_job_id = $1::text::uuid \
+               AND conclusion NOT IN ('success', 'failure', 'cancelled', 'skipped', 'failed') \
+             ORDER BY position"
+        );
+        let rows = tx.query(&sql, &[&agent]).await.map_err(db)?;
+        for row in &rows {
+            let current = StoredStep::from_record(&step_from_row(row)?.1);
+            let patch = StepPatch {
+                id: current.id.clone(),
+                name: String::new(),
+                conclusion: Some(crate::control::types::settled_step_conclusion(
+                    &current.conclusion,
+                    outcome,
+                )),
+                runner_number: None,
+                started_at_us: None,
+                finished_at_us: Some(finished_us),
+                observed_us: None,
+            };
+            let Some(merged) = merge_step_patch(Some(&current), &patch) else {
+                continue;
+            };
+            write_step(tx, &agent, true, &merged.row).await?;
+            if merged.changed {
+                let event = merged.row.event(run_id, &JobId(job_id.clone()));
+                super::dispatch::append_event_tx(tx, &event).await?;
+                events.push(event);
+            }
+        }
+    }
+    Ok(events)
 }

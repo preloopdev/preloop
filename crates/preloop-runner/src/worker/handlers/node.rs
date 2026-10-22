@@ -813,7 +813,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({}),
         );
-        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "step1".into(), "Step".into());
         let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let err = run_node_action(
@@ -842,7 +842,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({}),
         );
-        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "step1".into(), "Step".into());
         let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let err = run_node_action(
@@ -947,7 +947,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({}),
         );
-        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "step1".into(), "Step".into());
         let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let err = run_node_action(
@@ -1079,7 +1079,8 @@ mod tests {
         );
         // First node20 step should emit the warning.
         {
-            let mut ctx = StepContext::new(&mut job, "step1".into(), "Step 1".into());
+            let mut ctx =
+                StepContext::new(&mut job, "step1".into(), "step1".into(), "Step 1".into());
             let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
             run_node_action(
                 &manifest20,
@@ -1101,7 +1102,8 @@ mod tests {
 
         // Second node20 step in the same job must NOT emit again.
         {
-            let mut ctx = StepContext::new(&mut job, "step2".into(), "Step 2".into());
+            let mut ctx =
+                StepContext::new(&mut job, "step2".into(), "step2".into(), "Step 2".into());
             let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
             run_node_action(
                 &manifest20,
@@ -1138,7 +1140,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({}),
         );
-        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step 1".into());
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "step1".into(), "Step 1".into());
         let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
         run_node_action(
             &manifest24,
