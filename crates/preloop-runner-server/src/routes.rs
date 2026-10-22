@@ -1232,6 +1232,13 @@ pub fn build_app(
             )),
         )
         .route(
+            "/api/v1/pool/bindings",
+            get(pool_bindings).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
             "/runner/session",
             post(broker_session_root).delete(broker_delete_session_root),
         )
