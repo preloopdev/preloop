@@ -353,6 +353,9 @@ impl App {
     /// Everything the header shows.
     pub fn header_info(&self) -> HeaderInfo {
         let status = self.store.status.get();
+        // Version and uptime describe a live engine; a stale snapshot from
+        // before the engine went away must not keep claiming an uptime.
+        let live = status.filter(|_| self.engine_down.is_none());
         let health = if self.engine_down.is_some() {
             Some(("no engine".to_owned(), Tone::Error))
         } else {
@@ -376,8 +379,8 @@ impl App {
         HeaderInfo {
             context: self.current().name.clone(),
             health,
-            version: status.map_or_else(|| "—".to_owned(), |status| status.service.version.clone()),
-            uptime: status.map_or_else(String::new, |status| {
+            version: live.map_or_else(String::new, |status| status.service.version.clone()),
+            uptime: live.map_or_else(String::new, |status| {
                 fmt_age(TimeDelta::seconds(status.service.uptime_seconds as i64))
             }),
             ready: status.map_or(0, |status| status.jobs.ready),

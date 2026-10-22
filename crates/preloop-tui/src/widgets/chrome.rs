@@ -48,39 +48,76 @@ pub fn header(frame: &mut Frame, area: Rect, info: &HeaderInfo, theme: Theme) {
         Span::styled(info.context.clone(), theme.text()),
         Span::styled(" ● ", theme.tone(dot_tone)),
         Span::styled(health_word, theme.tone(dot_tone)),
-        Span::styled(
-            format!("  {} · up {}", info.version, info.uptime),
-            theme.text(),
-        ),
     ];
-
-    let mut right = vec![Span::styled(
-        format!(
-            "queue {} ready · {} claimable   pool {}/{}   ",
-            info.ready, info.claimable, info.pool_idle, info.pool_busy
-        ),
-        theme.text(),
-    )];
-    match info.sandbox {
-        Some((providers, tone)) => {
-            right.push(Span::styled("sbx ", theme.text()));
-            right.push(Span::styled("● ", theme.tone(tone)));
-            right.push(Span::styled(format!("{providers} prov"), theme.text()));
-        }
-        None => right.push(Span::styled("sbx ○ off", theme.muted())),
+    let engine = match (info.version.is_empty(), info.uptime.is_empty()) {
+        (false, false) => format!("  {} · up {}", info.version, info.uptime),
+        (false, true) => format!("  {}", info.version),
+        (true, false) => format!("  up {}", info.uptime),
+        (true, true) => String::new(),
+    };
+    if !engine.is_empty() {
+        left.push(Span::styled(engine, theme.text()));
     }
 
     let left_width: usize = left.iter().map(|span| span.content.chars().count()).sum();
-    let right_width: usize = right.iter().map(|span| span.content.chars().count()).sum();
     let total = area.width as usize;
-    let used = left_width + right_width + HEADER_RIGHT_MARGIN;
-    if used < total {
-        left.push(Span::raw(" ".repeat(total - used)));
+    let width = |spans: &[Span<'_>]| -> usize {
+        spans.iter().map(|span| span.content.chars().count()).sum()
+    };
+    // The mockup's summary at full width; narrower terminals get the compact
+    // form, and only then give up the right margin, so the sandbox summary is
+    // the last thing to be clipped.
+    let mut right = summary(info, theme, false);
+    if left_width + 1 + width(&right) + HEADER_RIGHT_MARGIN > total {
+        right = summary(info, theme, true);
     }
+    let right_width = width(&right);
+    let margin = if left_width + 1 + right_width + HEADER_RIGHT_MARGIN <= total {
+        HEADER_RIGHT_MARGIN
+    } else {
+        0
+    };
+    let gap = total
+        .saturating_sub(left_width + right_width + margin)
+        .max(1);
+    left.push(Span::raw(" ".repeat(gap)));
     left.append(&mut right);
-    left.push(Span::raw(" ".repeat(HEADER_RIGHT_MARGIN)));
+    left.push(Span::raw(" ".repeat(margin)));
 
     frame.render_widget(Paragraph::new(Line::from(left)).style(theme.bar()), area);
+}
+
+/// The header's right-hand summary: queue, pool and sandbox. `compact` is the
+/// form for terminals narrower than the mockup.
+fn summary(info: &HeaderInfo, theme: Theme, compact: bool) -> Vec<Span<'static>> {
+    let text = if compact {
+        format!(
+            "q {}/{} · pool {}/{} · ",
+            info.ready, info.claimable, info.pool_idle, info.pool_busy
+        )
+    } else {
+        format!(
+            "queue {} ready · {} claimable   pool {}/{}   ",
+            info.ready, info.claimable, info.pool_idle, info.pool_busy
+        )
+    };
+    let mut spans = vec![Span::styled(text, theme.text())];
+    match info.sandbox {
+        Some((providers, tone)) => {
+            spans.push(Span::styled("sbx ", theme.text()));
+            spans.push(Span::styled("● ", theme.tone(tone)));
+            spans.push(Span::styled(
+                if compact {
+                    providers.to_string()
+                } else {
+                    format!("{providers} prov")
+                },
+                theme.text(),
+            ));
+        }
+        None => spans.push(Span::styled("sbx ○ off", theme.muted())),
+    }
+    spans
 }
 
 /// Draw the tab bar. `tabs` is `(label, active)`, labels like `2 Runs`.
@@ -162,6 +199,34 @@ mod tests {
         assert!(text.ends_with("sbx ● 2 prov     "), "{text:?}");
         assert_eq!(text.chars().count(), 120);
         assert_eq!(text.chars().position(|c| c == 'q'), Some(62));
+    }
+
+    #[test]
+    fn header_without_an_engine_shows_no_version_or_uptime() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).expect("test terminal");
+        let info = HeaderInfo {
+            context: "local".into(),
+            health: Some(("no engine".into(), Tone::Error)),
+            sandbox: Some((0, Tone::Muted)),
+            ..HeaderInfo::default()
+        };
+        terminal
+            .draw(|frame| header(frame, frame.area(), &info, Theme::monochrome()))
+            .expect("draw");
+        let text = row_text(&terminal, 0);
+        assert!(!text.contains("up"), "{text:?}");
+        assert!(!text.contains('—'), "{text:?}");
+        assert!(
+            text.starts_with(" preloop  ctx local ● no engine "),
+            "{text:?}"
+        );
+        // 80 columns cannot hold the mockup's summary: the compact form keeps
+        // the sandbox count visible instead of clipping it.
+        assert!(
+            text.trim_end().ends_with("q 0/0 · pool 0/0 · sbx ● 0"),
+            "{text:?}"
+        );
+        assert_eq!(text.chars().count(), 80);
     }
 
     #[test]
