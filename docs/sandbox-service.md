@@ -31,7 +31,8 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
   fencing generation), `Heartbeat`, `Poll` (long-poll for work), `Report` /
   `ReportExec` (fenced by generation), `Reconcile` (full inventory: lost
   sandboxes fail, orphans are destroyed, and a `Terminating` machine that is
-  still there gets its destroy re-queued), `RenewCertificate`.
+  still there gets its destroy re-queued; a template's fork base is never an
+  orphan, whichever provider reports it), `RenewCertificate`.
 
 Both are served with the Connect protocol, JSON codec, over one HTTPS port:
 `POST /preloop.sandbox.v1.<Service>/<Method>`. Every RPC is unary or
@@ -63,10 +64,11 @@ An exec with `timeout_secs = 0` gets the service deadline
 command at it and reports exit code 124. When the caller drops the exec
 response stream, the service queues `CancelExec` for the provider and drops
 the exec; the agent calls the driver's optional `cancel_exec` (SmolVM kills the
-exec child) and reports exit code 130. The service also sweeps execs and
-pending work past their deadlines; `Acquire` is bounded by its wait window,
-and every request that waits on a provider to report (`Snapshot`, copy, power)
-is bounded by the same work timeout.
+host-side `machine exec` client and, with a second `machine exec`, the guest
+command it left behind) and reports exit code 130. The service also sweeps
+execs and pending work past their deadlines; `Acquire` is bounded by its wait
+window, and every request that waits on a provider to report (`Snapshot`,
+copy, power) is bounded by the same work timeout.
 
 The Connect layer is hand-rolled (`crates/preloop-sandbox/src/connect.rs`):
 adding `connectrpc` would bring its own protobuf runtime, while the subset used
@@ -84,7 +86,10 @@ from the `.proto` interoperates.
   architecture it supports, so one template can serve several hosts. Formats
   are `oci-image` (the backend pulls the registry image itself) and
   `smolmachine` (a monolithic pack at `file://…` or a digest-pinned OCI
-  artifact on GHCR).
+  artifact on GHCR). The captured machine stays live as the template's fork
+  base. It has no sandbox record, but it is never an orphan: any provider that
+  reports it — including a second agent sharing the host's engine home — must
+  leave it alone, and only deleting the template destroys it.
 * **Pool** — template + shape + network + mounts + warm target + max. The
   service keeps `warm` idle sandboxes per pool (the generic warm pool) and
   refills after each claim, backing off after creation failures.
@@ -111,7 +116,10 @@ Capabilities decide placement; nothing branches on driver names. A request no
 registered provider can satisfy fails with the unmet requirement named
 (`no provider satisfies template "mac": host/smolvm: os=macos`), and an
 operation a backend does not declare (`Pause`, `Snapshot`) fails with
-`failed_precondition` instead of being emulated. `one_shot` backends run one
+`failed_precondition` instead of being emulated. A cordon is an operator
+choice, not a lost provider: an acquire only a cordoned provider could serve
+fails at once with `failed_precondition` naming the cordon rather than waiting
+and reporting "no provider is online". `one_shot` backends run one
 command per sandbox; callers needing several execs require `multi_exec`.
 Placement also enforces each provider's declared per-sandbox ceiling
 (`maxVcpus`/`maxMemoryMib`, zero meaning unreported): a `Shape` asking for more
@@ -176,7 +184,7 @@ sandbox still references.
 ## Security
 
 Every listener speaks TLS. On first start the service creates a CA in
-`<state>/sandbox-ca/` (`ca.pem`, `ca.key`, mode 0600) and reuses it, issuing its
+`<state>/sandbox-ca/` (`ca.pem` public, `ca.key` mode 0600) and reuses it, issuing its
 own server certificate with SANs from `PRELOOP_SANDBOX_TLS_SANS` (default: the
 hostname, `localhost`, `127.0.0.1`, `::1`).
 `PRELOOP_SANDBOX_TLS_CERT` / `PRELOOP_SANDBOX_TLS_KEY` replace the server
@@ -245,8 +253,10 @@ directory: tickets live only in memory, so no restart can claim them.
 `List`, `ListTemplates`, `ListPools` and `ListProviders` are paginated.
 `pageSize` defaults to 100 and is capped at 1000; `nextPageToken` from a
 response is passed back as `pageToken`. Items are ordered by id, and the token
-is an opaque encoding of the last id. `SandboxClient` follows the tokens, so
-the in-process and network APIs still return complete lists.
+is an opaque encoding of the last id. A token this service did not mint (or
+one minted for a different listing) is `invalid_argument`, never a silent
+restart from the first page. `SandboxClient` follows the tokens, so the
+in-process and network APIs still return complete lists.
 
 ## State
 

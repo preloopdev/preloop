@@ -29,13 +29,18 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 #[cfg(unix)]
 mod unix {
     use super::*;
+    use preloop_sandbox::Driver as _;
+    use preloop_sandbox::api::{CreateWork, Template, TemplateSpec};
+    use preloop_sandbox::drivers::smolvm::SmolvmDriver;
     use preloop_sandbox::drivers::smolvm::cli::{
         ExecOutput, GuestVolume, MachineRole, MachineSpec, MachineState, NetworkPolicy,
-        SmolVmProvider, SocketMount, VmProvider, VolumeMount,
+        SANDBOX_OWNER_MARKER, SmolVmProvider, SocketMount, VmProvider, VolumeMount,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    use preloop_sandbox::api::{ExecEvent, ExecRequest};
 
     static TEST_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -125,6 +130,15 @@ case "${1-}:${2-}" in
     printf '[{"name":"alpha"},{"name":"beta-2"},{"kind":"other"}]\n'
     ;;
   machine:exec)
+    if [ "${3-}" = "--stream" ] && [ -f "$0.hang-stream" ]; then
+      printf 'stream-started\n' >> "$0.exec-log"
+      exec sleep 300
+    fi
+    if [ "${3-}" != "--stream" ] && [ -f "$0.hang-stream" ]; then
+      printf 'guest-kill\n' >> "$0.exec-log"
+      for arg in "$@"; do printf '%s\n' "$arg" >> "$0.exec-log"; done
+      exit 0
+    fi
     if [ "${3-}" = "--stream" ]; then
       printf 'stream-out\n'
       printf 'stream-err\n' >&2
@@ -1479,5 +1493,147 @@ exit 0
                 "{needle:?} missing from {message}"
             );
         }
+    }
+
+    /// The Sandbox Service marks every machine it serves for a caller outside
+    /// the CI pool so the engine's `OrphanPurge::All` sweep spares it. On a
+    /// real host `machine create` does not create the machine data directory —
+    /// smolvm only materialises the hash-derived path in `machine start` — so
+    /// the marker write must create it, or every driver create fails.
+    #[tokio::test]
+    async fn the_driver_marks_a_machine_before_its_data_dir_exists() {
+        let _env_guard = TEST_ENV_MUTEX.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        // The guard accepts the guest agent shipped beside the binary.
+        write_agent_rootfs(&directory.path().join("agent-rootfs"), "1.30.1", true);
+        let data_dir = directory.path().join("vms").join("0123456789abcdef");
+        let executable = directory.path().join("smolvm");
+        write_executable(
+            &executable,
+            &format!(
+                r##"#!/bin/sh
+if [ "${{1-}}" = "--version" ]; then
+  printf 'smolvm 1.30.1\n'
+fi
+case "${{1-}}:${{2-}}" in
+  machine:data-dir) printf '%s\n' '{dir}' ;;
+esac
+exit 0
+"##,
+                dir = data_dir.display()
+            ),
+        );
+        let saved = std::env::var_os("SMOLVM_AGENT_ROOTFS");
+        unsafe { std::env::remove_var("SMOLVM_AGENT_ROOTFS") };
+
+        let driver = SmolvmDriver::new(SmolVmProvider::new(&executable), 0);
+        let work = CreateWork {
+            sandbox_id: "sbx-3f2a9c".into(),
+            driver: "smolvm".into(),
+            template: Template {
+                spec: TemplateSpec {
+                    name: "alpine".into(),
+                    os: "linux".into(),
+                    artifacts: vec![preloop_sandbox::api::Artifact {
+                        format: preloop_sandbox::api::Artifact::OCI_IMAGE.into(),
+                        arch: preloop_sandbox::api::host_arch().into(),
+                        reference: format!("alpine@sha256:{}", "0".repeat(64)),
+                        digest: format!("sha256:{}", "0".repeat(64)),
+                        size_bytes: 0,
+                    }],
+                    ..TemplateSpec::default()
+                },
+                ..Template::default()
+            },
+            ..CreateWork::default()
+        };
+        // The fake never creates the data dir on `machine create`, exactly
+        // like smolvm; the driver must not need it to exist.
+        let result = driver.create(&work).await;
+
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("SMOLVM_AGENT_ROOTFS", value),
+                None => std::env::remove_var("SMOLVM_AGENT_ROOTFS"),
+            }
+        }
+
+        let native = result.expect("a missing data dir must not fail the create");
+        assert_eq!(native, "psbx-3f2a9c");
+        assert_eq!(
+            fs::read_to_string(data_dir.join(SANDBOX_OWNER_MARKER))
+                .expect("the marker was written")
+                .trim(),
+            native
+        );
+    }
+
+    /// SmolVM's guest agent does not reap a command when the host-side
+    /// `machine exec` client goes away. At the deadline the driver must also
+    /// kill it in the guest, through the PID file its wrapper recorded.
+    #[tokio::test]
+    async fn deadline_kills_the_guest_command_with_a_second_exec() {
+        let (_directory, executable) = fake_smolvm();
+        fs::write(executable.with_extension("hang-stream"), b"").unwrap();
+        let driver = SmolvmDriver::new(SmolVmProvider::new(&executable), 0);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ExecEvent>(16);
+        let request = ExecRequest {
+            argv: vec!["sleep".to_owned(), "300".to_owned()],
+            timeout_secs: 1,
+            ..ExecRequest::default()
+        };
+
+        let code = driver
+            .exec("runner", "exe-deadline", &request, tx)
+            .await
+            .unwrap();
+
+        assert_eq!(code, 124, "the deadline is reported");
+        let log = fs::read_to_string(executable.with_extension("exec-log")).unwrap();
+        assert!(log.contains("guest-kill"), "no guest-side kill in {log:?}");
+        assert!(
+            log.contains("/var/tmp/.psbx-exec-exe-deadline.pid"),
+            "the kill does not target this exec: {log:?}"
+        );
+        assert!(log.contains("kill -TERM"), "{log:?}");
+    }
+
+    /// A cancel kills the host-side client; the guest command must die too.
+    #[tokio::test]
+    async fn cancel_kills_the_guest_command_with_a_second_exec() {
+        let (_directory, executable) = fake_smolvm();
+        fs::write(executable.with_extension("hang-stream"), b"").unwrap();
+        let log_path = executable.with_extension("exec-log");
+        let driver = std::sync::Arc::new(SmolvmDriver::new(SmolVmProvider::new(&executable), 0));
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ExecEvent>(16);
+        let request = ExecRequest {
+            argv: vec!["sleep".to_owned(), "300".to_owned()],
+            timeout_secs: 300,
+            ..ExecRequest::default()
+        };
+        let running = {
+            let driver = driver.clone();
+            tokio::spawn(async move { driver.exec("runner", "exe-cancel", &request, tx).await })
+        };
+        // Cancel only once the streaming exec really started.
+        let mut started = false;
+        for _ in 0..200 {
+            if fs::read_to_string(&log_path).is_ok_and(|log| log.contains("stream-started")) {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(started, "the streaming exec never started");
+
+        driver.cancel_exec("runner", "exe-cancel").await.unwrap();
+
+        assert_eq!(running.await.unwrap().unwrap(), 130);
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("guest-kill"), "no guest-side kill in {log:?}");
+        assert!(
+            log.contains("/var/tmp/.psbx-exec-exe-cancel.pid"),
+            "the kill does not target this exec: {log:?}"
+        );
     }
 }

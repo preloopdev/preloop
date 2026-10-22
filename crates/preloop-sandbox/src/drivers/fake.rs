@@ -68,6 +68,12 @@ impl FakeDriver {
             one_shot: false,
             max_vcpus: 0,
             max_memory_mib: 0,
+            default_shape: buffa::MessageField::some(Shape {
+                cpus: 2,
+                memory_mib: 1024,
+                disk_gib: 10,
+                ..Shape::default()
+            }),
             ..Capabilities::default()
         }
     }

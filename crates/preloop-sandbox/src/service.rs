@@ -191,14 +191,18 @@ pub fn template_digest(spec: &TemplateSpec) -> String {
 
 /// Page `items` (already ordered by id) as the request asks.
 ///
-/// The token is the base64url encoding of the last returned id: callers pass
-/// it back untouched, and an id that has since disappeared still resumes at
-/// the right position.
+/// The token is the base64url encoding of `v1:<kind>:<last returned id>`:
+/// callers pass it back untouched, an id that has since disappeared still
+/// resumes at the right position, and anything else (garbage, or a token
+/// minted for another listing) is rejected rather than silently rewinding to
+/// the first page.
 fn paginate<T>(
+    kind: &str,
     items: impl IntoIterator<Item = (String, T)>,
     request: &ListRequest,
 ) -> Result<(Vec<T>, String)> {
     use base64::Engine as _;
+    const PREFIX: &str = "v1";
     let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let limit = match request.page_size {
         0 => DEFAULT_PAGE_SIZE,
@@ -210,10 +214,17 @@ fn paginate<T>(
         let decoded = engine
             .decode(request.page_token.as_bytes())
             .map_err(|_| Error::invalid_argument("invalid page token"))?;
-        Some(
-            String::from_utf8(decoded)
-                .map_err(|_| Error::invalid_argument("invalid page token"))?,
-        )
+        let decoded = String::from_utf8(decoded)
+            .map_err(|_| Error::invalid_argument("invalid page token"))?;
+        let (token_kind, id) = decoded
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .and_then(|rest| rest.split_once(':'))
+            .ok_or_else(|| Error::invalid_argument("invalid page token"))?;
+        if token_kind != kind || id.is_empty() {
+            return Err(Error::invalid_argument("invalid page token"));
+        }
+        Some(id.to_owned())
     };
     let items: Vec<(String, T)> = items.into_iter().collect();
     let start = after
@@ -224,7 +235,7 @@ fn paginate<T>(
     for (id, item) in items.into_iter().skip(start) {
         if page.len() == limit {
             let token = last.expect("a full page has a last id");
-            return Ok((page, engine.encode(token)));
+            return Ok((page, engine.encode(format!("{PREFIX}:{kind}:{token}"))));
         }
         last = Some(id);
         page.push(item);
@@ -347,6 +358,29 @@ struct JoinTokenRecord {
     id: String,
     secret_sha256: String,
     expires_at: i64,
+}
+
+/// The caller's exec response: the event stream plus the end of a oneshot
+/// that tells the disconnect watcher the caller is gone.
+///
+/// The service keeps a sender for this exec in [`State::execs`] so
+/// `ReportExec` can forward output; watching the channel's senders for
+/// closure therefore cannot detect a caller that walked away. This guard is
+/// dropped with the response stream itself and is unaffected by that sender.
+struct ExecStream {
+    inner: BoxStream<'static, Result<ExecEvent>>,
+    _disconnect: oneshot::Sender<()>,
+}
+
+impl futures::Stream for ExecStream {
+    type Item = Result<ExecEvent>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        futures::Stream::poll_next(self.inner.as_mut(), cx)
+    }
 }
 
 /// Data-plane blob for one ticket.
@@ -1081,6 +1115,7 @@ impl Service {
     pub fn list_templates_page(&self, request: &ListRequest) -> Result<ListTemplatesResponse> {
         let state = self.state.lock();
         let (templates, next_page_token) = paginate(
+            "template",
             state
                 .templates
                 .iter()
@@ -1124,6 +1159,7 @@ impl Service {
     pub fn list_pools_page(&self, request: &ListRequest) -> Result<ListPoolsResponse> {
         let state = self.state.lock();
         let (pools, next_page_token) = paginate(
+            "pool",
             state
                 .pools
                 .iter()
@@ -1207,7 +1243,7 @@ impl Service {
                 if state.providers.is_empty() {
                     return Ok(());
                 }
-                self.place(state, &placement, false).map(|_| ())
+                self.place_with(state, &placement, false, false).map(|_| ())
             }
             Err(_) => Ok(()),
         }
@@ -1239,6 +1275,21 @@ impl Service {
         spec: &PlacementSpec,
         require_online: bool,
     ) -> Result<(String, String)> {
+        self.place_with(state, spec, require_online, true)
+    }
+
+    /// `place`, optionally honouring cordons.
+    ///
+    /// `PutPool` validates with cordons ignored: a cordon is transient, so a
+    /// pool whose only capable provider is cordoned is still valid
+    /// configuration once that provider is uncordoned.
+    fn place_with(
+        &self,
+        state: &State,
+        spec: &PlacementSpec,
+        require_online: bool,
+        respect_cordon: bool,
+    ) -> Result<(String, String)> {
         let template = &spec.template;
         let requires = &spec.requires;
         let os = if requires.os.is_empty() {
@@ -1249,10 +1300,8 @@ impl Service {
         let mut unmet = Vec::new();
         let mut full = false;
         let mut candidates: Vec<Candidate> = Vec::new();
+        let mut cordoned: Vec<&str> = Vec::new();
         for (provider_id, rec) in &state.providers {
-            if rec.provider.cordoned {
-                continue;
-            }
             if require_online && rec.seen.elapsed() > self.config.provider_timeout {
                 continue;
             }
@@ -1260,6 +1309,8 @@ impl Service {
             if !template.native_ref.is_empty() && template.provider_id != *provider_id {
                 continue;
             }
+            let is_cordoned = respect_cordon && rec.provider.cordoned;
+            let mut capable = false;
             for driver in &rec.provider.drivers {
                 let caps = &driver.capabilities;
                 let mut reasons = Vec::new();
@@ -1308,12 +1359,20 @@ impl Service {
                     }
                 }
                 if !reasons.is_empty() {
-                    unmet.push(format!(
-                        "{}/{}: {}",
-                        rec.provider.name,
-                        driver.driver,
-                        reasons.join(", ")
-                    ));
+                    // A cordoned provider's gaps did not decide the
+                    // placement, so keep them out of the unmet list.
+                    if !is_cordoned {
+                        unmet.push(format!(
+                            "{}/{}: {}",
+                            rec.provider.name,
+                            driver.driver,
+                            reasons.join(", ")
+                        ));
+                    }
+                    continue;
+                }
+                capable = true;
+                if is_cordoned {
                     continue;
                 }
                 if !Self::fits_shape(caps, &spec.shape) {
@@ -1350,6 +1409,9 @@ impl Service {
                     slots: caps.slots,
                 });
             }
+            if is_cordoned && capable {
+                cordoned.push(rec.provider.name.as_str());
+            }
         }
         if candidates.is_empty() {
             if full {
@@ -1357,6 +1419,14 @@ impl Service {
                     Code::ResourceExhausted,
                     "every matching provider is at capacity",
                 ));
+            }
+            // Every provider that could have taken this placement is
+            // cordoned: waiting cannot help, and "not online" is wrong.
+            if !cordoned.is_empty() {
+                return Err(Error::failed_precondition(match cordoned.as_slice() {
+                    [name] => format!("provider {name} is cordoned"),
+                    names => format!("providers {} are cordoned", names.join(", ")),
+                }));
             }
             if unmet.is_empty() {
                 return Err(Error::unavailable(
@@ -1394,6 +1464,7 @@ impl Service {
         ops: &mut Vec<Op>,
     ) -> Result<String> {
         let id = new_id("sbx");
+        let shape = effective_shape(state, &provider_id, &driver, &placement.shape);
         let sandbox = Sandbox {
             id: id.clone(),
             name: name.to_owned(),
@@ -1404,6 +1475,7 @@ impl Service {
             state: SandboxState::Provisioning.into(),
             purpose: purpose.into(),
             created_at: now(),
+            shape: shape.into(),
             ..Sandbox::default()
         };
         let sandbox_driver = driver.clone();
@@ -2172,6 +2244,7 @@ impl Service {
     pub fn list_page(&self, request: &ListRequest) -> Result<ListSandboxesResponse> {
         let state = self.state.lock();
         let (sandboxes, next_page_token) = paginate(
+            "sandbox",
             state.sandboxes.iter().map(|(id, sandbox)| {
                 let mut sandbox = sandbox.clone();
                 sandbox.lease_id.clear();
@@ -2200,6 +2273,7 @@ impl Service {
     pub fn list_providers_page(&self, request: &ListRequest) -> Result<ListProvidersResponse> {
         let state = self.state.lock();
         let (providers, next_page_token) = paginate(
+            "provider",
             state
                 .providers
                 .iter()
@@ -2319,7 +2393,7 @@ impl Service {
             Exec {
                 sandbox_id: sandbox.id.clone(),
                 work_id: work_id.clone(),
-                tx: tx.clone(),
+                tx,
                 sequence: 0,
                 deadline,
                 finished: finished.clone(),
@@ -2351,22 +2425,26 @@ impl Service {
             return Err(error);
         }
         drop(state);
-        // The sender held here keeps the channel open until either the exec
-        // finishes (`finished`) or the caller drops the stream (`closed`).
+        // The response stream owns the only end of this channel that observes
+        // the caller: its drop guard fires when the caller drops the stream,
+        // independently of the sender the service keeps in `state.execs` for
+        // `ReportExec`.
+        let (disconnected, dropped) = oneshot::channel::<()>();
         let service = Arc::clone(self);
         tokio::spawn(async move {
-            let held = tx;
             tokio::select! {
-                _ = held.closed() => service.cancel_disconnected(&exec_id).await,
+                _ = dropped => service.cancel_disconnected(&exec_id).await,
                 _ = finished.cancelled() => {}
             }
         });
-        let metrics = self.config.metrics.clone();
-        Ok(record_exec_metrics(
-            metrics,
-            Instant::now(),
-            tokio_stream_from(rx),
-        ))
+        Ok(Box::pin(ExecStream {
+            inner: record_exec_metrics(
+                self.config.metrics.clone(),
+                Instant::now(),
+                tokio_stream_from(rx),
+            ),
+            _disconnect: disconnected,
+        }))
     }
 
     /// The caller's exec stream went away: drop the exec and tell the
@@ -3794,15 +3872,29 @@ impl Service {
                 }
             }
             // Machines no record owns (orphans).
-            let snapshots: HashSet<&str> = state
+            //
+            // A template's `native_ref` is its fork base (SmolVM's golden):
+            // a live machine with no sandbox record. It is never an orphan,
+            // whichever provider reports it. Two agents can share one host's
+            // engine home and each lists every machine there, and the base
+            // belongs to the template rather than to the agent that happened
+            // to create it. Reaping it wedges every later fork ("cannot be
+            // re-launched while … live clone(s)"); the owning provider
+            // destroys it when the template is deleted, and nowhere else.
+            //
+            // Narrowing the driver's inventory to machines carrying this
+            // agent's ownership marker would not do instead: the marker names
+            // the machine, not the agent, and a provider must still see the
+            // other agent's genuinely orphaned machines to reap them.
+            let goldens: HashSet<&str> = state
                 .templates
                 .values()
-                .filter(|t| t.provider_id == request.provider_id)
                 .map(|t| t.native_ref.as_str())
+                .filter(|native_ref| !native_ref.is_empty())
                 .collect();
             let mut destroy = Vec::new();
             for item in &request.sandboxes {
-                if snapshots.contains(item.native_ref.as_str()) {
+                if goldens.contains(item.native_ref.as_str()) {
                     continue;
                 }
                 let owned = state.sandboxes.values().any(|s| {
@@ -3887,6 +3979,31 @@ fn sandbox_meets(state: &State, sandbox: &Sandbox, requires: &Requirements) -> b
                 && requires.capabilities.iter().all(|c| caps.has(c))
                 && (requires.driver.is_empty() || requires.driver == driver.driver)
         })
+}
+
+/// A new sandbox's effective size: the request's fields, with the driver's
+/// advertised defaults filling the zeros.
+fn effective_shape(state: &State, provider_id: &str, driver: &str, requested: &Shape) -> Shape {
+    let defaults = state
+        .providers
+        .get(provider_id)
+        .and_then(|rec| {
+            rec.provider
+                .drivers
+                .iter()
+                .find(|info| info.driver == driver)
+        })
+        .map(|info| info.capabilities.default_shape.clone())
+        .unwrap_or_default();
+    let pick = |requested: u32, default: u32| {
+        if requested == 0 { default } else { requested }
+    };
+    Shape {
+        cpus: pick(requested.cpus, defaults.cpus),
+        memory_mib: pick(requested.memory_mib, defaults.memory_mib),
+        disk_gib: pick(requested.disk_gib, defaults.disk_gib),
+        ..Shape::default()
+    }
 }
 
 async fn load<T: DeserializeOwned>(store: &dyn Store, kind: Kind) -> Result<Vec<T>> {
@@ -3982,18 +4099,23 @@ mod tests {
             .collect()
     }
 
+    fn encode_token(token: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token)
+    }
+
     #[test]
     fn pages_are_ordered_and_carry_a_token_until_exhausted() {
         let mut request = ListRequest::default();
-        let (page, token) = paginate(items(250), &request).unwrap();
+        let (page, token) = paginate("widget", items(250), &request).unwrap();
         assert_eq!(page, (0..100usize).collect::<Vec<_>>());
         assert!(!token.is_empty());
         request.page_token = token;
-        let (page, token) = paginate(items(250), &request).unwrap();
+        let (page, token) = paginate("widget", items(250), &request).unwrap();
         assert_eq!(page, (100..200usize).collect::<Vec<_>>());
         assert!(!token.is_empty());
         request.page_token = token;
-        let (page, token) = paginate(items(250), &request).unwrap();
+        let (page, token) = paginate("widget", items(250), &request).unwrap();
         assert_eq!(page, (200..250usize).collect::<Vec<_>>());
         assert!(token.is_empty());
     }
@@ -4004,14 +4126,68 @@ mod tests {
             page_size: 5000,
             page_token: String::new(),
         };
-        let (page, _) = paginate(items(1500), &request).unwrap();
+        let (page, _) = paginate("widget", items(1500), &request).unwrap();
         assert_eq!(page.len(), MAX_PAGE_SIZE as usize);
 
         let request = ListRequest {
             page_token: "not base64!".into(),
             ..ListRequest::default()
         };
-        let error = paginate(items(3), &request).unwrap_err();
+        let error = paginate("widget", items(3), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument);
+    }
+
+    #[test]
+    fn a_bogus_page_token_is_rejected_instead_of_restarting_at_page_one() {
+        // `base64url("not-a-sandbox")`, the token the end-to-end run used.
+        let request = ListRequest {
+            page_size: 2,
+            page_token: "bm90LWEtc2FuZGJveA".into(),
+        };
+        let error = paginate("sandbox", items(4), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+
+        // A cursor minted for another listing is not a cursor for this one.
+        let first = ListRequest {
+            page_size: 2,
+            page_token: String::new(),
+        };
+        let (_, token) = paginate("template", items(4), &first).unwrap();
+        let request = ListRequest {
+            page_size: 2,
+            page_token: token,
+        };
+        let error = paginate("sandbox", items(4), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+    }
+
+    #[test]
+    fn a_token_whose_id_disappeared_still_resumes_after_it() {
+        let request = ListRequest {
+            page_size: 2,
+            page_token: String::new(),
+        };
+        let (_, token) = paginate("widget", items(4), &request).unwrap();
+        // The token names `id-0001`, which is gone by the second page.
+        let remaining: Vec<_> = items(4)
+            .into_iter()
+            .filter(|(id, _)| id != "id-0001")
+            .collect();
+        let request = ListRequest {
+            page_size: 2,
+            page_token: token,
+        };
+        let (page, _) = paginate("widget", remaining, &request).unwrap();
+        assert_eq!(page, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_page_token_with_a_missing_value_is_rejected() {
+        let request = ListRequest {
+            page_token: encode_token("v1:sandbox:"),
+            ..ListRequest::default()
+        };
+        let error = paginate("sandbox", items(3), &request).unwrap_err();
         assert_eq!(error.code, Code::InvalidArgument);
     }
 }

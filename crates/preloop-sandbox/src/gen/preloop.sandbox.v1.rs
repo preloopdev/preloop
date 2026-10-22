@@ -958,6 +958,15 @@ pub struct Capabilities {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
     )]
     pub max_memory_mib: u32,
+    /// size used for fields a create request leaves unset
+    ///
+    /// Field 142: `default_shape`
+    #[serde(
+        rename = "defaultShape",
+        alias = "default_shape",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+    )]
+    pub default_shape: ::buffa::MessageField<Shape, ::buffa::Inline<Shape>>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -979,6 +988,7 @@ impl ::core::fmt::Debug for Capabilities {
             .field("one_shot", &self.one_shot)
             .field("max_vcpus", &self.max_vcpus)
             .field("max_memory_mib", &self.max_memory_mib)
+            .field("default_shape", &self.default_shape)
             .finish()
     }
 }
@@ -1005,7 +1015,7 @@ impl ::buffa::Message for Capabilities {
     /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
     /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
@@ -1057,12 +1067,20 @@ impl ::buffa::Message for Capabilities {
             size
                 += 2u64 + ::buffa::types::uint32_encoded_len(self.max_memory_mib) as u64;
         }
+        if self.default_shape.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.default_shape.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
-        _cache: &mut ::buffa::SizeCache,
+        __cache: &mut ::buffa::SizeCache,
         buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
@@ -1116,6 +1134,14 @@ impl ::buffa::Message for Capabilities {
         }
         if self.max_memory_mib != 0u32 {
             ::buffa::types::put_uint32_field(141u32, self.max_memory_mib, buf);
+        }
+        if self.default_shape.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                142u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.default_shape.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1267,6 +1293,17 @@ impl ::buffa::Message for Capabilities {
                 )?;
                 self.max_memory_mib = ::buffa::types::decode_uint32(buf)?;
             }
+            142u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::Message::merge_length_delimited(
+                    self.default_shape.get_or_insert_default(),
+                    buf,
+                    ctx,
+                )?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1289,6 +1326,7 @@ impl ::buffa::Message for Capabilities {
         self.one_shot = false;
         self.max_vcpus = 0u32;
         self.max_memory_mib = 0u32;
+        self.default_shape = ::buffa::MessageField::none();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -4112,7 +4150,7 @@ pub struct Sandbox {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
     )]
     pub preserve_until: i64,
-    /// configured size, for capacity accounting
+    /// effective size: request fields + driver defaults
     ///
     /// Field 15: `shape`
     #[serde(
@@ -16128,6 +16166,12 @@ pub mod __buffa {
             ///
             /// Field 141: `max_memory_mib`
             pub max_memory_mib: u32,
+            /// size used for fields a create request leaves unset
+            ///
+            /// Field 142: `default_shape`
+            pub default_shape: ::buffa::MessageFieldView<
+                super::super::__buffa::view::ShapeView<'a>,
+            >,
             pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
         }
         impl<'a> ::buffa::MessageView<'a> for CapabilitiesView<'a> {
@@ -16243,6 +16287,31 @@ pub mod __buffa {
                         )?;
                         view.max_memory_mib = ::buffa::types::decode_uint32(&mut cur)?;
                     }
+                    142u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::LengthDelimited,
+                        )?;
+                        let __sub_ctx = ctx.descend()?;
+                        let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                        match view.default_shape.as_mut() {
+                            Some(existing) => {
+                                ::buffa::MessageView::merge_into_view(
+                                    existing,
+                                    sub,
+                                    __sub_ctx,
+                                )?
+                            }
+                            None => {
+                                view.default_shape = ::buffa::MessageFieldView::set(
+                                    <super::super::__buffa::view::ShapeView as ::buffa::MessageView>::decode_view_ctx(
+                                        sub,
+                                        __sub_ctx,
+                                    )?,
+                                );
+                            }
+                        }
+                    }
                     2u32 => {
                         ::buffa::encoding::check_wire_type(
                             tag,
@@ -16341,6 +16410,15 @@ pub mod __buffa {
                     one_shot: self.one_shot,
                     max_vcpus: self.max_vcpus,
                     max_memory_mib: self.max_memory_mib,
+                    default_shape: match self.default_shape.as_option() {
+                        Some(v) => {
+                            ::buffa::MessageField::<
+                                super::super::Shape,
+                                ::buffa::Inline<super::super::Shape>,
+                            >::some(v.to_owned_from_source(__buffa_src)?)
+                        }
+                        None => ::buffa::MessageField::none(),
+                    },
                     __buffa_unknown_fields: self
                         .__buffa_unknown_fields
                         .to_owned()?
@@ -16351,7 +16429,7 @@ pub mod __buffa {
         }
         impl<'a> ::buffa::ViewEncode<'a> for CapabilitiesView<'a> {
             #[allow(clippy::needless_borrow, clippy::let_and_return)]
-            fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+            fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
                 #[allow(unused_imports)]
                 use ::buffa::Enumeration as _;
                 let mut size = 0u64;
@@ -16409,13 +16487,21 @@ pub mod __buffa {
                             + ::buffa::types::uint32_encoded_len(self.max_memory_mib)
                                 as u64;
                 }
+                if self.default_shape.is_set() {
+                    let __slot = __cache.reserve();
+                    let inner_size = self.default_shape.compute_size(__cache);
+                    __cache.set(__slot, inner_size);
+                    size
+                        += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                            + inner_size as u64;
+                }
                 size += self.__buffa_unknown_fields.encoded_len() as u64;
                 ::buffa::saturate_size(size)
             }
             #[allow(clippy::needless_borrow)]
             fn write_to(
                 &self,
-                _cache: &mut ::buffa::SizeCache,
+                __cache: &mut ::buffa::SizeCache,
                 buf: &mut impl ::buffa::EncodeSink,
             ) {
                 #[allow(unused_imports)]
@@ -16469,6 +16555,14 @@ pub mod __buffa {
                 }
                 if self.max_memory_mib != 0u32 {
                     ::buffa::types::put_uint32_field(141u32, self.max_memory_mib, buf);
+                }
+                if self.default_shape.is_set() {
+                    ::buffa::types::put_len_delimited_header(
+                        142u32,
+                        u64::from(__cache.consume_next()),
+                        buf,
+                    );
+                    self.default_shape.write_to(__cache, buf);
                 }
                 self.__buffa_unknown_fields.write_to(buf);
             }
@@ -16548,6 +16642,14 @@ pub mod __buffa {
                             "maxMemoryMib",
                             &::buffa::json_helpers::ProtoJson(&self.max_memory_mib),
                         )?;
+                }
+                {
+                    if let ::core::option::Option::Some(__v) = self
+                        .default_shape
+                        .as_option()
+                    {
+                        __map.serialize_entry("defaultShape", __v)?;
+                    }
                 }
                 __map.end()
             }
@@ -16738,6 +16840,15 @@ pub mod __buffa {
             #[must_use]
             pub fn max_memory_mib(&self) -> u32 {
                 self.0.reborrow().max_memory_mib
+            }
+            /// size used for fields a create request leaves unset
+            ///
+            /// Field 142: `default_shape`
+            #[must_use]
+            pub fn default_shape(
+                &self,
+            ) -> &::buffa::MessageFieldView<super::super::__buffa::view::ShapeView<'_>> {
+                &self.0.reborrow().default_shape
             }
         }
         impl ::core::convert::From<::buffa::OwnedView<CapabilitiesView<'static>>>
@@ -21413,7 +21524,7 @@ pub mod __buffa {
             pub name: &'a str,
             /// Field 14: `preserve_until`
             pub preserve_until: i64,
-            /// configured size, for capacity accounting
+            /// effective size: request fields + driver defaults
             ///
             /// Field 15: `shape`
             pub shape: ::buffa::MessageFieldView<
@@ -22007,7 +22118,7 @@ pub mod __buffa {
             pub fn preserve_until(&self) -> i64 {
                 self.0.reborrow().preserve_until
             }
-            /// configured size, for capacity accounting
+            /// effective size: request fields + driver defaults
             ///
             /// Field 15: `shape`
             #[must_use]

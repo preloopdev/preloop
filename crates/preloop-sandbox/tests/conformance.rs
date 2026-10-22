@@ -295,6 +295,100 @@ async fn placement_rejects_unsatisfiable_requirements_by_name() {
 }
 
 #[tokio::test]
+async fn sandbox_shape_is_the_effective_size() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    // The fake driver advertises these defaults, standing in for SmolVM's
+    // own 2 vCPU / 4096 MiB / 20 GiB.
+    let defaults = Shape {
+        cpus: 2,
+        memory_mib: 1024,
+        disk_gib: 10,
+    };
+
+    let defaulted = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "shape-defaulted".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        defaulted.sandbox.shape, defaults,
+        "an empty request reports the driver's effective size"
+    );
+
+    let explicit = Shape {
+        cpus: 4,
+        memory_mib: 2048,
+        disk_gib: 20,
+    };
+    let shaped = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "shape-explicit".into(),
+            template: "alpine".into(),
+            shape: explicit,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        shaped.sandbox.shape, explicit,
+        "a requested shape is reported verbatim"
+    );
+
+    // Unset fields still take the driver's defaults.
+    let partial = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "shape-partial".into(),
+            template: "alpine".into(),
+            shape: Shape {
+                cpus: 4,
+                ..Shape::default()
+            },
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        partial.sandbox.shape,
+        Shape {
+            cpus: 4,
+            ..defaults
+        }
+    );
+
+    // Get and List report the record's shape, not a recomputation.
+    for (id, lease_id, expected) in [
+        (&defaulted.sandbox.id, &defaulted.lease.id, defaults),
+        (&shaped.sandbox.id, &shaped.lease.id, explicit),
+        (
+            &partial.sandbox.id,
+            &partial.lease.id,
+            Shape {
+                cpus: 4,
+                ..defaults
+            },
+        ),
+    ] {
+        assert_eq!(h.service.get(id, lease_id).unwrap().shape, expected);
+        assert_eq!(
+            h.service
+                .list()
+                .into_iter()
+                .find(|sandbox| &sandbox.id == id)
+                .unwrap()
+                .shape,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
 async fn placement_rejects_a_shape_the_provider_cannot_host() {
     let dir = tempfile::tempdir().unwrap();
     let mut caps = FakeDriver::full_capabilities();
@@ -1501,6 +1595,121 @@ async fn reconcile_never_destroys_another_providers_machine() {
     assert!(response.destroy.iter().any(|w| w.native_ref == orphan));
 }
 
+/// A golden is a template's fork base, not a sandbox: it has no record, so
+/// reconcile would call it an orphan. Every agent sharing the host's engine
+/// home reports it, and none of them may reap it.
+#[tokio::test]
+async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let build = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "bake".into(),
+            template: "alpine".into(),
+            purpose: Purpose::Build,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let (code, _, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: build.sandbox.id.clone(),
+            lease_id: build.lease.id.clone(),
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo baked > \"$SANDBOX_ROOT/marker\"".into(),
+            ],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    let golden = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: build.sandbox.id.clone(),
+            lease_id: build.lease.id.clone(),
+            name: "golden".into(),
+        })
+        .await
+        .unwrap();
+    // SmolVM keeps the snapped machine running as the fork base, so it is in
+    // every agent's inventory even though no sandbox record names it.
+    let golden_dir = h
+        ._dir
+        .path()
+        .join("host")
+        .join("sandboxes")
+        .join(&golden.native_ref);
+    std::fs::create_dir_all(&golden_dir).unwrap();
+
+    // A second agent on the same host, over the same driver, reports the
+    // whole inventory — the golden included.
+    let other = h
+        .service
+        .register(RegisterRequest {
+            name: "host-b".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities(),
+            }],
+        })
+        .await
+        .unwrap();
+    let observed = h.fake.inventory().await.unwrap();
+    assert!(
+        observed.iter().any(|o| o.native_ref == golden.native_ref),
+        "the golden is not in the shared inventory"
+    );
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id,
+            generation: other.generation,
+            sandboxes: observed,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !response
+            .destroy
+            .iter()
+            .any(|w| w.native_ref == golden.native_ref),
+        "another provider reaped the golden: {:?}",
+        response.destroy
+    );
+    // What the agent does with the answer still leaves the base alone.
+    for work in &response.destroy {
+        h.fake.destroy(&work.native_ref).await.unwrap();
+    }
+    assert!(golden_dir.is_dir(), "the golden was destroyed");
+
+    // The template still forks the captured state.
+    let fork = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "fork".into(),
+            template: "golden".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let (_, stdout, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: fork.sandbox.id,
+            lease_id: fork.lease.id,
+            argv: vec!["cat".into(), "marker".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(stdout, b"baked\n");
+}
+
 #[tokio::test]
 async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
     let dir = tempfile::tempdir().unwrap();
@@ -1900,17 +2109,23 @@ async fn cordoned_provider_receives_no_placements() {
     let records = store.load(Kind::Providers).await.unwrap();
     assert!(records[0]["cordoned"].as_bool().unwrap_or(false));
 
-    let error = h
-        .service
-        .acquire(AcquireRequest {
+    // A cordon is not transient: fail at once, naming it, rather than
+    // waiting out the window and claiming the provider is offline.
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        h.service.acquire(AcquireRequest {
             idempotency_key: "cordoned".into(),
             template: "alpine".into(),
-            wait_secs: Some(0),
+            wait_secs: Some(30),
             ..AcquireRequest::default()
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, Code::Unavailable, "{}", error.message);
+        }),
+    )
+    .await
+    .expect("a cordoned provider must not be waited for")
+    .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", error.message);
+    assert!(error.message.contains(&name), "{}", error.message);
+    assert!(error.message.contains("cordoned"), "{}", error.message);
     assert!(h.fake.inventory().await.unwrap().is_empty());
 
     let provider = h.service.set_provider_cordon(&name, false).await.unwrap();
@@ -1925,6 +2140,31 @@ async fn cordoned_provider_receives_no_placements() {
         .await
         .unwrap();
     assert_eq!(lease.sandbox.state, SandboxState::Leased);
+}
+
+#[tokio::test]
+async fn a_pool_whose_only_capable_provider_is_cordoned_still_validates() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let name = h.service.list_providers()[0].name.clone();
+    h.service.set_provider_cordon(&name, true).await.unwrap();
+
+    // A cordon is transient, so it must not reject the pool as impossible.
+    h.service
+        .put_pool(PoolSpec {
+            name: "linux".into(),
+            template: "alpine".into(),
+            warm: 1,
+            max: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .expect("a cordoned provider is still a valid pool target");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(h.service.list().is_empty(), "no fill while cordoned");
+
+    h.service.set_provider_cordon(&name, false).await.unwrap();
+    wait_for(|| h.service.list().len() == 1).await;
 }
 
 #[tokio::test]
@@ -2104,6 +2344,31 @@ async fn list_pagination_round_trips_across_250_items() {
     let mut sorted = names.clone();
     sorted.sort();
     assert_eq!(names, sorted);
+
+    // A bogus token is rejected instead of silently restarting at page one.
+    let error = service
+        .list_templates_page(&ListRequest {
+            page_size: 100,
+            page_token: "bm90LWEtc2FuZGJveA".into(),
+        })
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+
+    // A token minted for another listing is not a cursor for this one.
+    let foreign = service
+        .list_templates_page(&ListRequest {
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .unwrap()
+        .next_page_token;
+    let error = service
+        .list_pools_page(&ListRequest {
+            page_size: 100,
+            page_token: foreign,
+        })
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
 
     // The network client follows the same tokens.
     let base = serve(service).await;
@@ -3071,4 +3336,62 @@ async fn a_snapshot_wait_is_bounded_by_the_work_timeout() {
         .unwrap_err();
     assert_eq!(error.code, Code::Unavailable);
     assert!(error.message.contains("snapshot"), "{}", error.message);
+}
+
+/// The caller is a network client, so its disconnect is observed through the
+/// response body, not through a shared channel. Dropping the stream must
+/// still queue `CancelExec` for the provider while the service stays alive.
+#[tokio::test]
+async fn dropping_a_remote_exec_stream_cancels_the_command() {
+    use preloop_sandbox::SandboxApi as _;
+    let t = common::TestService::start().await;
+    let service = t.service.clone();
+    let dir = t.dir.path().to_path_buf();
+    let fake = Arc::new(FakeDriver::new(
+        "fake",
+        dir.join("host"),
+        FakeDriver::full_capabilities(),
+    ));
+    let link = t.enroll("remote-host").await;
+    let agent = Agent::new(
+        Arc::new(link),
+        vec![fake.clone() as Arc<dyn Driver>],
+        AgentConfig::new("remote-host", dir.join("scratch")),
+    );
+    tokio::spawn(agent.run(t.shutdown_token()));
+    let client = t.client();
+    wait_for(|| !service.list_providers().is_empty()).await;
+    client.put_template(template("alpine")).await.unwrap();
+    let lease = client
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let stream = client
+        .exec(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            argv: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    // Let the work reach the agent, then walk away while the service lives.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(stream);
+    wait_for(|| fake.cancel_calls.load(Ordering::Acquire) > 0).await;
+    // The sandbox is still usable: the dropped exec left no state behind.
+    let (code, _, _) = client
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id,
+            lease_id: lease.lease.id,
+            argv: vec!["true".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
 }

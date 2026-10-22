@@ -42,6 +42,36 @@ pub const SMOLMACHINE_RECIPE: &str = "smolmachine:";
 /// Docker-save `.tar` archive or a bare rootfs directory.
 pub const IMAGE_RECIPE: &str = "image:";
 
+/// SmolVM's vCPU default for a machine created without a shape.
+const DEFAULT_CPUS: u32 = 2;
+/// SmolVM's memory default for a machine created without a shape, in MiB.
+const DEFAULT_MEMORY_MIB: u32 = 4096;
+/// SmolVM's persistent-storage default for a machine created without a shape.
+const DEFAULT_STORAGE_GIB: u32 = 20;
+
+/// The size a create request actually gets: its own fields, with SmolVM's
+/// defaults filling the zeros.
+fn effective_shape(requested: &Shape) -> Shape {
+    Shape {
+        cpus: if requested.cpus == 0 {
+            DEFAULT_CPUS
+        } else {
+            requested.cpus
+        },
+        memory_mib: if requested.memory_mib == 0 {
+            DEFAULT_MEMORY_MIB
+        } else {
+            requested.memory_mib
+        },
+        disk_gib: if requested.disk_gib == 0 {
+            DEFAULT_STORAGE_GIB
+        } else {
+            requested.disk_gib
+        },
+        ..Shape::default()
+    }
+}
+
 /// SmolVM driver.
 pub struct SmolvmDriver {
     provider: SmolVmProvider,
@@ -181,6 +211,7 @@ impl SmolvmDriver {
     async fn exec_inner(
         &self,
         name: &MachineName,
+        exec_id: &str,
         request: &ExecRequest,
         argv: &[String],
         output: mpsc::Sender<ExecEvent>,
@@ -201,11 +232,13 @@ impl SmolvmDriver {
                 }
             }
         });
-        let run = self.provider.exec_stream(name, argv, tx);
-        let code = {
+        let pidfile = guest_pid_file(exec_id);
+        let wrapped = guest_wrapped_argv(argv, &pidfile);
+        let run = self.provider.exec_stream(name, &wrapped, tx);
+        let end = {
             let wait = async {
                 if request.timeout_secs == 0 {
-                    return run.await.map_err(vm_error);
+                    return run.await.map_err(vm_error).map(End::Status);
                 }
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(request.timeout_secs),
@@ -213,19 +246,167 @@ impl SmolvmDriver {
                 )
                 .await
                 {
-                    Ok(result) => result.map_err(vm_error),
+                    Ok(result) => result.map_err(vm_error).map(End::Status),
                     // Dropping the stream killed the CLI child (`kill_on_drop`).
-                    Err(_) => Ok(EXEC_TIMED_OUT),
+                    Err(_) => Ok(End::TimedOut),
                 }
             };
             tokio::select! {
                 result = wait => result?,
-                _ = cancel.cancelled() => EXEC_CANCELLED,
+                _ = cancel.cancelled() => End::Cancelled,
+            }
+        };
+        // Killing the host-side `machine exec` child does not stop the
+        // command in the guest: SmolVM's guest agent does not reap it when
+        // the client goes away. Terminate it in the guest as well.
+        let code = match end {
+            End::Status(code) => code,
+            End::TimedOut => {
+                self.kill_guest(name, exec_id).await;
+                EXEC_TIMED_OUT
+            }
+            End::Cancelled => {
+                self.kill_guest(name, exec_id).await;
+                EXEC_CANCELLED
             }
         };
         let _ = forward.await;
         Ok(code)
     }
+
+    /// Terminate a command the guest agent left behind, with a second
+    /// `machine exec` (see [`guest_kill_script`]).
+    ///
+    /// Best effort: the caller already has its `124`/`130`, and a guest that
+    /// cannot answer must not hold the agent's exec slot. The pid file makes
+    /// the call idempotent, so a deadline followed by a cancel is harmless.
+    async fn kill_guest(&self, name: &MachineName, exec_id: &str) {
+        let argv = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            guest_kill_script(&guest_pid_file(exec_id)),
+        ];
+        match tokio::time::timeout(GUEST_KILL_TIMEOUT, self.provider.exec(name, &argv)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(%error, machine = %name.as_str(), exec = exec_id, "smolvm: guest command kill failed")
+            }
+            Err(_) => {
+                warn!(machine = %name.as_str(), exec = exec_id, "smolvm: guest command kill timed out")
+            }
+        }
+    }
+}
+
+/// How long the guest-side kill may take, including the wait for a command
+/// that is still starting up.
+const GUEST_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Guest file recording the PID of the command started for `exec_id`.
+///
+/// The exec id is driver-internal, but sanitise it anyway: it ends up inside
+/// a guest shell script and a path, and must never be able to break out of
+/// either.
+fn guest_pid_file(exec_id: &str) -> String {
+    let token: String = exec_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let token = if token.is_empty() { "anon" } else { &token };
+    format!("/var/tmp/.psbx-exec-{token}.pid")
+}
+
+/// Wrap `argv` so the guest records the command's PID and process group.
+///
+/// SmolVM's `machine exec` client can be killed (deadline, cancel, a dropped
+/// connection) while the guest agent keeps running the command: it does not
+/// reap the process it started. The wrapper starts the command in its own
+/// session when the guest has `setsid` (Alpine's busybox does), records the
+/// PID and the PID's `/proc` start time — so a recycled PID is never
+/// signalled — and removes the record when the command exits. A later
+/// [`guest_kill_script`] can then signal the whole process group.
+///
+/// Without `setsid`, the command is still recorded and killed by PID; only
+/// its children survive.
+fn guest_wrapped_argv(argv: &[String], pidfile: &str) -> Vec<String> {
+    let pidfile = shell_quote(pidfile);
+    let script = format!(
+        "pidfile={pidfile}\n\
+         if command -v setsid >/dev/null 2>&1; then\n\
+         \x20 setsid \"$@\" &\n\
+         else\n\
+         \x20 \"$@\" &\n\
+         fi\n\
+         child=$!\n\
+         start=\n\
+         if [ -r \"/proc/$child/stat\" ]; then\n\
+         \x20 stat=$(cat \"/proc/$child/stat\")\n\
+         \x20 rest=${{stat##*) }}\n\
+         \x20 set -- $rest\n\
+         \x20 start=${{20-}}\n\
+         fi\n\
+         printf '%s %s\\n' \"$child\" \"$start\" > \"$pidfile\"\n\
+         wait \"$child\"\n\
+         status=$?\n\
+         rm -f \"$pidfile\"\n\
+         exit $status\n"
+    );
+    let mut wrapped = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        script,
+        "psbx-exec".to_owned(),
+    ];
+    wrapped.extend_from_slice(argv);
+    wrapped
+}
+
+/// Guest-side script that terminates the command recorded by
+/// [`guest_wrapped_argv`].
+///
+/// Waits briefly for the PID file (a cancel can beat the wrapper), refuses a
+/// PID whose start time no longer matches, then sends `SIGTERM` to the
+/// command's process group — falling back to the PID — and escalates to
+/// `SIGKILL` after two seconds.
+fn guest_kill_script(pidfile: &str) -> String {
+    let pidfile = shell_quote(pidfile);
+    format!(
+        "pidfile={pidfile}\n\
+         i=0\n\
+         while [ ! -s \"$pidfile\" ] && [ \"$i\" -lt 20 ]; do sleep 0.1; i=$((i+1)); done\n\
+         [ -s \"$pidfile\" ] || exit 0\n\
+         read pid start < \"$pidfile\"\n\
+         case \"$pid\" in ''|*[!0-9]*) exit 0;; esac\n\
+         if [ -n \"$start\" ]; then\n\
+         \x20 [ -r \"/proc/$pid/stat\" ] || exit 0\n\
+         \x20 stat=$(cat \"/proc/$pid/stat\")\n\
+         \x20 rest=${{stat##*) }}\n\
+         \x20 set -- $rest\n\
+         \x20 [ \"${{20-}}\" = \"$start\" ] || exit 0\n\
+         fi\n\
+         rm -f \"$pidfile\"\n\
+         kill -TERM \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || exit 0\n\
+         i=0\n\
+         while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 20 ]; do sleep 0.1; i=$((i+1)); done\n\
+         kill -KILL \"-$pid\" 2>/dev/null || kill -KILL \"$pid\" 2>/dev/null || true\n\
+         exit 0\n"
+    )
+}
+
+/// The end of a streaming exec.
+enum End {
+    /// The host-side `machine exec` returned this exit code.
+    Status(i32),
+    /// The deadline dropped the host-side client.
+    TimedOut,
+    /// [`Driver::cancel_exec`] dropped the host-side client.
+    Cancelled,
 }
 
 fn guest_arch() -> &'static str {
@@ -454,6 +635,7 @@ impl Driver for SmolvmDriver {
             one_shot: false,
             max_vcpus,
             max_memory_mib,
+            default_shape: buffa::MessageField::some(effective_shape(&Shape::default())),
             ..Capabilities::default()
         }
     }
@@ -511,24 +693,13 @@ impl Driver for SmolvmDriver {
         }
         let (image, pin) = self.image_for(&work.template).await?;
         let option = |key: &str| work.options.get(key).map(String::as_str);
+        let shape = effective_shape(&work.shape);
         let spec = MachineSpec {
             name: clone.clone(),
             image,
-            cpus: if work.shape.cpus == 0 {
-                2
-            } else {
-                work.shape.cpus as u16
-            },
-            memory_mib: if work.shape.memory_mib == 0 {
-                4096
-            } else {
-                work.shape.memory_mib
-            },
-            storage_gib: if work.shape.disk_gib == 0 {
-                20
-            } else {
-                work.shape.disk_gib
-            },
+            cpus: shape.cpus as u16,
+            memory_mib: shape.memory_mib,
+            storage_gib: shape.disk_gib,
             overlay_gib: option("overlay_gib").and_then(|v| v.parse().ok()),
             network: network(&work.network),
             // The host agent admitted these paths against its allowlist
@@ -598,10 +769,15 @@ impl Driver for SmolvmDriver {
         request: &ExecRequest,
         output: mpsc::Sender<ExecEvent>,
     ) -> Result<i32> {
+        if request.argv.is_empty() {
+            return Err(Error::invalid_argument("argv is required"));
+        }
         let name = machine(native_ref)?;
         let argv = crate::driver::posix_exec_argv(request);
         let cancel = self.cancels.start(exec_id);
-        let result = self.exec_inner(&name, request, &argv, output, cancel).await;
+        let result = self
+            .exec_inner(&name, exec_id, request, &argv, output, cancel)
+            .await;
         self.cancels.finish(exec_id);
         result
     }
@@ -874,6 +1050,58 @@ exit 0
     }
 
     #[tokio::test]
+    async fn a_cold_create_without_a_shape_uses_the_advertised_defaults() {
+        let (directory, _executable) = fake_smolvm();
+        let driver = driver(&directory);
+        let defaults = driver.capabilities().default_shape;
+        assert_eq!(
+            defaults,
+            Shape {
+                cpus: 2,
+                memory_mib: 4096,
+                disk_gib: 20,
+            }
+        );
+        let work = CreateWork {
+            sandbox_id: "sbx-default".into(),
+            driver: NAME.into(),
+            template: Template {
+                spec: TemplateSpec {
+                    name: "alpine".into(),
+                    os: "linux".into(),
+                    artifacts: vec![crate::api::Artifact {
+                        format: crate::api::Artifact::OCI_IMAGE.into(),
+                        arch: crate::api::host_arch().into(),
+                        reference: format!("alpine@sha256:{}", "0".repeat(64)),
+                        digest: format!("sha256:{}", "0".repeat(64)),
+                        size_bytes: 0,
+                    }],
+                    ..TemplateSpec::default()
+                },
+                ..Template::default()
+            },
+            ..CreateWork::default()
+        };
+
+        driver.create(&work).await.unwrap();
+
+        let calls = calls(&directory.path().join("smolvm"));
+        let create = index_of(&calls, "create").expect("machine create");
+        let args = &calls[create].1;
+        for (flag, value) in [
+            ("--cpus", defaults.cpus.to_string()),
+            ("--mem", defaults.memory_mib.to_string()),
+            ("--storage", defaults.disk_gib.to_string()),
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == flag && pair[1] == value),
+                "create must pass {flag} {value}: {args:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_fork_applies_network_and_mounts_to_the_clone() {
         let (directory, _executable) = fake_smolvm();
         let host = directory.path().join("workspace");
@@ -1008,5 +1236,54 @@ exit 0
         let fork = index_of(&calls, "fork").expect("machine fork");
         assert!(calls[fork].1.contains(&"--branchable".to_owned()));
         assert_eq!(index_of(&calls, "update"), None);
+    }
+
+    use std::time::Duration;
+
+    /// The wrapper records a PID that `guest_kill_script` can terminate; this
+    /// exercises the exact scripts the guest runs, not just their framing.
+    #[tokio::test]
+    async fn guest_scripts_record_and_kill_the_wrapped_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("exec.pid");
+        let pidfile = pidfile.display().to_string();
+        let argv = guest_wrapped_argv(&["sleep".to_owned(), "30".to_owned()], &pidfile);
+        let mut wrapper = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut pid = None;
+        for _ in 0..200 {
+            pid = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|text| text.split_whitespace().next()?.parse::<i32>().ok());
+            if pid.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = pid.expect("the wrapper records its command's pid");
+
+        let script = guest_kill_script(&pidfile);
+        let status = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill script failed");
+
+        let status = wrapper.wait().unwrap();
+        assert!(!status.success(), "the killed command is not a success");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!alive.success(), "pid {pid} survived the guest kill");
+        assert!(
+            !std::path::Path::new(&pidfile).exists(),
+            "pid file left behind"
+        );
     }
 }
