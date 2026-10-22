@@ -843,8 +843,14 @@ async fn restored_leases_re_inject_their_files() {
 #[tokio::test]
 async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
     let dir = tempfile::tempdir().unwrap();
+    // `Acquire` only places on a provider the service still considers
+    // online. A ghost that never reports would be read as already gone if
+    // the acquire ran more than `provider_timeout` after it registered, so
+    // the test refreshes its liveness itself and stops the heartbeats to
+    // make the host lose it.
+    let provider_timeout = Duration::from_secs(1);
     let mut config = ServiceConfig::new(dir.path().join("blobs"));
-    config.provider_timeout = Duration::from_millis(80);
+    config.provider_timeout = provider_timeout;
     config.provider_lost_factor = 1;
     config.acquire_wait = Duration::from_millis(200);
     let service = Service::open(store::open("memory:").await.unwrap(), config)
@@ -852,7 +858,7 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         .unwrap();
     // A provider that registers and then dies without reporting: its create
     // never completes.
-    service
+    let ghost = service
         .register(RegisterRequest {
             name: "ghost".into(),
             drivers: vec![DriverInfo {
@@ -862,6 +868,27 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         })
         .await
         .unwrap();
+    let alive = CancellationToken::new();
+    {
+        let service = service.clone();
+        let alive = alive.clone();
+        let heartbeat = provider_timeout / 20;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = alive.cancelled() => return,
+                    _ = tokio::time::sleep(heartbeat) => {
+                        // A fenced or failed heartbeat is irrelevant: the
+                        // next tick retries, exactly like an agent.
+                        drop(service.heartbeat(HeartbeatRequest {
+                            provider_id: ghost.provider_id.clone(),
+                            generation: ghost.generation,
+                        }));
+                    }
+                }
+            }
+        });
+    }
     service
         .put_template(TemplateSpec {
             name: "alpine".into(),
@@ -885,7 +912,10 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::DeadlineExceeded);
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    // The host stops answering: wait past the timeout the service declares
+    // it lost by, not past the last heartbeat.
+    alive.cancel();
+    tokio::time::sleep(provider_timeout * 2).await;
     service.maintain().await;
     let sandboxes = service.list();
     assert!(
