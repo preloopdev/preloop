@@ -87,11 +87,13 @@ impl ProviderLink for Arc<Service> {
             .map_err(|e| Error::internal(format!("blob fetch: {e}")))
     }
     async fn put_blob(&self, id: &Session, ticket: &str, src: &Path) -> Result<()> {
-        let path = self.agent_blob(&id.provider_id, id.generation, ticket)?;
-        tokio::fs::copy(src, &path)
+        let path = self.begin_agent_write(&id.provider_id, id.generation, ticket)?;
+        let result = tokio::fs::copy(src, &path)
             .await
             .map(|_| ())
-            .map_err(|e| Error::internal(format!("blob put: {e}")))
+            .map_err(|e| Error::internal(format!("blob put: {e}")));
+        self.end_agent_write(ticket);
+        result
     }
 }
 

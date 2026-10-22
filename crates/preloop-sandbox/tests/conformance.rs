@@ -2355,6 +2355,191 @@ async fn blob_upload_cap_rejects_and_removes_the_partial_file() {
     shutdown.cancel();
 }
 
+/// Guest paths are confined at the service: a `..` component is rejected
+/// before any driver can resolve the path on a host filesystem.
+#[tokio::test]
+async fn open_stream_rejects_parent_components() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "paths".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    for path in [
+        "/../secret",
+        "/work/../../secret",
+        "/work/../..",
+        "/a\\..\\secret",
+        "/....//secret/..",
+    ] {
+        let error = h
+            .service
+            .open_stream(OpenStreamRequest {
+                sandbox_id: lease.sandbox.id.clone(),
+                lease_id: lease.lease.id.clone(),
+                kind: StreamKind::Download.into(),
+                path: path.into(),
+                ..OpenStreamRequest::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "path {path}: {error}");
+    }
+    // A plain absolute path — including one with `.` components — is fine.
+    for path in ["/work", "/work/./data"] {
+        h.service
+            .open_stream(OpenStreamRequest {
+                sandbox_id: lease.sandbox.id.clone(),
+                lease_id: lease.lease.id.clone(),
+                kind: StreamKind::Download.into(),
+                path: path.into(),
+                ..OpenStreamRequest::default()
+            })
+            .unwrap();
+    }
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// Two concurrent downloads of one ticket: the claim is atomic, so
+/// exactly one transfer runs and the loser is refused up front (404),
+/// never a 500 from a spool file unlinked mid-flight.
+#[tokio::test]
+async fn concurrent_download_claims_have_exactly_one_winner() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "dl-race".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let (code, _, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "mkdir -p data && head -c 100000 /dev/zero | tr '\\0' 'x' > data/blob.bin".into(),
+            ],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    let ticket = h
+        .service
+        .open_stream(OpenStreamRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            kind: StreamKind::Download.into(),
+            path: "/data".into(),
+            ..OpenStreamRequest::default()
+        })
+        .unwrap();
+    let base = serve(h.service.clone()).await;
+    let url = format!("{base}{}", ticket.url);
+    let get = |url: &str, token: &str| {
+        reqwest::Client::new()
+            .get(url)
+            .bearer_auth(token.to_owned())
+            .send()
+    };
+    let (first, second) = tokio::join!(get(&url, &ticket.token), get(&url, &ticket.token));
+    let mut statuses: Vec<reqwest::StatusCode> = [first.unwrap(), second.unwrap()]
+        .into_iter()
+        .map(|r| r.status())
+        .collect();
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [reqwest::StatusCode::OK, reqwest::StatusCode::NOT_FOUND],
+        "exactly one download may win the claim"
+    );
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// Two concurrent uploads of one ticket: exactly one writer streams into
+/// the spool path; the loser's claim fails before any bytes move.
+#[tokio::test]
+async fn concurrent_upload_claims_have_exactly_one_winner() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "ul-race".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let ticket = h
+        .service
+        .open_stream(OpenStreamRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            kind: StreamKind::Upload.into(),
+            path: "/up".into(),
+            ..OpenStreamRequest::default()
+        })
+        .unwrap();
+    let base = serve(h.service.clone()).await;
+    let url = format!("{base}{}", ticket.url);
+    // An all-zero body is a valid empty tar.
+    let put = |url: &str, token: &str| {
+        reqwest::Client::new()
+            .put(url)
+            .bearer_auth(token.to_owned())
+            .body(vec![0u8; 2048])
+            .send()
+    };
+    let (first, second) = tokio::join!(put(&url, &ticket.token), put(&url, &ticket.token));
+    let mut statuses: Vec<reqwest::StatusCode> = [first.unwrap(), second.unwrap()]
+        .into_iter()
+        .map(|r| r.status())
+        .collect();
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [
+            reqwest::StatusCode::NO_CONTENT,
+            reqwest::StatusCode::NOT_FOUND
+        ],
+        "exactly one upload may win the claim"
+    );
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn list_pagination_round_trips_across_250_items() {
     use preloop_sandbox::SandboxApi as _;

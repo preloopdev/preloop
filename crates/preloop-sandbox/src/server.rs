@@ -959,7 +959,7 @@ async fn agent_blob_put(
         let identity = app.service.provider_identity(peer.fingerprint()?)?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
-        let path = app.service.agent_blob(&id, generation, &ticket)?;
+        let path = app.service.begin_agent_write(&id, generation, &ticket)?;
         Ok::<_, Error>(path)
     }
     .await;
@@ -969,10 +969,17 @@ async fn agent_blob_put(
     };
     let max_bytes = app.service.config().blob_max_bytes;
     if content_length(&headers).is_some_and(|length| length > max_bytes) {
+        app.service.end_agent_write(&ticket);
         return payload_too_large(max_bytes);
     }
     match write_body(&path, body, max_bytes).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => error.into_response(),
+        Ok(()) => {
+            app.service.end_agent_write(&ticket);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            app.service.end_agent_write(&ticket);
+            error.into_response()
+        }
     }
 }
