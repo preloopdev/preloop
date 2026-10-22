@@ -662,6 +662,23 @@ pub fn http_client(ca_pem: &str, identity_pem: Option<&[u8]>) -> Result<reqwest:
         .map_err(|e| Error::internal(format!("tls client: {e}")))
 }
 
+/// A rustls client-config builder with this crate's crypto provider named
+/// explicitly.
+///
+/// `ClientConfig::builder()` defers to a process-level provider and panics
+/// when the linked features alone cannot pick one: the binary contains both
+/// ring (via `rustls`) and aws-lc-rs (via reqwest's `rustls` feature), so
+/// there is nothing to infer. CA-less clients (`SandboxClient::new`) are
+/// built before any service setup installs a default, which is exactly the
+/// path that used to abort. Naming the provider keeps every config
+/// independent of process-wide state.
+pub(crate) fn client_config_builder()
+-> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>> {
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| tls_error(format!("TLS client config: {e}")))
+}
+
 /// A rustls client configuration trusting only `ca_pem` and presenting the
 /// client certificate in `identity_pem` (certificate chain followed by its
 /// key), for the ConnectRPC client transport.
@@ -669,18 +686,13 @@ pub fn client_config(
     ca_pem: &str,
     identity_pem: Option<&[u8]>,
 ) -> Result<Arc<rustls::ClientConfig>> {
-    // rustls needs a process-level provider before any config is built; CLI
-    // tests and one-shot agent paths never go through the service's setup.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
     let mut roots = RootCertStore::empty();
     for certificate in pem_certificates(ca_pem) {
         roots
             .add(certificate)
             .map_err(|e| tls_error(format!("CA certificate: {e}")))?;
     }
-    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let builder = client_config_builder()?.with_root_certificates(roots);
     let config = match identity_pem {
         Some(identity) => {
             let identity = std::str::from_utf8(identity)
