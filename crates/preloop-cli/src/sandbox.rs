@@ -398,7 +398,7 @@ fn sandbox_client(
                 .with_context(|| format!("reading sandbox CA {}", path.display()))?;
             Ok(SandboxClient::with_tls(service, Some(token), &pem, None)?)
         }
-        None => Ok(SandboxClient::new(service, Some(token))),
+        None => Ok(SandboxClient::new(service, Some(token))?),
     }
 }
 
