@@ -179,7 +179,11 @@ unchanged; update the guest agent before retrying` — not yet explained (the
 `quiesced-shutdown-v1` capability exists in both releases' protocol crate), so
 the stop check, not the pin bump, decides when a digest may be updated. The
 recipe for the aarch64 artifact is the same shape (bake on an Apple Silicon
-host, publish), since hosted macOS cannot bake.
+host, publish), since hosted macOS cannot bake. The bake must also upload the
+aarch64 package SBOM as an Actions artifact named `golden-sbom-aarch64`
+(`preloop-ubuntu-24.04-aarch64.apt-sbom.cdx.json`); `golden-security-scan`
+fails closed if that artifact is missing, so an unscanned arm64 golden cannot
+be treated as current.
 
 ## Runtime verification
 

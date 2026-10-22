@@ -1146,6 +1146,69 @@ pub fn build_app(
             "/api/v3/repos/{owner}/{repo}/tarball/{*git_ref}",
             get(crate::snapshots::forge_api_repo_tarball),
         )
+        // GitHub code-scanning SARIF shim: the legacy `POST …/sarifs` upload,
+        // the `PUT …/analysis` endpoint current `github/codeql-action`
+        // releases use, and the status/analyses reads the action follows.
+        // Both the GHES-style `/api/v3` base and the unprefixed
+        // `{server}/api` base are served; handlers authenticate the job
+        // runtime token and bind it to the path's repository.
+        .route(
+            "/api/v3/repos/{owner}/{repo}/code-scanning/sarifs",
+            post(crate::sarif::github_upload_sarif),
+        )
+        .route(
+            "/repos/{owner}/{repo}/code-scanning/sarifs",
+            post(crate::sarif::github_upload_sarif),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/code-scanning/sarifs/{sarif_id}",
+            get(crate::sarif::github_sarif_status),
+        )
+        .route(
+            "/repos/{owner}/{repo}/code-scanning/sarifs/{sarif_id}",
+            get(crate::sarif::github_sarif_status),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/code-scanning/analysis",
+            put(crate::sarif::github_create_analysis),
+        )
+        .route(
+            "/repos/{owner}/{repo}/code-scanning/analysis",
+            put(crate::sarif::github_create_analysis),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/code-scanning/analyses",
+            get(crate::sarif::github_list_analyses),
+        )
+        // `github/codeql-action` reads its Actions run while deriving an
+        // analysis key; the handler answers the credential's run so the
+        // upload step does not fail on a 404 before it reaches the shim.
+        .route(
+            "/api/v3/repos/{owner}/{repo}/actions/runs/{run_ref}",
+            get(crate::sarif::github_actions_run),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/runs/{run_ref}",
+            get(crate::sarif::github_actions_run),
+        )
+        .route(
+            "/repos/{owner}/{repo}/code-scanning/analyses",
+            get(crate::sarif::github_list_analyses),
+        )
+        // Native SARIF ingestion: a job token bound to the run (or the system
+        // token) may upload, list, and read analyses.
+        .route(
+            "/api/v1/runs/{run_id}/sarif",
+            post(crate::sarif::upload_run_sarif).get(crate::sarif::list_run_sarif),
+        )
+        .route(
+            "/api/v1/sarif/{analysis_id}",
+            get(crate::sarif::get_sarif_analysis),
+        )
+        .route(
+            "/api/v1/sarif/{analysis_id}/raw",
+            get(crate::sarif::get_sarif_raw),
+        )
         .route(
             "/api/v1/runners",
             post(register_runner_native)
