@@ -107,6 +107,12 @@ pub const DEFAULT_PAGE_SIZE: u32 = 100;
 /// Largest accepted `ListRequest.page_size`.
 pub const MAX_PAGE_SIZE: u32 = 1000;
 
+/// Largest caller-supplied TTL the service honours, in seconds (30 days).
+/// Acquire, Renew, Release (PRESERVE) and CreateJoinToken all resolve their
+/// TTLs through [`ttl_expiry`], so no caller can pin a sandbox, a pool slot
+/// or an enrollment token for longer than this, whatever the API.
+pub const MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Default cap for one blob upload: 8 GiB.
 pub const DEFAULT_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -157,6 +163,28 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
+}
+
+/// Reject a caller-supplied TTL beyond [`MAX_TTL_SECS`].
+fn validate_ttl(ttl_secs: u64) -> Result<()> {
+    if ttl_secs > MAX_TTL_SECS {
+        return Err(Error::invalid_argument(format!(
+            "ttlSecs {ttl_secs} exceeds the maximum of {MAX_TTL_SECS} seconds"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a TTL in seconds to an expiry timestamp: the shared ceiling is
+/// enforced and the addition is checked, so an absurd TTL is an
+/// `invalid_argument`, never a wrapped negative expiry handed back as
+/// success.
+fn ttl_expiry(ttl_secs: u64) -> Result<i64> {
+    validate_ttl(ttl_secs)?;
+    let ttl = i64::try_from(ttl_secs).expect("a capped TTL fits an i64");
+    now()
+        .checked_add(ttl)
+        .ok_or_else(|| Error::invalid_argument("ttlSecs overflows the expiry timestamp"))
 }
 
 /// Remove every file a previous process left in the blob directory.
@@ -442,8 +470,8 @@ impl PlacementSpec {
 
 /// Check that `lease_id` is the capability for `sandbox`: it must be the
 /// sandbox's active lease, and the lease must still exist. Every
-/// sandbox-scoped RPC goes through this; `List` is the only read that does
-/// not name a sandbox and therefore redacts lease ids instead.
+/// sandbox-scoped RPC goes through this; `List` and `Stats` are the only
+/// reads that do not name a sandbox and therefore redact lease ids instead.
 fn authorize(state: &State, sandbox: &Sandbox, lease_id: &str) -> Result<()> {
     if lease_id.is_empty() {
         return Err(Error::new(
@@ -790,7 +818,9 @@ impl Service {
                 .collect();
             for lease_id in expired {
                 info!(%lease_id, "lease expired; destroying sandbox");
-                self.release_locked(&mut state, &lease_id, ReleaseMode::Destroy, 0, &mut ops);
+                // Destroy releases cannot fail: only PRESERVE resolves a TTL.
+                let _ =
+                    self.release_locked(&mut state, &lease_id, ReleaseMode::Destroy, 0, &mut ops);
                 self.config.metrics.record_lease_transition("expired");
             }
             // A stopped sandbox holds no host capacity, but it does hold
@@ -1134,6 +1164,11 @@ impl Service {
     /// `PutPool`.
     pub async fn put_pool(&self, pool: PoolSpec) -> Result<PoolSpec> {
         validate_name("pool", &pool.name)?;
+        // A pool's default lease TTL is resolved into caller leases at
+        // Acquire time; hold it to the same ceiling there, at write time.
+        if pool.lease_ttl_secs > 0 {
+            validate_ttl(pool.lease_ttl_secs)?;
+        }
         let ops = {
             let mut state = self.state.lock();
             if !state.templates.contains_key(&pool.template) {
@@ -1175,13 +1210,27 @@ impl Service {
         })
     }
 
-    /// `DeletePool`: idle members are destroyed; leased ones finish.
+    /// `DeletePool`: refused while any member is leased — mirroring
+    /// `DeleteTemplate`'s in-use guard, since deleting the record would
+    /// orphan live leases from refill and pool accounting. Otherwise the
+    /// pool record goes and its idle members are destroyed.
     pub async fn delete_pool(&self, name: &str) -> Result<()> {
         let ops = {
             let mut state = self.state.lock();
-            if state.pools.remove(name).is_none() {
+            if !state.pools.contains_key(name) {
                 return Err(Error::not_found(format!("pool `{name}` not found")));
             }
+            if let Some(leased) = state
+                .sandboxes
+                .values()
+                .find(|s| s.pool == name && !s.lease_id.is_empty())
+            {
+                return Err(Error::failed_precondition(format!(
+                    "pool `{name}` has leased sandbox `{}`",
+                    leased.id
+                )));
+            }
+            state.pools.remove(name);
             let mut ops = vec![self.remove(Kind::Pools, name)];
             let idle: Vec<String> = state
                 .sandboxes
@@ -1767,9 +1816,9 @@ impl Service {
         mode: ReleaseMode,
         preserve_ttl: u64,
         ops: &mut Vec<Op>,
-    ) {
+    ) -> Result<()> {
         let Some(lease) = state.leases.get(lease_id).cloned() else {
-            return;
+            return Ok(());
         };
         let preserve = mode == ReleaseMode::Preserve;
         let failed = state
@@ -1793,7 +1842,9 @@ impl Service {
             } else {
                 preserve_ttl
             };
-            let until = now() + ttl as i64;
+            // Resolved before any state changes: an absurd window fails the
+            // release instead of destroying or half-preserving the sandbox.
+            let until = ttl_expiry(ttl)?;
             if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
                 sandbox.state = SandboxState::Preserved.into();
                 sandbox.preserve_until = until;
@@ -1809,7 +1860,7 @@ impl Service {
                 ops.push(self.put(Kind::Leases, lease_id, &*lease));
             }
             self.config.metrics.record_lease_transition("preserved");
-            return;
+            return Ok(());
         }
         state.leases.remove(lease_id);
         state.lease_by_key.remove(&lease.idempotency_key);
@@ -1821,6 +1872,7 @@ impl Service {
         // Failed sandboxes may still hold a native machine: destroy_locked
         // handles both cases.
         self.destroy_locked(state, &lease.sandbox_id, ops);
+        Ok(())
     }
 
     // ─── Leases ────────────────────────────────────────────────────
@@ -1943,12 +1995,16 @@ impl Service {
                     } else {
                         sandbox.error.clone()
                     };
-                    self.release_locked(state, &lease_id, ReleaseMode::Destroy, 0, ops);
+                    self.release_locked(state, &lease_id, ReleaseMode::Destroy, 0, ops)?;
                     Err(Error::unavailable(error))
                 }
             };
         }
         let ttl = if request.ttl_secs > 0 {
+            // Validate the caller's TTL before any sandbox is created for
+            // it: an absurd value fails the request here, not the lease
+            // bookkeeping after provisioning has already started.
+            validate_ttl(request.ttl_secs)?;
             request.ttl_secs
         } else {
             request
@@ -2060,7 +2116,7 @@ impl Service {
             sandbox_id: sandbox_id.clone(),
             pool: request.pool.clone(),
             idempotency_key: request.idempotency_key.clone(),
-            expires_at: now() + ttl as i64,
+            expires_at: ttl_expiry(ttl)?,
             env: request.inject.env.clone(),
             request_hash: fingerprint.to_owned(),
             ..Lease::default()
@@ -2182,7 +2238,7 @@ impl Service {
             } else {
                 request.ttl_secs
             };
-            lease.expires_at = now() + ttl as i64;
+            lease.expires_at = ttl_expiry(ttl)?;
             let lease = lease.clone();
             let ops = vec![self.put(Kind::Leases, &lease.id, &lease)];
             (lease, ops)
@@ -2207,7 +2263,7 @@ impl Service {
                 request.mode.as_known().unwrap_or_default(),
                 request.preserve_ttl_secs,
                 &mut ops,
-            );
+            )?;
             ops
         };
         self.persist(ops).await;
@@ -2301,7 +2357,10 @@ impl Service {
     /// `Stats`: per-provider host sample + capacity and sandboxes by state
     /// with their latest reported runtime facts. Aggregates only — the
     /// stored report never carries host PIDs, process names or data-dir
-    /// paths, because every client-token holder can read this.
+    /// paths, because every client-token holder can read this. Lease ids
+    /// are redacted exactly as in `List`: the lease is the sandbox's
+    /// capability, and Stats names no sandbox, so it must not hand the
+    /// capability out.
     pub fn stats(&self) -> StatsResponse {
         let state = self.state.lock();
         let providers = state
@@ -2312,15 +2371,20 @@ impl Service {
                     .sandboxes
                     .values()
                     .filter(|sandbox| sandbox.provider_id == rec.provider.id)
-                    .map(|sandbox| SandboxStats {
-                        sandbox: sandbox.clone().into(),
-                        runtime: rec
+                    .map(|sandbox| {
+                        let mut sandbox = sandbox.clone();
+                        sandbox.lease_id.clear();
+                        let runtime = rec
                             .sandbox_stats
                             .get(&sandbox.native_ref)
                             .cloned()
                             .unwrap_or_default()
-                            .into(),
-                        ..SandboxStats::default()
+                            .into();
+                        SandboxStats {
+                            sandbox: sandbox.into(),
+                            runtime,
+                            ..SandboxStats::default()
+                        }
                     })
                     .collect();
                 ProviderStats {
@@ -2717,7 +2781,10 @@ impl Service {
     // ─── Snapshot / pause / resume ─────────────────────────────────
 
     /// `Snapshot`: capture a leased, snapshot-capable sandbox as a template.
-    /// The source sandbox is consumed (its lease ends).
+    /// The source sandbox is consumed (its lease ends). The template name
+    /// must be free: an existing template is never silently replaced, and a
+    /// name a pool is built on is refused the way `DeleteTemplate` refuses
+    /// to remove one.
     pub async fn snapshot(&self, request: SnapshotRequest) -> Result<Template> {
         validate_name("template", &request.name)?;
         let (tx, rx) = oneshot::channel();
@@ -2732,6 +2799,30 @@ impl Service {
             if sandbox.state != SandboxState::Leased {
                 return Err(Error::failed_precondition(
                     "only a leased sandbox can be snapshotted",
+                ));
+            }
+            // Snapshot-capability is a property of the acquisition: only a
+            // sandbox acquired with build purpose was started branchable.
+            // The driver's capability bit alone is not the gate — an
+            // ordinary exec/runner lease must not gain template-writing
+            // power from the driver happening to support snapshots.
+            if sandbox.purpose.as_known() != Some(Purpose::Build) {
+                return Err(Error::failed_precondition(format!(
+                    "sandbox {} was not acquired with build purpose; \
+                     only build sandboxes can be snapshotted",
+                    sandbox.id
+                )));
+            }
+            if let Some(pool) = state.pools.values().find(|p| p.template == request.name) {
+                return Err(Error::failed_precondition(format!(
+                    "template `{}` is used by pool `{}`",
+                    request.name, pool.name
+                )));
+            }
+            if state.templates.contains_key(&request.name) {
+                return Err(Error::new(
+                    Code::AlreadyExists,
+                    format!("template `{}` already exists", request.name),
                 ));
             }
             let caps = self.driver_caps(&state, &sandbox)?;
@@ -2788,18 +2879,21 @@ impl Service {
         };
         let ops = {
             let mut state = self.state.lock();
+            if state.templates.contains_key(&template.spec.name) {
+                // A concurrent Snapshot or PutTemplate took the name while
+                // the provider worked. Retire the snapshot just captured
+                // and leave the source sandbox leased, so the caller can
+                // retry under another name.
+                self.drop_snapshot_locked(&mut state, &template);
+                return Err(Error::new(
+                    Code::AlreadyExists,
+                    format!("template `{}` already exists", template.spec.name),
+                ));
+            }
             let mut ops = vec![self.put(Kind::Templates, &template.spec.name, &template)];
-            let replaced = state
+            state
                 .templates
                 .insert(template.spec.name.clone(), template.clone());
-            if let Some(old) = replaced.filter(|old| {
-                !old.native_ref.is_empty()
-                    && (old.native_ref != template.native_ref
-                        || old.provider_id != template.provider_id)
-            }) {
-                // Retire the previous snapshot once nothing still starts from it.
-                self.drop_snapshot_locked(&mut state, &old);
-            }
             // The source sandbox now backs the snapshot (or was freed by the
             // driver): end its lease without destroying it.
             if let Some(source) = state.sandboxes.remove(&sandbox.id) {
@@ -3214,10 +3308,12 @@ impl Service {
         } else {
             ttl
         };
+        // The shared ceiling applies: an enrollment token must not be
+        // mintable with a lifetime beyond anything the service honours, and
+        // the expiry addition is checked rather than saturating.
+        let expires_at = ttl_expiry(ttl.as_secs())?;
         let id = new_id("jt");
         let secret = tls::random_hex(32);
-        let seconds = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
-        let expires_at = now().saturating_add(seconds);
         let record = JoinTokenRecord {
             id: id.clone(),
             secret_sha256: tls::sha256_hex(secret.as_bytes()),
@@ -4216,5 +4312,23 @@ mod tests {
         };
         let error = paginate("sandbox", items(3), &request).unwrap_err();
         assert_eq!(error.code, Code::InvalidArgument);
+    }
+
+    #[test]
+    fn ttl_expiry_enforces_the_ceiling_and_checked_arithmetic() {
+        let before = now();
+        let expiry = ttl_expiry(60).unwrap();
+        assert!((before + 60..=now() + 60).contains(&expiry));
+
+        // The ceiling itself is accepted; anything past it is not — the
+        // pentest's 2^40 seconds and the wrapping i64::MAX alike.
+        assert!(ttl_expiry(MAX_TTL_SECS).is_ok());
+        for ttl in [MAX_TTL_SECS + 1, 1 << 40, i64::MAX as u64, u64::MAX] {
+            let error = ttl_expiry(ttl).unwrap_err();
+            assert_eq!(error.code, Code::InvalidArgument, "ttl {ttl}");
+            assert_eq!(validate_ttl(ttl).unwrap_err().code, Code::InvalidArgument);
+        }
+        assert!(validate_ttl(0).is_ok());
+        assert!(validate_ttl(MAX_TTL_SECS).is_ok());
     }
 }
