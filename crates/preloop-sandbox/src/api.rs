@@ -1,120 +1,14 @@
-//! Wire types for `proto/preloop/sandbox/v1/sandbox.proto`.
+//! The Sandbox Service's API types and domain helpers.
 //!
-//! Hand-written to the proto3 JSON mapping (lowerCamelCase fields, enum
-//! value names, base64 bytes, oneof members as optional fields), so any
-//! Connect client generated from the `.proto` interoperates with the JSON
-//! codec this crate serves.
+//! The types are generated from `proto/preloop/sandbox/v1/sandbox.proto`
+//! (see [`crate::gen`]); this module re-exports them under one path and adds
+//! the domain behaviour that is not wire state — capability lookup,
+//! requirement merging, artifact validation and the few derived labels the
+//! service computes from a state enum. Keeping it here (rather than on a
+//! hand-written twin of the proto) means there is exactly one definition of
+//! every field.
 
-use std::collections::BTreeMap;
-
-use serde::{Deserialize, Serialize};
-
-/// Base64 (standard, padded) for proto `bytes` fields.
-pub mod b64 {
-    use base64::Engine as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    /// Serialize bytes as a base64 string.
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
-    }
-
-    /// Deserialize a base64 string into bytes.
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let text = String::deserialize(d)?;
-        base64::engine::general_purpose::STANDARD
-            .decode(text.as_bytes())
-            .map_err(serde::de::Error::custom)
-    }
-
-    /// Optional variant for oneof members.
-    pub mod opt {
-        use base64::Engine as _;
-        use serde::{Deserialize, Deserializer, Serializer};
-
-        /// Serialize optional bytes as base64.
-        pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
-            match bytes {
-                Some(bytes) => {
-                    s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
-                }
-                None => s.serialize_none(),
-            }
-        }
-
-        /// Deserialize optional base64 into bytes.
-        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
-            let text = Option::<String>::deserialize(d)?;
-            text.map(|text| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(text.as_bytes())
-                    .map_err(serde::de::Error::custom)
-            })
-            .transpose()
-        }
-    }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-fn is_zero_u32(value: &u32) -> bool {
-    *value == 0
-}
-
-fn is_zero_u64(value: &u64) -> bool {
-    *value == 0
-}
-
-/// What a driver can do.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Capabilities {
-    /// `linux` | `macos` | `windows`.
-    pub os: String,
-    /// Supported guest architectures (`x86_64`, `aarch64`).
-    pub arch: Vec<String>,
-    /// Free-form features (`docker`, `display`, `simulator`, …).
-    pub features: Vec<String>,
-    /// Pause/resume with live state.
-    #[serde(skip_serializing_if = "is_false")]
-    pub pause: bool,
-    /// Capture a sandbox as a new template.
-    #[serde(skip_serializing_if = "is_false")]
-    pub snapshot: bool,
-    /// Fork a running sandbox.
-    #[serde(skip_serializing_if = "is_false")]
-    pub fork: bool,
-    /// Host Unix sockets can be mounted into the guest.
-    #[serde(skip_serializing_if = "is_false")]
-    pub socket_mounts: bool,
-    /// Live host directories can be mounted into the guest.
-    #[serde(skip_serializing_if = "is_false")]
-    pub host_mounts: bool,
-    /// Enforceable network modes.
-    pub network_modes: Vec<NetworkMode>,
-    /// Maximum concurrent sandboxes (0 = unbounded).
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub slots: u32,
-    /// The backend keeps its own warm pool.
-    #[serde(skip_serializing_if = "is_false")]
-    pub native_pool: bool,
-    /// Each sandbox runs exactly one command (a one-job VM); files uploaded
-    /// before it are staged into that run. Clients needing several execs
-    /// require `multi_exec`.
-    #[serde(skip_serializing_if = "is_false")]
-    pub one_shot: bool,
-    /// Largest vCPU count one sandbox can be given (0 = unreported).
-    ///
-    /// Placement rejects a [`Shape`] above this instead of handing the driver
-    /// a machine it cannot boot.
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub max_vcpus: u32,
-    /// Largest memory one sandbox can be given, in MiB (0 = unreported).
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub max_memory_mib: u32,
-}
+pub use crate::generated::preloop::sandbox::v1::*;
 
 impl Capabilities {
     /// Whether these capabilities include a named optional operation.
@@ -130,70 +24,6 @@ impl Capabilities {
             _ => false,
         }
     }
-}
-
-/// Guest egress mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum NetworkMode {
-    /// Not set; drivers treat it as the pool default.
-    #[default]
-    NetworkModeUnspecified,
-    /// No networking.
-    Disabled,
-    /// Unrestricted egress.
-    Unrestricted,
-    /// Internet only; private, loopback and link-local ranges denied.
-    PublicOnly,
-    /// Only the listed hosts/CIDRs.
-    Restricted,
-}
-
-/// Guest egress policy.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct NetworkPolicy {
-    /// Mode.
-    pub mode: NetworkMode,
-    /// Allowed host names (restricted mode).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub hosts: Vec<String>,
-    /// Allowed CIDRs (restricted mode, or extra allowances).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub cidrs: Vec<String>,
-}
-
-/// Machine size.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Shape {
-    /// vCPUs.
-    pub cpus: u32,
-    /// Memory in MiB.
-    pub memory_mib: u32,
-    /// Disk in GiB.
-    pub disk_gib: u32,
-}
-
-/// Placement requirements.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Requirements {
-    /// Required guest OS.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub os: String,
-    /// Required guest architecture.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub arch: String,
-    /// Required features.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub features: Vec<String>,
-    /// Required optional operations.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
-    /// Pin a driver (debugging escape hatch).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub driver: String,
 }
 
 impl Requirements {
@@ -214,49 +44,9 @@ impl Requirements {
             features,
             capabilities,
             driver: pick(&self.driver, &other.driver),
+            ..Requirements::default()
         }
     }
-}
-
-/// Host directory mount.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Mount {
-    /// Host path.
-    pub host: String,
-    /// Guest path.
-    pub guest: String,
-    /// Read-only.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub readonly: bool,
-}
-
-/// Host Unix socket mount.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SocketMount {
-    /// Host socket path.
-    pub host: String,
-    /// Guest socket path.
-    pub guest: String,
-}
-
-/// One immutable artifact a backend can materialize for a template.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Artifact {
-    /// `oci-image` or `smolmachine`.
-    pub format: String,
-    /// Guest architecture (`aarch64`/`x86_64`, or `arm64`/`amd64`).
-    pub arch: String,
-    /// Image reference or `file://` pack path. Proto field: `ref`.
-    #[serde(rename = "ref")]
-    pub reference: String,
-    /// sha256 of the artifact content (`sha256:<hex>`).
-    pub digest: String,
-    /// Size in bytes when known.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub size_bytes: u64,
 }
 
 impl Artifact {
@@ -264,6 +54,11 @@ impl Artifact {
     pub const OCI_IMAGE: &'static str = "oci-image";
     /// A monolithic packed machine (an OCI artifact or a `file://` pack).
     pub const SMOLMACHINE: &'static str = "smolmachine";
+
+    /// The artifact's registry reference or pack path (proto field `ref`).
+    pub fn reference(&self) -> &str {
+        &self.r#ref
+    }
 
     /// Validate the artifact's shape and digest pinning.
     ///
@@ -282,38 +77,38 @@ impl Artifact {
                 self.digest
             ));
         }
-        if self.reference.is_empty() {
+        if self.r#ref.is_empty() {
             return Err("artifact ref is required".into());
         }
         match self.format.as_str() {
             Self::OCI_IMAGE => {
-                let pinned = self.reference.rsplit_once('@').map(|(_, digest)| digest);
+                let pinned = self.r#ref.rsplit_once('@').map(|(_, digest)| digest);
                 match pinned {
                     Some(digest) if is_sha256_digest(digest) => {}
                     _ => {
                         return Err(format!(
                             "artifact ref `{}` is not digest-pinned; use `{}@sha256:…`",
-                            self.reference, self.reference
+                            self.r#ref, self.r#ref
                         ));
                     }
                 }
                 if !pinned.is_some_and(|digest| digest.eq_ignore_ascii_case(&self.digest)) {
                     return Err(format!(
                         "artifact digest `{}` does not match its pinned ref `{}`",
-                        self.digest, self.reference
+                        self.digest, self.r#ref
                     ));
                 }
             }
-            Self::SMOLMACHINE => match self.reference.strip_prefix("file://") {
+            Self::SMOLMACHINE => match self.r#ref.strip_prefix("file://") {
                 Some("") => return Err("artifact ref `file://` has no path".into()),
                 Some(_) => {}
                 None => {
-                    let pinned = self.reference.rsplit_once('@').map(|(_, digest)| digest);
+                    let pinned = self.r#ref.rsplit_once('@').map(|(_, digest)| digest);
                     if !pinned.is_some_and(is_sha256_digest) {
                         return Err(format!(
                             "artifact ref `{}` must be a `file://` pack or a digest-pinned \
                              OCI artifact reference",
-                            self.reference
+                            self.r#ref
                         ));
                     }
                 }
@@ -359,154 +154,34 @@ pub fn host_arch() -> &'static str {
     }
 }
 
-/// A logical image.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct TemplateSpec {
-    /// Unique name.
-    pub name: String,
-    /// Guest OS.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub os: String,
-    /// Driver-specific recipe (oneof source).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recipe: Option<String>,
-    /// Sandbox captured by `Snapshot` (oneof source).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub snapshot_of: Option<String>,
-    /// Formats and architectures this template can be materialized in.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<Artifact>,
-    /// Placement requirements every sandbox from this template carries.
-    pub requires: Requirements,
-    /// Labels.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub labels: BTreeMap<String, String>,
+/// Derived behaviour on a sandbox's state.
+///
+/// The generated message stores an open enum ([`buffa::EnumValue`]), so an
+/// unknown wire value is preserved rather than coerced. Every predicate here
+/// treats an unknown value as "not the state asked about", which is what the
+/// service wants: an unknown state is never terminal, never ready.
+pub trait SandboxStateExt {
+    /// The known state, with an unrecognized value read as unspecified.
+    fn known(self) -> SandboxState;
+    /// Terminal states hold no capacity.
+    fn is_terminal(&self) -> bool;
+    /// Lowercase label for metrics (matches the proto value names).
+    fn as_metric_label(&self) -> &'static str;
 }
 
-/// A registered template.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Template {
-    /// Spec as submitted.
-    pub spec: TemplateSpec,
-    /// sha256 of the canonical spec.
-    pub digest: String,
-    /// Owner that holds the snapshot (snapshot templates only).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub provider_id: String,
-    /// Driver that holds the snapshot (snapshot templates only).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub driver: String,
-    /// Native snapshot reference (snapshot templates only).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub native_ref: String,
-    /// Unix seconds.
-    pub created_at: i64,
-}
+impl SandboxStateExt for buffa::EnumValue<SandboxState> {
+    fn known(self) -> SandboxState {
+        self.as_known()
+            .unwrap_or(SandboxState::SandboxStateUnspecified)
+    }
 
-/// Pool configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PoolSpec {
-    /// Unique name.
-    pub name: String,
-    /// Template name.
-    pub template: String,
-    /// Machine size.
-    pub shape: Shape,
-    /// Egress policy.
-    pub network: NetworkPolicy,
-    /// Idle ready sandboxes to keep.
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub warm: u32,
-    /// Maximum live sandboxes (0 = unbounded).
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub max: u32,
-    /// Extra requirements.
-    pub requires: Requirements,
-    /// Host directory mounts.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub mounts: Vec<Mount>,
-    /// Host socket mounts.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub sockets: Vec<SocketMount>,
-    /// Driver hints.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub options: BTreeMap<String, String>,
-    /// Default lease TTL.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub lease_ttl_secs: u64,
-}
+    fn is_terminal(&self) -> bool {
+        matches!(self.known(), SandboxState::Gone | SandboxState::Failed)
+    }
 
-/// Why a sandbox is acquired.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Purpose {
-    /// Not set (treated as `Exec`).
-    #[default]
-    PurposeUnspecified,
-    /// An ephemeral CI runner.
-    Runner,
-    /// One-off command execution.
-    Exec,
-    /// Interactive session.
-    Session,
-    /// Template bake; started snapshot-capable.
-    Build,
-}
-
-/// A file written into the guest at acquire.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileSpec {
-    /// Absolute guest path.
-    pub path: String,
-    /// Contents.
-    #[serde(with = "b64")]
-    pub data: Vec<u8>,
-    /// Octal mode (0 = 0644).
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub mode: u32,
-}
-
-/// Identity delivered at acquire.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Inject {
-    /// Environment merged into every exec on the lease.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-    /// Files written before the lease is returned.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub files: Vec<FileSpec>,
-}
-
-/// Sandbox lifecycle state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SandboxState {
-    /// Not set.
-    #[default]
-    SandboxStateUnspecified,
-    /// Being created.
-    Provisioning,
-    /// Warm and unleased.
-    Ready,
-    /// Held by a lease.
-    Leased,
-    /// Paused.
-    Paused,
-    /// Powered off; the machine and its disk are kept.
-    Stopped,
-    /// Kept for debugging after release.
-    Preserved,
-    /// Being destroyed.
-    Terminating,
-    /// Destroyed.
-    Gone,
-    /// Creation or runtime failure.
-    Failed,
+    fn as_metric_label(&self) -> &'static str {
+        self.known().as_metric_label()
+    }
 }
 
 impl SandboxState {
@@ -532,479 +207,6 @@ impl SandboxState {
     }
 }
 
-/// A sandbox record.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Sandbox {
-    /// Service id (`sbx-…`).
-    pub id: String,
-    /// Caller-chosen name (see [`AcquireRequest::name`]).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub name: String,
-    /// Template name.
-    pub template: String,
-    /// Pool name, if pooled.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub pool: String,
-    /// Owning provider.
-    pub provider_id: String,
-    /// Driver on that provider.
-    pub driver: String,
-    /// Driver-native reference.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub native_ref: String,
-    /// State.
-    pub state: SandboxState,
-    /// Purpose.
-    pub purpose: Purpose,
-    /// Current lease. Redacted in `List`; `Get` returns it only to the
-    /// caller presenting that lease.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub lease_id: String,
-    /// Failure reason.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub error: String,
-    /// Unix seconds.
-    pub created_at: i64,
-    /// Preserved sandboxes expire at this Unix second (0 = n/a).
-    #[serde(skip_serializing_if = "is_zero_i64")]
-    pub preserve_until: i64,
-    /// Configured size, for capacity accounting.
-    pub shape: Shape,
-}
-
-fn is_zero_i64(value: &i64) -> bool {
-    *value == 0
-}
-
-/// A lease on a sandbox. The id is the capability every sandbox-scoped RPC
-/// presents; only `Acquire` and `Renew` (both scoped to the lease) return it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Lease {
-    /// Lease id (`lse-…`).
-    pub id: String,
-    /// Sandbox id.
-    pub sandbox_id: String,
-    /// Pool, if any.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub pool: String,
-    /// Caller idempotency key.
-    pub idempotency_key: String,
-    /// Unix seconds.
-    pub expires_at: i64,
-    /// Environment merged into every exec on this lease.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-    /// sha256 of the [`AcquireRequest`] that owns the idempotency key.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub request_hash: String,
-}
-
-/// Empty message.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Empty {}
-
-/// List request: page size and the token of the previous page.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ListRequest {
-    /// Items per page (0 = default 100; capped at 1000).
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub page_size: u32,
-    /// Opaque continuation token from the previous response.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub page_token: String,
-}
-
-/// `PutTemplate`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PutTemplateRequest {
-    /// Template.
-    pub template: TemplateSpec,
-}
-
-/// `ListTemplates`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ListTemplatesResponse {
-    /// Templates.
-    pub templates: Vec<Template>,
-    /// Continuation token; empty on the last page.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub next_page_token: String,
-}
-
-/// `DeleteTemplate`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct DeleteTemplateRequest {
-    /// Template name.
-    pub name: String,
-}
-
-/// `PutPool`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PutPoolRequest {
-    /// Pool.
-    pub pool: PoolSpec,
-}
-
-/// `ListPools`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ListPoolsResponse {
-    /// Pools.
-    pub pools: Vec<PoolSpec>,
-    /// Continuation token; empty on the last page.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub next_page_token: String,
-}
-
-/// `DeletePool`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct DeletePoolRequest {
-    /// Pool name.
-    pub name: String,
-}
-
-/// `Acquire`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct AcquireRequest {
-    /// Required; the same key returns the same lease.
-    pub idempotency_key: String,
-    /// Optional caller-chosen name, unique among live sandboxes.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub name: String,
-    /// Pool (or `template`).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub pool: String,
-    /// Template (or `pool`).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub template: String,
-    /// Size override.
-    pub shape: Shape,
-    /// Extra requirements.
-    pub requires: Requirements,
-    /// Purpose.
-    pub purpose: Purpose,
-    /// Lease TTL (0 = pool or service default).
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub ttl_secs: u64,
-    /// Identity.
-    pub inject: Inject,
-    /// Egress policy override (template acquires).
-    pub network: NetworkPolicy,
-    /// Host mounts (template acquires).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub mounts: Vec<Mount>,
-    /// Socket mounts (template acquires).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub sockets: Vec<SocketMount>,
-    /// Driver hints (template acquires).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub options: BTreeMap<String, String>,
-    /// Block until the sandbox is ready. Absent = service default;
-    /// `Some(0)` returns immediately (one attempt) instead of blocking.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wait_secs: Option<u64>,
-}
-
-/// `Acquire` result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct AcquireResponse {
-    /// Lease.
-    pub lease: Lease,
-    /// Sandbox.
-    pub sandbox: Sandbox,
-}
-
-/// `Renew`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RenewRequest {
-    /// Lease id.
-    pub lease_id: String,
-    /// New TTL from now (0 = original TTL).
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub ttl_secs: u64,
-}
-
-/// Release disposition.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ReleaseMode {
-    /// Treated as `Destroy`.
-    #[default]
-    ReleaseModeUnspecified,
-    /// Destroy the sandbox.
-    Destroy,
-    /// Keep it (debugging) until `preserve_ttl_secs`.
-    Preserve,
-}
-
-/// `Release`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ReleaseRequest {
-    /// Lease id.
-    pub lease_id: String,
-    /// Disposition.
-    pub mode: ReleaseMode,
-    /// Preservation window.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub preserve_ttl_secs: u64,
-}
-
-/// `Get` / `Stop` / `Pause` / `Resume`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct GetRequest {
-    /// Sandbox id.
-    pub sandbox_id: String,
-    /// Capability from `Acquire`; must be this sandbox's active lease.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub lease_id: String,
-}
-
-/// `List`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ListSandboxesResponse {
-    /// Sandboxes.
-    pub sandboxes: Vec<Sandbox>,
-    /// Continuation token; empty on the last page.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub next_page_token: String,
-}
-
-/// `Exec`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ExecRequest {
-    /// Sandbox id.
-    pub sandbox_id: String,
-    /// Capability from `Acquire`; must be this sandbox's active lease.
-    /// Cleared before the request is handed to a provider.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub lease_id: String,
-    /// Command.
-    pub argv: Vec<String>,
-    /// Environment (added to the lease environment).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-    /// Working directory.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub workdir: String,
-    /// Guest user.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub user: String,
-    /// Deadline in seconds (0 = the service's exec deadline).
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub timeout_secs: u64,
-    /// Standard input.
-    #[serde(with = "b64", skip_serializing_if = "Vec::is_empty")]
-    pub stdin: Vec<u8>,
-}
-
-/// One exec stream event (oneof).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ExecEvent {
-    /// Stdout bytes.
-    #[serde(with = "b64::opt", skip_serializing_if = "Option::is_none")]
-    pub stdout: Option<Vec<u8>>,
-    /// Stderr bytes.
-    #[serde(with = "b64::opt", skip_serializing_if = "Option::is_none")]
-    pub stderr: Option<Vec<u8>>,
-    /// Exit status (terminal event).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-}
-
-impl ExecEvent {
-    /// Stdout fragment.
-    pub fn stdout(bytes: Vec<u8>) -> Self {
-        Self {
-            stdout: Some(bytes),
-            ..Self::default()
-        }
-    }
-    /// Stderr fragment.
-    pub fn stderr(bytes: Vec<u8>) -> Self {
-        Self {
-            stderr: Some(bytes),
-            ..Self::default()
-        }
-    }
-    /// Exit status.
-    pub fn exit(code: i32) -> Self {
-        Self {
-            exit_code: Some(code),
-            ..Self::default()
-        }
-    }
-}
-
-/// Stream direction.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum StreamKind {
-    /// Not set.
-    #[default]
-    StreamKindUnspecified,
-    /// Client uploads a tar extracted at `path`.
-    Upload,
-    /// Client downloads a tar of `path`.
-    Download,
-}
-
-/// `OpenStream`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct OpenStreamRequest {
-    /// Sandbox id.
-    pub sandbox_id: String,
-    /// Capability from `Acquire`; must be this sandbox's active lease.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub lease_id: String,
-    /// Direction.
-    pub kind: StreamKind,
-    /// Guest path (directory for uploads; file or directory for downloads).
-    pub path: String,
-}
-
-/// A data-plane ticket.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Ticket {
-    /// URL (relative to the service base when it starts with `/`).
-    pub url: String,
-    /// Bearer token for the URL.
-    pub token: String,
-    /// Unix seconds.
-    pub expires_at: i64,
-}
-
-/// `Snapshot`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SnapshotRequest {
-    /// Sandbox to capture.
-    pub sandbox_id: String,
-    /// Capability from `Acquire`; must be this sandbox's active lease.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub lease_id: String,
-    /// New template name.
-    pub name: String,
-}
-
-/// A driver advertised by a provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct DriverInfo {
-    /// Driver name.
-    pub driver: String,
-    /// Capabilities.
-    pub capabilities: Capabilities,
-}
-
-/// A registered provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Provider {
-    /// Provider id.
-    pub id: String,
-    /// Display name.
-    pub name: String,
-    /// Fencing generation (bumped per registration).
-    pub generation: u64,
-    /// Drivers.
-    pub drivers: Vec<DriverInfo>,
-    /// Unix seconds.
-    pub last_seen: i64,
-    /// No new placements are made here; survives re-registration.
-    #[serde(skip_serializing_if = "is_false")]
-    pub cordoned: bool,
-    /// Client certificates this provider may authenticate with.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub certificates: Vec<ProviderCertificate>,
-}
-
-/// A provider client certificate the service accepts.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ProviderCertificate {
-    /// Lowercase hex SHA-256 of the certificate DER.
-    pub sha256: String,
-    /// Unix seconds after which the certificate is rejected.
-    pub expires_at: i64,
-}
-
-/// `ListProviders`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ListProvidersResponse {
-    /// Providers.
-    pub providers: Vec<Provider>,
-    /// Continuation token; empty on the last page.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub next_page_token: String,
-}
-
-/// `CordonProvider` / `UncordonProvider` / `DrainProvider`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ProviderControlRequest {
-    /// Provider name (or id).
-    pub name: String,
-}
-
-/// `DrainProvider` result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct DrainProviderResult {
-    /// Idle pool members released by this drain.
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub released_pool_members: u32,
-    /// Leased sandboxes still running on the provider (not killed).
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub leased_remaining: u32,
-}
-
-/// Host facts only the owning driver can measure, reported on `Heartbeat`.
-/// Every field is `None` when unmeasured — never a fabricated zero.
-///
-/// Aggregates only: host process names, PIDs and paths never reach the wire,
-/// because every client-token holder can read `Stats`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct HostSample {
-    /// Total host RAM.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mem_total_bytes: Option<u64>,
-    /// Host RAM available for new work.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mem_available_bytes: Option<u64>,
-    /// Total host swap.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub swap_total_bytes: Option<u64>,
-    /// Free host swap.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub swap_free_bytes: Option<u64>,
-    /// The host agent's own RSS.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub engine_rss_bytes: Option<u64>,
-    /// Summed guest-VM RSS.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vm_rss_bytes: Option<u64>,
-}
-
 impl From<preloop_observability::vm_telemetry::HostSample> for HostSample {
     fn from(sample: preloop_observability::vm_telemetry::HostSample) -> Self {
         Self {
@@ -1014,6 +216,7 @@ impl From<preloop_observability::vm_telemetry::HostSample> for HostSample {
             swap_free_bytes: sample.swap_free_bytes,
             engine_rss_bytes: sample.engine_rss_bytes,
             vm_rss_bytes: sample.vm_rss_bytes,
+            ..HostSample::default()
         }
     }
 }
@@ -1040,422 +243,67 @@ impl HostSample {
     }
 }
 
-/// Per-sandbox runtime facts only the owning driver can measure. Aggregates
-/// only: the hypervisor PID and host data-directory path stay on the
-/// provider that measured them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SandboxRuntimeStats {
-    /// Driver-native reference (matches [`Sandbox::native_ref`]). This is the
-    /// heartbeat's key; a `Stats` response already nests the stats under the
-    /// sandbox record.
-    pub native_ref: String,
-    /// RSS or cgroup `memory.current`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_bytes: Option<u64>,
-    /// Unix seconds, best-effort (a data-directory timestamp when no
-    /// process start time is recoverable).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_time: Option<i64>,
+impl TemplateSpec {
+    /// The driver-specific recipe, when this template names one.
+    pub fn recipe(&self) -> Option<&str> {
+        match self.source.as_ref() {
+            Some(template_spec::Source::Recipe(recipe)) => Some(recipe),
+            _ => None,
+        }
+    }
+
+    /// The sandbox this template was captured from, for snapshot templates.
+    pub fn snapshot_of(&self) -> Option<&str> {
+        match self.source.as_ref() {
+            Some(template_spec::Source::SnapshotOf(id)) => Some(id),
+            _ => None,
+        }
+    }
 }
 
-/// What a driver reports at `Heartbeat`: its host sample plus every
-/// sandbox it currently owns that it can say anything about. Batched so a
-/// 10s heartbeat and a reconcile need not each re-measure. Never an error:
-/// an unmeasurable report is the default (empty), not a failure.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct HostReport {
-    /// Host sample (every field `None` when unmeasured).
-    pub host: HostSample,
-    /// This driver's current sandboxes.
-    pub sandboxes: Vec<SandboxRuntimeStats>,
+impl WorkItem {
+    /// One work item carrying `work` under a fresh or redelivered id.
+    pub fn new(id: impl Into<String>, work: work_item::Work) -> Self {
+        Self {
+            id: id.into(),
+            work: Some(work),
+            ..Self::default()
+        }
+    }
 }
 
-/// One sandbox in a `Stats` response: its record plus the latest runtime
-/// facts its provider reported (default/empty when never reported).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SandboxStats {
-    /// The sandbox record.
-    pub sandbox: Sandbox,
-    /// Latest runtime facts.
-    pub runtime: SandboxRuntimeStats,
+impl ExecEvent {
+    /// Stdout fragment.
+    pub fn stdout(bytes: Vec<u8>) -> Self {
+        Self {
+            event: Some(exec_event::Event::Stdout(bytes)),
+            ..Self::default()
+        }
+    }
+
+    /// Stderr fragment.
+    pub fn stderr(bytes: Vec<u8>) -> Self {
+        Self {
+            event: Some(exec_event::Event::Stderr(bytes)),
+            ..Self::default()
+        }
+    }
+
+    /// Exit status (terminal event).
+    pub fn exit(code: i32) -> Self {
+        Self {
+            event: Some(exec_event::Event::ExitCode(code)),
+            ..Self::default()
+        }
+    }
 }
 
-/// One provider in a `Stats` response.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ProviderStats {
-    /// Provider id.
-    pub provider_id: String,
-    /// Display name.
-    pub name: String,
-    /// Drivers and capacity.
-    pub drivers: Vec<DriverInfo>,
-    /// Latest reported host sample.
-    pub host: HostSample,
-    /// Age of `host` at request time; 0 when never sampled.
-    pub host_sample_age_secs: i64,
-    /// This provider's sandboxes.
-    pub sandboxes: Vec<SandboxStats>,
-}
+/// The concrete `HashMap` a generated proto3 `map` field uses.
+///
+/// buffa parameterizes `std::collections::HashMap` with its own hasher, so a
+/// bare `std::collections::HashMap` is a different type even though the
+/// contents and JSON mapping are identical.
+pub type Map<K, V> = buffa::__private::HashMap<K, V>;
 
-/// `Stats`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct StatsResponse {
-    /// Providers.
-    pub providers: Vec<ProviderStats>,
-}
-
-/// `Register`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RegisterRequest {
-    /// Stable provider name (re-registering the same name bumps the generation).
-    pub name: String,
-    /// Drivers.
-    pub drivers: Vec<DriverInfo>,
-}
-
-/// `Register` result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RegisterResponse {
-    /// Provider id.
-    pub provider_id: String,
-    /// Fencing generation.
-    pub generation: u64,
-}
-
-/// `Heartbeat`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct HeartbeatRequest {
-    /// Provider id.
-    pub provider_id: String,
-    /// Generation.
-    pub generation: u64,
-    /// Host sample (every field `None` when unmeasured).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<HostSample>,
-    /// This provider's measurable sandboxes, most recently active first and
-    /// capped at 512 entries so one heartbeat stays bounded. Replaces the
-    /// prior report — not a merge.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub sandboxes: Vec<SandboxRuntimeStats>,
-}
-
-/// `Poll`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PollRequest {
-    /// Provider id.
-    pub provider_id: String,
-    /// Generation.
-    pub generation: u64,
-    /// Long-poll window.
-    pub wait_secs: u64,
-}
-
-/// Create a sandbox.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CreateWork {
-    /// Sandbox id.
-    pub sandbox_id: String,
-    /// Caller-chosen name; drivers use it as the native name when set.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub name: String,
-    /// Driver.
-    pub driver: String,
-    /// Template (with native_ref when it is a snapshot).
-    pub template: Template,
-    /// Size.
-    pub shape: Shape,
-    /// Egress.
-    pub network: NetworkPolicy,
-    /// Mounts.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub mounts: Vec<Mount>,
-    /// Socket mounts.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub sockets: Vec<SocketMount>,
-    /// Driver hints.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub options: BTreeMap<String, String>,
-    /// Start snapshot-capable (build sandboxes).
-    #[serde(skip_serializing_if = "is_false")]
-    pub snapshot_capable: bool,
-}
-
-/// A work target.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SandboxWork {
-    /// Sandbox id.
-    pub sandbox_id: String,
-    /// Driver.
-    pub driver: String,
-    /// Native reference.
-    pub native_ref: String,
-}
-
-/// Run a command.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ExecWork {
-    /// Exec id; output is reported with `ReportExec`.
-    pub exec_id: String,
-    /// Target.
-    pub target: SandboxWork,
-    /// Request (environment already merged).
-    pub request: ExecRequest,
-}
-
-/// Move a tar through a ticket.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CopyWork {
-    /// Target.
-    pub target: SandboxWork,
-    /// Ticket id (fetch/put at `/sandbox/v1/agent/blobs/{ticket}`).
-    pub ticket: String,
-    /// Guest path.
-    pub path: String,
-    /// Direction.
-    pub kind: StreamKind,
-}
-
-/// Start a stopped sandbox.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct StartWork {
-    /// Target.
-    pub target: SandboxWork,
-    /// Start as a branch base (`--forkable`).
-    #[serde(skip_serializing_if = "is_false")]
-    pub forkable: bool,
-}
-
-/// Cancel a running exec whose caller's stream went away.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CancelExecWork {
-    /// Exec id.
-    pub exec_id: String,
-    /// Target.
-    pub target: SandboxWork,
-}
-
-/// `Start`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct StartRequest {
-    /// Sandbox id.
-    pub sandbox_id: String,
-    /// Capability from `Acquire`; must be this sandbox's active lease.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub lease_id: String,
-    /// Start as a branch base.
-    #[serde(skip_serializing_if = "is_false")]
-    pub forkable: bool,
-}
-
-/// Capture a snapshot.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SnapshotWork {
-    /// Target.
-    pub target: SandboxWork,
-    /// New template name.
-    pub template: String,
-}
-
-/// One unit of provider work (oneof).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct WorkItem {
-    /// Work id: stable across redelivery; `Report` acknowledges it.
-    pub id: String,
-    /// Create.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub create: Option<CreateWork>,
-    /// Destroy.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub destroy: Option<SandboxWork>,
-    /// Exec.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exec: Option<ExecWork>,
-    /// Copy.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub copy: Option<CopyWork>,
-    /// Snapshot.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub snapshot: Option<SnapshotWork>,
-    /// Pause.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pause: Option<SandboxWork>,
-    /// Resume.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resume: Option<SandboxWork>,
-    /// Power off, keeping the machine.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<SandboxWork>,
-    /// Start a stopped machine.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start: Option<StartWork>,
-    /// Cancel a running exec.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cancel_exec: Option<CancelExecWork>,
-}
-
-/// `Poll` result: at most the service's poll batch. Unacknowledged work is
-/// redelivered after the visibility timeout or when the provider re-registers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PollResponse {
-    /// Work.
-    pub work: Vec<WorkItem>,
-}
-
-/// `Report`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ReportRequest {
-    /// Provider id.
-    pub provider_id: String,
-    /// Generation.
-    pub generation: u64,
-    /// Work id.
-    pub work_id: String,
-    /// Success.
-    pub ok: bool,
-    /// Failure reason.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub error: String,
-    /// Create/snapshot result.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub native_ref: String,
-}
-
-/// `ReportExec`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ReportExecRequest {
-    /// Provider id.
-    pub provider_id: String,
-    /// Generation.
-    pub generation: u64,
-    /// Exec id.
-    pub exec_id: String,
-    /// Events, in order.
-    pub events: Vec<ExecEvent>,
-    /// Per-exec batch sequence, strictly increasing for the exec; the service
-    /// drops a batch it already applied. 0 is unsequenced.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub sequence: u64,
-}
-
-/// One observed sandbox.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Observed {
-    /// Driver.
-    pub driver: String,
-    /// Native reference.
-    pub native_ref: String,
-    /// Sandbox id, when the driver can recover it from the native name.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub sandbox_id: String,
-}
-
-/// `Reconcile`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ReconcileRequest {
-    /// Provider id.
-    pub provider_id: String,
-    /// Generation.
-    pub generation: u64,
-    /// Full inventory.
-    pub sandboxes: Vec<Observed>,
-}
-
-/// `Reconcile` result: what the provider must destroy.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ReconcileResponse {
-    /// Orphans: machines no live record owns.
-    pub destroy: Vec<SandboxWork>,
-}
-
-/// `Enroll`: exchange a join token for a client certificate.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct EnrollRequest {
-    /// Single-use join token (`plj1.<id>.<secret>.<ca_sha256>`).
-    pub token: String,
-    /// Provider name the certificate is bound to.
-    pub name: String,
-    /// PEM certificate signing request.
-    pub csr_pem: String,
-}
-
-/// `Enroll` result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct EnrollResponse {
-    /// PEM leaf certificate.
-    pub cert_pem: String,
-    /// PEM CA certificate the leaf chains to.
-    pub ca_pem: String,
-    /// Unix seconds.
-    pub expires_at: i64,
-}
-
-/// `RenewCertificate`: replace an expiring client certificate.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RenewCertificateRequest {
-    /// PEM certificate signing request for a fresh key.
-    pub csr_pem: String,
-}
-
-/// `RenewCertificate` result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RenewCertificateResponse {
-    /// PEM leaf certificate.
-    pub cert_pem: String,
-    /// Unix seconds.
-    pub expires_at: i64,
-}
-
-/// `CreateJoinToken`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CreateJoinTokenRequest {
-    /// Lifetime in seconds (0 = service default).
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub ttl_secs: u64,
-}
-
-/// `CreateJoinToken` result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CreateJoinTokenResponse {
-    /// `plj1.<id>.<secret>.<ca_sha256>`; printed once and never recoverable.
-    pub token: String,
-    /// Unix seconds.
-    pub expires_at: i64,
-}
-
-/// `DeleteProvider`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct DeleteProviderRequest {
-    /// Provider name.
-    pub name: String,
-}
+/// A proto3 `map<string, string>` field.
+pub type StringMap = Map<String, String>;

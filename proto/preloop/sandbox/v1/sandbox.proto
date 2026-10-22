@@ -270,7 +270,7 @@ message AcquireRequest {
   repeated Mount mounts = 10;
   repeated SocketMount sockets = 11;
   map<string, string> options = 12;
-  uint64 wait_secs = 13;            // block until the sandbox is ready
+  optional uint64 wait_secs = 13;   // block until the sandbox is ready; absent = service default, 0 = return now
   string name = 14;                 // optional, unique among live sandboxes
 }
 message AcquireResponse { Lease lease = 1; Sandbox sandbox = 2; }
@@ -426,7 +426,14 @@ message Provider {
   repeated ProviderCertificate certificates = 110; // assigned range
 }
 
-message RegisterRequest { string name = 1; repeated DriverInfo drivers = 2; }
+// `protocol_version` is the agent's major protocol version. The service
+// refuses a mismatch (`FAILED_PRECONDITION`) rather than half-speaking a
+// newer protocol.
+message RegisterRequest {
+  string name = 1;
+  repeated DriverInfo drivers = 2;
+  uint32 protocol_version = 200;
+}
 message RegisterResponse { string provider_id = 1; uint64 generation = 2; }
 message HeartbeatRequest {
   string provider_id = 1;

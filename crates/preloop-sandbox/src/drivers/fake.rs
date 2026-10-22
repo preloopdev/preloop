@@ -12,10 +12,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::*;
-use crate::connect::{Error, Result};
 use crate::driver::{
     Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, ExecCancels, native_name, parse_native_name,
 };
+use crate::error::{Error, Result};
 
 /// Fake driver.
 pub struct FakeDriver {
@@ -59,21 +59,24 @@ impl FakeDriver {
             socket_mounts: true,
             host_mounts: true,
             network_modes: vec![
-                NetworkMode::Disabled,
-                NetworkMode::Unrestricted,
-                NetworkMode::PublicOnly,
+                NetworkMode::Disabled.into(),
+                NetworkMode::Unrestricted.into(),
+                NetworkMode::PublicOnly.into(),
             ],
             slots: 0,
             native_pool: false,
             one_shot: false,
             max_vcpus: 0,
             max_memory_mib: 0,
+            ..Capabilities::default()
         }
     }
 
     fn dir(&self, native_ref: &str) -> Result<PathBuf> {
         if native_ref.contains('/') || native_ref.contains("..") || native_ref.is_empty() {
-            return Err(Error::invalid(format!("bad native ref `{native_ref}`")));
+            return Err(Error::invalid_argument(format!(
+                "bad native ref `{native_ref}`"
+            )));
         }
         Ok(self.root.join("sandboxes").join(native_ref))
     }
@@ -99,10 +102,10 @@ impl FakeDriver {
             return Err(Error::not_found("sandbox is gone"));
         }
         if root.join(".paused").exists() {
-            return Err(Error::precondition("sandbox is paused"));
+            return Err(Error::failed_precondition("sandbox is paused"));
         }
         if root.join(".stopped").exists() {
-            return Err(Error::precondition("sandbox is stopped"));
+            return Err(Error::failed_precondition("sandbox is stopped"));
         }
         let mut command = tokio::process::Command::new(&request.argv[0]);
         command
@@ -335,6 +338,7 @@ impl Driver for FakeDriver {
                 driver: self.name.clone(),
                 native_ref: name,
                 sandbox_id,
+                ..Observed::default()
             });
         }
         Ok(out)
@@ -344,7 +348,11 @@ impl Driver for FakeDriver {
         let host = preloop_observability::vm_telemetry::sample_host().into();
         let mut sandboxes = Vec::new();
         let Ok(entries) = std::fs::read_dir(self.root.join("sandboxes")) else {
-            return HostReport { host, sandboxes };
+            return HostReport {
+                host: buffa::MessageField::some(host),
+                sandboxes,
+                ..HostReport::default()
+            };
         };
         for entry in entries.flatten() {
             let native_ref = entry.file_name().to_string_lossy().into_owned();
@@ -358,9 +366,14 @@ impl Driver for FakeDriver {
                 native_ref,
                 memory_bytes: None,
                 start_time,
+                ..SandboxRuntimeStats::default()
             });
         }
-        HostReport { host, sandboxes }
+        HostReport {
+            host: buffa::MessageField::some(host),
+            sandboxes,
+            ..HostReport::default()
+        }
     }
 }
 

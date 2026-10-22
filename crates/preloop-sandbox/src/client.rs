@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 
 use crate::api::*;
-use crate::connect::{self, Error, Result};
+use crate::error::{Error, Result};
 use crate::service::{Service, collect_exec};
 
 /// Everything a caller (CI fleet adapter, CLI, agents) can do.
@@ -183,20 +183,26 @@ impl SandboxApi for InProcess {
     }
 }
 
-const SANDBOXES: &str = "preloop.sandbox.v1.Sandboxes";
-
 /// Network client for the `Sandboxes` service.
-#[derive(Clone)]
+///
+/// Speaks ConnectRPC through the generated [`rpc::SandboxesClient`] (JSON
+/// codec, same wire shape as before) and uses the reqwest client only for the
+/// ticketed data plane, whose tar bodies are not RPC messages.
 pub struct SandboxClient {
-    inner: connect::Client,
+    inner: rpc::SandboxesClient<connectrpc::client::HttpClient>,
+    http: reqwest::Client,
+    base: String,
 }
+
+/// The generated message types, re-exported for readability below.
+use crate::generated::preloop::sandbox::v1 as rpc;
 
 impl SandboxClient {
     /// `base` like `https://127.0.0.1:9191` (system trust store).
     pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
-        Self {
-            inner: connect::Client::new(base, token),
-        }
+        let base = base.into().trim_end_matches('/').to_owned();
+        let tls = native_tls_config();
+        Self::build(base, token, tls, reqwest::Client::new())
     }
 
     /// `base` like `https://127.0.0.1:9191`, trusting only `ca_pem`.
@@ -206,49 +212,91 @@ impl SandboxClient {
         ca_pem: &str,
         identity_pem: Option<&[u8]>,
     ) -> Result<Self> {
-        Ok(Self {
-            inner: connect::Client::with_tls(base, token, ca_pem, identity_pem)?,
-        })
+        let base = base.into().trim_end_matches('/').to_owned();
+        let tls = crate::tls::client_config(ca_pem, identity_pem)?;
+        let http = crate::tls::http_client(ca_pem, identity_pem)?;
+        Ok(Self::build(base, token, tls, http))
     }
 
-    async fn call<Req: serde::Serialize + Sync, Resp: serde::de::DeserializeOwned>(
-        &self,
-        method: &str,
-        request: &Req,
-    ) -> Result<Resp> {
-        self.inner
-            .unary(&format!("{SANDBOXES}/{method}"), request)
-            .await
+    fn build(
+        base: String,
+        token: Option<String>,
+        tls: Arc<rustls::ClientConfig>,
+        http: reqwest::Client,
+    ) -> Self {
+        let uri: axum::http::Uri = base
+            .parse()
+            .unwrap_or_else(|_| axum::http::Uri::from_static("https://127.0.0.1:9191"));
+        let mut config = connectrpc::client::ClientConfig::new(uri).json();
+        if let Some(token) = token.as_deref()
+            && let Ok(value) = axum::http::HeaderValue::from_str(&format!("Bearer {token}"))
+        {
+            config = config.with_default_header(axum::http::header::AUTHORIZATION, value);
+        }
+        let transport = connectrpc::client::HttpClient::with_tls(tls);
+        Self {
+            inner: rpc::SandboxesClient::new(transport, config),
+            http,
+            base,
+        }
+    }
+
+    /// Base URL.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Underlying HTTP client (for data-plane tickets).
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
     }
 
     fn ticket_url(&self, ticket: &Ticket) -> String {
         if ticket.url.starts_with('/') {
-            format!("{}{}", self.inner.base(), ticket.url)
+            format!("{}{}", self.base, ticket.url)
         } else {
             ticket.url.clone()
         }
     }
 }
 
+/// A rustls configuration trusting the system roots.
+fn native_tls_config() -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
 #[async_trait]
 impl SandboxApi for SandboxClient {
     async fn put_template(&self, spec: TemplateSpec) -> Result<Template> {
-        self.call("PutTemplate", &PutTemplateRequest { template: spec })
-            .await
+        Ok(self
+            .inner
+            .put_template(PutTemplateRequest {
+                template: spec.into(),
+                ..PutTemplateRequest::default()
+            })
+            .await?
+            .into_owned())
     }
+
     async fn list_templates(&self) -> Result<Vec<Template>> {
         let mut templates = Vec::new();
         let mut page_token = String::new();
         loop {
-            let page: ListTemplatesResponse = self
-                .call(
-                    "ListTemplates",
-                    &ListRequest {
-                        page_size: crate::service::MAX_PAGE_SIZE,
-                        page_token,
-                    },
-                )
-                .await?;
+            let page = self
+                .inner
+                .list_templates(ListRequest {
+                    page_size: crate::service::MAX_PAGE_SIZE,
+                    page_token,
+                    ..ListRequest::default()
+                })
+                .await?
+                .into_owned();
             templates.extend(page.templates);
             if page.next_page_token.is_empty() {
                 return Ok(templates);
@@ -256,32 +304,41 @@ impl SandboxApi for SandboxClient {
             page_token = page.next_page_token;
         }
     }
+
     async fn delete_template(&self, name: &str) -> Result<()> {
-        self.call::<_, Empty>(
-            "DeleteTemplate",
-            &DeleteTemplateRequest {
+        self.inner
+            .delete_template(DeleteTemplateRequest {
                 name: name.to_owned(),
-            },
-        )
-        .await
-        .map(|_| ())
+                ..DeleteTemplateRequest::default()
+            })
+            .await?;
+        Ok(())
     }
+
     async fn put_pool(&self, pool: PoolSpec) -> Result<PoolSpec> {
-        self.call("PutPool", &PutPoolRequest { pool }).await
+        Ok(self
+            .inner
+            .put_pool(PutPoolRequest {
+                pool: pool.into(),
+                ..PutPoolRequest::default()
+            })
+            .await?
+            .into_owned())
     }
+
     async fn list_pools(&self) -> Result<Vec<PoolSpec>> {
         let mut pools = Vec::new();
         let mut page_token = String::new();
         loop {
-            let page: ListPoolsResponse = self
-                .call(
-                    "ListPools",
-                    &ListRequest {
-                        page_size: crate::service::MAX_PAGE_SIZE,
-                        page_token,
-                    },
-                )
-                .await?;
+            let page = self
+                .inner
+                .list_pools(ListRequest {
+                    page_size: crate::service::MAX_PAGE_SIZE,
+                    page_token,
+                    ..ListRequest::default()
+                })
+                .await?
+                .into_owned();
             pools.extend(page.pools);
             if page.next_page_token.is_empty() {
                 return Ok(pools);
@@ -289,48 +346,55 @@ impl SandboxApi for SandboxClient {
             page_token = page.next_page_token;
         }
     }
+
     async fn delete_pool(&self, name: &str) -> Result<()> {
-        self.call::<_, Empty>(
-            "DeletePool",
-            &DeletePoolRequest {
+        self.inner
+            .delete_pool(DeletePoolRequest {
                 name: name.to_owned(),
-            },
-        )
-        .await
-        .map(|_| ())
+                ..DeletePoolRequest::default()
+            })
+            .await?;
+        Ok(())
     }
+
     async fn acquire(&self, request: AcquireRequest) -> Result<AcquireResponse> {
-        self.call("Acquire", &request).await
+        Ok(self.inner.acquire(request).await?.into_owned())
     }
+
     async fn renew(&self, request: RenewRequest) -> Result<Lease> {
-        self.call("Renew", &request).await
+        Ok(self.inner.renew(request).await?.into_owned())
     }
+
     async fn release(&self, request: ReleaseRequest) -> Result<()> {
-        self.call::<_, Empty>("Release", &request).await.map(|_| ())
+        self.inner.release(request).await?;
+        Ok(())
     }
+
     async fn get(&self, sandbox_id: &str, lease_id: &str) -> Result<Sandbox> {
-        self.call(
-            "Get",
-            &GetRequest {
+        Ok(self
+            .inner
+            .get(GetRequest {
                 sandbox_id: sandbox_id.to_owned(),
                 lease_id: lease_id.to_owned(),
-            },
-        )
-        .await
+                ..GetRequest::default()
+            })
+            .await?
+            .into_owned())
     }
+
     async fn list(&self) -> Result<Vec<Sandbox>> {
         let mut sandboxes = Vec::new();
         let mut page_token = String::new();
         loop {
-            let page: ListSandboxesResponse = self
-                .call(
-                    "List",
-                    &ListRequest {
-                        page_size: crate::service::MAX_PAGE_SIZE,
-                        page_token,
-                    },
-                )
-                .await?;
+            let page = self
+                .inner
+                .list(ListRequest {
+                    page_size: crate::service::MAX_PAGE_SIZE,
+                    page_token,
+                    ..ListRequest::default()
+                })
+                .await?
+                .into_owned();
             sandboxes.extend(page.sandboxes);
             if page.next_page_token.is_empty() {
                 return Ok(sandboxes);
@@ -338,19 +402,20 @@ impl SandboxApi for SandboxClient {
             page_token = page.next_page_token;
         }
     }
+
     async fn list_providers(&self) -> Result<Vec<Provider>> {
         let mut providers = Vec::new();
         let mut page_token = String::new();
         loop {
-            let page: ListProvidersResponse = self
-                .call(
-                    "ListProviders",
-                    &ListRequest {
-                        page_size: crate::service::MAX_PAGE_SIZE,
-                        page_token,
-                    },
-                )
-                .await?;
+            let page = self
+                .inner
+                .list_providers(ListRequest {
+                    page_size: crate::service::MAX_PAGE_SIZE,
+                    page_token,
+                    ..ListRequest::default()
+                })
+                .await?
+                .into_owned();
             providers.extend(page.providers);
             if page.next_page_token.is_empty() {
                 return Ok(providers);
@@ -358,43 +423,61 @@ impl SandboxApi for SandboxClient {
             page_token = page.next_page_token;
         }
     }
+
     async fn cordon_provider(&self, name: &str) -> Result<Provider> {
-        self.call(
-            "CordonProvider",
-            &ProviderControlRequest {
-                name: name.to_owned(),
-            },
-        )
-        .await
-    }
-    async fn uncordon_provider(&self, name: &str) -> Result<Provider> {
-        self.call(
-            "UncordonProvider",
-            &ProviderControlRequest {
-                name: name.to_owned(),
-            },
-        )
-        .await
-    }
-    async fn drain_provider(&self, name: &str) -> Result<DrainProviderResult> {
-        self.call(
-            "DrainProvider",
-            &ProviderControlRequest {
-                name: name.to_owned(),
-            },
-        )
-        .await
-    }
-    async fn stats(&self) -> Result<StatsResponse> {
-        self.call("Stats", &ListRequest::default()).await
-    }
-    async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         Ok(self
             .inner
-            .server_stream::<_, ExecEvent>(&format!("{SANDBOXES}/Exec"), &request)
+            .cordon_provider(ProviderControlRequest {
+                name: name.to_owned(),
+                ..ProviderControlRequest::default()
+            })
             .await?
-            .boxed())
+            .into_owned())
     }
+
+    async fn uncordon_provider(&self, name: &str) -> Result<Provider> {
+        Ok(self
+            .inner
+            .uncordon_provider(ProviderControlRequest {
+                name: name.to_owned(),
+                ..ProviderControlRequest::default()
+            })
+            .await?
+            .into_owned())
+    }
+
+    async fn drain_provider(&self, name: &str) -> Result<DrainProviderResult> {
+        Ok(self
+            .inner
+            .drain_provider(ProviderControlRequest {
+                name: name.to_owned(),
+                ..ProviderControlRequest::default()
+            })
+            .await?
+            .into_owned())
+    }
+
+    async fn stats(&self) -> Result<StatsResponse> {
+        Ok(self.inner.stats(ListRequest::default()).await?.into_owned())
+    }
+
+    async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
+        let stream = self.inner.exec(request).await?;
+        Ok(
+            futures::stream::unfold((stream, false), |(mut stream, done)| async move {
+                if done {
+                    return None;
+                }
+                match stream.message::<ExecEvent>().await {
+                    Ok(Some(message)) => Some((Ok(message.to_owned_message()), (stream, false))),
+                    Ok(None) => None,
+                    Err(error) => Some((Err(error), (stream, true))),
+                }
+            })
+            .boxed(),
+        )
+    }
+
     async fn upload(
         &self,
         sandbox_id: &str,
@@ -402,24 +485,23 @@ impl SandboxApi for SandboxClient {
         guest_dir: &str,
         tar: &Path,
     ) -> Result<()> {
-        let ticket: Ticket = self
-            .call(
-                "OpenStream",
-                &OpenStreamRequest {
-                    sandbox_id: sandbox_id.to_owned(),
-                    lease_id: lease_id.to_owned(),
-                    kind: StreamKind::Upload,
-                    path: guest_dir.to_owned(),
-                },
-            )
-            .await?;
+        let ticket = self
+            .inner
+            .open_stream(OpenStreamRequest {
+                sandbox_id: sandbox_id.to_owned(),
+                lease_id: lease_id.to_owned(),
+                kind: StreamKind::Upload.into(),
+                path: guest_dir.to_owned(),
+                ..OpenStreamRequest::default()
+            })
+            .await?
+            .into_owned();
         let file = tokio::fs::File::open(tar)
             .await
             .map_err(|e| Error::internal(format!("upload: {e}")))?;
         let length = file.metadata().await.map(|m| m.len()).unwrap_or_default();
         let response = self
-            .inner
-            .http()
+            .http
             .put(self.ticket_url(&ticket))
             .bearer_auth(&ticket.token)
             .header(reqwest::header::CONTENT_LENGTH, length)
@@ -431,12 +513,13 @@ impl SandboxApi for SandboxClient {
             .map_err(|e| Error::unavailable(format!("upload: {e}")))?;
         if !response.status().is_success() {
             let body = response.bytes().await.unwrap_or_default();
-            return Err(serde_json::from_slice::<Error>(&body).unwrap_or_else(|_| {
-                Error::unavailable(String::from_utf8_lossy(&body).into_owned())
-            }));
+            return Err(Error::unavailable(
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
         }
         Ok(())
     }
+
     async fn download(
         &self,
         sandbox_id: &str,
@@ -445,20 +528,19 @@ impl SandboxApi for SandboxClient {
         dest: &Path,
     ) -> Result<()> {
         use tokio::io::AsyncWriteExt as _;
-        let ticket: Ticket = self
-            .call(
-                "OpenStream",
-                &OpenStreamRequest {
-                    sandbox_id: sandbox_id.to_owned(),
-                    lease_id: lease_id.to_owned(),
-                    kind: StreamKind::Download,
-                    path: guest_path.to_owned(),
-                },
-            )
-            .await?;
-        let response = self
+        let ticket = self
             .inner
-            .http()
+            .open_stream(OpenStreamRequest {
+                sandbox_id: sandbox_id.to_owned(),
+                lease_id: lease_id.to_owned(),
+                kind: StreamKind::Download.into(),
+                path: guest_path.to_owned(),
+                ..OpenStreamRequest::default()
+            })
+            .await?
+            .into_owned();
+        let response = self
+            .http
             .get(self.ticket_url(&ticket))
             .bearer_auth(&ticket.token)
             .send()
@@ -466,9 +548,9 @@ impl SandboxApi for SandboxClient {
             .map_err(|e| Error::unavailable(format!("download: {e}")))?;
         if !response.status().is_success() {
             let body = response.bytes().await.unwrap_or_default();
-            return Err(serde_json::from_slice::<Error>(&body).unwrap_or_else(|_| {
-                Error::unavailable(String::from_utf8_lossy(&body).into_owned())
-            }));
+            return Err(Error::unavailable(
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
         }
         let mut file = tokio::fs::File::create(dest)
             .await
@@ -484,66 +566,74 @@ impl SandboxApi for SandboxClient {
             .await
             .map_err(|e| Error::internal(format!("download: {e}")))
     }
+
     async fn snapshot(&self, request: SnapshotRequest) -> Result<Template> {
-        self.call("Snapshot", &request).await
+        Ok(self.inner.snapshot(request).await?.into_owned())
     }
+
     async fn stop(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
-        self.call::<_, Empty>(
-            "Stop",
-            &GetRequest {
+        self.inner
+            .stop(GetRequest {
                 sandbox_id: sandbox_id.to_owned(),
                 lease_id: lease_id.to_owned(),
-            },
-        )
-        .await
-        .map(|_| ())
+                ..GetRequest::default()
+            })
+            .await?;
+        Ok(())
     }
+
     async fn start(&self, sandbox_id: &str, lease_id: &str, forkable: bool) -> Result<()> {
-        self.call::<_, Empty>(
-            "Start",
-            &StartRequest {
+        self.inner
+            .start(StartRequest {
                 sandbox_id: sandbox_id.to_owned(),
                 lease_id: lease_id.to_owned(),
                 forkable,
-            },
-        )
-        .await
-        .map(|_| ())
+                ..StartRequest::default()
+            })
+            .await?;
+        Ok(())
     }
+
     async fn pause(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
-        self.call::<_, Empty>(
-            "Pause",
-            &GetRequest {
+        self.inner
+            .pause(GetRequest {
                 sandbox_id: sandbox_id.to_owned(),
                 lease_id: lease_id.to_owned(),
-            },
-        )
-        .await
-        .map(|_| ())
+                ..GetRequest::default()
+            })
+            .await?;
+        Ok(())
     }
+
     async fn resume(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
-        self.call::<_, Empty>(
-            "Resume",
-            &GetRequest {
+        self.inner
+            .resume(GetRequest {
                 sandbox_id: sandbox_id.to_owned(),
                 lease_id: lease_id.to_owned(),
-            },
-        )
-        .await
-        .map(|_| ())
+                ..GetRequest::default()
+            })
+            .await?;
+        Ok(())
     }
+
     async fn create_join_token(&self, ttl_secs: u64) -> Result<CreateJoinTokenResponse> {
-        self.call("CreateJoinToken", &CreateJoinTokenRequest { ttl_secs })
-            .await
+        Ok(self
+            .inner
+            .create_join_token(CreateJoinTokenRequest {
+                ttl_secs,
+                ..CreateJoinTokenRequest::default()
+            })
+            .await?
+            .into_owned())
     }
+
     async fn delete_provider(&self, name: &str) -> Result<()> {
-        self.call::<_, Empty>(
-            "DeleteProvider",
-            &DeleteProviderRequest {
+        self.inner
+            .delete_provider(DeleteProviderRequest {
                 name: name.to_owned(),
-            },
-        )
-        .await
-        .map(|_| ())
+                ..DeleteProviderRequest::default()
+            })
+            .await?;
+        Ok(())
     }
 }

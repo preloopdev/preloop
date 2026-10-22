@@ -44,6 +44,8 @@ missing_docs = "warn"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+buffa = { version = "0.9.2", features = ["json"] }
+connectrpc = { version = "0.9.1", features = ["axum", "client", "client-tls"] }
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 hyper = "1.0"

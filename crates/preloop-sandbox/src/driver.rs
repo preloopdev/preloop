@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::api::{Capabilities, CreateWork, ExecEvent, ExecRequest, HostReport, Observed};
-use crate::connect::{Error, Result};
+use crate::error::{Error, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -116,7 +116,7 @@ pub trait Driver: Send + Sync {
 
 /// The error for an operation a backend does not declare.
 pub fn unsupported(driver: &str, operation: &str) -> Error {
-    Error::precondition(format!("{driver}: {operation} unsupported"))
+    Error::failed_precondition(format!("{driver}: {operation} unsupported"))
 }
 
 /// Prefix of every native machine name the sandbox layer creates.

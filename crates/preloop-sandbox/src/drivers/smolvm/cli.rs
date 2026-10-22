@@ -2119,8 +2119,9 @@ impl SmolVmProvider {
             Ok(names) => names,
             Err(_) => {
                 return HostReport {
-                    host,
+                    host: buffa::MessageField::some(host),
                     sandboxes: Vec::new(),
+                    ..HostReport::default()
                 };
             }
         };
@@ -2164,9 +2165,14 @@ impl SmolVmProvider {
                 native_ref: name.as_str().to_owned(),
                 memory_bytes,
                 start_time,
+                ..SandboxRuntimeStats::default()
             });
         }
-        HostReport { host, sandboxes }
+        HostReport {
+            host: buffa::MessageField::some(host),
+            sandboxes,
+            ..HostReport::default()
+        }
     }
 }
 

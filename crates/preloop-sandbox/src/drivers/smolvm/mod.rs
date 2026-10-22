@@ -26,11 +26,11 @@ use self::cli::{
 };
 use self::pack::{ArtifactCache, ArtifactPin, LocalImage, PackFormat, select_artifact};
 use crate::api::*;
-use crate::connect::{Code, Error, Result};
 use crate::driver::{
     Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, ExecCancels, NATIVE_PREFIX, native_name,
     parse_native_name, shell_quote,
 };
+use crate::error::{Code, Error, Result};
 
 /// Driver name.
 pub const NAME: &str = "smolvm";
@@ -146,15 +146,17 @@ impl SmolvmDriver {
     /// cache, the pin that keeps them resident for the machine's lifetime.
     async fn image_for(&self, template: &Template) -> Result<(String, Option<ArtifactPin>)> {
         if template.spec.artifacts.is_empty() {
-            if let Some(recipe) = &template.spec.recipe {
+            if let Some(recipe) = template.spec.recipe() {
                 let path = recipe
                     .strip_prefix(SMOLMACHINE_RECIPE)
                     .or_else(|| recipe.strip_prefix(IMAGE_RECIPE))
                     .map(str::to_owned)
-                    .ok_or_else(|| Error::invalid(format!("smolvm: unknown recipe `{recipe}`")))?;
+                    .ok_or_else(|| {
+                        Error::invalid_argument(format!("smolvm: unknown recipe `{recipe}`"))
+                    })?;
                 return Ok((path, None));
             }
-            return Err(Error::invalid(format!(
+            return Err(Error::invalid_argument(format!(
                 "template `{}` has no artifacts",
                 template.spec.name
             )));
@@ -249,14 +251,15 @@ fn machine(native_ref: &str) -> Result<MachineName> {
 /// Decode a JSON driver option the CI pool encoded from its `MachineSpec`.
 fn json_option<T: serde::de::DeserializeOwned>(raw: Option<&str>, key: &str) -> Result<Option<T>> {
     raw.map(|raw| {
-        serde_json::from_str(raw)
-            .map_err(|error| Error::invalid(format!("smolvm: invalid `{key}` option: {error}")))
+        serde_json::from_str(raw).map_err(|error| {
+            Error::invalid_argument(format!("smolvm: invalid `{key}` option: {error}"))
+        })
     })
     .transpose()
 }
 
 fn network(policy: &NetworkPolicy) -> VmNetwork {
-    match policy.mode {
+    match policy.mode.as_known().unwrap_or_default() {
         NetworkMode::Disabled => VmNetwork::Disabled,
         NetworkMode::PublicOnly => VmNetwork::PublicOnly,
         NetworkMode::Restricted => VmNetwork::Restricted {
@@ -270,7 +273,7 @@ fn network(policy: &NetworkPolicy) -> VmNetwork {
 /// Fork egress policy: `None` keeps the fork base's policy, unlike a cold
 /// boot, where an unset mode means unrestricted.
 fn fork_network(policy: &NetworkPolicy) -> Option<VmNetwork> {
-    match policy.mode {
+    match policy.mode.as_known().unwrap_or_default() {
         NetworkMode::NetworkModeUnspecified => None,
         NetworkMode::Disabled => Some(VmNetwork::Disabled),
         NetworkMode::PublicOnly => Some(VmNetwork::PublicOnly),
@@ -326,7 +329,7 @@ fn fork_request(work: &CreateWork) -> Result<(ForkLaunch, MachineUpdate)> {
         }
     }
     if !unsupported.is_empty() {
-        return Err(Error::precondition(format!(
+        return Err(Error::failed_precondition(format!(
             "smolvm: forking cannot apply {}: a clone inherits {} from its fork base",
             unsupported.join(", "),
             if unsupported.len() == 1 { "it" } else { "them" },
@@ -337,7 +340,7 @@ fn fork_request(work: &CreateWork) -> Result<(ForkLaunch, MachineUpdate)> {
     if work.shape.cpus > 0 {
         update.cpus = Some(
             u16::try_from(work.shape.cpus)
-                .map_err(|_| Error::invalid("smolvm: shape.cpus is too large"))?,
+                .map_err(|_| Error::invalid_argument("smolvm: shape.cpus is too large"))?,
         );
     }
     if work.shape.memory_mib > 0 {
@@ -349,7 +352,7 @@ fn fork_request(work: &CreateWork) -> Result<(ForkLaunch, MachineUpdate)> {
     if let Some(raw) = option("overlay_gib") {
         update.overlay_gib = Some(
             raw.parse()
-                .map_err(|_| Error::invalid("smolvm: invalid `overlay_gib` option"))?,
+                .map_err(|_| Error::invalid_argument("smolvm: invalid `overlay_gib` option"))?,
         );
     }
     update.network = fork_network(&work.network);
@@ -441,16 +444,17 @@ impl Driver for SmolvmDriver {
             socket_mounts: true,
             host_mounts: true,
             network_modes: vec![
-                NetworkMode::Disabled,
-                NetworkMode::Unrestricted,
-                NetworkMode::PublicOnly,
-                NetworkMode::Restricted,
+                NetworkMode::Disabled.into(),
+                NetworkMode::Unrestricted.into(),
+                NetworkMode::PublicOnly.into(),
+                NetworkMode::Restricted.into(),
             ],
             slots: self.slots,
             native_pool: false,
             one_shot: false,
             max_vcpus,
             max_memory_mib,
+            ..Capabilities::default()
         }
     }
 
@@ -687,7 +691,7 @@ impl Driver for SmolvmDriver {
         match self.provider.status(&name).await.map_err(vm_error)? {
             cli::MachineState::Running | cli::MachineState::Stopped => {}
             state => {
-                return Err(Error::precondition(format!(
+                return Err(Error::failed_precondition(format!(
                     "smolvm: snapshot source {native_ref} is {state:?}"
                 )));
             }
@@ -745,6 +749,7 @@ impl Driver for SmolvmDriver {
                     driver: NAME.into(),
                     native_ref: name.as_str().to_owned(),
                     sandbox_id,
+                    ..Observed::default()
                 }
             })
             .collect())

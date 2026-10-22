@@ -17,8 +17,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::api::*;
-use crate::connect::{self, Code, Error, Result};
 use crate::driver::Driver;
+use crate::error::{Code, Error, Result};
+use crate::generated::preloop::sandbox::v1 as rpc;
 use crate::service::Service;
 
 /// Most per-sandbox runtime entries one `Heartbeat` carries. A host can run
@@ -100,6 +101,9 @@ impl ProviderLink for Arc<Service> {
 pub struct RemoteLink {
     base: String,
     http: parking_lot::RwLock<reqwest::Client>,
+    /// rustls configuration for the RPC transport, rebuilt with the HTTP
+    /// client whenever the identity is renewed.
+    tls: parking_lot::RwLock<Arc<rustls::ClientConfig>>,
     identity: parking_lot::RwLock<Option<crate::tls::AgentIdentity>>,
     renew: tokio::sync::Mutex<()>,
 }
@@ -116,7 +120,7 @@ fn unix_now() -> i64 {
 fn normalize_base(base: &str) -> Result<String> {
     let base = base.trim_end_matches('/');
     if !base.starts_with("https://") {
-        return Err(Error::invalid(
+        return Err(Error::invalid_argument(
             "the sandbox API is always TLS; use an https:// URL",
         ));
     }
@@ -146,17 +150,7 @@ impl RemoteLink {
             ));
         }
         let (key_pem, csr_pem) = crate::tls::generate_csr(name)?;
-        let http = crate::tls::http_client(&ca_pem, None)?;
-        let response: EnrollResponse = connect::Client::with_http(base.clone(), None, http)
-            .unary(
-                &format!("{PROVIDERS}/Enroll"),
-                &EnrollRequest {
-                    token: token.to_owned(),
-                    name: name.to_owned(),
-                    csr_pem,
-                },
-            )
-            .await?;
+        let response = enroll(&base, &ca_pem, token, name, csr_pem).await?;
         if crate::tls::pem_fingerprint(&response.ca_pem)? != pin {
             return Err(Error::new(
                 Code::Unauthenticated,
@@ -196,7 +190,7 @@ impl RemoteLink {
             return Self::from_identity(identity);
         }
         let base = base.ok_or_else(|| {
-            Error::invalid("`--join` is required on the first run (no stored identity)")
+            Error::invalid_argument("`--join` is required on the first run (no stored identity)")
         })?;
         let token = token.ok_or_else(|| {
             Error::new(
@@ -210,9 +204,11 @@ impl RemoteLink {
 
     fn from_identity(identity: crate::tls::AgentIdentity) -> Result<Self> {
         let http = crate::tls::http_client(&identity.ca_pem, Some(&identity.identity_pem()))?;
+        let tls = crate::tls::client_config(&identity.ca_pem, Some(&identity.identity_pem()))?;
         Ok(Self {
             base: identity.metadata.base.clone(),
             http: parking_lot::RwLock::new(http),
+            tls: parking_lot::RwLock::new(tls),
             identity: parking_lot::RwLock::new(Some(identity)),
             renew: tokio::sync::Mutex::new(()),
         })
@@ -231,8 +227,17 @@ impl RemoteLink {
             .map(|identity| identity.metadata.name.clone())
     }
 
-    fn client(&self) -> connect::Client {
-        connect::Client::with_http(self.base.clone(), None, self.http.read().clone())
+    /// A generated `Providers` client over the current identity.
+    fn client(&self) -> Result<rpc::ProvidersClient<connectrpc::client::HttpClient>> {
+        let uri: axum::http::Uri = self
+            .base
+            .parse()
+            .map_err(|e| Error::invalid_argument(format!("sandbox API URL: {e}")))?;
+        let config = connectrpc::client::ClientConfig::new(uri).json();
+        Ok(rpc::ProvidersClient::new(
+            connectrpc::client::HttpClient::with_tls(self.tls.read().clone()),
+            config,
+        ))
     }
 
     /// Issue a fresh certificate and hot-reload the client identity.
@@ -245,17 +250,20 @@ impl RemoteLink {
         };
         let _guard = self.renew.lock().await;
         let (key_pem, csr_pem) = crate::tls::generate_csr(&identity.metadata.name)?;
-        let response: RenewCertificateResponse = self
-            .client()
-            .unary(
-                &format!("{PROVIDERS}/RenewCertificate"),
-                &RenewCertificateRequest { csr_pem },
-            )
-            .await?;
+        let response = self
+            .client()?
+            .renew_certificate(RenewCertificateRequest {
+                csr_pem,
+                ..RenewCertificateRequest::default()
+            })
+            .await?
+            .into_owned();
         let next = identity.renewed(response.cert_pem, key_pem, unix_now(), response.expires_at);
         let http = crate::tls::http_client(&next.ca_pem, Some(&next.identity_pem()))?;
+        let tls = crate::tls::client_config(&next.ca_pem, Some(&next.identity_pem()))?;
         next.save()?;
         *self.http.write() = http;
+        *self.tls.write() = tls;
         *self.identity.write() = Some(next);
         Ok(())
     }
@@ -291,45 +299,58 @@ impl RemoteLink {
     }
 }
 
-const PROVIDERS: &str = "preloop.sandbox.v1.Providers";
+/// `Enroll`: the one RPC authenticated by the join token instead of a
+/// client certificate, so it runs over a transport that presents none.
+async fn enroll(
+    base: &str,
+    ca_pem: &str,
+    token: &str,
+    name: &str,
+    csr_pem: String,
+) -> Result<EnrollResponse> {
+    let uri: axum::http::Uri = base
+        .parse()
+        .map_err(|e| Error::invalid_argument(format!("sandbox API URL: {e}")))?;
+    let config = connectrpc::client::ClientConfig::new(uri).json();
+    let transport =
+        connectrpc::client::HttpClient::with_tls(crate::tls::client_config(ca_pem, None)?);
+    let response = rpc::ProvidersClient::new(transport, config)
+        .enroll(EnrollRequest {
+            token: token.to_owned(),
+            name: name.to_owned(),
+            csr_pem,
+            ..EnrollRequest::default()
+        })
+        .await?
+        .into_owned();
+    Ok(response)
+}
 
 #[async_trait]
 impl ProviderLink for RemoteLink {
     async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse> {
-        self.client()
-            .unary(&format!("{PROVIDERS}/Register"), &request)
-            .await
+        Ok(self.client()?.register(request).await?.into_owned())
     }
     async fn heartbeat(&self, request: HeartbeatRequest) -> Result<()> {
         // Heartbeats are the agent's slowest reliable tick: renew here so a
         // long-polling agent still rotates its certificate in time.
         self.maybe_renew().await;
-        self.client()
-            .unary::<_, Empty>(&format!("{PROVIDERS}/Heartbeat"), &request)
-            .await
-            .map(|_| ())
+        self.client()?.heartbeat(request).await?;
+        Ok(())
     }
     async fn poll(&self, request: PollRequest) -> Result<PollResponse> {
-        self.client()
-            .unary(&format!("{PROVIDERS}/Poll"), &request)
-            .await
+        Ok(self.client()?.poll(request).await?.into_owned())
     }
     async fn report(&self, request: ReportRequest) -> Result<()> {
-        self.client()
-            .unary::<_, Empty>(&format!("{PROVIDERS}/Report"), &request)
-            .await
-            .map(|_| ())
+        self.client()?.report(request).await?;
+        Ok(())
     }
     async fn report_exec(&self, request: ReportExecRequest) -> Result<()> {
-        self.client()
-            .unary::<_, Empty>(&format!("{PROVIDERS}/ReportExec"), &request)
-            .await
-            .map(|_| ())
+        self.client()?.report_exec(request).await?;
+        Ok(())
     }
     async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse> {
-        self.client()
-            .unary(&format!("{PROVIDERS}/Reconcile"), &request)
-            .await
+        Ok(self.client()?.reconcile(request).await?.into_owned())
     }
     async fn fetch_blob(&self, id: &Session, ticket: &str, dest: &Path) -> Result<()> {
         use futures::StreamExt as _;
@@ -448,15 +469,17 @@ impl HostAccess {
 /// Canonicalize `host` and require it under one of `allowed`.
 fn check_host_path(kind: &str, host: &str, allowed: &[PathBuf]) -> Result<()> {
     if host.is_empty() {
-        return Err(Error::precondition(format!("host {kind} path is empty")));
+        return Err(Error::failed_precondition(format!(
+            "host {kind} path is empty"
+        )));
     }
     if allowed.is_empty() {
-        return Err(Error::precondition(format!(
+        return Err(Error::failed_precondition(format!(
             "host {kind} `{host}` is not allowed: this agent exports no {kind} paths"
         )));
     }
     let resolved = std::fs::canonicalize(host).map_err(|error| {
-        Error::precondition(format!("host {kind} `{host}` cannot be resolved: {error}"))
+        Error::failed_precondition(format!("host {kind} `{host}` cannot be resolved: {error}"))
     })?;
     let permitted = allowed.iter().any(|prefix| {
         std::fs::canonicalize(prefix).is_ok_and(|prefix| resolved.starts_with(prefix))
@@ -464,7 +487,7 @@ fn check_host_path(kind: &str, host: &str, allowed: &[PathBuf]) -> Result<()> {
     if permitted {
         Ok(())
     } else {
-        Err(Error::precondition(format!(
+        Err(Error::failed_precondition(format!(
             "host {kind} `{host}` is outside this agent's allowlist"
         )))
     }
@@ -543,14 +566,7 @@ impl WorkOutcome {
                 ok: false,
                 // Keep the code visible: an operator reading the service log
                 // can tell "not supported" from "provider is down".
-                error: format!(
-                    "{}: {}",
-                    serde_json::to_value(error.code)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_owned))
-                        .unwrap_or_default(),
-                    error.message
-                ),
+                error: format!("{}: {}", error.code.as_str(), crate::error::message(&error)),
                 native_ref: String::new(),
             },
         }
@@ -622,9 +638,12 @@ impl Agent {
                     .values()
                     .map(|driver| DriverInfo {
                         driver: driver.name().to_owned(),
-                        capabilities: driver.capabilities(),
+                        capabilities: driver.capabilities().into(),
+                        ..DriverInfo::default()
                     })
                     .collect(),
+                protocol_version: crate::PROTOCOL_VERSION,
+                ..RegisterRequest::default()
             })
             .await?;
         Ok(Session {
@@ -677,8 +696,9 @@ impl Agent {
                             if let Err(error) = agent.link.heartbeat(HeartbeatRequest {
                                 provider_id: session.provider_id.clone(),
                                 generation: session.generation,
-                                host,
+                                host: host.into(),
                                 sandboxes,
+                                ..HeartbeatRequest::default()
                             }).await && error.code == Code::Aborted {
                                 stop.cancel();
                                 return;
@@ -709,6 +729,7 @@ impl Agent {
                 provider_id: session.provider_id.clone(),
                 generation: session.generation,
                 wait_secs: 25,
+                ..PollRequest::default()
             });
             let response = tokio::select! {
                 _ = stop.cancelled() => break,
@@ -812,6 +833,7 @@ impl Agent {
                 provider_id: session.provider_id.clone(),
                 generation: session.generation,
                 sandboxes: inventory,
+                ..ReconcileRequest::default()
             })
             .await
         {
@@ -844,8 +866,11 @@ impl Agent {
         let mut sandboxes = Vec::new();
         for driver in self.drivers.values() {
             let report = driver.host_report().await;
-            if host.is_none() && report.host != HostSample::default() {
-                host = Some(report.host);
+            if host.is_none()
+                && report.host.is_set()
+                && report.host.as_option() != Some(&HostSample::default())
+            {
+                host = report.host.into_option();
             }
             sandboxes.extend(report.sandboxes);
         }
@@ -877,10 +902,9 @@ impl Agent {
     }
 
     fn driver(&self, name: &str) -> Result<Arc<dyn Driver>> {
-        self.drivers
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Error::precondition(format!("driver `{name}` is not on this host")))
+        self.drivers.get(name).cloned().ok_or_else(|| {
+            Error::failed_precondition(format!("driver `{name}` is not on this host"))
+        })
     }
 
     /// Run one work item, remember its outcome, and report it until the
@@ -926,6 +950,7 @@ impl Agent {
                     ok: outcome.ok,
                     error: outcome.error.clone(),
                     native_ref: outcome.native_ref.clone(),
+                    ..ReportRequest::default()
                 })
                 .await
             {
@@ -959,93 +984,99 @@ impl Agent {
         stop: &CancellationToken,
         item: WorkItem,
     ) -> Result<String> {
-        if let Some(cancel) = item.cancel_exec {
-            self.driver(&cancel.target.driver)?
-                .cancel_exec(&cancel.target.native_ref, &cancel.exec_id)
-                .await?;
-            return Ok(String::new());
-        }
         // Record activity before running: a slow exec is exactly the
         // sandbox whose stats a capped heartbeat must keep.
         if let Some(native_ref) = item_native_ref(&item) {
             self.touch(native_ref);
         }
-        if let Some(create) = item.create {
-            // Admission before the driver: no backend sees a host path this
-            // agent does not export. Fork acquires carry their mounts here
-            // too, so they are checked the same way.
-            self.config.access.check_create(&create)?;
-            return self.driver(&create.driver)?.create(&create).await;
-        }
-        if let Some(target) = item.destroy {
-            let driver = self.driver(&target.driver)?;
-            if let Some(snapshot) = target.native_ref.strip_prefix("snapshot:") {
-                driver.drop_snapshot(snapshot).await?;
-            } else {
-                driver.destroy(&target.native_ref).await?;
+        let Some(work) = item.work else {
+            return Err(Error::new(Code::Unimplemented, "unknown work item"));
+        };
+        match work {
+            work_item::Work::CancelExec(cancel) => {
+                self.driver(&cancel.target.driver)?
+                    .cancel_exec(&cancel.target.native_ref, &cancel.exec_id)
+                    .await?;
+                Ok(String::new())
             }
-            return Ok(String::new());
-        }
-        if let Some(exec) = item.exec {
-            self.run_exec(session, stop, exec).await?;
-            return Ok(String::new());
-        }
-        if let Some(copy) = item.copy {
-            let driver = self.driver(&copy.target.driver)?;
-            let scratch = self.config.scratch.join(format!("{}.tar", copy.ticket));
-            let result = match copy.kind {
-                StreamKind::Upload => {
-                    self.link
-                        .fetch_blob(session, &copy.ticket, &scratch)
-                        .await?;
-                    driver
-                        .copy_in(&copy.target.native_ref, &scratch, &copy.path)
-                        .await
+            work_item::Work::Create(create) => {
+                let create = *create;
+                // Admission before the driver: no backend sees a host path
+                // this agent does not export. Fork acquires carry their mounts
+                // here too, so they are checked the same way.
+                self.config.access.check_create(&create)?;
+                self.driver(&create.driver)?.create(&create).await
+            }
+            work_item::Work::Destroy(target) => {
+                let driver = self.driver(&target.driver)?;
+                if let Some(snapshot) = target.native_ref.strip_prefix("snapshot:") {
+                    driver.drop_snapshot(snapshot).await?;
+                } else {
+                    driver.destroy(&target.native_ref).await?;
                 }
-                StreamKind::Download => {
-                    driver
-                        .copy_out(&copy.target.native_ref, &copy.path, &scratch)
-                        .await?;
-                    self.link.put_blob(session, &copy.ticket, &scratch).await
-                }
-                StreamKind::StreamKindUnspecified => Err(Error::invalid("copy kind unset")),
-            };
-            let _ = tokio::fs::remove_file(&scratch).await;
-            return result.map(|_| String::new());
+                Ok(String::new())
+            }
+            work_item::Work::Exec(exec) => {
+                self.run_exec(session, stop, *exec).await?;
+                Ok(String::new())
+            }
+            work_item::Work::Copy(copy) => {
+                let driver = self.driver(&copy.target.driver)?;
+                let scratch = self.config.scratch.join(format!("{}.tar", copy.ticket));
+                let result = match copy.kind.as_known().unwrap_or_default() {
+                    StreamKind::Upload => {
+                        self.link
+                            .fetch_blob(session, &copy.ticket, &scratch)
+                            .await?;
+                        driver
+                            .copy_in(&copy.target.native_ref, &scratch, &copy.path)
+                            .await
+                    }
+                    StreamKind::Download => {
+                        driver
+                            .copy_out(&copy.target.native_ref, &copy.path, &scratch)
+                            .await?;
+                        self.link.put_blob(session, &copy.ticket, &scratch).await
+                    }
+                    StreamKind::StreamKindUnspecified => {
+                        Err(Error::invalid_argument("copy kind unset"))
+                    }
+                };
+                let _ = tokio::fs::remove_file(&scratch).await;
+                result.map(|_| String::new())
+            }
+            work_item::Work::Snapshot(snapshot) => {
+                self.driver(&snapshot.target.driver)?
+                    .snapshot(&snapshot.target.native_ref, &snapshot.template)
+                    .await
+            }
+            work_item::Work::Stop(target) => {
+                self.driver(&target.driver)?
+                    .stop(&target.native_ref)
+                    .await?;
+                Ok(String::new())
+            }
+            work_item::Work::Start(start) => {
+                // `Start` boots an existing machine and carries no host
+                // mounts; a fork is a `Create` and took the allowlist check.
+                self.driver(&start.target.driver)?
+                    .start(&start.target.native_ref, start.forkable)
+                    .await?;
+                Ok(String::new())
+            }
+            work_item::Work::Pause(target) => {
+                self.driver(&target.driver)?
+                    .pause(&target.native_ref)
+                    .await?;
+                Ok(String::new())
+            }
+            work_item::Work::Resume(target) => {
+                self.driver(&target.driver)?
+                    .resume(&target.native_ref)
+                    .await?;
+                Ok(String::new())
+            }
         }
-        if let Some(snapshot) = item.snapshot {
-            return self
-                .driver(&snapshot.target.driver)?
-                .snapshot(&snapshot.target.native_ref, &snapshot.template)
-                .await;
-        }
-        if let Some(target) = item.stop {
-            self.driver(&target.driver)?
-                .stop(&target.native_ref)
-                .await?;
-            return Ok(String::new());
-        }
-        if let Some(start) = item.start {
-            // `Start` boots an existing machine and carries no host mounts;
-            // a fork is a `Create` and took the allowlist check above.
-            self.driver(&start.target.driver)?
-                .start(&start.target.native_ref, start.forkable)
-                .await?;
-            return Ok(String::new());
-        }
-        if let Some(target) = item.pause {
-            self.driver(&target.driver)?
-                .pause(&target.native_ref)
-                .await?;
-            return Ok(String::new());
-        }
-        if let Some(target) = item.resume {
-            self.driver(&target.driver)?
-                .resume(&target.native_ref)
-                .await?;
-            return Ok(String::new());
-        }
-        Err(Error::new(Code::Unimplemented, "unknown work item"))
     }
 
     async fn run_exec(
@@ -1087,8 +1118,11 @@ impl Agent {
                 }
             };
             let Some(event) = next else { break };
-            size += event.stdout.as_ref().map_or(0, Vec::len)
-                + event.stderr.as_ref().map_or(0, Vec::len);
+            size += match event.event.as_ref() {
+                Some(exec_event::Event::Stdout(bytes)) => bytes.len(),
+                Some(exec_event::Event::Stderr(bytes)) => bytes.len(),
+                _ => 0,
+            };
             batch.push(event);
             if size >= 64 * 1024 {
                 caller_gone |= !self
@@ -1139,6 +1173,7 @@ impl Agent {
                     exec_id: exec_id.to_owned(),
                     events: events.clone(),
                     sequence,
+                    ..ReportExecRequest::default()
                 })
                 .await
             {
@@ -1163,34 +1198,18 @@ impl Agent {
 /// `CreateWork` does not: the driver picks the native ref and returns it in
 /// the report.
 fn item_native_ref(item: &WorkItem) -> Option<&str> {
-    if item.create.is_some() {
-        return None;
+    match item.work.as_ref()? {
+        work_item::Work::Create(_) => None,
+        work_item::Work::Destroy(target)
+        | work_item::Work::Pause(target)
+        | work_item::Work::Resume(target)
+        | work_item::Work::Stop(target) => Some(target.native_ref.as_str()),
+        work_item::Work::CancelExec(cancel) => Some(cancel.target.native_ref.as_str()),
+        work_item::Work::Exec(exec) => Some(exec.target.native_ref.as_str()),
+        work_item::Work::Copy(copy) => Some(copy.target.native_ref.as_str()),
+        work_item::Work::Snapshot(snapshot) => Some(snapshot.target.native_ref.as_str()),
+        work_item::Work::Start(start) => Some(start.target.native_ref.as_str()),
     }
-    if let Some(target) = &item.destroy {
-        return Some(target.native_ref.as_str());
-    }
-    if let Some(exec) = &item.exec {
-        return Some(exec.target.native_ref.as_str());
-    }
-    if let Some(copy) = &item.copy {
-        return Some(copy.target.native_ref.as_str());
-    }
-    if let Some(snapshot) = &item.snapshot {
-        return Some(snapshot.target.native_ref.as_str());
-    }
-    if let Some(target) = &item.pause {
-        return Some(target.native_ref.as_str());
-    }
-    if let Some(target) = &item.resume {
-        return Some(target.native_ref.as_str());
-    }
-    if let Some(target) = &item.stop {
-        return Some(target.native_ref.as_str());
-    }
-    if let Some(start) = &item.start {
-        return Some(start.target.native_ref.as_str());
-    }
-    None
 }
 
 /// Order a heartbeat's runtime report most-recently-active first and trim it

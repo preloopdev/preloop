@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::connect::{Error, Result};
+use crate::error::{Error, Result};
 
 /// Record kinds (one table each).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

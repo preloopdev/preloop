@@ -1,25 +1,42 @@
-//! HTTP surface: Connect routes for both services plus the ticketed data plane.
+//! HTTP surface: the generated ConnectRPC services plus the ticketed data
+//! plane.
 //!
 //! Everything is served over TLS. Callers hold the one client bearer token;
 //! capacity owners authenticate with a client certificate issued by the
 //! service CA (see [`crate::tls`]), except for `Enroll` which is authenticated
 //! by a single-use join token.
+//!
+//! The RPC routes ([`crate::generated`]) run under an axum fallback so the
+//! ticketed data plane — plain `GET`/`PUT` routes that stream tar bodies —
+//! shares the listener and the connection-scoped [`PeerIdentity`]. The
+//! generated dispatch hands each handler a [`connectrpc::RequestContext`]
+//! whose extensions are the request's own: `ConnectInfo<PeerIdentity>`
+//! inserted by axum's listener is how `Providers` sees the client
+//! certificate.
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::connect_info::ConnectInfo;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
+use connectrpc::{
+    Encodable, RequestContext, Response as RpcResponse, ServiceRequest, ServiceResult,
+    ServiceStream,
+};
 use futures::StreamExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::*;
-use crate::connect::{self, Code, Error};
+use crate::error::{Error, Result};
+use crate::generated::preloop::sandbox::v1::{
+    Empty, Providers, ProvidersExt, Sandboxes, SandboxesExt,
+};
 use crate::service::{ProviderIdentity, Service};
 use crate::tls::{PeerIdentity, ServerTls, TlsListener};
 
@@ -43,12 +60,6 @@ impl Auth {
     }
 }
 
-#[derive(Clone)]
-struct AppState {
-    service: Arc<Service>,
-    auth: Auth,
-}
-
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -57,33 +68,638 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-fn check(expected: &str, headers: &HeaderMap) -> Result<(), Error> {
-    match bearer(headers) {
-        Some(token)
-            if token.len() == expected.len()
-                && token
-                    .bytes()
-                    .zip(expected.bytes())
-                    .fold(0u8, |a, (x, y)| a | (x ^ y))
-                    == 0 =>
-        {
-            Ok(())
+/// Constant-time equality, so a token cannot be probed byte by byte.
+fn token_eq(candidate: &str, expected: &str) -> bool {
+    candidate.len() == expected.len()
+        && candidate
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
+/// `Sandboxes` handler: bearer token, then the service.
+struct SandboxesService {
+    service: Arc<Service>,
+    auth: Auth,
+}
+
+impl SandboxesService {
+    fn authorize(&self, ctx: &RequestContext) -> Result<()> {
+        let token = ctx
+            .header(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        match token {
+            Some(token) if token_eq(token, &self.auth.client_token) => Ok(()),
+            _ => Err(Error::unauthenticated("missing or bad bearer token")),
         }
-        _ => Err(Error::new(
-            Code::Unauthenticated,
-            "missing or bad bearer token",
-        )),
     }
+}
+
+/// `Providers` handler: certificate identity, then the service.
+struct ProvidersService {
+    service: Arc<Service>,
+}
+
+impl ProvidersService {
+    /// The enrolled provider the request's client certificate authenticates,
+    /// plus the fingerprint it was resolved from.
+    fn identity(&self, ctx: &RequestContext) -> Result<(ProviderIdentity, String)> {
+        let peer = ctx
+            .extensions()
+            .get::<ConnectInfo<PeerIdentity>>()
+            .map(|info| &info.0)
+            .ok_or_else(|| Error::unauthenticated("a client certificate is required"))?;
+        let fingerprint = peer.fingerprint()?.to_owned();
+        let identity = self.service.provider_identity(&fingerprint)?;
+        Ok((identity, fingerprint))
+    }
+
+    fn bound(&self, ctx: &RequestContext, provider_id: &str) -> Result<()> {
+        let (identity, _) = self.identity(ctx)?;
+        require_identity(&identity, provider_id)
+    }
+}
+
+fn require_identity(identity: &ProviderIdentity, provider_id: &str) -> Result<()> {
+    if provider_id != identity.provider_id {
+        return Err(Error::permission_denied(
+            "provider id does not match the client certificate",
+        ));
+    }
+    Ok(())
+}
+
+// The response future borrows neither the request body nor `self` beyond
+// the call, so the concrete type captures less than the trait's
+// `use<'a, Self>` allows. That narrowing is deliberate and local.
+#[allow(refining_impl_trait)]
+impl Sandboxes for SandboxesService {
+    fn put_template<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, PutTemplateRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Template> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(
+                self.service
+                    .put_template(request.template.into_option().unwrap_or_default())
+                    .await?,
+            )
+        }
+    }
+
+    fn list_templates<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<ListTemplatesResponse> + Send + use<'a>>,
+    > + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.list_templates_page(&request)?)
+        }
+    }
+
+    fn delete_template<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, DeleteTemplateRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            self.service.delete_template(&request.name).await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn put_pool<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, PutPoolRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<PoolSpec> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(
+                self.service
+                    .put_pool(request.pool.into_option().unwrap_or_default())
+                    .await?,
+            )
+        }
+    }
+
+    fn list_pools<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<ListPoolsResponse> + Send + use<'a>>,
+    > + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.list_pools_page(&request)?)
+        }
+    }
+
+    fn delete_pool<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, DeletePoolRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            self.service.delete_pool(&request.name).await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn acquire<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, AcquireRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<AcquireResponse> + Send + use<'a>>,
+    > + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.acquire(request).await?)
+        }
+    }
+
+    fn renew<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RenewRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Lease> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.renew(request).await?)
+        }
+    }
+
+    fn release<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ReleaseRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            self.service.release(request).await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn get<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Sandbox> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            let request = request;
+            RpcResponse::ok(self.service.get(&request.sandbox_id, &request.lease_id)?)
+        }
+    }
+
+    fn list<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<ListSandboxesResponse> + Send + use<'a>>,
+    > + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.list_page(&request)?)
+        }
+    }
+
+    fn exec(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ExecRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<ServiceStream<impl Encodable<ExecEvent> + Send + use<>>>,
+    > + Send
+    + use<> {
+        let request = request.to_owned_message();
+        // Authorize before the future is built: the stream is `'static`, so
+        // the response borrows neither the request nor `self`.
+        let allowed = self.authorize(&ctx);
+        let service = self.service.clone();
+        async move {
+            allowed?;
+            Ok(RpcResponse::stream(service.exec(request)?))
+        }
+    }
+
+    fn open_stream<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, OpenStreamRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Ticket> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.open_stream(request)?)
+        }
+    }
+
+    fn snapshot<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, SnapshotRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Template> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.snapshot(request).await?)
+        }
+    }
+
+    fn stop<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            let request = request;
+            self.service
+                .stop(&request.sandbox_id, &request.lease_id)
+                .await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn start<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, StartRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            let request = request;
+            self.service
+                .start(&request.sandbox_id, &request.lease_id, request.forkable)
+                .await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn pause<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            let request = request;
+            self.service
+                .pause(&request.sandbox_id, &request.lease_id)
+                .await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn resume<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            let request = request;
+            self.service
+                .resume(&request.sandbox_id, &request.lease_id)
+                .await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn list_providers<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<ListProvidersResponse> + Send + use<'a>>,
+    > + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.list_providers_page(&request)?)
+        }
+    }
+
+    fn cordon_provider<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ProviderControlRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Provider> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(
+                self.service
+                    .set_provider_cordon(&request.name, true)
+                    .await?,
+            )
+        }
+    }
+
+    fn uncordon_provider<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ProviderControlRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Provider> + Send + use<'a>>>
+    + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(
+                self.service
+                    .set_provider_cordon(&request.name, false)
+                    .await?,
+            )
+        }
+    }
+
+    fn drain_provider<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ProviderControlRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<DrainProviderResult> + Send + use<'a>>,
+    > + Send
+    + use<'a> {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.drain_provider(&request.name).await?)
+        }
+    }
+
+    fn stats<'a>(
+        &'a self,
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<StatsResponse> + Send + use<'a>>,
+    > + Send
+    + use<'a> {
+        async move {
+            self.authorize(&ctx)?;
+            RpcResponse::ok(self.service.stats())
+        }
+    }
+
+    fn delete_provider<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, DeleteProviderRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            self.service.delete_provider(&request.name).await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn create_join_token<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateJoinTokenRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<CreateJoinTokenResponse> + Send + use<'a>>,
+    > + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            self.authorize(&ctx)?;
+            let ttl = std::time::Duration::from_secs(request.ttl_secs);
+            RpcResponse::ok(self.service.create_join_token(ttl).await?)
+        }
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl Providers for ProvidersService {
+    fn enroll<'a>(
+        &'a self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, EnrollRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<EnrollResponse> + Send + use<'a>>,
+    > + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            // `Enroll` is authenticated by its join token alone.
+            RpcResponse::ok(self.service.enroll(request).await?)
+        }
+    }
+
+    fn register<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RegisterRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<RegisterResponse> + Send + use<'a>>,
+    > + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            let (identity, _) = self.identity(&ctx)?;
+            RpcResponse::ok(
+                self.service
+                    .register_enrolled(request, &identity.provider_id)
+                    .await?,
+            )
+        }
+    }
+
+    fn heartbeat<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, HeartbeatRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            let request = request;
+            self.bound(&ctx, &request.provider_id)?;
+            self.service.heartbeat(request)?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn poll<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, PollRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<PollResponse> + Send + use<'a>>,
+    > + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            let request = request;
+            self.bound(&ctx, &request.provider_id)?;
+            RpcResponse::ok(self.service.poll(request).await?)
+        }
+    }
+
+    fn report<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ReportRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            let request = request;
+            self.bound(&ctx, &request.provider_id)?;
+            self.service.report(request).await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn report_exec<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ReportExecRequest>,
+    ) -> impl std::future::Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>>
+    + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            let request = request;
+            self.bound(&ctx, &request.provider_id)?;
+            self.service.report_exec(request).await?;
+            RpcResponse::ok(Empty::default())
+        }
+    }
+
+    fn reconcile<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ReconcileRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<ReconcileResponse> + Send + use<'a>>,
+    > + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            let request = request;
+            self.bound(&ctx, &request.provider_id)?;
+            RpcResponse::ok(self.service.reconcile(request).await?)
+        }
+    }
+
+    fn renew_certificate<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RenewCertificateRequest>,
+    ) -> impl std::future::Future<
+        Output = ServiceResult<impl Encodable<RenewCertificateResponse> + Send + use<'a>>,
+    > + Send
+    + 'a {
+        let request = request.to_owned_message();
+        async move {
+            let (_, fingerprint) = self.identity(&ctx)?;
+            RpcResponse::ok(
+                self.service
+                    .renew_certificate(request, &fingerprint)
+                    .await?,
+            )
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    service: Arc<Service>,
 }
 
 /// Build the router.
 ///
-/// `Providers` reads the peer certificate from `ConnectInfo<PeerIdentity>`, so
-/// serve it with [`serve`] (or `Router::into_make_service_with_connect_info`).
+/// The ConnectRPC services own the fallback; the data-plane routes are plain
+/// axum routes on the same listener. `Providers` reads the peer certificate
+/// from `ConnectInfo<PeerIdentity>`, so serve it with [`serve`] (or
+/// `Router::into_make_service_with_connect_info`).
 pub fn router(service: Arc<Service>, auth: Auth) -> Router {
+    let sandboxes = Arc::new(SandboxesService {
+        service: service.clone(),
+        auth: auth.clone(),
+    });
+    let providers = Arc::new(ProvidersService {
+        service: service.clone(),
+    });
+    let rpc = sandboxes.register(providers.register(connectrpc::Router::new()));
+    // Bulk bytes travel over the ticketed data plane, never in RPCs. The
+    // buffering middleware bounds every unary request (and the single Exec
+    // envelope), and the data-plane routes below stream their own bodies.
+    let rpc = axum::Router::new()
+        .fallback_service(rpc.into_axum_service())
+        .layer(middleware::from_fn(cap_rpc_body));
     Router::new()
-        .route("/preloop.sandbox.v1.Sandboxes/{method}", post(sandboxes))
-        .route("/preloop.sandbox.v1.Providers/{method}", post(providers))
         .route(
             "/sandbox/v1/streams/{ticket}",
             get(stream_download).put(stream_upload),
@@ -94,10 +710,24 @@ pub fn router(service: Arc<Service>, auth: Auth) -> Router {
         )
         .route("/sandbox/v1/ca.pem", get(ca_pem))
         .route("/sandbox/v1/healthz", get(|| async { "ok" }))
-        // Bulk bytes travel over the ticketed data plane, never in RPCs.
-        // This bounds every unary request (and the single Exec envelope).
-        .layer(DefaultBodyLimit::max(CONNECT_BODY_LIMIT))
-        .with_state(AppState { service, auth })
+        .fallback_service(rpc)
+        .with_state(AppState { service })
+}
+
+/// Reject an RPC body above [`CONNECT_BODY_LIMIT`] with `413`.
+///
+/// The generated dispatch reads the body itself and would answer a body over
+/// its own limit with a Connect `resource_exhausted`; this middleware keeps
+/// the service's documented HTTP answer and bounds buffering before dispatch.
+async fn cap_rpc_body(request: axum::extract::Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    match axum::body::to_bytes(body, CONNECT_BODY_LIMIT).await {
+        Ok(bytes) => {
+            let request = axum::extract::Request::from_parts(parts, Body::from(bytes));
+            next.run(request).await
+        }
+        Err(_) => payload_too_large(CONNECT_BODY_LIMIT as u64),
+    }
 }
 
 /// Serve the API over TLS until `shutdown`.
@@ -133,233 +763,6 @@ async fn ca_pem(State(app): State<AppState>) -> Response {
     }
 }
 
-async fn sandboxes(
-    State(app): State<AppState>,
-    Path(method): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if let Err(error) = check(&app.auth.client_token, &headers) {
-        return error.into_response();
-    }
-    let service = app.service;
-    use connect::{decode, unary_response as reply};
-    match method.as_str() {
-        "PutTemplate" => match decode::<PutTemplateRequest>(&body) {
-            Ok(r) => reply(service.put_template(r.template).await),
-            Err(e) => e.into_response(),
-        },
-        "DeleteTemplate" => match decode::<DeleteTemplateRequest>(&body) {
-            Ok(r) => reply(service.delete_template(&r.name).await.map(|_| Empty {})),
-            Err(e) => e.into_response(),
-        },
-        "ListTemplates" => match decode::<ListRequest>(&body) {
-            Ok(r) => reply(service.list_templates_page(&r)),
-            Err(e) => e.into_response(),
-        },
-        "PutPool" => match decode::<PutPoolRequest>(&body) {
-            Ok(r) => reply(service.put_pool(r.pool).await),
-            Err(e) => e.into_response(),
-        },
-        "ListPools" => match decode::<ListRequest>(&body) {
-            Ok(r) => reply(service.list_pools_page(&r)),
-            Err(e) => e.into_response(),
-        },
-        "DeletePool" => match decode::<DeletePoolRequest>(&body) {
-            Ok(r) => reply(service.delete_pool(&r.name).await.map(|_| Empty {})),
-            Err(e) => e.into_response(),
-        },
-        "Acquire" => match decode::<AcquireRequest>(&body) {
-            Ok(r) => reply(service.acquire(r).await),
-            Err(e) => e.into_response(),
-        },
-        "Renew" => match decode::<RenewRequest>(&body) {
-            Ok(r) => reply(service.renew(r).await),
-            Err(e) => e.into_response(),
-        },
-        "Release" => match decode::<ReleaseRequest>(&body) {
-            Ok(r) => reply(service.release(r).await.map(|_| Empty {})),
-            Err(e) => e.into_response(),
-        },
-        "Get" => match decode::<GetRequest>(&body) {
-            Ok(r) => reply(service.get(&r.sandbox_id, &r.lease_id)),
-            Err(e) => e.into_response(),
-        },
-        "List" => match decode::<ListRequest>(&body) {
-            Ok(r) => reply(service.list_page(&r)),
-            Err(e) => e.into_response(),
-        },
-        "ListProviders" => match decode::<ListRequest>(&body) {
-            Ok(r) => reply(service.list_providers_page(&r)),
-            Err(e) => e.into_response(),
-        },
-        "CordonProvider" => match decode::<ProviderControlRequest>(&body) {
-            Ok(r) => reply(service.set_provider_cordon(&r.name, true).await),
-            Err(e) => e.into_response(),
-        },
-        "UncordonProvider" => match decode::<ProviderControlRequest>(&body) {
-            Ok(r) => reply(service.set_provider_cordon(&r.name, false).await),
-            Err(e) => e.into_response(),
-        },
-        "DrainProvider" => match decode::<ProviderControlRequest>(&body) {
-            Ok(r) => reply(service.drain_provider(&r.name).await),
-            Err(e) => e.into_response(),
-        },
-        "Stats" => reply(Ok(service.stats())),
-        "DeleteProvider" => match decode::<DeleteProviderRequest>(&body) {
-            Ok(r) => reply(service.delete_provider(&r.name).await.map(|_| Empty {})),
-            Err(e) => e.into_response(),
-        },
-        "CreateJoinToken" => match decode::<CreateJoinTokenRequest>(&body) {
-            Ok(r) => {
-                let ttl = std::time::Duration::from_secs(r.ttl_secs);
-                reply(service.create_join_token(ttl).await)
-            }
-            Err(e) => e.into_response(),
-        },
-        "Exec" => match connect::decode_stream_request::<ExecRequest>(&body) {
-            Ok(r) => match service.exec(r) {
-                Ok(stream) => connect::stream_response(stream),
-                Err(e) => connect::stream_response(futures::stream::once(async move {
-                    Err::<ExecEvent, _>(e)
-                })),
-            },
-            Err(e) => e.into_response(),
-        },
-        "OpenStream" => match decode::<OpenStreamRequest>(&body) {
-            Ok(r) => reply(service.open_stream(r)),
-            Err(e) => e.into_response(),
-        },
-        "Snapshot" => match decode::<SnapshotRequest>(&body) {
-            Ok(r) => reply(service.snapshot(r).await),
-            Err(e) => e.into_response(),
-        },
-        "Stop" => match decode::<GetRequest>(&body) {
-            Ok(r) => reply(
-                service
-                    .stop(&r.sandbox_id, &r.lease_id)
-                    .await
-                    .map(|_| Empty {}),
-            ),
-            Err(e) => e.into_response(),
-        },
-        "Start" => match decode::<StartRequest>(&body) {
-            Ok(r) => reply(
-                service
-                    .start(&r.sandbox_id, &r.lease_id, r.forkable)
-                    .await
-                    .map(|_| Empty {}),
-            ),
-            Err(e) => e.into_response(),
-        },
-        "Pause" => match decode::<GetRequest>(&body) {
-            Ok(r) => reply(
-                service
-                    .pause(&r.sandbox_id, &r.lease_id)
-                    .await
-                    .map(|_| Empty {}),
-            ),
-            Err(e) => e.into_response(),
-        },
-        "Resume" => match decode::<GetRequest>(&body) {
-            Ok(r) => reply(
-                service
-                    .resume(&r.sandbox_id, &r.lease_id)
-                    .await
-                    .map(|_| Empty {}),
-            ),
-            Err(e) => e.into_response(),
-        },
-        other => Error::new(Code::Unimplemented, format!("unknown method {other}")).into_response(),
-    }
-}
-
-fn require_identity(identity: &ProviderIdentity, provider_id: &str) -> Result<(), Error> {
-    if provider_id != identity.provider_id {
-        return Err(Error::new(
-            Code::PermissionDenied,
-            "provider id does not match the client certificate",
-        ));
-    }
-    Ok(())
-}
-
-async fn providers(
-    State(app): State<AppState>,
-    Path(method): Path<String>,
-    ConnectInfo(peer): ConnectInfo<PeerIdentity>,
-    body: Bytes,
-) -> Response {
-    let service = app.service;
-    use connect::{decode, unary_response as reply};
-    // `Enroll` is the one RPC authenticated by its join token instead of a
-    // client certificate; every other method needs an enrolled identity.
-    if method == "Enroll" {
-        return match decode::<EnrollRequest>(&body) {
-            Ok(request) => reply(service.enroll(request).await),
-            Err(error) => error.into_response(),
-        };
-    }
-    let fingerprint = match peer.fingerprint() {
-        Ok(fingerprint) => fingerprint.to_owned(),
-        Err(error) => return error.into_response(),
-    };
-    let identity = match service.provider_identity(&fingerprint) {
-        Ok(identity) => identity,
-        Err(error) => return error.into_response(),
-    };
-    match method.as_str() {
-        "Register" => match decode::<RegisterRequest>(&body) {
-            Ok(request) => reply(
-                service
-                    .register_enrolled(request, &identity.provider_id)
-                    .await,
-            ),
-            Err(error) => error.into_response(),
-        },
-        "Heartbeat" => match decode::<HeartbeatRequest>(&body) {
-            Ok(request) => match require_identity(&identity, &request.provider_id) {
-                Ok(()) => reply(service.heartbeat(request).map(|_| Empty {})),
-                Err(error) => error.into_response(),
-            },
-            Err(error) => error.into_response(),
-        },
-        "Poll" => match decode::<PollRequest>(&body) {
-            Ok(request) => match require_identity(&identity, &request.provider_id) {
-                Ok(()) => reply(service.poll(request).await),
-                Err(error) => error.into_response(),
-            },
-            Err(error) => error.into_response(),
-        },
-        "Report" => match decode::<ReportRequest>(&body) {
-            Ok(request) => match require_identity(&identity, &request.provider_id) {
-                Ok(()) => reply(service.report(request).await.map(|_| Empty {})),
-                Err(error) => error.into_response(),
-            },
-            Err(error) => error.into_response(),
-        },
-        "ReportExec" => match decode::<ReportExecRequest>(&body) {
-            Ok(request) => match require_identity(&identity, &request.provider_id) {
-                Ok(()) => reply(service.report_exec(request).await.map(|_| Empty {})),
-                Err(error) => error.into_response(),
-            },
-            Err(error) => error.into_response(),
-        },
-        "Reconcile" => match decode::<ReconcileRequest>(&body) {
-            Ok(request) => match require_identity(&identity, &request.provider_id) {
-                Ok(()) => reply(service.reconcile(request).await),
-                Err(error) => error.into_response(),
-            },
-            Err(error) => error.into_response(),
-        },
-        "RenewCertificate" => match decode::<RenewCertificateRequest>(&body) {
-            Ok(request) => reply(service.renew_certificate(request, &fingerprint).await),
-            Err(error) => error.into_response(),
-        },
-        other => Error::new(Code::Unimplemented, format!("unknown method {other}")).into_response(),
-    }
-}
-
 /// A rejected blob body: the cap was exceeded or the transfer failed.
 enum BodyWriteError {
     TooLarge(u64),
@@ -382,18 +785,14 @@ impl IntoResponse for BodyWriteError {
 }
 
 fn payload_too_large(max_bytes: u64) -> Response {
-    let error = Error::new(
-        Code::OutOfRange,
-        format!("blob exceeds the {max_bytes} byte limit"),
-    );
-    let body = serde_json::to_vec(&error).unwrap_or_default();
+    let error = Error::out_of_range(format!("blob exceeds the {max_bytes} byte limit"));
     (
         StatusCode::PAYLOAD_TOO_LARGE,
         [(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         )],
-        body,
+        error.to_json(),
     )
         .into_response()
 }
@@ -450,7 +849,7 @@ async fn write_body(
     Ok(())
 }
 
-async fn file_response(path: &std::path::Path) -> Result<Response, Error> {
+async fn file_response(path: &std::path::Path) -> Result<Response> {
     let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| Error::internal(format!("blob read: {e}")))?;
@@ -479,7 +878,7 @@ async fn stream_upload(
         Err(error) => return error.into_response(),
     };
     if kind != StreamKind::Upload {
-        return Error::invalid("ticket is not an upload").into_response();
+        return Error::invalid_argument("ticket is not an upload").into_response();
     }
     if content_length(&headers).is_some_and(|length| length > max_bytes) {
         return payload_too_large(max_bytes);
@@ -507,7 +906,7 @@ async fn stream_download(
     let result = async {
         let (kind, _) = app.service.claim_ticket(&ticket, token)?;
         if kind != StreamKind::Download {
-            return Err(Error::invalid("ticket is not a download"));
+            return Err(Error::invalid_argument("ticket is not a download"));
         }
         let path = app.service.prepare_download(&ticket).await?;
         let response = file_response(&path).await;
@@ -519,16 +918,16 @@ async fn stream_download(
     result.unwrap_or_else(IntoResponse::into_response)
 }
 
-fn provider_headers(headers: &HeaderMap) -> Result<(String, u64), Error> {
+fn provider_headers(headers: &HeaderMap) -> Result<(String, u64)> {
     let id = headers
         .get("x-provider-id")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Error::invalid("x-provider-id required"))?;
+        .ok_or_else(|| Error::invalid_argument("x-provider-id required"))?;
     let generation = headers
         .get("x-provider-generation")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
-        .ok_or_else(|| Error::invalid("x-provider-generation required"))?;
+        .ok_or_else(|| Error::invalid_argument("x-provider-generation required"))?;
     Ok((id.to_owned(), generation))
 }
 

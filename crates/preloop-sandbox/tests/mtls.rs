@@ -12,7 +12,7 @@ use std::time::Duration;
 use common::TestService;
 use preloop_sandbox::agent::{ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
-use preloop_sandbox::connect::Client as ConnectClient;
+use preloop_sandbox::error::Client as ConnectClient;
 use preloop_sandbox::{Code, SandboxApi, SandboxClient};
 
 fn register(name: &str) -> RegisterRequest {

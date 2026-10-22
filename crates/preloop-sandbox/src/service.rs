@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::api::*;
-use crate::connect::{Code, Error, Result};
+use crate::error::{Code, Error, Result};
 use crate::placement::{Candidate, CandidateId, LeastLoaded, Placement, PlacementRequest};
 use crate::store::{Kind, Store};
 use crate::tls;
@@ -142,7 +142,9 @@ fn validate_name(kind: &str, name: &str) -> Result<()> {
         || name.contains("..")
         || name.chars().any(|c| c.is_control());
     if bad {
-        return Err(Error::invalid(format!("invalid {kind} name `{name}`")));
+        return Err(Error::invalid_argument(format!(
+            "invalid {kind} name `{name}`"
+        )));
     }
     Ok(())
 }
@@ -207,8 +209,11 @@ fn paginate<T>(
     } else {
         let decoded = engine
             .decode(request.page_token.as_bytes())
-            .map_err(|_| Error::invalid("invalid page token"))?;
-        Some(String::from_utf8(decoded).map_err(|_| Error::invalid("invalid page token"))?)
+            .map_err(|_| Error::invalid_argument("invalid page token"))?;
+        Some(
+            String::from_utf8(decoded)
+                .map_err(|_| Error::invalid_argument("invalid page token"))?,
+        )
     };
     let items: Vec<(String, T)> = items.into_iter().collect();
     let start = after
@@ -238,9 +243,9 @@ fn acquire_fingerprint(request: &AcquireRequest) -> String {
     let identity = (
         &request.pool,
         &request.template,
-        request.shape,
+        &request.shape,
         &request.requires,
-        request.purpose,
+        &request.purpose,
         &request.network,
         &request.mounts,
         &request.sockets,
@@ -362,7 +367,7 @@ struct PlacementSpec {
     network: NetworkPolicy,
     mounts: Vec<Mount>,
     sockets: Vec<SocketMount>,
-    options: BTreeMap<String, String>,
+    options: StringMap,
     requires: Requirements,
     snapshot_capable: bool,
 }
@@ -391,7 +396,7 @@ impl PlacementSpec {
             features: requires.features.clone(),
             capabilities: requires.capabilities.clone(),
             snapshot_capable: self.snapshot_capable,
-            network: self.network.mode,
+            network: self.network.mode.as_known().unwrap_or_default(),
             host_mounts: !self.mounts.is_empty(),
             socket_mounts: !self.sockets.is_empty(),
         }
@@ -958,7 +963,10 @@ impl Service {
             .iter()
             .filter(|s| {
                 s.lease_id.is_empty()
-                    && matches!(s.state, SandboxState::Ready | SandboxState::Provisioning)
+                    && matches!(
+                        s.state.known(),
+                        SandboxState::Ready | SandboxState::Provisioning
+                    )
             })
             .count() as u32;
         self.config
@@ -995,22 +1003,24 @@ impl Service {
         validate_name("template", &spec.name)?;
         let sources = [
             !spec.artifacts.is_empty(),
-            spec.recipe.is_some(),
-            spec.snapshot_of.is_some(),
+            spec.recipe().is_some(),
+            spec.snapshot_of().is_some(),
         ];
         if sources.iter().filter(|set| **set).count() != 1 {
-            return Err(Error::invalid(
+            return Err(Error::invalid_argument(
                 "exactly one template source is required: artifacts, recipe, or snapshotOf",
             ));
         }
-        if spec.snapshot_of.is_some() {
-            return Err(Error::invalid("snapshot templates are created by Snapshot"));
+        if spec.snapshot_of().is_some() {
+            return Err(Error::invalid_argument(
+                "snapshot templates are created by Snapshot",
+            ));
         }
         let mut seen = std::collections::BTreeSet::new();
         for artifact in &spec.artifacts {
-            artifact.validate().map_err(Error::invalid)?;
+            artifact.validate().map_err(Error::invalid_argument)?;
             if !seen.insert((artifact.format.as_str(), artifact.arch.as_str())) {
-                return Err(Error::invalid(format!(
+                return Err(Error::invalid_argument(format!(
                     "artifact for format `{}` and arch `{}` is declared twice",
                     artifact.format, artifact.arch
                 )));
@@ -1019,7 +1029,7 @@ impl Service {
         let template = Template {
             digest: template_digest(&spec),
             created_at: now(),
-            spec,
+            spec: spec.into(),
             ..Template::default()
         };
         let ops = {
@@ -1044,7 +1054,7 @@ impl Service {
         let ops = {
             let mut state = self.state.lock();
             if let Some(pool) = state.pools.values().find(|p| p.template == name) {
-                return Err(Error::precondition(format!(
+                return Err(Error::failed_precondition(format!(
                     "template `{name}` is used by pool `{}`",
                     pool.name
                 )));
@@ -1080,6 +1090,7 @@ impl Service {
         Ok(ListTemplatesResponse {
             templates,
             next_page_token,
+            ..ListTemplatesResponse::default()
         })
     }
 
@@ -1122,6 +1133,7 @@ impl Service {
         Ok(ListPoolsResponse {
             pools,
             next_page_token,
+            ..ListPoolsResponse::default()
         })
     }
 
@@ -1164,8 +1176,8 @@ impl Service {
         let placement = PlacementSpec {
             requires: template.spec.requires.merged(&pool.requires).merged(extra),
             template,
-            shape: pool.shape,
-            network: pool.network.clone(),
+            shape: (*pool.shape).clone(),
+            network: (*pool.network).clone(),
             mounts: pool.mounts.clone(),
             sockets: pool.sockets.clone(),
             options: pool.options.clone(),
@@ -1185,8 +1197,8 @@ impl Service {
                 let placement = PlacementSpec {
                     requires: template.spec.requires.merged(&pool.requires),
                     template: template.clone(),
-                    shape: pool.shape,
-                    network: pool.network.clone(),
+                    shape: (*pool.shape).clone(),
+                    network: (*pool.network).clone(),
                     mounts: pool.mounts.clone(),
                     sockets: pool.sockets.clone(),
                     options: pool.options.clone(),
@@ -1288,7 +1300,7 @@ impl Service {
                 {
                     reasons.push(format!("network={mode:?}"));
                 }
-                if template.spec.recipe.is_some() && template.native_ref.is_empty() {
+                if template.spec.recipe().is_some() && template.native_ref.is_empty() {
                     // Recipes are driver-specific; the template names its driver
                     // through `requires.driver`.
                     if requires.driver.is_empty() && template.spec.requires.driver.is_empty() {
@@ -1351,7 +1363,7 @@ impl Service {
                     "no provider is online for this template",
                 ));
             }
-            return Err(Error::precondition(format!(
+            return Err(Error::failed_precondition(format!(
                 "no provider satisfies template `{}`: {}",
                 template.spec.name,
                 unmet.join("; ")
@@ -1389,28 +1401,31 @@ impl Service {
             pool: pool.to_owned(),
             provider_id: provider_id.clone(),
             driver: driver.clone(),
-            state: SandboxState::Provisioning,
-            purpose,
+            state: SandboxState::Provisioning.into(),
+            purpose: purpose.into(),
             created_at: now(),
             ..Sandbox::default()
         };
         let sandbox_driver = driver.clone();
-        let work = WorkItem {
-            id: new_id("wrk"),
-            create: Some(CreateWork {
-                sandbox_id: id.clone(),
-                name: name.to_owned(),
-                driver,
-                template: placement.template,
-                shape: placement.shape,
-                network: placement.network,
-                mounts: placement.mounts,
-                sockets: placement.sockets,
-                options: placement.options,
-                snapshot_capable: placement.snapshot_capable,
-            }),
-            ..WorkItem::default()
-        };
+        let work = WorkItem::new(
+            new_id("wrk"),
+            work_item::Work::Create(
+                CreateWork {
+                    sandbox_id: id.clone(),
+                    name: name.to_owned(),
+                    driver,
+                    template: placement.template.into(),
+                    shape: placement.shape.into(),
+                    network: placement.network.into(),
+                    mounts: placement.mounts,
+                    sockets: placement.sockets,
+                    options: placement.options,
+                    snapshot_capable: placement.snapshot_capable,
+                    ..CreateWork::default()
+                }
+                .into(),
+            ),
+        );
         self.enqueue(
             state,
             &provider_id,
@@ -1519,14 +1534,17 @@ impl Service {
         if sandbox.state.is_terminal() || sandbox.native_ref.is_empty() {
             return;
         }
-        let work = WorkItem {
-            id: new_id("wrk"),
-            cancel_exec: Some(CancelExecWork {
-                exec_id: exec_id.to_owned(),
-                target: Self::target(sandbox),
-            }),
-            ..WorkItem::default()
-        };
+        let work = WorkItem::new(
+            new_id("wrk"),
+            work_item::Work::CancelExec(
+                CancelExecWork {
+                    exec_id: exec_id.to_owned(),
+                    target: Self::target(sandbox).into(),
+                    ..CancelExecWork::default()
+                }
+                .into(),
+            ),
+        );
         let _ = self.enqueue_work(state, &sandbox.provider_id, work);
     }
 
@@ -1535,11 +1553,12 @@ impl Service {
             sandbox_id: sandbox.id.clone(),
             driver: sandbox.driver.clone(),
             native_ref: sandbox.native_ref.clone(),
+            ..SandboxWork::default()
         }
     }
 
     fn destroy_locked(&self, state: &mut State, id: &str, ops: &mut Vec<Op>) {
-        match state.sandboxes.get(id).map(|sandbox| sandbox.state) {
+        match state.sandboxes.get(id).map(|sandbox| sandbox.state.known()) {
             None => return,
             Some(SandboxState::Gone | SandboxState::Terminating) => return,
             Some(_) => {}
@@ -1550,7 +1569,7 @@ impl Service {
             // Never created (or still provisioning): drop the record; a late
             // create report finds no record and the reconcile removes the
             // orphan.
-            sandbox.state = SandboxState::Gone;
+            sandbox.state = SandboxState::Gone.into();
             let id = id.to_owned();
             state.sandboxes.remove(&id);
             state.created_at.remove(&id);
@@ -1558,14 +1577,13 @@ impl Service {
             ops.push(self.remove(Kind::Sandboxes, &id));
             return;
         }
-        sandbox.state = SandboxState::Terminating;
+        sandbox.state = SandboxState::Terminating.into();
         let snapshot = sandbox.clone();
         ops.push(self.put(Kind::Sandboxes, id, &snapshot));
-        let work = WorkItem {
-            id: new_id("wrk"),
-            destroy: Some(Self::target(&snapshot)),
-            ..WorkItem::default()
-        };
+        let work = WorkItem::new(
+            new_id("wrk"),
+            work_item::Work::Destroy(Self::target(&snapshot).into()),
+        );
         if self
             .enqueue(
                 state,
@@ -1597,11 +1615,10 @@ impl Service {
         let Some(sandbox) = state.sandboxes.get(id).cloned() else {
             return false;
         };
-        let work = WorkItem {
-            id: new_id("wrk"),
-            destroy: Some(Self::target(&sandbox)),
-            ..WorkItem::default()
-        };
+        let work = WorkItem::new(
+            new_id("wrk"),
+            work_item::Work::Destroy(Self::target(&sandbox).into()),
+        );
         let queued = self
             .enqueue(
                 state,
@@ -1627,7 +1644,7 @@ impl Service {
         close_execs(state, id, reason);
         if let Some(sandbox) = state.sandboxes.get_mut(id) {
             warn!(sandbox = id, reason, "sandbox failed");
-            sandbox.state = SandboxState::Failed;
+            sandbox.state = SandboxState::Failed.into();
             sandbox.error = reason.to_owned();
             ops.push(self.put(Kind::Sandboxes, id, &*sandbox));
             if !sandbox.pool.is_empty() {
@@ -1681,10 +1698,12 @@ impl Service {
         // second preserve extends that window instead of destroying.
         if preserve
             && !failed
-            && state
-                .sandboxes
-                .get(&lease.sandbox_id)
-                .is_some_and(|s| matches!(s.state, SandboxState::Leased | SandboxState::Preserved))
+            && state.sandboxes.get(&lease.sandbox_id).is_some_and(|s| {
+                matches!(
+                    s.state.known(),
+                    SandboxState::Leased | SandboxState::Preserved
+                )
+            })
         {
             let ttl = if preserve_ttl == 0 {
                 self.config.preserve_ttl.as_secs()
@@ -1693,7 +1712,7 @@ impl Service {
             };
             let until = now() + ttl as i64;
             if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
-                sandbox.state = SandboxState::Preserved;
+                sandbox.state = SandboxState::Preserved.into();
                 sandbox.preserve_until = until;
                 ops.push(self.put(Kind::Sandboxes, &lease.sandbox_id, &*sandbox));
             }
@@ -1745,10 +1764,10 @@ impl Service {
 
     async fn acquire_inner(self: &Arc<Self>, request: AcquireRequest) -> Result<AcquireResponse> {
         if request.idempotency_key.is_empty() {
-            return Err(Error::invalid("idempotencyKey is required"));
+            return Err(Error::invalid_argument("idempotencyKey is required"));
         }
         if request.pool.is_empty() == request.template.is_empty() {
-            return Err(Error::invalid(
+            return Err(Error::invalid_argument(
                 "exactly one of pool or template is required",
             ));
         }
@@ -1769,7 +1788,11 @@ impl Service {
                 Step::Ready(ready) => {
                     let (lease, sandbox) = *ready;
                     self.inject(&lease, &sandbox, &request.inject).await?;
-                    return Ok(AcquireResponse { lease, sandbox });
+                    return Ok(AcquireResponse {
+                        lease: lease.into(),
+                        sandbox: sandbox.into(),
+                        ..AcquireResponse::default()
+                    });
                 }
                 Step::Wait(last) => {
                     if tokio::time::timeout_at(deadline, changed).await.is_err() {
@@ -1805,7 +1828,7 @@ impl Service {
         if let Some(lease_id) = state.lease_by_key.get(&request.idempotency_key).cloned() {
             let stored = state.leases[&lease_id].request_hash.as_str();
             if !stored.is_empty() && stored != fingerprint {
-                return Err(Error::invalid(format!(
+                return Err(Error::invalid_argument(format!(
                     "idempotency key `{}` was used for a different acquire request",
                     request.idempotency_key
                 )));
@@ -1824,7 +1847,7 @@ impl Service {
                 .get(&lease.sandbox_id)
                 .cloned()
                 .ok_or_else(|| Error::not_found("leased sandbox is gone"))?;
-            return match sandbox.state {
+            return match sandbox.state.known() {
                 SandboxState::Leased | SandboxState::Paused | SandboxState::Preserved => {
                     Ok(Step::Ready(Box::new((lease, sandbox))))
                 }
@@ -1909,7 +1932,7 @@ impl Service {
                             state,
                             placement,
                             &pool.name,
-                            request.purpose,
+                            request.purpose.as_known().unwrap_or_default(),
                             "",
                             ops,
                         )?,
@@ -1929,8 +1952,8 @@ impl Service {
             let placement = PlacementSpec {
                 requires: template.spec.requires.merged(&request.requires),
                 template,
-                shape: request.shape,
-                network: request.network.clone(),
+                shape: (*request.shape).clone(),
+                network: (*request.network).clone(),
                 mounts: request.mounts.clone(),
                 sockets: request.sockets.clone(),
                 options: request.options.clone(),
@@ -1941,7 +1964,7 @@ impl Service {
                     state,
                     (placement, provider, driver),
                     "",
-                    request.purpose,
+                    request.purpose.as_known().unwrap_or_default(),
                     &request.name,
                     ops,
                 )?,
@@ -1957,6 +1980,7 @@ impl Service {
             expires_at: now() + ttl as i64,
             env: request.inject.env.clone(),
             request_hash: fingerprint.to_owned(),
+            ..Lease::default()
         };
         let sandbox = state
             .sandboxes
@@ -1966,7 +1990,7 @@ impl Service {
         sandbox.purpose = request.purpose;
         sandbox.name = request.name.clone();
         if sandbox.state == SandboxState::Ready {
-            sandbox.state = SandboxState::Leased;
+            sandbox.state = SandboxState::Leased.into();
         }
         let ready = sandbox.state == SandboxState::Leased;
         let snapshot = sandbox.clone();
@@ -2004,7 +2028,10 @@ impl Service {
             for spec in &inject.files {
                 let path = spec.path.trim_start_matches('/');
                 if path.is_empty() || path.split('/').any(|p| p == "..") {
-                    return Err(Error::invalid(format!("bad inject path `{}`", spec.path)));
+                    return Err(Error::invalid_argument(format!(
+                        "bad inject path `{}`",
+                        spec.path
+                    )));
                 }
                 let mut header = tar::Header::new_gnu();
                 header.set_size(spec.data.len() as u64);
@@ -2042,7 +2069,7 @@ impl Service {
             let sandbox_state = state
                 .sandboxes
                 .get(&sandbox_id)
-                .map(|sandbox| sandbox.state);
+                .map(|sandbox| sandbox.state.known());
             match sandbox_state {
                 Some(SandboxState::Failed) => {
                     let reason = &state.sandboxes[&sandbox_id].error;
@@ -2051,12 +2078,12 @@ impl Service {
                     } else {
                         format!(": {reason}")
                     };
-                    return Err(Error::precondition(format!(
+                    return Err(Error::failed_precondition(format!(
                         "sandbox {sandbox_id} failed{detail}"
                     )));
                 }
                 Some(SandboxState::Terminating | SandboxState::Gone) => {
-                    return Err(Error::precondition(format!(
+                    return Err(Error::failed_precondition(format!(
                         "sandbox {sandbox_id} is being destroyed"
                     )));
                 }
@@ -2094,7 +2121,7 @@ impl Service {
             self.release_locked(
                 &mut state,
                 &request.lease_id,
-                request.mode,
+                request.mode.as_known().unwrap_or_default(),
                 request.preserve_ttl_secs,
                 &mut ops,
             );
@@ -2155,6 +2182,7 @@ impl Service {
         Ok(ListSandboxesResponse {
             sandboxes,
             next_page_token,
+            ..ListSandboxesResponse::default()
         })
     }
 
@@ -2181,6 +2209,7 @@ impl Service {
         Ok(ListProvidersResponse {
             providers,
             next_page_token,
+            ..ListProvidersResponse::default()
         })
     }
 
@@ -2199,28 +2228,34 @@ impl Service {
                     .values()
                     .filter(|sandbox| sandbox.provider_id == rec.provider.id)
                     .map(|sandbox| SandboxStats {
-                        sandbox: sandbox.clone(),
+                        sandbox: sandbox.clone().into(),
                         runtime: rec
                             .sandbox_stats
                             .get(&sandbox.native_ref)
                             .cloned()
-                            .unwrap_or_default(),
+                            .unwrap_or_default()
+                            .into(),
+                        ..SandboxStats::default()
                     })
                     .collect();
                 ProviderStats {
                     provider_id: rec.provider.id.clone(),
                     name: rec.provider.name.clone(),
                     drivers: rec.provider.drivers.clone(),
-                    host: rec.host.clone().unwrap_or_default(),
+                    host: rec.host.clone().unwrap_or_default().into(),
                     host_sample_age_secs: rec
                         .host_sampled_at
                         .map(|at| at.elapsed().as_secs() as i64)
                         .unwrap_or(0),
                     sandboxes,
+                    ..ProviderStats::default()
                 }
             })
             .collect();
-        StatsResponse { providers }
+        StatsResponse {
+            providers,
+            ..StatsResponse::default()
+        }
     }
 
     /// PEM of the service CA, when TLS is configured.
@@ -2229,13 +2264,13 @@ impl Service {
     }
 
     fn usable(sandbox: &Sandbox) -> Result<()> {
-        match sandbox.state {
+        match sandbox.state.known() {
             SandboxState::Leased | SandboxState::Preserved | SandboxState::Ready => Ok(()),
-            SandboxState::Stopped => Err(Error::precondition(format!(
+            SandboxState::Stopped => Err(Error::failed_precondition(format!(
                 "sandbox {} is stopped; start it first",
                 sandbox.id
             ))),
-            state => Err(Error::precondition(format!(
+            state => Err(Error::failed_precondition(format!(
                 "sandbox {} is {state:?}",
                 sandbox.id
             ))),
@@ -2253,7 +2288,7 @@ impl Service {
     ) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         let _span = tracing::info_span!("sandbox.exec", sandbox_id = %request.sandbox_id).entered();
         if request.argv.is_empty() {
-            return Err(Error::invalid("argv is required"));
+            return Err(Error::invalid_argument("argv is required"));
         }
         let mut state = self.state.lock();
         let sandbox = state
@@ -2290,15 +2325,18 @@ impl Service {
                 finished: finished.clone(),
             },
         );
-        let work = WorkItem {
-            id: work_id,
-            exec: Some(ExecWork {
-                exec_id: exec_id.clone(),
-                target: Self::target(&sandbox),
-                request: merged,
-            }),
-            ..WorkItem::default()
-        };
+        let work = WorkItem::new(
+            work_id,
+            work_item::Work::Exec(
+                ExecWork {
+                    exec_id: exec_id.clone(),
+                    target: Self::target(&sandbox).into(),
+                    request: merged.into(),
+                    ..ExecWork::default()
+                }
+                .into(),
+            ),
+        );
         if let Err(error) = self.enqueue(
             &mut state,
             &sandbox.provider_id,
@@ -2358,14 +2396,14 @@ impl Service {
 
     /// `OpenStream`: issue a ticket.
     pub fn open_stream(&self, request: OpenStreamRequest) -> Result<Ticket> {
-        if request.kind == StreamKind::StreamKindUnspecified {
-            return Err(Error::invalid("kind is required"));
+        if request.kind.as_known().unwrap_or_default() == StreamKind::StreamKindUnspecified {
+            return Err(Error::invalid_argument("kind is required"));
         }
         let windows_absolute = request.path.len() > 2
             && request.path.as_bytes()[0].is_ascii_alphabetic()
             && request.path.as_bytes()[1] == b':';
         if !request.path.starts_with('/') && !windows_absolute {
-            return Err(Error::invalid("path must be absolute"));
+            return Err(Error::invalid_argument("path must be absolute"));
         }
         let mut state = self.state.lock();
         let sandbox = state
@@ -2381,7 +2419,7 @@ impl Service {
             ticket.clone(),
             Blob {
                 sandbox_id: request.sandbox_id,
-                kind: request.kind,
+                kind: request.kind.as_known().unwrap_or_default(),
                 guest_path: request.path,
                 token: token.clone(),
                 expires_at,
@@ -2392,6 +2430,7 @@ impl Service {
             url: format!("/sandbox/v1/streams/{ticket}"),
             token,
             expires_at,
+            ..Ticket::default()
         })
     }
 
@@ -2538,16 +2577,19 @@ impl Service {
                 .get(sandbox_id)
                 .cloned()
                 .ok_or_else(|| Error::not_found("sandbox not found"))?;
-            let work = WorkItem {
-                id: new_id("wrk"),
-                copy: Some(CopyWork {
-                    target: Self::target(&sandbox),
-                    ticket: ticket.to_owned(),
-                    path: guest_path.to_owned(),
-                    kind,
-                }),
-                ..WorkItem::default()
-            };
+            let work = WorkItem::new(
+                new_id("wrk"),
+                work_item::Work::Copy(
+                    CopyWork {
+                        target: Self::target(&sandbox).into(),
+                        ticket: ticket.to_owned(),
+                        path: guest_path.to_owned(),
+                        kind: kind.into(),
+                        ..CopyWork::default()
+                    }
+                    .into(),
+                ),
+            );
             self.enqueue(
                 &mut state,
                 &sandbox.provider_id,
@@ -2599,13 +2641,13 @@ impl Service {
                 .ok_or_else(|| Error::not_found("sandbox not found"))?;
             authorize(&state, &sandbox, &request.lease_id)?;
             if sandbox.state != SandboxState::Leased {
-                return Err(Error::precondition(
+                return Err(Error::failed_precondition(
                     "only a leased sandbox can be snapshotted",
                 ));
             }
             let caps = self.driver_caps(&state, &sandbox)?;
             if !caps.snapshot {
-                return Err(Error::precondition(format!(
+                return Err(Error::failed_precondition(format!(
                     "{}: snapshot unsupported",
                     sandbox.driver
                 )));
@@ -2615,14 +2657,17 @@ impl Service {
                 .get(&sandbox.template)
                 .cloned()
                 .unwrap_or_default();
-            let work = WorkItem {
-                id: new_id("wrk"),
-                snapshot: Some(SnapshotWork {
-                    target: Self::target(&sandbox),
-                    template: request.name.clone(),
-                }),
-                ..WorkItem::default()
-            };
+            let work = WorkItem::new(
+                new_id("wrk"),
+                work_item::Work::Snapshot(
+                    SnapshotWork {
+                        target: Self::target(&sandbox).into(),
+                        template: request.name.clone(),
+                        ..SnapshotWork::default()
+                    }
+                    .into(),
+                ),
+            );
             self.enqueue(
                 &mut state,
                 &sandbox.provider_id,
@@ -2638,18 +2683,19 @@ impl Service {
         let spec = TemplateSpec {
             name: request.name.clone(),
             os: source_template.spec.os.clone(),
-            snapshot_of: Some(sandbox.id.clone()),
+            source: Some(template_spec::Source::SnapshotOf(sandbox.id.clone())),
             requires: source_template.spec.requires.clone(),
             labels: source_template.spec.labels.clone(),
             ..TemplateSpec::default()
         };
         let template = Template {
             digest: template_digest(&spec),
-            spec,
+            spec: spec.into(),
             provider_id: sandbox.provider_id.clone(),
             driver: sandbox.driver.clone(),
             native_ref,
             created_at: now(),
+            ..Template::default()
         };
         let ops = {
             let mut state = self.state.lock();
@@ -2681,15 +2727,18 @@ impl Service {
     }
 
     fn drop_snapshot_locked(&self, state: &mut State, template: &Template) {
-        let work = WorkItem {
-            id: new_id("wrk"),
-            destroy: Some(SandboxWork {
-                sandbox_id: String::new(),
-                driver: template.driver.clone(),
-                native_ref: format!("snapshot:{}", template.native_ref),
-            }),
-            ..WorkItem::default()
-        };
+        let work = WorkItem::new(
+            new_id("wrk"),
+            work_item::Work::Destroy(
+                SandboxWork {
+                    sandbox_id: String::new(),
+                    driver: template.driver.clone(),
+                    native_ref: format!("snapshot:{}", template.native_ref),
+                    ..SandboxWork::default()
+                }
+                .into(),
+            ),
+        );
         let _ = self.enqueue(
             state,
             &template.provider_id,
@@ -2710,7 +2759,7 @@ impl Service {
                     .iter()
                     .find(|d| d.driver == sandbox.driver)
             })
-            .map(|d| d.capabilities.clone())
+            .map(|d| (*d.capabilities).clone())
             .ok_or_else(|| Error::unavailable("sandbox provider is gone"))
     }
 
@@ -2736,7 +2785,7 @@ impl Service {
             authorize(&state, &sandbox, lease_id)?;
             let caps = self.driver_caps(&state, &sandbox)?;
             if !caps.pause {
-                return Err(Error::precondition(format!(
+                return Err(Error::failed_precondition(format!(
                     "{}: stop/start unsupported",
                     sandbox.driver
                 )));
@@ -2744,22 +2793,24 @@ impl Service {
             let target = Self::target(&sandbox);
             let (work, kind) = match op {
                 PowerOp::Stop => (
-                    WorkItem {
-                        id: new_id("wrk"),
-                        stop: Some(target),
-                        ..WorkItem::default()
-                    },
+                    WorkItem::new(new_id("wrk"), work_item::Work::Stop(target.into())),
                     Pending::Stop {
                         sandbox_id: id.to_owned(),
                         reply: tx,
                     },
                 ),
                 PowerOp::Start { forkable } => (
-                    WorkItem {
-                        id: new_id("wrk"),
-                        start: Some(StartWork { target, forkable }),
-                        ..WorkItem::default()
-                    },
+                    WorkItem::new(
+                        new_id("wrk"),
+                        work_item::Work::Start(
+                            StartWork {
+                                target: target.into(),
+                                forkable,
+                                ..StartWork::default()
+                            }
+                            .into(),
+                        ),
+                    ),
                     Pending::Start {
                         sandbox_id: id.to_owned(),
                         forkable,
@@ -2798,7 +2849,7 @@ impl Service {
             authorize(&state, &sandbox, lease_id)?;
             let caps = self.driver_caps(&state, &sandbox)?;
             if !caps.pause {
-                return Err(Error::precondition(format!(
+                return Err(Error::failed_precondition(format!(
                     "{}: pause unsupported",
                     sandbox.driver
                 )));
@@ -2806,11 +2857,7 @@ impl Service {
             let target = Self::target(&sandbox);
             let (work, kind) = if pause {
                 (
-                    WorkItem {
-                        id: new_id("wrk"),
-                        pause: Some(target),
-                        ..WorkItem::default()
-                    },
+                    WorkItem::new(new_id("wrk"), work_item::Work::Pause(target.into())),
                     Pending::Pause {
                         sandbox_id: id.to_owned(),
                         reply: tx,
@@ -2818,11 +2865,7 @@ impl Service {
                 )
             } else {
                 (
-                    WorkItem {
-                        id: new_id("wrk"),
-                        resume: Some(target),
-                        ..WorkItem::default()
-                    },
+                    WorkItem::new(new_id("wrk"), work_item::Work::Resume(target.into())),
                     Pending::Resume {
                         sandbox_id: id.to_owned(),
                         reply: tx,
@@ -2857,7 +2900,7 @@ impl Service {
     /// Find a provider by its registered name, falling back to its id.
     fn provider_id_for(state: &State, reference: &str) -> Result<String> {
         if reference.is_empty() {
-            return Err(Error::invalid("provider name is required"));
+            return Err(Error::invalid_argument("provider name is required"));
         }
         for (id, rec) in &state.providers {
             if id == reference || rec.provider.name == reference {
@@ -2926,6 +2969,7 @@ impl Service {
                 DrainProviderResult {
                     released_pool_members,
                     leased_remaining,
+                    ..DrainProviderResult::default()
                 },
                 ops,
             )
@@ -2967,7 +3011,14 @@ impl Service {
         enrolled: Option<&str>,
     ) -> Result<RegisterResponse> {
         if request.name.is_empty() {
-            return Err(Error::invalid("name is required"));
+            return Err(Error::invalid_argument("name is required"));
+        }
+        if request.protocol_version != crate::PROTOCOL_VERSION {
+            return Err(Error::failed_precondition(format!(
+                "agent speaks protocol version {}, this service speaks protocol version {}",
+                request.protocol_version,
+                crate::PROTOCOL_VERSION
+            )));
         }
         let (response, ops) = {
             let mut state = self.state.lock();
@@ -3016,6 +3067,7 @@ impl Service {
                 last_seen: now(),
                 cordoned,
                 certificates,
+                ..Provider::default()
             };
             // Everything the old generation had queued or in flight is
             // unacknowledged: hand it to the new one.
@@ -3050,6 +3102,7 @@ impl Service {
                 RegisterResponse {
                     provider_id: id,
                     generation,
+                    ..RegisterResponse::default()
                 },
                 ops,
             )
@@ -3065,7 +3118,7 @@ impl Service {
     /// Mint a single-use join token for provider enrollment.
     pub async fn create_join_token(&self, ttl: Duration) -> Result<CreateJoinTokenResponse> {
         let ca = self.config.ca.as_ref().ok_or_else(|| {
-            Error::precondition("enrollment is unavailable: the service has no TLS CA")
+            Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
         })?;
         let ttl = if ttl.is_zero() {
             Duration::from_secs(3600)
@@ -3090,6 +3143,7 @@ impl Service {
         Ok(CreateJoinTokenResponse {
             token: tls::join_token(&id, &secret, ca.sha256_hex()),
             expires_at,
+            ..CreateJoinTokenResponse::default()
         })
     }
 
@@ -3122,7 +3176,7 @@ impl Service {
     /// is removed whether or not binding the provider then succeeds.
     pub async fn enroll(&self, request: EnrollRequest) -> Result<EnrollResponse> {
         let ca = self.config.ca.clone().ok_or_else(|| {
-            Error::precondition("enrollment is unavailable: the service has no TLS CA")
+            Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
         })?;
         let parts = tls::parse_join_token(&request.token)?;
         if !constant_time_eq(parts.ca_sha256.as_bytes(), ca.sha256_hex().as_bytes()) {
@@ -3184,6 +3238,7 @@ impl Service {
             provider.certificates = vec![ProviderCertificate {
                 sha256: signed.sha256.clone(),
                 expires_at: signed.expires_at,
+                ..ProviderCertificate::default()
             }];
             state.providers.insert(
                 id.clone(),
@@ -3208,6 +3263,7 @@ impl Service {
             cert_pem: signed.cert_pem,
             ca_pem: ca.pem().to_owned(),
             expires_at: signed.expires_at,
+            ..EnrollResponse::default()
         })
     }
 
@@ -3221,7 +3277,7 @@ impl Service {
         fingerprint_sha256: &str,
     ) -> Result<RenewCertificateResponse> {
         let ca = self.config.ca.clone().ok_or_else(|| {
-            Error::precondition("enrollment is unavailable: the service has no TLS CA")
+            Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
         })?;
         let (signed, ops) = {
             let mut state = self.state.lock();
@@ -3250,6 +3306,7 @@ impl Service {
             rec.provider.certificates.push(ProviderCertificate {
                 sha256: signed.sha256.clone(),
                 expires_at: signed.expires_at,
+                ..ProviderCertificate::default()
             });
             rec.seen = Instant::now();
             rec.provider.last_seen = t;
@@ -3260,6 +3317,7 @@ impl Service {
         Ok(RenewCertificateResponse {
             cert_pem: signed.cert_pem,
             expires_at: signed.expires_at,
+            ..RenewCertificateResponse::default()
         })
     }
 
@@ -3334,7 +3392,7 @@ impl Service {
         if let Some(rec) = state.providers.get_mut(&request.provider_id) {
             rec.seen = Instant::now();
             rec.provider.last_seen = now();
-            if let Some(host) = request.host {
+            if let Some(host) = request.host.into_option() {
                 rec.host = Some(host);
                 rec.host_sampled_at = Some(Instant::now());
             }
@@ -3398,7 +3456,10 @@ impl Service {
                     work.push(item);
                 }
                 if !work.is_empty() {
-                    return Ok(PollResponse { work });
+                    return Ok(PollResponse {
+                        work,
+                        ..PollResponse::default()
+                    });
                 }
                 let next = rec.in_flight.values().map(|item| item.visible_at).min();
                 (rec.wake.clone(), next)
@@ -3476,15 +3537,18 @@ impl Service {
                 Ok(native_ref) => {
                     let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id) else {
                         // Released while provisioning: destroy the late machine.
-                        let work = WorkItem {
-                            id: new_id("wrk"),
-                            destroy: Some(SandboxWork {
-                                sandbox_id: sandbox_id.clone(),
-                                driver,
-                                native_ref,
-                            }),
-                            ..WorkItem::default()
-                        };
+                        let work = WorkItem::new(
+                            new_id("wrk"),
+                            work_item::Work::Destroy(
+                                SandboxWork {
+                                    sandbox_id: sandbox_id.clone(),
+                                    driver,
+                                    native_ref,
+                                    ..SandboxWork::default()
+                                }
+                                .into(),
+                            ),
+                        );
                         let _ = self.enqueue(
                             state,
                             &provider_id,
@@ -3498,13 +3562,14 @@ impl Service {
                         SandboxState::Ready
                     } else {
                         SandboxState::Leased
-                    };
+                    }
+                    .into();
                     ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
                     state.created_at.remove(&sandbox_id);
                 }
                 Err(error) => {
                     self.config.metrics.record_create_failure("reported");
-                    self.fail_locked(state, &sandbox_id, &error.message, ops);
+                    self.fail_locked(state, &sandbox_id, crate::error::message(&error), ops);
                 }
             },
             Pending::Destroy { sandbox_id } => {
@@ -3535,7 +3600,7 @@ impl Service {
                 if result.is_ok()
                     && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
                 {
-                    sandbox.state = SandboxState::Paused;
+                    sandbox.state = SandboxState::Paused.into();
                     ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
                 }
                 let _ = reply.send(result);
@@ -3544,7 +3609,7 @@ impl Service {
                 if result.is_ok()
                     && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
                 {
-                    sandbox.state = SandboxState::Stopped;
+                    sandbox.state = SandboxState::Stopped.into();
                     ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
                 }
                 let _ = reply.send(result);
@@ -3561,7 +3626,8 @@ impl Service {
                         SandboxState::Ready
                     } else {
                         SandboxState::Leased
-                    };
+                    }
+                    .into();
                     if forkable {
                         sandbox.error.clear();
                     }
@@ -3577,7 +3643,8 @@ impl Service {
                         SandboxState::Preserved
                     } else {
                         SandboxState::Leased
-                    };
+                    }
+                    .into();
                     ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
                 }
                 let _ = reply.send(result);
@@ -3630,7 +3697,7 @@ impl Service {
         };
         let mut exited = false;
         for event in request.events {
-            let exit = event.exit_code.is_some();
+            let exit = matches!(event.event, Some(exec_event::Event::ExitCode(_)));
             if tx.send(Ok(event)).await.is_err() {
                 // The caller dropped its stream: leave the state for the
                 // disconnect watcher, which cancels the guest command.
@@ -3768,13 +3835,20 @@ impl Service {
                         sandbox_id: item.sandbox_id.clone(),
                         driver: item.driver.clone(),
                         native_ref: item.native_ref.clone(),
+                        ..SandboxWork::default()
                     });
                 }
             }
             self.config
                 .metrics
                 .record_reconcile_orphans(destroy.len() as u64);
-            (ReconcileResponse { destroy }, ops)
+            (
+                ReconcileResponse {
+                    destroy,
+                    ..ReconcileResponse::default()
+                },
+                ops,
+            )
         };
         self.persist(ops).await;
         self.changed.notify_waiters();
@@ -3848,7 +3922,10 @@ fn record_exec_metrics(
             }
             match stream.next().await {
                 Some(Ok(event)) => {
-                    if let Some(code) = event.exit_code {
+                    if let Some(code) = match event.event {
+                        Some(exec_event::Event::ExitCode(code)) => Some(code),
+                        _ => None,
+                    } {
                         let class = if code == 0 { "success" } else { "failure" };
                         metrics.record_exec(started.elapsed(), class);
                         Some((Ok(event), (stream, true)))
@@ -3879,14 +3956,11 @@ pub async fn collect_exec(
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     while let Some(event) = stream.next().await {
         let event = event?;
-        if let Some(bytes) = event.stdout {
-            stdout.extend(bytes);
-        }
-        if let Some(bytes) = event.stderr {
-            stderr.extend(bytes);
-        }
-        if let Some(code) = event.exit_code {
-            return Ok((code, stdout, stderr));
+        match event.event {
+            Some(exec_event::Event::Stdout(bytes)) => stdout.extend(bytes),
+            Some(exec_event::Event::Stderr(bytes)) => stderr.extend(bytes),
+            Some(exec_event::Event::ExitCode(code)) => return Ok((code, stdout, stderr)),
+            None => {}
         }
     }
     Err(Error::unavailable(

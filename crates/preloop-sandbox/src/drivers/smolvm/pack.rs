@@ -23,7 +23,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::api::Artifact;
-use crate::connect::{Code, Error, Result};
+use crate::error::{Code, Error, Result};
 
 /// Default cache budget: 50 GiB.
 pub const DEFAULT_CACHE_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
@@ -93,7 +93,7 @@ pub fn select_artifact<'a>(
         .map(|format| format.name())
         .collect::<Vec<_>>()
         .join(", ");
-    Err(Error::precondition(format!(
+    Err(Error::failed_precondition(format!(
         "no artifact for {arch}: template offers [{offered}], driver supports [{supported}]"
     )))
 }
@@ -113,7 +113,7 @@ impl PackFormat for SmolMachineFormat {
     }
 
     async fn materialize(&self, artifact: &Artifact, cache: &ArtifactCache) -> Result<LocalImage> {
-        artifact.validate().map_err(Error::invalid)?;
+        artifact.validate().map_err(Error::invalid_argument)?;
         // Holding a pin while the bytes are resolved keeps a concurrent GC
         // from deleting the entry before the caller can pin it itself.
         let _pin = cache.pin(&artifact.digest);
@@ -138,9 +138,9 @@ impl PackFormat for SmolMachineFormat {
         let partial = cache
             .root()
             .join(format!(".{hex}.{}.partial", uuid::Uuid::new_v4().simple()));
-        let stored = match artifact.reference.strip_prefix("file://") {
+        let stored = match artifact.reference().strip_prefix("file://") {
             Some(source) => copy_verified(Path::new(source), &partial, &artifact.digest).await,
-            None => fetch_oci_blob(&artifact.reference, &artifact.digest, &partial).await,
+            None => fetch_oci_blob(artifact.reference(), &artifact.digest, &partial).await,
         };
         if let Err(error) = stored {
             let _ = tokio::fs::remove_file(&partial).await;
@@ -171,8 +171,8 @@ impl PackFormat for OciImageFormat {
     }
 
     async fn materialize(&self, artifact: &Artifact, _cache: &ArtifactCache) -> Result<LocalImage> {
-        artifact.validate().map_err(Error::invalid)?;
-        Ok(LocalImage::Reference(artifact.reference.clone()))
+        artifact.validate().map_err(Error::invalid_argument)?;
+        Ok(LocalImage::Reference(artifact.reference().to_owned()))
     }
 }
 
@@ -408,7 +408,7 @@ fn digest_key(digest: &str) -> String {
 /// Copy a local pack into the cache, hashing as it goes.
 async fn copy_verified(source: &Path, target: &Path, expected: &str) -> Result<()> {
     let mut input = tokio::fs::File::open(source).await.map_err(|error| {
-        Error::precondition(format!("opening pack {}: {error}", source.display()))
+        Error::failed_precondition(format!("opening pack {}: {error}", source.display()))
     })?;
     let mut output = tokio::fs::File::create(target)
         .await
@@ -524,7 +524,7 @@ async fn fetch_oci_blob(reference: &str, expected: &str, target: &Path) -> Resul
 fn verify_digest(expected: &str, actual_hex: &str, subject: &str) -> Result<()> {
     let expected_hex = expected.strip_prefix("sha256:").unwrap_or(expected);
     if !expected_hex.eq_ignore_ascii_case(actual_hex) {
-        return Err(Error::precondition(format!(
+        return Err(Error::failed_precondition(format!(
             "{subject}: sha256 mismatch: expected sha256:{expected_hex}, got sha256:{actual_hex}"
         )));
     }
@@ -564,7 +564,7 @@ impl RegistryLocation {
             None => ("registry-1.docker.io".to_owned(), format!("library/{name}")),
         };
         if repository.is_empty() || registry.is_empty() {
-            return Err(Error::invalid(format!(
+            return Err(Error::invalid_argument(format!(
                 "`{reference}` is not a registry reference"
             )));
         }
