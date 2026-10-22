@@ -12,6 +12,12 @@
 //! `PRELOOP_RUNNER_BASE_IMAGE` still wins — there is no second config
 //! mechanism.
 //!
+//! Every question and line of output goes through [`Prompter`], so the same
+//! wizard can be driven by something other than a terminal: the CLI uses
+//! [`StdioPrompter`], `--json` captures the reused flow's output, and a host
+//! program (the TUI) calls [`run_wizard`] with its own prompts. The wizard
+//! never starts an engine — see [`WizardOutcome`].
+//!
 //! Golden work is deliberately *recorded*, not performed: the packed official
 //! golden is downloaded by the engine, and a custom base is baked by the pool
 //! on the next `serve`, into the same artifact path the engine already uses.
@@ -4183,6 +4189,22 @@ mod tests {
             0,
             "the flags answered every step: {}",
             prompter.prompts().join(", ")
+        );
+    }
+
+    /// [`run_wizard`] builds the runtime its network and container work
+    /// needs, so it must not be called from inside one: saying so beats the
+    /// panic `block_on` raises.
+    #[tokio::test]
+    async fn the_blocking_entry_point_refuses_to_run_inside_a_runtime() {
+        let mut prompter = crate::prompter::test_support::TestPrompter::new([]);
+        let error = run_wizard(&mut prompter, WizardOptions::embedded(InitArgs::default()))
+            .expect_err("a wizard inside an async runtime must be refused");
+        assert!(error.to_string().contains("blocking thread"), "{error}");
+        assert_eq!(
+            prompter.remaining_answers(),
+            0,
+            "nothing may be asked before the runtime check"
         );
     }
 
