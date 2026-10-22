@@ -288,6 +288,35 @@ impl ControlBackend for LiteBackend {
     async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError> {
         self.put_artifact_catalog(row).await
     }
+    async fn put_sarif_analysis(
+        &self,
+        analysis: NewSarifAnalysis,
+        findings: Vec<SarifFinding>,
+    ) -> Result<(SarifAnalysisRecord, bool), ControlError> {
+        self.put_sarif_analysis(analysis, findings).await
+    }
+    async fn sarif_analysis(
+        &self,
+        analysis_id: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError> {
+        self.sarif_analysis(analysis_id).await
+    }
+    async fn sarif_analysis_by_dedupe(
+        &self,
+        run_id: RunId,
+        dedupe_key: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError> {
+        self.sarif_analysis_by_dedupe(run_id, dedupe_key).await
+    }
+    async fn sarif_analyses(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<SarifAnalysisRecord>, ControlError> {
+        self.sarif_analyses(run_id).await
+    }
+    async fn sarif_findings(&self, analysis_id: &str) -> Result<Vec<SarifFinding>, ControlError> {
+        self.sarif_findings(analysis_id).await
+    }
     async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError> {
         self.create_log(plan_id).await
     }

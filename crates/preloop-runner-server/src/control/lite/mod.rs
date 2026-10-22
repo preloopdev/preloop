@@ -30,6 +30,7 @@ mod reaper;
 mod requests;
 mod rerun;
 mod runners;
+mod sarif;
 mod settle;
 mod steps;
 mod submit;

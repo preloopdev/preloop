@@ -97,6 +97,23 @@ jobs:
             -n golden-sbom-x86_64 -D dist
           test -s dist/preloop-ubuntu-24.04-x86_64.apt-sbom.cdx.json
 
+      - name: Download arm64 SBOM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest='[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last'
+          run_id="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=golden-sbom-aarch64&per_page=100" \
+            --jq "${latest} | .workflow_run.id // empty")"
+          if [ -z "$run_id" ]; then
+            echo "::error::no golden-sbom-aarch64 artifact; the Apple Silicon bake must upload the aarch64 apt SBOM"
+            exit 1
+          fi
+          gh run download "$run_id" \
+            -n golden-sbom-aarch64 -D dist-arm64
+          test -s dist-arm64/preloop-ubuntu-24.04-aarch64.apt-sbom.cdx.json
+
       - name: Install pinned Grype
         run: |
           set -euo pipefail
@@ -118,11 +135,21 @@ jobs:
             -o table -o json=dist/grype.json \
             --only-fixed --fail-on high
 
+      - name: Scan arm64 for fixed high/critical findings
+        run: |
+          set -euo pipefail
+          sbom="dist-arm64/preloop-ubuntu-24.04-aarch64.apt-sbom.cdx.json"
+          grype "sbom:$sbom" \
+            -o table -o json=dist/grype-arm64.json \
+            --only-fixed --fail-on high
+
       - name: Upload scan result
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: grype-scan-${{ github.run_id }}
-          path: dist/grype.json
+          path: |
+            dist/grype.json
+            dist/grype-arm64.json
           retention-days: 30
           if-no-files-found: warn
