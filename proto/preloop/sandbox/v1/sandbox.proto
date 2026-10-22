@@ -236,7 +236,14 @@ service Sandboxes {
   rpc CreateJoinToken(CreateJoinTokenRequest) returns (CreateJoinTokenResponse);
 }
 
-message CreateJoinTokenRequest { uint64 ttl_secs = 1; } // 0 = service default
+message CreateJoinTokenRequest {
+  uint64 ttl_secs = 1; // 0 = service default
+  // Provider name the token is bound to. Empty mints an unbound token,
+  // which may only enroll a provider name that does not exist yet; a
+  // name-bound token may also re-enroll (replace the certificates of)
+  // the provider it names.
+  string provider_name = 2;
+}
 message CreateJoinTokenResponse { string token = 1; int64 expires_at = 2; }
 message DeleteProviderRequest { string name = 1; }
 

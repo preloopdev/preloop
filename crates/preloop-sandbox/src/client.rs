@@ -75,7 +75,16 @@ pub trait SandboxApi: Send + Sync {
     /// `Resume`.
     async fn resume(&self, sandbox_id: &str, lease_id: &str) -> Result<()>;
     /// `CreateJoinToken`: mint a single-use provider enrollment token.
-    async fn create_join_token(&self, ttl_secs: u64) -> Result<CreateJoinTokenResponse>;
+    ///
+    /// `provider_name` binds the token to that provider: the token then
+    /// enrolls only that name and may re-enroll it (replacing its
+    /// certificates). An empty name mints an unbound token, which may
+    /// only enroll a provider name that does not exist yet.
+    async fn create_join_token(
+        &self,
+        ttl_secs: u64,
+        provider_name: &str,
+    ) -> Result<CreateJoinTokenResponse>;
     /// `DeleteProvider`: remove a provider and revoke its certificates.
     async fn delete_provider(&self, name: &str) -> Result<()>;
 
@@ -175,8 +184,17 @@ impl SandboxApi for InProcess {
     async fn resume(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
         Service::resume(&self.0, sandbox_id, lease_id).await
     }
-    async fn create_join_token(&self, ttl_secs: u64) -> Result<CreateJoinTokenResponse> {
-        Service::create_join_token(&self.0, std::time::Duration::from_secs(ttl_secs)).await
+    async fn create_join_token(
+        &self,
+        ttl_secs: u64,
+        provider_name: &str,
+    ) -> Result<CreateJoinTokenResponse> {
+        Service::create_join_token(
+            &self.0,
+            std::time::Duration::from_secs(ttl_secs),
+            provider_name,
+        )
+        .await
     }
     async fn delete_provider(&self, name: &str) -> Result<()> {
         Service::delete_provider(&self.0, name).await
@@ -662,11 +680,16 @@ impl SandboxApi for SandboxClient {
         Ok(())
     }
 
-    async fn create_join_token(&self, ttl_secs: u64) -> Result<CreateJoinTokenResponse> {
+    async fn create_join_token(
+        &self,
+        ttl_secs: u64,
+        provider_name: &str,
+    ) -> Result<CreateJoinTokenResponse> {
         Ok(self
             .inner
             .create_join_token(CreateJoinTokenRequest {
                 ttl_secs,
+                provider_name: provider_name.to_owned(),
                 ..CreateJoinTokenRequest::default()
             })
             .await?

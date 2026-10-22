@@ -125,6 +125,13 @@ const MAX_DESTROY_ATTEMPTS: u32 = 3;
 /// error that depends on scheduling.
 const EXEC_SWEEP_GRACE: Duration = Duration::from_secs(5);
 
+/// How many simultaneously valid certificates one provider may hold: the
+/// current certificate plus two predecessors. Renewal keeps a short overlap
+/// so a client that fails to store its new key keeps working, but the set is
+/// bounded — after this many rotations the oldest certificate is pruned even
+/// if unexpired, so rotating can actually evict a compromised certificate.
+pub const MAX_PROVIDER_CERTIFICATES: usize = 3;
+
 /// The provider a client certificate authenticates, resolved from the leaf's
 /// SHA-256 fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +368,13 @@ struct JoinTokenRecord {
     id: String,
     secret_sha256: String,
     expires_at: i64,
+    /// Provider name the token was minted for. Empty (the default, and the
+    /// value on records persisted before name binding existed) means the
+    /// token is unbound: it may only enroll a provider name that does not
+    /// exist yet. A name-bound token may also re-enroll — replace the
+    /// certificates of — the provider it names, and no other.
+    #[serde(default)]
+    provider_name: String,
 }
 
 /// The caller's exec response: the event stream plus the end of a oneshot
@@ -3205,10 +3219,23 @@ impl Service {
     // ─── Enrollment and identity ───────────────────────────────────
 
     /// Mint a single-use join token for provider enrollment.
-    pub async fn create_join_token(&self, ttl: Duration) -> Result<CreateJoinTokenResponse> {
+    ///
+    /// `provider_name` binds the token to one provider identity: a bound
+    /// token enrolls only that name, and is the only kind that may
+    /// re-enroll an existing provider (replacing its certificates). An
+    /// empty name mints an unbound token, which may only enroll a
+    /// provider name that does not exist yet.
+    pub async fn create_join_token(
+        &self,
+        ttl: Duration,
+        provider_name: &str,
+    ) -> Result<CreateJoinTokenResponse> {
         let ca = self.config.ca.as_ref().ok_or_else(|| {
             Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
         })?;
+        if !provider_name.is_empty() {
+            validate_name("provider", provider_name)?;
+        }
         let ttl = if ttl.is_zero() {
             Duration::from_secs(3600)
         } else {
@@ -3222,6 +3249,7 @@ impl Service {
             id: id.clone(),
             secret_sha256: tls::sha256_hex(secret.as_bytes()),
             expires_at,
+            provider_name: provider_name.to_owned(),
         };
         self.state
             .lock()
@@ -3263,16 +3291,25 @@ impl Service {
     /// The certificate is signed before the token is consumed, so a malformed
     /// CSR does not burn a valid token; a token that reaches the store lookup
     /// is removed whether or not binding the provider then succeeds.
+    ///
+    /// Every token-validation failure — malformed, issued for another CA,
+    /// unknown or used, expired, wrong secret — returns the same
+    /// `Unauthenticated` error, so this endpoint cannot be used as an oracle
+    /// for which component of a token is wrong; the specific reason is only
+    /// logged. Name-binding failures are authorization errors about an
+    /// otherwise valid token, and keep their own codes.
     pub async fn enroll(&self, request: EnrollRequest) -> Result<EnrollResponse> {
         let ca = self.config.ca.clone().ok_or_else(|| {
             Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
         })?;
-        let parts = tls::parse_join_token(&request.token)?;
+        let invalid = |reason: &str| {
+            warn!(reason, provider = %request.name, "enroll rejected");
+            Error::new(Code::Unauthenticated, "invalid join token")
+        };
+        let parts =
+            tls::parse_join_token(&request.token).map_err(|_| invalid("malformed join token"))?;
         if !constant_time_eq(parts.ca_sha256.as_bytes(), ca.sha256_hex().as_bytes()) {
-            return Err(Error::new(
-                Code::Unauthenticated,
-                "join token was issued for a different CA",
-            ));
+            return Err(invalid("join token was issued for a different CA"));
         }
         validate_name("provider", &request.name)?;
         let signed = ca.sign_client(&request.csr_pem, &request.name, tls::CLIENT_CERT_LIFETIME)?;
@@ -3282,45 +3319,72 @@ impl Service {
             let record = state
                 .join_tokens
                 .get(parts.id)
-                .ok_or_else(|| Error::new(Code::Unauthenticated, "unknown or used join token"))?;
+                .ok_or_else(|| invalid("unknown or used join token"))?;
             if record.expires_at <= t {
-                return Err(Error::new(Code::Unauthenticated, "join token expired"));
+                return Err(invalid("join token expired"));
             }
             if !constant_time_eq(
                 record.secret_sha256.as_bytes(),
                 tls::sha256_hex(parts.secret.as_bytes()).as_bytes(),
             ) {
-                return Err(Error::new(Code::Unauthenticated, "bad join token"));
+                return Err(invalid("bad join token"));
             }
-            state.join_tokens.remove(parts.id);
-            let mut ops = vec![self.remove(Kind::JoinTokens, parts.id)];
+            let bound_name = record.provider_name.clone();
             let existing = state
                 .providers
                 .values()
                 .find(|rec| rec.provider.name == request.name)
                 .map(|rec| rec.provider.id.clone());
+            // Name binding: a token may only claim the identity it was
+            // minted for. A name-bound token presented for any other name
+            // is refused, and an unbound token may enroll a new provider
+            // but must not take over an existing one — replacing a live
+            // provider's certificates requires a token bound to its name.
+            // A refused attempt does not consume the token.
+            if !bound_name.is_empty() && bound_name != request.name {
+                return Err(Error::new(
+                    Code::PermissionDenied,
+                    "join token was issued for a different provider name",
+                ));
+            }
+            if bound_name.is_empty() && existing.is_some() {
+                return Err(Error::new(
+                    Code::AlreadyExists,
+                    "provider name is already enrolled: re-enrolling it requires \
+                     a join token bound to that name",
+                ));
+            }
+            state.join_tokens.remove(parts.id);
+            let mut ops = vec![self.remove(Kind::JoinTokens, parts.id)];
             let id = existing.unwrap_or_else(|| new_id("prv"));
-            let (seen, queue, wake) = state
-                .providers
-                .get(&id)
-                .map(|rec| (rec.seen, rec.queue.clone(), rec.wake.clone()))
-                .unwrap_or_else(|| {
-                    (
-                        // Enrolled but never registered: not placeable yet.
-                        Instant::now() - self.config.provider_timeout * 2,
-                        VecDeque::new(),
-                        Arc::new(Notify::new()),
-                    )
-                });
-            let mut provider = state
-                .providers
-                .get(&id)
-                .map(|rec| rec.provider.clone())
-                .unwrap_or_else(|| Provider {
-                    id: id.clone(),
-                    name: request.name.clone(),
-                    ..Provider::default()
-                });
+            // Take the previous record out: everything it held carries
+            // over except the certificates (replaced below) — in
+            // particular its in-flight work returns to the queue for
+            // redelivery, exactly as on re-registration, instead of being
+            // dropped while its `pending` entries linger.
+            let previous = state.providers.remove(&id);
+            let (seen, queue, wake, mut provider) = match previous {
+                Some(rec) => {
+                    let mut queue = rec.queue;
+                    let mut redeliver: Vec<InFlight> = rec.in_flight.into_values().collect();
+                    redeliver.sort_by_key(|item| item.visible_at);
+                    for item in redeliver.into_iter().rev() {
+                        queue.push_front(item.work);
+                    }
+                    (rec.seen, queue, rec.wake, rec.provider)
+                }
+                None => (
+                    // Enrolled but never registered: not placeable yet.
+                    Instant::now() - self.config.provider_timeout * 2,
+                    VecDeque::new(),
+                    Arc::new(Notify::new()),
+                    Provider {
+                        id: id.clone(),
+                        name: request.name.clone(),
+                        ..Provider::default()
+                    },
+                ),
+            };
             provider.name = request.name.clone();
             // Re-enrolling replaces earlier certificates: issuing a new token
             // means these credentials, not accumulated old ones.
@@ -3336,12 +3400,13 @@ impl Service {
                     seen,
                     queue,
                     in_flight: HashMap::new(),
-                    wake,
+                    wake: wake.clone(),
                     host: None,
                     host_sampled_at: None,
                     sandbox_stats: HashMap::new(),
                 },
             );
+            wake.notify_waiters();
             ops.push(self.put(Kind::Providers, &id, &provider));
             ops
         };
@@ -3359,7 +3424,10 @@ impl Service {
     /// `RenewCertificate`: issue a new certificate for an enrolled provider.
     ///
     /// The previous fingerprint stays valid until it expires, so a client
-    /// that fails to store the new key keeps working.
+    /// that fails to store the new key keeps working — but the retained set
+    /// is capped at [`MAX_PROVIDER_CERTIFICATES`], pruning the oldest, so a
+    /// compromised certificate is evicted after a bounded number of
+    /// rotations instead of living (and self-renewing) forever.
     pub async fn renew_certificate(
         &self,
         request: RenewCertificateRequest,
@@ -3397,6 +3465,14 @@ impl Service {
                 expires_at: signed.expires_at,
                 ..ProviderCertificate::default()
             });
+            // Bound the live set: certificates are in issuance order, so
+            // the front is the oldest. Without a cap every renewal would
+            // leave the superseded certificate valid until its own expiry
+            // and able to renew itself, making rotation unable to evict a
+            // compromised certificate.
+            while rec.provider.certificates.len() > MAX_PROVIDER_CERTIFICATES {
+                rec.provider.certificates.remove(0);
+            }
             rec.seen = Instant::now();
             rec.provider.last_seen = t;
             let provider = rec.provider.clone();

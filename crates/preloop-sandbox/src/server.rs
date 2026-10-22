@@ -532,7 +532,11 @@ impl Sandboxes for SandboxesService {
         async move {
             self.authorize(&ctx)?;
             let ttl = std::time::Duration::from_secs(request.ttl_secs);
-            RpcResponse::ok(self.service.create_join_token(ttl).await?)
+            RpcResponse::ok(
+                self.service
+                    .create_join_token(ttl, &request.provider_name)
+                    .await?,
+            )
         }
     }
 }

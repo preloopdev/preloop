@@ -4784,6 +4784,8 @@ pub const __LEASE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct CreateJoinTokenRequest {
+    /// 0 = service default
+    ///
     /// Field 1: `ttl_secs`
     #[serde(
         rename = "ttlSecs",
@@ -4792,6 +4794,19 @@ pub struct CreateJoinTokenRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub ttl_secs: u64,
+    /// Provider name the token is bound to. Empty mints an unbound token,
+    /// which may only enroll a provider name that does not exist yet; a
+    /// name-bound token may also re-enroll (replace the certificates of)
+    /// the provider it names.
+    ///
+    /// Field 2: `provider_name`
+    #[serde(
+        rename = "providerName",
+        alias = "provider_name",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub provider_name: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -4800,6 +4815,7 @@ impl ::core::fmt::Debug for CreateJoinTokenRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         f.debug_struct("CreateJoinTokenRequest")
             .field("ttl_secs", &self.ttl_secs)
+            .field("provider_name", &self.provider_name)
             .finish()
     }
 }
@@ -4833,6 +4849,10 @@ impl ::buffa::Message for CreateJoinTokenRequest {
         if self.ttl_secs != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.ttl_secs) as u64;
         }
+        if !self.provider_name.is_empty() {
+            size
+                += 1u64 + ::buffa::types::string_encoded_len(&self.provider_name) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4845,6 +4865,9 @@ impl ::buffa::Message for CreateJoinTokenRequest {
         use ::buffa::Enumeration as _;
         if self.ttl_secs != 0u64 {
             ::buffa::types::put_uint64_field(1u32, self.ttl_secs, buf);
+        }
+        if !self.provider_name.is_empty() {
+            ::buffa::types::put_string_field(2u32, &self.provider_name, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4866,6 +4889,13 @@ impl ::buffa::Message for CreateJoinTokenRequest {
                 )?;
                 self.ttl_secs = ::buffa::types::decode_uint64(buf)?;
             }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.provider_name, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -4875,6 +4905,7 @@ impl ::buffa::Message for CreateJoinTokenRequest {
     }
     fn clear(&mut self) {
         self.ttl_secs = 0u64;
+        self.provider_name.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -22669,8 +22700,17 @@ pub mod __buffa {
         }
         #[derive(Clone, Debug, Default)]
         pub struct CreateJoinTokenRequestView<'a> {
+            /// 0 = service default
+            ///
             /// Field 1: `ttl_secs`
             pub ttl_secs: u64,
+            /// Provider name the token is bound to. Empty mints an unbound token,
+            /// which may only enroll a provider name that does not exist yet; a
+            /// name-bound token may also re-enroll (replace the certificates of)
+            /// the provider it names.
+            ///
+            /// Field 2: `provider_name`
+            pub provider_name: &'a str,
             pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
         }
         impl<'a> ::buffa::MessageView<'a> for CreateJoinTokenRequestView<'a> {
@@ -22716,6 +22756,13 @@ pub mod __buffa {
                         )?;
                         view.ttl_secs = ::buffa::types::decode_uint64(&mut cur)?;
                     }
+                    2u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::LengthDelimited,
+                        )?;
+                        view.provider_name = ::buffa::types::borrow_str(&mut cur)?;
+                    }
                     _ => {
                         ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                         let span_len = before_tag.len() - cur.len();
@@ -22746,6 +22793,7 @@ pub mod __buffa {
                 let _ = __buffa_src;
                 ::core::result::Result::Ok(super::super::CreateJoinTokenRequest {
                     ttl_secs: self.ttl_secs,
+                    provider_name: self.provider_name.to_string(),
                     __buffa_unknown_fields: self
                         .__buffa_unknown_fields
                         .to_owned()?
@@ -22765,6 +22813,12 @@ pub mod __buffa {
                         += 1u64
                             + ::buffa::types::uint64_encoded_len(self.ttl_secs) as u64;
                 }
+                if !self.provider_name.is_empty() {
+                    size
+                        += 1u64
+                            + ::buffa::types::string_encoded_len(&self.provider_name)
+                                as u64;
+                }
                 size += self.__buffa_unknown_fields.encoded_len() as u64;
                 ::buffa::saturate_size(size)
             }
@@ -22778,6 +22832,9 @@ pub mod __buffa {
                 use ::buffa::Enumeration as _;
                 if self.ttl_secs != 0u64 {
                     ::buffa::types::put_uint64_field(1u32, self.ttl_secs, buf);
+                }
+                if !self.provider_name.is_empty() {
+                    ::buffa::types::put_string_field(2u32, &self.provider_name, buf);
                 }
                 self.__buffa_unknown_fields.write_to(buf);
             }
@@ -22806,6 +22863,9 @@ pub mod __buffa {
                             "ttlSecs",
                             &::buffa::json_helpers::ProtoJson(&self.ttl_secs),
                         )?;
+                }
+                if !::buffa::json_helpers::skip_if::is_empty_str(self.provider_name) {
+                    __map.serialize_entry("providerName", self.provider_name)?;
                 }
                 __map.end()
             }
@@ -22902,10 +22962,22 @@ pub mod __buffa {
             pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
                 self.0.into_bytes()
             }
+            /// 0 = service default
+            ///
             /// Field 1: `ttl_secs`
             #[must_use]
             pub fn ttl_secs(&self) -> u64 {
                 self.0.reborrow().ttl_secs
+            }
+            /// Provider name the token is bound to. Empty mints an unbound token,
+            /// which may only enroll a provider name that does not exist yet; a
+            /// name-bound token may also re-enroll (replace the certificates of)
+            /// the provider it names.
+            ///
+            /// Field 2: `provider_name`
+            #[must_use]
+            pub fn provider_name(&self) -> &'_ str {
+                self.0.reborrow().provider_name
             }
         }
         impl ::core::convert::From<
