@@ -55,10 +55,11 @@ An exec with `timeout_secs = 0` gets the service deadline
 command at it and reports exit code 124. When the caller drops the exec
 response stream, the service queues `CancelExec` for the provider and drops
 the exec; the agent calls the driver's optional `cancel_exec` (SmolVM kills the
-exec child) and reports exit code 130. The service also sweeps execs and
-pending work past their deadlines; `Acquire` is bounded by its wait window,
-and every request that waits on a provider to report (`Snapshot`, copy, power)
-is bounded by the same work timeout.
+host-side `machine exec` client and, with a second `machine exec`, the guest
+command it left behind) and reports exit code 130. The service also sweeps
+execs and pending work past their deadlines; `Acquire` is bounded by its wait
+window, and every request that waits on a provider to report (`Snapshot`,
+copy, power) is bounded by the same work timeout.
 
 The Connect layer is hand-rolled (`crates/preloop-sandbox/src/connect.rs`):
 adding `connectrpc` would bring its own protobuf runtime, while the subset used

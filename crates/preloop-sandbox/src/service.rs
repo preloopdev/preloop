@@ -198,6 +198,29 @@ struct Exec {
     finished: CancellationToken,
 }
 
+/// The caller's exec response: the event stream plus the end of a oneshot
+/// that tells the disconnect watcher the caller is gone.
+///
+/// The service keeps a sender for this exec in [`State::execs`] so
+/// `ReportExec` can forward output; watching the channel's senders for
+/// closure therefore cannot detect a caller that walked away. This guard is
+/// dropped with the response stream itself and is unaffected by that sender.
+struct ExecStream {
+    inner: BoxStream<'static, Result<ExecEvent>>,
+    _disconnect: oneshot::Sender<()>,
+}
+
+impl futures::Stream for ExecStream {
+    type Item = Result<ExecEvent>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        futures::Stream::poll_next(self.inner.as_mut(), cx)
+    }
+}
+
 /// Data-plane blob for one ticket.
 struct Blob {
     sandbox_id: String,
@@ -1551,7 +1574,7 @@ impl Service {
             Exec {
                 sandbox_id: sandbox.id.clone(),
                 work_id: work_id.clone(),
-                tx: tx.clone(),
+                tx,
                 sequence: 0,
                 deadline,
                 finished: finished.clone(),
@@ -1580,17 +1603,22 @@ impl Service {
             return Err(error);
         }
         drop(state);
-        // The sender held here keeps the channel open until either the exec
-        // finishes (`finished`) or the caller drops the stream (`closed`).
+        // The response stream owns the only end of this channel that observes
+        // the caller: its drop guard fires when the caller drops the stream,
+        // independently of the sender the service keeps in `state.execs` for
+        // `ReportExec`.
+        let (disconnected, dropped) = oneshot::channel::<()>();
         let service = Arc::clone(self);
         tokio::spawn(async move {
-            let held = tx;
             tokio::select! {
-                _ = held.closed() => service.cancel_disconnected(&exec_id).await,
+                _ = dropped => service.cancel_disconnected(&exec_id).await,
                 _ = finished.cancelled() => {}
             }
         });
-        Ok(tokio_stream_from(rx))
+        Ok(Box::pin(ExecStream {
+            inner: tokio_stream_from(rx),
+            _disconnect: disconnected,
+        }))
     }
 
     /// The caller's exec stream went away: drop the exec and tell the
