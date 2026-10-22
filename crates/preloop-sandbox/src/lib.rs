@@ -39,5 +39,5 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub use driver::Driver;
 pub use error::{Code, Error, Result};
 pub use placement::{Candidate, CandidateId, LeastLoaded, Placement, PlacementRequest};
-pub use service::{ProviderIdentity, Service, ServiceConfig};
+pub use service::{MAX_TTL_SECS, ProviderIdentity, Service, ServiceConfig};
 pub use tls::{AgentIdentity, PeerIdentity, ServerTls, ServiceCa};

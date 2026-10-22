@@ -689,6 +689,362 @@ async fn stats_follow_lease_expiry() {
     assert!(h.service.get(&lease.sandbox.id, &lease.lease.id).is_err());
 }
 
+/// Regression (pentest W1-F1): `Stats` names no sandbox, so — exactly
+/// like `List` — it must redact lease ids. The lease is the sandbox's only
+/// capability; Stats handed every active one to any caller-token holder,
+/// who could then Get/Exec/Destroy other callers' sandboxes.
+#[tokio::test]
+async fn stats_redact_lease_ids() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "stats-redact".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    // The holder's own reads still carry the lease.
+    assert_eq!(
+        h.service
+            .get(&lease.sandbox.id, &lease.lease.id)
+            .unwrap()
+            .lease_id,
+        lease.lease.id
+    );
+    let stats = h.service.stats();
+    let entries: Vec<_> = stats
+        .providers
+        .iter()
+        .flat_map(|provider| provider.sandboxes.iter())
+        .collect();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.sandbox.id == lease.sandbox.id),
+        "the leased sandbox is reported"
+    );
+    for entry in entries {
+        assert!(
+            entry.sandbox.lease_id.is_empty(),
+            "stats leaked lease `{}` for sandbox `{}`",
+            entry.sandbox.lease_id,
+            entry.sandbox.id
+        );
+    }
+    assert!(h.service.list().iter().all(|s| s.lease_id.is_empty()));
+}
+
+async fn acquire_build(service: &Arc<Service>, key: &str, template: &str) -> AcquireResponse {
+    service
+        .acquire(AcquireRequest {
+            idempotency_key: key.into(),
+            template: template.into(),
+            purpose: Purpose::Build.into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap()
+}
+
+/// Regression (pentest W1-F2/W4-F5): a snapshot silently replaced any
+/// template with the same name. The name must be refused, the stored
+/// template left untouched, and the source sandbox left leased so the
+/// caller can retry under another name.
+#[tokio::test]
+async fn snapshot_refuses_an_existing_template_name() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let bake = acquire_build(&h.service, "bake-1", "alpine").await;
+    let golden = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: bake.sandbox.id.clone(),
+            lease_id: bake.lease.id.clone(),
+            name: "golden".into(),
+            ..SnapshotRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let bake = acquire_build(&h.service, "bake-2", "alpine").await;
+    let error = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: bake.sandbox.id.clone(),
+            lease_id: bake.lease.id.clone(),
+            name: "golden".into(),
+            ..SnapshotRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::AlreadyExists, "{}", message(&error));
+    let stored = h
+        .service
+        .list_templates()
+        .into_iter()
+        .find(|t| t.spec.name == "golden")
+        .expect("golden template exists");
+    assert_eq!(stored.native_ref, golden.native_ref);
+    assert_eq!(stored.digest, golden.digest);
+    let source = h.service.get(&bake.sandbox.id, &bake.lease.id).unwrap();
+    assert_eq!(source.state, SandboxState::Leased);
+}
+
+/// Regression (pentest W1-F2): snapshotting over a pool's base template is
+/// the in-use case of the same overwrite — refused the way DeleteTemplate
+/// refuses to remove an in-use template.
+#[tokio::test]
+async fn snapshot_refuses_a_pool_base_template_name() {
+    let h = harness().await;
+    h.service.put_template(template("base")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "pool-a".into(),
+            template: "base".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let bake = acquire_build(&h.service, "bake", "base").await;
+    let error = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: bake.sandbox.id.clone(),
+            lease_id: bake.lease.id.clone(),
+            name: "base".into(),
+            ..SnapshotRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", message(&error));
+    assert!(
+        message(&error).contains("used by pool"),
+        "{}",
+        message(&error)
+    );
+    let stored = h
+        .service
+        .list_templates()
+        .into_iter()
+        .find(|t| t.spec.name == "base")
+        .expect("base template exists");
+    assert!(stored.spec.snapshot_of().is_none());
+    let source = h.service.get(&bake.sandbox.id, &bake.lease.id).unwrap();
+    assert_eq!(source.state, SandboxState::Leased);
+}
+
+/// Regression (pentest W1-F6): Snapshot never checked the acquisition
+/// purpose, so any exec/runner lease could write templates. Only a sandbox
+/// acquired with build purpose — started snapshot-capable — may snapshot.
+#[tokio::test]
+async fn snapshot_requires_build_purpose() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    for (key, purpose) in [("exec", Purpose::Exec), ("runner", Purpose::Runner)] {
+        let lease = h
+            .service
+            .acquire(AcquireRequest {
+                idempotency_key: key.into(),
+                template: "alpine".into(),
+                purpose: purpose.into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        let error = h
+            .service
+            .snapshot(SnapshotRequest {
+                sandbox_id: lease.sandbox.id.clone(),
+                lease_id: lease.lease.id.clone(),
+                name: format!("snap-{key}"),
+                ..SnapshotRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            Code::FailedPrecondition,
+            "{key}: {}",
+            message(&error)
+        );
+        // The refusal does not consume the sandbox.
+        assert_eq!(
+            h.service
+                .get(&lease.sandbox.id, &lease.lease.id)
+                .unwrap()
+                .state,
+            SandboxState::Leased
+        );
+    }
+}
+
+/// Regression (pentest W1-F4): DeletePool removed the pool record under
+/// live leases, orphaning their sandboxes from refill and accounting.
+/// Like DeleteTemplate, it now refuses while a member is leased.
+#[tokio::test]
+async fn delete_pool_refuses_while_a_member_is_leased() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "linux".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let lease = h.service.acquire(acquire("job-1", "linux")).await.unwrap();
+    let error = h.service.delete_pool("linux").await.unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", message(&error));
+    assert!(
+        h.service
+            .list_pools()
+            .iter()
+            .any(|pool| pool.name == "linux"),
+        "the pool survives the refused delete"
+    );
+    // Once the lease is gone the delete goes through.
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    h.service.delete_pool("linux").await.unwrap();
+    assert!(
+        h.service
+            .list_pools()
+            .iter()
+            .all(|pool| pool.name != "linux")
+    );
+}
+
+/// Regression (pentest W1-F5/W4-F3): TTLs were unbounded and the expiry
+/// arithmetic unchecked — 2^40 seconds minted ~34,800-year leases, and
+/// i64::MAX wrapped to a negative expiresAt returned as success. Acquire,
+/// Renew and Release (PRESERVE) now share one ceiling and checked
+/// arithmetic.
+#[tokio::test]
+async fn caller_ttls_are_capped_on_acquire_renew_and_preserve() {
+    const ABSURD: u64 = 1 << 40;
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    for ttl in [ABSURD, u64::MAX] {
+        let error = h
+            .service
+            .acquire(AcquireRequest {
+                idempotency_key: format!("ttl-{ttl}"),
+                template: "alpine".into(),
+                ttl_secs: ttl,
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "ttl {ttl}");
+    }
+    // The ceiling itself is honoured.
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "ttl-max".into(),
+            template: "alpine".into(),
+            ttl_secs: preloop_sandbox::MAX_TTL_SECS,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let max = preloop_sandbox::MAX_TTL_SECS as i64;
+    assert!(
+        (now + max - 60..=now + max + 60).contains(&lease.lease.expires_at),
+        "expires_at {} not ~now + {max}",
+        lease.lease.expires_at
+    );
+    // Renew is capped the same way.
+    for ttl in [ABSURD, u64::MAX] {
+        let error = h
+            .service
+            .renew(RenewRequest {
+                lease_id: lease.lease.id.clone(),
+                ttl_secs: ttl,
+                ..RenewRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "ttl {ttl}");
+    }
+    h.service
+        .renew(RenewRequest {
+            lease_id: lease.lease.id.clone(),
+            ttl_secs: 120,
+            ..RenewRequest::default()
+        })
+        .await
+        .unwrap();
+    // And a PRESERVE window is capped the same way; the refusal leaves the
+    // sandbox leased — no destroy, no half-preserve.
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "ttl-preserve".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let error = h
+        .service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Preserve.into(),
+            preserve_ttl_secs: ABSURD,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument, "{}", message(&error));
+    assert_eq!(
+        h.service
+            .get(&lease.sandbox.id, &lease.lease.id)
+            .unwrap()
+            .state,
+        SandboxState::Leased
+    );
+}
+
+/// Regression (pentest W1-F5/W2-F4): join tokens could be minted with
+/// lifetimes up to i64::MAX seconds. They share the lease ceiling.
+#[tokio::test]
+async fn join_token_ttls_are_capped() {
+    let t = common::TestService::start().await;
+    for ttl in [Duration::from_secs(1 << 40), Duration::from_secs(u64::MAX)] {
+        let error = t.service.create_join_token(ttl).await.unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "ttl {ttl:?}");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let max = preloop_sandbox::MAX_TTL_SECS as i64;
+    let minted = t
+        .service
+        .create_join_token(Duration::from_secs(preloop_sandbox::MAX_TTL_SECS))
+        .await
+        .unwrap();
+    assert!((now + max - 60..=now + max + 60).contains(&minted.expires_at));
+    // Zero still means the documented one-hour default.
+    let minted = t.service.create_join_token(Duration::ZERO).await.unwrap();
+    assert!((now + 3600 - 60..=now + 3600 + 60).contains(&minted.expires_at));
+}
+
 #[tokio::test]
 async fn reconcile_destroys_orphans_and_fails_lost_sandboxes() {
     let h = harness().await;
@@ -3058,11 +3414,16 @@ async fn poll_now(service: &Arc<Service>, provider: &RegisterResponse) -> Vec<Wo
 
 /// Acquire without blocking, leaving the create work queued for the test.
 async fn acquire_unreported(service: &Arc<Service>, key: &str) {
+    acquire_unreported_as(service, key, Purpose::PurposeUnspecified).await;
+}
+
+async fn acquire_unreported_as(service: &Arc<Service>, key: &str, purpose: Purpose) {
     let error = service
         .acquire(AcquireRequest {
             idempotency_key: key.into(),
             template: "alpine".into(),
             wait_secs: Some(0),
+            purpose: purpose.into(),
             ..AcquireRequest::default()
         })
         .await
@@ -3442,7 +3803,9 @@ async fn a_redelivered_create_is_not_executed_twice() {
 async fn a_snapshot_wait_is_bounded_by_the_work_timeout() {
     let (service, _dir, provider, store) =
         manual_service(|config| config.work_timeout = Duration::from_millis(100)).await;
-    acquire_unreported(&service, "k").await;
+    // Snapshot is gated on build purpose; the wait being bounded is what
+    // this test exercises, so acquire as a build sandbox.
+    acquire_unreported_as(&service, "k", Purpose::Build).await;
     let create = poll_now(&service, &provider).await;
     service
         .report(ReportRequest {
