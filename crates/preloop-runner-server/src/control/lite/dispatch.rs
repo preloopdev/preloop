@@ -6,9 +6,8 @@
 //! (`control/pg/dispatch.rs::complete_node`): outputs/annotations land on
 //! the jobs row, `settle_node` owns the status transition + concurrency
 //! release + dependent decrement, reusable callers fold their callee
-//! outputs once every inner job is terminal, in-progress step rows of the
-//! attempt settle with the job, then `promote_run` runs the dependent
-//! sweep. On SQLite the whole command is one `BEGIN IMMEDIATE` writer
+//! outputs once every inner job is terminal, the attempt's unfinished step
+//! rows settle with the job, then `promote_run` runs the dependent sweep. On SQLite the whole command is one `BEGIN IMMEDIATE` writer
 //! transaction — the run-row lock `pg` takes is implicit.
 
 use super::codec::{self, now_us};
@@ -18,7 +17,7 @@ use super::{LiteBackend, db, promote, settle};
 use crate::control::backend::JobCompletionInput;
 use crate::control::types::*;
 use crate::models::TaskAgentJobRequestRecord;
-use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
+use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId, azdo};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
@@ -124,6 +123,8 @@ struct CompletionApplied {
     newly_terminal_success: bool,
     replayed: bool,
     live_log_key: String,
+    /// `StepStatus` events the settle transaction persisted.
+    events: Vec<NdjsonEvent>,
 }
 
 /// Fold completed callee subtrees into their reusable callers
@@ -222,6 +223,7 @@ fn complete_node(
             newly_terminal_success: false,
             replayed: true,
             live_log_key: attempt_log_key(tx, run_id, job_id, explicit_attempt)?,
+            events: Vec::new(),
         });
     }
     // Outputs + annotations land on the node (masked by the caller).
@@ -266,27 +268,16 @@ fn complete_node(
     if summary.is_terminal() {
         settle::release_concurrency_for_run(tx, backend, run_id)?;
     }
-    // Orphaned in-progress steps of this attempt settle with the job.
-    tx.prepare_cached(
-        "UPDATE job_steps SET conclusion = ?3, finished_at = COALESCE(finished_at, ?4) \
-         WHERE agent_job_id = (SELECT agent_job_id FROM job_requests \
-           WHERE run_id = ?1 AND job_id = ?2 ORDER BY request_id DESC LIMIT 1) \
-           AND conclusion = 'in_progress'",
-    )
-    .map_err(db)?
-    .execute(params![
-        codec::run_key(run_id),
-        job_id.0,
-        crate::runtime_scheduling::status_string(effects.effective_status),
-        now_us()
-    ])
-    .map_err(db)?;
+    // The settle above closed this attempt's unfinished steps (in_progress
+    // takes the job's verdict, pending never ran) and persisted a
+    // `StepStatus` per changed row; the handler broadcasts them.
     Ok(CompletionApplied {
         effective_status: effects.effective_status,
         cancelled_siblings: effects.cancelled_siblings,
         newly_terminal_success: effects.newly_terminal_success,
         replayed: false,
         live_log_key: attempt_log_key(tx, run_id, job_id, explicit_attempt)?,
+        events: effects.events,
     })
 }
 
@@ -363,6 +354,7 @@ impl LiteBackend {
                 live_log_key: applied.live_log_key,
                 queue_nonempty,
                 replayed: applied.replayed,
+                events: applied.events,
             })
         })
     }
@@ -437,6 +429,7 @@ impl LiteBackend {
                 let record = jobs::run_record(tx, run_id)?.expect("existence checked");
                 return Ok(SettleJobOutcome::Unchanged(Box::new(record)));
             }
+            let mut events = applied.events;
             if let Some(request_id) = attempt {
                 settle_request_tx(tx, request_id, applied.effective_status)?;
                 // The attempt's step results land on its manifest. The compat
@@ -455,25 +448,20 @@ impl LiteBackend {
                         let Some(external_id) = wire.external_id.as_deref() else {
                             continue;
                         };
-                        if let Some(conclusion) =
+                        let Some(conclusion) =
                             crate::distributed_task::completion_step_conclusion(wire)
-                        {
-                            tx.prepare_cached(
-                                "UPDATE job_steps SET conclusion = ?3, \
-                                 runner_number = COALESCE(?4, runner_number), \
-                                 finished_at = COALESCE(finished_at, ?5) \
-                                 WHERE agent_job_id = ?1 AND step_id = ?2",
-                            )
-                            .map_err(db)?
-                            .execute(params![
-                                agent.to_string(),
-                                external_id,
-                                conclusion,
-                                wire.number.and_then(|n| i64::try_from(n).ok()),
-                                now_us()
-                            ])
-                            .map_err(db)?;
-                        }
+                        else {
+                            continue;
+                        };
+                        events.extend(super::steps::apply_step_result(
+                            tx,
+                            &agent.to_string(),
+                            run_id,
+                            &job_id,
+                            external_id,
+                            &conclusion,
+                            wire.number.and_then(|n| u32::try_from(n).ok()),
+                        )?);
                     }
                 }
             }
@@ -488,6 +476,7 @@ impl LiteBackend {
                 newly_terminal_success: applied.newly_terminal_success,
                 live_log_key: applied.live_log_key,
                 next_runs_on,
+                events,
             })))
         })
     }
@@ -511,7 +500,8 @@ impl LiteBackend {
             if !exists {
                 return Err(ControlError::NotFound(format!("run {run_id}")));
             }
-            let (cancellations, run_cancelled) = settle::cancel_run_inner(tx, self, run_id)?;
+            let (cancellations, run_cancelled, events) =
+                settle::cancel_run_inner(tx, self, run_id)?;
             let cancelled_jobs: Vec<JobId> = {
                 let mut stmt = tx
                     .prepare_cached(
@@ -536,6 +526,7 @@ impl LiteBackend {
                 record,
                 cancelled_jobs,
                 next_runs_on,
+                events,
             })
         })
     }
@@ -550,7 +541,8 @@ impl LiteBackend {
     ) -> Result<CancelOutcome, ControlError> {
         let job_id = job_id.clone();
         self.write(|tx| {
-            let cancellations = settle::cancel_job_inner(tx, self, run_id, &job_id)?;
+            let mut events = Vec::new();
+            let cancellations = settle::cancel_job_inner(tx, self, run_id, &job_id, &mut events)?;
             let cancelled_jobs: Vec<JobId> = {
                 let mut stmt = tx
                     .prepare_cached(
@@ -575,6 +567,7 @@ impl LiteBackend {
                 record,
                 cancelled_jobs,
                 next_runs_on,
+                events,
             })
         })
     }

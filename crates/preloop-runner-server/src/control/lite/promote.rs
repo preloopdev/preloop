@@ -544,8 +544,11 @@ fn settle_job_row(
     backend: &LiteBackend,
     job: &JobRow,
     status: ExecutionStatus,
+    outcome: &mut crate::runtime_scheduling::SchedulingOutcome,
 ) -> Result<(), ControlError> {
-    super::settle::settle_node(tx, backend, job.run_id, &job.job_id, status).map(|_| ())
+    let effects = super::settle::settle_node(tx, backend, job.run_id, &job.job_id, status)?;
+    outcome.events.extend(effects.events);
+    Ok(())
 }
 
 /// The caller's JobSet gate declarations (`caller_jobset_gates`): caller +
@@ -932,7 +935,7 @@ pub(super) fn promote_run(
                             .map_err(db)?;
                         }
                         Advance::Fail(status) => {
-                            settle_job_row(tx, backend, &job, status)?;
+                            settle_job_row(tx, backend, &job, status, outcome)?;
                             outcome.failed.push((run_id, job.job_id.clone()));
                         }
                     }
@@ -1003,7 +1006,13 @@ pub(super) fn promote_run(
                             }
                             crate::runtime_scheduling::EnvironmentGateOutcome::Failed => {
                                 super::fork_gate::write_gate(tx, run_id, &job.job_id, gate)?;
-                                settle_job_row(tx, backend, &job, ExecutionStatus::Failure)?;
+                                settle_job_row(
+                                    tx,
+                                    backend,
+                                    &job,
+                                    ExecutionStatus::Failure,
+                                    outcome,
+                                )?;
                                 outcome.failed.push((run_id, job.job_id.clone()));
                                 settled = true;
                                 continue;
@@ -1037,7 +1046,7 @@ pub(super) fn promote_run(
                             %reason,
                             "runs-on unsatisfiable by runner pool; failing the job"
                         );
-                        settle_job_row(tx, backend, &job, ExecutionStatus::Failure)?;
+                        settle_job_row(tx, backend, &job, ExecutionStatus::Failure, outcome)?;
                         outcome.failed.push((run_id, job.job_id.clone()));
                         settled = true;
                     } else {
@@ -1064,7 +1073,7 @@ pub(super) fn promote_run(
                                 .map_err(db)?;
                             }
                             GateOutcome::Failed(status) => {
-                                settle_job_row(tx, backend, &job, status)?;
+                                settle_job_row(tx, backend, &job, status, outcome)?;
                                 outcome.failed.push((run_id, job.job_id.clone()));
                                 settled = true;
                             }
@@ -1077,7 +1086,7 @@ pub(super) fn promote_run(
                     } else {
                         ExecutionStatus::Failure
                     };
-                    settle_job_row(tx, backend, &job, status)?;
+                    settle_job_row(tx, backend, &job, status, outcome)?;
                     if decision == DependencyDecision::Skip {
                         outcome.skipped.push((run_id, job.job_id.clone()));
                     } else {

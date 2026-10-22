@@ -567,7 +567,8 @@ impl LiteBackend {
             let built = match claim.built {
                 Ok(built) => built,
                 Err(status) => {
-                    settle::settle_node(tx, self, run_id, &node_id, status)?;
+                    let effects = settle::settle_node(tx, self, run_id, &node_id, status)?;
+                    outcome.events.extend(effects.events);
                     outcome.failed.push((run_id, node_id));
                     // Children materialize *after* the caller's own needs may have
                     // settled (they inherit them): recompute before promoting, same
@@ -580,7 +581,9 @@ impl LiteBackend {
             match built {
                 BuiltExpansion::Matrix { jobs } if jobs.is_empty() => {
                     // An empty matrix concludes the node as skipped.
-                    settle::settle_node(tx, self, run_id, &node_id, ExecutionStatus::Skipped)?;
+                    let effects =
+                        settle::settle_node(tx, self, run_id, &node_id, ExecutionStatus::Skipped)?;
+                    outcome.events.extend(effects.events);
                     outcome.skipped.push((run_id, node_id));
                 }
                 BuiltExpansion::Matrix { jobs } => {

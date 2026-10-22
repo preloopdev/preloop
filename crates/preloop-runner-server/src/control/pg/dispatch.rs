@@ -34,7 +34,7 @@ use crate::models::{
 use crate::runtime_scheduling::{self as sched_helpers, DependencyDecision, SchedulingOutcome};
 use crate::state::JobSetGate;
 use preloop_gha_parser::ConcurrencyQueue;
-use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
+use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId, azdo};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tokio_postgres::{GenericClient, Transaction};
 
@@ -1159,13 +1159,18 @@ async fn cancel_holder_inner(
 ) -> Result<CanceledWork, ControlError> {
     match holder {
         concurrency::Holder::Run(run_id) => {
-            let (cancelled, _) = cancel_run_tx(backend, tx, *run_id, reason).await?;
+            // The `StepStatus` events are persisted with the rows; this
+            // displacement path has no client-facing fan-out of its own (its
+            // `JobStatus` events ride the caller's outbox rows).
+            let (cancelled, _, _) = cancel_run_tx(backend, tx, *run_id, reason).await?;
             Ok(CanceledWork {
                 cancellations: cancelled,
             })
         }
         concurrency::Holder::Job { run_id, job_id } => {
-            let cancelled = cancel_job_tx(backend, tx, *run_id, job_id, reason).await?;
+            let mut step_events = Vec::new();
+            let cancelled =
+                cancel_job_tx(backend, tx, *run_id, job_id, reason, &mut step_events).await?;
             Ok(CanceledWork {
                 cancellations: cancelled,
             })
@@ -1185,8 +1190,10 @@ async fn cancel_holder_inner(
             .await
             .map_err(db)?;
             let mut cancellations = 0;
+            let mut step_events = Vec::new();
             for job_id in job_ids {
-                cancellations += cancel_job_tx(backend, tx, *run_id, job_id, reason).await?;
+                cancellations +=
+                    cancel_job_tx(backend, tx, *run_id, job_id, reason, &mut step_events).await?;
             }
             // Terminal-settle the run when every member ended.
             tx.execute(
@@ -2240,7 +2247,7 @@ async fn cancel_run_tx(
     tx: &Transaction<'_>,
     run_id: RunId,
     reason: Option<&str>,
-) -> Result<(usize, bool), ControlError> {
+) -> Result<(usize, bool, Vec<NdjsonEvent>), ControlError> {
     let _ = reason;
     // In-flight attempts get a pending cancellation the next poll delivers;
     // every other non-terminal job simply turns terminal (its runner holds
@@ -2328,6 +2335,11 @@ async fn cancel_run_tx(
             .await
             .map_err(db)?;
     }
+    // No attempt of a cancelled run survives it: every step still pending or
+    // running is cancelled, so the run never reports work that cannot happen.
+    let events =
+        super::timelines::close_unfinished_steps(tx, run_id, None, ExecutionStatus::Cancelled)
+            .await?;
     release_concurrency_for_run(backend, tx, run_id).await?;
     if finalized > 0 {
         emit_outbox(
@@ -2338,7 +2350,7 @@ async fn cancel_run_tx(
         )
         .await?;
     }
-    Ok((cancellations, finalized > 0))
+    Ok((cancellations, finalized > 0, events))
 }
 
 /// Cancellation bookkeeping for the cancel commands: mark a
@@ -2397,6 +2409,7 @@ async fn cancel_job_tx(
     run_id: RunId,
     job_id: &JobId,
     reason: Option<&str>,
+    events: &mut Vec<NdjsonEvent>,
 ) -> Result<usize, ControlError> {
     let _ = reason;
     let row = tx
@@ -2443,6 +2456,16 @@ async fn cancel_job_tx(
         .await
         .map_err(db)?;
         clear_assignment(tx, run_id, job_id).await?;
+        // The cancelled job's unfinished steps cancel with it.
+        events.extend(
+            super::timelines::close_unfinished_steps(
+                tx,
+                run_id,
+                Some(job_id),
+                ExecutionStatus::Cancelled,
+            )
+            .await?,
+        );
         if expandable {
             retire_node_requests(
                 tx,
@@ -2468,7 +2491,7 @@ async fn cancel_job_tx(
         .map(|row| JobId(row.get::<_, String>(0)))
         .collect();
     for child in children {
-        count += Box::pin(cancel_job_tx(backend, tx, run_id, &child, reason)).await?;
+        count += Box::pin(cancel_job_tx(backend, tx, run_id, &child, reason, events)).await?;
     }
     // Re-summarize the run once the subtree is settled (idempotent on the
     // recursion: each level recomputes the same aggregate).
@@ -2493,7 +2516,7 @@ impl PgBackend {
             tx.rollback().await.map_err(db)?;
             return Err(ControlError::NotFound(format!("run {run_id}")));
         }
-        let (cancellations, run_cancelled) =
+        let (cancellations, run_cancelled, events) =
             cancel_run_tx(self, &tx, run_id, reason.as_deref()).await?;
         let (cancelled_jobs, queue_nonempty, next_runs_on, pending_cancels) =
             cancel_outcome_gauges(&tx, run_id).await?;
@@ -2510,6 +2533,7 @@ impl PgBackend {
             record,
             cancelled_jobs,
             next_runs_on,
+            events,
         })
     }
 
@@ -2524,7 +2548,8 @@ impl PgBackend {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         PgBackend::lock_run(&tx, run_id).await?;
-        let cancellations = cancel_job_tx(self, &tx, run_id, job_id, None).await?;
+        let mut events = Vec::new();
+        let cancellations = cancel_job_tx(self, &tx, run_id, job_id, None, &mut events).await?;
         let (cancelled_jobs, queue_nonempty, next_runs_on, pending_cancels) =
             cancel_outcome_gauges(&tx, run_id).await?;
         let record = self
@@ -2540,6 +2565,7 @@ impl PgBackend {
             record,
             cancelled_jobs,
             next_runs_on,
+            events,
         })
     }
 }
@@ -2618,6 +2644,9 @@ pub(super) struct Sweep<'a> {
     pub(crate) concluded: Vec<(JobId, ExecutionStatus)>,
     /// Cancellation messages queued (holder displacement, cancels).
     pub(crate) cancellations: usize,
+    /// `StepStatus` events persisted while settling nodes this command
+    /// concluded; the caller broadcasts them.
+    pub(crate) events: Vec<NdjsonEvent>,
     now: i64,
 }
 
@@ -2636,6 +2665,7 @@ impl<'a> Sweep<'a> {
             outcome: SchedulingOutcome::default(),
             concluded: Vec::new(),
             cancellations: 0,
+            events: Vec::new(),
             now: now_us(),
         })
     }
@@ -3479,6 +3509,13 @@ impl<'a> Sweep<'a> {
         }
         set_status_in(self.graphs.get_mut(&run_id), job_id, status);
         self.mark(run_id, job_id);
+        // A settled node's unfinished steps settle with it: `in_progress`
+        // takes the node's verdict, `pending` never ran. Before this, only
+        // `in_progress` rows were closed, so a skipped or cancelled job kept
+        // showing work that was still "waiting".
+        let events =
+            super::timelines::close_unfinished_steps(self.tx, run_id, Some(job_id), status).await?;
+        self.events.extend(events);
         release_concurrency_for_job(self.backend, self.tx, run_id, job_id).await?;
         let expandable = self
             .graphs
@@ -6327,26 +6364,6 @@ impl<'a> Sweep<'a> {
             }
             !was_terminal_success && record.status == ExecutionStatus::Success
         };
-        // Orphaned in-progress steps of this attempt settle with the job.
-        let orphan_conclusion = crate::runtime_scheduling::status_string(effective);
-        self.tx
-            .execute(
-                concat!(
-                    "UPDATE job_steps SET conclusion = $3, finished_at = COALESCE(finished_at, ",
-                    ts!("$4"),
-                    ") WHERE agent_job_id = (SELECT agent_job_id FROM job_requests \
-                     WHERE run_id = $1::text::uuid AND job_id = $2 \
-                     ORDER BY request_id DESC LIMIT 1) AND conclusion = 'in_progress'"
-                ),
-                &[
-                    &run_id.0.to_string(),
-                    &job_id.0,
-                    &orphan_conclusion,
-                    &now_us(),
-                ],
-            )
-            .await
-            .map_err(db)?;
         let live_log_key = attempt_log_key(self.tx, run_id, job_id, None).await?;
         Ok(CompletionApplied {
             effective_status: effective,
@@ -6445,6 +6462,9 @@ struct SettleCoreOutcome {
     run_completed: bool,
     conclusion: Option<String>,
     live_log_key: String,
+    /// `StepStatus` events this settle persisted (unfinished steps closed and
+    /// reported step results).
+    events: Vec<NdjsonEvent>,
 }
 
 impl Default for SettleCoreOutcome {
@@ -6459,6 +6479,7 @@ impl Default for SettleCoreOutcome {
             run_completed: false,
             conclusion: None,
             live_log_key: String::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -6510,6 +6531,7 @@ impl PgBackend {
             live_log_key: outcome.live_log_key,
             queue_nonempty,
             replayed: outcome.replayed,
+            events: outcome.events,
         })
     }
 
@@ -6586,21 +6608,33 @@ impl PgBackend {
         } else {
             crate::runtime_scheduling::SchedulingOutcome::default()
         };
+        let mut events = outcome.events;
         if let Some(request_id) = attempt {
             settle_request_tx(&tx, request_id, outcome.effective_status).await?;
             // The attempt's step results land on its manifest.
-            for wire in &comp.step_results {
-                let Some(external_id) = wire.external_id.as_deref() else {
-                    continue;
-                };
-                if let Some(conclusion) = crate::distributed_task::completion_step_conclusion(wire)
-                {
-                    let agent = comp.agent_job_id.ok_or_else(|| {
-                        ControlError::NotFound("settle_job without agent job id".to_owned())
-                    })?;
-                    let number = wire.number.and_then(|number| i32::try_from(number).ok());
-                    self.patch_step_conclusion(&tx, agent, external_id, &conclusion, number)
-                        .await?;
+            if let Some(agent) = comp.agent_job_id {
+                for wire in &comp.step_results {
+                    let Some(external_id) = wire.external_id.as_deref() else {
+                        continue;
+                    };
+                    let Some(conclusion) =
+                        crate::distributed_task::completion_step_conclusion(wire)
+                    else {
+                        continue;
+                    };
+                    let number = wire.number.and_then(|number| u32::try_from(number).ok());
+                    events.extend(
+                        self.apply_step_result(
+                            &tx,
+                            agent,
+                            run_id,
+                            &job_id,
+                            external_id,
+                            &conclusion,
+                            number,
+                        )
+                        .await?,
+                    );
                 }
             }
         }
@@ -6618,6 +6652,7 @@ impl PgBackend {
             newly_terminal_success: outcome.newly_terminal_success,
             live_log_key: outcome.live_log_key,
             next_runs_on,
+            events,
         })))
     }
 
@@ -6720,21 +6755,12 @@ impl PgBackend {
             .map_err(db)?;
         }
         // Retire the job's open attempts, drop its machine binding, and settle
-        // the newest attempt's orphaned in-progress steps with it.
+        // the newest attempt's unfinished steps with it.
         retire_node_requests(tx, run_id, job_id, Retirement::Settle(effective)).await?;
         clear_assignment(tx, run_id, job_id).await?;
-        tx.execute(
-            concat!(
-                "UPDATE job_steps SET conclusion=$3, finished_at=COALESCE(finished_at, ",
-                ts!("$4"),
-                ") WHERE agent_job_id = (SELECT agent_job_id FROM job_requests \
-                 WHERE run_id = $1::text::uuid AND job_id = $2 \
-                 ORDER BY request_id DESC LIMIT 1) AND conclusion = 'in_progress'"
-            ),
-            &[&run, &job_id.0, &status_str(effective), &now_us()],
-        )
-        .await
-        .map_err(db)?;
+        outcome.events.extend(
+            super::timelines::close_unfinished_steps(tx, run_id, Some(job_id), effective).await?,
+        );
         // Release this job's hold or wait row, and a JobSet hold if this was
         // its final terminal member. Promotion also handles max-parallel
         // re-parking without leaving the completed holder behind.
@@ -6893,34 +6919,48 @@ impl PgBackend {
         Ok(row.map(|row| row.get::<_, i64>(0)))
     }
 
-    /// Set one step's conclusion on an attempt's manifest.
-    async fn patch_step_conclusion(
+    /// Apply one `completejob` `stepResults` conclusion to an attempt's
+    /// manifest, through the same terminal guard and change comparison as
+    /// every other step update. Returns the `StepStatus` event when the row
+    /// changed (already persisted in `tx`).
+    ///
+    /// Statement: one indexed row read (inside `append_event_tx`'s caller) and
+    /// one `UPDATE job_steps ..`.
+    async fn apply_step_result(
         &self,
         tx: &Transaction<'_>,
         agent_job_id: uuid::Uuid,
+        run_id: RunId,
+        job_id: &JobId,
         step_id: &str,
         conclusion: &str,
-        runner_number: Option<i32>,
-    ) -> Result<(), ControlError> {
-        tx.execute(
-            concat!(
-                "UPDATE job_steps SET conclusion = $3, \
-                 runner_number = COALESCE($5::int4, runner_number), \
-                 finished_at = COALESCE(finished_at, ",
-                ts!("$4"),
-                ") WHERE agent_job_id = $1::text::uuid AND step_id = $2"
-            ),
-            &[
-                &agent_job_id.to_string(),
-                &step_id,
-                &conclusion,
-                &now_us(),
-                &runner_number,
-            ],
-        )
-        .await
-        .map_err(db)?;
-        Ok(())
+        runner_number: Option<u32>,
+    ) -> Result<Vec<NdjsonEvent>, ControlError> {
+        let agent = agent_job_id.to_string();
+        let Some(current) = super::timelines::stored_step(tx, &agent, step_id).await? else {
+            // `completejob` only refines a step the manifest already holds;
+            // an unknown id is runner bookkeeping, not a new manifest entry.
+            return Ok(Vec::new());
+        };
+        let patch = crate::control::types::StepPatch {
+            id: step_id.to_owned(),
+            name: String::new(),
+            conclusion: Some(conclusion.to_owned()),
+            runner_number,
+            started_at_us: None,
+            finished_at_us: Some(now_us()),
+            observed_us: None,
+        };
+        let Some(merged) = crate::control::types::merge_step_patch(Some(&current), &patch) else {
+            return Ok(Vec::new());
+        };
+        super::timelines::write_step(tx, &agent, true, &merged.row).await?;
+        if !merged.changed {
+            return Ok(Vec::new());
+        }
+        let event = merged.row.event(run_id, job_id);
+        append_event_tx(tx, &event).await?;
+        Ok(vec![event])
     }
 
     /// Whether any ready/claimed work or pending cancellation exists.

@@ -604,6 +604,36 @@ mod tests {
         Arc::new(RegexMasker::compile(r"user:[^@\s]+@host").expect("test pattern compiles"))
     }
 
+    /// The live feed's `stepId` is the step's timeline-record GUID, not its
+    /// expression-context name. The official runner's `ExecutionContext.Write`
+    /// passes `_record.Id` to `QueueWebConsoleLine`; preloop-runner passed the
+    /// context name (`__run_2`), so a client could not join log lines to the
+    /// `StepRecord.id` its status updates and `completejob` results carry.
+    #[test]
+    fn step_context_feeds_the_record_id_to_the_live_feed() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.live_logs = Some(LiveLogQueue::disconnected());
+        let queue = job.live_logs.clone().expect("live logs installed");
+
+        let mut ctx = crate::worker::execution_context::StepContext::new(
+            &mut job,
+            "__run_2".into(),
+            "8d0a2f6c-4a1e-4f63-9a3d-0b1f2c3d4e5f".into(),
+            "Run tests".into(),
+        );
+        ctx.write_chunk(b"hello\n");
+
+        let lines = queue.dequeue(DRAIN_LIMIT);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].step_id, "8d0a2f6c-4a1e-4f63-9a3d-0b1f2c3d4e5f");
+        assert_ne!(lines[0].step_id, "__run_2");
+    }
+
     #[test]
     fn enqueue_drops_above_threshold_and_truncates() {
         let queue = LiveLogQueue::disconnected();

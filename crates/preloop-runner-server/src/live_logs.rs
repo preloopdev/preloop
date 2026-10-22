@@ -289,15 +289,18 @@ async fn live_log_stream(
     let live_stream = stream::unfold(subscription, |subscription| async move {
         // A closed job has no subscription: the snapshot is the whole stream.
         let mut rx = subscription?;
-        loop {
-            match rx.recv().await {
-                Ok(wrapper) => {
-                    let event = live_log_sse_event(&wrapper);
-                    return Some((Ok(event), Some(rx)));
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
+        match rx.recv().await {
+            Ok(wrapper) => {
+                let event = live_log_sse_event(&wrapper);
+                Some((Ok(event), Some(rx)))
             }
+            // A lagging consumer has an incomplete feed: the broadcast channel
+            // dropped batches it never saw. Ending the stream makes the client
+            // reconnect and receive the retained snapshot again (exactly what
+            // `events.ndjson` does), instead of silently continuing with a
+            // hole in the log.
+            Err(broadcast::error::RecvError::Lagged(_)) => None,
+            Err(broadcast::error::RecvError::Closed) => None,
         }
     });
 

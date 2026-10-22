@@ -631,6 +631,7 @@ pub async fn run_steps(
         let mut step_ctx = StepContext::new(
             job,
             step.context_name.clone(),
+            step.id.clone(),
             resolved_display_name.clone(),
         );
         // An action step registers its post hook from its own handler, so the
@@ -1769,7 +1770,12 @@ async fn run_background_step(
     } = start;
     let workspace = workspace.as_str();
     let started_at = crate::worker::helpers::iso_now();
-    let mut ctx = StepContext::new(job, step.context_name.clone(), display_name.clone());
+    let mut ctx = StepContext::new(
+        job,
+        step.context_name.clone(),
+        step.id.clone(),
+        display_name.clone(),
+    );
     ctx.hooks = hooks;
     {
         let expr_ctx = ctx.job.build_expression_context();

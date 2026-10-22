@@ -144,14 +144,22 @@ pub async fn patch_timeline_records(
             .iter()
             .filter_map(|record| step_patch(record, job_status, observed_us))
             .collect();
-        if let Some(agent_job_id) = agent_job_id
-            && let Err(error) = shared
+        if let Some(agent_job_id) = agent_job_id {
+            match shared
                 .state
                 .backend
                 .patch_steps(agent_job_id, patches)
                 .await
-        {
-            warn!(?error, "failed to persist timeline steps");
+            {
+                // Persisted with the rows; broadcast so a watching client
+                // updates the step in place.
+                Ok(events) => {
+                    for event in events {
+                        shared.state.emit_persisted(event).await;
+                    }
+                }
+                Err(error) => warn!(?error, "failed to persist timeline steps"),
+            }
         }
     }
     // Status events keep the legacy path (persisted by `emit`); annotations
@@ -1474,19 +1482,30 @@ fn step_patch(
         return None;
     }
     let conclusion = match record.result {
-        Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => "success",
-        Some(azdo::TaskResult::Failed) => {
-            if job_status == Some(ExecutionStatus::Cancelled) {
-                "cancelled"
-            } else {
-                "failure"
-            }
+        Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => {
+            Some("success")
         }
-        Some(azdo::TaskResult::Cancelled) => "cancelled",
-        Some(azdo::TaskResult::Skipped) => "skipped",
-        Some(azdo::TaskResult::Abandoned) => "failed",
-        None if record.state == Some(azdo::TimelineRecordState::InProgress) => "in_progress",
-        _ => "success",
+        Some(azdo::TaskResult::Failed) => Some(if job_status == Some(ExecutionStatus::Cancelled) {
+            "cancelled"
+        } else {
+            "failure"
+        }),
+        Some(azdo::TaskResult::Cancelled) => Some("cancelled"),
+        Some(azdo::TaskResult::Skipped) => Some("skipped"),
+        // `Abandoned` is the value the *server* sets on a record the job
+        // never ran (the official runner says so verbatim in `StepsRunner`:
+        // "Abandoned (Server set this.)"). It means the step went with the
+        // cancelled job, so the canonical word is `cancelled`; the old
+        // mapping wrote `failed`, which is not even in the vocabulary the run
+        // record's step conclusions use.
+        Some(azdo::TaskResult::Abandoned) => Some("cancelled"),
+        None if record.state == Some(azdo::TimelineRecordState::InProgress) => Some("in_progress"),
+        // A record in a completed non-`InProgress` state with no `result`
+        // makes no conclusion claim: the PATCH is partial, and the official
+        // runner always sends `result` with `Completed`. The old fallback
+        // invented `success`, so a malformed record could mark work passed.
+        None if record.state == Some(azdo::TimelineRecordState::Pending) => Some("pending"),
+        None => None,
     };
     let micros = |time: Option<&str>| {
         time.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
@@ -1495,10 +1514,11 @@ fn step_patch(
     Some(crate::control::types::StepPatch {
         id: record.id.to_string(),
         name,
-        conclusion: conclusion.to_owned(),
+        conclusion: conclusion.map(str::to_owned),
+        runner_number: None,
         started_at_us: micros(record.start_time.as_deref()),
         finished_at_us: micros(record.finish_time.as_deref()),
-        observed_us,
+        observed_us: Some(observed_us),
     })
 }
 
@@ -1507,6 +1527,60 @@ mod tests {
     use super::*;
     use crate::store::now_us;
     use std::sync::Arc;
+
+    /// The AzDO `result` mapping: `Abandoned` is the *server*-set marker for a
+    /// step the job never ran, so it lands in the canonical `cancelled` word
+    /// (it used to be written as `failed`, which is not even in the run
+    /// record's step vocabulary); a record with no `result` makes no
+    /// conclusion claim instead of defaulting to success.
+    #[test]
+    fn step_patch_maps_azdo_results_to_the_canonical_vocabulary() {
+        let record = |state: azdo::TimelineRecordState, result: Option<azdo::TaskResult>| {
+            serde_json::from_value(serde_json::json!({
+                "id": uuid::Uuid::new_v4(),
+                // Untyped records need a parent to read as steps.
+                "parentId": uuid::Uuid::new_v4(),
+                "displayName": "Run tests",
+                "state": state,
+                "result": result,
+                "startTime": "2026-07-28T18:58:13.715Z",
+                "finishTime": "2026-07-28T18:58:19.000Z",
+            }))
+            .expect("a step timeline record")
+        };
+        let patch = |record: &azdo::TimelineRecord| {
+            step_patch(record, None, 0).expect("a named step record patches")
+        };
+        assert_eq!(
+            patch(&record(
+                azdo::TimelineRecordState::Completed,
+                Some(azdo::TaskResult::Abandoned)
+            ))
+            .conclusion
+            .as_deref(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            patch(&record(azdo::TimelineRecordState::Completed, None)).conclusion,
+            None,
+            "a completed record with no result claims no conclusion"
+        );
+        assert_eq!(
+            patch(&record(azdo::TimelineRecordState::InProgress, None))
+                .conclusion
+                .as_deref(),
+            Some("in_progress")
+        );
+        assert_eq!(
+            patch(&record(
+                azdo::TimelineRecordState::Completed,
+                Some(azdo::TaskResult::Skipped)
+            ))
+            .conclusion
+            .as_deref(),
+            Some("skipped")
+        );
+    }
 
     /// Seed a single in-flight run with one job, its plan→request mapping, and
     /// timeline id. Returns the owned `TempDir` (keeps the store file alive for

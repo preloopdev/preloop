@@ -148,7 +148,18 @@ impl HookRegistrations {
 
 pub struct StepContext<'a> {
     pub job: &'a mut JobContext,
+    /// Expression-context key of the step (`compile`, `__run_2`, and
+    /// `__post_<...>` for hooks). It keys saved state and hook registration;
+    /// it is *not* the step's identity on the wire.
     pub step_id: String,
+    /// The step's timeline-record GUID — `TaskStep.id` for a workflow step, a
+    /// runner-minted id for bookkeeping steps. This is what the server stores
+    /// as `StepRecord.id`, what `WorkflowStepsUpdate.external_id` and
+    /// `completejob.stepResults[].external_id` carry, and therefore what the
+    /// live-console feed must carry as `stepId`: the official runner passes
+    /// its `TimelineRecord.Id` to `QueueWebConsoleLine`, and a client joins
+    /// log lines to a step by that id.
+    pub record_id: String,
     pub step_name: String,
     /// Step-level env overrides.
     pub env: HashMap<String, String>,
@@ -219,7 +230,12 @@ impl<'a> StepContext<'a> {
     }
 
     /// Create a new step context.
-    pub fn new(job: &'a mut JobContext, step_id: String, step_name: String) -> Self {
+    pub fn new(
+        job: &'a mut JobContext,
+        step_id: String,
+        record_id: String,
+        step_name: String,
+    ) -> Self {
         let is_debug = |v: &str| v == "true" || v == "1";
         let debug = std::env::var("ACTIONS_STEP_DEBUG").is_ok_and(|v| is_debug(&v))
             || std::env::var("RUNNER_DEBUG").is_ok_and(|v| is_debug(&v))
@@ -245,6 +261,7 @@ impl<'a> StepContext<'a> {
         Self {
             job,
             step_id,
+            record_id,
             step_name,
             env: HashMap::new(),
             annotations: Vec::new(),
@@ -335,7 +352,7 @@ impl<'a> StepContext<'a> {
                 let line_num = self
                     .live_line_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                live.enqueue(&self.step_id, &masked, line_num);
+                live.enqueue(&self.record_id, &masked, line_num);
             }
         }
     }
@@ -383,7 +400,7 @@ impl<'a> StepContext<'a> {
             let line_num = self
                 .live_line_counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            live.enqueue(&self.step_id, &masked, line_num);
+            live.enqueue(&self.record_id, &masked, line_num);
         }
     }
 
@@ -904,7 +921,7 @@ mod tests {
     #[test]
     fn build_env_merges_job_and_step() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step 1".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step 1".into());
         ctx.env.insert("STEP_VAR".into(), "from_step".into());
         ctx.env.insert("JOB_VAR".into(), "overridden".into());
 
@@ -920,7 +937,7 @@ mod tests {
     #[test]
     fn build_env_defaults_to_system_ca_store() {
         let mut job = make_job();
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
         let env = ctx.build_env();
         assert_eq!(
@@ -942,7 +959,7 @@ mod tests {
         let mut job = make_job();
         job.env
             .insert("NODE_OPTIONS".into(), "--max-old-space-size=4096".into());
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
         let env = ctx.build_env();
         assert_eq!(
@@ -957,7 +974,7 @@ mod tests {
     #[test]
     fn build_env_leaves_host_ca_env_alone() {
         let mut job = make_job();
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
         let env = ctx.build_env();
         assert!(!env.contains_key("NODE_OPTIONS"));
@@ -977,7 +994,7 @@ mod tests {
             ],
             || {
                 let mut job = make_job();
-                let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+                let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
                 let env = ctx.build_env();
                 assert_eq!(env.get("USER").map(String::as_str), Some("runner"));
@@ -1000,7 +1017,7 @@ mod tests {
             &[("PRELOOP_RUNNER_USER", None), ("PRELOOP_RUNNER_UID", None)],
             || {
                 let mut job = make_job();
-                let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+                let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
                 let env = ctx.build_env();
                 let expected = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
@@ -1020,7 +1037,7 @@ mod tests {
             ],
             || {
                 let mut job = make_job();
-                let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+                let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
                 ctx.env
                     .insert("XDG_RUNTIME_DIR".into(), "/custom/run".into());
 
@@ -1037,7 +1054,7 @@ mod tests {
     fn build_env_includes_extra_path() {
         let mut job = make_job();
         job.extra_path.push("/custom/bin".into());
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
         let env = ctx.build_env();
         let path = env.get("PATH").unwrap();
@@ -1052,7 +1069,7 @@ mod tests {
             .insert("PATH".into(), "/workflow/bin:/usr/bin".into());
         // Simulate GITHUB_PATH addition
         job.extra_path.push("/github/path/bin".into());
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
         let env = ctx.build_env();
         let path = env.get("PATH").unwrap();
@@ -1071,7 +1088,7 @@ mod tests {
     #[test]
     fn build_env_guarantees_path_when_none_supplied() {
         let mut job = make_job();
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
         let env = ctx.build_env();
         let path = env.get("PATH").expect("PATH must always be present");
@@ -1094,7 +1111,7 @@ mod tests {
     #[test]
     fn container_env_does_not_leak_host_path_fallback() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         // Set by the docker-action handlers, and for every step of a job
         // container: the env is bound for docker run/exec.
         ctx.translate_container_path = true;
@@ -1113,7 +1130,7 @@ mod tests {
     fn container_env_keeps_explicit_job_path() {
         let mut job = make_job();
         job.env.insert("PATH".into(), "/image/bin:/usr/bin".into());
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.translate_container_path = true;
 
         let env = ctx.build_env();
@@ -1130,7 +1147,7 @@ mod tests {
     fn container_env_prepends_github_path_without_host_base() {
         let mut job = make_job();
         job.extra_path.push("/github/path/bin".into());
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.translate_container_path = true;
 
         let env = ctx.build_env();
@@ -1151,7 +1168,7 @@ mod tests {
     fn build_env_respects_explicit_job_path() {
         let mut job = make_job();
         job.env.insert("PATH".into(), "/custom/bin".into());
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
         let env = ctx.build_env();
         assert_eq!(env.get("PATH").map(String::as_str), Some("/custom/bin"));
@@ -1180,7 +1197,7 @@ mod tests {
     #[test]
     fn log_masks_secrets() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.log("token is secret-value here");
         assert!(ctx.log_lines[0].ends_with("token is *** here"));
     }
@@ -1191,7 +1208,7 @@ mod tests {
     fn truncation_masks_before_cutting() {
         let mut job = make_job();
         job.add_mask("straddling-secret-token");
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         // Secret starts 5 bytes before the cut: truncate-first would keep a
         // "strad" fragment that no longer matches the whole secret and leaks.
         let line = format!(
@@ -1216,7 +1233,7 @@ mod tests {
     #[test]
     fn completed_line_capped_at_1mib() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.write_chunk(format!("{}.\n", "C".repeat(3 * 1024 * 1024)).as_bytes());
         let logged = ctx.log_lines.join("\n");
         assert!(
@@ -1235,7 +1252,7 @@ mod tests {
     #[test]
     fn complete_lines_survive_partial_buffer_pressure() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         let chunk = format!("first secret-value\n{}", "Z".repeat(2 * 1024 * 1024));
         ctx.write_chunk(chunk.as_bytes());
         assert!(
@@ -1253,7 +1270,7 @@ mod tests {
     #[test]
     fn log_content_joins_lines() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.log("line1");
         ctx.log("line2");
         let lines: Vec<&str> = ctx
@@ -1268,7 +1285,7 @@ mod tests {
     #[test]
     fn log_content_keeps_history_past_old_cap() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         for i in 0..9 {
             ctx.log(&format!("pad-{i} {}", "x".repeat(1024 * 1024)));
         }
@@ -1292,7 +1309,7 @@ mod tests {
             hint_type: preloop_gha_protocol::azdo::MaskType::Regex,
             value: "(?s)BEGIN.*END".to_owned(),
         }]);
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.write_chunk(b"BEGIN\ncross-line-token\nEND\ntail\n");
 
         // Per-line masking cannot see the span: the pattern needs the newline.
@@ -1312,7 +1329,7 @@ mod tests {
     #[test]
     fn log_head_is_bounded_prefix() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.log("line1");
         ctx.log(&format!("filler {}", "y".repeat(4096)));
         let head = ctx.log_head(64);
@@ -1325,7 +1342,7 @@ mod tests {
     #[test]
     fn multiline_durable_writes_count_each_physical_line() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.log_raw("first\nsecond");
         assert_eq!(ctx.log_line_count(), 2);
         let start = ctx.log_line_count();
@@ -1337,7 +1354,7 @@ mod tests {
     fn marker_valued_masks_are_stable_retroactively() {
         for secret in ["*", "**", "***"] {
             let mut job = make_job();
-            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
             ctx.log(&format!("before {secret}"));
             let new_masks = ctx.job.add_mask(secret);
             ctx.retroactive_mask(&new_masks).unwrap();
@@ -1360,7 +1377,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({}),
         );
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.log("prior hunter2-secret");
         let attempt_start = ctx.log_line_count();
         let new_masks = ctx.job.add_mask("hunter2-secret");
@@ -1385,7 +1402,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({}),
         );
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.log_raw("leaked token-a\ntoken-b here");
         let count_before = ctx.log_line_count();
         assert_eq!(count_before, 2);
@@ -1409,7 +1426,7 @@ mod tests {
     #[test]
     fn annotations_collected() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.annotate(Annotation {
             level: AnnotationLevel::Error,
             message: "test error".into(),
@@ -1426,7 +1443,7 @@ mod tests {
     #[test]
     fn annotations_cap_enforced() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         for i in 0..15 {
             ctx.annotate(Annotation {
                 level: AnnotationLevel::Warning,
@@ -1451,7 +1468,12 @@ mod tests {
             .or_default()
             .insert("repository".into(), "owner/repo".into());
 
-        let ctx = StepContext::new(&mut job, "__post_checkout".into(), "Post checkout".into());
+        let ctx = StepContext::new(
+            &mut job,
+            "__post_checkout".into(),
+            "__post_checkout".into(),
+            "Post checkout".into(),
+        );
         let env = ctx.build_env();
 
         assert_eq!(
@@ -1479,7 +1501,7 @@ mod tests {
         .unwrap();
         job.matchers.add_from_file(&path).unwrap();
 
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
 
         // 1. Unsafe repository telemetry check
         ctx.log("fatal: unsafe repository ('/github/workspace' is owned by someone else)");
@@ -1504,7 +1526,7 @@ mod tests {
     #[test]
     fn annotation_message_trimmed_to_max_length() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         let long_msg = "x".repeat(5000);
         ctx.annotate(Annotation {
             level: AnnotationLevel::Error,
@@ -1523,7 +1545,7 @@ mod tests {
     #[test]
     fn debug_splits_multiline_messages() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.debug = true;
         ctx.debug("line1\nline2\nline3");
         // Should produce 3 separate log entries
@@ -1541,7 +1563,7 @@ mod tests {
     #[test]
     fn debug_single_line_unchanged() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.debug = true;
         ctx.debug("single line");
         let debug_lines: Vec<_> = ctx
@@ -1556,7 +1578,7 @@ mod tests {
     #[test]
     fn debug_noop_when_disabled() {
         let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         ctx.debug = false;
         ctx.debug("should not appear");
         assert!(ctx.log_lines.is_empty());
@@ -1591,7 +1613,7 @@ mod tests {
         for value in [None, Some("false")] {
             with_stdout_toggle(value, || {
                 let mut job = make_job();
-                let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+                let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
                 ctx.write_chunk(b"first\nsecond\n");
                 let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
                 assert_eq!(lines.len(), 2);
@@ -1613,7 +1635,7 @@ mod tests {
     fn write_chunk_multiline_stdout_suppresses_true_continuation_prefix() {
         with_stdout_toggle(Some("true"), || {
             let mut job = make_job();
-            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
             ctx.write_chunk(b"first\nsecond\n");
             let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
             assert_eq!(lines.len(), 2);
@@ -1630,7 +1652,7 @@ mod tests {
     fn write_chunk_flushes_true_partial_continuation_without_prefix() {
         with_stdout_toggle(Some("true"), || {
             let mut job = make_job();
-            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
             ctx.write_chunk(b"first\nsecond");
             ctx.flush_line_buffer();
             let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
@@ -1644,7 +1666,7 @@ mod tests {
     fn write_chunk_flushes_standalone_partial_line_with_prefix() {
         with_stdout_toggle(Some("true"), || {
             let mut job = make_job();
-            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
             ctx.write_chunk(b"standalone");
             ctx.flush_line_buffer();
             let content = ctx.log_content();
@@ -1659,7 +1681,7 @@ mod tests {
     fn write_chunk_preserves_continuation_state_across_chunks() {
         with_stdout_toggle(Some("true"), || {
             let mut job = make_job();
-            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
             ctx.write_chunk(b"first\nsec");
             ctx.write_chunk(b"ond");
             ctx.flush_line_buffer();
@@ -1675,7 +1697,7 @@ mod tests {
     fn write_chunk_multiline_stdout_preserves_unrelated_command_prefixes() {
         with_stdout_toggle(Some("true"), || {
             let mut job = make_job();
-            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
             ctx.write_chunk(b"##[error]first\n##[warning]second\n");
             let lines: Vec<_> = ctx.log_content().lines().map(str::to_string).collect();
             assert_eq!(lines.len(), 2);
@@ -1729,7 +1751,7 @@ mod services_path_tests {
         // first GITHUB_PATH write replaced PATH with extras-only and every
         // later spawn failed with ENOENT.
         let mut job = services_only_job();
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "s1".into(), "Step".into());
         assert!(
             !ctx.translate_container_path,
             "services-only steps execute on the host"

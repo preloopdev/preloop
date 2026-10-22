@@ -1039,10 +1039,11 @@ async fn patch_steps_upserts_synthetic_steps() {
             vec![StepPatch {
                 id: "step-1".to_owned(),
                 name: "Build".to_owned(),
-                conclusion: "success".to_owned(),
+                conclusion: Some("success".to_owned()),
+                runner_number: None,
                 started_at_us: Some(now),
                 finished_at_us: Some(now + 5),
-                observed_us: now,
+                observed_us: Some(now),
             }],
         )
         .await
@@ -1054,10 +1055,11 @@ async fn patch_steps_upserts_synthetic_steps() {
             vec![StepPatch {
                 id: "step-1".to_owned(),
                 name: "Build (renamed)".to_owned(),
-                conclusion: "success".to_owned(),
+                conclusion: Some("success".to_owned()),
+                runner_number: None,
                 started_at_us: None,
                 finished_at_us: None,
-                observed_us: now + 10,
+                observed_us: Some(now + 10),
             }],
         )
         .await
@@ -1069,10 +1071,11 @@ async fn patch_steps_upserts_synthetic_steps() {
             vec![StepPatch {
                 id: "x".to_owned(),
                 name: "x".to_owned(),
-                conclusion: "success".to_owned(),
+                conclusion: Some("success".to_owned()),
+                runner_number: None,
                 started_at_us: None,
                 finished_at_us: None,
-                observed_us: now,
+                observed_us: Some(now),
             }],
         )
         .await
@@ -1303,10 +1306,11 @@ async fn run_step_manifests_survive_archival() {
         vec![StepPatch {
             id: "step-1".to_owned(),
             name: "Build".to_owned(),
-            conclusion: "success".to_owned(),
+            conclusion: Some("success".to_owned()),
+            runner_number: None,
             started_at_us: Some(now),
             finished_at_us: Some(now + 5),
-            observed_us: now,
+            observed_us: Some(now),
         }],
     )
     .await
@@ -1426,10 +1430,11 @@ async fn out_of_range_step_timestamp_reads_as_absent() {
         vec![StepPatch {
             id: "step-1".to_owned(),
             name: "Build".to_owned(),
-            conclusion: "success".to_owned(),
+            conclusion: Some("success".to_owned()),
+            runner_number: None,
             started_at_us: Some(now),
             finished_at_us: None,
-            observed_us: now,
+            observed_us: Some(now),
         }],
     )
     .await
