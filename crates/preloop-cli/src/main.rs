@@ -25,6 +25,7 @@ mod github_auth;
 mod github_setup;
 mod init;
 
+mod prompter;
 mod push;
 mod sandbox;
 mod server_install;
@@ -2624,13 +2625,18 @@ fn configured_base_image() -> anyhow::Result<String> {
 /// watching, otherwise say the one line an operator needs. A non-interactive
 /// `serve` (systemd, CI, a pipe) must never block on a prompt.
 ///
+/// "Configured" is [`init::wizard_configured`], not "a base image resolves":
+/// the official golden is a *kind* with no base image, and asking "run
+/// `preloop init` first?" on every start after the operator chose it would be
+/// asking a question that was already answered.
+///
 /// `engine_public_url` is the origin this engine resolved for itself before the
 /// wizard ran. The wizard can resolve a different one — the App flow asks for
 /// the address GitHub is given — and the handoff installs that answer into the
 /// running engine (or reports which origin won when the two disagree).
 async fn offer_init_when_unconfigured(engine_public_url: &str) -> anyhow::Result<()> {
     let config = preloop_runner_server::config::load_config()?;
-    if preloop_runner_server::config::golden_base_image(&config).is_some() {
+    if init::wizard_configured(&config) {
         return Ok(());
     }
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {

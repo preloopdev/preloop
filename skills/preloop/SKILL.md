@@ -102,7 +102,7 @@ preloop debug [session] --export [--patch-only]   # pull VM-side edits back to h
 preloop secret set <NAME> [--value V | stdin] [--repo owner/repo]
 preloop secret list [--repo owner/repo]           # names only, never values
 preloop secret rm <NAME> [--repo owner/repo]
-preloop setup github                              # GitHub App or fine-grained PAT
+preloop setup github --via app                    # GitHub App (or --via pat)
 preloop doctor                                    # verify credential config
 ```
 
