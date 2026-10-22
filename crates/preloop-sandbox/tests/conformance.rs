@@ -387,14 +387,17 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
     h.service.acquire(request.clone()).await.unwrap();
     wait_for(|| h.service.list().is_empty()).await;
 
+    // A preserved sandbox stays usable for its whole window, so the debugging
+    // exec below must not race the window: this one is held far longer than
+    // an exec can take.
     request.idempotency_key = "keep".into();
     request.ttl_secs = 60;
-    let lease = h.service.acquire(request).await.unwrap();
+    let lease = h.service.acquire(request.clone()).await.unwrap();
     h.service
         .release(ReleaseRequest {
             lease_id: lease.lease.id.clone(),
             mode: ReleaseMode::Preserve,
-            preserve_ttl_secs: 1,
+            preserve_ttl_secs: 60,
         })
         .await
         .unwrap();
@@ -411,7 +414,30 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
         .await
         .unwrap();
     assert_eq!(code, 0);
-    wait_for(|| h.service.get(&lease.sandbox.id).is_err()).await;
+
+    // A short window ends at its TTL. Only the window elapses here, so the
+    // destroy is caused by the TTL itself.
+    request.idempotency_key = "short-preserve".into();
+    let short = h.service.acquire(request).await.unwrap();
+    h.service
+        .release(ReleaseRequest {
+            lease_id: short.lease.id.clone(),
+            mode: ReleaseMode::Preserve,
+            preserve_ttl_secs: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.service.get(&short.sandbox.id).unwrap().state,
+        SandboxState::Preserved
+    );
+    wait_for(|| h.service.get(&short.sandbox.id).is_err()).await;
+    // The long window outlived it: the short sandbox ended by its TTL, not
+    // by reconcile.
+    assert_eq!(
+        h.service.get(&lease.sandbox.id).unwrap().state,
+        SandboxState::Preserved
+    );
 }
 
 #[tokio::test]
