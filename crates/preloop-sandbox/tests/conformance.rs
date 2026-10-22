@@ -2716,8 +2716,13 @@ async fn a_lost_provider_releases_its_leases() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("sandbox.db");
     let store = store::open(db.to_str().unwrap()).await.unwrap();
+    // The provider is only online while its liveness keeps being refreshed,
+    // so the heartbeat the agent sends must be well inside the timeout the
+    // test declares it lost by: otherwise a scheduling pause between
+    // registration and `Acquire` reads as a dead host.
+    let provider_timeout = Duration::from_secs(1);
     let mut config = ServiceConfig::new(dir.path().join("blobs"));
-    config.provider_timeout = Duration::from_millis(80);
+    config.provider_timeout = provider_timeout;
     config.provider_lost_factor = 1;
     config.acquire_wait = Duration::from_secs(10);
     let service = Service::open(store.clone(), config).await.unwrap();
@@ -2727,10 +2732,12 @@ async fn a_lost_provider_releases_its_leases() {
         FakeDriver::full_capabilities(),
     ));
     let shutdown = CancellationToken::new();
+    let mut agent_config = AgentConfig::new("host-a", dir.path().join("scratch"));
+    agent_config.heartbeat = provider_timeout / 20;
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![fake as Arc<dyn Driver>],
-        AgentConfig::new("host-a", dir.path().join("scratch")),
+        agent_config,
     );
     tokio::spawn(agent.run(shutdown.clone()));
     wait_for(|| !service.list_providers().is_empty()).await;
@@ -2744,9 +2751,10 @@ async fn a_lost_provider_releases_its_leases() {
         .await
         .unwrap();
     // Silencing the agent is what a host losing its network looks like: no
-    // heartbeat, no poll, no report.
+    // heartbeat, no poll, no report. Wait past the timeout the service
+    // declares the provider lost by, not past the last heartbeat.
     shutdown.cancel();
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(provider_timeout * 2).await;
     service.maintain().await;
     let error = service
         .renew(RenewRequest {
