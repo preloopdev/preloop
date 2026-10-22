@@ -54,6 +54,19 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Sandbox Service certificates verify under OpenSSL 3, and an agent with a
+  stale identity recovers cleanly.** The generated CA and its server/client
+  leaves now carry Subject and Authority Key Identifiers (plus
+  `basicConstraints` and matching EKUs), so strict verifiers such as Python
+  `ssl` and `curl` accept the chain instead of failing with `Missing Authority
+  Key Identifier`. `preloop sandbox agent` without `--join` now dials the
+  service URL recorded with its identity instead of the `https://127.0.0.1:9191`
+  default (`--join` still overrides it). A registration rejected because the
+  service was re-keyed now reports that the identity was issued by a different
+  CA and how to re-enroll, backing off at 30 seconds instead of retrying in a
+  loop; the service logs the rejected TLS handshake, or the rejected RPC with
+  the client certificate's fingerprint when the certificate chains but is not
+  enrolled.
 - **The runner pool's golden-release GitHub calls now go through the engine's
   circuit breaker.** `resolve_latest_golden_tag` (the `/releases` listing), the
   OCI manifest and token lookups, the `.sha256` sidecars and the golden

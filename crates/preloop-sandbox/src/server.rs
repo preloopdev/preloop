@@ -17,6 +17,7 @@ use axum::routing::{get, post};
 use futures::StreamExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::api::*;
 use crate::connect::{self, Code, Error};
@@ -264,11 +265,25 @@ async fn providers(
     }
     let fingerprint = match peer.fingerprint() {
         Ok(fingerprint) => fingerprint.to_owned(),
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            warn!(method = %method, "providers: call without a client certificate");
+            return error.into_response();
+        }
     };
     let identity = match service.provider_identity(&fingerprint) {
         Ok(identity) => identity,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            // The TLS layer accepted the certificate (it chains to this CA),
+            // but no live provider record owns that fingerprint: an identity
+            // from before a re-key, or a revoked one.
+            warn!(
+                method = %method,
+                fingerprint = %fingerprint,
+                %error,
+                "providers: client certificate is not enrolled"
+            );
+            return error.into_response();
+        }
     };
     match method.as_str() {
         "Register" => match decode::<RegisterRequest>(&body) {

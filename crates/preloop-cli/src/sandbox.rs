@@ -391,7 +391,8 @@ struct ServeSandboxArgs {
 #[derive(Debug, Args)]
 struct AgentArgs {
     /// Service URL to enroll with (`https://host:9191`). Required on the
-    /// first run; the URL is stored with the identity.
+    /// first run; the URL is stored with the identity. On later runs this
+    /// overrides the stored URL; without it the agent dials the stored one.
     #[arg(long)]
     join: Option<String>,
     /// Stable provider name. Stored with the identity on first run.
@@ -582,7 +583,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
     match args.command {
         SandboxCommand::Serve(serve) => serve_standalone(serve).await,
-        SandboxCommand::Agent(agent) => run_agent(&args.service, args.token.clone(), agent).await,
+        SandboxCommand::Agent(agent) => run_agent(args.token.clone(), agent).await,
         command => {
             let client = sandbox_client(&args.service, args.token.clone(), args.ca.clone())?;
             run_client(client, command).await
@@ -827,21 +828,35 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_agent(
-    service: &str,
-    client_token: Option<String>,
-    args: AgentArgs,
-) -> anyhow::Result<()> {
+/// Resolve the link `sandbox agent` runs on.
+///
+/// `--join` is the only override. Without it the service URL recorded with
+/// the identity wins: the global `--service` default is for caller commands
+/// and must not silently point a restarted agent at `127.0.0.1:9191`.
+async fn agent_link(
+    identity_dir: &Path,
+    join: Option<&str>,
+    join_token: Option<&str>,
+    name: &str,
+) -> anyhow::Result<RemoteLink> {
+    Ok(RemoteLink::connect(identity_dir, join, join_token, name).await?)
+}
+
+async fn run_agent(client_token: Option<String>, args: AgentArgs) -> anyhow::Result<()> {
     let home = crate::preloop_home();
     let state = home.join("state");
     let identity_dir = args
         .identity
         .unwrap_or_else(|| state.join("sandbox-identity"));
     let initial_name = args.name.unwrap_or_else(local_provider_name);
-    let base = args.join.as_deref().or(Some(service));
     let join_token = args.join_token.or(client_token);
-    let link =
-        RemoteLink::connect(&identity_dir, base, join_token.as_deref(), &initial_name).await?;
+    let link = agent_link(
+        &identity_dir,
+        args.join.as_deref(),
+        join_token.as_deref(),
+        &initial_name,
+    )
+    .await?;
     // An existing identity owns the name it was enrolled under.
     let name = link.name().unwrap_or(initial_name);
     let base = link.base().to_owned();
@@ -859,4 +874,69 @@ async fn run_agent(
     eprintln!("[preloop] sandbox agent joining {base}");
     agent.run(shutdown).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use preloop_sandbox::tls::{AgentIdentity, IdentityMetadata, ServiceCa, generate_csr};
+
+    fn stored_identity(root: &Path, base: &str) -> AgentIdentity {
+        let ca = ServiceCa::load_or_create(&root.join("ca")).unwrap();
+        let (key_pem, csr) = generate_csr("host-a").unwrap();
+        let signed = ca
+            .sign_client(&csr, "host-a", tls::CLIENT_CERT_LIFETIME)
+            .unwrap();
+        let identity = AgentIdentity {
+            dir: root.join("identity"),
+            metadata: IdentityMetadata {
+                name: "host-a".into(),
+                base: base.into(),
+                ca_sha256: ca.sha256_hex().to_owned(),
+                issued_at: 1,
+                expires_at: 2,
+            },
+            ca_pem: ca.pem().to_owned(),
+            cert_pem: signed.cert_pem,
+            key_pem,
+        };
+        identity.save().unwrap();
+        identity
+    }
+
+    #[tokio::test]
+    async fn restart_without_join_reuses_the_stored_service_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = stored_identity(dir.path(), "https://stored.example:9191");
+        let link = agent_link(&identity.dir, None, None, "host-a")
+            .await
+            .unwrap();
+        assert_eq!(link.base(), "https://stored.example:9191");
+    }
+
+    #[tokio::test]
+    async fn join_overrides_the_stored_service_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = stored_identity(dir.path(), "https://stored.example:9191");
+        let link = agent_link(
+            &identity.dir,
+            Some("https://other.example:9191"),
+            None,
+            "host-a",
+        )
+        .await
+        .unwrap();
+        assert_eq!(link.base(), "https://other.example:9191");
+        let reloaded = AgentIdentity::load(&identity.dir).unwrap().unwrap();
+        assert_eq!(reloaded.metadata.base, "https://other.example:9191");
+    }
+
+    #[tokio::test]
+    async fn a_first_run_without_join_asks_for_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = agent_link(dir.path(), None, None, "host-a")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("--join"), "{error}");
+    }
 }

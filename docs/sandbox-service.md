@@ -96,10 +96,13 @@ certificate. There is no plaintext mode and no loopback exemption.
 * **Providers** authenticate with a client certificate issued by the service
   CA. Every `Providers` RPC except `Enroll` requires one; the service maps the
   leaf's SHA-256 fingerprint to a provider record, so no X.509 parsing happens
-  past the handshake. A certificate only acts as the provider it was enrolled
-  for: `Register`'s `name` must equal the enrolled name and every other RPC may
-  only name its own provider id. Removed providers and expired certificates are
-  rejected with `permission_denied`. `PRELOOP_SANDBOX_PROVIDER_TOKEN` is gone.
+  past the handshake. The CA and the leaves it issues carry Subject and
+  Authority Key Identifiers (plus `basicConstraints` and the matching EKU), so
+  OpenSSL 3 verifiers — Python `ssl`, `curl` — accept the chain. A certificate
+  only acts as the provider it was enrolled for: `Register`'s `name` must equal
+  the enrolled name and every other RPC may only name its own provider id.
+  Removed providers and expired certificates are rejected with
+  `permission_denied`. `PRELOOP_SANDBOX_PROVIDER_TOKEN` is gone.
 * **Enrollment** is a single-use token:
   `preloop sandbox token create --ttl 1h` prints
   `plj1.<id>.<secret>.<ca_sha256>` and the store keeps only a hash of the
@@ -109,6 +112,14 @@ certificate. There is no plaintext mode and no loopback exemption.
   unless that CA hashes to the token's pin. The identity (`key.pem`, `cert.pem`,
   `ca.pem`, `identity.json`, all 0600) lives under
   `<home>/state/sandbox-identity/`; later starts reuse it with no token.
+  `--join` is recorded in `identity.json`, and a restart without it dials that
+  stored URL — the global `--service` default never overrides it; passing
+  `--join` again does. If the service was re-keyed, the identity's `ca.pem` no
+  longer matches: the agent reports that the identity was issued by a different
+  CA and asks for a re-enroll with `--join … --token …` (backing off at 30s
+  rather than retrying the handshake in a loop), and the service logs the
+  rejected TLS handshake — or, when the certificate chains to its CA but is not
+  enrolled, the rejected RPC with the client certificate's fingerprint.
   Re-enrolling an existing name with a new token replaces its fingerprints.
 * **Renewal** is automatic: the agent asks for a new certificate once two
   thirds of the lifetime have passed and hot-reloads its client identity. The
@@ -159,6 +170,7 @@ and debug-hold strategy; the machines under it are sandboxes.
 preloop sandbox serve --listen 0.0.0.0:9191            # standalone service (+ local SmolVM)
 preloop sandbox token create --ttl 1h                  # join token for a provider
 preloop sandbox agent --join https://hub:9191 --token plj1.…  # enroll, then reuse the identity
+preloop sandbox agent                                         # later starts reuse the stored URL
 preloop sandbox template put --name alpine --image alpine:3.20
 preloop sandbox pool put --name alpine --template alpine --warm 2
 preloop sandbox acquire --pool alpine --env JOB=1      # → lease + sandbox JSON

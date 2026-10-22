@@ -340,7 +340,7 @@ impl Client {
             .body(body)
             .send()
             .await
-            .map_err(|error| Error::unavailable(format!("{path}: {error}")))?;
+            .map_err(|error| transport_error(path, &error))?;
         let status = response.status();
         let bytes = response
             .bytes()
@@ -370,7 +370,7 @@ impl Client {
             .body(envelope(0, &payload).to_vec())
             .send()
             .await
-            .map_err(|error| Error::unavailable(format!("{path}: {error}")))?;
+            .map_err(|error| transport_error(path, &error))?;
         let status = response.status();
         if !status.is_success() {
             let bytes = response.bytes().await.unwrap_or_default();
@@ -384,6 +384,35 @@ impl Client {
         let body = response.bytes_stream();
         Ok(decode_frames::<Resp, _>(body))
     }
+}
+
+/// Map a transport failure.
+///
+/// A stale CA is an identity problem, not a network blip: an agent whose
+/// `ca.pem` predates a service re-key must re-enroll instead of retrying (and
+/// reporting `error sending request for url` forever).
+fn transport_error(path: &str, error: &reqwest::Error) -> Error {
+    if crate::tls::is_untrusted_service_ca(error) {
+        return Error::new(
+            Code::Unauthenticated,
+            format!(
+                "{path}: identity was issued by a different CA (the service certificate does \
+                 not chain to the stored ca.pem); re-enroll with `--join <service-url> --token \
+                 <join-token>`"
+            ),
+        );
+    }
+    if crate::tls::is_client_certificate_rejected(error) {
+        return Error::new(
+            Code::Unauthenticated,
+            format!(
+                "{path}: the service rejected the client certificate (the identity is unknown \
+                 or was issued by a different CA); re-enroll with `--join <service-url> --token \
+                 <join-token>`"
+            ),
+        );
+    }
+    Error::unavailable(format!("{path}: {error}"))
 }
 
 #[derive(Deserialize)]
