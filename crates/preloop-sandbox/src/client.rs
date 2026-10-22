@@ -264,9 +264,9 @@ impl SandboxClient {
 ///
 /// A stale CA is an identity problem, not a network blip: an agent whose
 /// `ca.pem` predates a service re-key must re-enroll instead of retrying (and
-/// reporting `HTTPS request failed` forever). The generated transport keeps
-/// the `reqwest::Error` as the `ConnectError` source, so the rustls cause is
-/// still reachable here.
+/// reporting `HTTPS request failed` forever). The built-in transport keeps
+/// the hyper/rustls failure as the `ConnectError` source, so the certificate
+/// cause is still reachable here.
 pub(crate) fn classify_transport(error: Error) -> Error {
     let Some(source) = error.source_arc() else {
         return error;
@@ -288,8 +288,8 @@ pub(crate) fn classify_transport(error: Error) -> Error {
 #[derive(Clone)]
 pub(crate) struct ClassifiedTransport<T>(pub(crate) T);
 
-impl<T: connectrpc::client::ClientTransport<Error = Error>>
-    connectrpc::client::ClientTransport for ClassifiedTransport<T>
+impl<T: connectrpc::client::ClientTransport<Error = Error>> connectrpc::client::ClientTransport
+    for ClassifiedTransport<T>
 {
     type ResponseBody = T::ResponseBody;
     type Error = Error;

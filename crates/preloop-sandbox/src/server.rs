@@ -763,7 +763,6 @@ async fn ca_pem(State(app): State<AppState>) -> Response {
     }
 }
 
-
 /// A rejected blob body: the cap was exceeded or the transfer failed.
 enum BodyWriteError {
     TooLarge(u64),

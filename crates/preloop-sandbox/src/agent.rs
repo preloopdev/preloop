@@ -231,9 +231,7 @@ impl RemoteLink {
     fn client(
         &self,
     ) -> Result<
-        rpc::ProvidersClient<
-            crate::client::ClassifiedTransport<connectrpc::client::HttpClient>,
-        >,
+        rpc::ProvidersClient<crate::client::ClassifiedTransport<connectrpc::client::HttpClient>>,
     > {
         let uri: axum::http::Uri = self
             .base

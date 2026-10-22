@@ -669,6 +669,11 @@ pub fn client_config(
     ca_pem: &str,
     identity_pem: Option<&[u8]>,
 ) -> Result<Arc<rustls::ClientConfig>> {
+    // rustls needs a process-level provider before any config is built; CLI
+    // tests and one-shot agent paths never go through the service's setup.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let mut roots = RootCertStore::empty();
     for certificate in pem_certificates(ca_pem) {
         roots

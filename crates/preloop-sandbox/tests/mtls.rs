@@ -294,10 +294,27 @@ async fn an_identity_from_an_old_service_ca_reports_re_enrollment() {
         .await
         .unwrap();
     let error = link.register(register("host-a")).await.unwrap_err();
-    assert_eq!(error.code, Code::Unauthenticated, "{}", preloop_sandbox::error::message(&error));
-    assert!(preloop_sandbox::error::message(&error).contains("different CA"), "{}", preloop_sandbox::error::message(&error));
-    assert!(preloop_sandbox::error::message(&error).contains("--join"), "{}", preloop_sandbox::error::message(&error));
-    assert!(preloop_sandbox::error::message(&error).contains("--token"), "{}", preloop_sandbox::error::message(&error));
+    assert_eq!(
+        error.code,
+        Code::Unauthenticated,
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
+    assert!(
+        preloop_sandbox::error::message(&error).contains("different CA"),
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
+    assert!(
+        preloop_sandbox::error::message(&error).contains("--join"),
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
+    assert!(
+        preloop_sandbox::error::message(&error).contains("--token"),
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
 }
 
 #[tokio::test]
@@ -323,8 +340,17 @@ async fn an_identity_the_service_does_not_know_reports_re_enrollment() {
         .await
         .unwrap();
     let error = link.register(register("host-a")).await.unwrap_err();
-    assert_eq!(error.code, Code::Unauthenticated, "{}", preloop_sandbox::error::message(&error));
-    assert!(preloop_sandbox::error::message(&error).contains("re-enroll"), "{}", preloop_sandbox::error::message(&error));
+    assert_eq!(
+        error.code,
+        Code::Unauthenticated,
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
+    assert!(
+        preloop_sandbox::error::message(&error).contains("re-enroll"),
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
 }
 
 #[tokio::test]
