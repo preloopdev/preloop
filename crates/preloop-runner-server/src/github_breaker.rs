@@ -499,6 +499,34 @@ pub fn classify_status(
     None
 }
 
+/// Whether a GitHub error body carries the secondary-rate-limit marker.
+///
+/// GitHub's secondary limits are supposed to arrive with `retry-after`,
+/// but in the wild they sometimes come as a bare 403 whose only signal is
+/// the JSON `message` ("You have exceeded a secondary rate limit…").
+/// Header-only classification cannot see those, and counting them as
+/// successes teaches the breaker that a throttled credential is healthy.
+///
+/// The structured `message` is preferred: the phrase appearing elsewhere
+/// in the payload (a documentation URL, an echoed input) is not GitHub's
+/// verdict. Bodies that are not the expected JSON shape fall back to a
+/// substring scan of the whole body.
+fn body_marks_secondary_rate_limit(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body);
+    let haystack = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| text.into_owned());
+    haystack
+        .to_ascii_lowercase()
+        .contains("secondary rate limit")
+}
+
 /// Resume time from `retry-after` (delta seconds) or `x-ratelimit-reset`
 /// (absolute unix seconds), whichever is present.
 fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
@@ -555,8 +583,9 @@ impl std::error::Error for BreakerOpen {}
 ///
 /// Every GitHub call on the webhook path goes through here so the breaker
 /// sees the whole dependency, not the one endpoint someone remembered to
-/// instrument. The response is returned untouched: a 404 still means what
-/// it meant to the caller, it just also counts as proof GitHub is up.
+/// instrument. The response is handed back with its body intact: a 404
+/// still means what it meant to the caller, it just also counts as proof
+/// GitHub is up.
 pub async fn send_observed(
     registry: &GithubBreakerRegistry,
     bucket: GithubCredentialBucket,
@@ -570,7 +599,7 @@ pub async fn send_observed(
     }
     match request.send().await {
         Ok(response) => {
-            breaker.observe_status(response.status(), response.headers());
+            let (response, _kind) = observe_response(&breaker, response).await;
             Ok(response)
         }
         Err(error) => {
@@ -578,6 +607,105 @@ pub async fn send_observed(
             Err(error.into())
         }
     }
+}
+
+/// How much of a 403 body the senders peek at while classifying it.
+///
+/// GitHub error JSON is a few hundred bytes; the cap exists so a
+/// pathological 403 (a proxy error page, say) is never buffered whole
+/// just to look for the secondary-limit marker. The peeked prefix is
+/// handed back to the caller in front of the unread remainder, so the
+/// response body stays byte-identical from the caller's side.
+const FORBIDDEN_BODY_PEEK_LIMIT: usize = 16 * 1024;
+
+/// Observe a completed response for `breaker`, returning the response
+/// (body intact) together with its failure classification.
+///
+/// Header classification runs first, exactly like
+/// [`GithubBreaker::observe_status`]. A 403 the headers leave
+/// unclassified gets one bounded look at its body: a secondary rate
+/// limit sent without rate headers must still count as a rate limit,
+/// not as a success (which would reset the failure streak and teach
+/// the breaker a throttled credential is healthy). A plain 403 — a
+/// permission problem, the delivery's fault — still counts as a
+/// success, so the queue never parks behind it.
+async fn observe_response(
+    breaker: &GithubBreaker,
+    response: reqwest::Response,
+) -> (reqwest::Response, Option<GithubFailureKind>) {
+    let status = response.status();
+    // Only a header-unclassified 403 needs the body peek; everything
+    // else records through `observe_status` exactly as before.
+    if status == axum::http::StatusCode::FORBIDDEN
+        && classify_status(status, response.headers()).is_none()
+    {
+        let (response, secondary) = peek_forbidden_body(response, FORBIDDEN_BODY_PEEK_LIMIT).await;
+        if secondary {
+            let kind = GithubFailureKind::RateLimited {
+                retry_after: retry_after_from_headers(response.headers()),
+            };
+            breaker.record_failure(
+                &kind,
+                format!("GitHub responded {status} (secondary rate limit)"),
+            );
+            return (response, Some(kind));
+        }
+        // Headers and body both say "not a failure": record the success
+        // through the usual path (the rebuilt response's headers are the
+        // originals, so the classification is the same).
+        let kind = breaker.observe_status(status, response.headers());
+        return (response, kind);
+    }
+    let kind = breaker.observe_status(status, response.headers());
+    (response, kind)
+}
+
+/// Read up to `limit` bytes of a 403 response body looking for the
+/// secondary-rate-limit marker, then rebuild the response so the
+/// caller receives every byte it would have without the peek: the
+/// buffered prefix first, then the unread remainder of the stream.
+async fn peek_forbidden_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> (reqwest::Response, bool) {
+    use futures::StreamExt as _;
+
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let mut buffered = bytes::BytesMut::new();
+    let mut exhausted = false;
+    while buffered.len() < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => buffered.extend_from_slice(&chunk),
+            Ok(None) => {
+                exhausted = true;
+                break;
+            }
+            // A body that errors mid-read is broken for the caller either
+            // way; classify what was seen and hand back the remainder,
+            // which surfaces the same error to the caller.
+            Err(_) => break,
+        }
+    }
+    let secondary = body_marks_secondary_rate_limit(&buffered);
+    let prefix = buffered.freeze();
+    let body = if exhausted {
+        reqwest::Body::from(prefix)
+    } else {
+        let prefix_stream = futures::stream::once(async move { Ok::<_, reqwest::Error>(prefix) });
+        reqwest::Body::wrap_stream(prefix_stream.chain(response.bytes_stream()))
+    };
+    let mut builder = axum::http::Response::builder()
+        .status(status)
+        .version(version);
+    if let Some(headers_out) = builder.headers_mut() {
+        *headers_out = headers;
+    }
+    let rebuilt = builder
+        .body(body)
+        .expect("a response rebuilt from a valid status, headers and body cannot fail");
+    (reqwest::Response::from(rebuilt), secondary)
 }
 
 // ---------------------------------------------------------------------------
@@ -814,7 +942,7 @@ pub async fn send_observed_labeled(
         Ok(response) => {
             consumption.record_request(subsystem);
             let status = response.status();
-            let kind = breaker.observe_status(status, response.headers());
+            let (response, kind) = observe_response(&breaker, response).await;
             if matches!(kind, Some(GithubFailureKind::RateLimited { .. })) {
                 consumption.record_rate_limited(subsystem);
                 tracing::warn!(
@@ -951,6 +1079,35 @@ mod tests {
             ),
             Some(GithubFailureKind::RateLimited { .. })
         ));
+    }
+
+    #[test]
+    fn secondary_rate_limit_marker_reads_the_error_message() {
+        // GitHub's secondary-limit shape: the verdict lives in `message`.
+        assert!(body_marks_secondary_rate_limit(
+            br#"{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again.","documentation_url":"https://docs.github.com/en/rest/overview/rate-limits"}"#
+        ));
+        // Case does not matter.
+        assert!(body_marks_secondary_rate_limit(
+            br#"{"message":"You have exceeded a Secondary Rate Limit"}"#
+        ));
+        // Plain permission and credential 403s are not rate limits.
+        assert!(!body_marks_secondary_rate_limit(
+            br#"{"message":"Resource not accessible by integration"}"#
+        ));
+        assert!(!body_marks_secondary_rate_limit(
+            br#"{"message":"Bad credentials"}"#
+        ));
+        // The phrase outside `message` is not GitHub's verdict.
+        assert!(!body_marks_secondary_rate_limit(
+            br#"{"message":"Bad credentials","documentation_url":"https://example.com/secondary rate limit"}"#
+        ));
+        // Bodies that are not the JSON shape fall back to a substring scan.
+        assert!(body_marks_secondary_rate_limit(
+            b"You have exceeded a secondary rate limit"
+        ));
+        assert!(!body_marks_secondary_rate_limit(b""));
+        assert!(!body_marks_secondary_rate_limit(b"Forbidden"));
     }
 
     #[test]
@@ -1198,6 +1355,163 @@ mod tests {
                 assert_eq!(usage.requests, 0, "{label} must not be charged");
             }
         }
+    }
+
+    /// A secondary rate limit sent as a bare 403 — no `retry-after`, no
+    /// `x-ratelimit-remaining`, the reason only in the JSON message —
+    /// must still trip the breaker as a rate limit. Pre-fix the headers
+    /// classified it as a success, resetting the failure streak.
+    #[tokio::test]
+    async fn headerless_secondary_limit_403_trips_the_breaker() {
+        let body = r#"{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}"#;
+        let stub = StubGitHub::serve(axum::http::StatusCode::FORBIDDEN, vec![], body).await;
+        let registry = GithubBreakerRegistry::new(test_config());
+        let consumption = GithubConsumption::default();
+
+        let response = send_observed_labeled(
+            &registry,
+            GithubCredentialBucket::Pat,
+            &consumption,
+            GithubSubsystem::Actions,
+            crate::shared_http::CLIENT.get(format!("{}/repos/o/r/tarball/main", stub.base)),
+        )
+        .await
+        .expect("the 403 response itself is returned, not an error");
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        // The peek must not eat the body: the caller reads every byte.
+        assert_eq!(response.text().await.unwrap(), body);
+
+        let snapshot = registry.breaker_for(GithubCredentialBucket::Pat).snapshot();
+        assert!(snapshot.open, "a secondary limit must open the breaker");
+        assert!(snapshot.rate_limited);
+        let usage: std::collections::HashMap<&str, GithubSubsystemUsage> = consumption
+            .snapshot()
+            .into_iter()
+            .map(|usage| (usage.subsystem, usage))
+            .collect();
+        assert_eq!(usage["actions"].requests, 1);
+        assert_eq!(usage["actions"].rate_limited, 1);
+    }
+
+    /// The invariant through the funnel: a plain 403 (permission
+    /// problem, no marker in the body) still counts as reachability —
+    /// it resets the failure streak and never parks the queue.
+    #[tokio::test]
+    async fn plain_403_through_the_sender_stays_a_success() {
+        let body = r#"{"message":"Resource not accessible by integration"}"#;
+        let stub = StubGitHub::serve(axum::http::StatusCode::FORBIDDEN, vec![], body).await;
+        let registry = GithubBreakerRegistry::new(test_config());
+        let consumption = GithubConsumption::default();
+        // Two failures on the streak, so the reset is observable.
+        let breaker = registry.breaker_for(GithubCredentialBucket::Pat);
+        breaker.record_failure(&GithubFailureKind::Unavailable, "502");
+        breaker.record_failure(&GithubFailureKind::Unavailable, "502");
+
+        let response = send_observed_labeled(
+            &registry,
+            GithubCredentialBucket::Pat,
+            &consumption,
+            GithubSubsystem::Actions,
+            crate::shared_http::CLIENT.get(format!("{}/repos/o/r/tarball/main", stub.base)),
+        )
+        .await
+        .expect("the 403 response itself is returned, not an error");
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(response.text().await.unwrap(), body);
+
+        let snapshot = registry.breaker_for(GithubCredentialBucket::Pat).snapshot();
+        assert!(!snapshot.open, "a plain 403 must not park the queue");
+        assert_eq!(
+            snapshot.consecutive_failures, 0,
+            "a plain 403 still counts as reachability"
+        );
+        let usage: std::collections::HashMap<&str, GithubSubsystemUsage> = consumption
+            .snapshot()
+            .into_iter()
+            .map(|usage| (usage.subsystem, usage))
+            .collect();
+        assert_eq!(usage["actions"].rate_limited, 0);
+    }
+
+    /// The peek is bounded but lossless: a body larger than the peek
+    /// limit still reaches the caller byte-identical (peeked prefix plus
+    /// unread remainder), and the marker inside the prefix is found.
+    #[tokio::test]
+    async fn forbidden_body_peek_rebuilds_bodies_larger_than_the_limit() {
+        let body = format!(
+            "{{\"message\":\"You have exceeded a secondary rate limit\"}}{}",
+            "x".repeat(600)
+        );
+        let stub = StubGitHub::serve(
+            axum::http::StatusCode::FORBIDDEN,
+            vec![],
+            Box::leak(body.clone().into_boxed_str()),
+        )
+        .await;
+        let response = crate::shared_http::CLIENT
+            .get(format!("{}/repos/o/r", stub.base))
+            .send()
+            .await
+            .unwrap();
+        let (response, secondary) = peek_forbidden_body(response, 64).await;
+        assert!(secondary, "the marker sits inside the peeked prefix");
+        assert_eq!(response.text().await.unwrap(), body);
+    }
+
+    /// With redirects disabled (the tarball download's client), the
+    /// response the funnel observes IS the redirect: its advertised
+    /// primary budget reaches `observe_rate_budget` and parks the next
+    /// call, instead of being swallowed by the follow.
+    #[tokio::test]
+    async fn redirect_response_budget_headers_are_observed() {
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let stub = StubGitHub::serve(
+            axum::http::StatusCode::FOUND,
+            vec![
+                (
+                    "location".to_owned(),
+                    "https://codeload.example/o/r/tar.gz/legacy/main".to_owned(),
+                ),
+                ("x-ratelimit-remaining".to_owned(), "0".to_owned()),
+                ("x-ratelimit-reset".to_owned(), reset.to_string()),
+            ],
+            "",
+        )
+        .await;
+        let registry = GithubBreakerRegistry::new(test_config());
+        let consumption = GithubConsumption::default();
+
+        let client = crate::shared_http::github_client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let response = send_observed_labeled(
+            &registry,
+            GithubCredentialBucket::Pat,
+            &consumption,
+            GithubSubsystem::Actions,
+            client.get(format!("{}/repos/o/r/tarball/main", stub.base)),
+        )
+        .await
+        .expect("the 302 response itself is returned, not an error");
+        assert_eq!(response.status(), axum::http::StatusCode::FOUND);
+        assert!(
+            registry.breaker_for(GithubCredentialBucket::Pat).is_open(),
+            "remaining=0 on the redirect must park the breaker until the reset"
+        );
+        let usage: std::collections::HashMap<&str, GithubSubsystemUsage> = consumption
+            .snapshot()
+            .into_iter()
+            .map(|usage| (usage.subsystem, usage))
+            .collect();
+        assert_eq!(usage["actions"].requests, 1);
+        // A redirect is not itself a rate limit; the park comes from the
+        // advertised budget, not the status classification.
+        assert_eq!(usage["actions"].rate_limited, 0);
     }
 
     #[tokio::test]

@@ -280,6 +280,25 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Whether a manually followed redirect may keep the engine credential:
+/// only when the target is the same host and effective port as the API
+/// URL — exactly the rule reqwest applies to automatic redirects.
+/// GitHub's tarball endpoint redirects to presigned codeload URLs on
+/// another host, and those URLs are bearer-capable on their own, so the
+/// credential never travels to them. An unparseable target counts as
+/// cross-host: when in doubt, the credential stays home.
+fn redirect_target_keeps_authorization(api_url: &str, location: &str) -> bool {
+    let Ok(api) = reqwest::Url::parse(api_url) else {
+        return false;
+    };
+    let Ok(target) = reqwest::Url::parse(location) else {
+        return false;
+    };
+    api.host_str().is_some()
+        && api.host_str() == target.host_str()
+        && api.port_or_known_default() == target.port_or_known_default()
+}
+
 /// Resolve an action ref (branch, tag, or short SHA) to the commit SHA GitHub
 /// would pin for the job. Cached briefly in memory so a matrix fan-out
 /// resolves each `uses:` once per window. Returns `None` on any failure
@@ -483,7 +502,12 @@ pub async fn download_action_tarball(
         repo, git_ref, github_url, "Downloading action to server cache"
     );
 
+    // Redirects are followed manually below: GitHub answers the tarball
+    // endpoint with a redirect to a presigned codeload URL, and reqwest's
+    // automatic follow would hide the REST response — including its
+    // rate-limit headers — from the breaker's observation.
     let client = crate::shared_http::github_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build reqwest client: {e}")))?;
 
@@ -494,16 +518,18 @@ pub async fn download_action_tarball(
     // engine's static PAT (env or config) raises the budget to 5000/hour and
     // is the only credential that works for arbitrary third-party action
     // repos (a GitHub App installation token is scoped to the App's repos).
+    let pat = shared
+        .state
+        .static_github_pat()
+        .filter(|_| url_targets_configured_github(&github_url, &shared.state.github_urls));
     let mut request = client.get(&github_url);
-    let bucket = if let Some(pat) = shared.state.static_github_pat()
-        && url_targets_configured_github(&github_url, &shared.state.github_urls)
-    {
+    let bucket = if let Some(pat) = pat.as_deref() {
         request = request.bearer_auth(pat);
         crate::github_breaker::GithubCredentialBucket::Pat
     } else {
         crate::github_breaker::GithubCredentialBucket::Anonymous
     };
-    let response = match crate::github_breaker::send_observed_labeled(
+    let mut response = match crate::github_breaker::send_observed_labeled(
         &shared.state.github_breakers,
         bucket,
         &shared.state.github_consumption,
@@ -531,6 +557,39 @@ pub async fn download_action_tarball(
         }
     };
 
+    // Follow GitHub's redirect to the archive manually. The labeled send
+    // above has already observed the REST response itself — its status
+    // and its `x-ratelimit-*` headers reached the breaker and the budget
+    // accounting, which automatic redirect-following used to hide: the
+    // proactive park on an advertised `x-ratelimit-remaining: 0` never
+    // fired for tarball downloads, and the archive bytes were charged to
+    // the GitHub byte counter even though codeload spends no API budget.
+    //
+    // The redirect target is a presigned URL that is bearer-capable on
+    // its own, so the engine credential must not travel to it: the
+    // follow-up request is built fresh, and the credential is re-attached
+    // only when the target is the same host as the API URL (reqwest's own
+    // cross-host strip rule) — the codeload target never is. Like the LFS
+    // downloads in `snapshots.rs`, the cross-host fetch bypasses the
+    // breaker, and its bytes are accounted as cross-host below.
+    let mut cross_host_download = false;
+    if response.status().is_redirection()
+        && let Some(location) = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    {
+        cross_host_download = !redirect_target_keeps_authorization(&github_url, &location);
+        let mut follow = crate::shared_http::CLIENT.get(&location);
+        if !cross_host_download && let Some(pat) = pat.as_deref() {
+            follow = follow.bearer_auth(pat);
+        }
+        response = follow.send().await.map_err(|e| {
+            ApiError::internal(format!("failed to follow GitHub tarball redirect: {e}"))
+        })?;
+    }
+
     if !response.status().is_success() {
         return Err(ApiError::not_found(format!(
             "GitHub returned status {} for {}",
@@ -550,11 +609,20 @@ pub async fn download_action_tarball(
             ApiError::internal(format!("failed to read chunk from GitHub response: {e}"))
         })?;
         // Account each chunk as it arrives, so a stream that dies mid-download
-        // still charges the bytes GitHub already sent.
-        shared.state.github_consumption.record_bytes(
-            crate::github_breaker::GithubSubsystem::Actions,
-            chunk.len() as u64,
-        );
+        // still charges the bytes already sent. Bytes served by the
+        // presigned cross-host target are real bandwidth but spend no
+        // GitHub API budget, so they go to the cross-host counter instead.
+        if cross_host_download {
+            shared.state.github_consumption.record_cross_host_bytes(
+                crate::github_breaker::GithubSubsystem::Actions,
+                chunk.len() as u64,
+            );
+        } else {
+            shared.state.github_consumption.record_bytes(
+                crate::github_breaker::GithubSubsystem::Actions,
+                chunk.len() as u64,
+            );
+        }
         // Hash the archive bytes as they arrive, so the digest the engine
         // pins is computed over exactly the bytes written to the cache —
         // no second read, no TOCTOU between write and hash.
@@ -2580,6 +2648,36 @@ mod tests {
         }
     }
 
+    /// A manually followed redirect keeps the engine credential only for
+    /// the API's own host and port (reqwest's cross-host strip rule):
+    /// api.github.com → codeload.github.com never keeps it, and neither
+    /// does an unparseable target.
+    #[test]
+    fn redirect_keeps_authorization_only_for_the_api_origin() {
+        assert!(!redirect_target_keeps_authorization(
+            "https://api.github.com/repos/o/r/tarball/main",
+            "https://codeload.github.com/o/r/tar.gz/legacy/main"
+        ));
+        // Same host, different port is still cross-host.
+        assert!(!redirect_target_keeps_authorization(
+            "https://ghes.example.com/api/v3/repos/o/r/tarball/main",
+            "https://ghes.example.com:8443/o/r/tar.gz/main"
+        ));
+        // A same-origin GHES redirect keeps it, as automatic following did.
+        assert!(redirect_target_keeps_authorization(
+            "https://ghes.example.com/api/v3/repos/o/r/tarball/main",
+            "https://ghes.example.com/o/r/tar.gz/main"
+        ));
+        assert!(!redirect_target_keeps_authorization(
+            "https://api.github.com/repos/o/r/tarball/main",
+            "not a url"
+        ));
+        assert!(!redirect_target_keeps_authorization(
+            "https://api.github.com/repos/o/r/tarball/main",
+            "/relative/path"
+        ));
+    }
+
     /// `archive_sha256_hex` is the lowercase hex SHA-256 of the bytes —
     /// the same value the runner computes over the downloaded archive.
     #[test]
@@ -2920,6 +3018,113 @@ mod tests {
         {
             assert_eq!(other.requests, 0, "{} must not be charged", other.subsystem);
         }
+    }
+
+    /// The redirect GitHub answers the tarball route with is followed
+    /// manually: the archive comes from the presigned cross-host target,
+    /// the REST response's advertised budget parks the breaker (automatic
+    /// following used to hide those headers), the engine PAT never
+    /// reaches the cross-host target, and the archive bytes are accounted
+    /// as cross-host rather than GitHub budget.
+    #[tokio::test]
+    async fn tarball_download_follows_the_redirect_manually() {
+        // Held for the whole test, with the PAT set before the state is
+        // built: `AppState::new` reads `PRELOOP_GITHUB_TOKEN`, and the
+        // credential is what makes the no-forwarding assertion meaningful.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _pat = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "pat-sentinel");
+
+        // The "codeload" stand-in: serves the archive bytes on any path
+        // and records the Authorization header it was (not) sent.
+        let archive: &'static [u8] = b"fake-tarball-bytes";
+        let codeload_authorization = Arc::new(std::sync::Mutex::new(None::<String>));
+        let codeload_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (auth_route, hits_route) = (codeload_authorization.clone(), codeload_hits.clone());
+        let codeload_app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::any(move |headers: axum::http::HeaderMap| {
+                let auth_route = auth_route.clone();
+                let hits_route = hits_route.clone();
+                async move {
+                    hits_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    *auth_route.lock().unwrap() = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    axum::http::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(axum::body::Body::from(archive))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let codeload_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, codeload_app).await.unwrap() });
+
+        // The API stand-in, in GitHub's real shape: a 302 to the
+        // presigned URL, carrying the primary budget headers of the
+        // response that just spent budget.
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let stub = TarballStub::serve(
+            StatusCode::FOUND,
+            vec![
+                (
+                    "location".to_owned(),
+                    format!("{codeload_base}/o/r/tar.gz/legacy/main"),
+                ),
+                ("x-ratelimit-remaining".to_owned(), "0".to_owned()),
+                ("x-ratelimit-reset".to_owned(), reset.to_string()),
+            ],
+            Vec::new(),
+        )
+        .await;
+        let (shared, _temp) = tarball_shared(&stub.base).await;
+
+        let (state, path, query) = download_call(&shared);
+        let response = download_action_tarball(state, path, query)
+            .await
+            .expect("the redirected download must succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let served = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&served[..], archive);
+
+        assert_eq!(stub.hits(), 1, "one REST exchange with the API");
+        assert_eq!(
+            codeload_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one follow to the presigned target"
+        );
+        assert_eq!(
+            *codeload_authorization.lock().unwrap(),
+            None,
+            "the engine PAT must never be forwarded to the cross-host target"
+        );
+
+        // The 302's advertised budget reached the breaker: the PAT bucket
+        // parks until the reset instead of the follow hiding it.
+        assert!(
+            shared
+                .state
+                .github_breakers
+                .breaker_for(crate::github_breaker::GithubCredentialBucket::Pat)
+                .is_open(),
+            "remaining=0 on the tarball 302 must park the PAT bucket"
+        );
+
+        let usage = actions_usage(&shared);
+        assert_eq!(
+            usage.requests, 1,
+            "only the REST exchange is a GitHub request"
+        );
+        assert_eq!(usage.bytes, 0, "codeload bytes are not GitHub budget");
+        assert_eq!(usage.cross_host_bytes, archive.len() as u64);
     }
 
     /// Only a breaker refusal is a 503. A transport failure that never reached
