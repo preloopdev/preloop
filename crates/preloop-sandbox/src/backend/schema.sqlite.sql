@@ -163,6 +163,18 @@ CREATE TABLE IF NOT EXISTS acquire_waiters (
 );
 CREATE INDEX IF NOT EXISTS acquire_waiters_sandbox ON acquire_waiters(sandbox_id);
 
+-- One expiring, node-session-fenced snapshot claim per sandbox. It reserves
+-- the source while a capture is in flight so a second snapshot or a release
+-- cannot race it; the row is deleted when the work finishes or expires.
+CREATE TABLE IF NOT EXISTS snapshot_claims (
+    sandbox_id TEXT PRIMARY KEY,
+    work_id    TEXT NOT NULL DEFAULT '',
+    node_id    TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS snapshot_claims_expiry ON snapshot_claims(expires_at);
+
 CREATE TABLE IF NOT EXISTS providers (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,

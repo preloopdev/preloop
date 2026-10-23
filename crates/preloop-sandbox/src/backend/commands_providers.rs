@@ -178,9 +178,32 @@ pub(crate) async fn complete_work(
     let provider_id = row.text("provider_id")?.to_owned();
     let generation = row.u64("generation")?;
     let mut result = result;
-    if kind == "snapshot" && result.ok {
-        let template = apply_snapshot_receipt(tx, &payload, &result).await?;
-        result.template = Some(template);
+    if kind == "snapshot" {
+        let snapshot_sandbox = match &payload.work.work {
+            Some(work_item::Work::Snapshot(snapshot)) => {
+                Some(snapshot.target.sandbox_id.clone())
+            }
+            _ => None,
+        };
+        if result.ok {
+            match apply_snapshot_receipt(tx, &payload, &result).await? {
+                SnapshotApplication::Applied(template) => {
+                    result.template = Some(template);
+                }
+                // The source changed mid-capture: the provider's work is
+                // acknowledged (so it is not retried forever) and the
+                // caller's wait ends with the domain failure.
+                SnapshotApplication::Invalid(reason) => {
+                    result = WorkResult::failed(reason);
+                }
+            }
+        } else if let Some(sandbox_id) = snapshot_sandbox {
+            tx.execute(
+                "DELETE FROM snapshot_claims WHERE sandbox_id = $1 AND work_id = $2",
+                &[sandbox_id.as_str().into(), work_id.into()],
+            )
+            .await?;
+        }
     }
     let result_json = serde_json::to_string(&result).unwrap_or_default();
     let version = bump_version(tx).await?;
@@ -250,12 +273,68 @@ pub(crate) async fn complete_work(
             }
         }
         "destroy" => {
-            let sandbox_id = match &payload.work.work {
-                Some(work_item::Work::Destroy(target)) => target.sandbox_id.clone(),
-                _ => String::new(),
+            let target = match &payload.work.work {
+                Some(work_item::Work::Destroy(target)) => Some((**target).clone()),
+                _ => None,
             };
-            if !sandbox_id.is_empty() {
-                purge_sandbox(tx, &sandbox_id).await?;
+            let Some(target) = target else {
+                return Ok(());
+            };
+            if target.sandbox_id.is_empty() {
+                // A captured-base cleanup, not a sandbox machine.
+                return Ok(());
+            }
+            if result.ok {
+                purge_sandbox(tx, &target.sandbox_id).await?;
+            } else if sandbox_by_id(tx, &target.sandbox_id).await?.is_some() {
+                // A failed destroy is retried by Reconcile while the provider
+                // still reports the machine. Counting the failure here (not
+                // at requeue time) is what bounds the retries; the record
+                // holds through the first two and becomes a GONE tombstone at
+                // the third, still reclaimable by reconcile.
+                let stored_attempts = tx
+                    .query(
+                        "SELECT delete_attempts FROM sandboxes WHERE id = $1",
+                        &[target.sandbox_id.as_str().into()],
+                    )
+                    .await?
+                    .first()
+                    .map(|row| row.int("delete_attempts"))
+                    .transpose()?
+                    .unwrap_or(0);
+                let attempts = u32::try_from(stored_attempts)
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(1);
+                let version = bump_version(tx).await?;
+                if attempts >= super::commands_runtime::MAX_DESTROY_ATTEMPTS {
+                    let reason = format!(
+                        "destroy failed {attempts} times: {}",
+                        result.error
+                    );
+                    tx.execute(
+                        "UPDATE sandboxes SET state = 'gone', error = $2, lease_id = '', \
+                         delete_attempts = $3, version = $4 WHERE id = $1",
+                        &[
+                            target.sandbox_id.as_str().into(),
+                            reason.as_str().into(),
+                            i64::from(attempts).into(),
+                            version.into(),
+                        ],
+                    )
+                    .await?;
+                } else {
+                    tx.execute(
+                        "UPDATE sandboxes SET delete_attempts = $2, version = $3 WHERE id = $1",
+                        &[
+                            target.sandbox_id.as_str().into(),
+                            i64::from(attempts).into(),
+                            version.into(),
+                        ],
+                    )
+                    .await?;
+                }
+                outbox(tx, "sandbox", &target.sandbox_id, version, "destroy-failed", "{}")
+                    .await?;
             }
         }
         "exec" => {
@@ -270,28 +349,28 @@ pub(crate) async fn complete_work(
                 && let Some(target) = payload.work.work.as_ref().and_then(sandbox_target)
                 && let Some(mut sandbox) = sandbox_by_id(tx, &target.sandbox_id).await?
             {
+                // A used machine stays a debug hold even while its preserved
+                // lease survives: powering it on must never put it back in
+                // the warm set.
+                let resumed = if sandbox.preserve_until > 0 {
+                    SandboxState::Preserved
+                } else if sandbox.lease_id.is_empty() {
+                    SandboxState::Ready
+                } else {
+                    SandboxState::Leased
+                };
                 sandbox.state = match kind.as_str() {
                     "pause" => SandboxState::Paused,
                     "stop" => SandboxState::Stopped,
-                    "start" => {
-                        if sandbox.lease_id.is_empty() {
-                            SandboxState::Ready
-                        } else {
-                            SandboxState::Leased
-                        }
-                    }
-                    "resume" => {
-                        if sandbox.lease_id.is_empty() {
-                            SandboxState::Preserved
-                        } else {
-                            SandboxState::Leased
-                        }
-                    }
+                    "start" | "resume" => resumed,
                     _ => sandbox.state.known(),
                 }
                 .into();
-                if kind == "start" {
+                if kind == "start" || kind == "resume" {
                     sandbox.error.clear();
+                    if sandbox.state.known() != SandboxState::Preserved {
+                        sandbox.preserve_until = 0;
+                    }
                 }
                 save_sandbox(tx, &sandbox).await?;
             }
@@ -341,25 +420,89 @@ async fn save_sandbox(tx: &mut dyn SqlTx, sandbox: &Sandbox) -> Result<()> {
     Ok(())
 }
 
+/// What a snapshot report means once checked against the live source.
+enum SnapshotApplication {
+    /// The capture is installed as a template.
+    Applied(Template),
+    /// The source changed while the provider was working; the captured base
+    /// is dropped and the caller gets this failure.
+    Invalid(String),
+}
+
 async fn apply_snapshot_receipt(
     tx: &mut dyn SqlTx,
     payload: &WorkPayload,
     result: &WorkResult,
-) -> Result<Template> {
-    let (sandbox_id, template_name) = match &payload.work.work {
-        Some(work_item::Work::Snapshot(snapshot)) => (
-            snapshot.target.sandbox_id.clone(),
-            snapshot.template.clone(),
-        ),
-        _ => return Err(Error::internal("snapshot work has no target")),
-    };
-    let source = payload.source_template.clone().unwrap_or_default();
+) -> Result<SnapshotApplication> {
+    let (sandbox_id, template_name, target_native_ref, target_driver) =
+        match &payload.work.work {
+            Some(work_item::Work::Snapshot(snapshot)) => (
+                snapshot.target.sandbox_id.clone(),
+                snapshot.template.clone(),
+                snapshot.target.native_ref.clone(),
+                snapshot.target.driver.clone(),
+            ),
+            _ => return Err(Error::internal("snapshot work has no target")),
+        };
+    // A release, failure or lifecycle transition while the provider worked
+    // invalidates the capture: installing the template would point at a
+    // machine that is being destroyed or has changed.
+    let source = sandbox_by_id(tx, &sandbox_id).await?;
+    let valid = source.as_ref().is_some_and(|sandbox| {
+        sandbox.state.known() == SandboxState::Leased
+            && !payload.lease_sha256.is_empty()
+            && super::logic::constant_time_eq(
+                super::logic::token_hash(&sandbox.lease_id).as_bytes(),
+                payload.lease_sha256.as_bytes(),
+            )
+            && (target_native_ref.is_empty() || sandbox.native_ref == target_native_ref)
+    });
+    if !valid {
+        tx.execute(
+            "DELETE FROM snapshot_claims WHERE sandbox_id = $1",
+            &[sandbox_id.as_str().into()],
+        )
+        .await?;
+        if !result.native_ref.is_empty()
+            && let Some(source) = &source
+        {
+            // The driver may have left a base behind. Drop it as a snapshot
+            // cleanup rather than as a sandbox machine.
+            let generation = tx
+                .query(
+                    "SELECT generation FROM providers WHERE id = $1",
+                    &[source.provider_id.as_str().into()],
+                )
+                .await?
+                .first()
+                .map(|row| row.u64("generation"))
+                .transpose()?
+                .unwrap_or(0);
+            queue_destroy_target(
+                tx,
+                &source.provider_id,
+                generation,
+                "",
+                &target_driver,
+                &format!("snapshot:{}", result.native_ref),
+                &format!("drop-snapshot:{}", result.native_ref),
+                now_ms() + 86_400_000,
+            )
+            .await?;
+        }
+        return Ok(SnapshotApplication::Invalid(
+            "failed_precondition: the sandbox changed while its snapshot was \
+             in flight; result discarded"
+                .to_owned(),
+        ));
+    }
+    let source_template = payload.source_template.clone().unwrap_or_default();
     let spec = TemplateSpec {
         name: template_name.clone(),
-        os: source.spec.os.clone(),
+        os: source_template.spec.os.clone(),
         source: Some(template_spec::Source::SnapshotOf(sandbox_id.clone())),
-        requires: source.spec.requires.clone(),
-        labels: source.spec.labels.clone(),
+        requires: source_template.spec.requires.clone(),
+        labels: source_template.spec.labels.clone(),
         ..TemplateSpec::default()
     };
     let digest = crate::service::template_digest(&spec);
@@ -385,25 +528,11 @@ async fn apply_snapshot_receipt(
             .await?;
         }
     }
-    let provider_id = match &payload.work.work {
-        Some(work_item::Work::Snapshot(snapshot)) => {
-            // The source sandbox's provider; read before it is removed.
-            tx.query(
-                "SELECT provider_id FROM sandboxes WHERE id = $1",
-                &[snapshot.target.sandbox_id.as_str().into()],
-            )
-            .await?
-            .first()
-            .map(|row| row.text("provider_id").map(str::to_owned))
-            .transpose()?
-            .unwrap_or_default()
-        }
-        _ => String::new(),
-    };
-    let driver = match &payload.work.work {
-        Some(work_item::Work::Snapshot(snapshot)) => snapshot.target.driver.clone(),
-        _ => String::new(),
-    };
+    let provider_id = source
+        .as_ref()
+        .map(|sandbox| sandbox.provider_id.clone())
+        .unwrap_or_default();
+    let driver = target_driver;
     tx.execute(
         "INSERT INTO templates \
          (name, digest, spec_json, provider_id, native_ref, driver, created_at, version, \
@@ -433,9 +562,15 @@ async fn apply_snapshot_receipt(
         &spec_json,
     )
     .await?;
-    // The source sandbox is consumed by the snapshot.
-    purge_sandbox(tx, &sandbox_id).await?;
-    Ok(Template {
+    // The source sandbox is consumed by the snapshot. Its open execs fail
+    // with "snapshotted" and the provider is asked to stop them.
+    tx.execute(
+        "DELETE FROM snapshot_claims WHERE sandbox_id = $1",
+        &[sandbox_id.as_str().into()],
+    )
+    .await?;
+    purge_sandbox_with_reason(tx, &sandbox_id, "sandbox was snapshotted").await?;
+    Ok(SnapshotApplication::Applied(Template {
         spec: spec.into(),
         digest,
         provider_id,
@@ -443,11 +578,22 @@ async fn apply_snapshot_receipt(
         created_at: now_secs(),
         driver,
         ..Template::default()
-    })
+    }))
 }
 
 /// Delete a sandbox record and everything that could still act on it.
 pub(crate) async fn purge_sandbox(tx: &mut dyn SqlTx, sandbox_id: &str) -> Result<()> {
+    purge_sandbox_with_reason(tx, sandbox_id, "sandbox was destroyed").await
+}
+
+/// Delete a sandbox record, failing its live handles with `reason`. The
+/// reason is what the caller's open exec stream reports, so a snapshot says
+/// the sandbox was snapshotted rather than destroyed.
+pub(crate) async fn purge_sandbox_with_reason(
+    tx: &mut dyn SqlTx,
+    sandbox_id: &str,
+    reason: &str,
+) -> Result<()> {
     let leases = tx
         .query(
             "SELECT id, idempotency_key FROM leases WHERE sandbox_id = $1",
@@ -467,15 +613,26 @@ pub(crate) async fn purge_sandbox(tx: &mut dyn SqlTx, sandbox_id: &str) -> Resul
                 .await?;
         }
     }
+    // Fail each live exec through the same path a caller disconnect uses:
+    // the row is finalized and the provider is asked to kill the command
+    // that would otherwise keep running against a machine being destroyed.
+    let execs = tx
+        .query(
+            "SELECT id FROM execs WHERE sandbox_id = $1 AND status = 'running'",
+            &[sandbox_id.into()],
+        )
+        .await?;
+    for row in execs {
+        super::commands_runtime::fail_exec_inner(tx, row.text("id")?, reason).await?;
+    }
     tx.execute(
-        "UPDATE execs SET status = 'failed', error = 'sandbox was destroyed' \
-         WHERE sandbox_id = $1 AND status = 'running'",
-        &[sandbox_id.into()],
+        "UPDATE tickets SET status = 'aborted', reason = $2 \
+         WHERE sandbox_id = $1 AND status IN ('open', 'ready')",
+        &[sandbox_id.into(), reason.into()],
     )
     .await?;
     tx.execute(
-        "UPDATE tickets SET status = 'aborted', reason = 'sandbox was destroyed' \
-         WHERE sandbox_id = $1 AND status IN ('open', 'ready')",
+        "DELETE FROM snapshot_claims WHERE sandbox_id = $1",
         &[sandbox_id.into()],
     )
     .await?;
@@ -1444,7 +1601,7 @@ pub(crate) async fn reconcile(
                     .query(
                         "SELECT s.id, s.native_ref, s.state, s.delete_attempts, p.driver \
                          FROM sandboxes s JOIN sandbox_specs p ON p.id = s.id \
-                         WHERE s.provider_id = $1 AND s.state NOT IN ('gone', 'failed')",
+                         WHERE s.provider_id = $1 AND s.state <> 'failed'",
                         &[request.provider_id.as_str().into()],
                     )
                     .await?;
@@ -1458,11 +1615,13 @@ pub(crate) async fn reconcile(
                         row.text("driver")?.to_owned(),
                     ));
                 }
+                // A record the provider no longer reports is done: terminated
+                // and GONE tombstones are removed, anything else is failed.
                 for (id, native_ref, state, _attempts, _driver) in &records {
                     if native_ref.is_empty() || observed.contains(native_ref.as_str()) {
                         continue;
                     }
-                    if state == "terminating" {
+                    if state == "terminating" || state == "gone" {
                         purge_sandbox(tx, id).await?;
                     } else {
                         super::commands_leases::fail_sandbox(
@@ -1486,18 +1645,38 @@ pub(crate) async fn reconcile(
                         continue;
                     }
                     if *attempts >= super::commands_runtime::MAX_DESTROY_ATTEMPTS {
-                        // The machine is still reported. Keep the tombstone:
-                        // it still proves the machine is the service's, and
-                        // reconcile reclaims it once the provider stops
-                        // reporting it.
+                        // The machine is still reported after the retry
+                        // budget: keep the tombstone (it still proves the
+                        // machine is the service's) and let reconcile reclaim
+                        // it once the provider stops reporting it.
+                        let version = bump_version(tx).await?;
+                        tx.execute(
+                            "UPDATE sandboxes SET state = 'gone', lease_id = '', version = $2 \
+                             WHERE id = $1",
+                            &[id.as_str().into(), version.into()],
+                        )
+                        .await?;
                         continue;
                     }
-                    tx.execute(
-                        "UPDATE sandboxes SET delete_attempts = delete_attempts + 1 \
-                         WHERE id = $1",
-                        &[id.as_str().into()],
-                    )
-                    .await?;
+                    // A destroy already queued or in flight is awaited, not
+                    // asked again: a slow driver must not run two destroys.
+                    let destroy_key = format!("destroy:{id}");
+                    let requeue_key = format!("destroy-requeue:{id}");
+                    let active = tx
+                        .query(
+                            "SELECT 1 AS present FROM work_items \
+                             WHERE provider_id = $1 AND status <> 'done' \
+                               AND dedup_key IN ($2, $3) LIMIT 1",
+                            &[
+                                request.provider_id.as_str().into(),
+                                destroy_key.as_str().into(),
+                                requeue_key.as_str().into(),
+                            ],
+                        )
+                        .await?;
+                    if !active.is_empty() {
+                        continue;
+                    }
                     queue_destroy_target(
                         tx,
                         &request.provider_id,
@@ -1527,6 +1706,12 @@ pub(crate) async fn reconcile(
                         &[],
                     )
                     .await?;
+                // Machines no record owns. Only proof that this service
+                // created a machine makes it reapable: its sandbox id is one
+                // of ours, its caller-given name is a provisioning create of
+                // this provider, or it is a tombstone's machine. Anything
+                // else on the host belongs to another service sharing the
+                // registry and is left alone.
                 let mut destroy = Vec::new();
                 for item in &request.sandboxes {
                     if bases.contains(&item.native_ref) {
@@ -1535,25 +1720,32 @@ pub(crate) async fn reconcile(
                     let owned = all_records.iter().any(|row| {
                         row.text("provider_id").ok() == Some(request.provider_id.as_str())
                             && row.text("native_ref").ok() == Some(item.native_ref.as_str())
+                            && row.text("state").ok() != Some("gone")
                     });
-                    let provisioning = (!item.sandbox_id.is_empty()
-                        && all_records.iter().any(|row| {
-                            row.text("id").ok() == Some(item.sandbox_id.as_str())
-                                && row.text("state").ok() == Some("provisioning")
-                        }))
+                    let ours = (!item.sandbox_id.is_empty()
+                        && all_records
+                            .iter()
+                            .any(|row| row.text("id").ok() == Some(item.sandbox_id.as_str())))
                         || all_records.iter().any(|row| {
                             row.text("provider_id").ok() == Some(request.provider_id.as_str())
                                 && row.text("state").ok() == Some("provisioning")
                                 && !row.text("name").unwrap_or_default().is_empty()
                                 && row.text("name").ok() == Some(item.native_ref.as_str())
+                        })
+                        || all_records.iter().any(|row| {
+                            row.text("provider_id").ok() == Some(request.provider_id.as_str())
+                                && row.text("state").ok() == Some("gone")
+                                && row.text("native_ref").ok() == Some(item.native_ref.as_str())
                         });
-                    let foreign = all_records.iter().any(|row| {
-                        row.text("provider_id").ok() != Some(request.provider_id.as_str())
-                            && (row.text("native_ref").ok() == Some(item.native_ref.as_str())
-                                || (!item.sandbox_id.is_empty()
-                                    && row.text("id").ok() == Some(item.sandbox_id.as_str())))
-                    });
-                    if !owned && !provisioning && !foreign {
+                    // Another provider's record (live, or a tombstone) that
+                    // names this machine: its reclaim belongs to that provider.
+                    let foreign = !item.native_ref.is_empty()
+                        && all_records.iter().any(|row| {
+                            row.text("provider_id").ok() != Some(request.provider_id.as_str())
+                                && row.text("native_ref").ok() == Some(item.native_ref.as_str())
+                                && row.text("state").ok() != Some("failed")
+                        });
+                    if !owned && ours && !foreign {
                         destroy.push(SandboxWork {
                             sandbox_id: item.sandbox_id.clone(),
                             driver: item.driver.clone(),

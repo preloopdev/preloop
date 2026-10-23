@@ -928,7 +928,47 @@ pub(crate) async fn snapshot_start(
                     .transpose()?
                     .unwrap_or_default();
                 let provider_generation = provider_generation(tx, &sandbox.provider_id).await?;
+                // Reserve the source in the database. A local mutex would not
+                // survive another replica or a crash; this expiring,
+                // node-session-fenced claim is what a release or a second
+                // snapshot consults.
+                let claim = tx
+                    .query(
+                        "SELECT work_id, expires_at FROM snapshot_claims WHERE sandbox_id = $1",
+                        &[sandbox.id.as_str().into()],
+                    )
+                    .await?
+                    .into_iter()
+                    .next();
+                if let Some(claim) = claim {
+                    if claim.int("expires_at")? > now_ms() {
+                        return Err(Error::failed_precondition(
+                            "a snapshot of this sandbox is already in progress",
+                        ));
+                    }
+                    tx.execute(
+                        "DELETE FROM snapshot_claims WHERE sandbox_id = $1",
+                        &[sandbox.id.as_str().into()],
+                    )
+                    .await?;
+                }
                 let work_id = format!("wrk-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+                let claim_expires_at = now_ms()
+                    + i64::try_from(command.timeout.as_millis()).unwrap_or(i64::MAX)
+                    + 30_000;
+                tx.execute(
+                    "INSERT INTO snapshot_claims \
+                     (sandbox_id, work_id, node_id, session_id, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                    &[
+                        sandbox.id.as_str().into(),
+                        work_id.as_str().into(),
+                        command.owner.node_id.as_str().into(),
+                        command.owner.session_id.as_str().into(),
+                        claim_expires_at.into(),
+                    ],
+                )
+                .await?;
                 let target = SandboxWork {
                     sandbox_id: sandbox.id.clone(),
                     driver: sandbox.driver.clone(),
@@ -1460,7 +1500,16 @@ pub(crate) async fn maintain(
                         &[now_ms().into()],
                     )
                     .await?;
-                outcome.changed |= claims + waiters > 0;
+                // An abandoned snapshot claim must not reserve its source
+                // forever. The row is fenced by the node/session that took
+                // it and expires with the work timeout.
+                let snapshot_claims = tx
+                    .execute(
+                        "DELETE FROM snapshot_claims WHERE expires_at <= $1",
+                        &[now_ms().into()],
+                    )
+                    .await?;
+                outcome.changed |= claims + waiters + snapshot_claims > 0;
                 // Expired leases, unless a live waiter still depends on one.
                 let leases = tx
                     .query(
@@ -1716,6 +1765,27 @@ pub(crate) async fn maintain(
                     let name = pool.text("name")?.to_owned();
                     let warm = pool.int("warm")?;
                     let max = pool.int("max_members")?;
+                    // A warm member built by an older pool revision can never
+                    // serve the current pool: retire idle ones before the
+                    // deficit is computed, so a reconfiguration builds the
+                    // new member instead of counting the old one as warm.
+                    let revision = pool.u64("revision")?;
+                    let stale = tx
+                        .query(
+                            "SELECT s.id FROM sandboxes s JOIN sandbox_specs p ON p.id = s.id \
+                             WHERE p.pool = $1 AND s.lease_id = '' \
+                               AND s.state IN ('ready', 'provisioning') \
+                               AND p.pool_revision <> $2",
+                            &[
+                                name.as_str().into(),
+                                i64::try_from(revision).unwrap_or(i64::MAX).into(),
+                            ],
+                        )
+                        .await?;
+                    for row in stale {
+                        super::commands_leases::destroy_sandbox(tx, row.text("id")?).await?;
+                        outcome.changed = true;
+                    }
                     let counts = tx
                         .query(
                             "SELECT \

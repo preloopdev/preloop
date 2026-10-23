@@ -458,7 +458,7 @@ pub(crate) async fn delete_template(store: &SqlStore, name: &str) -> Result<()> 
                 // template). Refuse until the clone is gone.
                 let live = tx
                     .query(
-                        "SELECT p.template_json FROM sandboxes s \
+                        "SELECT s.id, p.template_json FROM sandboxes s \
                          JOIN sandbox_specs p ON p.id = s.id \
                          WHERE s.state NOT IN ('gone', 'failed')",
                         &[],
@@ -469,8 +469,9 @@ pub(crate) async fn delete_template(store: &SqlStore, name: &str) -> Result<()> 
                         rows::json(spec.text("template_json")?, "sandbox template")?;
                     if used.spec.as_option().is_some_and(|used| used.name == name) {
                         return Err(Error::failed_precondition(format!(
-                            "template `{name}` is in use by a live sandbox; \
-                             release the clone first"
+                            "template `{name}` is in use by live sandbox `{}`; \
+                             release the clone first",
+                            spec.text("id")?
                         )));
                     }
                 }

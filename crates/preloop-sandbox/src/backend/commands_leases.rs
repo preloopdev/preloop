@@ -293,9 +293,13 @@ pub(crate) async fn acquire(store: &SqlStore, command: AcquireCommand) -> Result
                     };
                     let state = sandbox.state.known();
                     match state {
+                        // A stopped sandbox is a live sandbox the caller
+                        // powered off on purpose. An idempotent retry returns
+                        // it instead of destroying the machine and its disk.
                         SandboxState::Leased
                         | SandboxState::Paused
                         | SandboxState::Preserved
+                        | SandboxState::Stopped
                         | SandboxState::Ready => {
                             let lease = lease_by_id(tx, &lease_id, &seal)
                                 .await?
@@ -900,14 +904,26 @@ pub(crate) async fn release(
         .run_tx(|tx| {
             let lease_id = lease_id.to_owned();
             Box::pin(async move {
-                let exists = tx
+                let lease = tx
                     .query(
-                        "SELECT 1 AS present FROM leases WHERE id = $1",
+                        "SELECT sandbox_id FROM leases WHERE id = $1",
                         &[lease_id.as_str().into()],
                     )
                     .await?;
-                if exists.is_empty() {
+                let Some(lease) = lease.first() else {
                     return Err(Error::not_found("lease not found"));
+                };
+                let busy = tx
+                    .query(
+                        "SELECT 1 AS present FROM snapshot_claims \
+                         WHERE sandbox_id = $1 AND expires_at > $2",
+                        &[lease.text("sandbox_id")?.into(), now_ms().into()],
+                    )
+                    .await?;
+                if !busy.is_empty() {
+                    return Err(Error::failed_precondition(
+                        "a snapshot is in progress; release after it completes",
+                    ));
                 }
                 release_lease(
                     tx,
@@ -1060,6 +1076,19 @@ pub(crate) async fn destroy_sandbox(tx: &mut dyn SqlTx, sandbox_id: &str) -> Res
         &[sandbox_id.into(), version.into()],
     )
     .await?;
+    // End the caller's exec streams now, not when the provider eventually
+    // reports (a destroy cancels the command and a late exit would otherwise
+    // look like a normal completion).
+    let execs = tx
+        .query(
+            "SELECT id FROM execs WHERE sandbox_id = $1 AND status = 'running'",
+            &[sandbox_id.into()],
+        )
+        .await?;
+    for row in execs {
+        super::commands_runtime::fail_exec_inner(tx, row.text("id")?, "sandbox was destroyed")
+            .await?;
+    }
     outbox(tx, "sandbox", sandbox_id, version, "destroy", "{}").await?;
     let provider = provider_by_id(tx, &sandbox.provider_id).await?;
     let Some(provider) = provider else {

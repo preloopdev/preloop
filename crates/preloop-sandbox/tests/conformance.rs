@@ -3756,10 +3756,10 @@ async fn restart_fences_the_agent_and_it_re_registers() {
 /// is not on the record) and nothing will ever report it: the record is
 /// failed with a reason instead of waiting for the create timeout.
 #[tokio::test]
-async fn a_creating_record_is_failed_after_restart() {
+async fn a_creating_record_resumes_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("sandbox.db");
-    let sandbox_id = {
+    let (sandbox_id, provider_id, generation) = {
         let service = Service::open(
             backend::open(db.to_str().unwrap()).await.unwrap(),
             ServiceConfig::new(),
@@ -3767,7 +3767,7 @@ async fn a_creating_record_is_failed_after_restart() {
         .await
         .unwrap();
         // A provider that registers and never polls: its create never lands.
-        service
+        let provider = service
             .register(RegisterRequest {
                 name: "ghost".into(),
                 drivers: vec![DriverInfo {
@@ -3807,8 +3807,14 @@ async fn a_creating_record_is_failed_after_restart() {
         let sandboxes = service.list().await.unwrap();
         assert_eq!(sandboxes.len(), 1);
         assert_eq!(sandboxes[0].state, SandboxState::Provisioning);
-        sandboxes[0].id.clone()
+        (
+            sandboxes[0].id.clone(),
+            provider.provider_id,
+            provider.generation,
+        )
     };
+    // The database is the authority: the accepted provisioning is resumed
+    // from its durable create work rather than failed whole by the restart.
     let restored = Service::open(
         backend::open(db.to_str().unwrap()).await.unwrap(),
         ServiceConfig::new(),
@@ -3822,12 +3828,80 @@ async fn a_creating_record_is_failed_after_restart() {
         .into_iter()
         .find(|sandbox| sandbox.id == sandbox_id)
         .expect("the creating record survives the restart");
-    assert_eq!(sandbox.state, SandboxState::Failed);
-    assert!(
-        sandbox.error.contains("restarted while creating"),
-        "{}",
-        sandbox.error
+    assert_eq!(
+        sandbox.state,
+        SandboxState::Provisioning,
+        "restart resumed the accepted provisioning instead of failing it"
     );
+    assert!(sandbox.error.is_empty(), "{}", sandbox.error);
+    assert_eq!(
+        row_count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM work_items WHERE dedup_key = 'create:{sandbox_id}' \
+                 AND status <> 'done'"
+            ),
+        ),
+        1,
+        "the durable create work is still queued"
+    );
+
+    // The restart registers a new node session, which fences the previous
+    // provider session by bumping its generation. The surviving work is still
+    // delivered to the re-registered provider, and the caller's retry with
+    // the same idempotency key returns the same lease once it reports.
+    let current = restored
+        .list_providers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .expect("the provider row survives the restart");
+    assert!(current.generation > generation);
+    let generation = current.generation;
+    let polled = restored
+        .poll(PollRequest {
+            provider_id: provider_id.clone(),
+            generation,
+            wait_secs: 0,
+            ..PollRequest::default()
+        })
+        .await
+        .unwrap();
+    let create = polled
+        .work
+        .iter()
+        .find(|item| {
+            matches!(
+                item.work,
+                Some(preloop_sandbox::api::work_item::Work::Create(_))
+            )
+        })
+        .expect("the resumed create work is delivered")
+        .clone();
+    restored
+        .report(ReportRequest {
+            provider_id,
+            generation,
+            work_id: create.id.clone(),
+            ok: true,
+            native_ref: "psbx-restored".into(),
+            ..ReportRequest::default()
+        })
+        .await
+        .unwrap();
+    let replay = restored
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            wait_secs: Some(0),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(replay.sandbox.id, sandbox_id);
+    assert_eq!(replay.sandbox.state, SandboxState::Leased);
+    assert_eq!(replay.sandbox.native_ref, "psbx-restored");
 }
 
 /// A record left `Terminating` by a crashed process whose machine is still in

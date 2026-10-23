@@ -7,10 +7,11 @@
 //! capacity, a lease, a provider generation, a work claim or a live-channel
 //! owner is asked of the database in one short transaction.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use parking_lot::Mutex;
@@ -443,6 +444,39 @@ pub struct Service {
     node: Owner,
     peers: PeerDirectory,
     pool_backoff: Mutex<HashMap<String, Instant>>,
+    /// Idempotency keys whose local `Acquire` future was dropped. The
+    /// authoritative waiter row is cleared by the next maintenance pass; the
+    /// hint makes an aborted caller release its lease without waiting for the
+    /// claim's expiry.
+    abandoned_waiters: Mutex<HashSet<String>>,
+}
+
+/// Clears an `Acquire`'s durable waiter claim when the future is dropped.
+///
+/// `Drop` cannot await, so an abandoned key becomes a local hint that
+/// maintenance drains into the database. The DB row still exists and expires
+/// on its own, so another replica is never blocked by a lost hint.
+struct AcquireWaiterGuard {
+    service: Arc<Service>,
+    key: String,
+    armed: bool,
+}
+
+impl AcquireWaiterGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AcquireWaiterGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.service
+                .abandoned_waiters
+                .lock()
+                .insert(self.key.clone());
+        }
+    }
 }
 
 impl Service {
@@ -486,6 +520,7 @@ impl Service {
             node,
             peers: peer_dir,
             pool_backoff: Mutex::new(HashMap::new()),
+            abandoned_waiters: Mutex::new(HashSet::new()),
         });
         // One authoritative pass at open repairs crash-left rows (a sandbox
         // whose lease row vanished) and resumes warm pools. It is a normal
@@ -583,6 +618,13 @@ impl Service {
 
     /// One maintenance pass (exposed for tests).
     pub async fn maintain(&self) {
+        // Turn locally abandoned waiters into released DB claims before the
+        // reaper decides whether their leases are still waited on. The
+        // durable row remains the authority and expires on its own.
+        let abandoned: Vec<String> = self.abandoned_waiters.lock().drain().collect();
+        for key in abandoned {
+            let _ = self.backend.clear_waiter(&key, &self.node).await;
+        }
         let config = MaintenanceConfig {
             create_timeout: self.config.create_timeout,
             provider_timeout: self.config.provider_timeout,
@@ -606,6 +648,23 @@ impl Service {
         for ticket in &outcome.aborted_tickets {
             self.abort_local_ticket(ticket, "transfer ticket expired")
                 .await;
+        }
+        // Exec streams live only on this node, but a destroy or snapshot on
+        // any replica finalizes their durable rows. Close the local streams
+        // from that authoritative status instead of waiting for their
+        // deadline.
+        let local_execs: Vec<String> = self.runtime.execs.lock().keys().cloned().collect();
+        for exec_id in local_execs {
+            match self.backend.exec_status(&exec_id).await {
+                Ok(Some(ExecStatus::Failed { reason })) => {
+                    self.close_exec(&exec_id, &reason).await;
+                }
+                Ok(None) => {
+                    self.close_exec(&exec_id, "the sandbox was destroyed")
+                        .await;
+                }
+                _ => {}
+            }
         }
         for deficit in &outcome.pool_deficits {
             self.fill_pool(deficit).await;
@@ -1125,6 +1184,40 @@ impl Service {
                 "exactly one of pool or template is required",
             ));
         }
+        if !request.pool.is_empty() {
+            // The pool path uses the pool's placement; silently dropping
+            // these would hand back a sandbox that ignores what the caller
+            // asked for.
+            let mut ignored = Vec::new();
+            if *request.shape != Shape::default() {
+                ignored.push("shape");
+            }
+            if *request.network != NetworkPolicy::default() {
+                ignored.push("network");
+            }
+            if !request.mounts.is_empty() {
+                ignored.push("mounts");
+            }
+            if !request.sockets.is_empty() {
+                ignored.push("sockets");
+            }
+            if !request.options.is_empty() {
+                ignored.push("options");
+            }
+            if !ignored.is_empty() {
+                return Err(Error::invalid_argument(format!(
+                    "pool acquires cannot set {}; set these on the pool, or acquire from the template",
+                    ignored.join(", ")
+                )));
+            }
+            // A build sandbox must be started snapshot-capable, and a pool
+            // placement is fixed: take build sandboxes from the template.
+            if request.purpose == Purpose::Build {
+                return Err(Error::invalid_argument(
+                    "pool acquires cannot be build sandboxes; acquire from the template",
+                ));
+            }
+        }
         let wait = match request.wait_secs {
             None => self.config.acquire_wait,
             Some(0) => Duration::ZERO,
@@ -1147,6 +1240,7 @@ impl Service {
         let mut placement: Option<NewSandbox> = None;
         let mut attempted_with_placement = false;
         let mut waiter_for: Option<String> = None;
+        let mut waiter_guard: Option<AcquireWaiterGuard> = None;
         // Starts at the first capacity-blocked step and is never reset: a
         // caller that cannot be told about overload fails over instead of
         // parking for the whole acquire wait.
@@ -1172,6 +1266,9 @@ impl Service {
                 AcquireStep::Ready { lease, sandbox } => {
                     self.clear_waiter_if_any(&request.idempotency_key, waiter_for.take())
                         .await;
+                    if let Some(guard) = waiter_guard.as_mut() {
+                        guard.disarm();
+                    }
                     return Ok(AcquireResponse {
                         lease: lease.into(),
                         sandbox: sandbox.into(),
@@ -1193,6 +1290,9 @@ impl Service {
                                 .await;
                             self.clear_waiter_if_any(&request.idempotency_key, waiter_for.take())
                                 .await;
+                            if let Some(guard) = waiter_guard.as_mut() {
+                                guard.disarm();
+                            }
                             return Err(error);
                         }
                     }
@@ -1216,6 +1316,13 @@ impl Service {
                         }
                     }
                     if let Some(sandbox_id) = sandbox_id {
+                        if waiter_guard.is_none() {
+                            waiter_guard = Some(AcquireWaiterGuard {
+                                service: self.clone(),
+                                key: request.idempotency_key.clone(),
+                                armed: true,
+                            });
+                        }
                         let waiter = backend::Waiter {
                             key: request.idempotency_key.clone(),
                             sandbox_id,
@@ -1271,6 +1378,9 @@ impl Service {
         };
         self.clear_waiter_if_any(&request.idempotency_key, waiter_for)
             .await;
+        if let Some(guard) = waiter_guard.as_mut() {
+            guard.disarm();
+        }
         result
     }
 
@@ -1427,7 +1537,7 @@ impl Service {
                         let _ = service.backend.cancel_exec(&watched, &service.node).await;
                         break;
                     }
-                    _ = finished.cancelled() => break,
+
                     _ = tick.tick() => {
                         match service.backend.exec_status(&watched).await {
                             Ok(Some(ExecStatus::Done { code })) => {
@@ -1454,7 +1564,25 @@ impl Service {
                                 }
                                 break;
                             }
-                            Ok(Some(ExecStatus::Running)) | Ok(None) => {}
+                            // The durable handle is gone: the channel can no
+                            // longer be delivered to, so end the caller's
+                            // stream explicitly instead of pretending it
+                            // completed.
+                            Ok(None) => {
+                                let tx = service
+                                    .runtime
+                                    .execs
+                                    .lock()
+                                    .get(&watched)
+                                    .map(|exec| exec.tx.clone());
+                                if let Some(tx) = tx {
+                                    let _ = tx
+                                        .send(Err(Error::unavailable("the sandbox was destroyed")))
+                                        .await;
+                                }
+                                break;
+                            }
+                            Ok(Some(ExecStatus::Running)) => {}
                             Err(error) => {
                                 tracing::debug!(%error, exec_id = %watched, "exec status check failed");
                             }
@@ -1605,6 +1733,17 @@ impl Service {
         );
     }
 
+    /// A losing transfer-claim is an HTTP precondition failure. The Connect
+    /// code alone maps to 400, which a caller cannot distinguish from a bad
+    /// request; the duplicate side is a "this was already claimed" state.
+    fn claim_failure(error: Error) -> Error {
+        if error.code == Code::FailedPrecondition {
+            error.with_http_status(StatusCode::PRECONDITION_FAILED)
+        } else {
+            error
+        }
+    }
+
     /// Claim the caller's side of a ticket with its bearer token.
     pub async fn claim_caller(
         &self,
@@ -1624,8 +1763,9 @@ impl Service {
                 self.config.work_timeout.as_secs() as i64,
                 TicketAuthority::Caller { token },
             )
-            .await?;
-        self.claim_local(ticket, side)
+            .await
+            .map_err(Self::claim_failure)?;
+        self.claim_local(ticket, side).map_err(Self::claim_failure)
     }
 
     /// Claim the agent's side (the provider must own the sandbox).
@@ -1647,8 +1787,9 @@ impl Service {
                     generation,
                 },
             )
-            .await?;
-        self.claim_local(ticket, side)
+            .await
+            .map_err(Self::claim_failure)?;
+        self.claim_local(ticket, side).map_err(Self::claim_failure)
     }
 
     fn local_ticket_kind(&self, ticket: &str) -> Result<StreamKind> {
@@ -1670,8 +1811,9 @@ impl Service {
                 self.config.work_timeout.as_secs() as i64,
                 TicketAuthority::Internal,
             )
-            .await?;
-        self.claim_local(ticket, side)
+            .await
+            .map_err(Self::claim_failure)?;
+        self.claim_local(ticket, side).map_err(Self::claim_failure)
     }
 
     fn claim_local(&self, ticket: &str, side: TransferSide) -> Result<StreamClaim> {

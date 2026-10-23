@@ -92,7 +92,10 @@ pub fn pool_revision(pool: &PoolSpec, template_digest: &str) -> u64 {
     let digest = Sha256::digest(bytes);
     let mut first = [0u8; 8];
     first.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(first)
+    // The value is stored in a signed BIGINT/INTEGER column and compared as
+    // an equality key, so keep it in the positive 63-bit range. Identity is
+    // all that matters here; it is not an ordering.
+    u64::from_be_bytes(first) & i64::MAX as u64
 }
 
 /// Whether a driver's declared capacity can host `shape`. Zero means "not
