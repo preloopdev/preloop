@@ -308,6 +308,7 @@ pub(crate) async fn acquire(
                                 .ok_or_else(|| Error::not_found("lease not found"))?;
                             let inject_state = row.text("inject_state")?.to_owned();
                             if inject_state == "done" {
+                                let lease = deliver_lease(tx, &lease_id, &seal).await?;
                                 return Ok(AcquireStep::Ready { lease, sandbox });
                             }
                             if claim_injection(tx, &lease_id, &owner, Duration::from_secs(60))
@@ -399,7 +400,14 @@ pub(crate) async fn acquire(
                         .filter(|ttl| *ttl > 0)
                         .map(|ttl| u64::try_from(ttl).unwrap_or(0))
                         .unwrap_or(ttl)
-                };
+                }
+                .max(1);
+                // Until the caller actually receives the lease, its expiry
+                // is capped: provisioning may legitimately outlast a short
+                // requested TTL, and the caller must not lose a machine it
+                // is still waiting for.
+                let unclaimed_ttl = command.unclaimed_ttl_secs.max(1);
+                let initial_ttl = ttl_secs.min(unclaimed_ttl);
                 let sandbox_id = if let Some(pool) = &pool {
                     let pool_name = pool.text("name")?.to_owned();
                     let revision = pool.u64("revision")?;
@@ -562,16 +570,17 @@ pub(crate) async fn acquire(
                 let lease_version = bump_version(tx).await?;
                 tx.execute(
                     "INSERT INTO leases \
-                     (id, sandbox_id, pool, idempotency_key, expires_at, env_sealed, \
-                      request_hash, inject_state, inject_owner_node, inject_owner_session, \
-                      inject_claim_expires_at, version) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', '', 0, $9)",
+                     (id, sandbox_id, pool, idempotency_key, expires_at, requested_ttl_secs, \
+                      env_sealed, request_hash, inject_state, inject_owner_node, \
+                      inject_owner_session, inject_claim_expires_at, version) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', '', 0, $10)",
                     &[
                         lease_id.as_str().into(),
                         sandbox_id.as_str().into(),
                         request.pool.as_str().into(),
                         request.idempotency_key.as_str().into(),
-                        (now_secs() + i64::try_from(ttl_secs).unwrap_or(i64::MAX)).into(),
+                        (now_secs() + i64::try_from(initial_ttl).unwrap_or(i64::MAX)).into(),
+                        ttl_secs.into(),
                         env_sealed.into(),
                         fingerprint.as_str().into(),
                         inject_state.into(),
@@ -632,6 +641,7 @@ pub(crate) async fn acquire(
                         })
                     }
                 } else if sandbox.state.known() == SandboxState::Leased {
+                    let lease = deliver_lease(tx, &lease_id, &seal).await?;
                     Ok(AcquireStep::Ready { lease, sandbox })
                 } else {
                     Ok(AcquireStep::Wait {
@@ -650,6 +660,38 @@ async fn release_key(tx: &mut dyn SqlTx, key: &str) -> Result<()> {
     tx.execute("DELETE FROM lease_keys WHERE key = $1", &[key.into()])
         .await?;
     Ok(())
+}
+
+/// Mark a lease delivered: its expiry becomes the caller's full requested
+/// TTL. Until this point the expiry is capped so provisioning cannot outlast
+/// a short TTL before the caller ever sees the lease.
+async fn deliver_lease(
+    tx: &mut dyn SqlTx,
+    lease_id: &str,
+    seal: &super::seal::SealKey,
+) -> Result<Lease> {
+    let row = tx
+        .query(
+            "SELECT requested_ttl_secs FROM leases WHERE id = $1",
+            &[lease_id.into()],
+        )
+        .await?
+        .into_iter()
+        .next();
+    let requested = row.map(|row| row.u64("requested_ttl_secs")).transpose()?.unwrap_or(0);
+    if requested > 0 {
+        let version = bump_version(tx).await?;
+        tx.execute(
+            "UPDATE leases SET expires_at = $2 + requested_ttl_secs, version = $3 \
+             WHERE id = $1",
+            &[lease_id.into(), now_secs().into(), version.into()],
+        )
+        .await?;
+        outbox(tx, "lease", lease_id, version, "deliver", "{}").await?;
+    }
+    lease_by_id(tx, lease_id, seal)
+        .await?
+        .ok_or_else(|| Error::not_found("lease not found"))
 }
 
 async fn seal_env(
@@ -820,17 +862,26 @@ pub(crate) async fn renew(
                     }
                     _ => {}
                 }
+                let requested = row.u64("requested_ttl_secs")?;
                 let ttl = if ttl_secs == 0 {
-                    default_ttl_secs
+                    // Zero means "keep the TTL this lease was acquired
+                    // with", not the service default.
+                    if requested > 0 {
+                        requested
+                    } else {
+                        default_ttl_secs
+                    }
                 } else {
                     ttl_secs
                 };
                 let version = bump_version(tx).await?;
                 tx.execute(
-                    "UPDATE leases SET expires_at = $2, version = $3 WHERE id = $1",
+                    "UPDATE leases SET expires_at = $2, requested_ttl_secs = $3, version = $4 \
+                     WHERE id = $1",
                     &[
                         lease_id.as_str().into(),
                         (now_secs() + i64::try_from(ttl).unwrap_or(i64::MAX)).into(),
+                        ttl.into(),
                         version.into(),
                     ],
                 )

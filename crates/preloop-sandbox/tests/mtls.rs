@@ -126,6 +126,139 @@ async fn join_tokens_are_single_use() {
     assert!(message.contains("join token"), "{message}");
 }
 
+fn enroll_request(token: &str, name: &str, csr_pem: &str) -> EnrollRequest {
+    EnrollRequest {
+        token: token.into(),
+        name: name.into(),
+        csr_pem: csr_pem.into(),
+        ..EnrollRequest::default()
+    }
+}
+
+#[tokio::test]
+async fn a_lost_enroll_response_can_be_retried_with_the_same_csr() {
+    let t = TestService::start().await;
+    let token = t.join_token(Duration::from_secs(60)).await;
+    let (_key, csr) = preloop_sandbox::tls::generate_csr("host-a").unwrap();
+    let anonymous = anonymous_providers(&t.base, &t.ca_pem());
+    let request = enroll_request(&token, "host-a", &csr);
+    // The service accepted and signed, but the response never reached the
+    // agent. The retry presents the identical token and CSR.
+    let first = anonymous
+        .enroll(request.clone())
+        .await
+        .unwrap()
+        .into_owned();
+    let second = anonymous.enroll(request).await.unwrap().into_owned();
+    assert!(!first.cert_pem.is_empty());
+    assert_eq!(first.cert_pem, second.cert_pem);
+    assert_eq!(first.expires_at, second.expires_at);
+    assert_eq!(first.ca_pem, second.ca_pem);
+}
+
+#[tokio::test]
+async fn a_used_token_with_a_different_request_is_refused() {
+    let t = TestService::start().await;
+    let token = t.join_token(Duration::from_secs(60)).await;
+    let (_key, csr) = preloop_sandbox::tls::generate_csr("host-a").unwrap();
+    let anonymous = anonymous_providers(&t.base, &t.ca_pem());
+    anonymous
+        .enroll(enroll_request(&token, "host-a", &csr))
+        .await
+        .unwrap();
+
+    // Same token, different CSR: a different key is not the retry of the
+    // request the service already signed.
+    let (_other_key, other_csr) = preloop_sandbox::tls::generate_csr("host-a").unwrap();
+    let error = anonymous
+        .enroll(enroll_request(&token, "host-a", &other_csr))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Unauthenticated);
+    assert_eq!(
+        preloop_sandbox::error::message(&error),
+        "join token already used"
+    );
+
+    // Same token and CSR under a different name is also a different
+    // request.
+    let error = anonymous
+        .enroll(enroll_request(&token, "host-b", &csr))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Unauthenticated);
+    assert_eq!(
+        preloop_sandbox::error::message(&error),
+        "join token already used"
+    );
+}
+
+#[tokio::test]
+async fn a_join_token_ttl_above_one_day_is_rejected() {
+    let t = TestService::start().await;
+    let error = t
+        .service
+        .create_join_token(Duration::from_secs(24 * 60 * 60 + 1), "")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(
+        preloop_sandbox::error::message(&error).contains("24h"),
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
+    // The maximum itself is accepted.
+    let response = t
+        .service
+        .create_join_token(Duration::from_secs(24 * 60 * 60), "")
+        .await
+        .unwrap();
+    assert!(!response.token.is_empty());
+}
+
+#[tokio::test]
+async fn enroll_retries_reuse_the_pending_key_and_csr() {
+    let t = TestService::start().await;
+    let token = t.join_token(Duration::from_secs(60)).await;
+    let parts: Vec<&str> = token.split('.').collect();
+    // A well-formed token with a valid CA pin but the wrong secret: the
+    // service rejects it at `Enroll`, after the agent has already committed
+    // its key and CSR.
+    let bad = format!("{}.{}.{}.{}", parts[0], parts[1], "ab".repeat(32), parts[3]);
+    let identity_dir = t.dir.path().join("retry-identity");
+    let error = RemoteLink::enroll(&t.base, &bad, &identity_dir, "host-a")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Unauthenticated);
+    let pending_key = std::fs::read_to_string(identity_dir.join("pending-key.pem")).unwrap();
+    let pending_csr = std::fs::read_to_string(identity_dir.join("pending-csr.pem")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for file in ["pending-key.pem", "pending-csr.pem"] {
+            let mode = std::fs::metadata(identity_dir.join(file))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{file}");
+        }
+    }
+    // A later attempt (in practice a restarted agent) reuses that material:
+    // the certificate is issued for the same key the first request carried.
+    let token = t.join_token(Duration::from_secs(60)).await;
+    let link = RemoteLink::enroll(&t.base, &token, &identity_dir, "host-a")
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(identity_dir.join("key.pem")).unwrap(),
+        pending_key
+    );
+    assert!(!pending_csr.is_empty());
+    assert!(!identity_dir.join("pending-key.pem").exists());
+    assert!(!identity_dir.join("pending-csr.pem").exists());
+    link.register(register("host-a")).await.unwrap();
+}
+
 #[tokio::test]
 async fn expired_join_tokens_are_rejected() {
     let t = TestService::start().await;
@@ -177,8 +310,12 @@ async fn a_token_pinned_to_another_ca_is_rejected_by_the_service() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
-    assert!(
-        preloop_sandbox::error::message(&error).contains("CA"),
+    // Token-validation failures are indistinguishable by design: the same
+    // code and message covers a wrong CA pin, a bad secret, an unknown id
+    // and an expired token, so the endpoint is not a validity oracle.
+    assert_eq!(
+        preloop_sandbox::error::message(&error),
+        "invalid join token",
         "{error:?}"
     );
 }
@@ -203,6 +340,11 @@ async fn provider_calls_without_a_client_certificate_are_denied() {
     let anonymous = anonymous_providers(&t.base, &t.ca_pem());
     let error = anonymous.register(register("ghost")).await.unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
+    let message = preloop_sandbox::error::message(&error);
+    assert!(
+        message.contains("raw TCP") && message.contains("TLS termination"),
+        "{message}"
+    );
     let error = anonymous
         .heartbeat(HeartbeatRequest {
             provider_id: "prv-missing".into(),
@@ -367,4 +509,293 @@ async fn the_caller_token_is_still_required_over_tls() {
     let wrong = SandboxClient::with_tls(&t.base, Some("nope".into()), &ca, None).unwrap();
     assert_eq!(wrong.list().await.unwrap_err().code, Code::Unauthenticated);
     t.client().list().await.unwrap();
+}
+
+fn register_full(name: &str) -> RegisterRequest {
+    RegisterRequest {
+        name: name.into(),
+        drivers: vec![DriverInfo {
+            driver: "fake".into(),
+            capabilities: preloop_sandbox::drivers::fake::FakeDriver::full_capabilities().into(),
+            ..DriverInfo::default()
+        }],
+        protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+        ..RegisterRequest::default()
+    }
+}
+
+/// SHA-256 fingerprints of `host-a`'s certificates, in the order the service
+/// lists them.
+async fn certificate_fingerprints(t: &TestService) -> Vec<String> {
+    t.service
+        .list_providers()
+        .await
+        .expect("list providers")
+        .into_iter()
+        .find(|provider| provider.name == "host-a")
+        .map(|provider| {
+            provider
+                .certificates
+                .iter()
+                .map(|certificate| certificate.sha256.clone())
+                .collect::<Vec<_>>()
+        })
+        .expect("provider host-a present")
+}
+
+#[tokio::test]
+async fn an_unbound_token_cannot_take_over_an_existing_provider() {
+    let t = TestService::start().await;
+    let victim = t.enroll("host-a").await;
+    let session = victim.register(register("host-a")).await.unwrap();
+    let before = certificate_fingerprints(&t).await;
+    assert_eq!(before.len(), 1);
+    // A fresh unbound token presented under the victim's name is refused:
+    // replacing a live provider's certificates requires a token minted
+    // bound to that name.
+    let token = t.join_token(Duration::from_secs(60)).await;
+    let error = RemoteLink::enroll(&t.base, &token, t.dir.path().join("attacker"), "host-a")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        Code::AlreadyExists,
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
+    // The victim is untouched: same provider, same single certificate, and
+    // the certificate still authenticates.
+    let providers = t.service.list_providers().await.unwrap();
+    let provider = providers
+        .iter()
+        .find(|provider| provider.name == "host-a")
+        .expect("provider still present");
+    assert_eq!(provider.id, session.provider_id);
+    assert_eq!(certificate_fingerprints(&t).await, before);
+    victim
+        .heartbeat(HeartbeatRequest {
+            provider_id: session.provider_id,
+            generation: session.generation,
+            ..HeartbeatRequest::default()
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_name_bound_token_reenrolls_its_provider_and_replaces_its_certificates() {
+    let t = TestService::start().await;
+    let victim = t.enroll("host-a").await;
+    let first = victim.register(register("host-a")).await.unwrap();
+    let identity_dir = t.dir.path().join("identity").join("host-a");
+    let saved_dir = t.dir.path().join("saved-identity");
+    copy_identity(&identity_dir, &saved_dir);
+
+    // The operator mints a token bound to host-a for the replacement host:
+    // that is the one credential allowed to take the name over.
+    let token = t.join_token_for(Duration::from_secs(60), "host-a").await;
+    let replacement =
+        RemoteLink::enroll(&t.base, &token, t.dir.path().join("replacement"), "host-a")
+            .await
+            .unwrap();
+    let second = replacement.register(register("host-a")).await.unwrap();
+    assert_eq!(second.provider_id, first.provider_id);
+    assert_eq!(second.generation, first.generation + 1);
+
+    // The replaced certificate no longer authenticates.
+    let stale = RemoteLink::connect(&saved_dir, Some(&t.base), None, "host-a")
+        .await
+        .unwrap();
+    let error = stale.register(register("host-a")).await.unwrap_err();
+    assert_eq!(error.code, Code::PermissionDenied);
+    // The replacement's does.
+    replacement
+        .heartbeat(HeartbeatRequest {
+            provider_id: second.provider_id,
+            generation: second.generation,
+            ..HeartbeatRequest::default()
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_name_bound_token_cannot_enroll_a_different_provider() {
+    let t = TestService::start().await;
+    let token = t.join_token_for(Duration::from_secs(60), "host-b").await;
+    let error = RemoteLink::enroll(&t.base, &token, t.dir.path().join("wrong"), "host-a")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        Code::PermissionDenied,
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
+    // The refusal does not consume the token: its own name still enrolls.
+    let link = RemoteLink::enroll(&t.base, &token, t.dir.path().join("right"), "host-b")
+        .await
+        .unwrap();
+    link.register(register("host-b")).await.unwrap();
+}
+
+async fn enroll_failure(t: &TestService, token: &str) -> (Code, String) {
+    let anonymous = anonymous_providers(&t.base, &t.ca_pem());
+    let (_key, csr) = preloop_sandbox::tls::generate_csr("host-a").unwrap();
+    let error = anonymous
+        .enroll(EnrollRequest {
+            token: token.into(),
+            name: "host-a".into(),
+            csr_pem: csr,
+            ..EnrollRequest::default()
+        })
+        .await
+        .unwrap_err();
+    (
+        error.code,
+        preloop_sandbox::error::message(&error).to_owned(),
+    )
+}
+
+#[tokio::test]
+async fn enroll_token_failures_are_indistinguishable() {
+    let t = TestService::start().await;
+    let real = t.join_token(Duration::from_secs(60)).await;
+    let parts: Vec<&str> = real.split('.').collect();
+    assert_eq!(parts.len(), 4);
+    let wrong_pin = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], "00".repeat(32));
+    let unknown_id = format!("{}.jt-unknown.{}.{}", parts[0], parts[2], parts[3]);
+    let bad_secret = format!("{}.{}.{}.{}", parts[0], parts[1], "ab".repeat(32), parts[3]);
+    // Malformed, issued for another CA, unknown id and wrong secret all
+    // return the identical code and message, so a caller holding part of a
+    // token cannot probe which component is wrong.
+    for token in ["garbage".to_owned(), wrong_pin, unknown_id, bad_secret] {
+        let (code, message) = enroll_failure(&t, &token).await;
+        assert_eq!(code, Code::Unauthenticated, "{token}");
+        assert_eq!(message, "invalid join token", "{token}");
+    }
+    // Expired tokens collapse into the same response (whether the record
+    // was pruned by maintenance or rejected on its expiry).
+    let stale = t.join_token(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let (code, message) = enroll_failure(&t, &stale).await;
+    assert_eq!(code, Code::Unauthenticated);
+    assert_eq!(message, "invalid join token");
+    // The failures above neither consumed nor locked the genuine token.
+    RemoteLink::enroll(&t.base, &real, t.dir.path().join("genuine"), "host-a")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn renewal_prunes_the_oldest_certificate_beyond_the_cap() {
+    let t = TestService::start().await;
+    let link = t.enroll("host-a").await;
+    link.register(register("host-a")).await.unwrap();
+    let identity_dir = t.dir.path().join("identity").join("host-a");
+    let oldest_dir = t.dir.path().join("oldest-identity");
+    copy_identity(&identity_dir, &oldest_dir);
+
+    // Renew up to the cap: the retained set stops growing there, and one
+    // renewal past it prunes the original certificate even though it has
+    // not expired — rotation can evict a compromised certificate.
+    //
+    // Retention keeps the certificates with the latest `expires_at`, so
+    // renewals issued in the same second are ordered only by a random hash
+    // tie-break. Space them out to observe the eviction of the original.
+    let cap = preloop_sandbox::service::MAX_PROVIDER_CERTIFICATES;
+    for _ in 0..cap {
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        link.renew().await.unwrap();
+    }
+    let certificates = t
+        .service
+        .list_providers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|provider| provider.name == "host-a")
+        .map(|provider| provider.certificates)
+        .unwrap();
+    assert_eq!(certificates.len(), cap, "{certificates:?}");
+
+    // The current certificate still authenticates.
+    link.register(register("host-a")).await.unwrap();
+    // The pruned one no longer does.
+    let stale = RemoteLink::connect(&oldest_dir, Some(&t.base), None, "host-a")
+        .await
+        .unwrap();
+    let error = stale.register(register("host-a")).await.unwrap_err();
+    assert_eq!(error.code, Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn reenrollment_redelivers_in_flight_work() {
+    let t = TestService::start().await;
+    let link = t.enroll("host-a").await;
+    let session = link.register(register_full("host-a")).await.unwrap();
+    t.client()
+        .put_template(common::template("alpine"))
+        .await
+        .unwrap();
+    // Acquire blocks until the sandbox is ready (or fails); drive it in
+    // the background while the provider side is manipulated by hand.
+    let client = t.client();
+    let acquire = tokio::spawn(async move {
+        client
+            .acquire(AcquireRequest {
+                idempotency_key: "mtls-inflight".into(),
+                template: "alpine".into(),
+                wait_secs: Some(60),
+                ..AcquireRequest::default()
+            })
+            .await
+    });
+    // The create is delivered to the provider and sits in flight,
+    // unacknowledged.
+    let first = link
+        .poll(PollRequest {
+            provider_id: session.provider_id.clone(),
+            generation: session.generation,
+            wait_secs: 10,
+            ..PollRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.work.len(), 1, "{first:?}");
+    let work_id = first.work[0].id.clone();
+
+    // The provider re-enrolls (bound token) and registers a new session.
+    let token = t.join_token_for(Duration::from_secs(60), "host-a").await;
+    let replacement =
+        RemoteLink::enroll(&t.base, &token, t.dir.path().join("replacement"), "host-a")
+            .await
+            .unwrap();
+    let session = replacement.register(register_full("host-a")).await.unwrap();
+    // The in-flight item is redelivered to the new session rather than
+    // dropped: the sandbox must not wedge in PROVISIONING.
+    let second = replacement
+        .poll(PollRequest {
+            provider_id: session.provider_id.clone(),
+            generation: session.generation,
+            wait_secs: 10,
+            ..PollRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.work.len(), 1, "{second:?}");
+    assert_eq!(second.work[0].id, work_id);
+    // Fail the work so the blocked acquire unwinds.
+    replacement
+        .report(ReportRequest {
+            provider_id: session.provider_id,
+            generation: session.generation,
+            work_id,
+            ok: false,
+            error: "test over".into(),
+            ..ReportRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(acquire.await.unwrap().is_err());
 }

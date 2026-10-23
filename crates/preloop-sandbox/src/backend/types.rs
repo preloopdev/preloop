@@ -167,8 +167,11 @@ pub struct AcquireCommand {
     pub request: AcquireRequest,
     /// Fingerprint of the fields that decide which sandbox is acquired.
     pub fingerprint: String,
-    /// Lease TTL to record.
+    /// Lease TTL to record as the caller's requested TTL.
     pub ttl_secs: u64,
+    /// Cap on an undelivered lease's expiry: a caller whose provisioning
+    /// outlasts a short TTL still gets its lease once the machine is ready.
+    pub unclaimed_ttl_secs: u64,
     /// Create deadline, for the work item.
     pub create_timeout: Duration,
     /// Placement to use when no warm member can be claimed. The service
@@ -256,6 +259,15 @@ pub enum ReportExecOutcome {
     },
     /// A batch the service already applied (a retry).
     Duplicate,
+    /// A different delivery tried to start an exec that already started.
+    /// The exec is durably failed; the caller's stream must end with `reason`
+    /// rather than replay the command.
+    AlreadyStarted {
+        /// Exec whose start conflicted.
+        exec_id: String,
+        /// Explanation for the caller.
+        reason: String,
+    },
     /// The exec is gone or belongs to another provider; the agent must stop.
     Gone,
 }
@@ -376,6 +388,21 @@ pub enum TicketAuthority<'a> {
     },
     /// The service's own in-process side (upload/download helpers).
     Internal,
+}
+
+/// Outcome of a join-token exchange.
+#[derive(Debug, Clone)]
+pub enum EnrollOutcome {
+    /// The token was consumed and the provider's certificate bound.
+    Issued,
+    /// This exact enrollment already succeeded; the stored certificate is
+    /// returned so a caller whose response was lost can retry.
+    Replay {
+        /// The certificate issued by the original enrollment.
+        cert_pem: String,
+        /// Its expiry.
+        expires_at: i64,
+    },
 }
 
 /// Outcome of starting a snapshot request.

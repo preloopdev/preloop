@@ -2180,7 +2180,12 @@ pub(super) async fn on_job_enqueued(
             return Ok(());
         }
     }
-    if pool_assignments {
+    if pool_assignments || require_assignments {
+        // No free runner: mark pool-pending so provisioning sees it. Under
+        // strict assignments the mark is also the job's claim visa after the
+        // binding TTL, so it must be written even with the pool off —
+        // otherwise the job is ready with no intent row and no runner may
+        // ever claim it.
         tx.execute(
             "INSERT INTO provision_requests (run_id, job_id, namespace_id, pool_key, labels) \
              VALUES ($1::text::uuid,$2,$3,$4,$5::text::jsonb) ON CONFLICT DO NOTHING",
@@ -3999,6 +4004,7 @@ pub(super) async fn append_event_tx(
 /// lands in `retired` — and put the node back at the head of the ready
 /// queue (its `jobs` row goes back to `queued`/`ready`).
 pub(super) async fn requeue_claimed_tx(
+    backend: &PgBackend,
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
@@ -4036,6 +4042,13 @@ pub(super) async fn requeue_claimed_tx(
     )
     .await
     .map_err(db)?;
+    // Back on the ready queue: derive the same dispatch intent enqueue would
+    // have. The bare delete above leaves nothing behind, and under strict
+    // assignments a ready job with no assignment/provision row is
+    // unclaimable forever (only the boot rebuild repairs it).
+    if let Some(graph) = PgBackend::load_graph(backend, tx, run_id).await? {
+        on_job_enqueued(backend, tx, &graph, job_id).await?;
+    }
     // The job is requestable again: `job.requested.v1` marks the fresh
     // head-of-queue request (same transition the initial queue observed).
     emit_outbox(

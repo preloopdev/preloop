@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use preloop_sandbox::agent::RemoteLink;
+use preloop_sandbox::authz::Authorizer;
 use preloop_sandbox::backend;
-use preloop_sandbox::server::{Auth, serve};
+use preloop_sandbox::server::{Auth, serve, serve_with_authorizer};
 use preloop_sandbox::{SandboxClient, ServerTls, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -73,6 +74,44 @@ impl TestService {
         }
     }
 
+    /// Start a fresh service with an explicit authorization policy.
+    pub async fn start_with_authorizer(authorizer: Arc<dyn Authorizer>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let tls = ServerTls::load_or_create(
+            &state,
+            vec!["127.0.0.1".to_owned(), "localhost".to_owned()],
+            None,
+            None,
+        )
+        .expect("server tls");
+        let mut config = ServiceConfig::new();
+        config.ca = Some(tls.ca.clone());
+        let service = Service::open(backend::open("memory:").await.unwrap(), config)
+            .await
+            .unwrap();
+        let client_token = "test-client-token".to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("https://{}", listener.local_addr().unwrap());
+        let shutdown = CancellationToken::new();
+        tokio::spawn(serve_with_authorizer(
+            listener,
+            service.clone(),
+            Auth::new(client_token.clone()),
+            tls,
+            shutdown.clone(),
+            authorizer,
+        ));
+        tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+        Self {
+            service,
+            base,
+            client_token,
+            dir,
+            shutdown,
+        }
+    }
+
     /// A caller client that trusts the service CA.
     pub fn client(&self) -> SandboxClient {
         SandboxClient::with_tls(
@@ -94,9 +133,18 @@ impl TestService {
         self.service.ca_pem().expect("service CA")
     }
 
-    /// Mint a join token.
+    /// Mint an unbound join token.
     pub async fn join_token(&self, ttl: Duration) -> String {
-        self.service.create_join_token(ttl).await.unwrap().token
+        self.join_token_for(ttl, "").await
+    }
+
+    /// Mint a join token bound to provider `name` (empty = unbound).
+    pub async fn join_token_for(&self, ttl: Duration, name: &str) -> String {
+        self.service
+            .create_join_token(ttl, name)
+            .await
+            .unwrap()
+            .token
     }
 
     /// Enroll `name` with a fresh single-use token and return its link.

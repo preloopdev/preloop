@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use self::cli::{
-    ForkLaunch, MachineName, MachineRole, MachineSpec, MachineState, MachineUpdate,
+    ForkInFlight, ForkLaunch, MachineName, MachineRole, MachineSpec, MachineState, MachineUpdate,
     NetworkPolicy as VmNetwork, OutputChunk, SANDBOX_OWNER_MARKER, SmolVmProvider,
     SocketMount as VmSocket, VmError, VmProvider, VolumeMount, mark_sandbox_owned,
 };
@@ -113,27 +113,34 @@ impl SmolvmDriver {
         self
     }
 
+    /// The typed lifecycle primitive behind this driver. Callers that also
+    /// need host-side operations must clone this provider rather than build a
+    /// second one, so both share the lifecycle lock and fork census.
+    pub fn provider(&self) -> &SmolVmProvider {
+        &self.provider
+    }
+
     fn adopts(&self, name: &str) -> bool {
         self.named_prefix
             .as_deref()
             .is_some_and(|prefix| name.starts_with(prefix))
     }
 
-    /// Mark a machine the CI pool does not own as a Sandbox Service sandbox.
+    /// Mark a machine this driver creates as a Sandbox Service sandbox.
     ///
     /// The engine's start/teardown sweep (`OrphanPurge::All`) kills every
-    /// hypervisor under this home it cannot attribute, which used to include
-    /// sandboxes leased to other callers. The sweep sees only a machine's
-    /// data directory, so that is where the ownership marker goes. Pool
-    /// machines (`named_prefix`) stay unmarked: the pool deletes them itself
-    /// on teardown and the sweep is its crash backstop.
+    /// hypervisor under this home it cannot attribute, and a leased sandbox
+    /// must never be one of them. The sweep sees only a machine's data
+    /// directory, so that is where the ownership marker goes, whatever the
+    /// machine is named: a caller may name a sandbox inside the pool's prefix,
+    /// and the pool's own machines are created through the service too. The
+    /// pool does not rely on the sweep as a crash backstop: it deletes its
+    /// machines through the service on teardown, and its startup cleanup
+    /// (`remove_stale_runner_machines`) releases leftovers through the service.
     ///
     /// A marker that cannot be written fails the create: an unmarked sandbox
     /// could be killed under a live lease at the next engine start or stop.
     async fn mark_owned(&self, name: &MachineName) -> Result<()> {
-        if self.adopts(name.as_str()) {
-            return Ok(());
-        }
         let data_dir = self
             .provider
             .machine_data_dir(name)
@@ -221,11 +228,6 @@ impl SmolvmDriver {
             started.map_err(vm_error)?;
         }
         Ok(true)
-    }
-
-    /// The underlying CLI provider.
-    pub fn provider(&self) -> &SmolVmProvider {
-        &self.provider
     }
 
     /// The artifact cache this driver materializes packs into.
@@ -477,6 +479,12 @@ enum End {
     Cancelled,
 }
 
+/// Caller-chosen names must sit inside the prefix this driver reports in
+/// its inventory, or reconciliation cannot tell them from foreign machines.
+pub(crate) fn name_is_owned(prefix: Option<&str>, name: &str) -> bool {
+    prefix.is_some_and(|prefix| !prefix.is_empty() && name.starts_with(prefix))
+}
+
 fn guest_arch() -> &'static str {
     crate::api::host_arch()
 }
@@ -709,8 +717,16 @@ impl Driver for SmolvmDriver {
     }
 
     async fn create(&self, work: &CreateWork) -> Result<String> {
-        // A caller-chosen name doubles as the native name, so host tools
-        // (`preloop shell`, `smolvm machine exec`) address the same machine.
+        // A caller-chosen name doubles as the native name, but inventory can
+        // only recognize names inside the configured prefix: an arbitrary
+        // name would be reported lost, then its record dropped without
+        // destroying the machine. Keep the ownership boundary explicit.
+        if !work.name.is_empty() && !name_is_owned(self.named_prefix.as_deref(), &work.name) {
+            return Err(Error::invalid_argument(format!(
+                "caller-chosen sandbox name `{}` is outside this provider's owned prefix",
+                work.name
+            )));
+        }
         let name = if work.name.is_empty() {
             native_name(&work.sandbox_id)
         } else {
@@ -718,6 +734,9 @@ impl Driver for SmolvmDriver {
         };
         let clone = machine(&name)?;
         if !work.template.native_ref.is_empty() {
+            // The clone boots inside `fork`, before it is marked below: an
+            // orphan sweep must not run in between.
+            let _forking = ForkInFlight::enter();
             let golden = machine(&work.template.native_ref)?;
             // Validate the fork before touching the provider (and before an
             // idempotent short-circuit), so a request this backend cannot
@@ -858,7 +877,7 @@ impl Driver for SmolvmDriver {
             return Err(Error::invalid_argument("argv is required"));
         }
         let name = machine(native_ref)?;
-        let argv = crate::driver::posix_exec_argv(request);
+        let argv = crate::driver::posix_exec_argv(request)?;
         let cancel = self.cancels.start(exec_id);
         let result = self
             .exec_inner(&name, exec_id, request, &argv, output, cancel)
@@ -984,6 +1003,14 @@ impl Driver for SmolvmDriver {
     }
 }
 
+/// Serializes unit tests that read or rewrite the process-wide Preloop home.
+/// A fork records its home's machine data roots for as long as it runs (an
+/// orphan sweep of that home must defer), and a test that switches
+/// `PRELOOP_HOME` must not overlap one: the fork would read the other test's
+/// scratch home and the sweep would be deferred for the wrong one.
+#[cfg(all(test, unix))]
+pub(crate) static TEST_HOME_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1088,7 +1115,10 @@ exit 0
     }
 
     fn driver(directory: &tempfile::TempDir) -> SmolvmDriver {
+        // Production host drivers set the prefix their caller names live in;
+        // the fork tests fork a caller-named clone (`runtime-1`).
         SmolvmDriver::new(SmolVmProvider::new(directory.path().join("smolvm")), 0)
+            .with_named_prefix("runtime")
     }
 
     #[tokio::test]
@@ -1148,7 +1178,12 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits: the guard records
+    // `machine_data_roots` from `PRELOOP_HOME`, and a parallel env-mutating
+    // test could otherwise hand it a scratch home mid-fork.
+    #[allow(clippy::await_holding_lock)]
     async fn a_fork_applies_network_and_mounts_to_the_clone() {
+        let _home = TEST_HOME_LOCK.lock();
         let (directory, _executable) = fake_smolvm();
         let host = directory.path().join("workspace");
         fs::create_dir_all(&host).unwrap();
@@ -1199,7 +1234,11 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits (see
+    // `a_fork_applies_network_and_mounts_to_the_clone`).
+    #[allow(clippy::await_holding_lock)]
     async fn a_public_only_fork_launches_under_the_strict_egress_floor() {
+        let _home = TEST_HOME_LOCK.lock();
         let (directory, _executable) = fake_smolvm();
         let driver = driver(&directory);
         let mut work = fork_work();
@@ -1219,7 +1258,11 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits (see
+    // `a_fork_applies_network_and_mounts_to_the_clone`).
+    #[allow(clippy::await_holding_lock)]
     async fn a_fork_refuses_settings_it_cannot_change() {
+        let _home = TEST_HOME_LOCK.lock();
         for (field, mutate) in [
             (
                 "sockets",
@@ -1264,7 +1307,11 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits (see
+    // `a_fork_applies_network_and_mounts_to_the_clone`).
+    #[allow(clippy::await_holding_lock)]
     async fn a_fork_that_matches_the_base_needs_no_reconfiguration() {
+        let _home = TEST_HOME_LOCK.lock();
         let (directory, _executable) = fake_smolvm();
         let driver = driver(&directory);
 
@@ -1280,7 +1327,11 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits (see
+    // `a_fork_applies_network_and_mounts_to_the_clone`).
+    #[allow(clippy::await_holding_lock)]
     async fn a_snapshot_capable_fork_is_itself_branchable() {
+        let _home = TEST_HOME_LOCK.lock();
         let (directory, _executable) = fake_smolvm();
         let driver = driver(&directory);
         let mut work = fork_work();
@@ -1501,5 +1552,18 @@ exit 0
             0,
             "a foreign machine is not started"
         );
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::name_is_owned;
+
+    #[test]
+    fn caller_names_must_be_inside_the_owned_prefix() {
+        assert!(name_is_owned(Some("preloop-runner"), "preloop-runner-3-1"));
+        assert!(!name_is_owned(Some("preloop-runner"), "someone-elses-vm"));
+        assert!(!name_is_owned(None, "preloop-runner-3-1"));
+        assert!(!name_is_owned(Some(""), "anything"));
     }
 }

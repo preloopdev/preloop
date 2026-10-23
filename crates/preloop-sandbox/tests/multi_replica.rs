@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink, RemoteLink, Session};
 use preloop_sandbox::api::*;
-use preloop_sandbox::backend::{self, BackendConfig, PeerConfig, SandboxBackend};
+use preloop_sandbox::backend::{self, BackendConfig, PeerConfig};
 use preloop_sandbox::driver::{TransferChunk, native_name};
 use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::server::{Auth, serve};
@@ -242,7 +242,11 @@ async fn provider_reports_exec_and_transfers_through_the_other_replica() {
     client.put_template(template("base")).await.unwrap();
 
     // Enroll through A, then present the same certificate to B.
-    let join = node_a.service.create_join_token(Duration::from_secs(60)).await.unwrap();
+    let join = node_a
+        .service
+        .create_join_token(Duration::from_secs(60), "")
+        .await
+        .unwrap();
     let identity_dir = dir.path().join("identity");
     let a = Arc::new(
         RemoteLink::enroll(&base_a, &join.token, &identity_dir, "host-a")
@@ -265,7 +269,7 @@ async fn provider_reports_exec_and_transfers_through_the_other_replica() {
         AgentConfig::new("host-a"),
     );
     let agent_shutdown = CancellationToken::new();
-    tokio::spawn(agent.run(agent_shutdown.clone()));
+    tokio::spawn(agent.run(None, agent_shutdown.clone()));
 
     wait_for(|| async {
         node_a

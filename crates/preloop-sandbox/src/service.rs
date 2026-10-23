@@ -37,6 +37,16 @@ pub struct ServiceConfig {
     pub lease_ttl: Duration,
     /// Default time `Acquire` waits for a ready sandbox.
     pub acquire_wait: Duration,
+    /// How long an acquired-but-never-returned lease (one whose `Acquire` is
+    /// still provisioning, or timed out) may live before maintenance releases
+    /// it. A waiting `Acquire` keeps its lease past this window.
+    pub unclaimed_lease_ttl: Duration,
+    /// How long an `Acquire` may wait *for capacity* — the pool is at
+    /// `max`, or placement reports `resource_exhausted` — before the wait
+    /// fails with that error. Provisioning waits stay bounded by
+    /// `acquire_wait`: a cold create legitimately takes minutes, but a full
+    /// pool does not free up faster for waiting longer.
+    pub acquire_capacity_wait: Duration,
     /// A provider silent this long is not placed on.
     pub provider_timeout: Duration,
     /// A create not reported within this window fails.
@@ -97,6 +107,8 @@ impl ServiceConfig {
         Self {
             lease_ttl: Duration::from_secs(3600),
             acquire_wait: Duration::from_secs(900),
+            unclaimed_lease_ttl: Duration::from_secs(600),
+            acquire_capacity_wait: Duration::from_secs(30),
             provider_timeout: Duration::from_secs(45),
             create_timeout: Duration::from_secs(1800),
             preserve_ttl: Duration::from_secs(600),
@@ -162,6 +174,21 @@ pub const DEFAULT_PAGE_SIZE: u32 = 100;
 
 /// Largest accepted `ListRequest.page_size`.
 pub const MAX_PAGE_SIZE: u32 = 1000;
+
+/// Default lifetime of a join token when `Enroll` is asked for none.
+pub const DEFAULT_JOIN_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Longest accepted join-token lifetime. A token is a bearer credential for
+/// one enrollment; a day is long enough for an operator to hand it to a host
+/// and short enough that a leaked token stops working.
+pub const MAX_JOIN_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many simultaneously valid certificates one provider may hold: the
+/// current certificate plus two predecessors. Renewal keeps a short overlap
+/// so a client that fails to store its new key keeps working, but the set is
+/// bounded — after this many rotations the oldest certificate is pruned even
+/// if unexpired, so rotating can actually evict a compromised certificate.
+pub const MAX_PROVIDER_CERTIFICATES: usize = 3;
 
 /// Default cap for one blob upload: 8 GiB.
 pub const DEFAULT_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -1106,6 +1133,10 @@ impl Service {
         let mut placement: Option<NewSandbox> = None;
         let mut attempted_with_placement = false;
         let mut waiter_for: Option<String> = None;
+        // Starts at the first capacity-blocked step and is never reset: a
+        // caller that cannot be told about overload fails over instead of
+        // parking for the whole acquire wait.
+        let mut capacity_deadline: Option<Instant> = None;
         let result = loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -1114,6 +1145,7 @@ impl Service {
                 request: request.clone(),
                 fingerprint: fingerprint.clone(),
                 ttl_secs: ttl,
+                unclaimed_ttl_secs: self.config.unclaimed_lease_ttl.as_secs(),
                 create_timeout: self.config.create_timeout,
                 placement: placement.clone(),
                 owner: self.node.clone(),
@@ -1154,6 +1186,19 @@ impl Service {
                     sandbox_id,
                     lease_id,
                 } => {
+                    if last
+                        .as_ref()
+                        .is_some_and(|error| error.code == Code::ResourceExhausted)
+                    {
+                        let capacity_at = *capacity_deadline.get_or_insert(
+                            Instant::now() + self.config.acquire_capacity_wait,
+                        );
+                        if Instant::now() >= capacity_at {
+                            break Err(last.unwrap_or_else(|| {
+                                Error::new(Code::ResourceExhausted, "no capacity")
+                            }));
+                        }
+                    }
                     if let Some(sandbox_id) = sandbox_id {
                         let waiter = backend::Waiter {
                             key: request.idempotency_key.clone(),
@@ -1432,6 +1477,18 @@ impl Service {
                 Ok(())
             }
             backend::ReportExecOutcome::Duplicate => Ok(()),
+            backend::ReportExecOutcome::AlreadyStarted { exec_id, reason } => {
+                let exec = self.runtime.execs.lock().remove(&exec_id);
+                if let Some(exec) = exec {
+                    exec.finished.cancel();
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        exec.tx.send(Err(Error::aborted(reason))),
+                    )
+                    .await;
+                }
+                Ok(())
+            }
             backend::ReportExecOutcome::Gone => Err(Error::not_found("exec not found")),
         }
     }
@@ -2136,22 +2193,44 @@ impl Service {
         Ok(())
     }
 
-    /// Mint a single-use join token.
-    pub async fn create_join_token(&self, ttl: Duration) -> Result<CreateJoinTokenResponse> {
+    /// Mint a single-use join token, optionally bound to one provider name.
+    ///
+    /// A bound token enrolls only that name and is the only kind that may
+    /// re-enroll an existing provider (replacing its certificates). An
+    /// unbound token may only enroll a name that does not exist yet.
+    pub async fn create_join_token(
+        &self,
+        ttl: Duration,
+        provider_name: &str,
+    ) -> Result<CreateJoinTokenResponse> {
         let ca = self.config.ca.as_ref().ok_or_else(|| {
             Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
         })?;
+        if !provider_name.is_empty() {
+            backend::logic::validate_name("provider", provider_name)?;
+        }
         let ttl = if ttl.is_zero() {
-            Duration::from_secs(3600)
+            DEFAULT_JOIN_TOKEN_TTL
         } else {
             ttl
         };
+        if ttl > MAX_JOIN_TOKEN_TTL {
+            return Err(Error::invalid_argument(format!(
+                "join token ttl must be at most {}h",
+                MAX_JOIN_TOKEN_TTL.as_secs() / 3600
+            )));
+        }
         let id = new_id("jt");
         let secret = tls::random_hex(32);
         let seconds = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
         let expires_at = now().saturating_add(seconds);
         self.backend
-            .create_join_token(&id, &tls::sha256_hex(secret.as_bytes()), expires_at)
+            .create_join_token(
+                &id,
+                &tls::sha256_hex(secret.as_bytes()),
+                expires_at,
+                provider_name,
+            )
             .await?;
         Ok(CreateJoinTokenResponse {
             token: tls::join_token(&id, &secret, ca.sha256_hex()),
@@ -2165,36 +2244,60 @@ impl Service {
         self.backend.provider_identity(fingerprint_sha256).await
     }
 
-    /// `Enroll`.
+    /// `Enroll`: exchange a single-use join token for a client certificate.
+    ///
+    /// Every token-validation failure returns the same `Unauthenticated`
+    /// error, so the endpoint cannot be used as an oracle for which part of
+    /// a token is wrong. A retry with the same token, secret, CSR and name
+    /// returns the certificate the original enrollment issued; a different
+    /// CSR or name is refused as "join token already used". Name-binding
+    /// failures are authorization errors about an otherwise valid token and
+    /// keep their own codes.
     pub async fn enroll(&self, request: EnrollRequest) -> Result<EnrollResponse> {
         let ca = self.config.ca.clone().ok_or_else(|| {
             Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
         })?;
-        let parts = tls::parse_join_token(&request.token)?;
+        let invalid = |reason: &str| {
+            warn!(reason, provider = %request.name, "enroll rejected");
+            Error::new(Code::Unauthenticated, "invalid join token")
+        };
+        let parts =
+            tls::parse_join_token(&request.token).map_err(|_| invalid("malformed join token"))?;
         if !backend::logic::constant_time_eq(
             parts.ca_sha256.as_bytes(),
             ca.sha256_hex().as_bytes(),
         ) {
-            return Err(Error::new(
-                Code::Unauthenticated,
-                "join token was issued for a different CA",
-            ));
+            return Err(invalid("join token was issued for a different CA"));
         }
         backend::logic::validate_name("provider", &request.name)?;
+        // Signing happens before the token is consumed, so a malformed CSR
+        // never burns a valid token. A replay discards this fresh signature
+        // and returns the stored one.
         let signed = ca.sign_client(&request.csr_pem, &request.name, tls::CLIENT_CERT_LIFETIME)?;
-        self.backend
+        let outcome = self
+            .backend
             .enroll(
                 parts.id,
                 &tls::sha256_hex(parts.secret.as_bytes()),
                 &request.name,
+                &tls::sha256_hex(request.csr_pem.as_bytes()),
                 &signed.sha256,
+                &signed.cert_pem,
                 signed.expires_at,
             )
             .await?;
+        let (cert_pem, expires_at) = match outcome {
+            backend::EnrollOutcome::Issued => (signed.cert_pem, signed.expires_at),
+            backend::EnrollOutcome::Replay {
+                cert_pem,
+                expires_at,
+            } => (cert_pem, expires_at),
+        };
+        tracing::info!(provider = %request.name, "provider enrolled");
         Ok(EnrollResponse {
-            cert_pem: signed.cert_pem,
+            cert_pem,
             ca_pem: ca.pem().to_owned(),
-            expires_at: signed.expires_at,
+            expires_at,
             ..EnrollResponse::default()
         })
     }

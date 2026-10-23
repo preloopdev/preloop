@@ -16,7 +16,7 @@ use super::postgres::PgEngine;
 use super::seal::SealKey;
 use super::sqlite::SqliteEngine;
 use super::backend::SchemaInfo;
-use super::types::BackendConfig;
+use super::types::{BackendConfig, EnrollOutcome};
 use super::{backend_kind, validate_url};
 
 pub(crate) struct SqlStore {
@@ -397,7 +397,8 @@ pub(crate) async fn lease_by_id(
 pub(crate) async fn lease_row(tx: &mut dyn SqlTx, id: &str) -> Result<Option<Row>> {
     Ok(tx
         .query(
-            "SELECT id, sandbox_id, pool, idempotency_key, expires_at, env_sealed, request_hash \
+            "SELECT id, sandbox_id, pool, idempotency_key, expires_at, requested_ttl_secs, \
+                    env_sealed, request_hash \
              FROM leases WHERE id = $1",
             &[id.into()],
         )
@@ -699,8 +700,16 @@ impl super::SandboxBackend for SqlStore {
         id: &str,
         secret_sha256: &str,
         expires_at: i64,
+        provider_name: &str,
     ) -> Result<()> {
-        super::commands_providers::create_join_token(self, id, secret_sha256, expires_at).await
+        super::commands_providers::create_join_token(
+            self,
+            id,
+            secret_sha256,
+            expires_at,
+            provider_name,
+        )
+        .await
     }
 
     async fn enroll(
@@ -708,15 +717,19 @@ impl super::SandboxBackend for SqlStore {
         token_id: &str,
         secret_sha256: &str,
         name: &str,
+        csr_sha256: &str,
         cert_sha256: &str,
+        cert_pem: &str,
         cert_expires_at: i64,
-    ) -> Result<()> {
+    ) -> Result<EnrollOutcome> {
         super::commands_providers::enroll(
             self,
             token_id,
             secret_sha256,
             name,
+            csr_sha256,
             cert_sha256,
+            cert_pem,
             cert_expires_at,
         )
         .await

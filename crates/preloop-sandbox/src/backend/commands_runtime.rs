@@ -165,7 +165,8 @@ pub(crate) async fn report_exec(
                 let row = tx
                     .query(
                         "SELECT e.id, e.sandbox_id, e.work_id, e.sequence, e.status, \
-                                e.owner_node, e.owner_session, w.attempt, s.provider_id \
+                                e.started, e.started_attempt, e.owner_node, e.owner_session, \
+                                w.attempt, s.provider_id \
                          FROM execs e JOIN work_items w ON w.id = e.work_id \
                          JOIN sandboxes s ON s.id = e.sandbox_id \
                          WHERE e.id = $1",
@@ -191,15 +192,54 @@ pub(crate) async fn report_exec(
                     fail_exec_inner(tx, &request.exec_id, "the owning node is gone").await?;
                     return Ok(ReportExecOutcome::Gone);
                 }
-                if request.attempt != 0 && request.attempt != row.u64("attempt")? {
-                    return Err(Error::aborted("stale work delivery attempt"));
-                }
+                // Output from any delivery of this execution is that same
+                // execution's output: only the start claim is fenced by the
+                // delivery attempt, so a redelivery racing a long command
+                // cannot be mistaken for a stale report and cut it off.
+                let start_claim = request.events.is_empty() && request.sequence == 0;
                 let status = row.text("status")?;
                 if status != "running" {
                     if request.sequence != 0 && request.sequence <= row.u64("sequence")? {
                         return Ok(ReportExecOutcome::Duplicate);
                     }
                     return Ok(ReportExecOutcome::Gone);
+                }
+                if start_claim {
+                    if row.bool("started")? {
+                        let claimed = row.u64("started_attempt")?;
+                        if request.attempt != 0 && request.attempt != claimed {
+                            // A different delivery wants to start an exec
+                            // that already started: the outcome of that
+                            // first execution may be unknown, so fail it
+                            // explicitly instead of running the command a
+                            // second time.
+                            let reason = "exec was already started by an earlier delivery; \
+                                          refusing to run it twice";
+                            fail_exec_inner(tx, &request.exec_id, reason).await?;
+                            return Ok(ReportExecOutcome::AlreadyStarted {
+                                exec_id: request.exec_id,
+                                reason: reason.to_owned(),
+                            });
+                        }
+                        return Ok(ReportExecOutcome::Events {
+                            exec_id: request.exec_id,
+                            events: Vec::new(),
+                            terminal: false,
+                        });
+                    }
+                    tx.execute(
+                        "UPDATE execs SET started = TRUE, started_attempt = $2 WHERE id = $1",
+                        &[
+                            request.exec_id.as_str().into(),
+                            request.attempt.into(),
+                        ],
+                    )
+                    .await?;
+                    return Ok(ReportExecOutcome::Events {
+                        exec_id: request.exec_id,
+                        events: Vec::new(),
+                        terminal: false,
+                    });
                 }
                 if request.sequence != 0 && request.sequence <= row.u64("sequence")? {
                     return Ok(ReportExecOutcome::Duplicate);
@@ -212,19 +252,11 @@ pub(crate) async fn report_exec(
                     Some(exec_event::Event::ExitCode(code)) => Some(code),
                     _ => None,
                 });
-                if request.sequence != 0 {
-                    tx.execute(
-                        "UPDATE execs SET sequence = $2, started = TRUE WHERE id = $1",
-                        &[request.exec_id.as_str().into(), request.sequence.into()],
-                    )
-                    .await?;
-                } else {
-                    tx.execute(
-                        "UPDATE execs SET started = TRUE WHERE id = $1",
-                        &[request.exec_id.as_str().into()],
-                    )
-                    .await?;
-                }
+                tx.execute(
+                    "UPDATE execs SET sequence = $2, started = TRUE WHERE id = $1",
+                    &[request.exec_id.as_str().into(), request.sequence.into()],
+                )
+                .await?;
                 if let Some(code) = exit_code {
                     tx.execute(
                         "UPDATE execs SET status = 'done', exit_code = $2, started = TRUE \

@@ -194,19 +194,30 @@ pub trait SandboxBackend: Send + Sync {
     /// The provider a client certificate fingerprint authenticates.
     async fn provider_identity(&self, fingerprint_sha256: &str) -> Result<ProviderIdentity>;
 
-    /// Store a single-use join token's hash.
-    async fn create_join_token(&self, id: &str, secret_sha256: &str, expires_at: i64)
-    -> Result<()>;
+    /// Mint a single-use join token, optionally bound to one provider name.
+    async fn create_join_token(
+        &self,
+        id: &str,
+        secret_sha256: &str,
+        expires_at: i64,
+        provider_name: &str,
+    ) -> Result<()>;
 
     /// Atomically consume a join token and bind the provider certificate.
+    ///
+    /// A retry of an already-accepted enrollment (same token, secret, CSR and
+    /// name) returns its receipt instead of failing or re-binding: a response
+    /// lost on the wire must not cost the caller its certificate.
     async fn enroll(
         &self,
         token_id: &str,
         secret_sha256: &str,
         name: &str,
+        csr_sha256: &str,
         cert_sha256: &str,
+        cert_pem: &str,
         cert_expires_at: i64,
-    ) -> Result<()>;
+    ) -> Result<EnrollOutcome>;
 
     /// Add a renewed certificate for an enrolled fingerprint.
     async fn renew_certificate(

@@ -123,6 +123,7 @@ CREATE TABLE IF NOT EXISTS leases (
     pool                   TEXT NOT NULL DEFAULT '',
     idempotency_key        TEXT NOT NULL DEFAULT '',
     expires_at             BIGINT NOT NULL,
+    requested_ttl_secs     BIGINT NOT NULL DEFAULT 0,
     env_sealed             BYTEA,
     request_hash           TEXT NOT NULL DEFAULT '',
     inject_state           TEXT NOT NULL DEFAULT 'pending',
@@ -171,8 +172,23 @@ CREATE INDEX IF NOT EXISTS provider_certificates_provider ON provider_certificat
 CREATE TABLE IF NOT EXISTS join_tokens (
     id            TEXT PRIMARY KEY,
     secret_sha256 TEXT NOT NULL,
-    expires_at    BIGINT NOT NULL
+    expires_at    BIGINT NOT NULL,
+    -- Empty: may enroll a new provider name only. Non-empty: the one name
+    -- the token may enroll or re-enroll (replacing its certificates).
+    provider_name TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS join_receipts (
+    token_id        TEXT PRIMARY KEY,
+    secret_sha256   TEXT NOT NULL,
+    csr_sha256      TEXT NOT NULL,
+    provider_name   TEXT NOT NULL,
+    cert_sha256     TEXT NOT NULL,
+    cert_pem        TEXT NOT NULL,
+    cert_expires_at BIGINT NOT NULL,
+    expires_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS join_receipts_expiry ON join_receipts(expires_at);
 
 CREATE TABLE IF NOT EXISTS work_items (
     id           TEXT PRIMARY KEY,
@@ -208,6 +224,7 @@ CREATE TABLE IF NOT EXISTS execs (
     exit_code     INTEGER,
     error         TEXT NOT NULL DEFAULT '',
     started       BOOLEAN NOT NULL DEFAULT FALSE,
+    started_attempt BIGINT NOT NULL DEFAULT 0,
     owner_node    TEXT NOT NULL,
     owner_session TEXT NOT NULL,
     version       BIGINT NOT NULL

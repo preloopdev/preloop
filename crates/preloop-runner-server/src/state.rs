@@ -1136,6 +1136,11 @@ pub struct AppState {
     /// unchanged. A config change takes effect on restart, like the other
     /// policy tables in the config file.
     pub token_permissions_ceiling: Option<crate::config::TokenPermissionsCeiling>,
+    /// OIDC immutable-subject override loaded from the config file's
+    /// `[oidc]` table at startup. `None` = GitHub's creation-date rollout
+    /// policy decides the subject format. A config change takes effect on
+    /// restart, like the other policy tables in the config file.
+    pub oidc_immutable_subject_claims: Option<bool>,
     /// Fork pull-request workflow policy loaded from the config file at
     /// startup. Empty by default: fork-PR workflows run as today until the
     /// operator writes `[fork_policy]` rules. A config change takes effect
@@ -1806,6 +1811,7 @@ impl AppState {
             config_path,
             github_setup: Arc::new(crate::github_app_setup::session::SetupSessions::new()),
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
+            oidc_immutable_subject_claims: config.oidc.immutable_subject_claims,
             fork_policy: config.fork_policy.clone(),
             execution_protection: config.execution_protection.clone(),
             pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
@@ -2324,6 +2330,14 @@ pub struct InnerState {
     pub diag_upload_tokens: BTreeMap<String, DiagUploadToken>,
     /// Artifact v2 finalized registry: registry_key → metadata.
     pub artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
+    /// OIDC repository `created_at` cache: repository ID → creation time
+    /// (Unix seconds). In-memory only, per process: a restart starts
+    /// empty and simply re-fetches, which is safe because an ID's
+    /// creation date never changes. Keyed by ID, never by name: a
+    /// deleted-and-recreated repository gets a new ID and must never
+    /// inherit its predecessor's cached date. Entries never expire; the
+    /// map is a pure cache (a miss costs one GitHub API call).
+    pub oidc_repo_created_at: BTreeMap<String, i64>,
     /// Monotonic artifact v2 ID counter.
     pub next_artifact_v2_id: u64,
     /// OIDC issuer URL used in the `iss` claim and discovery document.

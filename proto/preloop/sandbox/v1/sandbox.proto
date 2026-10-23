@@ -152,7 +152,7 @@ enum Purpose {
 message FileSpec {
   string path = 1;
   bytes data = 2;                   // base64 in JSON
-  uint32 mode = 3;
+  uint32 mode = 3;                  // octal; 0 = 0600 (guest owner only)
 }
 
 message Inject {
@@ -190,7 +190,11 @@ message Sandbox {
   int64 created_at = 12;
   string name = 13;
   int64 preserve_until = 14;
-  Shape shape = 15;                 // effective size: request fields + driver defaults
+  SandboxState prior_state = 15;    // state before Pause/Stop; Resume/Start restores it
+  string pool_revision = 16;        // pool+template configuration this member was built for
+  // Effective size: request fields + driver defaults. 130-139 is the reserved
+  // range for fields added after #619; `shape` was 15 before that split.
+  Shape shape = 130;
 }
 
 message Lease {
@@ -200,6 +204,7 @@ message Lease {
   string idempotency_key = 4;
   int64 expires_at = 5;
   map<string, string> env = 6;      // merged into every Exec on this lease
+  uint64 requested_ttl_secs = 7;    // caller's TTL; delivery restores it
   // sha256 of the Acquire payload that owns `idempotency_key`; a reuse with a
   // different payload is rejected. 130-139 is the reserved range for new
   // fields on existing messages.
@@ -236,7 +241,14 @@ service Sandboxes {
   rpc CreateJoinToken(CreateJoinTokenRequest) returns (CreateJoinTokenResponse);
 }
 
-message CreateJoinTokenRequest { uint64 ttl_secs = 1; } // 0 = service default
+message CreateJoinTokenRequest {
+  uint64 ttl_secs = 1; // 0 = service default
+  // Provider name the token is bound to. Empty mints an unbound token,
+  // which may only enroll a provider name that does not exist yet; a
+  // name-bound token may also re-enroll (replace the certificates of)
+  // the provider it names.
+  string provider_name = 2;
+}
 message CreateJoinTokenResponse { string token = 1; int64 expires_at = 2; }
 message DeleteProviderRequest { string name = 1; }
 

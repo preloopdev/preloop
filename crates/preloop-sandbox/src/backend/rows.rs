@@ -85,6 +85,7 @@ pub(crate) fn lease_from_row(row: &Row, seal: &SealKey) -> Result<Lease> {
         pool: row.text("pool")?.to_owned(),
         idempotency_key: row.text("idempotency_key")?.to_owned(),
         expires_at: row.int("expires_at")?,
+        requested_ttl_secs: row.u64("requested_ttl_secs")?,
         env,
         request_hash: row.text("request_hash")?.to_owned(),
         ..Lease::default()

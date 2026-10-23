@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand};
 use futures::StreamExt as _;
 use preloop_orchestrator::RunnerPoolConfig;
@@ -26,7 +26,7 @@ use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
 use preloop_sandbox::drivers::smolvm::pack::ArtifactCache;
-use preloop_sandbox::server::{Auth, serve as serve_api};
+use preloop_sandbox::server::{Auth, HostAllowlist, ListenerSurface, serve_with_options};
 use preloop_sandbox::{
     Driver, LeastLoaded, Placement, SandboxApi, SandboxClient, ServerTls, Service, ServiceConfig,
     backend, tls,
@@ -39,6 +39,11 @@ pub(crate) const DEFAULT_SANDBOX_URL: &str = "https://127.0.0.1:9191";
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Prefix owned by this host's callers; the driver reports it in inventory.
+fn named_prefix() -> String {
+    env_nonempty("PRELOOP_RUNNER_NAME_PREFIX").unwrap_or_else(|| "preloop-runner".into())
 }
 
 fn smolvm_slots() -> u32 {
@@ -105,8 +110,11 @@ fn service_config(_state: &Path) -> anyhow::Result<ServiceConfig> {
     Ok(config)
 }
 
-/// Open the durable backend for this replica. The seal key and CA are shared
-/// between replicas by configuration, never by the database.
+/// Open the durable backend for this replica.
+///
+/// The seal key and CA live outside the database: replicas share them by
+/// configuration, so a database reader cannot decrypt sealed environment or
+/// transfer material and a node whose key differs refuses at open.
 async fn open_backend(
     url: &str,
     state: &Path,
@@ -116,10 +124,13 @@ async fn open_backend(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(8);
+    // `None` lets the backend load `PRELOOP_SANDBOX_SEAL_KEY` or a 0600 key
+    // file in the state directory (shared by replicas through configuration).
+    let seal_key = None;
     let backend = backend::open_with(BackendConfig {
         url: url.to_owned(),
         state_dir: state.to_path_buf(),
-        seal_key: None,
+        seal_key,
         pool_size,
         node_id: config.node_id.clone(),
         session_id: config.node_session.clone(),
@@ -132,9 +143,24 @@ async fn open_backend(
     Ok(backend)
 }
 
+/// Refuse to start when the selected authorization policy is unknown.
+///
+/// A policy is configuration, not availability: unlike a listener that
+/// cannot bind, an unsupported `PRELOOP_SANDBOX_AUTHORIZER` must stop the
+/// process instead of leaving it running without the intended policy.
+fn ensure_authorizer_config() -> anyhow::Result<()> {
+    preloop_sandbox::authz::from_config()
+        .map(|_| ())
+        .map_err(anyhow::Error::msg)
+}
+
 /// Agent tuning: defaults overridden by the documented environment.
-fn sandbox_agent_config(name: impl Into<String>) -> AgentConfig {
-    let mut config = AgentConfig::new(name);
+///
+/// The scratch directory lives under the state directory, not the system
+/// temp dir: it holds the durable started-exec fence, which only works if
+/// a restart reopens the same directory.
+fn sandbox_agent_config(state: &Path, name: impl Into<String>) -> AgentConfig {
+    let mut config = AgentConfig::new(name).with_scratch(state.join("sandbox-agent"));
     if let Some(value) = env_nonempty("PRELOOP_SANDBOX_AGENT_CONCURRENCY")
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -143,16 +169,18 @@ fn sandbox_agent_config(name: impl Into<String>) -> AgentConfig {
     }
     config
 }
-
 /// Drivers attached to this host: `PRELOOP_SANDBOX_DRIVERS`, comma-separated
 /// (default `smolvm`). An `external:<spec>` entry starts a driver plugin (see
 /// [`ExternalSpec`]); `runtime_dir` holds their sockets. `named_prefix` lets
 /// the SmolVM inventory adopt the CI pool's caller-named machines; `cache`
-/// holds the packed artifacts drivers materialize.
+/// holds the packed artifacts drivers materialize. `local` is the provider an
+/// adapter will use for host-side operations; passing it here (as a clone of
+/// the same handle) keeps the driver and adapter on one lifecycle lock.
 pub(crate) async fn host_drivers(
     named_prefix: Option<&str>,
     slots: u32,
     cache: &ArtifactCache,
+    local: Option<SmolVmProvider>,
     runtime_dir: &Path,
 ) -> anyhow::Result<Vec<Arc<dyn Driver>>> {
     let names = env_nonempty("PRELOOP_SANDBOX_DRIVERS").unwrap_or_else(|| "smolvm".into());
@@ -176,12 +204,13 @@ pub(crate) async fn host_drivers(
         }
         drivers.push(match entry {
             "smolvm" => {
-                let mut driver =
-                    SmolvmDriver::new(SmolVmProvider::default(), slots).with_cache(cache.clone());
-                if let Some(prefix) = named_prefix {
-                    driver = driver.with_named_prefix(prefix);
-                }
-                Arc::new(driver)
+                let driver = smolvm_driver(
+                    named_prefix,
+                    slots,
+                    local.clone().unwrap_or_default(),
+                    cache,
+                );
+                Arc::new(driver) as Arc<dyn Driver>
             }
             // Downstream builds register additional backends here.
             other => anyhow::bail!("unknown sandbox driver `{other}` in PRELOOP_SANDBOX_DRIVERS"),
@@ -219,6 +248,19 @@ fn configured_driver_names(entries: &[&str]) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
+fn smolvm_driver(
+    named_prefix: Option<&str>,
+    slots: u32,
+    provider: SmolVmProvider,
+    cache: &ArtifactCache,
+) -> SmolvmDriver {
+    let mut driver = SmolvmDriver::new(provider, slots).with_cache(cache.clone());
+    if let Some(prefix) = named_prefix {
+        driver = driver.with_named_prefix(prefix);
+    }
+    driver
+}
+
 /// The engine's in-process Sandbox Service plus its local agent.
 pub(crate) struct LocalSandboxes {
     service: Arc<Service>,
@@ -228,6 +270,8 @@ pub(crate) struct LocalSandboxes {
     pool_driver: String,
     pool_capabilities: Option<Capabilities>,
     shutdown: CancellationToken,
+    /// Held for this process's lifetime; releases the state directory.
+    _lock: ServiceLock,
 }
 
 impl LocalSandboxes {
@@ -248,20 +292,26 @@ impl LocalSandboxes {
         observability: preloop_observability::Observability,
     ) -> anyhow::Result<Self> {
         let state = home.join("state");
+        ensure_authorizer_config()?;
+        // One destructive authority per state directory: a bake or a second
+        // engine must not load and reap a running service's leases.
+        let lock = ServiceLock::acquire(&state)?;
         let store_url = env_nonempty("PRELOOP_SANDBOX_STORE_URL")
             .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
         let mut config = service_config(&state)?;
         config.placement = placement_from_env()?;
-        let store = open_backend(&store_url, &state, &config).await?;
-        let tls_state = env_path("PRELOOP_SANDBOX_CA_DIR").unwrap_or_else(|| state.clone());
-        let tls = ServerTls::load_or_create(
-            &tls_state,
-            tls::sans_from_env(),
-            env_path("PRELOOP_SANDBOX_TLS_CERT").as_deref(),
-            env_path("PRELOOP_SANDBOX_TLS_KEY").as_deref(),
-        )
-        .context("configuring the sandbox API TLS")?;
-        config.ca = Some(tls.ca.clone());
+        let store = open_backend(&store_url, &state, &config)
+            .await
+            .with_context(|| format!("opening sandbox store {store_url}"))?;
+        let listen =
+            env_nonempty("PRELOOP_SANDBOX_LISTEN").unwrap_or_else(|| "127.0.0.1:9191".into());
+        let plan = ListenerPlan::from_values(
+            &listen,
+            env_nonempty("PRELOOP_SANDBOX_AGENT_LISTEN").as_deref(),
+            env_nonempty("PRELOOP_SANDBOX_LISTEN_ALL_INTERFACES").as_deref() == Some("1"),
+        )?;
+        let listener_tls = listener_tls(&state, &plan).await?;
+        config.ca = Some(listener_tls.ca.clone());
         let metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
         config.metrics = metrics.clone();
         let service = Service::open(store, config).await?;
@@ -269,12 +319,12 @@ impl LocalSandboxes {
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
 
         let local = Arc::new(SmolVmProvider::default());
-        let prefix =
-            env_nonempty("PRELOOP_RUNNER_NAME_PREFIX").unwrap_or_else(|| "preloop-runner".into());
+        let prefix = named_prefix();
         let drivers = host_drivers(
             Some(&prefix),
             smolvm_slots(),
             &ArtifactCache::from_env(state.join("sandbox-cache")),
+            Some((*local).clone()),
             &state.join("driver-sockets"),
         )
         .await?;
@@ -293,7 +343,8 @@ impl LocalSandboxes {
             access.allow_mounts(pool.sandbox_mount_prefixes());
             access.allow_sockets(pool.sandbox_socket_prefixes());
         }
-        let mut agent_config = sandbox_agent_config(local_provider_name()).with_access(access);
+        let mut agent_config =
+            sandbox_agent_config(&state, local_provider_name()).with_access(access);
         agent_config.metrics = metrics;
         let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -301,45 +352,38 @@ impl LocalSandboxes {
             agent_config,
         )
         .context("configuring this host's sandbox drivers")?;
-        let session = agent.register().await.ok();
-        let provider_id = session
-            .as_ref()
-            .map(|session| session.provider_id.clone())
-            .unwrap_or_default();
-        tokio::spawn(agent.run(shutdown.clone()));
+        // Register once here so the pool can place immediately; the agent
+        // reuses this session instead of registering a second time (which
+        // would fence its own in-flight work).
+        let session = agent
+            .register()
+            .await
+            .context("registering the local sandbox provider")?;
+        let provider_id = session.provider_id.clone();
+        tokio::spawn(agent.run(Some(session), shutdown.clone()));
 
-        let listen =
-            env_nonempty("PRELOOP_SANDBOX_LISTEN").unwrap_or_else(|| "127.0.0.1:9191".into());
-        if listen != "off" {
-            let addr: SocketAddr = listen
-                .parse()
-                .context("PRELOOP_SANDBOX_LISTEN must be a socket address or `off`")?;
-            let auth = Auth::new(resolve_client_token(&state)?);
-            match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    tracing::info!(%addr, "sandbox API listening (https)");
-                    let stop = shutdown.clone();
-                    let service = service.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = serve_api(listener, service, auth, tls, stop).await {
-                            tracing::warn!(%error, "sandbox API server stopped");
-                        }
-                    });
-                }
-                Err(error) => {
-                    tracing::warn!(%addr, %error, "sandbox API not served (address in use?); the pool still works in-process");
-                }
-            }
+        let token = resolve_client_token(&state)?;
+        if let Err(error) = start_listeners(
+            &state,
+            service.clone(),
+            token,
+            &plan,
+            shutdown.clone(),
+            false,
+            listener_tls,
+        )
+        .await
+        {
+            tracing::warn!(%error, "sandbox API not served; the pool still works in-process");
         }
         // Wait for the local agent so the pool's first acquire can place.
         // An enrollment record (no drivers yet) does not count.
         for _ in 0..200 {
-            let registered = service
+            if service
                 .list_providers()
-                .await
-                .map(|providers| providers.iter().any(|provider| !provider.drivers.is_empty()))
-                .unwrap_or(false);
-            if registered {
+                .iter()
+                .any(|provider| !provider.drivers.is_empty())
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -351,6 +395,7 @@ impl LocalSandboxes {
             pool_driver,
             pool_capabilities,
             shutdown,
+            _lock: lock,
         })
     }
 
@@ -475,6 +520,10 @@ fn resolve_client_token(state: &Path) -> anyhow::Result<String> {
     if let Ok(token) = std::fs::read_to_string(&path) {
         let token = token.trim();
         if !token.is_empty() {
+            // A token file left with a wider mode by an old build or a manual
+            // copy must not stay readable by other local users.
+            crate::set_private_file_permissions(&path)
+                .with_context(|| format!("securing {}", path.display()))?;
             return Ok(token.to_owned());
         }
     }
@@ -484,18 +533,469 @@ fn resolve_client_token(state: &Path) -> anyhow::Result<String> {
     Ok(token)
 }
 
+/// The client API endpoint file: the address the last successful bind
+/// published.
+pub(crate) const ENDPOINT_FILE: &str = "sandbox-endpoint";
+/// The agent API endpoint file, written only in split-listener mode.
+pub(crate) const AGENT_ENDPOINT_FILE: &str = "sandbox-agent-endpoint";
+
+fn endpoint_path_named(state: &Path, name: &str) -> PathBuf {
+    state.join(name)
+}
+
+fn endpoint_path(state: &Path) -> PathBuf {
+    endpoint_path_named(state, ENDPOINT_FILE)
+}
+
+fn read_token_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
+        .filter(|base| !base.is_empty())
+}
+
 /// The token a local deployment wrote, when there is one.
 fn local_client_token(home: &Path) -> Option<String> {
-    std::fs::read_to_string(home.join("state/sandbox-client-token"))
-        .ok()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
+    read_token_file(&home.join("state/sandbox-client-token"))
 }
 
 /// The CA a local deployment wrote, when there is one.
 fn local_ca(home: &Path) -> Option<PathBuf> {
     let path = home.join("state").join(tls::CA_DIR).join(tls::CA_CERT_FILE);
     path.is_file().then_some(path)
+}
+
+fn endpoint_url_named(addr: SocketAddr, scheme: &str) -> String {
+    format!("{scheme}://{addr}")
+}
+
+/// Publish the address a listener actually bound. Written owner-only so a
+/// local caller can trust it as the service it should send a token to; the
+/// second line names the owning process so a failed bind can tell a live
+/// listener from a stale file.
+fn write_endpoint_named(
+    state: &Path,
+    addr: SocketAddr,
+    name: &str,
+    scheme: &str,
+) -> anyhow::Result<()> {
+    let path = endpoint_path_named(state, name);
+    tls::write_private(
+        &path,
+        format!(
+            "{}\n{}\n",
+            endpoint_url_named(addr, scheme),
+            std::process::id()
+        )
+        .as_bytes(),
+    )
+    .with_context(|| format!("writing {}", path.display()))
+}
+
+#[cfg(test)]
+pub(crate) fn write_endpoint(state: &Path, addr: SocketAddr) -> anyhow::Result<()> {
+    write_endpoint_named(state, addr, ENDPOINT_FILE, "https")
+}
+
+fn read_endpoint_named(state: &Path, name: &str) -> Option<String> {
+    std::fs::read_to_string(endpoint_path_named(state, name))
+        .ok()
+        .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
+        .filter(|base| !base.is_empty())
+}
+
+fn read_endpoint(state: &Path) -> Option<String> {
+    read_endpoint_named(state, ENDPOINT_FILE)
+}
+
+fn endpoint_owner_pid_named(state: &Path, name: &str) -> Option<i32> {
+    std::fs::read_to_string(endpoint_path_named(state, name))
+        .ok()?
+        .lines()
+        .nth(1)?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn endpoint_owner_alive_named(state: &Path, name: &str) -> bool {
+    let Some(pid) = endpoint_owner_pid_named(state, name) else {
+        return false;
+    };
+    // SAFETY: `kill` with signal 0 only probes existence.
+    #[allow(unsafe_code)]
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    alive
+}
+
+/// Remove the endpoint file only while it still names `addr` and no live
+/// owner has republished it.
+fn clear_endpoint_named(state: &Path, addr: SocketAddr, name: &str, scheme: &str) {
+    let path = endpoint_path_named(state, name);
+    let matches = read_endpoint_named(state, name).as_deref()
+        == Some(endpoint_url_named(addr, scheme).as_str());
+    let current_owner =
+        endpoint_owner_pid_named(state, name) == i32::try_from(std::process::id()).ok();
+    if matches && (current_owner || !endpoint_owner_alive_named(state, name)) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientTlsMode {
+    ServiceCa,
+    File,
+    PlainLoopback,
+}
+
+impl ClientTlsMode {
+    fn from_env() -> anyhow::Result<Self> {
+        match env_nonempty("PRELOOP_SANDBOX_CLIENT_TLS")
+            .as_deref()
+            .unwrap_or("service-ca")
+        {
+            "service-ca" => Ok(Self::ServiceCa),
+            "file" => Ok(Self::File),
+            "plain-loopback" => Ok(Self::PlainLoopback),
+            value => bail!(
+                "PRELOOP_SANDBOX_CLIENT_TLS must be service-ca, file, or plain-loopback (got `{value}`)"
+            ),
+        }
+    }
+}
+
+/// How this process exposes the service: one compatibility listener, or a
+/// caller listener plus a separate agent listener.
+#[derive(Debug, Clone)]
+struct ListenerPlan {
+    client: Option<SocketAddr>,
+    agent: Option<SocketAddr>,
+    mode: ClientTlsMode,
+    all_interfaces: bool,
+    allowed_hosts: Option<String>,
+}
+
+impl ListenerPlan {
+    fn from_values(
+        client_raw: &str,
+        agent_raw: Option<&str>,
+        all_interfaces: bool,
+    ) -> anyhow::Result<Self> {
+        let client = if client_raw.trim().eq_ignore_ascii_case("off") {
+            None
+        } else {
+            Some(parse_listen_addr(client_raw, "PRELOOP_SANDBOX_LISTEN")?)
+        };
+        let agent = match agent_raw {
+            Some(raw) if raw.trim().eq_ignore_ascii_case("off") => None,
+            Some(raw) => Some(parse_listen_addr(raw, "PRELOOP_SANDBOX_AGENT_LISTEN")?),
+            None => None,
+        };
+        if client.is_some() && agent.is_some() && client == agent {
+            bail!(
+                "PRELOOP_SANDBOX_LISTEN and PRELOOP_SANDBOX_AGENT_LISTEN must use different addresses"
+            );
+        }
+        if client.is_none() && agent.is_some() {
+            bail!("PRELOOP_SANDBOX_AGENT_LISTEN requires PRELOOP_SANDBOX_LISTEN");
+        }
+        let mode = ClientTlsMode::from_env()?;
+        if mode == ClientTlsMode::PlainLoopback
+            && client.is_some_and(|addr| !addr.ip().is_loopback())
+        {
+            bail!(
+                "PRELOOP_SANDBOX_CLIENT_TLS=plain-loopback requires PRELOOP_SANDBOX_LISTEN \
+                 to bind to a loopback address"
+            );
+        }
+        if let Some(addr) = client {
+            validate_bind_address(addr, all_interfaces)?;
+        }
+        if let Some(addr) = agent {
+            validate_bind_address(addr, all_interfaces)?;
+        }
+        Ok(Self {
+            client,
+            agent,
+            mode,
+            all_interfaces,
+            allowed_hosts: std::env::var("PRELOOP_SANDBOX_ALLOWED_HOSTS").ok(),
+        })
+    }
+
+    fn split(&self) -> bool {
+        self.agent.is_some()
+    }
+}
+
+fn parse_listen_addr(raw: &str, key: &str) -> anyhow::Result<SocketAddr> {
+    raw.parse()
+        .with_context(|| format!("{key} must be a socket address or `off`"))
+}
+
+fn validate_bind_address(addr: SocketAddr, allow_all: bool) -> anyhow::Result<()> {
+    if !addr.ip().is_unspecified() {
+        return Ok(());
+    }
+    if !allow_all {
+        bail!(
+            "refusing to bind sandbox API to all interfaces at {addr}; set \
+             PRELOOP_SANDBOX_LISTEN_ALL_INTERFACES=1 or use --listen-all-interfaces"
+        );
+    }
+    tracing::warn!(%addr, "sandbox API is listening on all interfaces");
+    Ok(())
+}
+
+fn exact_allowed_sans(raw: Option<&str>) -> Vec<String> {
+    raw.into_iter()
+        .flat_map(|raw| raw.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.starts_with("*."))
+        .map(|value| {
+            let value = if let Some(rest) = value.strip_prefix('[') {
+                rest.split_once(']').map_or(value, |(host, _)| host)
+            } else if let Some((host, port)) = value.rsplit_once(':') {
+                if !host.contains(':') && port.parse::<u16>().is_ok() {
+                    host
+                } else {
+                    value
+                }
+            } else {
+                value
+            };
+            value.trim_end_matches('.').to_ascii_lowercase()
+        })
+        .filter(|value| !value.contains('/') && !value.contains('\\'))
+        .fold(Vec::new(), |mut result, value| {
+            if !result.contains(&value) {
+                result.push(value);
+            }
+            result
+        })
+}
+
+async fn detected_magic_dns() -> Option<String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::process::Command::new("tailscale")
+            .args(["status", "--json"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let name = value.get("Self")?.get("DNSName")?.as_str()?;
+    let name = name.trim().trim_end_matches('.');
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+async fn server_sans(allowed_hosts: Option<&str>, magic_dns: Option<&str>) -> Vec<String> {
+    let mut sans = tls::sans_from_env();
+    for value in exact_allowed_sans(allowed_hosts) {
+        if !sans.iter().any(|san| san.eq_ignore_ascii_case(&value)) {
+            sans.push(value);
+        }
+    }
+    if let Some(name) = magic_dns
+        && !sans.iter().any(|san| san.eq_ignore_ascii_case(name))
+    {
+        sans.push(name.to_owned());
+    }
+    sans
+}
+
+struct ListenerTls {
+    client: Option<Arc<ServerTls>>,
+    agent: Option<Arc<ServerTls>>,
+    ca: Arc<preloop_sandbox::ServiceCa>,
+}
+
+async fn listener_tls(state: &Path, plan: &ListenerPlan) -> anyhow::Result<ListenerTls> {
+    // Replicas of one service share the CA directory by configuration; each
+    // keeps its own local home, lock and seal key unless told otherwise.
+    let shared_state = env_path("PRELOOP_SANDBOX_CA_DIR");
+    let state = shared_state.as_deref().unwrap_or(state);
+    let magic_dns = detected_magic_dns().await;
+    let sans = server_sans(plan.allowed_hosts.as_deref(), magic_dns.as_deref()).await;
+    let agent_tls =
+        ServerTls::load_or_create_with_client_auth(state, sans.clone(), None, None, true)
+            .context("configuring the sandbox agent TLS")?;
+    let ca = agent_tls.ca.clone();
+    let client = if plan.mode == ClientTlsMode::PlainLoopback {
+        None
+    } else if plan.split() {
+        match plan.mode {
+            ClientTlsMode::ServiceCa => Some(
+                ServerTls::load_or_create_with_client_auth(state, sans, None, None, false)
+                    .context("configuring the sandbox client TLS")?,
+            ),
+            ClientTlsMode::File => {
+                let cert = env_path("PRELOOP_SANDBOX_CLIENT_TLS_CERT").context(
+                    "PRELOOP_SANDBOX_CLIENT_TLS_CERT is required when \
+                     PRELOOP_SANDBOX_CLIENT_TLS=file",
+                )?;
+                let key = env_path("PRELOOP_SANDBOX_CLIENT_TLS_KEY").context(
+                    "PRELOOP_SANDBOX_CLIENT_TLS_KEY is required when \
+                     PRELOOP_SANDBOX_CLIENT_TLS=file",
+                )?;
+                Some(
+                    ServerTls::load_or_create_with_client_auth(
+                        state,
+                        sans,
+                        Some(&cert),
+                        Some(&key),
+                        false,
+                    )
+                    .context("configuring the sandbox client TLS certificate")?,
+                )
+            }
+            ClientTlsMode::PlainLoopback => None,
+        }
+    } else {
+        match plan.mode {
+            ClientTlsMode::ServiceCa => Some(agent_tls.clone()),
+            ClientTlsMode::File => {
+                let cert = env_path("PRELOOP_SANDBOX_CLIENT_TLS_CERT").context(
+                    "PRELOOP_SANDBOX_CLIENT_TLS_CERT is required when \
+                     PRELOOP_SANDBOX_CLIENT_TLS=file",
+                )?;
+                let key = env_path("PRELOOP_SANDBOX_CLIENT_TLS_KEY").context(
+                    "PRELOOP_SANDBOX_CLIENT_TLS_KEY is required when \
+                     PRELOOP_SANDBOX_CLIENT_TLS=file",
+                )?;
+                Some(
+                    ServerTls::load_or_create_with_client_auth(
+                        state,
+                        sans,
+                        Some(&cert),
+                        Some(&key),
+                        true,
+                    )
+                    .context("configuring the sandbox client TLS certificate")?,
+                )
+            }
+            ClientTlsMode::PlainLoopback => None,
+        }
+    };
+    Ok(ListenerTls {
+        client,
+        agent: plan.split().then_some(agent_tls),
+        ca,
+    })
+}
+
+/// Bind the planned listeners, publish their endpoint files and serve the
+/// matching surfaces until `shutdown`.
+async fn start_listeners(
+    state: &Path,
+    service: Arc<Service>,
+    token: String,
+    plan: &ListenerPlan,
+    shutdown: CancellationToken,
+    strict_bind: bool,
+    listener_tls: ListenerTls,
+) -> anyhow::Result<()> {
+    let magic_dns = detected_magic_dns().await;
+    if let Some(addr) = plan.client {
+        let scheme = listener_tls.client.as_ref().map_or("http", |_| "https");
+        let listener = match bind_endpoint_named(
+            state,
+            addr,
+            ENDPOINT_FILE,
+            scheme,
+            plan.all_interfaces,
+        )
+        .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error) if !strict_bind => {
+                tracing::warn!(%addr, %error, "sandbox client API not served");
+                None
+            }
+            Err(error) => return Err(error).with_context(|| format!("binding {addr}")),
+        };
+        if let Some(listener) = listener {
+            let bound = listener.local_addr()?;
+            let hosts =
+                HostAllowlist::from_config(bound, plan.allowed_hosts.as_deref(), magic_dns.clone())
+                    .map_err(anyhow::Error::msg)?;
+            let auth = Auth::for_listener(token.clone(), bound);
+            let service = service.clone();
+            let stop = shutdown.clone();
+            let tls = listener_tls.client.clone();
+            let split = plan.split();
+            let endpoint_state = state.to_owned();
+            tokio::spawn(async move {
+                if let Err(error) = serve_with_options(
+                    listener,
+                    service,
+                    auth,
+                    tls,
+                    if split {
+                        ListenerSurface::Client
+                    } else {
+                        ListenerSurface::Combined
+                    },
+                    hosts,
+                    stop,
+                )
+                .await
+                {
+                    tracing::warn!(%error, "sandbox client API server stopped");
+                }
+                clear_endpoint_named(&endpoint_state, bound, ENDPOINT_FILE, scheme);
+            });
+        }
+    }
+    if let Some(addr) = plan.agent {
+        let listener = match bind_endpoint_named(
+            state,
+            addr,
+            AGENT_ENDPOINT_FILE,
+            "https",
+            plan.all_interfaces,
+        )
+        .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error) if !strict_bind => {
+                tracing::warn!(%addr, %error, "sandbox agent API not served");
+                None
+            }
+            Err(error) => return Err(error).with_context(|| format!("binding {addr}")),
+        };
+        if let Some(listener) = listener {
+            let bound = listener.local_addr()?;
+            let service = service.clone();
+            let stop = shutdown.clone();
+            let tls = listener_tls.agent.clone().expect("split listener TLS");
+            let endpoint_state = state.to_owned();
+            tokio::spawn(async move {
+                if let Err(error) = serve_with_options(
+                    listener,
+                    service,
+                    Auth::new(String::new()),
+                    Some(tls),
+                    ListenerSurface::Agent,
+                    HostAllowlist::disabled(),
+                    stop,
+                )
+                .await
+                {
+                    tracing::warn!(%error, "sandbox agent API server stopped");
+                }
+                clear_endpoint_named(&endpoint_state, bound, AGENT_ENDPOINT_FILE, "https");
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Build the caller client, resolving the token and CA from flags, the
@@ -520,12 +1020,141 @@ fn sandbox_client(
     }
 }
 
+/// Exclusive claim on a state directory, held by the one process that may
+/// open the sandbox store and run maintenance against it.
+#[derive(Debug)]
+pub(crate) struct ServiceLock {
+    file: std::fs::File,
+}
+
+impl ServiceLock {
+    pub(crate) fn acquire(state: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(state).with_context(|| format!("creating {}", state.display()))?;
+        let path = state.join("sandbox-service.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            // SAFETY: the descriptor is valid for the lifetime of `file`.
+            #[allow(unsafe_code)]
+            let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if locked != 0 {
+                anyhow::bail!(
+                    "another preloop process is already serving sandbox state in {}; stop it \
+                     (or use a different PRELOOP_HOME) before starting another service or bake",
+                    state.display()
+                );
+            }
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ServiceLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            // SAFETY: closing would release the lock as well; unlocking first
+            // keeps the intent explicit.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+/// Bind and publish the endpoint, or clear a stale entry naming the address
+/// that could not be bound (a squatter must not inherit the CLI's trust).
+#[cfg(test)]
+pub(crate) async fn bind_endpoint(
+    state: &Path,
+    addr: SocketAddr,
+) -> std::io::Result<tokio::net::TcpListener> {
+    bind_endpoint_named(state, addr, ENDPOINT_FILE, "https", false).await
+}
+
+/// Bind `addr`, publish it under `name`, or clear a stale entry naming the
+/// address that could not be bound (a squatter must not inherit the CLI's
+/// trust).
+async fn bind_endpoint_named(
+    state: &Path,
+    addr: SocketAddr,
+    name: &str,
+    scheme: &str,
+    allow_all_interfaces: bool,
+) -> std::io::Result<tokio::net::TcpListener> {
+    if addr.ip().is_unspecified() && !allow_all_interfaces {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to bind sandbox API to all interfaces at {addr}; set \
+                 PRELOOP_SANDBOX_LISTEN_ALL_INTERFACES=1 or use --listen-all-interfaces"
+            ),
+        ));
+    }
+    if addr.ip().is_unspecified() {
+        tracing::warn!(%addr, "sandbox API is listening on all interfaces");
+    }
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            let bound = listener.local_addr()?;
+            write_endpoint_named(state, bound, name, scheme).map_err(std::io::Error::other)?;
+            Ok(listener)
+        }
+        Err(error) => {
+            // A live owner may legitimately hold the address (the embedded
+            // engine, or another `serve`); keep its endpoint file. Only a
+            // dead owner's stale file is removed, so a squatter cannot
+            // inherit the CLI's trust.
+            if !endpoint_owner_alive_named(state, name) {
+                clear_endpoint_named(state, addr, name, scheme);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn resolve_service(state: &Path, service: Option<String>) -> anyhow::Result<String> {
+    match service.filter(|service| !service.trim().is_empty()) {
+        Some(service) => Ok(service),
+        None => read_endpoint(state).with_context(|| {
+            format!(
+                "no sandbox endpoint file ({}); pass --service (for example {DEFAULT_SANDBOX_URL})",
+                endpoint_path(state).display()
+            )
+        }),
+    }
+}
+
+/// The embedded service is only needed when a pool will place VMs on it.
+pub(crate) async fn start_if_pool(
+    pool_configured: bool,
+    home: &Path,
+    pool: Option<&RunnerPoolConfig>,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<Option<LocalSandboxes>> {
+    if !pool_configured {
+        return Ok(None);
+    }
+    Ok(Some(
+        LocalSandboxes::start(home, pool, observability).await?,
+    ))
+}
+
 /// `preloop sandbox`.
 #[derive(Debug, Args)]
 pub(crate) struct SandboxArgs {
-    /// Sandbox API base URL.
-    #[arg(long, env = "PRELOOP_SANDBOX_URL", default_value = DEFAULT_SANDBOX_URL, global = true)]
-    service: String,
+    /// Sandbox API base URL (default: the address in `<home>/state/sandbox-endpoint`).
+    #[arg(long, env = "PRELOOP_SANDBOX_URL", global = true)]
+    service: Option<String>,
     /// Bearer token for the Sandboxes API. For `agent`'s first run this is the
     /// join token (`plj1.…`).
     #[arg(
@@ -599,9 +1228,16 @@ enum SandboxCommand {
 enum TokenCommand {
     /// Mint a single-use join token for `sandbox agent`.
     Create {
-        /// Lifetime (`30s`, `10m`, `1h`, `2d`).
+        /// Lifetime (`30s`, `10m`, `1h`); default 1h, maximum 24h.
         #[arg(long, default_value = "1h")]
         ttl: String,
+        /// Bind the token to this provider name. A bound token enrolls
+        /// only that provider and is the only kind that may re-enroll an
+        /// existing provider (replacing its certificates). Without
+        /// `--name` the token may only enroll a provider name that does
+        /// not exist yet.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -676,6 +1312,9 @@ struct ServeSandboxArgs {
     /// Do not attach this host's SmolVM.
     #[arg(long)]
     no_local: bool,
+    /// Allow binding the sandbox API to all interfaces.
+    #[arg(long, env = "PRELOOP_SANDBOX_LISTEN_ALL_INTERFACES")]
+    listen_all_interfaces: bool,
 }
 
 #[derive(Debug, Args)]
@@ -920,7 +1559,9 @@ pub(crate) async fn run(
         SandboxCommand::Agent(agent) => run_agent(token, agent, observability).await,
         SandboxCommand::Driver(driver) => run_driver(driver).await,
         command => {
-            let client = sandbox_client(&service, token, ca)?;
+            let state = crate::preloop_home().join("state");
+            let base = resolve_service(&state, service)?;
+            let client = sandbox_client(&base, token, ca)?;
             run_client(client, command, lease_id.unwrap_or_default()).await
         }
     }
@@ -1009,12 +1650,17 @@ async fn run_client(
         SandboxCommand::Pool(PoolCommand::Ls) => print_json(&client.list_pools().await?),
         SandboxCommand::Pool(PoolCommand::Rm { name }) => Ok(client.delete_pool(&name).await?),
         SandboxCommand::Acquire(acquire) => {
+            let pool = acquire.pool.unwrap_or_default();
+            let template = acquire.template.unwrap_or_default();
+            // A pool acquire takes its placement from the pool; the service
+            // rejects template-only fields, so leave them unset.
+            let pooled = !pool.is_empty();
             let mut request = AcquireRequest {
                 idempotency_key: acquire
                     .key
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                pool: acquire.pool.unwrap_or_default(),
-                template: acquire.template.unwrap_or_default(),
+                pool,
+                template,
                 ttl_secs: acquire.ttl,
                 purpose: if acquire.build {
                     Purpose::BUILD
@@ -1034,11 +1680,15 @@ async fn run_client(
                     ..Requirements::default()
                 }
                 .into(),
-                network: NetworkPolicy {
-                    mode: NetworkMode::UNRESTRICTED.into(),
-                    ..NetworkPolicy::default()
-                }
-                .into(),
+                network: if pooled {
+                    NetworkPolicy::default().into()
+                } else {
+                    NetworkPolicy {
+                        mode: NetworkMode::UNRESTRICTED.into(),
+                        ..NetworkPolicy::default()
+                    }
+                    .into()
+                },
                 ..AcquireRequest::default()
             };
             request
@@ -1094,9 +1744,11 @@ async fn run_client(
                 .await?,
         ),
         SandboxCommand::Ls => print_json(&client.list().await?),
-        SandboxCommand::Token(TokenCommand::Create { ttl }) => {
+        SandboxCommand::Token(TokenCommand::Create { ttl, name }) => {
             let ttl = parse_ttl(&ttl)?;
-            let response = client.create_join_token(ttl.as_secs()).await?;
+            let response = client
+                .create_join_token(ttl.as_secs(), name.as_deref().unwrap_or_default())
+                .await?;
             println!("{}", response.token);
             Ok(())
         }
@@ -1250,52 +1902,68 @@ async fn serve_standalone(
 ) -> anyhow::Result<()> {
     let home = crate::preloop_home();
     let state = home.join("state");
+    ensure_authorizer_config()?;
+    let _lock = ServiceLock::acquire(&state)?;
     let store_url = args
         .store
         .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
     let mut config = service_config(&state)?;
     config.placement = placement_from_env()?;
     let store = open_backend(&store_url, &state, &config).await?;
-    let tls_state = env_path("PRELOOP_SANDBOX_CA_DIR").unwrap_or_else(|| state.clone());
-    let tls = ServerTls::load_or_create(
-        &tls_state,
-        tls::sans_from_env(),
-        env_path("PRELOOP_SANDBOX_TLS_CERT").as_deref(),
-        env_path("PRELOOP_SANDBOX_TLS_KEY").as_deref(),
+    let listen = args.listen.to_string();
+    let plan = ListenerPlan::from_values(
+        &listen,
+        env_nonempty("PRELOOP_SANDBOX_AGENT_LISTEN").as_deref(),
+        args.listen_all_interfaces,
     )?;
-    config.ca = Some(tls.ca.clone());
+    let listener_tls = listener_tls(&state, &plan).await?;
+    config.ca = Some(listener_tls.ca.clone());
     let metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     config.metrics = metrics.clone();
     let service = Service::open(store, config).await?;
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {
-        let mut agent_config = sandbox_agent_config(local_provider_name());
+        let mut agent_config = sandbox_agent_config(&state, local_provider_name());
         agent_config.metrics = metrics;
         let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             host_drivers(
-                None,
+                Some(&named_prefix()),
                 smolvm_slots(),
                 &ArtifactCache::from_env(state.join("sandbox-cache")),
+                None,
                 &state.join("driver-sockets"),
             )
             .await?,
             agent_config.with_access(HostAccess::from_env()),
         )
         .context("configuring this host's sandbox drivers")?;
-        tokio::spawn(agent.run(shutdown.clone()));
+        tokio::spawn(agent.run(None, shutdown.clone()));
     }
-    let auth = Auth::new(resolve_client_token(&state)?);
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    eprintln!("[preloop] sandbox service on https://{}", args.listen);
+    if let Some(addr) = plan.client {
+        let scheme = listener_tls.client.as_ref().map_or("http", |_| "https");
+        eprintln!("[preloop] sandbox service on {scheme}://{addr}");
+    }
+    let token = resolve_client_token(&state)?;
     let stop = shutdown.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         stop.cancel();
     });
-    serve_api(listener, service, auth, tls, shutdown.clone()).await?;
-    shutdown.cancel();
+    start_listeners(
+        &state,
+        service,
+        token,
+        &plan,
+        shutdown.clone(),
+        true,
+        listener_tls,
+    )
+    .await?;
+    // The listeners run in their own tasks; keep this process alive until a
+    // signal cancels them, or `serve` would return as soon as it has bound.
+    shutdown.cancelled().await;
     Ok(())
 }
 
@@ -1335,7 +2003,7 @@ async fn run_agent(
     // An existing identity owns the name it was enrolled under.
     let name = link.name().unwrap_or(initial_name);
     let base = link.base().to_owned();
-    let mut agent_config = sandbox_agent_config(name).with_access(HostAccess::from_env());
+    let mut agent_config = sandbox_agent_config(&state, name).with_access(HostAccess::from_env());
     agent_config.metrics =
         preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     let agent = Agent::try_new(
@@ -1344,6 +2012,7 @@ async fn run_agent(
             None,
             args.slots,
             &ArtifactCache::from_env(state.join("sandbox-cache")),
+            None,
             &state.join("driver-sockets"),
         )
         .await?,
@@ -1357,8 +2026,7 @@ async fn run_agent(
         stop.cancel();
     });
     eprintln!("[preloop] sandbox agent joining {base}");
-    agent.run(shutdown.clone()).await;
-    shutdown.cancel();
+    agent.run(None, shutdown).await;
     Ok(())
 }
 
@@ -1483,6 +2151,13 @@ async fn run_driver(command: DriverCommand) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_scratch_is_pinned_under_the_state_directory() {
+        let state = Path::new("/var/lib/preloop/state");
+        let config = sandbox_agent_config(state, "host-a");
+        assert_eq!(config.scratch, state.join("sandbox-agent"));
+    }
 
     #[test]
     fn driver_conformance_parses_repeated_artifacts() {
@@ -1659,6 +2334,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
     #[test]
     fn sigterm_resolves_the_shutdown_future() {
         use std::io::{BufRead as _, BufReader};
@@ -1708,5 +2389,126 @@ mod tests {
             status.success(),
             "the child must exit cleanly on SIGTERM, not die from it: {status}\n{stderr}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_token_is_generated_once_and_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let first = resolve_client_token(state).unwrap();
+        assert_eq!(first.len(), 64, "32 random bytes as hex");
+        let path = state.join("sandbox-client-token");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(
+            resolve_client_token(state).unwrap(),
+            first,
+            "later starts reuse the generated token"
+        );
+        // A stale wider file is tightened, not trusted as-is.
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(resolve_client_token(state).unwrap(), first);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn endpoint_is_published_over_https_and_keeps_a_live_owners_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let listener = bind_endpoint(state, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert_eq!(read_endpoint(state), Some(format!("https://{addr}")));
+        assert_eq!(mode(&endpoint_path(state)), 0o600);
+
+        // The port is still held by a live process: a second bind fails but
+        // must not delete the endpoint other CLI calls depend on.
+        let error = bind_endpoint(state, addr).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(read_endpoint(state), Some(format!("https://{addr}")));
+
+        // A stale file owned by a dead process is removed on failed bind.
+        tls::write_private(
+            &endpoint_path(state),
+            format!("https://{addr}\n{}\n", u32::MAX).as_bytes(),
+        )
+        .unwrap();
+        let error = bind_endpoint(state, addr).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(read_endpoint(state), None);
+
+        drop(listener);
+    }
+
+    #[test]
+    fn the_state_directory_admits_one_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ServiceLock::acquire(dir.path()).unwrap();
+        let error = ServiceLock::acquire(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("already serving"), "{error}");
+        drop(first);
+        ServiceLock::acquire(dir.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_service_starts_only_for_a_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        assert!(
+            start_if_pool(
+                false,
+                &home,
+                None,
+                preloop_observability::Observability::noop()
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            !home.exists(),
+            "no pool must not open the store or touch the state directory"
+        );
+    }
+
+    #[test]
+    fn client_resolution_never_guesses_an_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        // No endpoint file and no explicit --service: refuse rather than
+        // send the bearer token to the built-in default.
+        assert!(resolve_service(state, None).is_err());
+
+        write_endpoint(state, "127.0.0.1:9191".parse().unwrap()).unwrap();
+        assert_eq!(
+            resolve_service(state, None).unwrap(),
+            "https://127.0.0.1:9191"
+        );
+
+        // An explicit --service is trusted even though the file names
+        // another address.
+        assert_eq!(
+            resolve_service(state, Some("https://other:1234".into())).unwrap(),
+            "https://other:1234"
+        );
+    }
+
+    #[test]
+    fn adapter_and_driver_share_one_provider() {
+        let provider = Arc::new(SmolVmProvider::default());
+        let driver = smolvm_driver(
+            None,
+            0,
+            (*provider).clone(),
+            &ArtifactCache::from_env(std::env::temp_dir().join("sandbox-cache-test")),
+        );
+        assert!(
+            provider.shares_lifecycle_with(driver.provider()),
+            "the adapter's sweep must take the same lifecycle lock as creates"
+        );
+        assert!(!SmolVmProvider::default().shares_lifecycle_with(driver.provider()));
     }
 }

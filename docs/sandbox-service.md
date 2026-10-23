@@ -2,7 +2,7 @@
 
 Preloop gets every VM from a Sandbox Service: a generic service that hands out
 running machines from pluggable backends. The CI runner pool is one client;
-`preloop sandbox …` The contract is
+the `preloop sandbox …` CLI is another. The contract is
 `proto/preloop/sandbox/v1/sandbox.proto` (in the repository root);
 the implementation is `crates/preloop-sandbox`, which never depends on the CI
 control plane.
@@ -32,19 +32,22 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
   service does not speak is `failed_precondition` naming both versions),
   `Heartbeat`, `Poll` (long-poll for work), `Report` /
   `ReportExec` (fenced by generation), `Reconcile` (full inventory: lost
-  sandboxes fail, orphans are destroyed, and a `Terminating` machine that is
-  still there gets its destroy re-queued; a template's fork base is never an
+  sandboxes fail, orphans are destroyed, a `Terminating` machine that is
+  still there gets its destroy asked again unless one is in flight, and a
+  tombstone's machine is destroyed; a template's fork base is never an
   orphan, whichever provider reports it), `RenewCertificate`.
 
-Both are served with the Connect protocol, JSON codec, over one HTTPS port:
+In simple mode both are served over one HTTPS port; split mode gives callers
+and agents separate ports with the same route families:
 `POST /preloop.sandbox.v1.<Service>/<Method>`. Every RPC is unary or
-server-streaming, so it works over HTTP/1.1 — proxies, and hosts behind NAT that
-dial out. Bulk bytes never ride inside RPCs: `OpenStream` returns a short-lived
-ticket and a tar moves with plain `PUT`/`GET` on `/sandbox/v1/streams/<ticket>`;
-agents fetch and return the same stream on `/sandbox/v1/agent/blobs/<ticket>`.
-The ticket is a rendezvous, not a file: the caller and agent connect their
-halves and bytes flow through bounded channels with backpressure, so neither
-the service nor the agent writes the archive to disk.
+server-streaming, so it works over HTTP/1.1 — proxies, and hosts behind NAT
+that dial out. Bulk bytes never ride inside RPCs: `OpenStream` returns a
+short-lived ticket and a tar moves with plain `PUT`/`GET` on
+`/sandbox/v1/streams/<ticket>`; agents fetch and return the same stream on
+`/sandbox/v1/agent/blobs/<ticket>`. The ticket is a rendezvous, not a file:
+the caller and agent connect their halves and bytes flow through bounded
+channels with backpressure, so neither the service nor the agent writes the
+archive to disk.
 
 ### Work delivery
 
@@ -75,7 +78,26 @@ execs and pending work past their deadlines; a swept exec ends the caller's
 stream with the same exit code 124 the driver reports, so a late report can
 never turn the caller's result into an error. `Acquire` is bounded by its wait
 window, and every request that waits on a provider to report (`Snapshot`,
-copy, power) is bounded by the same work timeout.
+copy, power) is bounded by the same work timeout. A wait that is blocked only
+because the pool is at capacity — not on provisioning — is bounded separately
+and much more tightly (30 s by default): the acquire then fails with
+`resource_exhausted`, the overload error itself, so the caller can fail over
+instead of queueing behind a full pool.
+
+Exec work is the one redelivery that must not replay: an exec is a command,
+and running it twice is a side effect, not a retry. The agent records every
+exec it starts in a durable started-set beside its identity state
+(`started-execs/` in its scratch directory; the CLI pins that directory to
+`<state>/sandbox-agent`, so a restart reuses it) *before* running it, and
+refuses a redelivery of an exec id already in the set, reporting it as a
+failed attempt; the service closes the caller's stream with that error rather
+than a phantom second run. The service counts each delivery on the exec record,
+so redeliveries are visible where the exec lives. The fence is host-local
+and lasts as long as the agent's scratch directory does: wiping the scratch,
+or redelivering the exec to a different host, reopens the window — and an
+exec that ran to completion but whose every report was lost ends the
+caller's stream with the fencing error instead of the lost success, the
+conservative direction, never a duplicate run.
 
 The Connect layer is generated from the proto, not hand-written.
 `scripts/gen-sandbox-proto.sh` runs `protoc` with two plugins:
@@ -134,11 +156,18 @@ The generated types speak the proto3 JSON mapping:
   shape, requirements, purpose, network, mounts, sockets, options and name of
   the request that first used it, and a reuse with any of those different is
   `invalid_argument`. TTL, wait and injected files are call tactics, not
-  identity: they may change on a retry. Lease environment is merged into every
+  identity: they may change on a retry. A replay returns the recorded sandbox
+  in whatever state its owner left it — including `Stopped`: a retry can
+  never destroy a sandbox that was stopped on purpose, and the caller starts
+  it again itself. Lease environment is merged into every
   exec; injected files are written before the lease is returned. Leases expire
   (the sandbox is destroyed); `Release(PRESERVE)` keeps a sandbox for debugging
   until its window ends, and the lease id keeps working as the debugging
-  capability until then.
+  capability until then. Preserve applies from `Leased`, `Preserved`, `Paused`
+  and `Stopped` — the machine keeps its power state, so a stopped sandbox
+  must be started before it executes — and from any other state it fails with
+  `failed_precondition` and changes nothing; a successful release response
+  never means the sandbox was destroyed.
 
 Capabilities decide placement; nothing branches on driver names. A request no
 registered provider can satisfy fails with the unmet requirement named
@@ -153,6 +182,23 @@ Placement also enforces each provider's declared per-sandbox ceiling
 (`maxVcpus`/`maxMemoryMib`, zero meaning unreported): a `Shape` asking for more
 vCPUs or memory is rejected by name instead of being sent to a driver that
 cannot boot it.
+
+## Placement
+
+Placement is split in two. The service filters: it drops offline providers
+(and, for a snapshot template, every provider that does not hold the snapshot)
+and every provider/driver pair that misses a required capability or is at its
+slot cap, leaving a candidate list. A `Placement`
+(`crates/preloop-sandbox/src/placement.rs`) then ranks those candidates by
+preference, and the service takes the first one. A placement therefore orders
+the candidates the service proved eligible; it can neither admit a pair the
+filter rejected nor widen a request.
+
+`LeastLoaded` is the default: fewest live sandboxes first, ties in candidate
+order (provider id, then the provider's driver order). `ServiceConfig::placement`
+takes any `Placement` implementation; `PRELOOP_SANDBOX_PLACEMENT` selects a
+built-in one by name (default `least-loaded`) for `preloop sandbox serve` and
+the engine, and an unknown name is a startup error naming the valid values.
 
 ## Placement
 
@@ -191,7 +237,6 @@ that exec).
 | `smolvm` | public | CLI. Golden-fork: a build sandbox starts `--branchable`; `Snapshot` keeps it as the fork base; sandboxes from the snapshot template are `machine branch` clones. |
 | `fake` | public | Process-backed, for tests and conformance. |
 | `external` | public | A plugin process speaking `preloop.sandbox.driver.v1.Driver` over a Unix socket, in any language. |
-| Private drivers | private build | See the private repository for driver-specific implementations. |
 
 A clone inherits the fork base's full configuration, so a fork request is a
 delta: the `smolvm` driver applies network, mounts, shape, overlay size and
@@ -218,12 +263,12 @@ sandbox still references.
 
 ## Security
 
-Every listener speaks TLS. On first start the service creates a CA in
-`<state>/sandbox-ca/` (`ca.pem` public, `ca.key` mode 0600) and reuses it, issuing its
-own server certificate with SANs from `PRELOOP_SANDBOX_TLS_SANS` (default: the
-hostname, `localhost`, `127.0.0.1`, `::1`).
-`PRELOOP_SANDBOX_TLS_CERT` / `PRELOOP_SANDBOX_TLS_KEY` replace the server
-certificate. There is no plaintext mode and no loopback exemption.
+The service creates a CA in `<state>/sandbox-ca/` (`ca.pem` public, `ca.key`
+mode 0600) and reuses it. Generated server certificates are issued from that
+CA with SANs from `PRELOOP_SANDBOX_TLS_SANS` plus exact names in
+`PRELOOP_SANDBOX_ALLOWED_HOSTS` and the detected Tailscale MagicDNS name. A
+changed SAN set causes a fresh generated certificate on restart. A supplied
+certificate is used as-is.
 
 * **Callers** (`Sandboxes`) present one bearer token. When
   `PRELOOP_SANDBOX_TOKEN` is unset the service generates one on first start at
@@ -241,6 +286,19 @@ certificate. There is no plaintext mode and no loopback exemption.
   the enrolled name and every other RPC may only name its own provider id.
   Removed providers and expired certificates are rejected with
   `permission_denied`. `PRELOOP_SANDBOX_PROVIDER_TOKEN` is gone.
+* **Enrollment** is a single-use token:
+  `preloop sandbox token create --ttl 1h` prints
+  `plj1.<id>.<secret>.<ca_sha256>`. The agent fetches the service CA and
+  refuses to send its CSR unless it hashes to the token's pin.
+* **Loopback Host guard.** A guarded client listener accepts `localhost`,
+  loopback IPs, its bound address, configured exact names, and one-label
+  `*.suffix` patterns. Host matching is case-insensitive, ignores a port and a
+  trailing dot, and never uses substring matching.
+* **Endpoint files.** The client address is published at
+  `<state>/sandbox-endpoint` (mode 0600). Split mode also publishes the agent
+  address at `<state>/sandbox-agent-endpoint`. Each file records the scheme,
+  bound address and owner PID; shutdown or stale cleanup never removes a live
+  owner's file.
 * **The lease is the capability.** Every sandbox-scoped RPC presents the
   `leaseId` `Acquire` returned, and the service checks it is that sandbox's
   active lease. A missing or foreign lease is `PERMISSION_DENIED`; an unknown
@@ -251,68 +309,31 @@ certificate. There is no plaintext mode and no loopback exemption.
   and short-lived; each side (producer and consumer) is claimable once, and a
   claimed transfer gets the work timeout. Their URLs are relative, so they
   inherit the `https` base.
-  `OpenStream` returns the stream URL and a separate `token`; the caller sends
-  it as `Authorization: Bearer <token>` on the upload or download, so the URL
-  alone is not enough.
-* **The host agent owns the mount policy.** A `Create` whose `Mount.host` or
-  `SocketMount.host` is outside the agent's allowlist is rejected with
-  `FAILED_PRECONDITION` before the driver runs (the caller sees it as the
-  sandbox's create failure, with the code and path in the message). Paths are
-  canonicalized, so `..` traversal and symlinks cannot step outside an allowed
-  tree. Forks arrive as `Create` work and take the same check. The default is
-  empty: deny every host mount and socket until an operator names the prefixes.
-* **Enrollment** is a single-use token:
-  `preloop sandbox token create --ttl 1h` prints
-  `plj1.<id>.<secret>.<ca_sha256>` and the store keeps only a hash of the
-  secret. `preloop sandbox agent --join https://hub:9191 --token plj1.…`
-  exchanges it for a 24h certificate and records the leaf's fingerprint on the
-  provider. The agent fetches the service CA first and refuses to send its CSR
-  unless that CA hashes to the token's pin. The identity (`key.pem`, `cert.pem`,
-  `ca.pem`, `identity.json`, all 0600) lives under
-  `<home>/state/sandbox-identity/`; later starts reuse it with no token.
-  `--join` is recorded in `identity.json`, and a restart without it dials that
-  stored URL — the global `--service` default never overrides it; passing
-  `--join` again does. If the service was re-keyed, the identity's `ca.pem` no
-  longer matches: the agent reports that the identity was issued by a different
-  CA and asks for a re-enroll with `--join … --token …` (backing off at 30s
-  rather than retrying the handshake in a loop), and the service logs the
-  rejected TLS handshake — or, when the certificate chains to its CA but is not
-  enrolled, the rejected RPC with the client certificate's fingerprint.
-  Re-enrolling an existing name with a new token replaces its fingerprints.
-* **Renewal** is automatic: the agent asks for a new certificate once two
-  thirds of the lifetime have passed and hot-reloads its client identity. The
-  previous fingerprint stays valid until it expires, so a failure between the
-  service signing and the agent persisting the new key does not lock it out.
-* **Revocation** is `preloop sandbox provider rm <name>`, which deletes the
-  provider record and its fingerprints. Its machine records are dropped too:
-  once the host cannot authenticate, nothing will ever reconcile them.
-* `Report`/`ReportExec`/`Reconcile` are additionally fenced by the provider's
-  registration generation, and a provider may not report output for another
-  provider's exec, nor destroy another provider's machine.
 
-## Limits and pagination
+## Authorization
 
-Unary Connect requests are capped at 4 MiB; bulk bytes never belong in them.
-The data-plane `PUT` routes count bytes in flight and stop at
-`PRELOOP_SANDBOX_BLOB_MAX_BYTES` (default 8 GiB), answering `413` and aborting
-the ticket so the peer sees a failed transfer rather than a truncated archive.
-A transfer leaves no service or agent file to sweep: tickets and payloads are
-memory-only, and a caller disconnect delivers a failure to the agent's driver.
+Authentication and authorization are separate. Handlers first verify the
+existing bearer token, provider certificate, or ticket token, then call the
+replaceable `Authorizer` seam with a named `Principal` and coarse `Action`.
+`PRELOOP_SANDBOX_AUTHORIZER` is unset or `builtin` today; any other value
+refuses startup and names the setting. The built-in policy
+allows every authenticated principal to use every action on its surface, so
+the default behavior is unchanged. Roles, namespaces, and per-caller
+credentials are follow-up work in #777/#792.
 
-`List`, `ListTemplates`, `ListPools` and `ListProviders` are paginated.
-`pageSize` defaults to 100 and is capped at 1000; `nextPageToken` from a
-response is passed back as `pageToken`. Items are ordered by id, and the token
-is an opaque encoding of the last id. A token this service did not mint (or
-one minted for a different listing) is `invalid_argument`, never a silent
-restart from the first page. `SandboxClient` follows the tokens, so the
-in-process and network APIs still return complete lists.
+The action groups are `Read`, `Write`, `Admin`, `Exec`, `Transfer`, `Enroll`,
+and `Provider`; the complete route mapping lives in
+`crates/preloop-sandbox/src/authz.rs`.
 
 ## State
 
 The service keeps its working set in memory and writes through to its own
 store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
 `sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
-never references control tables. Writes are best-effort in the project's
+never references control tables. One process at a time holds
+`<state>/sandbox-service.lock` (flock): a second service, or a golden bake
+pointed at the same `PRELOOP_HOME`, fails instead of loading the store and
+reaping the running service's leases. Writes are best-effort in the project's
 sense: in-memory state is authoritative, so a store failure is logged at error
 level with the record kind and never fails the caller's RPC.
 
@@ -339,12 +360,15 @@ with three decisions, before any provider is placed on or caller served:
   did land, no record names it and the next reconcile destroys it as an
   orphan. The caller's retry with the same key releases the failed record and
   starts over.
-* **A sandbox left `TERMINATING` stays so.** Its destroy was decided but its
-  report died with the process; when the provider reports the machine in a
-  `Reconcile`, the service re-queues the destroy (bounded: three attempts,
-  after which the record is dropped and the machine is reaped as an orphan).
-  When the machine is missing from the inventory the record is dropped
-  immediately, so it stops holding a slot.
+* **A sandbox left `TERMINATING` stays so until its machine is gone.** A destroy
+  in flight is awaited however long it takes. When a destroy fails, or the
+  provider is lost with it, the next `Reconcile` asks again while the provider
+  still reports the machine. After three such failures the record becomes a
+  `GONE` tombstone instead of being dropped: `Reconcile` destroys its machine
+  directly, because the record still proves the machine is the service's. The
+  tombstone is removed once the provider stops reporting the machine. It holds
+  no capacity slot, so the pool may start one machine more than its slots until
+  that reclaim lands.
 
 Stop, start, pause, resume and snapshot are operations, not record states: the
 record moves only when their report lands, so a restart leaves the last settled
@@ -443,33 +467,40 @@ data-directory paths stay on the provider that measured them. An unavailable
 ## How preloop uses it
 
 `preloop engine` runs the service in-process with this host's drivers attached
-through an in-process agent, and serves the API over HTTPS on
-`PRELOOP_SANDBOX_LISTEN` (default `127.0.0.1:9191`; `off` disables). The runner
-pool (`preloop_orchestrator::fleet::SandboxMachines`) acquires every VM from it:
-goldens are build sandboxes, forks are acquires from the golden's snapshot
-template, and deletes are releases. The pool keeps its golden, packed-artifact
-and debug-hold strategy; the machines under it are sandboxes. An image string
-becomes a template by content: a local pack is hashed and a registry tag is
-resolved to the digest the registry serves, so a rebuilt pack registers a new
-template instead of silently reusing the old one.
+through an in-process agent. With no agent-listener setting it keeps the simple
+single HTTPS listener on `PRELOOP_SANDBOX_LISTEN` (default `127.0.0.1:9191`;
+`off` disables). The runner pool (`preloop_orchestrator::fleet::SandboxMachines`)
+acquires every VM from it: goldens are build sandboxes, forks are acquires from
+the golden's snapshot template, and deletes are releases. The pool keeps its
+golden, packed-artifact and debug-hold strategy; the machines under it are
+sandboxes. An image string becomes a template by content: a local pack is
+hashed and a registry tag is resolved to the digest the registry serves, so a
+rebuilt pack registers a new template instead of silently reusing the old one.
 
 The engine also sweeps orphaned SmolVM hypervisors under its home at pool
 startup and teardown (`OrphanPurge::All`). Those sweeps only see a machine's
 data directory, so the SmolVM driver writes an ownership marker into every
-machine it serves for a caller that is not the CI pool; the sweeps spare
-marked machines. Another caller's leased sandbox therefore survives an engine
-restart or stop, while pool machines stay unmarked and the sweep remains their
-crash backstop. The service's own delete path escalates to a targeted kill when
-`machine delete` refuses.
+machine it creates, pool machines included, and the sweeps spare marked
+machines. Another caller's leased sandbox therefore survives an engine restart
+or stop. The pool has no sweep backstop for its own machines: it deletes them
+through the service on teardown, and its startup cleanup releases leftovers
+through the service. A pool that the guest-agent guard disables starts no
+service and runs no cleanup, so its leftover runners keep running until the
+pool next starts. The service's own delete path escalates to a targeted kill
+when `machine delete` refuses.
 
 | Variable | Effect |
 |---|---|
-| `PRELOOP_SANDBOX_LISTEN` | API address, or `off` |
+| `PRELOOP_SANDBOX_LISTEN` | client API address, or `off` |
+| `PRELOOP_SANDBOX_AGENT_LISTEN` | separate agent API address; unset keeps one listener |
+| `PRELOOP_SANDBOX_LISTEN_ALL_INTERFACES` | `1` permits `0.0.0.0` or `::` binds |
+| `PRELOOP_SANDBOX_CLIENT_TLS` | `service-ca` (default), `file`, or `plain-loopback` |
+| `PRELOOP_SANDBOX_CLIENT_TLS_CERT` / `_KEY` | PEM certificate and key for `file` mode |
+| `PRELOOP_SANDBOX_ALLOWED_HOSTS` | comma-separated exact names or `*.suffix` patterns |
 | `PRELOOP_SANDBOX_TOKEN` | caller bearer token; generated into `<state>/sandbox-client-token` when unset |
 | `PRELOOP_SANDBOX_CA` | CA bundle the CLI verifies the service with |
 | `PRELOOP_SANDBOX_JOIN_TOKEN` | join token for `sandbox agent` on its first run |
-| `PRELOOP_SANDBOX_TLS_SANS` | server certificate SANs (comma list) |
-| `PRELOOP_SANDBOX_TLS_CERT` / `PRELOOP_SANDBOX_TLS_KEY` | replace the generated server certificate |
+| `PRELOOP_SANDBOX_TLS_SANS` | additional generated server certificate SANs |
 | `PRELOOP_SANDBOX_STORE_URL` | store URL |
 | `PRELOOP_SANDBOX_BLOB_MAX_BYTES` | per-transfer byte cap (default 8 GiB) |
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
@@ -493,8 +524,8 @@ or `preloop sandbox agent` uses only those variables.
 ## CLI
 
 ```sh
-preloop sandbox serve --listen 0.0.0.0:9191            # standalone service (+ local SmolVM)
-preloop sandbox token create --ttl 1h                  # join token for a provider
+preloop sandbox serve --listen 0.0.0.0:9191 --listen-all-interfaces  # standalone service (+ local SmolVM)
+preloop sandbox token create --ttl 1h --name host-a    # join token bound to one provider
 preloop sandbox agent --join https://hub:9191 --token plj1.…  # enroll, then reuse the identity
 preloop sandbox agent                                         # later starts reuse the stored URL
 preloop sandbox template put --name alpine --artifact \
@@ -515,6 +546,10 @@ preloop sandbox provider drain host-a                # cordon + release idle poo
 preloop sandbox provider uncordon host-a
 preloop sandbox provider rm host-a                     # revoke its certificates
 ```
+
+Without `--service` (or `PRELOOP_SANDBOX_URL`), the CLI reads
+`<home>/state/sandbox-endpoint`, which the local service writes when it binds,
+and refuses to send its bearer token to any other address.
 
 ## Verification
 

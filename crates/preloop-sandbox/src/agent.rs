@@ -6,6 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -95,7 +96,8 @@ impl ProviderLink for Arc<Service> {
             id.generation,
             ticket,
             crate::service::TransferSide::Consumer,
-        ).await?;
+        )
+        .await?;
         self.wait_peer(&mut claim).await?;
         claim
             .take_consumer()
@@ -112,7 +114,8 @@ impl ProviderLink for Arc<Service> {
             id.generation,
             ticket,
             crate::service::TransferSide::Producer,
-        ).await?;
+        )
+        .await?;
         self.wait_peer(&mut claim).await?;
         let Some(tx) = claim.take_producer() else {
             return Err(Error::internal("download ticket has no producer side"));
@@ -183,6 +186,12 @@ impl RemoteLink {
     /// The service CA is fetched first and checked against the token's pin,
     /// so the CSR only reaches a service that holds the CA the operator
     /// issued the token for.
+    ///
+    /// The key and CSR are persisted (0600) before the first `Enroll` and
+    /// reused by every attempt, so a response lost after the service signed
+    /// does not spend the token: the retry carries the same CSR and gets the
+    /// same certificate. Transient failures are retried with bounded
+    /// backoff; the pair is removed once the identity is saved.
     pub async fn enroll(
         base: impl Into<String>,
         token: &str,
@@ -192,15 +201,28 @@ impl RemoteLink {
         let base = base.into();
         let base = normalize_base(&base)?;
         let pin = crate::tls::parse_join_token(token)?.ca_sha256.to_owned();
-        let ca_pem = crate::tls::fetch_ca(&base).await?;
+        let ca_base = base.clone();
+        let ca_pem = retry_transient(move || {
+            let base = ca_base.clone();
+            async move { crate::tls::fetch_ca(&base).await }
+        })
+        .await?;
         if crate::tls::pem_fingerprint(&ca_pem)? != pin {
             return Err(Error::new(
                 Code::Unauthenticated,
                 "sandbox service CA does not match the join token pin",
             ));
         }
-        let (key_pem, csr_pem) = crate::tls::generate_csr(name)?;
-        let response = enroll(&base, &ca_pem, token, name, csr_pem).await?;
+        let identity_dir = identity_dir.into();
+        let pending = crate::tls::PendingEnrollment::load_or_create(&identity_dir, name)?;
+        let response = retry_transient(|| {
+            let csr = pending.csr_pem.clone();
+            let base = base.clone();
+            let ca_pem = ca_pem.clone();
+            async move { enroll(&base, &ca_pem, token, name, &csr).await }
+        })
+        .await?;
+        let key_pem = pending.key_pem;
         if crate::tls::pem_fingerprint(&response.ca_pem)? != pin {
             return Err(Error::new(
                 Code::Unauthenticated,
@@ -208,7 +230,7 @@ impl RemoteLink {
             ));
         }
         let identity = crate::tls::AgentIdentity {
-            dir: identity_dir.into(),
+            dir: identity_dir.clone(),
             metadata: crate::tls::IdentityMetadata {
                 name: name.to_owned(),
                 base: base.clone(),
@@ -221,6 +243,7 @@ impl RemoteLink {
             key_pem,
         };
         identity.save()?;
+        crate::tls::PendingEnrollment::discard(&identity_dir);
         Self::from_identity(identity)
     }
 
@@ -362,7 +385,7 @@ async fn enroll(
     ca_pem: &str,
     token: &str,
     name: &str,
-    csr_pem: String,
+    csr_pem: &str,
 ) -> Result<EnrollResponse> {
     let uri: axum::http::Uri = base
         .parse()
@@ -374,7 +397,7 @@ async fn enroll(
         .enroll(EnrollRequest {
             token: token.to_owned(),
             name: name.to_owned(),
-            csr_pem,
+            csr_pem: csr_pem.to_owned(),
             ..EnrollRequest::default()
         })
         .await?
@@ -588,6 +611,10 @@ fn check_host_path(kind: &str, host: &str, allowed: &[PathBuf]) -> Result<()> {
 pub struct AgentConfig {
     /// Stable provider name.
     pub name: String,
+    /// Durable agent state: started-exec records that fence a redelivered
+    /// work item from running twice. Transfer bytes never touch this
+    /// directory; tickets stream through memory.
+    pub scratch: std::path::PathBuf,
     /// Heartbeat period.
     pub heartbeat: Duration,
     /// Full inventory reconcile period.
@@ -607,8 +634,22 @@ pub struct AgentConfig {
 impl AgentConfig {
     /// Defaults.
     pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         Self {
-            name: name.into(),
+            scratch: std::env::temp_dir()
+                .join("preloop-sandbox-agents")
+                .join(safe),
+            name,
             heartbeat: Duration::from_secs(10),
             reconcile: Duration::from_secs(60),
             access: HostAccess::default(),
@@ -616,6 +657,12 @@ impl AgentConfig {
             concurrency: 32,
             retry_backoff: Duration::from_millis(500),
         }
+    }
+
+    /// Use `scratch` for durable started-exec records.
+    pub fn with_scratch(mut self, scratch: impl Into<std::path::PathBuf>) -> Self {
+        self.scratch = scratch.into();
+        self
     }
 
     /// Set the host access allowlist.
@@ -631,6 +678,10 @@ const BACKOFF_CAP: Duration = Duration::from_secs(15);
 /// How long a completed work id is remembered so a redelivery does not run
 /// it again. Longer than the service's delivery timeout.
 const DONE_RETENTION: Duration = Duration::from_secs(600);
+
+/// Directory under the agent's scratch holding one file per exec this host
+/// has started (see [`Agent::mark_exec_started`]).
+const STARTED_EXECS_DIR: &str = "started-execs";
 
 /// The result of one work item, kept so a redelivery can re-report it
 /// instead of re-executing.
@@ -677,6 +728,43 @@ fn jittered(base: Duration) -> Duration {
     let nanos = base.as_nanos().max(1) as u64;
     let low = nanos / 2;
     Duration::from_nanos(low + rand::random::<u64>() % (nanos - low + 1))
+}
+
+/// Enrollment attempts before a transient failure is surfaced.
+const ENROLL_ATTEMPTS: u32 = 5;
+/// First delay between enrollment attempts.
+const ENROLL_BACKOFF_MIN: Duration = Duration::from_millis(500);
+/// Ceiling for enrollment retries.
+const ENROLL_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// Whether an enrollment failure is worth retrying. The service answers
+/// `unavailable`/`deadline_exceeded` only when nothing was decided, whereas
+/// `unauthenticated` means the token was rejected and a retry cannot help.
+fn transient(error: &Error) -> bool {
+    matches!(error.code, Code::Unavailable | Code::DeadlineExceeded)
+}
+
+/// Run `attempt` until it succeeds, fails permanently, or the attempt budget
+/// is spent, backing off exponentially with jitter between transient errors.
+async fn retry_transient<T, F, Fut>(mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut delay = ENROLL_BACKOFF_MIN;
+    let mut remaining = ENROLL_ATTEMPTS;
+    loop {
+        remaining -= 1;
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) if remaining > 0 && transient(&error) => {
+                debug!(%error, "enrollment attempt failed; retrying");
+                tokio::time::sleep(jittered(delay)).await;
+                delay = (delay * 2).min(ENROLL_BACKOFF_MAX);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// First delay between registration attempts.
@@ -790,23 +878,38 @@ impl Agent {
     }
 
     /// Run until `shutdown`, re-registering after fencing or link failures.
-    pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
+    ///
+    /// `initial` is a session the caller already registered (so a process
+    /// that needs the provider id before serving does not register twice and
+    /// fence its own in-flight work). After that session ends the agent
+    /// registers again.
+    pub async fn run(self: Arc<Self>, initial: Option<Session>, shutdown: CancellationToken) {
         let mut backoff = REGISTER_BACKOFF_MIN;
+        let mut pending = initial;
         while !shutdown.is_cancelled() {
             let mut failed = None;
-            match self.register().await {
-                Ok(session) => {
-                    info!(provider = %session.provider_id, generation = session.generation, "agent registered");
-                    backoff = REGISTER_BACKOFF_MIN;
-                    let error = self.clone().session(session, shutdown.clone()).await;
-                    if let Some(error) = error {
-                        warn!(%error, "agent session ended; re-registering");
+            let session = match pending.take() {
+                Some(session) => session,
+                None => match self.register().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        warn!(%error, "agent registration failed");
+                        failed = Some(error);
+                        let delay = registration_delay(backoff, failed.as_ref());
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        backoff = (backoff * 2).min(REGISTER_BACKOFF_MAX);
+                        continue;
                     }
-                }
-                Err(error) => {
-                    warn!(%error, "agent registration failed");
-                    failed = Some(error);
-                }
+                },
+            };
+            info!(provider = %session.provider_id, generation = session.generation, "agent registered");
+            backoff = REGISTER_BACKOFF_MIN;
+            let error = self.clone().session(session, shutdown.clone()).await;
+            if let Some(error) = error {
+                warn!(%error, "agent session ended; re-registering");
             }
             let delay = registration_delay(backoff, failed.as_ref());
             tokio::select! {
@@ -908,7 +1011,6 @@ impl Agent {
     /// or done (a redelivery), in which case its stored result is re-reported.
     async fn dispatch(self: &Arc<Self>, session: Session, stop: CancellationToken, item: WorkItem) {
         let work_id = item.id.clone();
-        let attempt = item.attempt;
         let previous = {
             let mut work = self.work.lock().await;
             prune_work(&mut work);
@@ -916,15 +1018,18 @@ impl Agent {
                 Some((WorkState::Running, _, current)) => {
                     // A redelivery while the command is still running: adopt
                     // the newer delivery identity without re-executing it.
-                    *current = attempt;
+                    *current = item.attempt;
                     Some(None)
                 }
                 Some((WorkState::Done(outcome), _, current)) => {
-                    *current = attempt;
+                    *current = item.attempt;
                     Some(Some(outcome.clone()))
                 }
                 None => {
-                    work.insert(work_id.clone(), (WorkState::Running, Instant::now(), attempt));
+                    work.insert(
+                        work_id.clone(),
+                        (WorkState::Running, Instant::now(), item.attempt),
+                    );
                     None
                 }
             }
@@ -993,8 +1098,11 @@ impl Agent {
                         continue;
                     };
                     info!(native = %target.native_ref, "reconcile: destroying orphan");
-                    if let Err(error) = driver.destroy(&target.native_ref).await {
-                        warn!(native = %target.native_ref, %error, "orphan destroy failed");
+                    match driver.destroy(&target.native_ref).await {
+                        Ok(()) => self.forget_started_execs(&target.native_ref),
+                        Err(error) => {
+                            warn!(native = %target.native_ref, %error, "orphan destroy failed");
+                        }
                     }
                 }
             }
@@ -1051,6 +1159,73 @@ impl Agent {
             .insert(native_ref.to_owned(), Instant::now());
     }
 
+    /// Record `exec_id` as started on this host, durably, before the
+    /// command runs: one small file per exec in the scratch directory,
+    /// created exclusively and synced. Returns `false` when a previous
+    /// agent process on this host already recorded the exec — the mark,
+    /// not the attempt, is what survives a crash, so an exec whose first
+    /// attempt finished but whose reports were all lost is still never
+    /// run twice; its caller gets the fencing error instead of a phantom
+    /// second run (or a first success reported as a failure's twin).
+    ///
+    /// The record lives in the agent's scratch: an operator who wipes the
+    /// scratch of a host whose guests can outlive the agent reopens the
+    /// window this closes. Entries are dropped when their sandbox is
+    /// destroyed, which bounds the directory by the execs of live
+    /// sandboxes.
+    fn mark_exec_started(&self, exec_id: &str, native_ref: &str) -> Result<bool> {
+        let dir = self.config.scratch.join(STARTED_EXECS_DIR);
+        std::fs::create_dir_all(&dir).map_err(|error| {
+            Error::internal(format!("recording started exec {exec_id}: {error}"))
+        })?;
+        // Exec ids are service-generated (`exe-…`); keep the file name
+        // inside the directory whatever a future id scheme allows.
+        let name: String = exec_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(native_ref.as_bytes())
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| {
+                        Error::internal(format!("recording started exec {exec_id}: {error}"))
+                    })?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(Error::internal(format!(
+                "recording started exec {exec_id}: {error}"
+            ))),
+        }
+    }
+
+    /// Drop the started-exec records of a sandbox that no longer exists.
+    fn forget_started_execs(&self, native_ref: &str) {
+        let dir = self.config.scratch.join(STARTED_EXECS_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let recorded = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            if recorded == native_ref {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     fn driver(&self, name: &str) -> Result<Arc<dyn Driver>> {
         self.drivers.get(name).cloned().ok_or_else(|| {
             Error::failed_precondition(format!("driver `{name}` is not on this host"))
@@ -1061,7 +1236,8 @@ impl Agent {
     /// service acknowledges it (or fences this session).
     async fn handle(self: Arc<Self>, session: Session, stop: CancellationToken, item: WorkItem) {
         let work_id = item.id.clone();
-        let outcome = WorkOutcome::from_result(self.run_work(&session, &stop, &work_id, item).await);
+        let outcome =
+            WorkOutcome::from_result(self.run_work(&session, &stop, &work_id, item).await);
         if !outcome.ok {
             warn!(%work_id, error = %outcome.error, "work failed");
         }
@@ -1073,7 +1249,10 @@ impl Agent {
 
         {
             let mut work = self.work.lock().await;
-            let attempt = work.get(&work_id).map(|(_, _, attempt)| *attempt).unwrap_or(0);
+            let attempt = work
+                .get(&work_id)
+                .map(|(_, _, attempt)| *attempt)
+                .unwrap_or(0);
             work.insert(
                 work_id.clone(),
                 (WorkState::Done(outcome.clone()), Instant::now(), attempt),
@@ -1177,10 +1356,50 @@ impl Agent {
                     driver.drop_snapshot(snapshot).await?;
                 } else {
                     driver.destroy(&target.native_ref).await?;
+                    self.forget_started_execs(&target.native_ref);
                 }
                 Ok(String::new())
             }
             work_item::Work::Exec(exec) => {
+                // Fence re-execution across agent restarts. The in-memory
+                // work map dedupes redelivery within this process, but it
+                // dies with the process — and a guest command can outlive
+                // it (an orphaned process on a process-backed driver, a VM
+                // on a machine-backed one). Delivery is at-least-once, so
+                // without a durable record the restarted agent ran the
+                // command a second time while the caller saw one success.
+                // A started exec is therefore never started again on this
+                // host: the redelivery is reported as failed and the
+                // service ends the caller's stream with the error.
+                match self.mark_exec_started(&exec.exec_id, &exec.target.native_ref) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(Error::new(
+                            Code::Aborted,
+                            format!(
+                                "exec {} was already started on this host by an earlier \
+                                 delivery; refusing to run it twice",
+                                exec.exec_id
+                            ),
+                        ));
+                    }
+                    // Unrecorded is unfenced: fail rather than risk the
+                    // duplicate run the record exists to prevent.
+                    Err(error) => return Err(error),
+                }
+                // Claim the durable start gate before the guest command runs.
+                // One start claim wins; a later delivery that tries to start
+                // the same exec again is fenced instead of re-run.
+                if !self.start_exec(session, stop, &exec.exec_id, work_id).await {
+                    return Err(Error::new(
+                        Code::Aborted,
+                        format!(
+                            "exec {} was already started by an earlier delivery; refusing to \
+                             run it twice",
+                            exec.exec_id
+                        ),
+                    ));
+                }
                 self.run_exec(session, stop, work_id, *exec).await?;
                 Ok(String::new())
             }
@@ -1255,11 +1474,6 @@ impl Agent {
         let native = exec.target.native_ref.clone();
         let request = exec.request.clone();
         let exec_id = exec.exec_id.clone();
-        // Claim the durable start fence before the guest command runs. A
-        // redelivery after this point never re-executes the command.
-        if !self.start_exec(session, stop, &exec_id, work_id).await {
-            return Err(Error::aborted("exec start was fenced or the caller left"));
-        }
         let run_native = native.clone();
         let run_exec_id = exec_id.clone();
         let run =
@@ -1316,7 +1530,13 @@ impl Agent {
         Ok(())
     }
 
-    /// Send the empty start acknowledgement that claims the execution fence.
+    /// Claim the durable execution start gate before the guest command runs.
+    ///
+    /// The first empty `ReportExec` for an exec records that this delivery
+    /// started it; a redelivery after that point is refused by the service
+    /// instead of executing the command twice. The call is retried while the
+    /// failure is transient, so a lost acknowledgement does not stop a
+    /// command that is about to run.
     async fn start_exec(
         &self,
         session: &Session,
@@ -1342,7 +1562,8 @@ impl Agent {
             {
                 Ok(()) => return true,
                 Err(error) if fenced(&error) => return false,
-                Err(_) => {
+                Err(error) => {
+                    debug!(exec_id, %error, "exec start not accepted; retrying");
                     if !self.wait_backoff(stop, backoff).await {
                         return false;
                     }
@@ -1461,7 +1682,108 @@ fn prune_work(work: &mut HashMap<String, (WorkState, Instant, u64)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{PollResponse, ReconcileResponse, ReportExecRequest, ReportRequest};
+    use async_trait::async_trait;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct TestLink {
+        registers: AtomicUsize,
+        abort_polls: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ProviderLink for TestLink {
+        async fn register(&self, _request: RegisterRequest) -> Result<RegisterResponse> {
+            let generation = self.registers.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            Ok(RegisterResponse {
+                provider_id: "prv-test".into(),
+                generation,
+                ..RegisterResponse::default()
+            })
+        }
+        async fn heartbeat(&self, _request: HeartbeatRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn poll(&self, _request: PollRequest) -> Result<PollResponse> {
+            if self.abort_polls.swap(false, Ordering::SeqCst) {
+                return Err(Error::aborted("fenced"));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(PollResponse::default())
+        }
+        async fn report(&self, _request: ReportRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn report_exec(&self, _request: ReportExecRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn reconcile(&self, _request: ReconcileRequest) -> Result<ReconcileResponse> {
+            Ok(ReconcileResponse::default())
+        }
+        async fn fetch_blob(
+            &self,
+            _id: &Session,
+            _ticket: &str,
+        ) -> Result<mpsc::Receiver<TransferChunk>> {
+            Ok(mpsc::channel(crate::driver::TRANSFER_QUEUE).1)
+        }
+        async fn put_blob(
+            &self,
+            _id: &Session,
+            _ticket: &str,
+            _tar: mpsc::Receiver<TransferChunk>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn agent(link: Arc<TestLink>) -> Arc<Agent> {
+        Agent::new(
+            link as Arc<dyn ProviderLink>,
+            Vec::new(),
+            AgentConfig::new("test"),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_initial_session_is_not_registered_twice() {
+        let link = Arc::new(TestLink::default());
+        let agent = agent(link.clone()).await;
+        let initial = agent.register().await.unwrap();
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(agent.run(Some(initial), shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(link.registers.load(Ordering::SeqCst), 1);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fenced_session_registers_again() {
+        let link = Arc::new(TestLink::default());
+        let agent = agent(link.clone()).await;
+        let initial = agent.register().await.unwrap();
+        link.abort_polls.store(true, Ordering::SeqCst);
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(agent.run(Some(initial), shutdown.clone()));
+        for _ in 0..100 {
+            if link.registers.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            link.registers.load(Ordering::SeqCst) >= 2,
+            "the agent must re-register after a fenced session"
+        );
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+    }
 
     fn create(mounts: Vec<Mount>, sockets: Vec<SocketMount>) -> CreateWork {
         CreateWork {
@@ -1747,6 +2069,68 @@ mod tests {
         assert!(fenced(&Error::aborted("stale generation")));
         assert!(fenced(&Error::not_found("exec not found")));
         assert!(!fenced(&Error::unavailable("try again")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enrollment_retries_reuse_the_pending_key_and_csr() {
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pending = crate::tls::PendingEnrollment::load_or_create(dir.path(), "host-a").unwrap();
+        // A restarted agent loads the same pair instead of generating one.
+        let reloaded = crate::tls::PendingEnrollment::load_or_create(dir.path(), "host-a").unwrap();
+        assert_eq!(pending.key_pem, reloaded.key_pem);
+        assert_eq!(pending.csr_pem, reloaded.csr_pem);
+
+        let attempts = AtomicUsize::new(0);
+        let seen = StdMutex::new(Vec::new());
+        let served = retry_transient(|| {
+            let attempt = attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            let csr = reloaded.csr_pem.clone();
+            seen.lock().unwrap().push(csr.clone());
+            async move {
+                if attempt < 2 {
+                    Err(Error::unavailable("response lost after signing"))
+                } else {
+                    Ok(csr)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|csr| csr == &reloaded.csr_pem),
+            "every retry must carry the same CSR"
+        );
+        assert_eq!(served, reloaded.csr_pem);
+
+        // Once the identity is saved the pending pair is gone.
+        crate::tls::PendingEnrollment::discard(dir.path());
+        assert!(!dir.path().join("pending-key.pem").exists());
+        assert!(!dir.path().join("pending-csr.pem").exists());
+        let fresh = crate::tls::PendingEnrollment::load_or_create(dir.path(), "host-a").unwrap();
+        assert_ne!(fresh.csr_pem, pending.csr_pem);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_enrollment_failures_are_not_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let attempts = AtomicUsize::new(0);
+        let error = retry_transient(|| {
+            attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            async { Err::<(), _>(Error::new(Code::Unauthenticated, "join token already used")) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, Code::Unauthenticated);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[test]

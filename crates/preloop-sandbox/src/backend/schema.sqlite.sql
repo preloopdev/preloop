@@ -133,6 +133,10 @@ CREATE TABLE IF NOT EXISTS leases (
     pool                   TEXT NOT NULL DEFAULT '',
     idempotency_key        TEXT NOT NULL DEFAULT '',
     expires_at             INTEGER NOT NULL,
+    -- The caller's requested TTL. Until the lease is delivered its expiry is
+    -- capped (an acquire may provision for much longer than a short TTL);
+    -- delivery restores this value, and Renew with 0 keeps it.
+    requested_ttl_secs     INTEGER NOT NULL DEFAULT 0,
     env_sealed             BLOB,
     request_hash           TEXT NOT NULL DEFAULT '',
     inject_state           TEXT NOT NULL DEFAULT 'pending',
@@ -184,8 +188,27 @@ CREATE INDEX IF NOT EXISTS provider_certificates_provider ON provider_certificat
 CREATE TABLE IF NOT EXISTS join_tokens (
     id            TEXT PRIMARY KEY,
     secret_sha256 TEXT NOT NULL,
-    expires_at    INTEGER NOT NULL
+    expires_at    INTEGER NOT NULL,
+    -- Empty: may enroll a new provider name only. Non-empty: the one name
+    -- the token may enroll or re-enroll (replacing its certificates).
+    provider_name TEXT NOT NULL DEFAULT ''
 );
+
+-- One enrollment that a consumed token already produced, kept until the
+-- token's own expiry so a retry with the same CSR and name gets the same
+-- certificate instead of "join token already used". The secret hash is
+-- re-checked, so knowing the token id is not enough to read the receipt.
+CREATE TABLE IF NOT EXISTS join_receipts (
+    token_id        TEXT PRIMARY KEY,
+    secret_sha256   TEXT NOT NULL,
+    csr_sha256      TEXT NOT NULL,
+    provider_name   TEXT NOT NULL,
+    cert_sha256     TEXT NOT NULL,
+    cert_pem        TEXT NOT NULL,
+    cert_expires_at INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS join_receipts_expiry ON join_receipts(expires_at);
 
 -- Durable provider work. `attempt` is the delivery identity; a Report echoes
 -- the delivery id and is fenced when it names an older attempt.
@@ -223,6 +246,10 @@ CREATE TABLE IF NOT EXISTS execs (
     exit_code     INTEGER,
     error         TEXT NOT NULL DEFAULT '',
     started       INTEGER NOT NULL DEFAULT 0,
+    -- Delivery attempt that claimed the start gate. Deliveries that start
+    -- the command set this; a later delivery that tries to start it again is
+    -- fenced instead of executing the command twice.
+    started_attempt INTEGER NOT NULL DEFAULT 0,
     owner_node    TEXT NOT NULL,
     owner_session TEXT NOT NULL,
     version       INTEGER NOT NULL

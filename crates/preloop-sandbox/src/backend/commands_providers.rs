@@ -16,7 +16,7 @@ use super::store::{
     SqlStore, bump_version, fence_provider, now_ms, now_secs, outbox, provider_by_id,
     provider_by_name, provider_id_for, sandbox_by_id, touch_provider,
 };
-use super::types::{Owner, WorkResult};
+use super::types::{EnrollOutcome, Owner, WorkResult};
 
 /// The durable envelope around a [`WorkItem`].
 ///
@@ -918,16 +918,23 @@ pub(crate) async fn create_join_token(
     id: &str,
     secret_sha256: &str,
     expires_at: i64,
+    provider_name: &str,
 ) -> Result<()> {
     store
         .run_tx(|tx| {
             let id = id.to_owned();
             let hash = secret_sha256.to_owned();
+            let provider_name = provider_name.to_owned();
             Box::pin(async move {
                 tx.execute(
-                    "INSERT INTO join_tokens (id, secret_sha256, expires_at) \
-                     VALUES ($1, $2, $3)",
-                    &[id.into(), hash.into(), expires_at.into()],
+                    "INSERT INTO join_tokens (id, secret_sha256, expires_at, provider_name) \
+                     VALUES ($1, $2, $3, $4)",
+                    &[
+                        id.into(),
+                        hash.into(),
+                        expires_at.into(),
+                        provider_name.into(),
+                    ],
                 )
                 .await?;
                 Ok(())
@@ -941,33 +948,102 @@ pub(crate) async fn enroll(
     token_id: &str,
     secret_sha256: &str,
     name: &str,
+    csr_sha256: &str,
     cert_sha256: &str,
+    cert_pem: &str,
     cert_expires_at: i64,
-) -> Result<()> {
+) -> Result<EnrollOutcome> {
     store
         .run_tx(|tx| {
             let token_id = token_id.to_owned();
             let secret = secret_sha256.to_owned();
             let name = name.to_owned();
+            let csr = csr_sha256.to_owned();
             let cert = cert_sha256.to_owned();
+            let cert_pem = cert_pem.to_owned();
             Box::pin(async move {
-                let row = tx
+                let now = now_secs();
+                let invalid = || Error::new(Code::Unauthenticated, "invalid join token");
+                // Retry of an accepted enrollment: same token, same secret,
+                // same CSR and same name gets the same certificate back. A
+                // different CSR or name is a different request and is
+                // refused. The secret is re-checked, so knowing the token id
+                // is not enough to fetch the certificate.
+                if let Some(receipt) = tx
                     .query(
-                        "SELECT id, secret_sha256, expires_at FROM join_tokens WHERE id = $1",
+                        "SELECT secret_sha256, csr_sha256, provider_name, cert_pem, \
+                                cert_expires_at, expires_at \
+                         FROM join_receipts WHERE token_id = $1",
                         &[token_id.as_str().into()],
                     )
                     .await?
                     .into_iter()
                     .next()
-                    .ok_or_else(|| {
-                        Error::new(Code::Unauthenticated, "unknown or used join token")
-                    })?;
-                if row.int("expires_at")? <= now_secs() {
-                    return Err(Error::new(Code::Unauthenticated, "join token expired"));
-                }
-                if !logic::constant_time_eq(row.text("secret_sha256")?.as_bytes(), secret.as_bytes())
                 {
-                    return Err(Error::new(Code::Unauthenticated, "bad join token"));
+                    if receipt.int("expires_at")? <= now {
+                        tx.execute(
+                            "DELETE FROM join_receipts WHERE token_id = $1",
+                            &[token_id.as_str().into()],
+                        )
+                        .await?;
+                    } else {
+                        if !logic::constant_time_eq(
+                            receipt.text("secret_sha256")?.as_bytes(),
+                            secret.as_bytes(),
+                        ) {
+                            return Err(invalid());
+                        }
+                        if receipt.text("csr_sha256")? == csr
+                            && receipt.text("provider_name")? == name
+                        {
+                            return Ok(EnrollOutcome::Replay {
+                                cert_pem: receipt.text("cert_pem")?.to_owned(),
+                                expires_at: receipt.int("cert_expires_at")?,
+                            });
+                        }
+                        return Err(Error::new(
+                            Code::Unauthenticated,
+                            "join token already used",
+                        ));
+                    }
+                }
+                let row = tx
+                    .query(
+                        "SELECT id, secret_sha256, expires_at, provider_name \
+                         FROM join_tokens WHERE id = $1",
+                        &[token_id.as_str().into()],
+                    )
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(invalid)?;
+                if row.int("expires_at")? <= now {
+                    return Err(invalid());
+                }
+                if !logic::constant_time_eq(
+                    row.text("secret_sha256")?.as_bytes(),
+                    secret.as_bytes(),
+                ) {
+                    return Err(invalid());
+                }
+                let bound_name = row.text("provider_name")?.to_owned();
+                let existing = provider_by_name(tx, &name).await?;
+                // A token is only usable for the identity it was minted for.
+                // An unbound token may enroll a new name, never take over an
+                // existing one; replacing a live provider's credentials
+                // requires a token bound to its name.
+                if !bound_name.is_empty() && bound_name != name {
+                    return Err(Error::new(
+                        Code::PermissionDenied,
+                        "join token was issued for a different provider name",
+                    ));
+                }
+                if bound_name.is_empty() && existing.is_some() {
+                    return Err(Error::new(
+                        Code::AlreadyExists,
+                        "provider name is already enrolled: re-enrolling it requires \
+                         a join token bound to that name",
+                    ));
                 }
                 let deleted = tx
                     .execute(
@@ -976,18 +1052,15 @@ pub(crate) async fn enroll(
                     )
                     .await?;
                 if deleted != 1 {
-                    return Err(Error::new(Code::Unauthenticated, "join token was used"));
+                    return Err(invalid());
                 }
-                let existing = provider_by_name(tx, &name).await?;
                 let id = existing
                     .as_ref()
                     .map(|provider| provider.id.clone())
                     .unwrap_or_else(|| {
                         format!("prv-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
                     });
-                let generation = existing
-                    .as_ref()
-                    .map_or(0, |provider| provider.generation);
+                let generation = existing.as_ref().map_or(0, |provider| provider.generation);
                 let drivers_json = existing
                     .as_ref()
                     .map(|provider| serde_json::to_string(&provider.drivers).unwrap_or_default())
@@ -1012,7 +1085,8 @@ pub(crate) async fn enroll(
                     ],
                 )
                 .await?;
-                // Re-enrolling replaces earlier credentials.
+                // Re-enrolling replaces earlier credentials: issuing a new
+                // token means these credentials, not accumulated old ones.
                 tx.execute(
                     "DELETE FROM provider_certificates WHERE provider_id = $1",
                     &[id.as_str().into()],
@@ -1021,11 +1095,41 @@ pub(crate) async fn enroll(
                 tx.execute(
                     "INSERT INTO provider_certificates (provider_id, sha256, expires_at) \
                      VALUES ($1, $2, $3)",
-                    &[id.as_str().into(), cert.as_str().into(), cert_expires_at.into()],
+                    &[
+                        id.as_str().into(),
+                        cert.as_str().into(),
+                        cert_expires_at.into(),
+                    ],
+                )
+                .await?;
+                // Work the previous credential set held is unacknowledged:
+                // return it to the queue instead of leaving it in flight for
+                // a session that may never poll again.
+                tx.execute(
+                    "UPDATE work_items SET status = 'queued', visible_at = 0 \
+                     WHERE provider_id = $1 AND status = 'inflight'",
+                    &[id.as_str().into()],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO join_receipts \
+                     (token_id, secret_sha256, csr_sha256, provider_name, cert_sha256, \
+                      cert_pem, cert_expires_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                    &[
+                        token_id.as_str().into(),
+                        secret.as_str().into(),
+                        csr.as_str().into(),
+                        name.as_str().into(),
+                        cert.as_str().into(),
+                        cert_pem.as_str().into(),
+                        cert_expires_at.into(),
+                        row.int("expires_at")?.into(),
+                    ],
                 )
                 .await?;
                 outbox(tx, "provider", &id, version, "enroll", "{}").await?;
-                Ok(())
+                Ok(EnrollOutcome::Issued)
             })
         })
         .await
@@ -1068,6 +1172,25 @@ pub(crate) async fn renew_certificate(
                     &[id.as_str().into(), now_secs().into()],
                 )
                 .await?;
+                // Keep the newest certificates and evict the rest, so a
+                // compromised certificate cannot live forever by renewing.
+                let retained = tx
+                    .query(
+                        "SELECT sha256 FROM provider_certificates WHERE provider_id = $1 \
+                         ORDER BY expires_at DESC, sha256 DESC",
+                        &[id.as_str().into()],
+                    )
+                    .await?;
+                for stale in retained
+                    .into_iter()
+                    .skip(crate::service::MAX_PROVIDER_CERTIFICATES)
+                {
+                    tx.execute(
+                        "DELETE FROM provider_certificates WHERE provider_id = $1 AND sha256 = $2",
+                        &[id.as_str().into(), stale.text("sha256")?.into()],
+                    )
+                    .await?;
+                }
                 outbox(tx, "provider", &id, version, "renew-certificate", "{}").await?;
                 Ok(())
             })

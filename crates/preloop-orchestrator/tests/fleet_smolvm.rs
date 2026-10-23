@@ -2,8 +2,6 @@
 //!
 //! Runs only with `PRELOOP_SANDBOX_E2E_SMOLVM=1`.
 
-#![allow(unsafe_code)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +23,7 @@ async fn secrets_reach_the_guest_without_entering_argv() {
         eprintln!("skipped: set PRELOOP_SANDBOX_E2E_SMOLVM=1");
         return;
     }
-    let _dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
         .await
         .unwrap();
@@ -36,20 +34,13 @@ async fn secrets_reach_the_guest_without_entering_argv() {
         vec![driver as Arc<dyn Driver>],
         AgentConfig::new("e2e-secrets"),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    while service
-        .list_providers()
-        .await
-        .map(|providers| providers.is_empty())
-        .unwrap_or(true)
-    {
+    while service.list_providers().is_empty() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let provider_id = service
         .list_providers()
-        .await
-        .unwrap()
         .first()
         .map(|provider| provider.id.clone())
         .expect("agent registered");
@@ -83,16 +74,14 @@ async fn secrets_reach_the_guest_without_entering_argv() {
         .unwrap();
     machines.start(&name).await.unwrap();
 
-    // SAFETY: single test in this binary; nothing else reads the variable.
-    unsafe { std::env::set_var("PRELOOP_E2E_SECRET", "e2e-s3cr3t-value") };
+    // A host file keeps this test parallel-safe: no process env mutation.
+    let secret_file = dir.path().join("e2e-secret");
+    std::fs::write(&secret_file, "e2e-s3cr3t-value").unwrap();
     let output = machines
         .exec_with_secret_env(
             &name,
             &["sh".into(), "-c".into(), "printf %s \"$TOKEN\"".into()],
-            &[(
-                "TOKEN".into(),
-                SecretSource::HostEnv("PRELOOP_E2E_SECRET".into()),
-            )],
+            &[("TOKEN".into(), SecretSource::HostFile(secret_file))],
         )
         .await
         .expect("secret exec");
@@ -106,9 +95,10 @@ async fn secrets_reach_the_guest_without_entering_argv() {
                 "sh".into(),
                 "-c".into(),
                 // The bracket keeps this probe's own command line from
-                // matching the pattern it searches for.
+                // matching the pattern it searches for. The carrier is
+                // staged in /var/tmp, not /tmp.
                 "printf '%s %s\\n' \"$(ps -eo args= | grep -c 'e2e-s3cr3t-valu[e]')\" \
-                 \"$(ls -a /tmp/.preloop-secret-env-* 2>/dev/null | wc -l)\""
+                 \"$(ls -a /var/tmp/.preloop-secret-env-* 2>/dev/null | wc -l)\""
                     .into(),
             ],
         )
@@ -119,7 +109,6 @@ async fn secrets_reach_the_guest_without_entering_argv() {
         "0 0",
         "the secret leaked into the guest"
     );
-    unsafe { std::env::remove_var("PRELOOP_E2E_SECRET") };
     machines.delete(&name).await.unwrap();
     shutdown.cancel();
 }
@@ -142,20 +131,13 @@ async fn a_packed_artifact_becomes_a_runnable_machine() {
         vec![driver as Arc<dyn Driver>],
         AgentConfig::new("e2e-pack"),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    while service
-        .list_providers()
-        .await
-        .map(|providers| providers.is_empty())
-        .unwrap_or(true)
-    {
+    while service.list_providers().is_empty() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let provider_id = service
         .list_providers()
-        .await
-        .unwrap()
         .first()
         .map(|provider| provider.id.clone())
         .expect("agent registered");
