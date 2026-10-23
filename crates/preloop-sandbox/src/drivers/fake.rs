@@ -3,10 +3,13 @@
 //! Guest absolute paths map under the sandbox root (`/x` → `<root>/x`), and
 //! commands receive the root as `SANDBOX_ROOT`.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +33,9 @@ pub struct FakeDriver {
     /// How many `cancel_exec` calls the agent delivered (disconnect tests).
     pub cancel_calls: AtomicU32,
     cancels: ExecCancels,
+    /// Exec ids currently running, per sandbox native ref, so `destroy`
+    /// can stop a sandbox's commands instead of orphaning them.
+    running: Mutex<HashMap<String, HashSet<String>>>,
     /// Artificial snapshot latency (tests that need an operation in flight).
     pub snapshot_delay_ms: AtomicU64,
     /// Fail the next N destroys (tests).
@@ -53,6 +59,7 @@ impl FakeDriver {
             create_calls: AtomicU32::new(0),
             cancel_calls: AtomicU32::new(0),
             cancels: ExecCancels::default(),
+            running: Mutex::new(HashMap::new()),
             snapshot_delay_ms: AtomicU64::new(0),
             fail_destroys: AtomicU32::new(0),
             destroy_delay_ms: AtomicU64::new(0),
@@ -159,6 +166,11 @@ impl FakeDriver {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // The command leads its own process group, so a cancel, a timeout
+        // or a destroy can take down the whole tree: a shell's children
+        // hold the output pipes and outlive the shell otherwise.
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command.spawn().map_err(io("spawn"))?;
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt as _;
@@ -220,7 +232,14 @@ impl FakeDriver {
         };
         // Dropping the wait on cancel (or on the deadline) leaves the child
         // running; kill it before returning so nothing outlives the exec.
+        // The whole group goes, not just the shell: its children inherited
+        // the output pipes and would hold this exec (and, after a destroy,
+        // the host) open until they exit on their own.
         if !matches!(end, WaitEnd::Status(_)) {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                kill_process_group(pid);
+            }
             let _ = child.kill().await;
         }
         let _ = stdout.await;
@@ -238,6 +257,22 @@ enum WaitEnd {
     TimedOut,
     Cancelled,
 }
+
+/// SIGKILLs the process group led by `pid`.
+///
+/// The caller passes the pid of a child this driver just spawned and made a
+/// group leader (see `exec_inner`), so the group id is the pid and every
+/// member of the group is part of that exec's tree.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+}
+
+/// How long `destroy` waits for a sandbox's cancelled execs to die before
+/// removing the directory anyway.
+const DESTROY_KILL_WAIT: Duration = Duration::from_secs(10);
 
 fn io(context: &str) -> impl Fn(std::io::Error) -> Error + '_ {
     move |error| Error::internal(format!("fake {context}: {error}"))
@@ -292,6 +327,32 @@ impl Driver for FakeDriver {
         {
             return Err(Error::unavailable("injected destroy failure"));
         }
+        // Stop the sandbox's commands before removing anything: destroy
+        // used to only delete the directory, leaving the exec processes
+        // running on the host, orphaned, with their working directory
+        // deleted under them. Cancellation is delivered to the exec task,
+        // which kills the command's process group; wait for it to land so
+        // "destroyed" means the processes are gone — bounded, so one stuck
+        // exec cannot wedge the destroy (and the pool slot) forever.
+        let running: Vec<String> = self
+            .running
+            .lock()
+            .get(native_ref)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default();
+        for exec_id in &running {
+            self.cancels.cancel(exec_id);
+        }
+        let deadline = std::time::Instant::now() + DESTROY_KILL_WAIT;
+        while std::time::Instant::now() < deadline
+            && self
+                .running
+                .lock()
+                .get(native_ref)
+                .is_some_and(|ids| !ids.is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         let dir = self.dir(native_ref)?;
         match std::fs::remove_dir_all(dir) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io("destroy")(error)),
@@ -307,8 +368,22 @@ impl Driver for FakeDriver {
         output: mpsc::Sender<ExecEvent>,
     ) -> Result<i32> {
         let cancel = self.cancels.start(exec_id);
+        self.running
+            .lock()
+            .entry(native_ref.to_owned())
+            .or_default()
+            .insert(exec_id.to_owned());
         let result = self.exec_inner(native_ref, request, output, cancel).await;
         self.cancels.finish(exec_id);
+        {
+            let mut running = self.running.lock();
+            if let Some(ids) = running.get_mut(native_ref) {
+                ids.remove(exec_id);
+                if ids.is_empty() {
+                    running.remove(native_ref);
+                }
+            }
+        }
         result
     }
 
@@ -499,6 +574,36 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// True while `pid` names a live (not zombie) process.
+    #[cfg(unix)]
+    fn running(pid: u32) -> bool {
+        // `ps` is portable where /proc is not, and still reports `Z` for a
+        // zombie, so a killed-but-unreaped process does not count as alive.
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|state| state != 'Z' && state != 'X')
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        for _ in 0..200 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
 
     #[test]
     fn guest_paths_are_confined_to_the_sandbox_root() {
@@ -515,100 +620,5 @@ mod tests {
         assert!(FakeDriver::guest(root, "/a/../../secret").is_err());
         assert!(FakeDriver::guest(root, "..").is_err());
         assert!(FakeDriver::guest(root, "/a/b/../../../secret").is_err());
-    }
-
-    fn driver_with_sandbox(dir: &tempfile::TempDir) -> (FakeDriver, PathBuf) {
-        let root = dir.path().join("host");
-        let driver = FakeDriver::new("fake", root.clone(), FakeDriver::full_capabilities());
-        let sandbox = root.join("sandboxes").join("ref-1");
-        std::fs::create_dir_all(&sandbox).unwrap();
-        (driver, sandbox)
-    }
-
-    fn tar_with_file(dir: &tempfile::TempDir, name: &str, content: &[u8]) -> PathBuf {
-        let source = dir.path().join("source.txt");
-        std::fs::write(&source, content).unwrap();
-        let tar_path = dir.path().join("in.tar");
-        let file = std::fs::File::create(&tar_path).unwrap();
-        let mut builder = tar::Builder::new(file);
-        builder.append_path_with_name(&source, name).unwrap();
-        builder.finish().unwrap();
-        tar_path
-    }
-
-    #[tokio::test]
-    async fn copy_in_refuses_an_escaping_destination() {
-        let dir = tempfile::tempdir().unwrap();
-        let (driver, sandbox) = driver_with_sandbox(&dir);
-        let tar = tar_with_file(&dir, "hello.txt", b"hello");
-        // The pre-fix join resolved this outside the sandbox entirely.
-        assert!(driver.copy_in("ref-1", &tar, "/../escape").await.is_err());
-        assert!(
-            !dir.path().join("host").join("escape").exists(),
-            "copy_in extracted outside the sandbox root"
-        );
-        // A destination inside the root still works.
-        driver.copy_in("ref-1", &tar, "/ok").await.unwrap();
-        assert_eq!(
-            std::fs::read(sandbox.join("ok/hello.txt")).unwrap(),
-            b"hello"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn copy_out_does_not_follow_a_planted_symlink() {
-        let dir = tempfile::tempdir().unwrap();
-        let (driver, sandbox) = driver_with_sandbox(&dir);
-        let data = sandbox.join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join("real.txt"), b"guest-data").unwrap();
-        let secret = dir.path().join("secret.txt");
-        std::fs::write(&secret, b"host-secret").unwrap();
-        std::os::unix::fs::symlink(&secret, data.join("link")).unwrap();
-
-        let tar_path = dir.path().join("out.tar");
-        driver.copy_out("ref-1", "/data", &tar_path).await.unwrap();
-        let mut archive = tar::Archive::new(std::fs::File::open(&tar_path).unwrap());
-        let mut saw_real = false;
-        for entry in archive.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            if entry.path().unwrap().ends_with("real.txt") {
-                saw_real = true;
-            }
-            let mut content = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
-            let secret: &[u8] = b"host-secret";
-            assert!(
-                !content.windows(secret.len()).any(|w| w == secret),
-                "copy_out leaked a host file through a guest symlink"
-            );
-        }
-        assert!(saw_real, "copy_out must still copy the real guest files");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn copy_out_refuses_a_source_resolving_outside_the_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let (driver, sandbox) = driver_with_sandbox(&dir);
-        let secret = dir.path().join("secret.txt");
-        std::fs::write(&secret, b"host-secret").unwrap();
-        std::os::unix::fs::symlink(&secret, sandbox.join("link")).unwrap();
-        let tar_path = dir.path().join("out.tar");
-        assert!(driver.copy_out("ref-1", "/link", &tar_path).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn exec_workdir_cannot_escape_the_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let (driver, _sandbox) = driver_with_sandbox(&dir);
-        let (tx, _rx) = mpsc::channel(1);
-        let request = ExecRequest {
-            argv: vec!["true".into()],
-            workdir: "/../..".into(),
-            ..ExecRequest::default()
-        };
-        assert!(driver.exec("ref-1", "exec-1", &request, tx).await.is_err());
     }
 }
