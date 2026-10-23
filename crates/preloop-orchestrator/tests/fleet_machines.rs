@@ -472,6 +472,24 @@ impl SandboxApi for FlakyRelease {
     async fn list_providers(&self) -> preloop_sandbox::Result<Vec<preloop_sandbox::api::Provider>> {
         self.inner.list_providers().await
     }
+    async fn cordon_provider(
+        &self,
+        name: &str,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::Provider> {
+        self.inner.cordon_provider(name).await
+    }
+    async fn uncordon_provider(
+        &self,
+        name: &str,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::Provider> {
+        self.inner.uncordon_provider(name).await
+    }
+    async fn drain_provider(
+        &self,
+        name: &str,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::DrainProviderResult> {
+        self.inner.drain_provider(name).await
+    }
     async fn exec(
         &self,
         request: preloop_sandbox::api::ExecRequest,

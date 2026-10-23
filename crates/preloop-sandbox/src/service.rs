@@ -4547,6 +4547,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store;
 
     fn items(count: usize) -> Vec<(String, usize)> {
         (0..count)
@@ -4644,7 +4645,7 @@ mod tests {
         };
         let error = paginate("sandbox", items(3), &request).unwrap_err();
         assert_eq!(error.code, Code::InvalidArgument);
-    use crate::store;
+    }
 
     fn ready_member(id: &str, created_at: i64) -> Sandbox {
         Sandbox {
