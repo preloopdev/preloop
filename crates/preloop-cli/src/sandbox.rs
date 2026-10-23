@@ -127,7 +127,8 @@ impl LocalSandboxes {
         let store = store::open(&store_url)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
-        config.metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+        config.metrics =
+            preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
         let metrics = config.metrics.clone();
         let service = Service::open(store, config).await?;
         let shutdown = CancellationToken::new();
