@@ -182,7 +182,7 @@ impl LocalSandboxes {
         let state = home.join("state");
         // One destructive authority per state directory: a bake or a second
         // engine must not load and reap a running service's leases.
-        let _lock = ServiceLock::acquire(&state)?;
+        let lock = ServiceLock::acquire(&state)?;
         let store_url = env_nonempty("PRELOOP_SANDBOX_STORE_URL")
             .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
         let mut config = service_config(&state)?;
@@ -293,7 +293,7 @@ impl LocalSandboxes {
             pool_driver,
             pool_capabilities,
             shutdown,
-            _lock,
+            _lock: lock,
         })
     }
 
@@ -376,6 +376,10 @@ fn resolve_client_token(state: &Path) -> anyhow::Result<String> {
     if let Ok(token) = std::fs::read_to_string(&path) {
         let token = token.trim();
         if !token.is_empty() {
+            // A token file left with a wider mode by an old build or a manual
+            // copy must not stay readable by other local users.
+            crate::set_private_file_permissions(&path)
+                .with_context(|| format!("securing {}", path.display()))?;
             return Ok(token.to_owned());
         }
     }
@@ -395,8 +399,8 @@ fn endpoint_path(state: &Path) -> PathBuf {
 fn read_token_file(path: &Path) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
+        .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
+        .filter(|base| !base.is_empty())
 }
 
 /// The token a local deployment wrote, when there is one.
@@ -410,25 +414,12 @@ fn local_ca(home: &Path) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Build the caller client, resolving the token and CA from flags, the
-/// environment, then the local state directory.
-fn sandbox_client(
-    service: &str,
-    token: Option<String>,
-    ca: Option<PathBuf>,
-) -> anyhow::Result<SandboxClient> {
-    let home = crate::preloop_home();
-    let token = token.or_else(|| local_client_token(&home)).context(
-        "set --token (or PRELOOP_SANDBOX_TOKEN), or run against a local service that wrote \
-         state/sandbox-client-token",
-    )?;
-    match ca.or_else(|| local_ca(&home)) {
-        Some(path) => {
-            let pem = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading sandbox CA {}", path.display()))?;
-            Ok(SandboxClient::with_tls(service, Some(token), &pem, None)?)
-        }
-        None => Ok(SandboxClient::new(service, Some(token))),
+/// Remove the endpoint file only while it still names `addr`: a newer
+/// process may have published its own address.
+pub(crate) fn clear_endpoint(state: &Path, addr: SocketAddr) {
+    let path = endpoint_path(state);
+    if read_endpoint(state).as_deref() == Some(endpoint_url(addr).as_str()) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -497,27 +488,14 @@ pub(crate) fn write_endpoint(state: &Path, addr: SocketAddr) -> anyhow::Result<(
 fn read_endpoint(state: &Path) -> Option<String> {
     std::fs::read_to_string(endpoint_path(state))
         .ok()
-        .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
-        .filter(|base| !base.is_empty())
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
 }
 
-/// True when the process that published the endpoint is still alive.
-fn endpoint_owner_alive(state: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(endpoint_path(state)) else {
-        return false;
-    };
-    let Some(pid) = text
-        .lines()
-        .nth(1)
-        .and_then(|pid| pid.trim().parse::<i32>().ok())
-    else {
-        return false;
-    };
-    // SAFETY: `kill` with signal 0 only probes existence.
-    #[allow(unsafe_code)]
-    let alive = unsafe { libc::kill(pid, 0) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    alive
+/// The CA a local deployment wrote, when there is one.
+fn local_ca(home: &Path) -> Option<PathBuf> {
+    let path = home.join("state").join(tls::CA_DIR).join(tls::CA_CERT_FILE);
+    path.is_file().then_some(path)
 }
 
 /// Remove the endpoint file only while it still names `addr`: a newer
@@ -1083,6 +1061,7 @@ async fn run_client(
                 Some(code) => std::process::exit(code),
                 None => std::process::exit(INTERRUPTED),
             }
+            anyhow::bail!("exec stream ended without an exit status")
         }
         SandboxCommand::Cp(cp) => copy(&client, &cp.source, &cp.destination, &lease_id()?).await,
         SandboxCommand::Stop { sandbox } => Ok(client.stop(&sandbox, &lease_id()?).await?),
@@ -1465,6 +1444,7 @@ mod tests {
         assert!(error.to_string().contains("--join"), "{error}");
     }
 
+    #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777

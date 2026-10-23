@@ -352,8 +352,14 @@ async fn providers(
     State(app): State<AppState>,
     Path(method): Path<String>,
     ConnectInfo(peer): ConnectInfo<PeerIdentity>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Providers authenticate by client certificate; the loopback Host guard
+    // still applies to the enrollment call, which carries no certificate.
+    if let Err(error) = check_host(app.auth.loopback_only, &headers) {
+        return error.into_response();
+    }
     let service = app.service;
     use connect::{decode, unary_response as reply};
     // `Enroll` is the one RPC authenticated by its join token instead of a
@@ -630,6 +636,7 @@ async fn agent_blob_get(
     headers: HeaderMap,
 ) -> Response {
     let result = async {
+        check_host(app.auth.loopback_only, &headers)?;
         let identity = app.service.provider_identity(peer.fingerprint()?)?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
@@ -648,6 +655,7 @@ async fn agent_blob_put(
     body: Body,
 ) -> Response {
     let result = async {
+        check_host(app.auth.loopback_only, &headers)?;
         let identity = app.service.provider_identity(peer.fingerprint()?)?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;

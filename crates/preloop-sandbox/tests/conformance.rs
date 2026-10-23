@@ -1002,7 +1002,7 @@ async fn remote_agent_and_client_over_connect() {
         vec![fake as Arc<dyn Driver>],
         AgentConfig::new("remote-host", dir.join("scratch")),
     );
-    tokio::spawn(agent.run(t.shutdown_token()));
+    tokio::spawn(agent.run(None, t.shutdown_token()));
 
     // A wrong caller token is rejected, over the same TLS endpoint.
     let ca = t.ca_pem();
@@ -1208,6 +1208,97 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
         })
         .await
         .unwrap();
+}
+
+async fn loopback_auth_requires_a_token_and_a_loopback_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let tls = preloop_sandbox::ServerTls::load_or_create(
+        &state,
+        vec!["127.0.0.1".to_owned(), "localhost".to_owned()],
+        None,
+        None,
+    )
+    .unwrap();
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    config.ca = Some(tls.ca.clone());
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    let http = preloop_sandbox::tls::http_client(tls.ca.pem(), None).unwrap();
+    let list = "/preloop.sandbox.v1.Sandboxes/List";
+
+    async fn status(
+        http: &reqwest::Client,
+        base: &str,
+        host: &str,
+        path: &str,
+        bearer: Option<&str>,
+    ) -> u16 {
+        let mut request = http
+            .post(format!("{base}{path}"))
+            .header("Host", host)
+            .body("{}");
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        request.send().await.unwrap().status().as_u16()
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("https://{addr}");
+    let shutdown = CancellationToken::new();
+    tokio::spawn(preloop_sandbox::server::serve(
+        listener,
+        service.clone(),
+        preloop_sandbox::server::Auth::for_listener("client-secret", addr),
+        tls.clone(),
+        shutdown.clone(),
+    ));
+
+    // No bearer: rejected.
+    assert_eq!(status(&http, &base, "127.0.0.1", list, None).await, 401);
+    // DNS rebinding: the bearer is valid, the Host is not.
+    assert_eq!(
+        status(&http, &base, "evil.example", list, Some("client-secret")).await,
+        403
+    );
+    // Loopback names and ports are fine.
+    for host in [
+        "127.0.0.1",
+        "127.0.0.1:9191",
+        "localhost:9191",
+        "[::1]:9191",
+    ] {
+        assert_eq!(
+            status(&http, &base, host, list, Some("client-secret")).await,
+            200,
+            "Host {host} must be accepted"
+        );
+    }
+    shutdown.cancel();
+
+    // An empty token never authorizes: the listener fails closed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("https://{addr}");
+    let shutdown = CancellationToken::new();
+    tokio::spawn(preloop_sandbox::server::serve(
+        listener,
+        service,
+        preloop_sandbox::server::Auth {
+            client_token: String::new(),
+            loopback_only: true,
+        },
+        tls,
+        shutdown.clone(),
+    ));
+    assert_eq!(
+        status(&http, &base, "127.0.0.1", list, Some("anything")).await,
+        401
+    );
+    shutdown.cancel();
 }
 
 #[tokio::test]
