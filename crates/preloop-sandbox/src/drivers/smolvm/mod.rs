@@ -112,11 +112,19 @@ impl SmolvmDriver {
         self
     }
 
+    /// The typed lifecycle primitive behind this driver. Callers that also
+    /// need host-side operations must clone this provider rather than build a
+    /// second one, so both share the lifecycle lock and fork census.
+    pub fn provider(&self) -> &SmolVmProvider {
+        &self.provider
+    }
+
     fn adopts(&self, name: &str) -> bool {
         self.named_prefix
             .as_deref()
             .is_some_and(|prefix| name.starts_with(prefix))
     }
+}
 
     /// Mark a machine the CI pool does not own as a Sandbox Service sandbox.
     ///
@@ -404,6 +412,10 @@ enum End {
     TimedOut,
     /// [`Driver::cancel_exec`] dropped the host-side client.
     Cancelled,
+/// Caller-chosen names must sit inside the prefix this driver reports in
+/// its inventory, or reconciliation cannot tell them from foreign machines.
+pub(crate) fn name_is_owned(prefix: Option<&str>, name: &str) -> bool {
+    prefix.is_some_and(|prefix| !prefix.is_empty() && name.starts_with(prefix))
 }
 
 fn guest_arch() -> &'static str {
@@ -636,8 +648,16 @@ impl Driver for SmolvmDriver {
     }
 
     async fn create(&self, work: &CreateWork) -> Result<String> {
-        // A caller-chosen name doubles as the native name, so host tools
-        // (`preloop shell`, `smolvm machine exec`) address the same machine.
+        // A caller-chosen name doubles as the native name, but inventory can
+        // only recognize names inside the configured prefix: an arbitrary
+        // name would be reported lost, then its record dropped without
+        // destroying the machine. Keep the ownership boundary explicit.
+        if !work.name.is_empty() && !name_is_owned(self.named_prefix.as_deref(), &work.name) {
+            return Err(Error::invalid(format!(
+                "caller-chosen sandbox name `{}` is outside this provider's owned prefix",
+                work.name
+            )));
+        }
         let name = if work.name.is_empty() {
             native_name(&work.sandbox_id)
         } else {
@@ -768,7 +788,7 @@ impl Driver for SmolvmDriver {
             return Err(Error::invalid("argv is required"));
         }
         let name = machine(native_ref)?;
-        let argv = crate::driver::posix_exec_argv(request);
+        let argv = crate::driver::posix_exec_argv(request)?;
         let cancel = self.cancels.start(exec_id);
         let result = self
             .exec_inner(&name, exec_id, request, &argv, output, cancel)
@@ -1279,5 +1299,18 @@ exit 0
             !std::path::Path::new(&pidfile).exists(),
             "pid file left behind"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_is_owned;
+
+    #[test]
+    fn caller_names_must_be_inside_the_owned_prefix() {
+        assert!(name_is_owned(Some("preloop-runner"), "preloop-runner-3-1"));
+        assert!(!name_is_owned(Some("preloop-runner"), "someone-elses-vm"));
+        assert!(!name_is_owned(None, "preloop-runner-3-1"));
+        assert!(!name_is_owned(Some(""), "anything"));
     }
 }

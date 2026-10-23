@@ -2,7 +2,7 @@
 
 Preloop gets every VM from a Sandbox Service: a generic service that hands out
 running machines from pluggable backends. The CI runner pool is one client;
-`preloop sandbox …` The contract is
+the `preloop sandbox …` CLI is another. The contract is
 `proto/preloop/sandbox/v1/sandbox.proto` (in the repository root);
 the implementation is `crates/preloop-sandbox`, which never depends on the CI
 control plane.
@@ -158,7 +158,6 @@ before `exec` starts; drivers remember it and refuse to start that exec).
 |---|---|---|
 | `smolvm` | public | CLI. Golden-fork: a build sandbox starts `--branchable`; `Snapshot` keeps it as the fork base; sandboxes from the snapshot template are `machine branch` clones. |
 | `fake` | public | Process-backed, for tests and conformance. |
-| Private drivers | private build | See the private repository for driver-specific implementations. |
 
 A clone inherits the fork base's full configuration, so a fork request is a
 delta: the `smolvm` driver applies network, mounts, shape, overlay size and
@@ -473,6 +472,10 @@ preloop sandbox provider drain host-a                # cordon + release idle poo
 preloop sandbox provider uncordon host-a
 preloop sandbox provider rm host-a                     # revoke its certificates
 ```
+
+Without `--service` (or `PRELOOP_SANDBOX_URL`), the CLI reads
+`<home>/state/sandbox-endpoint`, which the local service writes when it binds,
+and refuses to send its bearer token to any other address.
 
 ## Verification
 

@@ -11,7 +11,7 @@ Releases before v0.27.0 predate the changelog.
 
 - **Sandbox Service** (`preloop-sandbox`) replaces `preloop-vm`; the
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
-  service. The AgentENV backend moved to the private build.
+  service.
 - **Sandbox Service: provider cordon/drain, pagination and request caps.**
   `CordonProvider`/`UncordonProvider`/`DrainProvider` (and
   `preloop sandbox provider …`) stop new placements and release idle pool
@@ -41,6 +41,8 @@ Releases before v0.27.0 predate the changelog.
   engine process and reading a pool-fed VM telemetry registry.
   `VmTelemetryRegistry`, `VmRuntimeInfo`, and `build_fleet_snapshot` are
   removed; the runner pool no longer pushes VM identities into telemetry.
+
+## [0.35.6] - 2026-10-21
 
 ### Added
 - **Code-scanning SARIF ingestion.** `github/codeql-action/upload-sarif` now
@@ -86,9 +88,9 @@ Releases before v0.27.0 predate the changelog.
   Actions and Rust; dependency review blocks high-severity additions; and
   OpenSSF Scorecard runs weekly. The published runner image is now signed with
   keyless cosign and has a registry-backed provenance attestation. The golden
-  scan also requires the aarch64 apt SBOM and scans it with Grype, and the
-  main ruleset no longer allows direct pushes (admins may still merge a PR),
-  and the release-tag ruleset restricts tag creation.
+  scan also requires the aarch64 apt SBOM and scans it with Grype; the main
+  ruleset blocks direct pushes while still allowing an admin PR merge, and the
+  release-tag ruleset restricts tag creation.
 
 ### Fixed
 
@@ -160,6 +162,16 @@ Releases before v0.27.0 predate the changelog.
   An entry is retired only under the same per-entry lock a refresh takes, and
   never while a capture pin or an alternates reference protects it; clone
   hardlinks make the ceiling soft.
+
+- **Strict job assignments can no longer strand a ready job.** With
+  `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` on, a job is claimable only while it has a
+  `job_assignments` or `provision_requests` row. Every path that returns a job
+  to the ready queue now derives that intent exactly as enqueue does: requeue
+  after a runner purge (or boot reconcile), deferred matrix/reusable expansion
+  legs, and an enqueue with the pool off (which previously wrote no provision
+  mark at all under strict assignments). A 10 s reaper backstop repairs any
+  ready job that still has no row and logs the count at info, so a missed path
+  can no longer stall the queue until a restart.
 
 ## [0.35.5] - 2026-10-21
 
@@ -3420,7 +3432,8 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.5...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.6...HEAD
+[0.35.6]: https://github.com/preloopdev/preloop/compare/v0.35.5...v0.35.6
 [0.35.5]: https://github.com/preloopdev/preloop/compare/v0.35.0...v0.35.5
 [0.35.0]: https://github.com/preloopdev/preloop/compare/v0.34.4...v0.35.0
 [0.33.7]: https://github.com/preloopdev/preloop/compare/v0.33.6...v0.33.7
