@@ -23,7 +23,7 @@ import "preloop/sandbox/v1/sandbox.proto";
 
 // Bumped on incompatible changes. The agent refuses a plugin whose major
 // version differs from its own.
-// Current: 1.
+// Current: 2.
 
 service Driver {
   // Identity, protocol version and capabilities. Called once at start and
@@ -48,13 +48,15 @@ service Driver {
   // exec succeeds.
   rpc CancelExec(CancelExecRequest) returns (preloop.sandbox.v1.Empty);
 
-  // Copy a tar archive the agent staged at `host_tar` into `guest_dir`.
-  // The plugin runs on the same host and reads the file directly.
-  rpc CopyIn(CopyInRequest) returns (preloop.sandbox.v1.Empty);
+  // Extract a tar archive streamed by the agent into `guest_dir`. The first
+  // request carries `native_ref` and `guest_dir`; the rest carry `data`. The
+  // agent ends with `eof`, or with `error` when its source failed, so a
+  // truncated archive is never extracted. No host file is involved.
+  rpc CopyIn(stream CopyInRequest) returns (preloop.sandbox.v1.Empty);
 
-  // Write a tar archive of `guest_path` to `host_tar` (created by the agent,
-  // writable by the plugin).
-  rpc CopyOut(CopyOutRequest) returns (preloop.sandbox.v1.Empty);
+  // Stream a tar archive of `guest_path` to the agent. The stream ends after
+  // an `eof` message; a failure is the RPC's final status.
+  rpc CopyOut(CopyOutRequest) returns (stream CopyOutResponse);
 
   // Every sandbox this plugin owns on this host.
   rpc Inventory(InventoryRequest) returns (InventoryResponse);
@@ -106,14 +108,20 @@ message CancelExecRequest {
 
 message CopyInRequest {
   string native_ref = 1;
-  string host_tar = 2;
-  string guest_dir = 3;
+  string guest_dir = 2;
+  bytes data = 3;
+  bool eof = 4;
+  string error = 5;
 }
 
 message CopyOutRequest {
   string native_ref = 1;
   string guest_path = 2;
-  string host_tar = 3;
+}
+
+message CopyOutResponse {
+  bytes data = 1;
+  bool eof = 2;
 }
 
 message InventoryRequest {}

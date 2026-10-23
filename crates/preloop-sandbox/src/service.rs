@@ -7,7 +7,7 @@
 //! results fenced by their registration generation.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,12 +17,12 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::api::*;
-use crate::driver::EXEC_TIMED_OUT;
+use crate::driver::{EXEC_TIMED_OUT, TRANSFER_QUEUE, TransferChunk};
 use crate::error::{Code, Error, Result};
 use crate::placement::{Candidate, CandidateId, LeastLoaded, Placement, PlacementRequest};
 use crate::store::{Kind, Store};
@@ -41,9 +41,7 @@ pub struct ServiceConfig {
     pub create_timeout: Duration,
     /// Default preservation window.
     pub preserve_ttl: Duration,
-    /// Directory for data-plane blobs.
-    pub blob_dir: PathBuf,
-    /// Maximum bytes accepted for one blob upload (data plane).
+    /// Maximum bytes accepted for one transfer (data plane).
     pub blob_max_bytes: u64,
     /// How long a data-plane ticket stays valid.
     pub ticket_ttl: Duration,
@@ -75,15 +73,14 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
-    /// Defaults with blobs under `blob_dir`.
-    pub fn new(blob_dir: PathBuf) -> Self {
+    /// Defaults.
+    pub fn new() -> Self {
         Self {
             lease_ttl: Duration::from_secs(3600),
             acquire_wait: Duration::from_secs(900),
             provider_timeout: Duration::from_secs(45),
             create_timeout: Duration::from_secs(1800),
             preserve_ttl: Duration::from_secs(600),
-            blob_dir,
             blob_max_bytes: DEFAULT_BLOB_MAX_BYTES,
             ticket_ttl: Duration::from_secs(300),
             work_timeout: Duration::from_secs(900),
@@ -95,6 +92,12 @@ impl ServiceConfig {
             exec_timeout: Duration::from_secs(3600),
             ca: None,
         }
+    }
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -159,24 +162,16 @@ fn now() -> i64 {
         .unwrap_or_default()
 }
 
-/// Remove every file a previous process left in the blob directory.
-fn sweep_blob_dir(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => info!(path = %path.display(), "removed orphaned sandbox blob"),
-                Err(error) => warn!(
-                    path = %path.display(),
-                    %error,
-                    "could not remove orphaned sandbox blob"
-                ),
-            }
-        }
-    }
+/// Wait for a copy's report, bounded by the service's work timeout.
+pub(crate) async fn await_copy(
+    reply: oneshot::Receiver<Result<String>>,
+    timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, reply)
+        .await
+        .map_err(|_| Error::unavailable("provider did not report the copy"))?
+        .map_err(|_| Error::unavailable("provider dropped the copy"))?
+        .map(|_| ())
 }
 
 fn new_id(prefix: &str) -> String {
@@ -386,14 +381,77 @@ impl futures::Stream for ExecStream {
     }
 }
 
-/// Data-plane blob for one ticket.
+/// Which end of a transfer a caller is claiming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferSide {
+    /// Supplies the bytes.
+    Producer,
+    /// Consumes the bytes.
+    Consumer,
+}
+
+/// State two peers rendezvous on before bytes flow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferStatus {
+    /// Only one side has claimed the ticket.
+    Open,
+    /// Both sides are present; bytes may flow.
+    Ready,
+    /// The transfer ended before it completed.
+    Aborted(String),
+}
+
+/// One side's claim on a data-plane ticket.
+///
+/// Exactly one producer and one consumer may claim a ticket, and each claim
+/// takes its endpoint out of the ticket, so a duplicate claim fails rather
+/// than aliasing a live stream.
+#[derive(Debug)]
+pub struct StreamClaim {
+    /// Sandbox the copy targets.
+    pub sandbox_id: String,
+    /// Direction of the ticket.
+    pub kind: StreamKind,
+    /// Guest directory for uploads, guest path for downloads.
+    pub guest_path: String,
+    /// Ticket id, for cleanup helpers.
+    pub ticket: String,
+    status: watch::Receiver<TransferStatus>,
+    producer: Option<mpsc::Sender<TransferChunk>>,
+    consumer: Option<mpsc::Receiver<TransferChunk>>,
+}
+
+impl StreamClaim {
+    /// Take the producer's sending end (only a producer claim has one).
+    pub fn take_producer(&mut self) -> Option<mpsc::Sender<TransferChunk>> {
+        self.producer.take()
+    }
+
+    /// Take the consumer's receiving end (only a consumer claim has one).
+    pub fn take_consumer(&mut self) -> Option<mpsc::Receiver<TransferChunk>> {
+        self.consumer.take()
+    }
+}
+
+/// Data-plane ticket: a single-use rendezvous for one tar stream.
+///
+/// The bytes move through the bounded channel created here; the ticket holds
+/// only a token, the guest path and the two claim markers, never the payload.
 struct Blob {
     sandbox_id: String,
     kind: StreamKind,
     guest_path: String,
     token: String,
     expires_at: i64,
-    path: PathBuf,
+    producer_claimed: bool,
+    consumer_claimed: bool,
+    status: watch::Sender<TransferStatus>,
+    tx: Option<mpsc::Sender<TransferChunk>>,
+    rx: Option<mpsc::Receiver<TransferChunk>>,
+    /// A producer-side clone the service keeps to deliver an abort reason to
+    /// the consumer. Cleared when the producer finishes or aborts, because a
+    /// lingering clone would keep the consumer's channel open forever.
+    control: Option<mpsc::Sender<TransferChunk>>,
 }
 
 /// Per-sandbox creation parameters kept for (re)provisioning and audit.
@@ -535,12 +593,6 @@ struct Op {
 impl Service {
     /// Construct and restore from the store.
     pub async fn open(store: Arc<dyn Store>, config: ServiceConfig) -> Result<Arc<Self>> {
-        std::fs::create_dir_all(&config.blob_dir)
-            .map_err(|e| Error::internal(format!("blob dir: {e}")))?;
-        // Tickets are memory-only, so every file left in the blob directory
-        // belongs to a previous process: an upload interrupted by shutdown or
-        // a staging tar whose call never finished. Nothing can claim them.
-        sweep_blob_dir(&config.blob_dir);
         let mut state = State::default();
         for template in load::<Template>(&*store, Kind::Templates).await? {
             state.templates.insert(template.spec.name.clone(), template);
@@ -779,9 +831,10 @@ impl Service {
 
     /// One maintenance pass (exposed for tests).
     pub async fn maintain(&self) {
-        let ops = {
+        let (ops, expired_tickets) = {
             let mut state = self.state.lock();
             let mut ops = Vec::new();
+            let mut expired_tickets = Vec::new();
             let t = now();
             // Expired leases and preservation windows.
             let expired: Vec<String> = state
@@ -849,18 +902,16 @@ impl Service {
             for work_id in stale_work {
                 self.expire_pending_locked(&mut state, &work_id, &mut ops);
             }
-            // Expired tickets.
+            // Expired tickets: a peer never arrived (short claim TTL) or a
+            // claimed transfer outlived the work deadline. Aborting outside
+            // the lock delivers the failure to whoever is still reading.
             let stale: Vec<String> = state
                 .blobs
                 .iter()
                 .filter(|(_, blob)| blob.expires_at <= t)
                 .map(|(ticket, _)| ticket.clone())
                 .collect();
-            for ticket in stale {
-                if let Some(blob) = state.blobs.remove(&ticket) {
-                    let _ = std::fs::remove_file(&blob.path);
-                }
-            }
+            expired_tickets.extend(stale);
             // Sandboxes on a provider that has gone silent: nothing will ever
             // report for them, so fail them rather than leave leases and exec
             // streams open forever.
@@ -976,8 +1027,11 @@ impl Service {
                         (sandbox_state.to_owned(), provider, template, count)
                     },
                 ));
-            ops
+            (ops, expired_tickets)
         };
+        for ticket in expired_tickets {
+            self.abort_ticket(&ticket, "transfer ticket expired").await;
+        }
         if !ops.is_empty() {
             self.changed.notify_waiters();
         }
@@ -2101,41 +2155,31 @@ impl Service {
         if inject.files.is_empty() || self.state.lock().injected.contains(&lease.id) {
             return Ok(());
         }
-        // Group files by directory into one tar per call: extract at `/`.
-        let tar_path = self
-            .config
-            .blob_dir
-            .join(format!("inject-{}.tar", lease.id));
-        {
-            let file = std::fs::File::create(&tar_path)
-                .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
-            let mut builder = tar::Builder::new(file);
-            for spec in &inject.files {
-                let path = spec.path.trim_start_matches('/');
-                if path.is_empty() || path.split('/').any(|p| p == "..") {
-                    return Err(Error::invalid_argument(format!(
-                        "bad inject path `{}`",
-                        spec.path
-                    )));
-                }
-                let mut header = tar::Header::new_gnu();
-                header.set_size(spec.data.len() as u64);
-                header.set_mode(if spec.mode == 0 { 0o644 } else { spec.mode });
-                header.set_mtime(now() as u64);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, path, spec.data.as_slice())
-                    .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+        // Build the tar in memory: the files arrived in the unary request and
+        // are already capped by the Connect body limit, so there is no reason
+        // to stage a copy anywhere. Extraction is at `/`.
+        let mut builder = tar::Builder::new(Vec::new());
+        for spec in &inject.files {
+            let path = spec.path.trim_start_matches('/');
+            if path.is_empty() || path.split('/').any(|p| p == "..") {
+                return Err(Error::invalid_argument(format!(
+                    "bad inject path `{}`",
+                    spec.path
+                )));
             }
+            let mut header = tar::Header::new_gnu();
+            header.set_size(spec.data.len() as u64);
+            header.set_mode(if spec.mode == 0 { 0o644 } else { spec.mode });
+            header.set_mtime(now() as u64);
+            header.set_cksum();
             builder
-                .finish()
+                .append_data(&mut header, path, spec.data.as_slice())
                 .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
         }
-        let result = self
-            .upload_path(&sandbox.id, &lease.id, "/", &tar_path)
-            .await;
-        let _ = std::fs::remove_file(&tar_path);
-        result?;
+        let bytes = builder
+            .into_inner()
+            .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+        self.upload_bytes(&sandbox.id, "/", bytes).await?;
         self.state.lock().injected.insert(lease.id.clone());
         Ok(())
     }
@@ -2486,6 +2530,9 @@ impl Service {
     // ─── Data plane ────────────────────────────────────────────────
 
     /// `OpenStream`: issue a ticket.
+    ///
+    /// The ticket is a single-use rendezvous, not a file: the caller and the
+    /// agent claim opposite sides and the tar bytes flow between them.
     pub fn open_stream(&self, request: OpenStreamRequest) -> Result<Ticket> {
         if request.kind.as_known().unwrap_or_default() == StreamKind::StreamKindUnspecified {
             return Err(Error::invalid_argument("kind is required"));
@@ -2503,19 +2550,15 @@ impl Service {
             .ok_or_else(|| Error::not_found("sandbox not found"))?;
         authorize(&state, sandbox, &request.lease_id)?;
         Self::usable(sandbox)?;
-        let ticket = new_id("tkt");
         let token = uuid::Uuid::new_v4().simple().to_string();
         let expires_at = now() + self.config.ticket_ttl.as_secs() as i64;
-        state.blobs.insert(
-            ticket.clone(),
-            Blob {
-                sandbox_id: request.sandbox_id,
-                kind: request.kind.as_known().unwrap_or_default(),
-                guest_path: request.path,
-                token: token.clone(),
-                expires_at,
-                path: self.config.blob_dir.join(format!("{ticket}.tar")),
-            },
+        let ticket = Self::insert_ticket_locked(
+            &mut state,
+            expires_at,
+            request.sandbox_id,
+            request.kind.as_known().unwrap_or_default(),
+            request.path,
+            token.clone(),
         );
         Ok(Ticket {
             url: format!("/sandbox/v1/streams/{ticket}"),
@@ -2525,141 +2568,407 @@ impl Service {
         })
     }
 
-    /// Validate a client ticket; returns `(kind, blob path)`.
-    pub fn claim_ticket(&self, ticket: &str, token: &str) -> Result<(StreamKind, PathBuf)> {
-        let state = self.state.lock();
+    /// Insert a ticket with fresh channel ends. Caller holds the state lock.
+    fn insert_ticket_locked(
+        state: &mut State,
+        expires_at: i64,
+        sandbox_id: String,
+        kind: StreamKind,
+        guest_path: String,
+        token: String,
+    ) -> String {
+        let ticket = new_id("tkt");
+        let (tx, rx) = mpsc::channel(TRANSFER_QUEUE);
+        let control = tx.clone();
+        let (status, _) = watch::channel(TransferStatus::Open);
+        state.blobs.insert(
+            ticket.clone(),
+            Blob {
+                sandbox_id,
+                kind,
+                guest_path,
+                token,
+                expires_at,
+                producer_claimed: false,
+                consumer_claimed: false,
+                status,
+                tx: Some(tx),
+                rx: Some(rx),
+                control: Some(control),
+            },
+        );
+        ticket
+    }
+
+    /// Claim one side of a ticket. Caller holds the state lock.
+    ///
+    /// Only a caller upload and an agent fetch may produce/consume an upload
+    /// ticket; a download ticket is the mirror image. Each side is claimable
+    /// once, and the second claim releases the rendezvous.
+    fn claim_locked(
+        &self,
+        state: &mut State,
+        ticket: &str,
+        side: TransferSide,
+    ) -> Result<StreamClaim> {
+        let ticket_ttl = self.config.work_timeout;
+        let blob = state
+            .blobs
+            .get_mut(ticket)
+            .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
+        let already = match side {
+            TransferSide::Producer => std::mem::replace(&mut blob.producer_claimed, true),
+            TransferSide::Consumer => std::mem::replace(&mut blob.consumer_claimed, true),
+        };
+        if already {
+            return Err(Error::failed_precondition(
+                "that side of the transfer was already claimed",
+            ));
+        }
+        if blob.producer_claimed && blob.consumer_claimed {
+            blob.status.send_replace(TransferStatus::Ready);
+            // A claimed transfer gets the longer work deadline instead of the
+            // short ticket TTL: both peers are now present and a large copy
+            // must not be cut off by the claim window.
+            blob.expires_at = now() + ticket_ttl.as_secs() as i64;
+        }
+        let (producer, consumer) = match side {
+            TransferSide::Producer => (blob.tx.take(), None),
+            TransferSide::Consumer => (None, blob.rx.take()),
+        };
+        Ok(StreamClaim {
+            sandbox_id: blob.sandbox_id.clone(),
+            kind: blob.kind,
+            guest_path: blob.guest_path.clone(),
+            ticket: ticket.to_owned(),
+            status: blob.status.subscribe(),
+            producer,
+            consumer,
+        })
+    }
+
+    /// Claim the caller's side of a ticket with its bearer token.
+    ///
+    /// Upload tickets are claimed by their producer (`PUT /streams`),
+    /// download tickets by their consumer (`GET /streams`).
+    pub fn claim_caller(
+        &self,
+        ticket: &str,
+        token: &str,
+        side: TransferSide,
+    ) -> Result<StreamClaim> {
+        let mut state = self.state.lock();
         let blob = state
             .blobs
             .get(ticket)
-            .filter(|blob| blob.expires_at > now())
             .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
+        if blob.expires_at <= now() {
+            return Err(Error::not_found("ticket not found or expired"));
+        }
         if !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
             return Err(Error::new(Code::Unauthenticated, "bad ticket token"));
         }
-        Ok((blob.kind, blob.path.clone()))
-    }
-
-    /// Complete an upload ticket whose tar landed at its blob path: extract
-    /// it in the guest. Consumes the ticket.
-    pub async fn finish_upload(&self, ticket: &str) -> Result<()> {
-        let (sandbox_id, guest_path, path) = {
-            let mut state = self.state.lock();
-            let blob = state
-                .blobs
-                .remove(ticket)
-                .ok_or_else(|| Error::not_found("ticket not found"))?;
-            (blob.sandbox_id, blob.guest_path, blob.path)
+        let expected = match side {
+            TransferSide::Producer => StreamKind::Upload,
+            TransferSide::Consumer => StreamKind::Download,
         };
-        let result = self.stage_upload(&sandbox_id, &guest_path, &path).await;
-        let _ = std::fs::remove_file(&path);
-        result
-    }
-
-    /// Fill a download ticket's blob with a tar of the guest path.
-    /// The caller streams the file and then calls [`Service::drop_ticket`].
-    pub async fn prepare_download(&self, ticket: &str) -> Result<PathBuf> {
-        let (sandbox_id, guest_path, path) = {
-            let state = self.state.lock();
-            let blob = state
-                .blobs
-                .get(ticket)
-                .ok_or_else(|| Error::not_found("ticket not found"))?;
-            (
-                blob.sandbox_id.clone(),
-                blob.guest_path.clone(),
-                blob.path.clone(),
-            )
-        };
-        self.copy_work(&sandbox_id, ticket, &guest_path, StreamKind::Download)
-            .await?;
-        Ok(path)
-    }
-
-    /// Forget a ticket and its blob.
-    pub fn drop_ticket(&self, ticket: &str) {
-        if let Some(blob) = self.state.lock().blobs.remove(ticket) {
-            let _ = std::fs::remove_file(blob.path);
+        if blob.kind != expected {
+            return Err(Error::invalid_argument(if expected == StreamKind::Upload {
+                "ticket is not an upload"
+            } else {
+                "ticket is not a download"
+            }));
         }
+        self.claim_locked(&mut state, ticket, side)
+    }
+
+    /// Claim the agent's side of a ticket (provider must own the sandbox).
+    pub fn claim_agent(
+        &self,
+        provider_id: &str,
+        generation: u64,
+        ticket: &str,
+        side: TransferSide,
+    ) -> Result<StreamClaim> {
+        let mut state = self.state.lock();
+        self.fence(&state, provider_id, generation)?;
+        let blob = state
+            .blobs
+            .get(ticket)
+            .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
+        let owner = state
+            .sandboxes
+            .get(&blob.sandbox_id)
+            .map(|s| s.provider_id.as_str());
+        if owner != Some(provider_id) {
+            return Err(Error::new(
+                Code::PermissionDenied,
+                "ticket belongs to another provider",
+            ));
+        }
+        let expected = match side {
+            TransferSide::Consumer => StreamKind::Upload,
+            TransferSide::Producer => StreamKind::Download,
+        };
+        if blob.kind != expected {
+            return Err(Error::invalid_argument("ticket direction does not match"));
+        }
+        self.claim_locked(&mut state, ticket, side)
+    }
+
+    /// Wait until both sides have claimed `claim`'s ticket.
+    pub async fn wait_peer(&self, claim: &mut StreamClaim) -> Result<()> {
+        let wait = async {
+            loop {
+                let current = { claim.status.borrow_and_update().clone() };
+                match current {
+                    TransferStatus::Ready => return Ok(()),
+                    TransferStatus::Aborted(reason) => return Err(Error::unavailable(reason)),
+                    TransferStatus::Open => {
+                        if claim.status.changed().await.is_err() {
+                            return Err(Error::unavailable("transfer ticket closed"));
+                        }
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(self.config.work_timeout, wait)
+            .await
+            .map_err(|_| Error::unavailable("the peer did not claim the transfer"))?
+    }
+
+    /// Close the producer side cleanly: the consumer sees EOF.
+    ///
+    /// The producer's own sender must already be gone (the handler drops it
+    /// after its last chunk); this drops the service's control clone so the
+    /// channel does not stay open just because the ticket still exists.
+    pub fn finish_ticket(&self, ticket: &str) {
+        if let Some(blob) = self.state.lock().blobs.get_mut(ticket) {
+            blob.control.take();
+        }
+    }
+
+    /// Abort a transfer: the consumer gets a failure item, then the ticket is
+    /// forgotten. Safe to call after the peer already finished.
+    pub async fn abort_ticket(&self, ticket: &str, reason: &str) {
+        let control = {
+            let mut state = self.state.lock();
+            let Some(blob) = state.blobs.get_mut(ticket) else {
+                return;
+            };
+            blob.status
+                .send_replace(TransferStatus::Aborted(reason.to_owned()));
+            blob.control.take()
+        };
+        if let Some(tx) = control {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                tx.send(TransferChunk::Failed(reason.to_owned())),
+            )
+            .await;
+        }
+        self.remove_ticket(ticket);
+    }
+
+    /// Forget a ticket. The endpoints already handed to the peers decide when
+    /// their stream ends.
+    pub fn remove_ticket(&self, ticket: &str) {
+        self.state.lock().blobs.remove(ticket);
     }
 
     /// Extract a local tar into the guest (in-process callers). The caller
     /// must hold the sandbox's lease; data-plane tickets are their own
-    /// capability and use `stage_upload` directly.
+    /// capability.
     pub async fn upload_path(
-        &self,
+        self: &Arc<Self>,
         sandbox_id: &str,
         lease_id: &str,
         guest_dir: &str,
         tar: &Path,
     ) -> Result<()> {
         self.check_lease(sandbox_id, lease_id)?;
-        self.stage_upload(sandbox_id, guest_dir, tar).await
+        let file = tokio::fs::File::open(tar)
+            .await
+            .map_err(|e| Error::internal(format!("upload: {e}")))?;
+        let source = tokio_util::io::ReaderStream::new(file).map(|chunk| match chunk {
+            Ok(bytes) => TransferChunk::Data(bytes.to_vec()),
+            Err(error) => TransferChunk::Failed(format!("upload: {error}")),
+        });
+        self.upload_stream(sandbox_id, guest_dir, source).await
     }
 
-    /// Copy a staged tar to a fresh agent ticket and extract it in the guest.
-    async fn stage_upload(&self, sandbox_id: &str, guest_dir: &str, tar: &Path) -> Result<()> {
-        let ticket = new_id("tkt");
-        let path = self.config.blob_dir.join(format!("{ticket}.tar"));
-        std::fs::copy(tar, &path).map_err(|e| Error::internal(format!("stage upload: {e}")))?;
-        self.state.lock().blobs.insert(
-            ticket.clone(),
-            Blob {
-                sandbox_id: sandbox_id.to_owned(),
-                kind: StreamKind::Upload,
-                guest_path: guest_dir.to_owned(),
-                token: String::new(),
-                expires_at: now() + self.config.ticket_ttl.as_secs() as i64,
-                path: path.clone(),
-            },
-        );
-        let result = self
-            .copy_work(sandbox_id, &ticket, guest_dir, StreamKind::Upload)
-            .await;
-        self.drop_ticket(&ticket);
+    /// Send in-memory bytes through the same memory-only transfer path.
+    async fn upload_bytes(
+        self: &Arc<Self>,
+        sandbox_id: &str,
+        guest_dir: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let chunks: Vec<TransferChunk> = bytes
+            .chunks(64 * 1024)
+            .map(|chunk| TransferChunk::Data(chunk.to_vec()))
+            .collect();
+        self.upload_stream(sandbox_id, guest_dir, futures::stream::iter(chunks))
+            .await
+    }
+
+    /// Stream a tar into the guest through a fresh upload ticket.
+    async fn upload_stream<S>(
+        self: &Arc<Self>,
+        sandbox_id: &str,
+        guest_dir: &str,
+        mut source: S,
+    ) -> Result<()>
+    where
+        S: futures::Stream<Item = TransferChunk> + Send + Unpin,
+    {
+        let mut claim = self.open_internal(sandbox_id, StreamKind::Upload, guest_dir)?;
+        let ticket = claim.ticket.clone();
+        let reply = self
+            .start_copy(sandbox_id, &ticket, guest_dir, StreamKind::Upload)
+            .await?;
+        if let Err(error) = self.wait_peer(&mut claim).await {
+            self.abort_ticket(&ticket, crate::error::message(&error))
+                .await;
+            return Err(error);
+        }
+        let Some(tx) = claim.take_producer() else {
+            return Err(Error::internal("upload ticket has no producer side"));
+        };
+        let max_bytes = self.config.blob_max_bytes;
+        let feed = async move {
+            let mut written = 0u64;
+            while let Some(chunk) = source.next().await {
+                if let TransferChunk::Data(bytes) = &chunk {
+                    written = written.saturating_add(bytes.len() as u64);
+                    if written > max_bytes {
+                        let _ = tx
+                            .send(TransferChunk::Failed("blob exceeds the size limit".into()))
+                            .await;
+                        return Err(Error::out_of_range(format!(
+                            "blob exceeds the {max_bytes} byte limit"
+                        )));
+                    }
+                }
+                let failed = matches!(chunk, TransferChunk::Failed(_));
+                if tx.send(chunk).await.is_err() {
+                    return Err(Error::unavailable("transfer consumer went away"));
+                }
+                if failed {
+                    return Err(Error::unavailable("transfer source failed"));
+                }
+            }
+            drop(tx);
+            Ok(())
+        }
+        .await;
+        // Close the consumer's stream before waiting for its report: the
+        // driver only finishes extraction at EOF and reports afterwards.
+        self.finish_ticket(&ticket);
+        let result = match feed {
+            Ok(()) => await_copy(reply, self.config.work_timeout).await,
+            Err(error) => {
+                self.abort_ticket(&ticket, crate::error::message(&error))
+                    .await;
+                Err(error)
+            }
+        };
+        self.remove_ticket(&ticket);
         result
     }
 
     /// Tar a guest path into a local file (in-process callers).
     pub async fn download_path(
-        &self,
+        self: &Arc<Self>,
         sandbox_id: &str,
         lease_id: &str,
         guest_path: &str,
         dest: &Path,
     ) -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
         self.check_lease(sandbox_id, lease_id)?;
-        let ticket = new_id("tkt");
-        let path = self.config.blob_dir.join(format!("{ticket}.tar"));
-        self.state.lock().blobs.insert(
-            ticket.clone(),
-            Blob {
-                sandbox_id: sandbox_id.to_owned(),
-                kind: StreamKind::Download,
-                guest_path: guest_path.to_owned(),
-                token: String::new(),
-                expires_at: now() + self.config.ticket_ttl.as_secs() as i64,
-                path: path.clone(),
-            },
-        );
-        let result = self
-            .copy_work(sandbox_id, &ticket, guest_path, StreamKind::Download)
+        let mut claim = self.open_internal(sandbox_id, StreamKind::Download, guest_path)?;
+        let ticket = claim.ticket.clone();
+        let reply = self
+            .start_copy(sandbox_id, &ticket, guest_path, StreamKind::Download)
+            .await?;
+        if let Err(error) = self.wait_peer(&mut claim).await {
+            self.abort_ticket(&ticket, crate::error::message(&error))
+                .await;
+            return Err(error);
+        }
+        let Some(mut rx) = claim.take_consumer() else {
+            return Err(Error::internal("download ticket has no consumer side"));
+        };
+        let mut file = tokio::fs::File::create(dest)
             .await
-            .and_then(|_| {
-                std::fs::copy(&path, dest)
-                    .map(|_| ())
-                    .map_err(|e| Error::internal(format!("download: {e}")))
-            });
-        self.drop_ticket(&ticket);
+            .map_err(|e| Error::internal(format!("download: {e}")))?;
+        let result = async {
+            while let Some(chunk) = rx.recv().await {
+                match chunk {
+                    TransferChunk::Data(bytes) => file
+                        .write_all(&bytes)
+                        .await
+                        .map_err(|e| Error::internal(format!("download: {e}")))?,
+                    TransferChunk::Failed(reason) => {
+                        return Err(Error::unavailable(reason));
+                    }
+                }
+            }
+            file.flush()
+                .await
+                .map_err(|e| Error::internal(format!("download: {e}")))
+        }
+        .await;
+        drop(rx);
+        let result = match result {
+            Ok(()) => await_copy(reply, self.config.work_timeout).await,
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(dest).await;
+        }
+        self.remove_ticket(&ticket);
         result
     }
 
-    async fn copy_work(
+    /// Create a ticket and claim the service's side of it.
+    fn open_internal(
+        &self,
+        sandbox_id: &str,
+        kind: StreamKind,
+        guest_path: &str,
+    ) -> Result<StreamClaim> {
+        let mut state = self.state.lock();
+        let ticket = Self::insert_ticket_locked(
+            &mut state,
+            now() + self.config.ticket_ttl.as_secs() as i64,
+            sandbox_id.to_owned(),
+            kind,
+            guest_path.to_owned(),
+            String::new(),
+        );
+        let side = match kind {
+            StreamKind::Upload => TransferSide::Producer,
+            StreamKind::Download => TransferSide::Consumer,
+            StreamKind::StreamKindUnspecified => {
+                return Err(Error::invalid_argument("transfer kind is unset"));
+            }
+        };
+        self.claim_locked(&mut state, &ticket, side)
+    }
+
+    /// Queue the copy work item and return the report receiver.
+    ///
+    /// The caller enqueues before either side waits: the agent learns about
+    /// the ticket only from this item, so it can never claim first.
+    pub(crate) async fn start_copy(
         &self,
         sandbox_id: &str,
         ticket: &str,
         guest_path: &str,
         kind: StreamKind,
-    ) -> Result<()> {
+    ) -> Result<oneshot::Receiver<Result<String>>> {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock();
@@ -2688,34 +2997,10 @@ impl Service {
                 Pending::Copy { reply: tx },
             )?;
         }
-        tokio::time::timeout(self.config.work_timeout, rx)
-            .await
-            .map_err(|_| Error::unavailable("provider did not report the copy"))?
-            .map_err(|_| Error::unavailable("provider dropped the copy"))?
-            .map(|_| ())
+        Ok(rx)
     }
 
-    /// Blob path for an agent (provider must own the ticket's sandbox).
-    pub fn agent_blob(&self, provider_id: &str, generation: u64, ticket: &str) -> Result<PathBuf> {
-        let state = self.state.lock();
-        self.fence(&state, provider_id, generation)?;
-        let blob = state
-            .blobs
-            .get(ticket)
-            .ok_or_else(|| Error::not_found("ticket not found"))?;
-        let owner = state
-            .sandboxes
-            .get(&blob.sandbox_id)
-            .map(|s| s.provider_id.as_str());
-        if owner != Some(provider_id) {
-            return Err(Error::new(
-                Code::PermissionDenied,
-                "ticket belongs to another provider",
-            ));
-        }
-        Ok(blob.path.clone())
-    }
-
+    // ─── Snapshot / pause / resume ─────────────────────────────────
     // ─── Snapshot / pause / resume ─────────────────────────────────
 
     /// `Snapshot`: capture a leased, snapshot-capable sandbox as a template.

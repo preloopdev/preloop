@@ -29,10 +29,11 @@ use connectrpc::{
     ServiceStream,
 };
 use futures::StreamExt as _;
-use tokio::io::AsyncWriteExt as _;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::*;
+use crate::driver::TransferChunk;
 use crate::error::{Error, Result};
 use crate::generated::preloop::sandbox::v1::{
     Empty, Providers, ProvidersExt, Sandboxes, SandboxesExt,
@@ -763,7 +764,7 @@ async fn ca_pem(State(app): State<AppState>) -> Response {
     }
 }
 
-/// A rejected blob body: the cap was exceeded or the transfer failed.
+/// A rejected upload body: the cap was exceeded or the transfer failed.
 enum BodyWriteError {
     TooLarge(u64),
     Failed(Error),
@@ -806,63 +807,93 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
-async fn remove_partial(path: &std::path::Path) {
-    let _ = tokio::fs::remove_file(path).await;
-}
-
-async fn write_body(
-    path: &std::path::Path,
+/// Pump a request body into a transfer's producer channel.
+///
+/// The cap is enforced here, on the bytes actually received, so a lying
+/// `Content-Length` cannot overrun it. A body error or a vanished consumer
+/// sends `Failed`, which the peer turns into a failed extraction instead of a
+/// plausible-looking truncated archive.
+async fn pump_upload(
     body: Body,
+    tx: mpsc::Sender<TransferChunk>,
     max_bytes: u64,
 ) -> std::result::Result<(), BodyWriteError> {
-    let mut file = tokio::fs::File::create(path)
-        .await
-        .map_err(|e| Error::internal(format!("blob write: {e}")))?;
-    let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
+    let mut written = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
-                drop(file);
-                remove_partial(path).await;
-                return Err(Error::unavailable(format!("upload: {error}")).into());
+                let reason = format!("upload: {error}");
+                let _ = tx.send(TransferChunk::Failed(reason.clone())).await;
+                return Err(Error::unavailable(reason).into());
             }
         };
         written = written.saturating_add(chunk.len() as u64);
         if written > max_bytes {
-            drop(file);
-            remove_partial(path).await;
+            let _ = tx
+                .send(TransferChunk::Failed("blob exceeds the size limit".into()))
+                .await;
             return Err(BodyWriteError::TooLarge(max_bytes));
         }
-        if let Err(error) = file.write_all(&chunk).await {
-            drop(file);
-            remove_partial(path).await;
-            return Err(Error::internal(format!("blob write: {error}")).into());
+        if tx.send(TransferChunk::Data(chunk.to_vec())).await.is_err() {
+            return Err(Error::unavailable("transfer consumer went away").into());
         }
     }
-    if let Err(error) = file.flush().await {
-        drop(file);
-        remove_partial(path).await;
-        return Err(Error::internal(format!("blob write: {error}")).into());
-    }
+    drop(tx);
     Ok(())
 }
 
-async fn file_response(path: &std::path::Path) -> Result<Response> {
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| Error::internal(format!("blob read: {e}")))?;
-    let length = file.metadata().await.map(|m| m.len()).unwrap_or_default();
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/x-tar".to_owned()),
-            (header::CONTENT_LENGTH, length.to_string()),
-        ],
-        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
-    )
-        .into_response())
+/// Remove a finished ticket when the response body (or the handler's stream
+/// state) is dropped, including when the caller disconnects mid-download.
+struct TicketGuard {
+    service: Arc<Service>,
+    ticket: String,
+}
+
+impl Drop for TicketGuard {
+    fn drop(&mut self) {
+        self.service.remove_ticket(&self.ticket);
+    }
+}
+
+fn chunk_item(chunk: TransferChunk) -> std::result::Result<Vec<u8>, std::io::Error> {
+    match chunk {
+        TransferChunk::Data(bytes) => Ok(bytes),
+        TransferChunk::Failed(reason) => Err(std::io::Error::other(reason)),
+    }
+}
+
+/// A response body that streams a transfer's consumer side.
+fn transfer_body(
+    rx: mpsc::Receiver<TransferChunk>,
+    first: Option<TransferChunk>,
+    guard: Option<TicketGuard>,
+) -> Body {
+    Body::from_stream(futures::stream::unfold(
+        (rx, first, guard),
+        |(mut rx, first, guard)| async move {
+            if let Some(chunk) = first {
+                return Some((chunk_item(chunk), (rx, None, guard)));
+            }
+            rx.recv()
+                .await
+                .map(|chunk| (chunk_item(chunk), (rx, None, guard)))
+        },
+    ))
+}
+
+/// Take the first transfer item, bounded so an agent that claimed but never
+/// sends cannot hold the caller's headers open forever.
+async fn first_item(
+    service: &Service,
+    rx: &mut mpsc::Receiver<TransferChunk>,
+) -> Result<TransferChunk> {
+    match tokio::time::timeout(service.config().work_timeout, rx.recv()).await {
+        Ok(Some(chunk)) => Ok(chunk),
+        Ok(None) => Err(Error::internal("transfer produced no bytes")),
+        Err(_) => Err(Error::unavailable("transfer did not start")),
+    }
 }
 
 async fn stream_upload(
@@ -873,25 +904,59 @@ async fn stream_upload(
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
     let max_bytes = app.service.config().blob_max_bytes;
-    let (kind, path) = match app.service.claim_ticket(&ticket, token) {
-        Ok(claimed) => claimed,
-        Err(error) => return error.into_response(),
-    };
-    if kind != StreamKind::Upload {
-        return Error::invalid_argument("ticket is not an upload").into_response();
-    }
+    let mut claim =
+        match app
+            .service
+            .claim_caller(&ticket, token, crate::service::TransferSide::Producer)
+        {
+            Ok(claim) => claim,
+            Err(error) => return error.into_response(),
+        };
     if content_length(&headers).is_some_and(|length| length > max_bytes) {
+        app.service
+            .abort_ticket(&ticket, "blob exceeds the size limit")
+            .await;
         return payload_too_large(max_bytes);
     }
-    match write_body(&path, body, max_bytes).await {
-        Ok(()) => match app.service.finish_upload(&ticket).await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(error) => error.into_response(),
-        },
+    let reply = match app
+        .service
+        .start_copy(&claim.sandbox_id, &ticket, &claim.guest_path, claim.kind)
+        .await
+    {
+        Ok(reply) => reply,
         Err(error) => {
-            // The ticket's bytes are incomplete: consume it so nothing can
-            // extract a truncated tar.
-            app.service.drop_ticket(&ticket);
+            app.service
+                .abort_ticket(&ticket, crate::error::message(&error))
+                .await;
+            return error.into_response();
+        }
+    };
+    if let Err(error) = app.service.wait_peer(&mut claim).await {
+        app.service
+            .abort_ticket(&ticket, crate::error::message(&error))
+            .await;
+        return error.into_response();
+    }
+    let Some(tx) = claim.take_producer() else {
+        app.service.remove_ticket(&ticket);
+        return Error::internal("upload ticket has no producer side").into_response();
+    };
+    match pump_upload(body, tx, max_bytes).await {
+        Ok(()) => {
+            // Close the consumer's stream first; the agent reports only after
+            // its extraction sees EOF.
+            app.service.finish_ticket(&ticket);
+            let result = crate::service::await_copy(reply, app.service.config().work_timeout).await;
+            app.service.remove_ticket(&ticket);
+            match result {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(error) => error.into_response(),
+            }
+        }
+        Err(error) => {
+            app.service
+                .abort_ticket(&ticket, "upload did not complete")
+                .await;
             error.into_response()
         }
     }
@@ -903,19 +968,60 @@ async fn stream_download(
     headers: HeaderMap,
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
-    let result = async {
-        let (kind, _) = app.service.claim_ticket(&ticket, token)?;
-        if kind != StreamKind::Download {
-            return Err(Error::invalid_argument("ticket is not a download"));
-        }
-        let path = app.service.prepare_download(&ticket).await?;
-        let response = file_response(&path).await;
-        // The open file handle keeps the bytes readable after unlink.
-        app.service.drop_ticket(&ticket);
-        response
+    let mut claim =
+        match app
+            .service
+            .claim_caller(&ticket, token, crate::service::TransferSide::Consumer)
+        {
+            Ok(claim) => claim,
+            Err(error) => return error.into_response(),
+        };
+    if let Err(error) = app
+        .service
+        .start_copy(&claim.sandbox_id, &ticket, &claim.guest_path, claim.kind)
+        .await
+    {
+        app.service
+            .abort_ticket(&ticket, crate::error::message(&error))
+            .await;
+        return error.into_response();
     }
-    .await;
-    result.unwrap_or_else(IntoResponse::into_response)
+    if let Err(error) = app.service.wait_peer(&mut claim).await {
+        app.service
+            .abort_ticket(&ticket, crate::error::message(&error))
+            .await;
+        return error.into_response();
+    }
+    let Some(mut rx) = claim.take_consumer() else {
+        app.service.remove_ticket(&ticket);
+        return Error::internal("download ticket has no consumer side").into_response();
+    };
+    let first = match first_item(&app.service, &mut rx).await {
+        Ok(TransferChunk::Data(bytes)) => TransferChunk::Data(bytes),
+        Ok(TransferChunk::Failed(reason)) => {
+            app.service.remove_ticket(&ticket);
+            return Error::unavailable(reason).into_response();
+        }
+        Err(error) => {
+            app.service
+                .abort_ticket(&ticket, crate::error::message(&error))
+                .await;
+            return error.into_response();
+        }
+    };
+    let guard = TicketGuard {
+        service: app.service.clone(),
+        ticket,
+    };
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-tar"),
+        )],
+        transfer_body(rx, Some(first), Some(guard)),
+    )
+        .into_response()
 }
 
 fn provider_headers(headers: &HeaderMap) -> Result<(String, u64)> {
@@ -931,6 +1037,7 @@ fn provider_headers(headers: &HeaderMap) -> Result<(String, u64)> {
     Ok((id.to_owned(), generation))
 }
 
+/// The agent fetches an upload ticket's bytes (consumer side).
 async fn agent_blob_get(
     State(app): State<AppState>,
     Path(ticket): Path<String>,
@@ -941,13 +1048,37 @@ async fn agent_blob_get(
         let identity = app.service.provider_identity(peer.fingerprint()?)?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
-        let path = app.service.agent_blob(&id, generation, &ticket)?;
-        file_response(&path).await
+        let mut claim = app.service.claim_agent(
+            &id,
+            generation,
+            &ticket,
+            crate::service::TransferSide::Consumer,
+        )?;
+        app.service.wait_peer(&mut claim).await?;
+        let Some(mut rx) = claim.take_consumer() else {
+            return Err(Error::internal("upload ticket has no consumer side"));
+        };
+        let first = first_item(&app.service, &mut rx).await?;
+        if let TransferChunk::Failed(reason) = first {
+            return Err(Error::unavailable(reason));
+        }
+        Ok((
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-tar"),
+            )],
+            // The caller owns this ticket's lifetime; the agent's response
+            // body must not remove it.
+            transfer_body(rx, Some(first), None),
+        )
+            .into_response())
     }
     .await;
     result.unwrap_or_else(IntoResponse::into_response)
 }
 
+/// The agent produces a download ticket's bytes (producer side).
 async fn agent_blob_put(
     State(app): State<AppState>,
     Path(ticket): Path<String>,
@@ -959,20 +1090,45 @@ async fn agent_blob_put(
         let identity = app.service.provider_identity(peer.fingerprint()?)?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
-        let path = app.service.agent_blob(&id, generation, &ticket)?;
-        Ok::<_, Error>(path)
+        app.service.claim_agent(
+            &id,
+            generation,
+            &ticket,
+            crate::service::TransferSide::Producer,
+        )
     }
     .await;
-    let path = match result {
-        Ok(path) => path,
+    let mut claim = match result {
+        Ok(claim) => claim,
         Err(error) => return error.into_response(),
     };
     let max_bytes = app.service.config().blob_max_bytes;
     if content_length(&headers).is_some_and(|length| length > max_bytes) {
+        app.service
+            .abort_ticket(&ticket, "blob exceeds the size limit")
+            .await;
         return payload_too_large(max_bytes);
     }
-    match write_body(&path, body, max_bytes).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => error.into_response(),
+    if let Err(error) = app.service.wait_peer(&mut claim).await {
+        app.service
+            .abort_ticket(&ticket, crate::error::message(&error))
+            .await;
+        return error.into_response();
+    }
+    let Some(tx) = claim.take_producer() else {
+        app.service.remove_ticket(&ticket);
+        return Error::internal("download ticket has no producer side").into_response();
+    };
+    match pump_upload(body, tx, max_bytes).await {
+        Ok(()) => {
+            app.service.finish_ticket(&ticket);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            app.service
+                .abort_ticket(&ticket, "download did not complete")
+                .await;
+            error.into_response()
+        }
     }
 }

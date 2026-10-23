@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use preloop_sandbox::Result as DriverResult;
 use preloop_sandbox::agent::{Agent, AgentConfig};
 use preloop_sandbox::api::*;
+use preloop_sandbox::driver::TransferChunk;
 use preloop_sandbox::driver_conformance::{self, CaseResult, ConformanceOptions};
 use preloop_sandbox::driver_plugin;
 use preloop_sandbox::drivers::external::{ExternalDriver, ExternalSpec};
@@ -220,11 +221,21 @@ impl Driver for LimitedDriver {
         self.0.cancel_exec(native_ref, exec_id).await
     }
 
-    async fn copy_in(&self, native_ref: &str, tar: &Path, guest_dir: &str) -> DriverResult<()> {
-        self.0.copy_in(native_ref, tar, guest_dir).await
+    async fn copy_in(
+        &self,
+        native_ref: &str,
+        guest_dir: &str,
+        tar: mpsc::Receiver<TransferChunk>,
+    ) -> DriverResult<()> {
+        self.0.copy_in(native_ref, guest_dir, tar).await
     }
 
-    async fn copy_out(&self, native_ref: &str, guest_path: &str, tar: &Path) -> DriverResult<()> {
+    async fn copy_out(
+        &self,
+        native_ref: &str,
+        guest_path: &str,
+        tar: mpsc::Sender<TransferChunk>,
+    ) -> DriverResult<()> {
         self.0.copy_out(native_ref, guest_path, tar).await
     }
 
@@ -271,7 +282,7 @@ async fn external_driver_carries_the_agent_flow() {
 
     let service = common::TestService::start().await;
     let link = service.enroll("external-host").await;
-    let mut config = AgentConfig::new("external-host", service.dir.path().join("scratch"));
+    let mut config = AgentConfig::new("external-host");
     config.heartbeat = Duration::from_millis(50);
     let agent = Agent::new(Arc::new(link), vec![Arc::clone(&driver)], config);
     tokio::spawn(agent.run(service.shutdown_token()));

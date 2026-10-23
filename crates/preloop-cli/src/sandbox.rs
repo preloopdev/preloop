@@ -60,8 +60,8 @@ fn placement_from_env() -> anyhow::Result<Arc<dyn Placement>> {
 }
 
 /// Service tuning: defaults overridden by the documented environment.
-fn service_config(state: &Path) -> anyhow::Result<ServiceConfig> {
-    let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
+fn service_config(_state: &Path) -> anyhow::Result<ServiceConfig> {
+    let mut config = ServiceConfig::new();
     if let Some(raw) = env_nonempty("PRELOOP_SANDBOX_BLOB_MAX_BYTES") {
         config.blob_max_bytes = raw.parse().with_context(|| {
             format!("PRELOOP_SANDBOX_BLOB_MAX_BYTES must be a byte count, got `{raw}`")
@@ -87,8 +87,8 @@ fn service_config(state: &Path) -> anyhow::Result<ServiceConfig> {
 }
 
 /// Agent tuning: defaults overridden by the documented environment.
-fn sandbox_agent_config(name: impl Into<String>, scratch: PathBuf) -> AgentConfig {
-    let mut config = AgentConfig::new(name, scratch);
+fn sandbox_agent_config(name: impl Into<String>) -> AgentConfig {
+    let mut config = AgentConfig::new(name);
     if let Some(value) = env_nonempty("PRELOOP_SANDBOX_AGENT_CONCURRENCY")
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -248,9 +248,7 @@ impl LocalSandboxes {
             access.allow_mounts(pool.sandbox_mount_prefixes());
             access.allow_sockets(pool.sandbox_socket_prefixes());
         }
-        let mut agent_config =
-            sandbox_agent_config(local_provider_name(), state.join("sandbox-agent"))
-                .with_access(access);
+        let mut agent_config = sandbox_agent_config(local_provider_name()).with_access(access);
         agent_config.metrics = metrics;
         let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -1225,8 +1223,7 @@ async fn serve_standalone(
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {
-        let mut agent_config =
-            sandbox_agent_config(local_provider_name(), state.join("sandbox-agent"));
+        let mut agent_config = sandbox_agent_config(local_provider_name());
         agent_config.metrics = metrics;
         let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -1291,8 +1288,7 @@ async fn run_agent(
     // An existing identity owns the name it was enrolled under.
     let name = link.name().unwrap_or(initial_name);
     let base = link.base().to_owned();
-    let mut agent_config =
-        sandbox_agent_config(name, state.join("sandbox-agent")).with_access(HostAccess::from_env());
+    let mut agent_config = sandbox_agent_config(name).with_access(HostAccess::from_env());
     agent_config.metrics =
         preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     let agent = Agent::try_new(

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use preloop_sandbox::api::{Capabilities, CreateWork, ExecEvent, ExecRequest, Observed};
-use preloop_sandbox::driver::Driver as SandboxDriver;
+use preloop_sandbox::driver::{Driver as SandboxDriver, TRANSFER_QUEUE, TransferChunk};
 use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::drivers::smolvm::cli::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, ProviderCapabilities, SecretSource,
@@ -43,18 +43,15 @@ async fn fixture(dir: &tempfile::TempDir) -> Fixture {
     fixture_with_driver(dir, fake as Arc<dyn Driver>).await
 }
 
-async fn fixture_with_driver(dir: &tempfile::TempDir, driver: Arc<dyn Driver>) -> Fixture {
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
+async fn fixture_with_driver(_dir: &tempfile::TempDir, driver: Arc<dyn Driver>) -> Fixture {
+    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![driver],
-        AgentConfig::new("host", dir.path().join("scratch")),
+        AgentConfig::new("host"),
     );
     tokio::spawn(agent.run(shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -115,18 +112,32 @@ impl SandboxDriver for RecordingDriver {
     async fn copy_in(
         &self,
         native_ref: &str,
-        tar: &std::path::Path,
         guest_dir: &str,
+        mut tar: tokio::sync::mpsc::Receiver<TransferChunk>,
     ) -> preloop_sandbox::Result<()> {
-        *self.uploaded.lock().await = Some(std::fs::read(tar).unwrap());
-        self.inner.copy_in(native_ref, tar, guest_dir).await
+        let mut bytes = Vec::new();
+        while let Some(chunk) = tar.recv().await {
+            match chunk {
+                TransferChunk::Data(data) => bytes.extend_from_slice(&data),
+                TransferChunk::Failed(reason) => {
+                    return Err(preloop_sandbox::Error::unavailable(reason));
+                }
+            }
+        }
+        *self.uploaded.lock().await = Some(bytes.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel(TRANSFER_QUEUE);
+        tx.send(TransferChunk::Data(bytes)).await.map_err(|_| {
+            preloop_sandbox::Error::internal("copy-observing driver lost its receiver")
+        })?;
+        drop(tx);
+        self.inner.copy_in(native_ref, guest_dir, rx).await
     }
 
     async fn copy_out(
         &self,
         native_ref: &str,
         guest_path: &str,
-        tar: &std::path::Path,
+        tar: tokio::sync::mpsc::Sender<TransferChunk>,
     ) -> preloop_sandbox::Result<()> {
         self.inner.copy_out(native_ref, guest_path, tar).await
     }

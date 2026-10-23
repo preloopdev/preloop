@@ -29,7 +29,7 @@ use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{Capabilities, CreateWork, ExecEvent, ExecRequest, HostReport, Observed};
-use crate::driver::{DRIVER_PROTOCOL_VERSION, Driver, strip_ansi};
+use crate::driver::{DRIVER_PROTOCOL_VERSION, Driver, TransferChunk, strip_ansi};
 use crate::error::{Code, Error, Result};
 use crate::generated::preloop::sandbox::driver::v1 as proto;
 
@@ -414,28 +414,97 @@ impl Driver for ExternalDriver {
         Ok(())
     }
 
-    async fn copy_in(&self, native_ref: &str, tar: &Path, guest_dir: &str) -> Result<()> {
+    async fn copy_in(
+        &self,
+        native_ref: &str,
+        guest_dir: &str,
+        tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<()> {
         let client = self.client().await?;
-        self.call(client.copy_in(proto::CopyInRequest {
+        let start = proto::CopyInRequest {
             native_ref: native_ref.to_owned(),
-            host_tar: path_str(tar)?.to_owned(),
             guest_dir: guest_dir.to_owned(),
             ..proto::CopyInRequest::default()
-        }))
-        .await?;
+        };
+        // Protocol: one start message, then data, then an explicit `eof` or
+        // `error`. A stream that dies without either is a truncation, not a
+        // complete archive, and the plugin refuses to extract it.
+        let requests =
+            futures::stream::unfold((0u8, start, tar), |(step, start, mut rx)| async move {
+                match step {
+                    0 => Some((start, (1, proto::CopyInRequest::default(), rx))),
+                    1 => match rx.recv().await {
+                        Some(TransferChunk::Data(bytes)) => Some((
+                            proto::CopyInRequest {
+                                data: bytes,
+                                ..proto::CopyInRequest::default()
+                            },
+                            (1, proto::CopyInRequest::default(), rx),
+                        )),
+                        Some(TransferChunk::Failed(reason)) => Some((
+                            proto::CopyInRequest {
+                                error: reason,
+                                ..proto::CopyInRequest::default()
+                            },
+                            (2, proto::CopyInRequest::default(), rx),
+                        )),
+                        None => Some((
+                            proto::CopyInRequest {
+                                eof: true,
+                                ..proto::CopyInRequest::default()
+                            },
+                            (2, proto::CopyInRequest::default(), rx),
+                        )),
+                    },
+                    _ => None,
+                }
+            });
+        self.call(client.copy_in(requests)).await?;
         Ok(())
     }
 
-    async fn copy_out(&self, native_ref: &str, guest_path: &str, tar: &Path) -> Result<()> {
+    async fn copy_out(
+        &self,
+        native_ref: &str,
+        guest_path: &str,
+        tar: mpsc::Sender<TransferChunk>,
+    ) -> Result<()> {
         let client = self.client().await?;
-        self.call(client.copy_out(proto::CopyOutRequest {
-            native_ref: native_ref.to_owned(),
-            guest_path: guest_path.to_owned(),
-            host_tar: path_str(tar)?.to_owned(),
-            ..proto::CopyOutRequest::default()
-        }))
-        .await?;
-        Ok(())
+        let mut stream = self
+            .call(client.copy_out(proto::CopyOutRequest {
+                native_ref: native_ref.to_owned(),
+                guest_path: guest_path.to_owned(),
+                ..proto::CopyOutRequest::default()
+            }))
+            .await?;
+        loop {
+            match stream.message::<proto::CopyOutResponse>().await {
+                Ok(Some(message)) => {
+                    let message = message.to_owned_message();
+                    if !message.data.is_empty()
+                        && tar.send(TransferChunk::Data(message.data)).await.is_err()
+                    {
+                        return Err(Error::unavailable("copy-out: consumer went away"));
+                    }
+                    if message.eof {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => {
+                    return Err(Error::invalid_argument(
+                        "copy-out: plugin stream ended without eof",
+                    ));
+                }
+                Err(error) => {
+                    let _ = tar
+                        .send(TransferChunk::Failed(
+                            crate::error::message(&error).to_owned(),
+                        ))
+                        .await;
+                    return Err(error);
+                }
+            }
+        }
     }
 
     async fn snapshot(&self, native_ref: &str, template: &str) -> Result<String> {
@@ -929,13 +998,6 @@ fn new_client(socket: &Path) -> Client {
     Client::new(connection, ClientConfig::new(authority))
 }
 
-/// A path as the plugin's protocol spells it.
-fn path_str(path: &Path) -> Result<&str> {
-    path.to_str().ok_or_else(|| {
-        Error::invalid_argument(format!("path `{}` is not valid UTF-8", path.display()))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1166,11 +1228,22 @@ mod tests {
             unreachable!("the test only calls create and inventory")
         }
 
-        async fn copy_in(&self, _native_ref: &str, _tar: &Path, _guest_dir: &str) -> Result<()> {
+        async fn copy_in(
+            &self,
+            _native_ref: &str,
+            _guest_dir: &str,
+            mut tar: mpsc::Receiver<TransferChunk>,
+        ) -> Result<()> {
+            while tar.recv().await.is_some() {}
             Ok(())
         }
 
-        async fn copy_out(&self, _native_ref: &str, _guest_path: &str, _tar: &Path) -> Result<()> {
+        async fn copy_out(
+            &self,
+            _native_ref: &str,
+            _guest_path: &str,
+            _tar: mpsc::Sender<TransferChunk>,
+        ) -> Result<()> {
             Ok(())
         }
 

@@ -47,7 +47,7 @@ impl TestService {
             None,
         )
         .expect("server tls");
-        let mut config = ServiceConfig::new(dir.path().join("blobs"));
+        let mut config = ServiceConfig::new();
         config.ca = Some(tls.ca.clone());
         let service = Service::open(store::open("memory:").await.unwrap(), config)
             .await

@@ -5,6 +5,7 @@
 //! runner pool also uses them directly for host-local SmolVM concerns.
 
 use crate::api::{HostReport, SandboxRuntimeStats};
+use crate::driver::TransferChunk;
 use async_trait::async_trait;
 use preloop_observability::deadline;
 use serde::{Deserialize, Serialize};
@@ -1230,6 +1231,36 @@ pub trait VmProvider: Send + Sync {
     ) -> Result<i32, VmError>;
     /// Copy a file or directory using SmolVM's host/guest path syntax.
     async fn copy(&self, source: &str, destination: &str) -> Result<(), VmError>;
+    /// Extract a tar stream into `guest_dir` without a host file.
+    ///
+    /// Implemented as `machine exec -i -- sh -c 'tar -xf - -C <dir>'`: the
+    /// guest reads the archive from its stdin, so the bytes go host → vsock →
+    /// guest without a staging file on either side.
+    async fn copy_in_stream(
+        &self,
+        _name: &MachineName,
+        _guest_dir: &str,
+        _tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<(), VmError> {
+        Err(VmError::Protocol(
+            "this provider cannot stream a copy into a guest".into(),
+        ))
+    }
+    /// Stream a tar archive of `guest_path` out of the guest without a host
+    /// file.
+    ///
+    /// Implemented as `machine exec --stream -- sh -c 'tar -cf - -C <parent>
+    /// <base>'`: stdout is the archive, stderr is diagnostics.
+    async fn copy_out_stream(
+        &self,
+        _name: &MachineName,
+        _guest_path: &str,
+        _tar: mpsc::Sender<TransferChunk>,
+    ) -> Result<(), VmError> {
+        Err(VmError::Protocol(
+            "this provider cannot stream a copy out of a guest".into(),
+        ))
+    }
     /// Pack a configured machine into a reusable immutable artifact.
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError>;
 }
@@ -1331,6 +1362,22 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
     }
     async fn copy(&self, source: &str, destination: &str) -> Result<(), VmError> {
         (**self).copy(source, destination).await
+    }
+    async fn copy_in_stream(
+        &self,
+        name: &MachineName,
+        guest_dir: &str,
+        tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<(), VmError> {
+        (**self).copy_in_stream(name, guest_dir, tar).await
+    }
+    async fn copy_out_stream(
+        &self,
+        name: &MachineName,
+        guest_path: &str,
+        tar: mpsc::Sender<TransferChunk>,
+    ) -> Result<(), VmError> {
+        (**self).copy_out_stream(name, guest_path, tar).await
     }
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
         (**self).pack(name, output).await
@@ -3051,6 +3098,191 @@ impl VmProvider for SmolVmProvider {
         .map(|_| ())
     }
 
+    async fn copy_in_stream(
+        &self,
+        name: &MachineName,
+        guest_dir: &str,
+        mut tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<(), VmError> {
+        let script = format!(
+            "mkdir -p {dir} && tar -xf - -C {dir}",
+            dir = crate::driver::shell_quote(guest_dir)
+        );
+        let program = self.binary.display().to_string();
+        let mut command = self.sandboxed_command()?;
+        command
+            .args([
+                "machine",
+                "exec",
+                "-i",
+                "--name",
+                name.as_str(),
+                "--timeout",
+                EXEC_TIMEOUT,
+                "--",
+            ])
+            .args(["sh", "-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|source| VmError::Launch {
+            program: program.clone(),
+            source,
+        })?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let deadline = self.deadlines.exec;
+
+        let copy = async move {
+            use tokio::io::AsyncWriteExt as _;
+            let feed = async {
+                while let Some(chunk) = tar.recv().await {
+                    match chunk {
+                        TransferChunk::Data(bytes) => {
+                            if let Err(error) = stdin.write_all(&bytes).await {
+                                return Err(format!("stdin: {error}"));
+                            }
+                        }
+                        TransferChunk::Failed(reason) => {
+                            let _ = stdin.shutdown().await;
+                            return Err(reason);
+                        }
+                    }
+                }
+                stdin
+                    .shutdown()
+                    .await
+                    .map_err(|error| format!("stdin: {error}"))
+            };
+            let (fed, out, err, status) = tokio::join!(
+                feed,
+                read_tail(stdout, DEFAULT_CAPTURE_LIMIT),
+                read_tail(stderr, DEFAULT_CAPTURE_LIMIT),
+                child.wait()
+            );
+            let status = status.map_err(|error| {
+                VmError::Protocol(format!("copy-in: waiting for smolvm: {error}"))
+            })?;
+            let code = status.code().unwrap_or(-1);
+            if code != 0 {
+                return Err(VmError::Command {
+                    operation: "copy-in",
+                    exit_code: code,
+                    message: String::from_utf8_lossy(&err).into_owned(),
+                });
+            }
+            if let Err(reason) = fed {
+                return Err(VmError::Protocol(format!("copy-in: {reason}")));
+            }
+            let _ = out;
+            Ok(())
+        };
+        match tokio::time::timeout(deadline, copy).await {
+            Ok(result) => result,
+            Err(_) => Err(VmError::TimedOut {
+                operation: "copy-in",
+                program,
+                deadline,
+            }),
+        }
+    }
+
+    async fn copy_out_stream(
+        &self,
+        name: &MachineName,
+        guest_path: &str,
+        tar: mpsc::Sender<TransferChunk>,
+    ) -> Result<(), VmError> {
+        let path = Path::new(guest_path);
+        let parent = path
+            .parent()
+            .map_or("/".into(), |p| p.display().to_string());
+        let base = path
+            .file_name()
+            .map_or(".".into(), |b| b.to_string_lossy().into_owned());
+        let script = format!(
+            "tar -cf - -C {parent} {base}",
+            parent = crate::driver::shell_quote(if parent.is_empty() { "/" } else { &parent }),
+            base = crate::driver::shell_quote(&base)
+        );
+        let program = self.binary.display().to_string();
+        let mut command = self.sandboxed_command()?;
+        command
+            .args([
+                "machine",
+                "exec",
+                "--stream",
+                "--name",
+                name.as_str(),
+                "--timeout",
+                EXEC_TIMEOUT,
+                "--",
+            ])
+            .args(["sh", "-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|source| VmError::Launch {
+            program: program.clone(),
+            source,
+        })?;
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let deadline = self.deadlines.exec;
+
+        let copy = async move {
+            let forward = async {
+                let mut chunk = vec![0u8; 64 * 1024];
+                loop {
+                    let read = stdout
+                        .read(&mut chunk)
+                        .await
+                        .map_err(|error| VmError::Protocol(format!("copy-out: {error}")))?;
+                    if read == 0 {
+                        return Ok::<(), VmError>(());
+                    }
+                    if tar
+                        .send(TransferChunk::Data(chunk[..read].to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        return Err(VmError::Protocol("copy-out: consumer went away".into()));
+                    }
+                }
+            };
+            let (forwarded, err) = tokio::join!(forward, read_tail(stderr, DEFAULT_CAPTURE_LIMIT));
+            if forwarded.is_err() {
+                let _ = child.start_kill();
+            }
+            let status = child.wait().await.map_err(|error| {
+                VmError::Protocol(format!("copy-out: waiting for smolvm: {error}"))
+            })?;
+            let code = status.code().unwrap_or(-1);
+            if code != 0 {
+                let message = String::from_utf8_lossy(&err).into_owned();
+                let _ = tar.send(TransferChunk::Failed(message.clone())).await;
+                return Err(VmError::Command {
+                    operation: "copy-out",
+                    exit_code: code,
+                    message,
+                });
+            }
+            forwarded?;
+            Ok(())
+        };
+        match tokio::time::timeout(deadline, copy).await {
+            Ok(result) => result,
+            Err(_) => Err(VmError::TimedOut {
+                operation: "copy-out",
+                program,
+                deadline,
+            }),
+        }
+    }
+
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
         if !output.is_absolute() {
             return Err(VmError::InvalidSpec(
@@ -4746,6 +4978,26 @@ async fn forward(
         };
         if output.send(value).await.is_err() {
             return Ok(());
+        }
+    }
+}
+
+/// Read a process stream to EOF, retaining at most `cap` bytes.
+///
+/// Copy transfers have no use for the whole output: stderr is a diagnostic
+/// and stdout is the archive itself, so only a bounded tail is kept.
+async fn read_tail(mut reader: impl AsyncRead + Unpin, cap: usize) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut chunk = vec![0u8; 16 * 1024];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => return kept,
+            Ok(read) => {
+                if kept.len() < cap {
+                    let take = (cap - kept.len()).min(read);
+                    kept.extend_from_slice(&chunk[..take]);
+                }
+            }
         }
     }
 }

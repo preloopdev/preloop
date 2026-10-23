@@ -10,7 +10,7 @@ pub mod cli;
 pub mod pack;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,7 +27,7 @@ use self::cli::{
 use self::pack::{ArtifactCache, ArtifactPin, LocalImage, PackFormat, select_artifact};
 use crate::api::*;
 use crate::driver::{
-    Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, ExecCancels, NATIVE_PREFIX, native_name,
+    Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, ExecCancels, NATIVE_PREFIX, TransferChunk, native_name,
     parse_native_name, shell_quote,
 };
 use crate::error::{Code, Error, Result};
@@ -872,75 +872,30 @@ impl Driver for SmolvmDriver {
         Ok(())
     }
 
-    async fn copy_in(&self, native_ref: &str, tar: &Path, guest_dir: &str) -> Result<()> {
+    async fn copy_in(
+        &self,
+        native_ref: &str,
+        guest_dir: &str,
+        tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<()> {
         let name = machine(native_ref)?;
-        let staged = format!("/var/tmp/.psbx-in-{}.tar", uuid::Uuid::new_v4().simple());
         self.provider
-            .copy(
-                &tar.display().to_string(),
-                &format!("{native_ref}:{staged}"),
-            )
+            .copy_in_stream(&name, guest_dir, tar)
             .await
-            .map_err(vm_error)?;
-        let script = format!(
-            "mkdir -p {dir} && tar -xf {staged} -C {dir}; rc=$?; rm -f {staged}; exit $rc",
-            dir = shell_quote(guest_dir),
-            staged = shell_quote(&staged)
-        );
-        let output = self
-            .provider
-            .exec(&name, &["sh".into(), "-c".into(), script])
-            .await
-            .map_err(vm_error)?;
-        if output.exit_code != 0 {
-            return Err(Error::internal(format!(
-                "smolvm: extract into {guest_dir} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        Ok(())
+            .map_err(vm_error)
     }
 
-    async fn copy_out(&self, native_ref: &str, guest_path: &str, tar: &Path) -> Result<()> {
+    async fn copy_out(
+        &self,
+        native_ref: &str,
+        guest_path: &str,
+        tar: mpsc::Sender<TransferChunk>,
+    ) -> Result<()> {
         let name = machine(native_ref)?;
-        let staged = format!("/var/tmp/.psbx-out-{}.tar", uuid::Uuid::new_v4().simple());
-        let path = Path::new(guest_path);
-        let parent = path
-            .parent()
-            .map_or("/".into(), |p| p.display().to_string());
-        let base = path
-            .file_name()
-            .map_or(".".into(), |b| b.to_string_lossy().into_owned());
-        let script = format!(
-            "tar -cf {staged} -C {parent} {base}",
-            staged = shell_quote(&staged),
-            parent = shell_quote(if parent.is_empty() { "/" } else { &parent }),
-            base = shell_quote(&base)
-        );
-        let output = self
-            .provider
-            .exec(&name, &["sh".into(), "-c".into(), script])
+        self.provider
+            .copy_out_stream(&name, guest_path, tar)
             .await
-            .map_err(vm_error)?;
-        if output.exit_code != 0 {
-            return Err(Error::internal(format!(
-                "smolvm: archive {guest_path} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        let copied = self
-            .provider
-            .copy(
-                &format!("{native_ref}:{staged}"),
-                &tar.display().to_string(),
-            )
-            .await
-            .map_err(vm_error);
-        let _ = self
-            .provider
-            .exec(&name, &["rm".into(), "-f".into(), staged])
-            .await;
-        copied
+            .map_err(vm_error)
     }
 
     async fn snapshot(&self, native_ref: &str, _template: &str) -> Result<String> {
