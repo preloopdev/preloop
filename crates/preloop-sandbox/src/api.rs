@@ -430,7 +430,8 @@ pub struct Sandbox {
     pub state: SandboxState,
     /// Purpose.
     pub purpose: Purpose,
-    /// Current lease.
+    /// Current lease. Redacted in `List`; `Get` returns it only to the
+    /// caller presenting that lease.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub lease_id: String,
     /// Failure reason.
@@ -457,7 +458,8 @@ fn is_unspecified_state(state: &SandboxState) -> bool {
     *state == SandboxState::SandboxStateUnspecified
 }
 
-/// A lease on a sandbox.
+/// A lease on a sandbox. The id is the capability every sandbox-scoped RPC
+/// presents; only `Acquire` and `Renew` (both scoped to the lease) return it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Lease {
@@ -627,12 +629,15 @@ pub struct ReleaseRequest {
     pub preserve_ttl_secs: u64,
 }
 
-/// `Get` / `Pause` / `Resume`.
+/// `Get` / `Stop` / `Pause` / `Resume`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GetRequest {
     /// Sandbox id.
     pub sandbox_id: String,
+    /// Capability from `Acquire`; must be this sandbox's active lease.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lease_id: String,
 }
 
 /// `List`.
@@ -649,6 +654,10 @@ pub struct ListSandboxesResponse {
 pub struct ExecRequest {
     /// Sandbox id.
     pub sandbox_id: String,
+    /// Capability from `Acquire`; must be this sandbox's active lease.
+    /// Cleared before the request is handed to a provider.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lease_id: String,
     /// Command.
     pub argv: Vec<String>,
     /// Environment (added to the lease environment).
@@ -726,6 +735,9 @@ pub enum StreamKind {
 pub struct OpenStreamRequest {
     /// Sandbox id.
     pub sandbox_id: String,
+    /// Capability from `Acquire`; must be this sandbox's active lease.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lease_id: String,
     /// Direction.
     pub kind: StreamKind,
     /// Guest path (directory for uploads; file or directory for downloads).
@@ -750,6 +762,9 @@ pub struct Ticket {
 pub struct SnapshotRequest {
     /// Sandbox to capture.
     pub sandbox_id: String,
+    /// Capability from `Acquire`; must be this sandbox's active lease.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lease_id: String,
     /// New template name.
     pub name: String,
 }
@@ -918,6 +933,9 @@ pub struct StartWork {
 pub struct StartRequest {
     /// Sandbox id.
     pub sandbox_id: String,
+    /// Capability from `Acquire`; must be this sandbox's active lease.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lease_id: String,
     /// Start as a branch base.
     #[serde(skip_serializing_if = "is_false")]
     pub forkable: bool,

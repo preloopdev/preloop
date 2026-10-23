@@ -14,8 +14,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use clap::{Args, Subcommand};
 use futures::StreamExt as _;
+use preloop_orchestrator::RunnerPoolConfig;
 use preloop_orchestrator::fleet::SandboxMachines;
-use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink, RemoteLink};
+use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
@@ -110,7 +111,15 @@ impl LocalSandboxes {
     /// Open the service (state under `<home>/state`), attach this host's
     /// SmolVM driver, and serve the API when `PRELOOP_SANDBOX_LISTEN`
     /// (default `127.0.0.1:9191`) can be bound.
-    pub(crate) async fn start(home: &Path) -> anyhow::Result<Self> {
+    ///
+    /// `pool` is the CI pool this engine runs: its host mounts (runner
+    /// bundle, Node externals, control bridge) and control socket are the
+    /// embedded agent's allowlist, so the pool keeps working while every
+    /// other host path is refused.
+    pub(crate) async fn start(
+        home: &Path,
+        pool: Option<&RunnerPoolConfig>,
+    ) -> anyhow::Result<Self> {
         let state = home.join("state");
         // One destructive authority per state directory: a bake or a second
         // engine must not load and reap a running service's leases.
@@ -139,10 +148,16 @@ impl LocalSandboxes {
             .iter()
             .find(|driver| driver.name() == pool_driver)
             .map(|driver| driver.capabilities());
+        let mut access = HostAccess::from_env();
+        if let Some(pool) = pool {
+            access.allow_mounts(pool.sandbox_mount_prefixes());
+            access.allow_sockets(pool.sandbox_socket_prefixes());
+        }
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             drivers,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            AgentConfig::new(local_provider_name(), state.join("sandbox-agent"))
+                .with_access(access),
         );
         // Register once here so the pool can place immediately; the agent
         // reuses this session instead of registering a second time (which
@@ -490,13 +505,13 @@ fn resolve_provider_token(configured: Option<String>, state: &Path) -> anyhow::R
 
 /// The embedded service is only needed when a pool will place VMs on it.
 pub(crate) async fn start_if_pool(
-    pool_configured: bool,
+    pool: Option<&RunnerPoolConfig>,
     home: &Path,
 ) -> anyhow::Result<Option<LocalSandboxes>> {
-    if !pool_configured {
+    let Some(pool) = pool else {
         return Ok(None);
-    }
-    Ok(Some(LocalSandboxes::start(home).await?))
+    };
+    Ok(Some(LocalSandboxes::start(home, Some(pool)).await?))
 }
 
 /// `preloop sandbox`.
@@ -513,6 +528,9 @@ pub(crate) struct SandboxArgs {
         hide_env_values = true
     )]
     token: Option<String>,
+    /// Lease id from `acquire`; the capability for every sandbox-scoped command.
+    #[arg(long = "lease", env = "PRELOOP_SANDBOX_LEASE", global = true)]
+    lease_id: Option<String>,
     #[command(subcommand)]
     command: SandboxCommand,
 }
@@ -737,6 +755,7 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
     let SandboxArgs {
         service,
         token,
+        lease_id,
         command,
     } = args;
     match command {
@@ -746,6 +765,16 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
             let state = crate::preloop_home().join("state");
             let (base, token) = resolve_client(&state, service, token)?;
             let client = SandboxClient::new(base, Some(token));
+            let lease = lease_id.unwrap_or_default();
+            let lease_id = || -> anyhow::Result<String> {
+                if lease.is_empty() {
+                    anyhow::bail!(
+                        "this command needs the sandbox's lease: pass --lease <lse-…> (or set \
+                         PRELOOP_SANDBOX_LEASE) with the lease `preloop sandbox acquire` returned"
+                    );
+                }
+                Ok(lease.clone())
+            };
             match command {
                 SandboxCommand::Serve(_) | SandboxCommand::Agent(_) => {
                     unreachable!("handled above")
@@ -853,6 +882,7 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
                     let mut stream = client
                         .exec(ExecRequest {
                             sandbox_id: exec.sandbox,
+                            lease_id: lease_id()?,
                             argv: exec.argv,
                             env: exec.env.into_iter().collect(),
                             workdir: exec.workdir.unwrap_or_default(),
@@ -875,10 +905,12 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
                     }
                     anyhow::bail!("exec stream ended without an exit status")
                 }
-                SandboxCommand::Cp(cp) => copy(&client, &cp.source, &cp.destination).await,
-                SandboxCommand::Stop { sandbox } => Ok(client.stop(&sandbox).await?),
+                SandboxCommand::Cp(cp) => {
+                    copy(&client, &cp.source, &cp.destination, &lease_id()?).await
+                }
+                SandboxCommand::Stop { sandbox } => Ok(client.stop(&sandbox, &lease_id()?).await?),
                 SandboxCommand::Start { sandbox, forkable } => {
-                    Ok(client.start(&sandbox, forkable).await?)
+                    Ok(client.start(&sandbox, &lease_id()?, forkable).await?)
                 }
                 SandboxCommand::Release(release) => Ok(client
                     .release(ReleaseRequest {
@@ -895,6 +927,7 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
                     &client
                         .snapshot(SnapshotRequest {
                             sandbox_id: snapshot.sandbox,
+                            lease_id: lease_id()?,
                             name: snapshot.name,
                         })
                         .await?,
@@ -914,7 +947,12 @@ fn split_sandbox(path: &str) -> Option<(&str, &str)> {
     (sandbox.starts_with("sbx-") && (guest.starts_with('/') || windows)).then_some((sandbox, guest))
 }
 
-async fn copy(client: &SandboxClient, source: &str, destination: &str) -> anyhow::Result<()> {
+async fn copy(
+    client: &SandboxClient,
+    source: &str,
+    destination: &str,
+    lease_id: &str,
+) -> anyhow::Result<()> {
     let scratch = tempfile::tempdir()?;
     let tar_path = scratch.path().join("copy.tar");
     match (split_sandbox(source), split_sandbox(destination)) {
@@ -934,11 +972,13 @@ async fn copy(client: &SandboxClient, source: &str, destination: &str) -> anyhow
                 }
                 builder.finish()?;
             }
-            client.upload(sandbox, guest_dir, &tar_path).await?;
+            client
+                .upload(sandbox, lease_id, guest_dir, &tar_path)
+                .await?;
             Ok(())
         }
         (Some((sandbox, guest)), None) => {
-            client.download(sandbox, guest, &tar_path).await?;
+            client.download(sandbox, lease_id, guest, &tar_path).await?;
             std::fs::create_dir_all(destination)?;
             tar::Archive::new(std::fs::File::open(&tar_path)?).unpack(destination)?;
             Ok(())
@@ -964,7 +1004,8 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             host_drivers(Some(&named_prefix()), smolvm_slots(), None)?,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            AgentConfig::new(local_provider_name(), state.join("sandbox-agent"))
+                .with_access(HostAccess::from_env()),
         );
         tokio::spawn(agent.run(None, shutdown.clone()));
     }
@@ -993,7 +1034,7 @@ async fn run_agent(service: Option<String>, args: AgentArgs) -> anyhow::Result<(
     let agent = Agent::new(
         Arc::new(RemoteLink::new(&service, Some(provider_token))),
         host_drivers(Some(&named_prefix()), args.slots, None)?,
-        AgentConfig::new(name, scratch),
+        AgentConfig::new(name, scratch).with_access(HostAccess::from_env()),
     );
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
@@ -1129,7 +1170,7 @@ mod tests {
     async fn the_service_starts_only_for_a_pool() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        assert!(start_if_pool(false, &home).await.unwrap().is_none());
+        assert!(start_if_pool(None, &home).await.unwrap().is_none());
         assert!(
             !home.exists(),
             "no pool must not open the store or touch the state directory"

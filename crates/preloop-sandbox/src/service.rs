@@ -205,6 +205,20 @@ fn restored_state(sandbox: &Sandbox) -> SandboxState {
     }
 }
 
+/// State a powered-off sandbox returns to when it is started or resumed.
+/// A sandbox still inside its preserve window stays a debug hold even while
+/// its lease survives, so powering a used machine on cannot put it back in
+/// the warm set.
+fn resumed_state(sandbox: &Sandbox) -> SandboxState {
+    if sandbox.preserve_until > 0 {
+        SandboxState::Preserved
+    } else if sandbox.lease_id.is_empty() {
+        restored_state(sandbox)
+    } else {
+        SandboxState::Leased
+    }
+}
+
 #[derive(Debug)]
 enum Pending {
     Create {
@@ -316,6 +330,35 @@ impl PlacementSpec {
             host_mounts: !self.mounts.is_empty(),
             socket_mounts: !self.sockets.is_empty(),
         }
+    }
+}
+
+/// Check that `lease_id` is the capability for `sandbox`: it must be the
+/// sandbox's active lease, and the lease must still exist. Every
+/// sandbox-scoped RPC goes through this; `List` is the only read that does
+/// not name a sandbox and therefore redacts lease ids instead.
+fn authorize(state: &State, sandbox: &Sandbox, lease_id: &str) -> Result<()> {
+    if lease_id.is_empty() {
+        return Err(Error::new(
+            Code::PermissionDenied,
+            format!(
+                "leaseId is required to use sandbox `{}`; pass the lease returned by Acquire",
+                sandbox.id
+            ),
+        ));
+    }
+    let held = sandbox.lease_id == lease_id
+        && state
+            .leases
+            .get(lease_id)
+            .is_some_and(|lease| lease.sandbox_id == sandbox.id);
+    if held {
+        Ok(())
+    } else {
+        Err(Error::new(
+            Code::PermissionDenied,
+            format!("lease `{lease_id}` does not hold sandbox `{}`", sandbox.id),
+        ))
     }
 }
 
@@ -461,11 +504,13 @@ impl Service {
             state.sandboxes.insert(sandbox.id.clone(), sandbox);
         }
         for lease in load::<Lease>(&*store, Kind::Leases).await? {
-            // A lease persisted before `requested_ttl_secs` existed has 0 and
-            // counts as delivered: `claim` will not rewrite its expiry.
-            state
-                .lease_by_key
-                .insert(lease.idempotency_key.clone(), lease.id.clone());
+            // A preserved lease outlives its idempotency key, which release
+            // cleared; only live keys map back to leases.
+            if !lease.idempotency_key.is_empty() {
+                state
+                    .lease_by_key
+                    .insert(lease.idempotency_key.clone(), lease.id.clone());
+            }
             // Deliberately not marked injected: a crash between persisting the
             // lease and uploading its files would otherwise leave the caller
             // with a lease whose files never arrive. The next `Acquire` with
@@ -1279,44 +1324,61 @@ impl Service {
         preserve_ttl: u64,
         ops: &mut Vec<Op>,
     ) {
-        let Some(lease) = state.leases.remove(lease_id) else {
+        let Some(lease) = state.leases.get(lease_id).cloned() else {
             return;
         };
-        state.lease_by_key.remove(&lease.idempotency_key);
-        state.injected.remove(lease_id);
-        ops.push(self.remove(Kind::Leases, lease_id));
         let preserve = mode == ReleaseMode::Preserve;
         let failed = state
             .sandboxes
             .get(&lease.sandbox_id)
             .is_some_and(|s| s.state == SandboxState::Failed);
-        if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
-            sandbox.lease_id.clear();
-            // PRESERVE keeps the current power state: a paused or stopped
-            // debugging machine must not be woken, and must not be destroyed
-            // just because its state is no longer `Leased`.
-            if preserve
-                && !failed
-                && matches!(
-                    sandbox.state,
+        // Preservation is the one way a lease outlives `Release`: the id keeps
+        // working as the debugging capability until the window closes. A
+        // second preserve extends that window instead of destroying. A paused
+        // or stopped debugging machine keeps its power state (and must not be
+        // woken or destroyed just because it is no longer `Leased`).
+        if preserve
+            && !failed
+            && state.sandboxes.get(&lease.sandbox_id).is_some_and(|s| {
+                matches!(
+                    s.state,
                     SandboxState::Leased
                         | SandboxState::Paused
                         | SandboxState::Stopped
                         | SandboxState::Preserved
                 )
-            {
+            })
+        {
+            let ttl = if preserve_ttl == 0 {
+                self.config.preserve_ttl.as_secs()
+            } else {
+                preserve_ttl
+            };
+            let until = now() + ttl as i64;
+            if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
                 if sandbox.state == SandboxState::Leased {
                     sandbox.state = SandboxState::Preserved;
                 }
-                let ttl = if preserve_ttl == 0 {
-                    self.config.preserve_ttl.as_secs()
-                } else {
-                    preserve_ttl
-                };
-                sandbox.preserve_until = now() + ttl as i64;
+                sandbox.preserve_until = until;
                 ops.push(self.put(Kind::Sandboxes, &lease.sandbox_id, &*sandbox));
-                return;
             }
+            // The idempotency key is free again (also after a restart): a
+            // retry with it starts a new sandbox, as it did before
+            // preservation kept the lease alive.
+            state.lease_by_key.remove(&lease.idempotency_key);
+            if let Some(lease) = state.leases.get_mut(lease_id) {
+                lease.expires_at = until;
+                lease.idempotency_key.clear();
+                ops.push(self.put(Kind::Leases, lease_id, &*lease));
+            }
+            return;
+        }
+        state.leases.remove(lease_id);
+        state.lease_by_key.remove(&lease.idempotency_key);
+        state.injected.remove(lease_id);
+        ops.push(self.remove(Kind::Leases, lease_id));
+        if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
+            sandbox.lease_id.clear();
         }
         // Failed sandboxes may still hold a native machine: destroy_locked
         // handles both cases.
@@ -1652,7 +1714,10 @@ impl Service {
                 .await
                 .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
             let result = match built {
-                Ok(()) => self.upload_path(&sandbox.id, "/", &tar_path).await,
+                Ok(()) => {
+                    self.upload_path(&sandbox.id, &lease.id, "/", &tar_path)
+                        .await
+                }
                 Err(error) => Err(error),
             };
             let _ = std::fs::remove_file(&tar_path);
@@ -1720,19 +1785,40 @@ impl Service {
         Ok(())
     }
 
-    /// `Get`.
-    pub fn get(&self, id: &str) -> Result<Sandbox> {
+    /// `Get`: one sandbox, for the caller that holds its lease.
+    pub fn get(&self, id: &str, lease_id: &str) -> Result<Sandbox> {
+        let state = self.state.lock();
+        let sandbox = state
+            .sandboxes
+            .get(id)
+            .ok_or_else(|| Error::not_found(format!("sandbox `{id}` not found")))?;
+        authorize(&state, sandbox, lease_id)?;
+        Ok(sandbox.clone())
+    }
+
+    /// `List`: every sandbox, with lease ids redacted. Callers learn which
+    /// sandboxes exist, never which capability drives an arbitrary one.
+    pub fn list(&self) -> Vec<Sandbox> {
         self.state
             .lock()
             .sandboxes
-            .get(id)
-            .cloned()
-            .ok_or_else(|| Error::not_found(format!("sandbox `{id}` not found")))
+            .values()
+            .map(|sandbox| {
+                let mut sandbox = sandbox.clone();
+                sandbox.lease_id.clear();
+                sandbox
+            })
+            .collect()
     }
 
-    /// `List`.
-    pub fn list(&self) -> Vec<Sandbox> {
-        self.state.lock().sandboxes.values().cloned().collect()
+    /// Look up a sandbox and require the caller's lease for it.
+    fn check_lease(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
+        let state = self.state.lock();
+        let sandbox = state
+            .sandboxes
+            .get(sandbox_id)
+            .ok_or_else(|| Error::not_found("sandbox not found"))?;
+        authorize(&state, sandbox, lease_id)
     }
 
     /// `ListProviders`.
@@ -1771,6 +1857,7 @@ impl Service {
             .get(&request.sandbox_id)
             .cloned()
             .ok_or_else(|| Error::not_found("sandbox not found"))?;
+        authorize(&state, &sandbox, &request.lease_id)?;
         Self::usable(&sandbox)?;
         let mut merged = request.clone();
         if let Some(lease) = state.leases.get(&sandbox.lease_id) {
@@ -1779,6 +1866,8 @@ impl Service {
             env.extend(request.env.clone());
             merged.env = env;
         }
+        // The lease is the caller's capability: a provider never sees it.
+        merged.lease_id.clear();
         let exec_id = new_id("exe");
         let (tx, rx) = mpsc::channel(256);
         state
@@ -1830,6 +1919,7 @@ impl Service {
             .sandboxes
             .get(&request.sandbox_id)
             .ok_or_else(|| Error::not_found("sandbox not found"))?;
+        authorize(&state, sandbox, &request.lease_id)?;
         Self::usable(sandbox)?;
         let ticket = new_id("tkt");
         let token = uuid::Uuid::new_v4().simple().to_string();
@@ -1887,7 +1977,7 @@ impl Service {
                 .ok_or_else(|| Error::not_found("ticket not found"))?;
             (blob.sandbox_id, blob.guest_path, blob.path)
         };
-        let result = self.upload_path(&sandbox_id, &guest_path, &path).await;
+        let result = self.stage_upload(&sandbox_id, &guest_path, &path).await;
         let _ = std::fs::remove_file(&path);
         result
     }
@@ -1919,8 +2009,22 @@ impl Service {
         }
     }
 
-    /// Extract a local tar into the guest (in-process callers).
-    pub async fn upload_path(&self, sandbox_id: &str, guest_dir: &str, tar: &Path) -> Result<()> {
+    /// Extract a local tar into the guest (in-process callers). The caller
+    /// must hold the sandbox's lease; data-plane tickets are their own
+    /// capability and use `stage_upload` directly.
+    pub async fn upload_path(
+        &self,
+        sandbox_id: &str,
+        lease_id: &str,
+        guest_dir: &str,
+        tar: &Path,
+    ) -> Result<()> {
+        self.check_lease(sandbox_id, lease_id)?;
+        self.stage_upload(sandbox_id, guest_dir, tar).await
+    }
+
+    /// Copy a staged tar to a fresh agent ticket and extract it in the guest.
+    async fn stage_upload(&self, sandbox_id: &str, guest_dir: &str, tar: &Path) -> Result<()> {
         let ticket = new_id("tkt");
         let path = self.config.blob_dir.join(format!("{ticket}.tar"));
         copy_off_runtime(tar.to_owned(), path.clone(), "stage upload").await?;
@@ -1947,9 +2051,11 @@ impl Service {
     pub async fn download_path(
         &self,
         sandbox_id: &str,
+        lease_id: &str,
         guest_path: &str,
         dest: &Path,
     ) -> Result<()> {
+        self.check_lease(sandbox_id, lease_id)?;
         let ticket = new_id("tkt");
         let path = self.config.blob_dir.join(format!("{ticket}.tar"));
         self.state.lock().blobs.insert(
@@ -2049,6 +2155,7 @@ impl Service {
                 .get(&request.sandbox_id)
                 .cloned()
                 .ok_or_else(|| Error::not_found("sandbox not found"))?;
+            authorize(&state, &sandbox, &request.lease_id)?;
             if sandbox.state != SandboxState::Leased {
                 return Err(Error::precondition(
                     "only a leased sandbox can be snapshotted",
@@ -2212,16 +2319,16 @@ impl Service {
     }
 
     /// `Stop`: power off, keeping the machine and its disk.
-    pub async fn stop(&self, id: &str) -> Result<()> {
-        self.power(id, PowerOp::Stop).await
+    pub async fn stop(&self, id: &str, lease_id: &str) -> Result<()> {
+        self.power(id, lease_id, PowerOp::Stop).await
     }
 
     /// `Start`: boot a stopped machine, optionally as a branch base.
-    pub async fn start(&self, id: &str, forkable: bool) -> Result<()> {
-        self.power(id, PowerOp::Start { forkable }).await
+    pub async fn start(&self, id: &str, lease_id: &str, forkable: bool) -> Result<()> {
+        self.power(id, lease_id, PowerOp::Start { forkable }).await
     }
 
-    async fn power(&self, id: &str, op: PowerOp) -> Result<()> {
+    async fn power(&self, id: &str, lease_id: &str, op: PowerOp) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock();
@@ -2230,6 +2337,7 @@ impl Service {
                 .get(id)
                 .cloned()
                 .ok_or_else(|| Error::not_found("sandbox not found"))?;
+            authorize(&state, &sandbox, lease_id)?;
             let caps = self.driver_caps(&state, &sandbox)?;
             if !caps.pause {
                 return Err(Error::precondition(format!(
@@ -2288,16 +2396,16 @@ impl Service {
     }
 
     /// `Pause`.
-    pub async fn pause(&self, id: &str) -> Result<()> {
-        self.pause_resume(id, true).await
+    pub async fn pause(&self, id: &str, lease_id: &str) -> Result<()> {
+        self.pause_resume(id, lease_id, true).await
     }
 
     /// `Resume`.
-    pub async fn resume(&self, id: &str) -> Result<()> {
-        self.pause_resume(id, false).await
+    pub async fn resume(&self, id: &str, lease_id: &str) -> Result<()> {
+        self.pause_resume(id, lease_id, false).await
     }
 
-    async fn pause_resume(&self, id: &str, pause: bool) -> Result<()> {
+    async fn pause_resume(&self, id: &str, lease_id: &str, pause: bool) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock();
@@ -2306,6 +2414,7 @@ impl Service {
                 .get(id)
                 .cloned()
                 .ok_or_else(|| Error::not_found("sandbox not found"))?;
+            authorize(&state, &sandbox, lease_id)?;
             let caps = self.driver_caps(&state, &sandbox)?;
             if !caps.pause {
                 return Err(Error::precondition(format!(
@@ -2656,11 +2765,7 @@ impl Service {
                             .sandboxes
                             .get_mut(&sandbox_id)
                             .expect("state checked above");
-                        let next = if sandbox.lease_id.is_empty() {
-                            restored_state(sandbox)
-                        } else {
-                            SandboxState::Leased
-                        };
+                        let next = resumed_state(sandbox);
                         self.restore_locked(sandbox, next);
                         if forkable {
                             sandbox.error.clear();
@@ -2687,11 +2792,7 @@ impl Service {
                             .sandboxes
                             .get_mut(&sandbox_id)
                             .expect("state checked above");
-                        let next = if sandbox.lease_id.is_empty() {
-                            restored_state(sandbox)
-                        } else {
-                            SandboxState::Leased
-                        };
+                        let next = resumed_state(sandbox);
                         self.restore_locked(sandbox, next);
                         ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
                         Ok(String::new())
@@ -2711,11 +2812,14 @@ impl Service {
         sandbox.state = next;
         sandbox.prior_state = SandboxState::SandboxStateUnspecified;
         match next {
-            SandboxState::Ready => sandbox.preserve_until = 0,
-            SandboxState::Preserved if sandbox.preserve_until == 0 => {
-                sandbox.preserve_until = now() + self.config.preserve_ttl.as_secs() as i64;
+            SandboxState::Preserved => {
+                if sandbox.preserve_until == 0 {
+                    sandbox.preserve_until = now() + self.config.preserve_ttl.as_secs() as i64;
+                }
             }
-            _ => {}
+            // Resuming or starting a preserved sandbox ends its debugging
+            // window; only an explicitly preserved sandbox holds one open.
+            _ => sandbox.preserve_until = 0,
         }
     }
 

@@ -355,27 +355,24 @@ async fn a_restarted_adapter_adopts_a_snapshot_golden_and_forks() {
 }
 
 #[tokio::test]
-async fn a_restart_adopts_machines_this_process_never_created() {
+async fn a_restart_sees_but_cannot_drive_a_machine_it_did_not_lease() {
     let dir = tempfile::tempdir().unwrap();
     let f = fixture(&dir).await;
     let name = MachineName::new("pool-runner-9-1").unwrap();
     f.machines.create(&spec(name.as_str())).await.unwrap();
     f.machines.start(&name).await.unwrap();
-    // The service is authoritative for machines this process never created.
+    // The service is authoritative for machines this process never created,
+    // so status and list still see the machine...
     let restarted = stranger(&f.service);
     assert_eq!(
         restarted.status(&name).await.unwrap(),
         MachineState::Running
     );
-    assert_eq!(
-        restarted
-            .exec(&name, &["true".into()])
-            .await
-            .unwrap()
-            .exit_code,
-        0
-    );
     assert!(restarted.list().await.unwrap().contains(&name));
+    // ...but driving it needs the lease `Acquire` returned, and the list
+    // projection redacts lease ids: a restarted adapter cannot take over a
+    // sandbox it never leased.
+    assert!(restarted.exec(&name, &["true".into()]).await.is_err());
 }
 
 #[tokio::test]
@@ -436,8 +433,9 @@ impl SandboxApi for FlakyRelease {
     async fn get(
         &self,
         sandbox_id: &str,
+        lease_id: &str,
     ) -> preloop_sandbox::Result<preloop_sandbox::api::Sandbox> {
-        self.inner.get(sandbox_id).await
+        self.inner.get(sandbox_id, lease_id).await
     }
     async fn list(&self) -> preloop_sandbox::Result<Vec<preloop_sandbox::api::Sandbox>> {
         self.inner.list().await
@@ -477,18 +475,24 @@ impl SandboxApi for FlakyRelease {
     async fn upload(
         &self,
         sandbox_id: &str,
+        lease_id: &str,
         guest_dir: &str,
         tar: &std::path::Path,
     ) -> preloop_sandbox::Result<()> {
-        self.inner.upload(sandbox_id, guest_dir, tar).await
+        self.inner
+            .upload(sandbox_id, lease_id, guest_dir, tar)
+            .await
     }
     async fn download(
         &self,
         sandbox_id: &str,
+        lease_id: &str,
         guest_path: &str,
         dest: &std::path::Path,
     ) -> preloop_sandbox::Result<()> {
-        self.inner.download(sandbox_id, guest_path, dest).await
+        self.inner
+            .download(sandbox_id, lease_id, guest_path, dest)
+            .await
     }
     async fn snapshot(
         &self,
@@ -496,17 +500,22 @@ impl SandboxApi for FlakyRelease {
     ) -> preloop_sandbox::Result<preloop_sandbox::api::Template> {
         self.inner.snapshot(request).await
     }
-    async fn stop(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
-        self.inner.stop(sandbox_id).await
+    async fn stop(&self, sandbox_id: &str, lease_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.stop(sandbox_id, lease_id).await
     }
-    async fn start(&self, sandbox_id: &str, forkable: bool) -> preloop_sandbox::Result<()> {
-        self.inner.start(sandbox_id, forkable).await
+    async fn start(
+        &self,
+        sandbox_id: &str,
+        lease_id: &str,
+        forkable: bool,
+    ) -> preloop_sandbox::Result<()> {
+        self.inner.start(sandbox_id, lease_id, forkable).await
     }
-    async fn pause(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
-        self.inner.pause(sandbox_id).await
+    async fn pause(&self, sandbox_id: &str, lease_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.pause(sandbox_id, lease_id).await
     }
-    async fn resume(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
-        self.inner.resume(sandbox_id).await
+    async fn resume(&self, sandbox_id: &str, lease_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.resume(sandbox_id, lease_id).await
     }
 }
 

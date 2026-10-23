@@ -1390,7 +1390,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     let payload = artifact_payload(&output, &config.base_image);
     // The bake runs through an in-process sandbox service with this
     // host's SmolVM driver: `pack` writes a portable `.smolmachine`.
-    let sandboxes = crate::sandbox::LocalSandboxes::start(&preloop_home()).await?;
+    let sandboxes = crate::sandbox::LocalSandboxes::start(&preloop_home(), Some(&config)).await?;
     RunnerPool::new(sandboxes.machines(), config)?
         .rebuild_artifact()
         .await?;
@@ -2227,7 +2227,7 @@ async fn cmd_engine(
     // The runner pool gets its machines from the embedded Sandbox Service.
     // Without a pool there is nothing to place here, so do not open the
     // service (or bind its API) at all.
-    let sandboxes = sandbox::start_if_pool(pool_config.is_some(), &home).await?;
+    let sandboxes = sandbox::start_if_pool(pool_config.as_ref(), &home).await?;
     let machines = sandboxes.as_ref().map(sandbox::LocalSandboxes::machines);
 
     let spawn_pool = |config: &RunnerPoolConfig,

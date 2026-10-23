@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink, RemoteLink};
+use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::placement::{Candidate, CandidateId, Placement, PlacementRequest};
@@ -52,6 +52,26 @@ async fn harness_with_host(
     host: std::path::PathBuf,
     caps: Capabilities,
 ) -> Harness {
+    harness_with_host_access(store, dir, host, caps, HostAccess::default()).await
+}
+
+async fn harness_with_access(
+    store: Arc<dyn Store>,
+    dir: tempfile::TempDir,
+    caps: Capabilities,
+    access: HostAccess,
+) -> Harness {
+    let host = dir.path().join("host");
+    harness_with_host_access(store, dir, host, caps, access).await
+}
+
+async fn harness_with_host_access(
+    store: Arc<dyn Store>,
+    dir: tempfile::TempDir,
+    host: std::path::PathBuf,
+    caps: Capabilities,
+    access: HostAccess,
+) -> Harness {
     let mut config = ServiceConfig::new(dir.path().join("blobs"));
     config.acquire_wait = Duration::from_secs(10);
     let service = Service::open(store, config).await.unwrap();
@@ -66,7 +86,7 @@ async fn harness_with_host(
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![fake.clone() as Arc<dyn Driver>],
-        agent_config,
+        agent_config.with_access(access),
     );
     tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -154,6 +174,7 @@ async fn acquire_is_idempotent_and_injects_identity() {
         .service
         .exec_collect(ExecRequest {
             sandbox_id: first.sandbox.id.clone(),
+            lease_id: first.lease.id.clone(),
             argv: vec![
                 "sh".into(),
                 "-c".into(),
@@ -323,12 +344,17 @@ async fn unsupported_operations_fail_instead_of_being_emulated() {
         })
         .await
         .unwrap();
-    let error = h.service.pause(&lease.sandbox.id).await.unwrap_err();
+    let error = h
+        .service
+        .pause(&lease.sandbox.id, &lease.lease.id)
+        .await
+        .unwrap_err();
     assert_eq!(error.code, Code::FailedPrecondition);
     let error = h
         .service
         .snapshot(SnapshotRequest {
             sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
             name: "x".into(),
         })
         .await
@@ -366,6 +392,7 @@ async fn snapshot_becomes_a_template_that_starts_with_the_captured_state() {
         .service
         .exec_collect(ExecRequest {
             sandbox_id: build.sandbox.id.clone(),
+            lease_id: build.lease.id.clone(),
             argv: vec![
                 "sh".into(),
                 "-c".into(),
@@ -380,6 +407,7 @@ async fn snapshot_becomes_a_template_that_starts_with_the_captured_state() {
         .service
         .snapshot(SnapshotRequest {
             sandbox_id: build.sandbox.id.clone(),
+            lease_id: build.lease.id.clone(),
             name: "golden".into(),
         })
         .await
@@ -390,7 +418,7 @@ async fn snapshot_becomes_a_template_that_starts_with_the_captured_state() {
         Some(build.sandbox.id.as_str())
     );
     // The source is consumed.
-    assert!(h.service.get(&build.sandbox.id).is_err());
+    assert!(h.service.get(&build.sandbox.id, &build.lease.id).is_err());
     h.service
         .put_pool(PoolSpec {
             name: "from-golden".into(),
@@ -409,6 +437,7 @@ async fn snapshot_becomes_a_template_that_starts_with_the_captured_state() {
             .service
             .exec_collect(ExecRequest {
                 sandbox_id: lease.sandbox.id.clone(),
+                lease_id: lease.lease.id.clone(),
                 argv: vec!["cat".into(), "marker".into()],
                 ..ExecRequest::default()
             })
@@ -475,13 +504,14 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
         })
         .await
         .unwrap();
-    let preserved = h.service.get(&lease.sandbox.id).unwrap();
+    let preserved = h.service.get(&lease.sandbox.id, &lease.lease.id).unwrap();
     assert_eq!(preserved.state, SandboxState::Preserved);
     // Still usable for debugging while preserved.
     let (code, _, _) = h
         .service
         .exec_collect(ExecRequest {
             sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
             argv: vec!["true".into()],
             ..ExecRequest::default()
         })
@@ -502,14 +532,20 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
         .await
         .unwrap();
     assert_eq!(
-        h.service.get(&short.sandbox.id).unwrap().state,
+        h.service
+            .get(&short.sandbox.id, &short.lease.id)
+            .unwrap()
+            .state,
         SandboxState::Preserved
     );
-    wait_for(|| h.service.get(&short.sandbox.id).is_err()).await;
+    wait_for(|| h.service.get(&short.sandbox.id, &short.lease.id).is_err()).await;
     // The long window outlived it: the short sandbox ended by its TTL, not
     // by reconcile.
     assert_eq!(
-        h.service.get(&lease.sandbox.id).unwrap().state,
+        h.service
+            .get(&lease.sandbox.id, &lease.lease.id)
+            .unwrap()
+            .state,
         SandboxState::Preserved
     );
 }
@@ -542,7 +578,7 @@ async fn reconcile_spares_foreign_orphans_and_fails_lost_sandboxes() {
     h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
     wait_for(|| {
         h.service
-            .get(&lease.sandbox.id)
+            .get(&lease.sandbox.id, &lease.lease.id)
             .is_ok_and(|s| s.state == SandboxState::Failed)
     })
     .await;
@@ -688,10 +724,34 @@ async fn remote_agent_and_client_over_connect() {
         })
         .await
         .unwrap();
+    // The capability crosses the wire: `List` redacts, a foreign lease is
+    // refused, and the holder proceeds.
+    assert!(
+        client
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|sandbox| sandbox.lease_id.is_empty())
+    );
+    let denied = client
+        .get(&lease.sandbox.id, "lse-someone-else")
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, Code::PermissionDenied);
+    assert_eq!(
+        client
+            .get(&lease.sandbox.id, &lease.lease.id)
+            .await
+            .unwrap()
+            .id,
+        lease.sandbox.id
+    );
     // Streaming exec with large output crosses batching.
     let (code, stdout, stderr) = client
         .exec_collect(ExecRequest {
             sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
             argv: vec![
                 "sh".into(),
                 "-c".into(),
@@ -720,12 +780,12 @@ async fn remote_agent_and_client_over_connect() {
         builder.finish().unwrap();
     }
     client
-        .upload(&lease.sandbox.id, "/work", &src)
+        .upload(&lease.sandbox.id, &lease.lease.id, "/work", &src)
         .await
         .unwrap();
     let out = dir.path().join("out.tar");
     client
-        .download(&lease.sandbox.id, "/work/dir", &out)
+        .download(&lease.sandbox.id, &lease.lease.id, "/work/dir", &out)
         .await
         .unwrap();
     let mut archive = tar::Archive::new(std::fs::File::open(&out).unwrap());
@@ -882,6 +942,7 @@ async fn destroying_a_sandbox_closes_open_exec_streams() {
         .service
         .exec(ExecRequest {
             sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
             argv: vec!["sh".into(), "-c".into(), "sleep 300".into()],
             ..ExecRequest::default()
         })
@@ -996,6 +1057,7 @@ async fn restored_leases_re_inject_their_files() {
             .service
             .exec_collect(ExecRequest {
                 sandbox_id: lease.sandbox.id.clone(),
+                lease_id: lease.lease.id.clone(),
                 argv: vec![
                     "sh".into(),
                     "-c".into(),
@@ -1034,6 +1096,7 @@ async fn restored_leases_re_inject_their_files() {
         .service
         .exec_collect(ExecRequest {
             sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
             argv: vec![
                 "sh".into(),
                 "-c".into(),
@@ -1144,13 +1207,16 @@ async fn stop_and_start_round_trip_a_sandbox() {
         .await
         .unwrap();
     let id = lease.sandbox.id.clone();
+    let lease_id = lease.lease.id.clone();
     let exec = |argv: Vec<String>| {
         let service = h.service.clone();
         let id = id.clone();
+        let lease_id = lease_id.clone();
         async move {
             service
                 .exec_collect(ExecRequest {
                     sandbox_id: id,
+                    lease_id,
                     argv,
                     ..ExecRequest::default()
                 })
@@ -1158,16 +1224,22 @@ async fn stop_and_start_round_trip_a_sandbox() {
         }
     };
     assert_eq!(exec(vec!["true".into()]).await.unwrap().0, 0);
-    h.service.stop(&id).await.unwrap();
+    h.service.stop(&id, &lease_id).await.unwrap();
     let error = exec(vec!["true".into()]).await.unwrap_err();
     assert_eq!(error.code, Code::FailedPrecondition);
     assert!(error.message.contains("stopped"), "{}", error.message);
-    assert_eq!(h.service.get(&id).unwrap().state, SandboxState::Stopped);
+    assert_eq!(
+        h.service.get(&id, &lease_id).unwrap().state,
+        SandboxState::Stopped
+    );
     // A stopped sandbox keeps its lease, so a golden can be packed and
     // restarted forkable under the same lease.
-    h.service.start(&id, true).await.unwrap();
+    h.service.start(&id, &lease_id, true).await.unwrap();
     assert_eq!(exec(vec!["true".into()]).await.unwrap().0, 0);
-    assert_eq!(h.service.get(&id).unwrap().state, SandboxState::Leased);
+    assert_eq!(
+        h.service.get(&id, &lease_id).unwrap().state,
+        SandboxState::Leased
+    );
     assert_eq!(h.service.list().len(), 1);
 }
 
@@ -1214,7 +1286,7 @@ async fn reconcile_never_destroys_another_providers_machine() {
         response.destroy
     );
     assert_eq!(
-        h.service.get(&sandbox_id).unwrap().state,
+        h.service.get(&sandbox_id, &lease.lease.id).unwrap().state,
         SandboxState::Leased
     );
 
@@ -1321,7 +1393,13 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
     )
     .await
     .unwrap();
-    let sandbox = restored.get(&sandbox_id).unwrap();
+    // Its lease row is gone, so `Get` cannot be authorized for it; the
+    // unscoped list projection is the only view left.
+    let sandbox = restored
+        .list()
+        .into_iter()
+        .find(|sandbox| sandbox.id == sandbox_id)
+        .expect("restored sandbox is listed");
     assert_eq!(sandbox.state, SandboxState::Failed);
     assert!(
         sandbox.error.contains("without a lease"),
@@ -1761,29 +1839,31 @@ async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
     })
     .await;
     let idle = h.service.list()[0].clone();
-    let error = h.service.pause(&idle.id).await.unwrap_err();
-    assert_eq!(error.code, Code::FailedPrecondition);
+    // An idle warm member has no lease, so the scoped call cannot reach it
+    // at all; the pool's own precondition is the backstop.
+    let error = h.service.pause(&idle.id, "").await.unwrap_err();
+    assert_eq!(error.code, Code::PermissionDenied);
 
     let lease = h.service.acquire(acquire("k", "p")).await.unwrap();
     let id = lease.sandbox.id.clone();
-    h.service.pause(&id).await.unwrap();
+    h.service.pause(&id, &lease.lease.id).await.unwrap();
     h.service
         .release(ReleaseRequest {
-            lease_id: lease.lease.id,
+            lease_id: lease.lease.id.clone(),
             mode: ReleaseMode::Preserve,
             preserve_ttl_secs: 60,
         })
         .await
         .unwrap();
-    let paused = h.service.get(&id).unwrap();
+    let paused = h.service.get(&id, &lease.lease.id).unwrap();
     assert_eq!(
         paused.state,
         SandboxState::Paused,
         "PRESERVE kept power state"
     );
     assert!(paused.preserve_until > unix_now());
-    h.service.resume(&id).await.unwrap();
-    let resumed = h.service.get(&id).unwrap();
+    h.service.resume(&id, &lease.lease.id).await.unwrap();
+    let resumed = h.service.get(&id, &lease.lease.id).unwrap();
     assert_eq!(
         resumed.state,
         SandboxState::Preserved,
@@ -1792,7 +1872,7 @@ async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
     assert!(resumed.preserve_until > unix_now());
     h.service.maintain().await;
     assert_eq!(
-        h.service.get(&id).unwrap().state,
+        h.service.get(&id, &lease.lease.id).unwrap().state,
         SandboxState::Preserved,
         "the preserved member must not be swept before its deadline"
     );
@@ -1811,40 +1891,57 @@ async fn paused_and_stopped_debug_sandboxes_expire_from_the_preserve_window() {
         ..AcquireRequest::default()
     };
     let paused = h.service.acquire(request.clone()).await.unwrap();
-    h.service.pause(&paused.sandbox.id).await.unwrap();
+    h.service
+        .pause(&paused.sandbox.id, &paused.lease.id)
+        .await
+        .unwrap();
     h.service
         .release(ReleaseRequest {
-            lease_id: paused.lease.id,
+            lease_id: paused.lease.id.clone(),
             mode: ReleaseMode::Preserve,
             preserve_ttl_secs: 1,
         })
         .await
         .unwrap();
     assert_eq!(
-        h.service.get(&paused.sandbox.id).unwrap().state,
+        h.service
+            .get(&paused.sandbox.id, &paused.lease.id)
+            .unwrap()
+            .state,
         SandboxState::Paused
     );
 
     request.idempotency_key = "stop".into();
     let stopped = h.service.acquire(request).await.unwrap();
-    h.service.stop(&stopped.sandbox.id).await.unwrap();
+    h.service
+        .stop(&stopped.sandbox.id, &stopped.lease.id)
+        .await
+        .unwrap();
     h.service
         .release(ReleaseRequest {
-            lease_id: stopped.lease.id,
+            lease_id: stopped.lease.id.clone(),
             mode: ReleaseMode::Preserve,
             preserve_ttl_secs: 1,
         })
         .await
         .unwrap();
     assert_eq!(
-        h.service.get(&stopped.sandbox.id).unwrap().state,
+        h.service
+            .get(&stopped.sandbox.id, &stopped.lease.id)
+            .unwrap()
+            .state,
         SandboxState::Stopped
     );
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
     h.service.maintain().await;
-    wait_for(|| h.service.get(&paused.sandbox.id).is_err()).await;
-    wait_for(|| h.service.get(&stopped.sandbox.id).is_err()).await;
+    wait_for(|| h.service.get(&paused.sandbox.id, &paused.lease.id).is_err()).await;
+    wait_for(|| {
+        h.service
+            .get(&stopped.sandbox.id, &stopped.lease.id)
+            .is_err()
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1920,6 +2017,7 @@ async fn delete_template_refuses_while_a_clone_is_live() {
     h.service
         .snapshot(SnapshotRequest {
             sandbox_id: source.sandbox.id.clone(),
+            lease_id: source.lease.id.clone(),
             name: "golden".into(),
         })
         .await
@@ -1972,10 +2070,12 @@ async fn a_snapshot_in_flight_reserves_its_source() {
     let snapshot = tokio::spawn({
         let service = h.service.clone();
         let id = id.clone();
+        let lease_id = lease.lease.id.clone();
         async move {
             service
                 .snapshot(SnapshotRequest {
                     sandbox_id: id,
+                    lease_id,
                     name: "golden".into(),
                 })
                 .await
@@ -1987,6 +2087,7 @@ async fn a_snapshot_in_flight_reserves_its_source() {
         .service
         .snapshot(SnapshotRequest {
             sandbox_id: id.clone(),
+            lease_id: lease.lease.id.clone(),
             name: "other".into(),
         })
         .await
@@ -1995,7 +2096,7 @@ async fn a_snapshot_in_flight_reserves_its_source() {
     let release = h
         .service
         .release(ReleaseRequest {
-            lease_id: lease.lease.id,
+            lease_id: lease.lease.id.clone(),
             mode: ReleaseMode::Destroy,
             ..ReleaseRequest::default()
         })
@@ -2004,7 +2105,7 @@ async fn a_snapshot_in_flight_reserves_its_source() {
     assert_eq!(release.code, Code::FailedPrecondition);
 
     // A lifecycle change (pause) during the capture invalidates the result.
-    h.service.pause(&id).await.unwrap();
+    h.service.pause(&id, &lease.lease.id).await.unwrap();
     let error = snapshot.await.unwrap().unwrap_err();
     assert_eq!(error.code, Code::FailedPrecondition, "{}", error.message);
     assert!(
@@ -2066,7 +2167,7 @@ async fn a_reconfigured_pool_never_serves_an_old_warm_member() {
         .unwrap();
     h.service.maintain().await;
     assert!(
-        h.service.get(&old).is_ok(),
+        h.service.list().iter().any(|sandbox| sandbox.id == old),
         "a warm-count change retired the warm member"
     );
 
@@ -2088,7 +2189,7 @@ async fn a_reconfigured_pool_never_serves_an_old_warm_member() {
     })
     .await;
     assert!(
-        h.service.get(&old).is_err(),
+        !h.service.list().iter().any(|sandbox| sandbox.id == old),
         "the old-revision warm member was not retired"
     );
     let lease = h.service.acquire(acquire("k", "p")).await.unwrap();
@@ -2108,7 +2209,10 @@ async fn replayed_acquire_of_a_stopped_sandbox_returns_it() {
         })
         .await
         .unwrap();
-    h.service.stop(&lease.sandbox.id).await.unwrap();
+    h.service
+        .stop(&lease.sandbox.id, &lease.lease.id)
+        .await
+        .unwrap();
     let replay = h
         .service
         .acquire(AcquireRequest {
@@ -2139,6 +2243,7 @@ async fn a_ticket_authorises_exactly_one_transfer() {
         .service
         .open_stream(OpenStreamRequest {
             sandbox_id: lease.sandbox.id,
+            lease_id: lease.lease.id,
             kind: StreamKind::Download,
             path: "/work".into(),
         })
@@ -2192,6 +2297,7 @@ async fn reconcile_protects_snapshot_bases_from_any_provider() {
         .service
         .snapshot(SnapshotRequest {
             sandbox_id: source.sandbox.id,
+            lease_id: source.lease.id,
             name: "golden".into(),
         })
         .await
@@ -2256,6 +2362,7 @@ async fn concurrent_same_key_acquires_inject_once() {
         .service
         .exec_collect(ExecRequest {
             sandbox_id: first.sandbox.id,
+            lease_id: first.lease.id.clone(),
             argv: vec!["cat".into(), "work/value".into()],
             ..ExecRequest::default()
         })
@@ -2263,4 +2370,304 @@ async fn concurrent_same_key_acquires_inject_once() {
         .unwrap();
     assert_eq!(code, 0);
     assert_eq!(stdout, b"injected");
+}
+
+/// The lease from `Acquire` is the capability: every sandbox-scoped call
+/// needs it, a foreign one is denied, and an unknown sandbox is not found.
+#[tokio::test]
+async fn sandbox_scoped_calls_require_the_holding_lease() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let a = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "a".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let b = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "b".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let sandbox_id = a.sandbox.id.clone();
+    for lease_id in ["", b.lease.id.as_str()] {
+        let get = h.service.get(&sandbox_id, lease_id).unwrap_err();
+        assert_eq!(get.code, Code::PermissionDenied, "{get}");
+        let exec = h
+            .service
+            .exec(ExecRequest {
+                sandbox_id: sandbox_id.clone(),
+                lease_id: lease_id.to_owned(),
+                argv: vec!["true".into()],
+                ..ExecRequest::default()
+            })
+            .err()
+            .expect("exec must be denied");
+        assert_eq!(exec.code, Code::PermissionDenied, "{exec}");
+        let stream = h
+            .service
+            .open_stream(OpenStreamRequest {
+                sandbox_id: sandbox_id.clone(),
+                lease_id: lease_id.to_owned(),
+                kind: StreamKind::Download,
+                path: "/etc".into(),
+            })
+            .unwrap_err();
+        assert_eq!(stream.code, Code::PermissionDenied, "{stream}");
+        let stop = h.service.stop(&sandbox_id, lease_id).await.unwrap_err();
+        assert_eq!(stop.code, Code::PermissionDenied, "{stop}");
+        let start = h
+            .service
+            .start(&sandbox_id, lease_id, false)
+            .await
+            .unwrap_err();
+        assert_eq!(start.code, Code::PermissionDenied, "{start}");
+        let pause = h.service.pause(&sandbox_id, lease_id).await.unwrap_err();
+        assert_eq!(pause.code, Code::PermissionDenied, "{pause}");
+        let resume = h.service.resume(&sandbox_id, lease_id).await.unwrap_err();
+        assert_eq!(resume.code, Code::PermissionDenied, "{resume}");
+        let snapshot = h
+            .service
+            .snapshot(SnapshotRequest {
+                sandbox_id: sandbox_id.clone(),
+                lease_id: lease_id.to_owned(),
+                name: "stolen".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(snapshot.code, Code::PermissionDenied, "{snapshot}");
+    }
+    // The holder still works, and an unknown sandbox is not found (never a
+    // permission hint about another tenant).
+    assert_eq!(
+        h.service.get(&sandbox_id, &a.lease.id).unwrap().id,
+        sandbox_id
+    );
+    assert_eq!(
+        h.service
+            .exec_collect(ExecRequest {
+                sandbox_id: sandbox_id.clone(),
+                lease_id: a.lease.id.clone(),
+                argv: vec!["true".into()],
+                ..ExecRequest::default()
+            })
+            .await
+            .unwrap()
+            .0,
+        0
+    );
+    let missing = h.service.get("sbx-missing", &a.lease.id).unwrap_err();
+    assert_eq!(missing.code, Code::NotFound, "{missing}");
+    h.service
+        .release(ReleaseRequest {
+            lease_id: a.lease.id,
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    h.service
+        .release(ReleaseRequest {
+            lease_id: b.lease.id,
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// `List` is unscoped, so it never carries a lease id; `Get` only shows the
+/// lease the caller already presented.
+#[tokio::test]
+async fn list_redacts_lease_ids() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let first = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "first".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let second = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "second".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let listed = h.service.list();
+    assert_eq!(listed.len(), 2);
+    assert!(
+        listed.iter().all(|sandbox| sandbox.lease_id.is_empty()),
+        "{listed:?}"
+    );
+    // The holder sees its own lease; another lease does not unlock it.
+    assert_eq!(
+        h.service
+            .get(&first.sandbox.id, &first.lease.id)
+            .unwrap()
+            .lease_id,
+        first.lease.id
+    );
+    assert_eq!(
+        h.service
+            .get(&first.sandbox.id, &second.lease.id)
+            .unwrap_err()
+            .code,
+        Code::PermissionDenied
+    );
+}
+
+fn mounted(key: &str, host: &std::path::Path) -> AcquireRequest {
+    AcquireRequest {
+        idempotency_key: key.into(),
+        template: "alpine".into(),
+        mounts: vec![Mount {
+            host: host.display().to_string(),
+            guest: "/mnt".into(),
+            readonly: true,
+        }],
+        ..AcquireRequest::default()
+    }
+}
+
+fn socketed(key: &str, host: &std::path::Path) -> AcquireRequest {
+    AcquireRequest {
+        idempotency_key: key.into(),
+        template: "alpine".into(),
+        sockets: vec![SocketMount {
+            host: host.display().to_string(),
+            guest: "/run/host.sock".into(),
+        }],
+        ..AcquireRequest::default()
+    }
+}
+
+/// The agent admits only host paths under its configured prefixes, resolving
+/// `..` and symlinks before the check, and denies everything by default.
+#[tokio::test]
+async fn agent_enforces_the_host_mount_and_socket_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = dir.path().join("allowed");
+    let child = allowed.join("child");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let access = HostAccess {
+        mounts: vec![allowed.clone()],
+        sockets: vec![allowed.clone()],
+    };
+    let h = harness_with_access(
+        store::open("memory:").await.unwrap(),
+        tempfile::tempdir().unwrap(),
+        FakeDriver::full_capabilities(),
+        access,
+    )
+    .await;
+    h.service.put_template(template("alpine")).await.unwrap();
+
+    // Allowed prefix, its descendant, and a path that stays inside after
+    // resolving `..` all succeed.
+    for (key, host) in [
+        ("allow-prefix", allowed.clone()),
+        ("allow-child", child.clone()),
+        ("allow-dotdot-inside", child.join("..").join("child")),
+    ] {
+        let response = h.service.acquire(mounted(key, &host)).await.unwrap();
+        h.service
+            .release(ReleaseRequest {
+                lease_id: response.lease.id,
+                mode: ReleaseMode::Destroy,
+                ..ReleaseRequest::default()
+            })
+            .await
+            .unwrap();
+    }
+    // A sibling tree is refused before the driver runs.
+    let error = h
+        .service
+        .acquire(mounted("deny-outside", &outside))
+        .await
+        .unwrap_err();
+    assert!(
+        error.message.contains("outside this agent's allowlist"),
+        "{}",
+        error.message
+    );
+    // `..` cannot climb out of the allowed prefix.
+    let escape = allowed.join("..").join("outside");
+    let error = h
+        .service
+        .acquire(mounted("deny-escape", &escape))
+        .await
+        .unwrap_err();
+    assert!(
+        error.message.contains("outside this agent's allowlist"),
+        "{}",
+        error.message
+    );
+    // Sockets use their own prefix list.
+    let response = h
+        .service
+        .acquire(socketed("socket-allow", &allowed))
+        .await
+        .unwrap();
+    h.service
+        .release(ReleaseRequest {
+            lease_id: response.lease.id,
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    let error = h
+        .service
+        .acquire(socketed("socket-deny", &outside))
+        .await
+        .unwrap_err();
+    assert!(
+        error.message.contains("outside this agent's allowlist"),
+        "{}",
+        error.message
+    );
+}
+
+/// With no allowlist configured (the default), every host mount is refused.
+#[tokio::test]
+async fn agent_denies_all_host_mounts_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let error = h
+        .service
+        .acquire(mounted("no-allow", dir.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        error.message.contains("exports no mount paths"),
+        "{}",
+        error.message
+    );
+    let error = h
+        .service
+        .acquire(socketed("no-socket-allow", dir.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        error.message.contains("exports no socket paths"),
+        "{}",
+        error.message
+    );
 }
