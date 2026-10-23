@@ -24,6 +24,45 @@ pub const GITHUB_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.co
 /// Token validity window in seconds.
 const TOKEN_TTL_SECS: u64 = 300;
 
+/// GitHub's immutable-subject-claims rollout cutoff, as a Unix timestamp:
+/// 2026-07-15T00:00:00Z. Repositories created after this instant default
+/// to ID-embedded subjects on GitHub; preloop mirrors the same line.
+pub const IMMUTABLE_SUBJECT_CUTOFF_UNIX: i64 = 1_784_073_600;
+
+/// Parse a GitHub `created_at` timestamp (RFC 3339, e.g.
+/// `2026-08-01T12:34:56Z`) to Unix seconds. `None` for anything else.
+pub fn parse_repo_created_at(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|parsed| parsed.timestamp())
+}
+
+/// Decide whether a token's `sub` uses GitHub's immutable, ID-embedded
+/// form (`repo:OWNER@OWNER-ID/REPO@REPO-ID:…`).
+///
+/// Fail-closed on format: without both numeric IDs there is no immutable
+/// form — an empty-ID subject must never be minted — so the answer is
+/// `false` no matter what the operator or the date says. With both IDs,
+/// an operator override (`[oidc] immutable_subject_claims`) wins;
+/// otherwise GitHub's rollout policy applies: immutable when the
+/// repository was created after [`IMMUTABLE_SUBJECT_CUTOFF_UNIX`], and
+/// name-based when the date is older *or unknown* (a date that cannot be
+/// determined must never break or silently reformat a mint).
+pub fn use_immutable_subject(
+    repository_id: &str,
+    repository_owner_id: &str,
+    repository_created_at: Option<i64>,
+    operator_override: Option<bool>,
+) -> bool {
+    if repository_id.is_empty() || repository_owner_id.is_empty() {
+        return false;
+    }
+    if let Some(forced) = operator_override {
+        return forced;
+    }
+    repository_created_at.is_some_and(|created_at| created_at > IMMUTABLE_SUBJECT_CUTOFF_UNIX)
+}
+
 /// An RSA keypair dedicated to OIDC token signing, with a persisted X.509
 /// certificate and its identifiers.
 #[derive(Clone)]
@@ -230,6 +269,10 @@ pub struct OidcClaimsInput {
     pub repository_id: String,
     /// Numeric repository owner ID (as string). Empty if unknown.
     pub repository_owner_id: String,
+    /// Whether `sub` uses the immutable ID-embedded form. Resolved by the
+    /// mint handler via [`use_immutable_subject`]; `format_sub` re-checks
+    /// that both IDs are present before embedding them.
+    pub immutable_subject: bool,
     /// Full workflow ref path (e.g. `owner/repo/.github/workflows/ci.yml@refs/heads/main`).
     pub workflow_ref: Option<String>,
     /// Workflow SHA (same as `sha` for non-reusable workflows).
@@ -268,6 +311,29 @@ fn encode_colons(s: &str) -> String {
     s.replace(':', "%3A")
 }
 
+/// The `OWNER/REPO` segment of a subject claim: the name-based slug, or
+/// GitHub's immutable form (`OWNER@OWNER-ID/REPO@REPO-ID`) when the input
+/// resolved to an immutable subject *and* both IDs are present *and* the
+/// slug really is `owner/repo`. Anything else falls back to the plain
+/// slug — the empty-ID form must never be emitted.
+fn repo_subject_segment(input: &OidcClaimsInput) -> String {
+    let ids_known = input.immutable_subject
+        && !input.repository_id.is_empty()
+        && !input.repository_owner_id.is_empty();
+    if ids_known
+        && let Some((owner, repo)) = input.repository.split_once('/')
+        && !owner.is_empty()
+        && !repo.is_empty()
+        && !repo.contains('/')
+    {
+        return format!(
+            "{}@{}/{}@{}",
+            owner, input.repository_owner_id, repo, input.repository_id
+        );
+    }
+    input.repository.clone()
+}
+
 /// Format the `sub` (subject) claim per GitHub's documented rules.
 ///
 /// - With environment: `repo:OWNER/REPO:environment:NAME`
@@ -275,9 +341,14 @@ fn encode_colons(s: &str) -> String {
 /// - Branch (no env, no PR): `repo:OWNER/REPO:ref:refs/heads/BRANCH`
 /// - Tag (no env, no PR): `repo:OWNER/REPO:ref:refs/tags/TAG`
 ///
+/// When the input carries an immutable subject (see
+/// [`use_immutable_subject`]), the `OWNER/REPO` segment is replaced by
+/// `OWNER@OWNER-ID/REPO@REPO-ID`; the suffixes are unchanged.
+///
 /// Colons in environment names are `%3A`-encoded.
 pub fn format_sub(input: &OidcClaimsInput) -> String {
-    let repo = &input.repository;
+    let repo = repo_subject_segment(input);
+    let repo = &repo;
     if let Some(env) = &input.environment {
         return format!("repo:{repo}:environment:{}", encode_colons(env));
     }
@@ -443,6 +514,181 @@ mod tests {
             format_sub(&input),
             "repo:owner/repo:environment:Production%3AV1"
         );
+    }
+
+    // -- immutable (ID-embedded) sub formatting ----------------------------
+
+    fn immutable_input(git_ref: &str, event: &str, env: Option<&str>) -> OidcClaimsInput {
+        let mut input = test_input(git_ref, event, env);
+        input.immutable_subject = true;
+        input
+    }
+
+    #[test]
+    fn sub_immutable_branch_ref() {
+        let input = immutable_input("refs/heads/main", "push", None);
+        assert_eq!(
+            format_sub(&input),
+            "repo:owner@297229730/repo@1285198891:ref:refs/heads/main"
+        );
+    }
+
+    #[test]
+    fn sub_immutable_tag_ref() {
+        let input = immutable_input("refs/tags/v1.0", "push", None);
+        assert_eq!(
+            format_sub(&input),
+            "repo:owner@297229730/repo@1285198891:ref:refs/tags/v1.0"
+        );
+    }
+
+    #[test]
+    fn sub_immutable_pull_request() {
+        let input = immutable_input("refs/pull/42/merge", "pull_request", None);
+        assert_eq!(
+            format_sub(&input),
+            "repo:owner@297229730/repo@1285198891:pull_request"
+        );
+    }
+
+    #[test]
+    fn sub_immutable_environment() {
+        let input = immutable_input("refs/heads/main", "push", Some("production"));
+        assert_eq!(
+            format_sub(&input),
+            "repo:owner@297229730/repo@1285198891:environment:production"
+        );
+    }
+
+    #[test]
+    fn sub_immutable_environment_with_colon_is_encoded() {
+        let input = immutable_input("refs/heads/main", "push", Some("Production:V1"));
+        assert_eq!(
+            format_sub(&input),
+            "repo:owner@297229730/repo@1285198891:environment:Production%3AV1"
+        );
+    }
+
+    #[test]
+    fn sub_immutable_without_ids_falls_back_to_name_based() {
+        // The flag alone must never produce an empty-ID subject.
+        let mut input = immutable_input("refs/heads/main", "push", None);
+        input.repository_id = String::new();
+        assert_eq!(format_sub(&input), "repo:owner/repo:ref:refs/heads/main");
+        let mut input = immutable_input("refs/heads/main", "push", None);
+        input.repository_owner_id = String::new();
+        assert_eq!(format_sub(&input), "repo:owner/repo:ref:refs/heads/main");
+    }
+
+    #[test]
+    fn claims_sub_uses_immutable_form_when_resolved() {
+        let input = immutable_input("refs/heads/main", "push", None);
+        let claims = build_claims(&input, "test", GITHUB_OIDC_ISSUER, 100);
+        assert_eq!(
+            claims["sub"],
+            "repo:owner@297229730/repo@1285198891:ref:refs/heads/main"
+        );
+    }
+
+    // -- immutable-subject decision -----------------------------------------
+
+    /// 2020-01-01T00:00:00Z — comfortably before the rollout cutoff.
+    const PRE_CUTOFF: i64 = 1_577_836_800;
+    /// 2026-08-01T00:00:00Z — after the 2026-07-15 cutoff.
+    const POST_CUTOFF: i64 = 1_785_542_400;
+
+    #[test]
+    fn immutable_decision_pre_cutoff_repo_is_name_based() {
+        assert!(!use_immutable_subject(
+            "1285198891",
+            "297229730",
+            Some(PRE_CUTOFF),
+            None
+        ));
+    }
+
+    #[test]
+    fn immutable_decision_post_cutoff_repo_is_immutable() {
+        assert!(use_immutable_subject(
+            "1285198891",
+            "297229730",
+            Some(POST_CUTOFF),
+            None
+        ));
+    }
+
+    #[test]
+    fn immutable_decision_at_cutoff_is_name_based() {
+        // GitHub's rule is "created *after* 2026-07-15".
+        assert!(!use_immutable_subject(
+            "1285198891",
+            "297229730",
+            Some(IMMUTABLE_SUBJECT_CUTOFF_UNIX),
+            None
+        ));
+    }
+
+    #[test]
+    fn immutable_decision_operator_force_on_for_pre_cutoff_repo() {
+        assert!(use_immutable_subject(
+            "1285198891",
+            "297229730",
+            Some(PRE_CUTOFF),
+            Some(true)
+        ));
+    }
+
+    #[test]
+    fn immutable_decision_operator_force_off_for_post_cutoff_repo() {
+        assert!(!use_immutable_subject(
+            "1285198891",
+            "297229730",
+            Some(POST_CUTOFF),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn immutable_decision_missing_ids_is_name_based() {
+        assert!(!use_immutable_subject(
+            "",
+            "297229730",
+            Some(POST_CUTOFF),
+            None
+        ));
+        assert!(!use_immutable_subject(
+            "1285198891",
+            "",
+            Some(POST_CUTOFF),
+            None
+        ));
+        // Even an operator force-on cannot mint an empty-ID subject.
+        assert!(!use_immutable_subject(
+            "",
+            "",
+            Some(POST_CUTOFF),
+            Some(true)
+        ));
+    }
+
+    #[test]
+    fn immutable_decision_unknown_date_is_name_based() {
+        assert!(!use_immutable_subject(
+            "1285198891",
+            "297229730",
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn parse_repo_created_at_reads_rfc3339() {
+        assert_eq!(
+            parse_repo_created_at("2026-08-01T00:00:00Z"),
+            Some(POST_CUTOFF)
+        );
+        assert_eq!(parse_repo_created_at("not a date"), None);
+        assert_eq!(parse_repo_created_at(""), None);
     }
 
     // -- default audience ---------------------------------------------------
@@ -785,6 +1031,7 @@ jobs:
                 actor_id: String::new(),
                 repository_id: String::new(),
                 repository_owner_id: String::new(),
+                immutable_subject: false,
                 workflow: "test".to_string(),
                 run_id: "1".to_string(),
                 run_number: "1".to_string(),
@@ -821,6 +1068,7 @@ jobs:
                 actor_id: String::new(),
                 repository_id: String::new(),
                 repository_owner_id: String::new(),
+                immutable_subject: false,
                 workflow: "test".to_string(),
                 run_id: "1".to_string(),
                 run_number: "1".to_string(),
@@ -857,6 +1105,7 @@ jobs:
                 actor_id: String::new(),
                 repository_id: String::new(),
                 repository_owner_id: String::new(),
+                immutable_subject: false,
                 workflow: "test".to_string(),
                 run_id: "1".to_string(),
                 run_number: "1".to_string(),
@@ -892,6 +1141,7 @@ jobs:
                 actor_id: String::new(),
                 repository_id: String::new(),
                 repository_owner_id: String::new(),
+                immutable_subject: false,
                 workflow: "test".to_string(),
                 run_id: "1".to_string(),
                 run_number: "1".to_string(),
@@ -959,6 +1209,7 @@ jobs:
                 actor_id: String::new(),
                 repository_id: String::new(),
                 repository_owner_id: String::new(),
+                immutable_subject: false,
                 workflow: "test".to_string(),
                 run_id: "1".to_string(),
                 run_number: "1".to_string(),
@@ -1039,6 +1290,7 @@ jobs:
             repository_visibility: "private".to_string(),
             repository_id: "1285198891".to_string(),
             repository_owner_id: "297229730".to_string(),
+            immutable_subject: false,
             workflow_ref: None,
             workflow_sha: None,
             job_workflow_ref: None,
@@ -1072,6 +1324,7 @@ mod lie_github_tests {
             repository_visibility: "private".to_string(),
             repository_id: "1285198891".to_string(),
             repository_owner_id: "297229730".to_string(),
+            immutable_subject: false,
             workflow_ref: None,
             workflow_sha: None,
             job_workflow_ref: None,
@@ -1137,6 +1390,7 @@ mod lie_github_tests {
             repository_visibility: "private".to_string(),
             repository_id: "1285198891".to_string(),
             repository_owner_id: "297229730".to_string(),
+            immutable_subject: false,
             workflow_ref: Some(
                 "preloopdev/preloop-conformance-sample/.github/workflows/15-oidc-id-token.yml@refs/heads/main"
                     .to_string(),
