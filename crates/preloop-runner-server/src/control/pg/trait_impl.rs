@@ -953,6 +953,9 @@ impl ControlBackend for PgBackend {
     async fn rebuild_dispatch_intent(&self) -> Result<(), ControlError> {
         self.rebuild_dispatch_intent().await
     }
+    async fn reconcile_dispatch_intent(&self) -> Result<usize, ControlError> {
+        self.reconcile_dispatch_intent().await
+    }
     async fn runs_for_repository(&self, repository: &str) -> Result<Vec<RunRecord>, ControlError> {
         self.runs_for_repository(repository).await
     }

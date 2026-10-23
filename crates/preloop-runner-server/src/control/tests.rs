@@ -4881,6 +4881,9 @@ pub(crate) mod suite {
         /// Park a ready job outside the ready queue (`claimed`) with its
         /// binding left on the row — the dispatch leftover the sweep clears.
         Park { run_id: RunId, job_id: String },
+        /// Drop both intent rows from a ready job — the leaked shape strict
+        /// assignments can never claim.
+        ClearIntent { run_id: RunId, job_id: String },
     }
 
     /// The claim-binding ceiling: a job that has been in the ready queue
@@ -5123,6 +5126,219 @@ pub(crate) mod suite {
             panic!("the remaining job must be dispatched, got {outcome:?}");
         };
         assert_eq!(claimed.queued.job_id, JobId("newer".to_owned()));
+    }
+
+    /// A claimed job whose runner is purged is requeued WITH dispatch intent:
+    /// under strict assignments a ready job with no assignment/provision row
+    /// is unclaimable, so the requeue must re-derive the enqueue mark.
+    /// Requires `set_config(false, true, _)` from the wrapper.
+    pub(crate) async fn purge_rebinds_a_requeued_job_under_strict_assignments(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("dying"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("the enqueue-bound job must be claimable, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.run_id, run_id);
+
+        // The runner dies: purge requeues its claimed job.
+        backend.purge_runner(runner.runner.id).await.unwrap();
+
+        // A replacement pairs the requeued job only when the requeue wrote a
+        // provision mark; strict mode then lets it claim the fresh binding.
+        let replacement = backend
+            .register_runner(register_runner("replacement"))
+            .await
+            .unwrap();
+        let replacement_session = backend
+            .create_session(create_session(replacement.runner.id))
+            .await
+            .unwrap();
+        backend.pair_runner(replacement.runner.id).await.unwrap();
+        let outcome = backend
+            .poll_session(poll(&replacement_session.session_id, replacement.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a replacement runner must claim the requeued job, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.run_id, run_id);
+        assert_eq!(claimed.runner_id, replacement.runner.id);
+    }
+
+    /// Strict assignments with the pool off: an enqueue with no free matching
+    /// runner must still write a provision mark, or the job is born
+    /// unclaimable and no later runner can ever pair it. Requires
+    /// `set_config(false, true, _)` from the wrapper.
+    pub(crate) async fn strict_without_pool_marks_a_job_for_a_later_runner(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        // No session exists: enqueue-time pairing has no candidate.
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+
+        let runner = backend
+            .register_runner(register_runner("later"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend.pair_runner(runner.runner.id).await.unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a later runner must pair and claim the marked job, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.run_id, run_id);
+    }
+
+    /// A deferred matrix expansion materializes each leg as a ready job; every
+    /// leg must carry dispatch intent, or strict assignments leave it
+    /// unclaimable forever (the spec's F-3). Requires `set_config(false, true,
+    /// _)` from the wrapper.
+    pub(crate) async fn deferred_expansion_legs_are_claimable_under_strict(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "gen", 1), fan]))
+            .await
+            .unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        assert_eq!(claim.job.job_id, JobId("fan".to_owned()));
+        let outcome = backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix {
+                    jobs: vec![
+                        super::built_matrix_leg(run_id, "fan-1", "fan", 1, 2),
+                        super::built_matrix_leg(run_id, "fan-2", "fan", 2, 2),
+                    ],
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.promoted, 2,
+            "both expansion legs must be promoted, got {outcome:?}"
+        );
+
+        let runner = backend
+            .register_runner(register_runner("matrix"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend.pair_runner(runner.runner.id).await.unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("an expanded leg must be claimable under strict assignments, got {outcome:?}");
+        };
+        assert!(
+            matches!(claimed.queued.job_id.0.as_str(), "fan-1" | "fan-2"),
+            "the claimed job must be an expansion leg, got {:?}",
+            claimed.queued.job_id
+        );
+    }
+
+    /// The periodic backstop repairs a ready job with no dispatch intent at
+    /// all and reports the repair count; a second pass has nothing to do (it
+    /// never re-stamps a live row). Requires `set_config(false, true, _)`.
+    pub(crate) async fn reconcile_repairs_a_missing_intent_row<F, Fut>(
+        backend: &dyn ControlBackend,
+        seed: F,
+    ) where
+        F: Fn(SeedRow) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        // Recreate the leaked shape: the strict submit wrote a row; drop both.
+        seed(SeedRow::ClearIntent {
+            run_id,
+            job_id: "build".to_owned(),
+        })
+        .await;
+
+        assert_eq!(
+            backend.reconcile_dispatch_intent().await.unwrap(),
+            1,
+            "the leaked job must be repaired"
+        );
+        assert_eq!(
+            backend.reconcile_dispatch_intent().await.unwrap(),
+            0,
+            "a repaired job must not be touched twice"
+        );
+
+        let runner = backend
+            .register_runner(register_runner("reconciled"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend.pair_runner(runner.runner.id).await.unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Claimed(_)),
+            "the repaired job must be claimable, got {outcome:?}"
+        );
     }
 
     /// Claim the next job as `runner` and return `(run, job, agent job id)`.
@@ -9601,6 +9817,12 @@ mod pg {
                 "UPDATE jobs SET queue_state = 'claimed' \
                  WHERE run_id = '{run_id}' AND job_id = '{job_id}'"
             ),
+            suite::SeedRow::ClearIntent { run_id, job_id } => format!(
+                "WITH dropped AS (DELETE FROM job_assignments \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}') \
+                 DELETE FROM provision_requests \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'"
+            ),
         };
         backend.test_execute(&sql).await.unwrap();
     }
@@ -9626,6 +9848,46 @@ mod pg {
         backend.set_config(false, true, std::time::Duration::from_secs(300));
         let db = &backend;
         suite::stale_reservation_reopens_a_bound_job(&backend, |row| async move {
+            seed_row(db, row).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn purge_rebinds_a_requeued_job_under_strict_assignments() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::purge_rebinds_a_requeued_job_under_strict_assignments(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn strict_without_pool_marks_a_job_for_a_later_runner() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::strict_without_pool_marks_a_job_for_a_later_runner(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_expansion_legs_are_claimable_under_strict() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::deferred_expansion_legs_are_claimable_under_strict(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_repairs_a_missing_intent_row() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::reconcile_repairs_a_missing_intent_row(&backend, |row| async move {
             seed_row(db, row).await;
         })
         .await;
@@ -11615,6 +11877,12 @@ mod lite {
                 "UPDATE jobs SET queue_state = 'claimed' \
                  WHERE run_id = '{run_id}' AND job_id = '{job_id}'"
             ),
+            suite::SeedRow::ClearIntent { run_id, job_id } => format!(
+                "DELETE FROM job_assignments \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'; \
+                 DELETE FROM provision_requests \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'"
+            ),
         };
         backend.exec_for_test(&sql);
     }
@@ -11636,6 +11904,38 @@ mod lite {
         backend.set_config(false, true, std::time::Duration::from_secs(300));
         let db = &backend;
         suite::stale_reservation_reopens_a_bound_job(&backend, |row| async move {
+            seed_row(db, row);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn purge_rebinds_a_requeued_job_under_strict_assignments() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::purge_rebinds_a_requeued_job_under_strict_assignments(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn strict_without_pool_marks_a_job_for_a_later_runner() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::strict_without_pool_marks_a_job_for_a_later_runner(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_expansion_legs_are_claimable_under_strict() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::deferred_expansion_legs_are_claimable_under_strict(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_repairs_a_missing_intent_row() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::reconcile_repairs_a_missing_intent_row(&backend, |row| async move {
             seed_row(db, row);
         })
         .await;

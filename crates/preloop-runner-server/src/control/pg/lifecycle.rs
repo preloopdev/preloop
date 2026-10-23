@@ -444,7 +444,7 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
-            if pool_assignments {
+            if pool_assignments || require_assignments {
                 tx.execute(
                     concat!(
                         "INSERT INTO provision_requests (run_id, job_id, namespace_id, \
@@ -609,7 +609,7 @@ impl PgBackend {
         for row in requeue {
             let run_id = codec::run_id(row.get(0))?;
             let job_id = JobId(row.get(1));
-            super::dispatch::requeue_claimed_tx(tx, run_id, &job_id, &mut retired).await?;
+            super::dispatch::requeue_claimed_tx(self, tx, run_id, &job_id, &mut retired).await?;
         }
         let now = now_us();
         for row in unclaimed {
@@ -1501,7 +1501,8 @@ impl PgBackend {
         for row in &orphaned {
             let run_id = codec::run_id(row.get::<_, String>(0).as_str())?;
             let job_id = JobId(row.get(1));
-            if super::dispatch::requeue_claimed_tx(&tx, run_id, &job_id, &mut retired).await? {
+            if super::dispatch::requeue_claimed_tx(self, &tx, run_id, &job_id, &mut retired).await?
+            {
                 recovered += 1;
             } else {
                 failed += 1;
@@ -1528,7 +1529,24 @@ impl PgBackend {
     /// ready queue after a config change (assignments enabled): pair every
     /// unbound ready job, or clear bindings when assignments are off.
     pub(super) async fn rebuild_dispatch_intent(&self) -> Result<(), ControlError> {
+        self.derive_dispatch_intent(false).await.map(|_| ())
+    }
+
+    /// `reconcile_dispatch_intent`: the reaper's periodic backstop for ready
+    /// jobs a path leaked with no assignment and no pool-pending row. Only
+    /// those jobs are re-derived; existing rows are never re-stamped.
+    pub(super) async fn reconcile_dispatch_intent(&self) -> Result<usize, ControlError> {
+        self.derive_dispatch_intent(true).await
+    }
+
+    /// Shared derivation for the boot rebuild and the reaper backstop.
+    /// `only_missing` restricts the sweep to ready jobs with neither a
+    /// `job_assignments` nor a `provision_requests` row.
+    async fn derive_dispatch_intent(&self, only_missing: bool) -> Result<usize, ControlError> {
         let (pool_assignments, require_assignments, _l) = self.config();
+        if !pool_assignments && !require_assignments && only_missing {
+            return Ok(0);
+        }
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         if !pool_assignments && !require_assignments {
@@ -1539,16 +1557,22 @@ impl PgBackend {
                 .await
                 .map_err(db)?;
             tx.commit().await.map_err(db)?;
-            return Ok(());
+            return Ok(0);
         }
-        let ready = tx
-            .query(
-                "SELECT run_id::text, job_id FROM jobs WHERE queue_state='ready' \
-                 ORDER BY priority DESC, run_order, job_order",
-                &[],
+        let order = "ORDER BY priority DESC, run_order, job_order";
+        let sql = if only_missing {
+            format!(
+                "SELECT run_id::text, job_id FROM jobs j WHERE j.queue_state='ready' \
+                 AND NOT EXISTS (SELECT 1 FROM job_assignments a \
+                     WHERE a.run_id = j.run_id AND a.job_id = j.job_id) \
+                 AND NOT EXISTS (SELECT 1 FROM provision_requests p \
+                     WHERE p.run_id = j.run_id AND p.job_id = j.job_id) {order}"
             )
-            .await
-            .map_err(db)?;
+        } else {
+            format!("SELECT run_id::text, job_id FROM jobs WHERE queue_state='ready' {order}")
+        };
+        let ready = tx.query(&sql, &[]).await.map_err(db)?;
+        let mut repaired = 0usize;
         for row in ready {
             let run_id = codec::run_id(row.get::<_, String>(0).as_str())?;
             let job_id = JobId(row.get(1));
@@ -1561,18 +1585,20 @@ impl PgBackend {
                 .await
                 .map_err(db)?
                 .is_some();
-            if !exists {
-                // Reuse the enqueue pairing logic against a minimal graph.
-                let mut sweep_graph = match PgBackend::load_graph(self, &tx, run_id).await? {
-                    Some(graph) => graph,
-                    None => continue,
-                };
-                super::dispatch::on_job_enqueued(self, &tx, &sweep_graph, &job_id).await?;
-                let _ = &mut sweep_graph;
+            if exists {
+                continue;
             }
+            // Reuse the enqueue pairing logic against a minimal graph.
+            let Some(sweep_graph) = PgBackend::load_graph(self, &tx, run_id).await? else {
+                continue;
+            };
+            super::dispatch::on_job_enqueued(self, &tx, &sweep_graph, &job_id).await?;
+            repaired += 1;
         }
-        tx.commit().await.map_err(db)
+        tx.commit().await.map_err(db)?;
+        Ok(repaired)
     }
+
     /// `run_record`: the run's record — live rows when the run still exists,
     /// the history tables when it was archived.
     ///

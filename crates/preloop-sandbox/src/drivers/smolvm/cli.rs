@@ -1538,6 +1538,14 @@ impl SmolVmProvider {
         }
     }
 
+    /// True when both handles guard the same lifecycle: an adapter and the
+    /// driver it points at must share one lock and fork census, never hold
+    /// separate ones.
+    pub fn shares_lifecycle_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lifecycle_lock, &other.lifecycle_lock)
+            && Arc::ptr_eq(&self.forked_machines, &other.forked_machines)
+    }
+
     /// Override the child-wait deadlines (see [`WaitDeadlines`]).
     ///
     /// Every runtime call kills its child at the matching deadline, so this is
@@ -3137,31 +3145,22 @@ impl VmProvider for SmolVmProvider {
                 if message.contains("stop or delete the clones first") =>
             {
                 // SmolVM's registry knows live clones this process's
-                // in-memory map does not (the map is rebuilt per engine
-                // start, so clones leaked by an earlier session are
-                // invisible here). Delete them so the golden can re-freeze;
-                // `delete` retries transient registry-lock contention.
+                // in-memory map does not: they may belong to a live lease in
+                // another process or service. Never delete machines this
+                // process cannot prove it owns; fail closed and let the
+                // caller decide.
+                let clones = extract_dependent_clones(&message);
                 warn!(
                     golden = golden.as_str(),
-                    clones = extract_dependent_clones(&message).join(", "),
-                    "re-arm blocked by clones unknown to this session; removing them"
+                    clones = clones.join(", "),
+                    "re-arm blocked by dependent clones; refusing to delete them"
                 );
-                for clone in extract_dependent_clones(&message) {
-                    if let Ok(name) = MachineName::new(clone) {
-                        let _ = self.delete(&name).await;
-                    }
-                }
-                self.concurrent(
-                    "stop",
-                    &[
-                        "machine".into(),
-                        "stop".into(),
-                        "--name".into(),
-                        golden.as_str().into(),
-                    ],
-                    self.deadlines.control,
-                )
-                .await?;
+                return Err(VmError::InvalidSpec(format!(
+                    "fork base `{}` still has dependent clones ({}); refusing to delete machines \
+                     this process does not own",
+                    golden.as_str(),
+                    clones.join(", ")
+                )));
             }
             Err(error) => return Err(error),
         }
@@ -3866,8 +3865,8 @@ fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Resu
     Ok(detached)
 }
 
-/// Marker file the Sandbox Service's SmolVM driver writes into a machine's
-/// data directory for a sandbox the CI pool does not own (see
+/// Marker file the Sandbox Service's SmolVM driver writes into the data
+/// directory of every machine it creates (see
 /// [`SmolvmDriver`](super::SmolvmDriver)).
 ///
 /// The purge sees only the boot-config path of a hypervisor, never the
@@ -3915,10 +3914,10 @@ pub enum OrphanPurge {
     /// Every hypervisor whose argv names this Preloop home's data root,
     /// except machines the Sandbox Service owns.
     ///
-    /// Only safe where nothing *of the pool's* can be running: pool startup,
-    /// after the stale machines have been deleted, and shutdown. A Sandbox
-    /// Service sandbox the CI pool does not own may still be leased to
-    /// another caller at those moments — its machine is marked and spared.
+    /// Only safe where no unmarked machine of this home can be in flight: pool
+    /// startup, after the stale machines have been released through the
+    /// service, and shutdown. A Sandbox Service sandbox may still be leased at
+    /// those moments; its machine is marked and spared, whatever its name.
     All,
     /// Only hypervisors whose machine data directory is already gone — the
     /// directory the `boot-config.json` in their argv names no longer exists.
@@ -3951,10 +3950,10 @@ pub enum OrphanPurge {
 ///
 /// `scope` decides which of those processes may be killed; see
 /// [`OrphanPurge`]. A machine whose data directory carries
-/// [`SANDBOX_OWNER_MARKER`] belongs to a Sandbox Service sandbox the CI pool
-/// does not own and is never killed, whatever the scope. Called at pool
-/// startup (crash recovery, `All`) and on an interval while the pool serves
-/// (`RemovedDataDir`). Returns the number of processes killed.
+/// [`SANDBOX_OWNER_MARKER`] belongs to a Sandbox Service sandbox and is never
+/// killed, whatever the scope. Called at pool startup (crash recovery, `All`)
+/// and on an interval while the pool serves (`RemovedDataDir`). Returns the
+/// number of processes killed.
 ///
 /// Both host tools it runs (`ps`, `kill`) are bounded by [`PROBE_DEADLINE`]:
 /// this is called from the pool's reconcile loop, where a wedged `ps` on a
@@ -3975,10 +3974,9 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
             continue;
         }
         let dirs = boot_config_dirs(line, &roots);
-        // A Sandbox Service sandbox the CI pool does not own is not this
-        // purge's to kill, even under `All`: it may be leased to another
-        // caller right now, and the service's own delete path escalates to a
-        // targeted kill when smolvm refuses.
+        // A Sandbox Service sandbox is not this purge's to kill, even under
+        // `All`: it may be leased right now, and the service's own delete path
+        // escalates to a targeted kill when smolvm refuses.
         if dirs.iter().any(|dir| is_sandbox_owned(dir)) {
             continue;
         }
@@ -5293,8 +5291,8 @@ mod tests {
     }
 
     /// A machine the Sandbox Service marked as its own is never killed, even
-    /// under `All`: it may be a sandbox leased to a caller the CI pool knows
-    /// nothing about, and the service destroys it through the driver.
+    /// under `All`: it may be a sandbox leased to a caller, pool or not, and
+    /// the service destroys it through the driver.
     #[test]
     fn all_purge_spares_a_marked_sandbox_service_machine() {
         let _guard = PRELOOP_HOME_LOCK.lock();
@@ -5790,6 +5788,48 @@ mod tests {
         assert!(extract_dependent_clones("vm not found: preloop-runner-golden").is_empty());
         assert!(extract_dependent_clones("").is_empty());
         assert!(extract_dependent_clones("database is locked").is_empty());
+    }
+
+    /// A re-arm must fail closed when the registry names clones this process
+    /// does not know: they may belong to a live lease in another process.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rearm_refuses_to_delete_clones_it_does_not_own() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        let log = scratch.path().join("delete.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$1 $2\" in\n\
+             \"machine stop\")\n\
+               echo \"machine 'preloop-runner-golden' is the fork base for 1 live clone(s) \
+             (pool-runner-9-1); stop or delete the clones first\" >&2\n\
+               exit 1 ;;\n\
+             \"machine delete\")\n\
+               echo delete >> '{}'\n\
+               exit 0 ;;\n\
+             esac\n\
+             exit 0\n",
+            log.display()
+        );
+        let binary = fake_smolvm(scratch.path(), &script);
+        let provider = super::SmolVmProvider::new(&binary);
+        let golden = MachineName::new("preloop-runner-golden").unwrap();
+        let error = provider
+            .rearm_fork_base(&golden, None)
+            .await
+            .expect_err("a base with unknown clones must not be re-armed");
+        assert!(
+            error.to_string().contains("refusing to delete"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !log.exists(),
+            "re-arm deleted a clone it could not prove it owned"
+        );
     }
 
     #[test]
@@ -6945,9 +6985,12 @@ mod tests {
     /// the runtime recovers — gets to answer.
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_timed_out_capability_probe_is_not_cached() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let _agent_rootfs = AgentRootfsGuard::set();
         let dir = tempfile::tempdir().expect("scratch");
         let tool = dir.path().join("smolvm");
         let probed = dir.path().join("probed");
