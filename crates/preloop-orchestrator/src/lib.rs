@@ -5656,15 +5656,19 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
 /// caller.
 ///
 /// `All` is the only scope that may kill a *live* hypervisor, so it is only
-/// ever used where nothing of ours can be running: pool startup and pool
-/// teardown ([`preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms`]). Those two moments differ in
-/// what an abandoned sweep costs, which is all this decides.
+/// ever used where no unmarked machine can be in flight: pool startup and
+/// pool teardown
+/// ([`preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms`]). Every
+/// machine the Sandbox Service creates, the pool's included, is marked in its
+/// data directory and spared by that sweep. The pool releases its own through
+/// the service first, so a leased sandbox survives an engine restart. Those two
+/// moments differ in what an abandoned sweep costs, which is all this decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrphanPurgeDuty {
     /// The pool is about to boot machines. The sweep is bounded per child now,
     /// but a caller that stopped waiting cannot know it finished, and it kills
-    /// from a process table it read after that: a runner booted in the
-    /// meantime is in it. Do not serve on that.
+    /// from a process table it read after that: an unmarked machine booted in
+    /// the meantime is in it. Do not serve on that.
     BeforeServing,
     /// The pool is stopping, and this process is going away with the sweep
     /// thread. An unfinished sweep is worth a warning, not an error that turns
@@ -6285,8 +6289,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // smolvm DB no longer knows the machines, so the deletes above
         // cannot reach them and they keep the storage fds open — the
         // unlinked blocks leak until the process dies. Kill by config path.
-        // `All` is only sound here: every Preloop machine is stale by now, so
-        // nothing of ours can be running. The periodic reconcile the pool
+        // `All` is only sound here: the pool's stale machines were just released
+        // through the service above, and the sweep spares every machine the
+        // Sandbox Service marked (a leased sandbox outlives this engine), so it
+        // only reaches unmarked hypervisors. The periodic reconcile the pool
         // runs while serving uses `RemovedDataDir`, which spares any process
         // whose boot config still exists.
         match deadline::run_blocking(HOST_CLEANUP_TIMEOUT, "orphaned hypervisor purge", || {

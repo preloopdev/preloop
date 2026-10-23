@@ -23,6 +23,12 @@ pub struct FakeDriver {
     pub fail_creates: AtomicU32,
     /// Artificial snapshot latency (tests that need an operation in flight).
     pub snapshot_delay_ms: AtomicU64,
+    /// Fail the next N destroys (tests).
+    pub fail_destroys: AtomicU32,
+    /// Artificial destroy latency (tests that need a destroy in flight).
+    pub destroy_delay_ms: AtomicU64,
+    /// Destroys attempted, failed or not (tests).
+    pub destroy_calls: AtomicU32,
 }
 
 impl FakeDriver {
@@ -36,6 +42,9 @@ impl FakeDriver {
             capabilities,
             fail_creates: AtomicU32::new(0),
             snapshot_delay_ms: AtomicU64::new(0),
+            fail_destroys: AtomicU32::new(0),
+            destroy_delay_ms: AtomicU64::new(0),
+            destroy_calls: AtomicU32::new(0),
         }
     }
 
@@ -95,7 +104,7 @@ impl Driver for FakeDriver {
         {
             return Err(Error::unavailable("injected create failure"));
         }
-        let name = native_name(&work.sandbox_id, work.incarnation);
+        let name = native_name(&work.sandbox_id);
         let dir = self.dir(&name)?;
         std::fs::create_dir_all(&dir).map_err(io("create"))?;
         if !work.template.native_ref.is_empty() {
@@ -106,6 +115,25 @@ impl Driver for FakeDriver {
     }
 
     async fn destroy(&self, native_ref: &str) -> Result<()> {
+        self.destroy_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let delay = self
+            .destroy_delay_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        if self
+            .fail_destroys
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(Error::unavailable("injected destroy failure"));
+        }
         let dir = self.dir(native_ref)?;
         match std::fs::remove_dir_all(dir) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io("destroy")(error)),
@@ -284,12 +312,11 @@ impl Driver for FakeDriver {
                 .file_name()
                 .to_string_lossy()
                 .into_owned();
-            let (sandbox_id, incarnation) = parse_native_name(&name).unwrap_or_default();
+            let sandbox_id = parse_native_name(&name).unwrap_or_default();
             out.push(Observed {
                 driver: self.name.clone(),
                 native_ref: name,
                 sandbox_id,
-                incarnation,
             });
         }
         Ok(out)

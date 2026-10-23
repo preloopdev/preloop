@@ -23,7 +23,10 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
 * **Providers** (capacity owners): `Register` (drivers + capabilities →
   provider id and fencing generation), `Heartbeat`, `Poll` (long-poll for
   work), `Report` / `ReportExec` (fenced by generation), `Reconcile` (full
-  inventory: lost sandboxes fail, orphans and stale incarnations are destroyed).
+  inventory: lost sandboxes fail, orphans are destroyed, a `Terminating` machine
+  that is still there gets its destroy asked again unless one is in flight, and
+  a tombstone's machine is destroyed; a template's fork base is never an orphan,
+  whichever provider reports it).
 
 Both are served with the Connect protocol, JSON codec, over one HTTP port:
 `POST /preloop.sandbox.v1.<Service>/<Method>`. Every RPC is unary or
@@ -42,6 +45,10 @@ from the `.proto` interoperates.
 * **Template** — a logical image: an OCI image (optionally per architecture), a
   driver-specific `recipe` interpreted by the selected driver, or a snapshot
   captured by `Snapshot` (then bound to the provider and driver that hold it).
+  The captured machine stays live as the template's fork base. It has no
+  sandbox record, but it is never an orphan: any provider that reports it —
+  including a second agent sharing the host's engine home — must leave it
+  alone, and only deleting the template destroys it.
 * **Pool** — template + shape + network + mounts + warm target + max. The
   service keeps `warm` idle sandboxes per pool (the generic warm pool) and
   refills after each claim, backing off after creation failures.
@@ -49,9 +56,14 @@ from the `.proto` interoperates.
   (packing needs a stopped machine), `Start` boots it again, `--forkable` when
   it must serve forks. Both work under the same lease.
 * **Sandbox / Lease** — `Acquire` with the same idempotency key returns the same
-  lease. Lease environment is merged into every exec; injected files are written
-  before the lease is returned. Leases expire (the sandbox is destroyed);
-  `Release(PRESERVE)` keeps a sandbox for debugging until its window ends.
+  lease, provided the payload matches: the key is bound to the pool/template,
+  shape, requirements, purpose, network, mounts, sockets, options and name of
+  the request that first used it, and a reuse with any of those different is
+  `invalid_argument`. TTL, wait and injected files are call tactics, not
+  identity: they may change on a retry. Lease environment is merged into every
+  exec; injected files are written before the lease is returned. Leases expire
+  (the sandbox is destroyed); `Release(PRESERVE)` keeps a sandbox for debugging
+  until its window ends.
 
 Capabilities decide placement; nothing branches on driver names. A request no
 registered provider can satisfy fails with the unmet requirement named
@@ -125,7 +137,50 @@ are the service's.
 The service keeps its working set in memory and writes through to its own
 store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
 `sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
-never references control tables.
+never references control tables. Writes are best-effort in the project's
+sense: in-memory state is authoritative, so a store failure is logged at error
+level with the record kind and never fails the caller's RPC.
+
+## Restart and failure
+
+The store is the only thing that survives a process: provider queues, pending
+work, exec streams, tickets and pool backoff are memory. Boot therefore starts
+with three decisions, before any provider is placed on or caller served:
+
+* **Every provider's generation is bumped and persisted.** An agent session
+  that outlived the process is fenced (`aborted`) on its next call and
+  re-registers with a fresh generation; until it does, its records are not
+  placed on. Sandboxes, leases, pools and templates are restored as they were.
+* **A sandbox caught `PROVISIONING` becomes `FAILED`** with `restarted while
+  creating: …`. It cannot be re-driven: the create request (shape, network,
+  mounts, sockets, options) is not on the record, so a second create would be
+  a different sandbox, and nothing will ever report the first. If the machine
+  did land, no record names it and the next reconcile destroys it as an
+  orphan. The caller's retry with the same key releases the failed record and
+  starts over.
+* **A sandbox left `TERMINATING` stays so until its machine is gone.** A destroy
+  in flight is awaited however long it takes. When a destroy fails, or the
+  provider is lost with it, the next `Reconcile` asks again while the provider
+  still reports the machine. After three such failures the record becomes a
+  `GONE` tombstone instead of being dropped: `Reconcile` destroys its machine
+  directly, because the record still proves the machine is the service's. The
+  tombstone is removed once the provider stops reporting the machine. It holds
+  no capacity slot, so the pool may start one machine more than its slots until
+  that reclaim lands.
+
+Stop, start, pause, resume and snapshot are operations, not record states: the
+record moves only when their report lands, so a restart leaves the last settled
+state. A machine may therefore be stopped while the record says leased; the
+driver answers with its real state on the next operation, and the callers whose
+replies were lost see `unavailable`.
+
+A provider silent for `provider_lost_factor × provider_timeout` (default
+135 s) is declared lost. Its sandboxes are failed, its in-flight work is
+answered with `unavailable`, and its leases are released: the lease row is
+removed, so the caller's next `Renew` is `not_found` and its next `Acquire`
+with the same key starts over. `Renew` on a `FAILED` or `TERMINATING` sandbox
+is `failed_precondition` — a lease never outlives the machine it names, and
+one that did would promise capacity that cannot be used.
 
 ## How preloop uses it
 
@@ -136,6 +191,18 @@ through an in-process agent, and serves the API on `PRELOOP_SANDBOX_LISTEN`
 goldens are build sandboxes, forks are acquires from the golden's snapshot
 template, and deletes are releases. The pool keeps its golden, packed-artifact
 and debug-hold strategy; the machines under it are sandboxes.
+
+The engine also sweeps orphaned SmolVM hypervisors under its home at pool
+startup and teardown (`OrphanPurge::All`). Those sweeps only see a machine's
+data directory, so the SmolVM driver writes an ownership marker into every
+machine it creates, pool machines included, and the sweeps spare marked
+machines. Another caller's leased sandbox therefore survives an engine restart
+or stop. The pool has no sweep backstop for its own machines: it deletes them
+through the service on teardown, and its startup cleanup releases leftovers
+through the service. A pool that the guest-agent guard disables starts no
+service and runs no cleanup, so its leftover runners keep running until the
+pool next starts. The service's own delete path escalates to a targeted kill
+when `machine delete` refuses.
 
 | Variable | Effect |
 |---|---|
@@ -175,7 +242,9 @@ and refuses to send its bearer token to any other address.
   (idempotency, warm pools, placement errors and configured ranking,
   unsupported operations, snapshot → template → fork, create failure, lease
   expiry and preservation, orphan/lost reconcile, generation fencing, SQLite
-  restart, streaming exec, ticketed upload/download). Set
+  restart, streaming exec, ticketed upload/download, restart fencing and
+  recovery, terminating reaping, lease release on provider loss, idempotency
+  payload mismatch). Set
   `PRELOOP_SANDBOX_TEST_PG` to also run the Postgres store test.
 * `PRELOOP_SANDBOX_E2E_SMOLVM=1 cargo test -p preloop-sandbox --test smolvm_e2e`
   — real SmolVM: bake, snapshot, warm pool of branches, socket mount, files,

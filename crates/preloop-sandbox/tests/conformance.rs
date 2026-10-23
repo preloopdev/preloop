@@ -532,7 +532,6 @@ async fn reconcile_spares_foreign_orphans_and_fails_lost_sandboxes() {
         .fake
         .create(&CreateWork {
             sandbox_id: "sbx-orphan".into(),
-            incarnation: 1,
             driver: "fake".into(),
             ..CreateWork::default()
         })
@@ -1059,9 +1058,8 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
     config.provider_timeout = provider_timeout;
     config.provider_lost_factor = 1;
     config.acquire_wait = Duration::from_millis(200);
-    let service = Service::open(store::open("memory:").await.unwrap(), config)
-        .await
-        .unwrap();
+    let store = store::open("memory:").await.unwrap();
+    let service = Service::open(store.clone(), config).await.unwrap();
     // A provider that registers and then dies without reporting: its create
     // never completes.
     let ghost = service
@@ -1118,15 +1116,27 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::DeadlineExceeded);
+    // Non-vacuous: the host held exactly one sandbox, still provisioning.
+    let before = service.list();
+    assert!(
+        before.len() == 1 && before[0].state == SandboxState::Provisioning,
+        "{before:?}"
+    );
+    let sandbox_id = before[0].id.clone();
     // The host stops answering: wait past the timeout the service declares
     // it lost by, not past the last heartbeat.
     alive.cancel();
     tokio::time::sleep(provider_timeout * 2).await;
     service.maintain().await;
-    let sandboxes = service.list();
+    // It never reported a machine, so its record is dropped (a failed record
+    // would also satisfy this); it must not stay provisioning or leased.
+    match service.get(&sandbox_id) {
+        Ok(sandbox) => assert_eq!(sandbox.state, SandboxState::Failed, "{sandbox:?}"),
+        Err(error) => assert_eq!(error.code, Code::NotFound, "{}", error.message),
+    }
     assert!(
-        !sandboxes.is_empty() && sandboxes.iter().all(|s| s.state == SandboxState::Failed),
-        "{sandboxes:?}"
+        store.load(Kind::Leases).await.unwrap().is_empty(),
+        "a lost provider's lease is released, not left to expire"
     );
 }
 
@@ -1224,7 +1234,6 @@ async fn reconcile_never_destroys_another_providers_machine() {
         .fake
         .create(&CreateWork {
             sandbox_id: "sbx-orphan".into(),
-            incarnation: 1,
             driver: "fake".into(),
             ..CreateWork::default()
         })
@@ -1247,17 +1256,10 @@ async fn reconcile_never_destroys_another_providers_machine() {
         response.destroy
     );
 
-    // A stale incarnation of a sandbox this service did create is ours.
-    let stale = h
-        .fake
-        .create(&CreateWork {
-            sandbox_id: sandbox_id.clone(),
-            incarnation: 7,
-            driver: "fake".into(),
-            ..CreateWork::default()
-        })
-        .await
-        .unwrap();
+    // A machine reported under a sandbox id we own is ours even when its
+    // native reference is unknown: a stale copy of one of our sandboxes must
+    // be reaped rather than left running.
+    let stale = "sbx-stale-machine".to_owned();
     let response = h
         .service
         .reconcile(ReconcileRequest {
@@ -1267,15 +1269,126 @@ async fn reconcile_never_destroys_another_providers_machine() {
                 driver: "fake".into(),
                 native_ref: stale.clone(),
                 sandbox_id: sandbox_id.clone(),
-                incarnation: 7,
             }],
         })
         .await
         .unwrap();
     assert!(
         response.destroy.iter().any(|w| w.native_ref == stale),
-        "a stale incarnation of our own sandbox must be reaped"
+        "a stale copy of our own sandbox must be reaped"
     );
+}
+
+/// A golden is a template's fork base, not a sandbox: it has no record, so
+/// reconcile would call it an orphan. Every agent sharing the host's engine
+/// home reports it, and none of them may reap it.
+#[tokio::test]
+async fn reconcile_never_destroys_a_golden_reported_by_another_provider() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let build = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "bake".into(),
+            template: "alpine".into(),
+            purpose: Purpose::Build,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let (code, _, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: build.sandbox.id.clone(),
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo baked > \"$SANDBOX_ROOT/marker\"".into(),
+            ],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    let golden = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: build.sandbox.id.clone(),
+            name: "golden".into(),
+        })
+        .await
+        .unwrap();
+    // SmolVM keeps the snapped machine running as the fork base, so it is in
+    // every agent's inventory even though no sandbox record names it.
+    let golden_dir = h
+        ._dir
+        .path()
+        .join("host")
+        .join("sandboxes")
+        .join(&golden.native_ref);
+    std::fs::create_dir_all(&golden_dir).unwrap();
+
+    // A second agent on the same host, over the same driver, reports the
+    // whole inventory — the golden included.
+    let other = h
+        .service
+        .register(RegisterRequest {
+            name: "host-b".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities(),
+            }],
+        })
+        .await
+        .unwrap();
+    let observed = h.fake.inventory().await.unwrap();
+    assert!(
+        observed.iter().any(|o| o.native_ref == golden.native_ref),
+        "the golden is not in the shared inventory"
+    );
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id,
+            generation: other.generation,
+            sandboxes: observed,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !response
+            .destroy
+            .iter()
+            .any(|w| w.native_ref == golden.native_ref),
+        "another provider reaped the golden: {:?}",
+        response.destroy
+    );
+    // What the agent does with the answer still leaves the base alone.
+    for work in &response.destroy {
+        h.fake.destroy(&work.native_ref).await.unwrap();
+    }
+    assert!(golden_dir.is_dir(), "the golden was destroyed");
+
+    // The template still forks the captured state.
+    let fork = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "fork".into(),
+            template: "golden".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let (_, stdout, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: fork.sandbox.id,
+            argv: vec!["cat".into(), "marker".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(stdout, b"baked\n");
 }
 
 #[tokio::test]
@@ -1346,6 +1459,778 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
         .await
         .expect("a failed sandbox must not block its name");
     assert_ne!(lease.sandbox.id, sandbox_id);
+}
+
+/// A restart fences every agent session that survived the previous process:
+/// the generation was bumped and persisted, the old session is `aborted` on
+/// its next call, and the agent re-registering gets a fresh generation this
+/// service places work on.
+#[tokio::test]
+async fn restart_fences_the_agent_and_it_re_registers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let host = dir.path().join("host");
+    // A registered provider stands in for an agent whose process died with
+    // the service: its row (and generation) survives in the store.
+    let (provider_id, generation) = {
+        let service = Service::open(
+            store::open(db.to_str().unwrap()).await.unwrap(),
+            ServiceConfig::new(dir.path().join("blobs")),
+        )
+        .await
+        .unwrap();
+        let response = service
+            .register(RegisterRequest {
+                name: "host-a".into(),
+                drivers: vec![DriverInfo {
+                    driver: "fake".into(),
+                    capabilities: FakeDriver::full_capabilities(),
+                }],
+            })
+            .await
+            .unwrap();
+        (response.provider_id, response.generation)
+    };
+    assert_eq!(generation, 1);
+    // Reopening the same store bumps the generation before serving: the
+    // session above can no longer poll, report or heartbeat.
+    let restored = Service::open(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let error = restored
+        .poll(PollRequest {
+            provider_id: provider_id.clone(),
+            generation,
+            wait_secs: 0,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Aborted, "{}", error.message);
+    let bumped = restored
+        .list_providers()
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .expect("the provider row survives the restart");
+    assert_eq!(bumped.generation, generation + 1);
+    // The agent's answer to `aborted` is to register again, which is what the
+    // real agent does; the restarted service places work on that session.
+    let h = harness_with_host(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        tempfile::tempdir().unwrap(),
+        host,
+        FakeDriver::full_capabilities(),
+    )
+    .await;
+    let re_registered = h
+        .service
+        .list_providers()
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .expect("the re-registered agent keeps its provider id");
+    assert!(
+        re_registered.generation > bumped.generation,
+        "re-registration must be a new session: {} vs {}",
+        re_registered.generation,
+        bumped.generation
+    );
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "after-restart".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .expect("the re-registered agent serves work");
+    assert_eq!(lease.sandbox.state, SandboxState::Leased);
+}
+
+/// A create in flight when the process died cannot be re-driven (its request
+/// is not on the record) and nothing will ever report it: the record is
+/// failed with a reason instead of waiting for the create timeout.
+#[tokio::test]
+async fn a_creating_record_is_failed_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let sandbox_id = {
+        let service = Service::open(
+            store::open(db.to_str().unwrap()).await.unwrap(),
+            ServiceConfig::new(dir.path().join("blobs")),
+        )
+        .await
+        .unwrap();
+        // A provider that registers and never polls: its create never lands.
+        service
+            .register(RegisterRequest {
+                name: "ghost".into(),
+                drivers: vec![DriverInfo {
+                    driver: "ghost".into(),
+                    capabilities: FakeDriver::full_capabilities(),
+                }],
+            })
+            .await
+            .unwrap();
+        service
+            .put_template(TemplateSpec {
+                name: "alpine".into(),
+                os: "linux".into(),
+                image: Some("alpine:3.20".into()),
+                requires: Requirements {
+                    driver: "ghost".into(),
+                    ..Requirements::default()
+                },
+                ..TemplateSpec::default()
+            })
+            .await
+            .unwrap();
+        let error = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                template: "alpine".into(),
+                wait_secs: Some(0),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::DeadlineExceeded);
+        let sandboxes = service.list();
+        assert_eq!(sandboxes.len(), 1);
+        assert_eq!(sandboxes[0].state, SandboxState::Provisioning);
+        sandboxes[0].id.clone()
+    };
+    let restored = Service::open(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs2")),
+    )
+    .await
+    .unwrap();
+    let sandbox = restored.get(&sandbox_id).unwrap();
+    assert_eq!(sandbox.state, SandboxState::Failed);
+    assert!(
+        sandbox.error.contains("restarted while creating"),
+        "{}",
+        sandbox.error
+    );
+}
+
+/// A record left `Terminating` by a crashed process whose machine is still in
+/// the provider's inventory gets its destroy re-queued until the machine is
+/// gone, then stops holding a slot.
+#[tokio::test]
+async fn a_terminating_record_with_a_live_machine_is_reaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let host = dir.path().join("host");
+    let (sandbox_id, native_ref) = {
+        let h = harness_with_host(
+            store::open(db.to_str().unwrap()).await.unwrap(),
+            tempfile::tempdir().unwrap(),
+            host.clone(),
+            FakeDriver::full_capabilities(),
+        )
+        .await;
+        h.service.put_template(template("alpine")).await.unwrap();
+        let lease = h
+            .service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                template: "alpine".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        (lease.sandbox.id, lease.sandbox.native_ref)
+    };
+    // Acquire returns once the in-memory record is leased, which a reconcile
+    // notification can deliver before the create report's store write lands.
+    // The crash is only simulated from a state that was durable, so wait for
+    // the reported native reference to be persisted.
+    let raw = store::open(db.to_str().unwrap()).await.unwrap();
+    let mut durable = false;
+    for _ in 0..200 {
+        let sandboxes = raw.load(Kind::Sandboxes).await.unwrap();
+        let leases = raw.load(Kind::Leases).await.unwrap();
+        durable = !leases.is_empty()
+            && sandboxes.iter().any(|row| {
+                row["nativeRef"]
+                    .as_str()
+                    .is_some_and(|native| !native.is_empty())
+            });
+        if durable {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(durable, "the create report was never persisted");
+    // Simulate the crash window: the destroy was decided and persisted, but
+    // the machine outlived the process that asked for it.
+    for value in raw.load(Kind::Sandboxes).await.unwrap() {
+        let mut sandbox: Sandbox = serde_json::from_value(value).unwrap();
+        sandbox.state = SandboxState::Terminating;
+        raw.put(
+            Kind::Sandboxes,
+            &sandbox.id,
+            &serde_json::to_value(&sandbox).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    let h = harness_with_host(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        tempfile::tempdir().unwrap(),
+        host,
+        FakeDriver::full_capabilities(),
+    )
+    .await;
+    wait_for(|| h.service.get(&sandbox_id).is_err()).await;
+    assert!(
+        h.fake
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .all(|observed| observed.native_ref != native_ref),
+        "the machine behind the terminating record must be destroyed"
+    );
+}
+
+/// Releases a sandbox with every destroy failing, and reconciles the way the
+/// agent does, until its record is a tombstone. The machine is still on the
+/// host when this returns.
+async fn release_until_tombstoned(h: &Harness, lease_id: &str, sandbox_id: &str) {
+    h.fake
+        .fail_destroys
+        .store(1000, std::sync::atomic::Ordering::Release);
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease_id.into(),
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    let provider = h.service.list_providers().remove(0);
+    for _ in 0..200 {
+        let sandboxes = h.fake.inventory().await.unwrap();
+        h.service
+            .reconcile(ReconcileRequest {
+                provider_id: provider.id.clone(),
+                generation: provider.generation,
+                sandboxes,
+            })
+            .await
+            .unwrap();
+        match h.service.get(sandbox_id) {
+            Ok(sandbox) if sandbox.state == SandboxState::Gone => return,
+            Ok(sandbox) => assert_eq!(
+                sandbox.state,
+                SandboxState::Terminating,
+                "the record holds until the third failure"
+            ),
+            Err(error) => panic!(
+                "the record was dropped before its machine was destroyed: {}",
+                error.message
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the destroy never reached its third failure");
+}
+
+/// A destroy that outlasts several reconcile rounds keeps its record: each
+/// round finds it in flight and leaves it alone, so it is neither asked again
+/// nor counted toward giving up, and the record completes once the machine is
+/// gone.
+#[tokio::test]
+async fn a_slow_destroy_keeps_its_record_until_it_reports() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let sandbox_id = lease.sandbox.id.clone();
+    h.fake
+        .destroy_delay_ms
+        .store(1500, std::sync::atomic::Ordering::Release);
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    let provider = h.service.list_providers().remove(0);
+    for _ in 0..4 {
+        let sandboxes = h.fake.inventory().await.unwrap();
+        h.service
+            .reconcile(ReconcileRequest {
+                provider_id: provider.id.clone(),
+                generation: provider.generation,
+                sandboxes,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            h.service.get(&sandbox_id).unwrap().state,
+            SandboxState::Terminating,
+            "a destroy in flight keeps its record"
+        );
+    }
+    wait_for(|| h.service.get(&sandbox_id).is_err()).await;
+    // Let any destroy asked a second time run before counting the calls.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        h.fake
+            .destroy_calls
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the slow destroy was never asked again"
+    );
+    let machines = h.fake.inventory().await.unwrap();
+    assert!(
+        machines
+            .iter()
+            .all(|observed| observed.native_ref != lease.sandbox.native_ref),
+        "the machine is gone once its destroy reports"
+    );
+}
+
+/// A destroy that keeps failing leaves its machine reclaimable: the record
+/// holds through the first two failures, becomes a tombstone at the third, and
+/// once the service restarts the new agent's first reconcile destroys the
+/// machine.
+#[tokio::test]
+async fn a_destroy_that_fails_three_times_leaves_the_machine_reclaimable_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let host = dir.path().join("host");
+    let (sandbox_id, native_ref) = {
+        let h = harness_with_host(
+            store::open(db.to_str().unwrap()).await.unwrap(),
+            tempfile::tempdir().unwrap(),
+            host.clone(),
+            FakeDriver::full_capabilities(),
+        )
+        .await;
+        h.service.put_template(template("alpine")).await.unwrap();
+        let lease = h
+            .service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                template: "alpine".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
+        let record = h.service.get(&lease.sandbox.id).unwrap();
+        assert_eq!(record.state, SandboxState::Gone);
+        assert!(
+            record.error.contains("destroy failed 3 times"),
+            "{}",
+            record.error
+        );
+        // Every destroy failed, the agent's own orphan destroys included, so
+        // the machine is still on the host when the service goes down.
+        assert!(
+            h.fake
+                .inventory()
+                .await
+                .unwrap()
+                .iter()
+                .any(|observed| observed.native_ref == lease.sandbox.native_ref),
+            "the machine is still on the host"
+        );
+        (lease.sandbox.id.clone(), lease.sandbox.native_ref.clone())
+    };
+    // Restart: the tombstone comes back from the store, and the new agent's
+    // first reconcile destroys the machine it still reports.
+    let h = harness_with_host(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        tempfile::tempdir().unwrap(),
+        host,
+        FakeDriver::full_capabilities(),
+    )
+    .await;
+    for _ in 0..200 {
+        if h.fake
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .all(|observed| observed.native_ref != native_ref)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        h.fake
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .all(|observed| observed.native_ref != native_ref),
+        "the restarted agent reclaims the machine"
+    );
+    // Once the provider no longer reports the machine, the tombstone is done.
+    let provider = h.service.list_providers().remove(0);
+    let sandboxes = h.fake.inventory().await.unwrap();
+    h.service
+        .reconcile(ReconcileRequest {
+            provider_id: provider.id.clone(),
+            generation: provider.generation,
+            sandboxes,
+        })
+        .await
+        .unwrap();
+    assert!(
+        h.service.get(&sandbox_id).is_err(),
+        "the tombstone is removed once its machine is gone"
+    );
+}
+
+/// A tombstone keeps its machine provably the service's when the provider
+/// reports it without the sandbox id, as a caller-named machine is reported:
+/// reconcile hands the machine back for destruction.
+#[tokio::test]
+async fn a_tombstoned_machine_is_reclaimed_when_reported_without_its_id() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
+    let provider = h.service.list_providers().remove(0);
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: provider.id.clone(),
+            generation: provider.generation,
+            sandboxes: vec![Observed {
+                driver: "fake".into(),
+                native_ref: lease.sandbox.native_ref.clone(),
+                sandbox_id: String::new(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(
+        response
+            .destroy
+            .iter()
+            .any(|work| work.native_ref == lease.sandbox.native_ref),
+        "a tombstone's machine is reclaimed without its id: {:?}",
+        response.destroy
+    );
+}
+
+/// A tombstone belongs to the provider that created its machine. Another agent
+/// on the same host reports that machine too, and must leave it alone.
+#[tokio::test]
+async fn a_tombstone_is_not_reaped_by_another_provider() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
+    let other = h
+        .service
+        .register(RegisterRequest {
+            name: "host-b".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities(),
+            }],
+        })
+        .await
+        .unwrap();
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id.clone(),
+            generation: other.generation,
+            sandboxes: h.fake.inventory().await.unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        response
+            .destroy
+            .iter()
+            .all(|work| work.native_ref != lease.sandbox.native_ref),
+        "another provider reaped a tombstone it does not own: {:?}",
+        response.destroy
+    );
+    assert_eq!(
+        h.service.get(&lease.sandbox.id).unwrap().state,
+        SandboxState::Gone,
+        "the owning provider still holds the tombstone"
+    );
+}
+
+/// A store that refuses provider rows, as a full or read-only disk would.
+struct RefusesProviderRows(Arc<dyn Store>);
+
+#[async_trait::async_trait]
+impl Store for RefusesProviderRows {
+    async fn put(
+        &self,
+        kind: Kind,
+        id: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), preloop_sandbox::Error> {
+        if kind == Kind::Providers {
+            return Err(preloop_sandbox::Error::internal("disk full"));
+        }
+        self.0.put(kind, id, value).await
+    }
+
+    async fn delete(&self, kind: Kind, id: &str) -> Result<(), preloop_sandbox::Error> {
+        self.0.delete(kind, id).await
+    }
+
+    async fn load(&self, kind: Kind) -> Result<Vec<serde_json::Value>, preloop_sandbox::Error> {
+        self.0.load(kind).await
+    }
+}
+
+/// A generation counts only once the store has kept it. A restart bumps the
+/// stored generation, so a generation handed out and then lost can be issued
+/// again, and the session that still holds it would pass `fence` without
+/// re-registering.
+#[tokio::test]
+async fn a_generation_the_store_cannot_keep_is_never_handed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = store::open("memory:").await.unwrap();
+    let service = Service::open(
+        Arc::new(RefusesProviderRows(inner)),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let request = || RegisterRequest {
+        name: "host-a".into(),
+        drivers: vec![DriverInfo {
+            driver: "fake".into(),
+            capabilities: FakeDriver::full_capabilities(),
+        }],
+    };
+    for _ in 0..2 {
+        let Err(error) = service.register(request()).await else {
+            panic!("a generation the store refused was handed to the agent");
+        };
+        assert_eq!(error.code, Code::Unavailable, "{}", error.message);
+    }
+}
+
+/// A lease on a host that stopped answering is released, not held to its TTL:
+/// the caller learns it is gone, and the machine is left for reconcile.
+#[tokio::test]
+async fn a_lost_provider_releases_its_leases() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let store = store::open(db.to_str().unwrap()).await.unwrap();
+    // The provider is only online while its liveness keeps being refreshed,
+    // so the heartbeat the agent sends must be well inside the timeout the
+    // test declares it lost by: otherwise a scheduling pause between
+    // registration and `Acquire` reads as a dead host.
+    let provider_timeout = Duration::from_secs(1);
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    config.provider_timeout = provider_timeout;
+    config.provider_lost_factor = 1;
+    config.acquire_wait = Duration::from_secs(10);
+    let service = Service::open(store.clone(), config).await.unwrap();
+    let fake = Arc::new(FakeDriver::new(
+        "fake",
+        dir.path().join("host"),
+        FakeDriver::full_capabilities(),
+    ));
+    let shutdown = CancellationToken::new();
+    let mut agent_config = AgentConfig::new("host-a", dir.path().join("scratch"));
+    agent_config.heartbeat = provider_timeout / 20;
+    let agent = Agent::new(
+        Arc::new(service.clone()) as Arc<dyn ProviderLink>,
+        vec![fake as Arc<dyn Driver>],
+        agent_config,
+    );
+    tokio::spawn(agent.run(None, shutdown.clone()));
+    wait_for(|| !service.list_providers().is_empty()).await;
+    service.put_template(template("alpine")).await.unwrap();
+    let lease = service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    // Silencing the agent is what a host losing its network looks like: no
+    // heartbeat, no poll, no report. Wait past the timeout the service
+    // declares the provider lost by, not past the last heartbeat.
+    shutdown.cancel();
+    tokio::time::sleep(provider_timeout * 2).await;
+    service.maintain().await;
+    let error = service
+        .renew(RenewRequest {
+            lease_id: lease.lease.id.clone(),
+            ttl_secs: 60,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::NotFound, "{}", error.message);
+    assert!(
+        store.load(Kind::Leases).await.unwrap().is_empty(),
+        "the lease row must be released, not left to expire"
+    );
+    let sandbox = service.get(&lease.sandbox.id).unwrap();
+    assert!(sandbox.lease_id.is_empty(), "the lease id is cleared");
+    assert_eq!(sandbox.state, SandboxState::Terminating);
+    assert!(sandbox.error.contains("provider lost"), "{}", sandbox.error);
+}
+
+/// A lease that outlives its sandbox's failure cannot be renewed: extending
+/// it would promise a machine that is gone.
+#[tokio::test]
+async fn renew_on_a_failed_sandbox_is_rejected() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    // The machine disappears behind the service's back; the reconcile fails
+    // the record but the caller still holds its lease.
+    h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
+    wait_for(|| {
+        h.service
+            .get(&lease.sandbox.id)
+            .is_ok_and(|sandbox| sandbox.state == SandboxState::Failed)
+    })
+    .await;
+    let error = h
+        .service
+        .renew(RenewRequest {
+            lease_id: lease.lease.id,
+            ttl_secs: 60,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", error.message);
+}
+
+/// An idempotency key names one request: reusing it for a different payload
+/// is a caller bug, not a retry, and must not silently hand back the first
+/// sandbox.
+#[tokio::test]
+async fn a_reused_idempotency_key_with_a_different_payload_is_rejected() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let mut other = template("debian");
+    other.image = Some("debian:12".into());
+    h.service.put_template(other).await.unwrap();
+    let first = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let error = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "debian".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+    // The lease is untouched and still answers the original request.
+    let same = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(same.lease.id, first.lease.id);
+}
+
+/// A store whose writes always fail.
+struct FailingStore;
+
+#[async_trait::async_trait]
+impl Store for FailingStore {
+    async fn put(
+        &self,
+        _kind: Kind,
+        _id: &str,
+        _value: &serde_json::Value,
+    ) -> Result<(), preloop_sandbox::Error> {
+        Err(preloop_sandbox::Error::internal("disk full"))
+    }
+
+    async fn delete(&self, _kind: Kind, _id: &str) -> Result<(), preloop_sandbox::Error> {
+        Err(preloop_sandbox::Error::internal("disk full"))
+    }
+
+    async fn load(&self, _kind: Kind) -> Result<Vec<serde_json::Value>, preloop_sandbox::Error> {
+        Ok(Vec::new())
+    }
+}
+
+/// A failed store write is logged with the record kind and the RPC still
+/// succeeds: the in-memory working set is authoritative, the store is the
+/// restart source that will be behind.
+#[tokio::test]
+async fn store_write_failures_keep_the_rpc_successful() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = Service::open(
+        Arc::new(FailingStore),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let created = service
+        .put_template(template("alpine"))
+        .await
+        .expect("a store failure must not fail the caller");
+    assert_eq!(created.spec.name, "alpine");
+    assert_eq!(service.list_templates().len(), 1);
 }
 
 fn unix_now() -> i64 {
@@ -2216,7 +3101,6 @@ async fn reconcile_protects_snapshot_bases_from_any_provider() {
                 driver: "fake".into(),
                 native_ref: golden.native_ref.clone(),
                 sandbox_id: String::new(),
-                incarnation: 0,
             }],
         })
         .await
