@@ -580,6 +580,23 @@ pub(super) fn ready_jobs(tx: &Transaction<'_>) -> Result<Vec<JobRow>, ControlErr
     rows.collect::<Result<Vec<_>, _>>().map_err(db)
 }
 
+/// Ready jobs with neither a `job_assignments` nor a `provision_requests`
+/// row: the leaked dispatch-intent shape strict assignments can never claim.
+pub(super) fn ready_jobs_missing_intent(tx: &Transaction<'_>) -> Result<Vec<JobRow>, ControlError> {
+    let mut stmt = tx
+        .prepare_cached(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs j WHERE j.queue_state = 'ready' \
+             AND NOT EXISTS (SELECT 1 FROM job_assignments a \
+                 WHERE a.run_id = j.run_id AND a.job_id = j.job_id) \
+             AND NOT EXISTS (SELECT 1 FROM provision_requests p \
+                 WHERE p.run_id = j.run_id AND p.job_id = j.job_id) \
+             ORDER BY j.priority DESC, j.run_order, j.job_order"
+        ))
+        .map_err(db)?;
+    let rows = stmt.query_map([], job_row).map_err(db)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db)
+}
+
 /// Global ready-queue depth (the gauge commands report back).
 pub(super) fn ready_count(tx: &Transaction<'_>) -> Result<usize, ControlError> {
     tx.prepare_cached("SELECT COUNT(*) FROM jobs WHERE queue_state = 'ready'")

@@ -14,7 +14,7 @@ Preloop’s control plane turns a workflow submission or GitHub event into jobs,
 | **Control plane** | Accepts submissions and webhooks, authenticates callers, stores run and job state, schedules ready jobs, and exposes runner-compatible and native HTTP APIs. |
 | **Workflow engine** | Parses workflow YAML, matches triggers, expands reusable workflows and matrices, evaluates server-owned expressions, and builds runner job messages. |
 | **Runner protocol** | Implements the wire contracts used by the official Actions runner: registration, sessions, message delivery, job acquisition, renewals, completion, timelines, logs, cache, and artifacts. |
-| **MicroVM pool** | Forks an isolated microVM per job through the `VmProvider` trait, backed by SmolVM. Goldens are packed once and forked copy-on-write. |
+| **MicroVM pool** | Forks an isolated microVM per job through the `VmProvider` trait; the build ships the SmolVM driver, and other drivers attach the same way. Goldens are packed once and forked copy-on-write. |
 | **Storage** | Keeps durable control state in SQLite by default or Postgres for shared control-plane nodes; file-backed stores hold caches, artifacts, logs, and snapshots. |
 | **Observability** | Emits structured logs, Prometheus metrics, OpenTelemetry traces and logs, and a cached operational snapshot for health and capacity diagnosis. |
 
