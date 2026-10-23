@@ -1046,18 +1046,24 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::DeadlineExceeded);
+    // Non-vacuous: the host held exactly one sandbox, still provisioning.
+    let before = service.list();
+    assert!(
+        before.len() == 1 && before[0].state == SandboxState::Provisioning,
+        "{before:?}"
+    );
+    let sandbox_id = before[0].id.clone();
     // The host stops answering: wait past the timeout the service declares
     // it lost by, not past the last heartbeat.
     alive.cancel();
     tokio::time::sleep(provider_timeout * 2).await;
     service.maintain().await;
-    let sandboxes = service.list();
-    assert!(
-        sandboxes
-            .iter()
-            .all(|s| s.state != SandboxState::Provisioning && s.state != SandboxState::Leased),
-        "{sandboxes:?}"
-    );
+    // It never reported a machine, so its record is dropped (a failed record
+    // would also satisfy this); it must not stay provisioning or leased.
+    match service.get(&sandbox_id) {
+        Ok(sandbox) => assert_eq!(sandbox.state, SandboxState::Failed, "{sandbox:?}"),
+        Err(error) => assert_eq!(error.code, Code::NotFound, "{}", error.message),
+    }
     assert!(
         store.load(Kind::Leases).await.unwrap().is_empty(),
         "a lost provider's lease is released, not left to expire"
@@ -2200,7 +2206,7 @@ async fn replayed_acquire_of_a_failed_sandbox_persists_its_release() {
 }
 
 #[tokio::test]
-async fn paused_pool_member_resumes_to_ready_and_survives_maintenance() {
+async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
     let h = harness().await;
     h.service.put_template(template("alpine")).await.unwrap();
     h.service
@@ -2243,14 +2249,21 @@ async fn paused_pool_member_resumes_to_ready_and_survives_maintenance() {
     assert!(paused.preserve_until > unix_now());
     h.service.resume(&id).await.unwrap();
     let resumed = h.service.get(&id).unwrap();
-    assert_eq!(resumed.state, SandboxState::Ready);
-    assert_eq!(resumed.preserve_until, 0);
+    assert_eq!(
+        resumed.state,
+        SandboxState::Preserved,
+        "a machine that held a lease must never rejoin the warm set"
+    );
+    assert!(resumed.preserve_until > unix_now());
     h.service.maintain().await;
     assert_eq!(
         h.service.get(&id).unwrap().state,
-        SandboxState::Ready,
-        "the resumed warm member must not be swept"
+        SandboxState::Preserved,
+        "the preserved member must not be swept before its deadline"
     );
+    // The next acquire gets a clean machine, not the used one.
+    let fresh = h.service.acquire(acquire("k2", "p")).await.unwrap();
+    assert_ne!(fresh.sandbox.id, id);
 }
 
 #[tokio::test]
@@ -2505,6 +2518,22 @@ async fn a_reconfigured_pool_never_serves_an_old_warm_member() {
     })
     .await;
     let old = h.service.list()[0].id.clone();
+
+    // Scaling the pool does not change how members are built.
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "one".into(),
+            warm: 2,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    h.service.maintain().await;
+    assert!(
+        h.service.get(&old).is_ok(),
+        "a warm-count change retired the warm member"
+    );
 
     h.service
         .put_pool(PoolSpec {
