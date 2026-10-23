@@ -128,6 +128,14 @@ goldens are build sandboxes, forks are acquires from the golden's snapshot
 template, and deletes are releases. The pool keeps its golden, packed-artifact
 and debug-hold strategy; the machines under it are sandboxes.
 
+> **Single-host CI pool (current limitation).** The in-process handle ties the
+> pool to the engine's host: it mounts the runner bundle and externals from
+> engine paths, passes golden packs as engine file paths, sizes capacity from
+> the engine's disk and memory, and reaches the guest through a socket on that
+> host. Host agents on other machines can join a service and serve other
+> clients, but CI jobs from this engine run only on its own host. Running the
+> pool against a remote service is tracked in #776 (part of #773).
+
 | Variable | Effect |
 |---|---|
 | `PRELOOP_SANDBOX_LISTEN` | API address, or `off` |

@@ -17,6 +17,10 @@ A substrate is a driver behind a host agent. Each host agent attaches the driver
 
 The pool reaches the driver through the `VmProvider` trait. The trait (create, start, start forkable, fork, exec, copy, pack, delete) declares what the driver supports through `capabilities()`, and the pool chooses its strategy from those declarations instead of assuming SmolVM semantics.
 
+<Note>
+**Single-host CI pool (current limitation).** `preloop engine` embeds the sandbox service and gives the runner pool a direct in-process handle, so the pool assumes the service, its host agent and the VMs share the engine's host: it mounts the runner bundle and externals from engine paths, passes golden packs as engine file paths, sizes capacity from the engine's disk and memory, and reaches the guest through a socket on that host. Host agents on other machines can join a service and serve other clients, but CI jobs from this engine run only on its own host. Running the pool against a remote service is tracked in #776 (part of #773).
+</Note>
+
 ## How a job gets a machine
 
 <Steps>
