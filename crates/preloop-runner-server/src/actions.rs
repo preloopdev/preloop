@@ -1810,7 +1810,7 @@ async fn contents_read_credential(
         }
     };
     // The installation is the rate-limit identity, so never invent one.
-    match crate::github_app::installation_for_repo(&app, repository).await {
+    match crate::github_app::installation_for_repo(api_base, &app, repository).await {
         Ok(installation) if installation != 0 => Some((
             token,
             crate::github_breaker::GithubCredentialBucket::Installation(installation),

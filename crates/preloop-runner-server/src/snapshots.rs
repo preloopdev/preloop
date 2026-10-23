@@ -315,7 +315,8 @@ async fn resolve_github_repo_meta(
             .to_owned();
         if let Some(app) = crate::github_app::select_app_for_repo(shared, slug).await {
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-            if let Ok(token) = crate::github_app::get_or_mint_token(&app, slug, &permissions).await
+            if let Ok(token) =
+                crate::github_app::get_or_mint_token_at(&api_url, &app, slug, &permissions).await
             {
                 // The mint ledger names the installation locally, so the call
                 // is observed on the installation that minted it; an
@@ -786,11 +787,16 @@ async fn resolve_cache_upstream_credential(
 
     if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await {
         let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-        let token = crate::github_app::get_or_mint_token(&app, repository, &permissions)
-            .await
-            .map_err(|error| {
-                ApiError::internal(format!("failed to mint checkout-cache token: {error:#}"))
-            })?;
+        let token = crate::github_app::get_or_mint_token_at(
+            shared.state.github_urls.api_base(),
+            &app,
+            repository,
+            &permissions,
+        )
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("failed to mint checkout-cache token: {error:#}"))
+        })?;
         let Some(entry) = app.mint_ledger.lookup(&token) else {
             return Ok(None);
         };
@@ -3726,8 +3732,13 @@ fn scoped_fetch_auth_header(upstream_url: &str, token: &str) -> Option<(String, 
 pub(crate) async fn forge_read_token(shared: &SharedState, repository: &str) -> Option<String> {
     if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await {
         let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-        if let Ok(token) =
-            crate::github_app::get_or_mint_token(&app, repository, &permissions).await
+        if let Ok(token) = crate::github_app::get_or_mint_token_at(
+            shared.state.github_urls.api_base(),
+            &app,
+            repository,
+            &permissions,
+        )
+        .await
         {
             return Some(token);
         }

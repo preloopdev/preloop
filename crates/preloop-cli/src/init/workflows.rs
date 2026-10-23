@@ -320,7 +320,9 @@ async fn github_token(config: &ConfigFile, repo: &str) -> Result<String, String>
     match github_app::load_from(config) {
         Ok(Some(apps)) => {
             for app in &apps.apps {
-                match github_app::get_or_mint_token(app, repo, &read_only).await {
+                match github_app::get_or_mint_token_at(&github_api_base(), app, repo, &read_only)
+                    .await
+                {
                     Ok(token) => return Ok(token),
                     Err(error) => app_failure = Some(format!("{error:#}")),
                 }

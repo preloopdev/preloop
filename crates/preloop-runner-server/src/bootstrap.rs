@@ -1761,8 +1761,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // so the operator ticks the missing events in App settings.
     if let Some(app) = state.github_app.clone() {
         let app_id = app.app_id.clone();
+        let api_base = state.github_urls.api_base().to_owned();
         tokio::spawn(async move {
-            match app.read_app_subscription().await {
+            match app.read_app_subscription(&api_base).await {
                 Ok(subscription) => {
                     crate::github_app::warn_missing_trigger_events(&app_id, &subscription)
                 }
@@ -1783,9 +1784,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                 continue;
             }
             let app = app.clone();
+            let api_base = state.github_urls.api_base().to_owned();
             tokio::spawn(async move {
                 let app_id = app.app_id.clone();
-                match app.read_app_subscription().await {
+                match app.read_app_subscription(&api_base).await {
                     Ok(subscription) => {
                         crate::github_app::warn_missing_trigger_events(&app_id, &subscription)
                     }

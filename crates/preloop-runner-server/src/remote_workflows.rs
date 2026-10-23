@@ -45,10 +45,10 @@ pub async fn resolve_remote_workflows(
 
     let mut client = None;
     let token = github_token;
-    // Mirrors `github::fetch_workflows_at`: tests point this at a local mock,
-    // and GHES installs can point it at their instance.
-    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-        .unwrap_or_else(|_| "https://api.github.com".to_owned());
+    // Mirrors `github::fetch_workflows_at`: the base is the one resolved
+    // address in state, so tests point it at a local mock and GHES installs
+    // at their instance through the same resolution everything else uses.
+    let api_base = shared.state.github_urls.api_base();
     // Each queued workflow carries the remote reference it was fetched from and
     // the commit that reference is pinned to. `None` marks the submitted
     // repository (the root and its same-repository callees), which is pinned to

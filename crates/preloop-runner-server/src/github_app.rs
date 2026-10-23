@@ -722,9 +722,9 @@ impl GitHubAppCredentials {
     /// (`GET /app`).
     ///
     /// Authenticates with the App JWT, the only credential `/app` accepts.
-    pub async fn read_app_subscription(&self) -> anyhow::Result<AppSubscription> {
+    pub async fn read_app_subscription(&self, api_base: &str) -> anyhow::Result<AppSubscription> {
         read_app_subscription_at_with_breaker(
-            &api_base(),
+            api_base,
             &self.app_id,
             &self.private_key,
             self.github_accounting(),
@@ -1023,7 +1023,7 @@ pub async fn candidate_apps_for_repo_inner(
             };
         }
     };
-    let api_base = api_base();
+    let api_base = shared.state.github_urls.api_base();
     let mut candidates: Vec<GitHubAppCredentials> = Vec::new();
     // The first non-definitive failure, kept in case no App turns out to cover
     // the owner: an empty (or non-empty) candidate list built while lookups
@@ -1037,7 +1037,7 @@ pub async fn candidate_apps_for_repo_inner(
                 continue;
             }
         };
-        match installation_id_for(&api_base, app, &app_jwt, &owner).await {
+        match installation_id_for(api_base, app, &app_jwt, &owner).await {
             Ok(_) => candidates.push(app.clone()),
             Err(error) => {
                 if let AppLookupError::Transient(error) = classify_installation_error(error) {
@@ -1082,8 +1082,12 @@ pub async fn candidate_apps_for_repo_inner(
 /// (for [`REPOSITORY_COVERAGE_TTL`]); a definitive 404 denies this delivery but
 /// is not retained, so the next delivery can discover a newly added
 /// repository. See [`RepositoryCoverageCache`].
-pub async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str) -> bool {
-    app_covers_repository_cached(&api_base(), app, repository).await
+pub async fn app_covers_repository(
+    api_base: &str,
+    app: &GitHubAppCredentials,
+    repository: &str,
+) -> bool {
+    app_covers_repository_cached(api_base, app, repository).await
 }
 
 /// Apply a signature-verified installation lifecycle event to the signer
@@ -1302,38 +1306,16 @@ pub async fn select_app_for_repo(
 /// carry: `0` is never a valid GitHub installation, and discovery is cached
 /// per App+owner, so steady state costs no extra API call.
 pub async fn installation_for_repo(
+    api_base: &str,
     app: &GitHubAppCredentials,
     repository: &str,
 ) -> anyhow::Result<u64> {
     let (owner, _) = split_repository(repository)?;
     let app_jwt = sign_app_jwt(&app.app_id, &app.private_key)?;
-    installation_id_for(&api_base(), app, &app_jwt, owner).await
+    installation_id_for(api_base, app, &app_jwt, owner).await
 }
 
-/// Mint an installation token for `repository`, scoped to `permissions`.
-///
-/// `repository` is an `owner/repo` slug: the owner selects the installation and
-/// the repository bounds the token. `permissions` is the job's *effective*
-/// permission set, already resolved against
-/// [`preloop_gha_parser::DEFAULT_TOKEN_PERMISSIONS`] — this function does not
-/// invent a default, so no caller can accidentally request everything.
-///
-/// Resolves (and caches) the installation id for the account, then mints a
-/// fresh token. Never panics and never touches `AppState::inner`, so it is
-/// safe to call from the dispatch path.
-pub async fn get_or_mint_token(
-    creds: &GitHubAppCredentials,
-    repository: &str,
-    permissions: &BTreeMap<String, String>,
-) -> anyhow::Result<String> {
-    Ok(
-        mint_for_repository(&api_base(), creds, repository, permissions, false)
-            .await?
-            .0,
-    )
-}
-
-/// [`get_or_mint_token`], told whether the workflow declared `permissions:`.
+/// [`get_or_mint_token_at`], told whether the workflow declared `permissions:`.
 ///
 /// Either way the request is narrowed to the installation's grants: GitHub's
 /// `GITHUB_TOKEN` is the intersection of the workflow's `permissions:` block
@@ -1345,14 +1327,29 @@ pub async fn get_or_mint_token(
 /// when narrowing occurred. Callers must restate it to the job: a token that
 /// silently holds less than the job was told is a 403 with no explanation.
 pub async fn get_or_mint_token_declared(
+    api_base: &str,
     creds: &GitHubAppCredentials,
     repository: &str,
     permissions: &BTreeMap<String, String>,
     declared: bool,
 ) -> anyhow::Result<(String, Option<BTreeMap<String, String>>)> {
-    mint_for_repository(&api_base(), creds, repository, permissions, declared).await
+    mint_for_repository(api_base, creds, repository, permissions, declared).await
 }
 
+/// Mint an installation token for `repository`, scoped to `permissions`,
+/// against an explicit API base.
+///
+/// `repository` is an `owner/repo` slug: the owner selects the installation and
+/// the repository bounds the token. `permissions` is the job's *effective*
+/// permission set, already resolved against
+/// [`preloop_gha_parser::DEFAULT_TOKEN_PERMISSIONS`] — this function does not
+/// invent a default, so no caller can accidentally request everything.
+///
+/// Resolves (and caches) the installation id for the account, then mints a
+/// fresh token. Never panics and never touches `AppState::inner`, so it is
+/// safe to call from the dispatch path. The base is the one resolved address
+/// in `AppState::github_urls` (or the CLI's environment-derived base at the
+/// CLI boundary) — nothing in this module resolves an address itself.
 pub async fn get_or_mint_token_at(
     api_base: &str,
     creds: &GitHubAppCredentials,
@@ -1366,7 +1363,8 @@ pub async fn get_or_mint_token_at(
     )
 }
 
-/// [`get_or_mint_token`] against an explicit API base.
+/// The shared mint behind [`get_or_mint_token_at`] and
+/// [`get_or_mint_token_declared`].
 async fn mint_for_repository(
     api_base: &str,
     creds: &GitHubAppCredentials,
@@ -1865,13 +1863,6 @@ fn parse_private_key(pem: &str) -> anyhow::Result<rsa::RsaPrivateKey> {
     }
 }
 
-/// GitHub REST API base, overridable for GitHub Enterprise Server and tests.
-fn api_base() -> String {
-    env_non_empty("PRELOOP_GITHUB_API_URL")
-        .map(|base| base.trim_end_matches('/').to_owned())
-        .unwrap_or_else(|| "https://api.github.com".to_owned())
-}
-
 /// Read an environment variable, treating blank and whitespace-only as unset.
 fn env_non_empty(name: &str) -> Option<String> {
     std::env::var(name)
@@ -1884,7 +1875,7 @@ fn base64_json(value: &serde_json::Value) -> anyhow::Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?))
 }
 
-/// Permissions [`verify_repo_access_with_token`] probes, and therefore the
+/// Permissions [`verify_repo_access_at`] probes, and therefore the
 /// permissions a verification token has to request to be probed meaningfully.
 const PROBED_PERMISSIONS: [(&str, &str); 4] = [
     ("contents", "read"),
@@ -1900,15 +1891,7 @@ const PROBED_PERMISSIONS: [(&str, &str); 4] = [
 /// `pull-requests: read`). A credential that cannot read the repo at all is
 /// an error naming the status GitHub returned; individually missing
 /// permissions simply don't appear in the list.
-pub async fn verify_repo_access_with_token(
-    token: &str,
-    repo: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
-    verify_repo_access_at(&api_base(), token, repo).await
-}
-
-/// [`verify_repo_access_with_token`] against an explicit API base.
-async fn verify_repo_access_at(
+pub async fn verify_repo_access_at(
     api_base: &str,
     token: &str,
     repo: &str,
@@ -1970,18 +1953,9 @@ async fn verify_repo_access_at(
 }
 
 /// Verify a GitHub App configuration by minting a scoped installation token
-/// for `repo` and probing it.
-pub async fn verify_app_config(
-    app_id: &str,
-    pem: &str,
-    repo: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
-    verify_app_config_at(&api_base(), app_id, pem, repo).await
-}
-
-/// [`verify_app_config`] against an explicit API base, for callers that hold
-/// a resolved GitHub API URL (`AppState::github_urls`) rather than the
-/// process environment, which is what `api_base` reads.
+/// for `repo` and probing it, against an explicit API base: the resolved
+/// GitHub API URL from `AppState::github_urls` for server callers, or the
+/// CLI's environment-derived base at the CLI boundary.
 pub async fn verify_app_config_at(
     api_base: &str,
     app_id: &str,
@@ -2039,17 +2013,7 @@ pub async fn verify_app_config_at(
 /// GitHub exposes no `active` flag on this endpoint: an App created with
 /// `hook_attributes.active = false` keeps that checkbox until it is flipped
 /// in the App's settings. The caller is expected to say so.
-pub async fn set_app_webhook_config(
-    app_id: &str,
-    pem: &str,
-    url: &str,
-    secret: &str,
-) -> anyhow::Result<()> {
-    set_app_webhook_config_at(&api_base(), app_id, pem, url, secret).await
-}
-
-/// [`set_app_webhook_config`] against an explicit API base.
-async fn set_app_webhook_config_at(
+pub async fn set_app_webhook_config_at(
     api_base: &str,
     app_id: &str,
     pem: &str,

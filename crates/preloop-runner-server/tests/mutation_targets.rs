@@ -93,7 +93,7 @@ const T2: Target = Target {
         "--re",
         "verify_signature|decode_hex|claimed_repository|webhook_retry_backoff|handle_github_webhook|adapter_for|make_default_branch_events",
     ],
-    exclude_re: "send_github_check_request|resolve_repo_token|resolve_check_run_token|find_existing_check_run|report_check_run_queued|report_existing_check_run_queued|ensure_check_run_mapped|drain_check_run_sender|github_api_base",
+    exclude_re: "send_github_check_request|resolve_repo_token|resolve_check_run_token|find_existing_check_run|report_check_run_queued|report_existing_check_run_queued|ensure_check_run_mapped|drain_check_run_sender",
     tests: &[
         "--lib",
         "--test",
