@@ -16,6 +16,69 @@ pub struct OidcTokenResponse {
 ///
 /// Mints a GitHub-compatible RS256-signed OIDC id-token JWT. Looks up the
 /// originating workflow run to populate claims, and enforces `id-token: write`.
+/// Read the persisted repository `created_at` cache (keyed by
+/// repository ID) from node-local state.
+async fn cached_repo_created_at(shared: &Arc<SharedState>, repository_id: &str) -> Option<i64> {
+    let inner = shared.state.inner.lock().await;
+    inner.oidc_repo_created_at.get(repository_id).copied()
+}
+
+/// Record a repository `created_at` in the cache and persist it,
+/// mirroring the artifact-v2 registry's state-dir pattern. Best-effort:
+/// a failed write only costs a repeat lookup later.
+async fn cache_repo_created_at(shared: &Arc<SharedState>, repository_id: &str, created_at: i64) {
+    let snapshot = {
+        let mut inner = shared.state.inner.lock().await;
+        if inner.oidc_repo_created_at.get(repository_id) == Some(&created_at) {
+            return;
+        }
+        inner
+            .oidc_repo_created_at
+            .insert(repository_id.to_owned(), created_at);
+        inner.oidc_repo_created_at.clone()
+    };
+    if let Ok(content) = serde_json::to_string(&snapshot) {
+        let _ = tokio::fs::write(
+            shared.state.state_dir.join("oidc_repo_created_at.json"),
+            content,
+        )
+        .await;
+    }
+}
+
+/// Resolve whether this mint uses GitHub's immutable (ID-embedded)
+/// subject form. The creation date comes from, in order: the run
+/// submission's webhook payload, the persisted cache keyed by
+/// repository ID, and the GitHub API (whose result is cached — an ID's
+/// creation date never changes). Fail-soft throughout: unknown IDs or an
+/// undeterminable date mean the historical name-based form, and no
+/// failure here ever fails the mint.
+async fn resolve_immutable_subject(
+    shared: &Arc<SharedState>,
+    repository: &str,
+    repository_id: &str,
+    repository_owner_id: &str,
+    payload_created_at: Option<i64>,
+) -> bool {
+    if repository_id.is_empty() || repository_owner_id.is_empty() {
+        return false;
+    }
+    if let Some(forced) = shared.state.oidc_immutable_subject_claims {
+        return forced;
+    }
+    let cached = cached_repo_created_at(shared, repository_id).await;
+    let created_at = match payload_created_at.or(cached) {
+        Some(created_at) => Some(created_at),
+        None => crate::github::fetch_repository_created_at(shared, repository).await,
+    };
+    if let Some(created_at) = created_at
+        && cached != Some(created_at)
+    {
+        cache_repo_created_at(shared, repository_id, created_at).await;
+    }
+    oidc::use_immutable_subject(repository_id, repository_owner_id, created_at, None)
+}
+
 pub async fn oidc_token_run_service(
     State(shared): State<Arc<SharedState>>,
     Path((_orchestration_id, plan_id, job_id)): Path<(String, String, String)>,
@@ -165,6 +228,15 @@ pub async fn oidc_token(
         .and_then(|value| value.as_str())
         .unwrap_or("private")
         .to_owned();
+    // Extract the repository creation date when the webhook payload
+    // carries it — the first source for the immutable-subject decision
+    // (see `resolve_immutable_subject`).
+    let repository_created_at = submission
+        .payload
+        .get("repository")
+        .and_then(|r| r.get("created_at"))
+        .and_then(|v| v.as_str())
+        .and_then(oidc::parse_repo_created_at);
 
     let workflow_name = parse_workflow(&submission.workflow_yaml)
         .ok()
@@ -214,6 +286,14 @@ pub async fn oidc_token(
             .or_else(|| job_workflow_ref.as_ref().map(|_| sha.clone()))
     });
 
+    let immutable_subject = resolve_immutable_subject(
+        &shared,
+        &submission.repository,
+        &repository_id,
+        &repository_owner_id,
+        repository_created_at,
+    )
+    .await;
     let claims_input = oidc::OidcClaimsInput {
         repository: submission.repository.clone(),
         repository_owner,
@@ -233,6 +313,7 @@ pub async fn oidc_token(
         repository_visibility,
         repository_id,
         repository_owner_id,
+        immutable_subject,
         workflow_ref: Some(workflow_ref),
         workflow_sha: Some(sha),
         job_workflow_ref,
@@ -321,8 +402,29 @@ mod tests {
 
     impl OidcJob {
         async fn submit() -> Self {
+            Self::submit_inner(serde_json::Value::Null, None).await
+        }
+
+        async fn submit_with_payload(payload: serde_json::Value) -> Self {
+            Self::submit_inner(payload, None).await
+        }
+
+        async fn submit_with_config(payload: serde_json::Value, config_toml: &str) -> Self {
+            Self::submit_inner(payload, Some(config_toml)).await
+        }
+
+        async fn submit_inner(payload: serde_json::Value, config_toml: Option<&str>) -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+            let state = match config_toml {
+                Some(toml) => {
+                    let config_path = temp.path().join("preloop-config.toml");
+                    std::fs::write(&config_path, toml).unwrap();
+                    AppState::new_with_config(temp.path().to_path_buf(), config_path)
+                        .await
+                        .unwrap()
+                }
+                None => AppState::new(temp.path().to_path_buf()).await.unwrap(),
+            };
             let app = crate::routes::app(state.clone(), CancellationToken::new());
             let response = app
                 .clone()
@@ -340,6 +442,7 @@ mod tests {
                                 "workflow_yaml": OIDC_WORKFLOW,
                                 "event": "push",
                                 "repository": "owner/repo",
+                                "payload": payload,
                             })
                             .to_string(),
                         ))
@@ -555,5 +658,74 @@ mod tests {
             .upload_step_log("plain.txt", "unrelated content\n")
             .await;
         assert_eq!(persisted, "unrelated content\n");
+    }
+
+    // -- immutable subject claims, end to end through the mint ------------
+
+    /// Decode a minted JWT's `sub` claim (the test inspects the payload
+    /// segment only; signature verification is covered elsewhere).
+    fn decoded_sub(jwt: &str) -> String {
+        let segment = jwt.split('.').nth(1).expect("a JWT has a payload segment");
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, segment)
+                .expect("the payload segment is base64url");
+        let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        claims["sub"]
+            .as_str()
+            .expect("the token carries a sub")
+            .to_owned()
+    }
+
+    fn repo_payload(created_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "repository": {
+                "id": 1285198891,
+                "owner": { "id": 297229730 },
+                "created_at": created_at,
+                "visibility": "private"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn mint_post_cutoff_repo_uses_immutable_subject() {
+        let job = OidcJob::submit_with_payload(repo_payload("2026-08-01T00:00:00Z")).await;
+        let jwt = job.mint().await;
+        assert_eq!(
+            decoded_sub(&jwt),
+            "repo:owner@297229730/repo@1285198891:ref:refs/heads/main"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_pre_cutoff_repo_keeps_name_based_subject() {
+        let job = OidcJob::submit_with_payload(repo_payload("2020-01-01T00:00:00Z")).await;
+        let jwt = job.mint().await;
+        assert_eq!(decoded_sub(&jwt), "repo:owner/repo:ref:refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn mint_operator_force_on_makes_pre_cutoff_repo_immutable() {
+        let job = OidcJob::submit_with_config(
+            repo_payload("2020-01-01T00:00:00Z"),
+            "[oidc]\nimmutable_subject_claims = true\n",
+        )
+        .await;
+        let jwt = job.mint().await;
+        assert_eq!(
+            decoded_sub(&jwt),
+            "repo:owner@297229730/repo@1285198891:ref:refs/heads/main"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_operator_force_off_keeps_post_cutoff_repo_name_based() {
+        let job = OidcJob::submit_with_config(
+            repo_payload("2026-08-01T00:00:00Z"),
+            "[oidc]\nimmutable_subject_claims = false\n",
+        )
+        .await;
+        let jwt = job.mint().await;
+        assert_eq!(decoded_sub(&jwt), "repo:owner/repo:ref:refs/heads/main");
     }
 }

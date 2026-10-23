@@ -106,6 +106,19 @@ allow_create_approve_pr = false
 
 Levels are `none`, `read`, `write`, and `admin`. The table is inactive when omitted. When present, `allow_create_approve_pr = false` caps pull-request permissions at read. See [GitHub tokens](/control-plane/github/tokens) for App-grant narrowing and PAT behavior.
 
+## OIDC subject claims
+
+Minted OIDC id-tokens carry GitHub's subject (`sub`) claim. By default preloop mirrors GitHub's immutable-subject rollout: a repository created after 2026-07-15 gets the ID-embedded form (`repo:OWNER@OWNER-ID/REPO@REPO-ID:ref:…`), which a deleted-and-recreated repository cannot inherit, and older repositories keep the name-based form (`repo:OWNER/REPO:ref:…`). The creation date comes from the run's webhook payload when present, then a per-node cache keyed by repository ID, then one GitHub API lookup; when the IDs or the date cannot be determined, the name-based form is used and the mint never fails.
+
+Force the format either way with the `[oidc]` table:
+
+```toml
+[oidc]
+immutable_subject_claims = true
+```
+
+`true` forces the ID-embedded form whenever both IDs are known; `false` forces the name-based form. Omit the key to use the creation-date policy.
+
 For local environment protection, use `[environment_rules."owner/repo".production]` with `deployment_branches`, `deployment_tags`, `wait_timer_minutes`, and `required_reviewers`. Environment approval uses `POST /api/v1/runs/RUN_ID/jobs/JOB_ID/approve`; the system bearer records an `admin_override` note. Local reviewer counts above one are rejected because the engine has no user identities. With a GitHub App, environment resolution needs Actions and Contents read; team reviewers need Members read; deployment status and Check Run reporting need Deployments write and Checks write.
 
 ## Secrets and credentials

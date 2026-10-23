@@ -219,6 +219,45 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
     resolve_repo_token(shared, repo, &permissions).await
 }
 
+/// Fetch a repository's `created_at` (Unix seconds) from the GitHub API:
+/// `GET /repos/{owner}/{repo}`. Used by the OIDC mint path to decide
+/// immutable subject claims; the result is cached by repository ID, so
+/// this runs at most once per repository per node.
+///
+/// Fail-soft by contract: no credential, a rate-limited or erroring
+/// GitHub, a missing repository, or an unparseable body all return
+/// `None` (date unknown) — an OIDC mint must never fail because this
+/// lookup did.
+pub async fn fetch_repository_created_at(shared: &Arc<SharedState>, repo: &str) -> Option<i64> {
+    let mut permissions = std::collections::BTreeMap::new();
+    permissions.insert("contents".to_owned(), "read".to_owned());
+    let token = resolve_repo_token(shared, repo, &permissions).await?;
+    let bucket = check_request_bucket(shared, repo, Some(&token)).await;
+    let url = format!("{}/repos/{}", github_api_base(), repo);
+    let res = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Oidc,
+        crate::shared_http::CLIENT
+            .get(&url)
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await
+    .ok()?;
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Oidc, &res);
+    if !res.status().is_success() {
+        return None;
+    }
+    let value: Value = res.json().await.ok()?;
+    crate::oidc::parse_repo_created_at(value.get("created_at")?.as_str()?)
+}
+
 async fn send_github_check_request(
     shared: &Arc<SharedState>,
     bucket: crate::github_breaker::GithubCredentialBucket,

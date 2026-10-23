@@ -74,6 +74,7 @@ Keys under `[github]` that hold credentials, such as `app_pem_ref` and `webhook_
 | `[fork_policy]` | Whether workflows from fork pull requests wait for approval. | [Security](/control-plane/operate/security) |
 | `[execution_protection]` | Event and actor rules that gate workflow runs. | [Security](/control-plane/operate/security) |
 | `[token_permissions_ceiling]` | A cap on the `permissions:` a job token may request. | [Security](/control-plane/operate/security) |
+| `[oidc]` | OIDC subject-claim format: `immutable_subject_claims` forces GitHub's ID-embedded subjects on or off; unset applies GitHub's creation-date rollout policy. | [Security](/control-plane/operate/security) |
 | `[environment_rules."owner/repo".<env>]` | Protection rules for a deployment environment. | [Security](/control-plane/operate/security) |
 | `[cache]`, `[checkout_cache]` | Actions cache quota and checkout reuse. | [Environment variables](/control-plane/reference/environment) |
 
