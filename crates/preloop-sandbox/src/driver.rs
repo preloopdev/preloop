@@ -16,7 +16,7 @@ use crate::connect::{Error, Result};
 /// A sandbox backend on one host (or one remote endpoint, for connectors).
 #[async_trait]
 pub trait Driver: Send + Sync {
-    /// Stable driver name (`smolvm`, `fake`, or a private downstream driver).
+    /// Stable driver name (`smolvm`, `fake`, or another driver).
     fn name(&self) -> &str;
 
     /// What this backend can do.
@@ -111,17 +111,32 @@ pub fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+/// Environment keys are interpolated into a shell script, so they must be
+/// POSIX identifiers: a key like `A; rm -rf /` would otherwise be executed.
+pub fn env_key_is_identifier(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// An argv applying the request's env/workdir/stdin/user through a POSIX
 /// shell, for backends whose exec primitive takes only an argv. Returns the
 /// argv verbatim when there is nothing to apply.
-pub fn posix_exec_argv(request: &ExecRequest) -> Vec<String> {
+pub fn posix_exec_argv(request: &ExecRequest) -> Result<Vec<String>> {
     use base64::Engine as _;
+    for key in request.env.keys() {
+        if !env_key_is_identifier(key) {
+            return Err(Error::invalid(format!(
+                "invalid environment variable name `{key}`"
+            )));
+        }
+    }
     let plain = request.env.is_empty()
         && request.workdir.is_empty()
         && request.stdin.is_empty()
         && (request.user.is_empty() || request.user == "root");
     if plain {
-        return request.argv.clone();
+        return Ok(request.argv.clone());
     }
     let mut script = String::new();
     if !request.workdir.is_empty() {
@@ -152,7 +167,7 @@ pub fn posix_exec_argv(request: &ExecRequest) -> Vec<String> {
             shell_quote(&data)
         ));
     }
-    vec!["sh".into(), "-c".into(), script]
+    Ok(vec!["sh".into(), "-c".into(), script])
 }
 
 #[cfg(test)]
@@ -174,7 +189,30 @@ mod tests {
             argv: vec!["uname".into(), "-a".into()],
             ..ExecRequest::default()
         };
-        assert_eq!(posix_exec_argv(&request), vec!["uname", "-a"]);
+        assert_eq!(posix_exec_argv(&request).unwrap(), vec!["uname", "-a"]);
+    }
+
+    #[test]
+    fn env_keys_must_be_identifiers() {
+        let mut request = ExecRequest {
+            argv: vec!["true".into()],
+            ..ExecRequest::default()
+        };
+        request.env.insert("A; touch /tmp/pwned".into(), "1".into());
+        let error = posix_exec_argv(&request).unwrap_err();
+        assert_eq!(error.code, crate::connect::Code::InvalidArgument);
+        assert!(error.message.contains("A; touch /tmp/pwned"));
+
+        for key in ["", "1A", "A-B", "A.B", "A B"] {
+            request.env.clear();
+            request.env.insert(key.into(), "1".into());
+            assert!(posix_exec_argv(&request).is_err(), "{key:?} must fail");
+        }
+        for key in ["A", "_A", "A1", "a_b_C"] {
+            request.env.clear();
+            request.env.insert(key.into(), "1".into());
+            assert!(posix_exec_argv(&request).is_ok(), "{key:?} must pass");
+        }
     }
 
     #[test]
@@ -186,7 +224,7 @@ mod tests {
             ..ExecRequest::default()
         };
         request.env.insert("K".into(), "v w".into());
-        let argv = posix_exec_argv(&request);
+        let argv = posix_exec_argv(&request).unwrap();
         assert_eq!(
             argv[2],
             "export K='v w'; printf %s 'aGk=' | base64 -d | su -m -s /bin/sh 'runner' -c ''\\''cat'\\'''"
