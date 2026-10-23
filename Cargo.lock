@@ -2778,6 +2778,7 @@ dependencies = [
  "cbc",
  "cipher",
  "indexmap",
+ "preloop-secrets",
  "proptest",
  "rand 0.10.2",
  "rsa",
@@ -2969,6 +2970,7 @@ dependencies = [
  "preloop-gha-protocol",
  "preloop-observability",
  "preloop-runner",
+ "preloop-secrets",
  "preloop-socket-activation",
  "proptest",
  "prost",
@@ -3032,6 +3034,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "preloop-secrets"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "keyring",
+ "parking_lot",
+ "preloop-observability",
+ "rand 0.10.2",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
