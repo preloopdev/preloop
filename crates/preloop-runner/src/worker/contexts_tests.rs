@@ -651,6 +651,36 @@ fn matrix_context_resolves_in_expressions() {
     );
 }
 
+/// Preloop `parallelism:` shards travel as `shard` in `contextData`; the
+/// runner must decode them like `matrix` so a step can partition its work
+/// with `${{ shard.index }}` / `${{ shard.count }}`.
+#[test]
+fn shard_context_resolves_in_expressions() {
+    let ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({
+            "github": {"repository": "owner/repo"},
+            "shard": {"index": 2, "count": 4}
+        }),
+    );
+
+    let expr_ctx = ctx.build_expression_context();
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("shard.index", &expr_ctx)
+            .unwrap()
+            .as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("shard.count", &expr_ctx)
+            .unwrap()
+            .as_u64(),
+        Some(4)
+    );
+}
+
 #[test]
 fn needs_context_resolves_in_expressions() {
     let ctx = JobContext::new(

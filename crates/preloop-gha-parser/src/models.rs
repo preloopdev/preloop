@@ -77,6 +77,31 @@ pub enum ParserError {
         /// Maximum allowed combinations.
         limit: usize,
     },
+    /// Matrix cells × `parallelism:` shards exceeded the per-job fan-out cap.
+    #[error(
+        "job `{job_id}` expands to {cells} matrix cells × {shards} shards ({total} jobs), \
+         exceeding the per-job fan-out limit of {limit}"
+    )]
+    JobFanoutTooLarge {
+        /// Job id.
+        job_id: String,
+        /// Matrix cells (1 when the job has no matrix).
+        cells: usize,
+        /// Shards per cell (1 when the job is not sharded).
+        shards: usize,
+        /// `cells * shards`.
+        total: usize,
+        /// Maximum allowed fan-out for one job.
+        limit: usize,
+    },
+    /// A workflow expanded past the parser's hard ceiling on job plans.
+    #[error("workflow expands to more than {limit} job plans (at job `{job_id}`)")]
+    TooManyJobPlans {
+        /// Job whose fan-out crossed the limit.
+        job_id: String,
+        /// Maximum allowed plans.
+        limit: usize,
+    },
     /// Local reusable workflow was referenced but not supplied.
     #[error("local reusable workflow `{path}` was not found")]
     MissingReusableWorkflow {
@@ -697,6 +722,16 @@ pub struct Job {
     /// runner as `jobTimeout` (seconds) on the job request message.
     #[serde(default, rename = "timeout-minutes")]
     pub timeout_minutes: Option<DeferredNumber>,
+    /// Shard fan-out for this job (preloop extension — GitHub has no such
+    /// key, so it deliberately lives at the top level of the job rather than
+    /// under `strategy`, which is GitHub's namespace).
+    ///
+    /// `parallelism: N` expands one job into N shard plans at expansion time
+    /// (like one synthetic matrix axis), each carrying `shard.index` /
+    /// `shard.count` and `PRELOOP_SHARD_INDEX` / `PRELOOP_SHARD_COUNT`.
+    /// Workflows using it are not portable to GitHub Actions.
+    #[serde(default)]
+    pub parallelism: Option<DeferredNumber>,
 }
 
 /// `defaults:` block in a job definition.

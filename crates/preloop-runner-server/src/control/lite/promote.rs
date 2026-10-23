@@ -24,6 +24,7 @@ pub(super) fn dependency_decision(
     graph: &RunGraph,
     needs: &[JobId],
     if_condition: Option<&str>,
+    deferred_matrix: bool,
     condition_context: &preloop_gha_expressions::Context,
 ) -> Result<DependencyDecision, ControlError> {
     if needs.is_empty() {
@@ -39,6 +40,15 @@ pub(super) fn dependency_decision(
     let aggregate =
         crate::runtime_scheduling::aggregate_need_status(&graph.ancestor_statuses(needs))
             .unwrap_or(ExecutionStatus::Skipped);
+    // A deferred-matrix placeholder has no shard identity: judge its
+    // `shard.*` condition on the cells, but keep the dependency gate (a
+    // failed/cancelled need skips it unless explicitly overridden).
+    if deferred_matrix && crate::runtime_scheduling::condition_defers_to_shards(if_condition) {
+        return Ok(crate::runtime_scheduling::shard_deferred_decision(
+            if_condition,
+            aggregate,
+        ));
+    }
     let mut context = condition_context.clone().with_status(
         aggregate == ExecutionStatus::Success,
         aggregate == ExecutionStatus::Failure,
@@ -856,7 +866,7 @@ pub(super) fn promote_run(
         let graph = jobs::run_graph(tx, run_id)?;
         for mut job in candidates {
             let needs = jobs::job_needs(tx, run_id, &job.job_id)?;
-            let (if_condition, ctx_json) = {
+            let (if_condition, ctx_json, deferred) = {
                 let spec = jobs::load_spec(tx, run_id, &job.job_id)?;
                 let ctx: String = tx
                     .prepare_cached(
@@ -870,12 +880,18 @@ pub(super) fn promote_run(
                     .optional()
                     .map_err(db)?
                     .unwrap_or_else(|| "{}".to_owned());
-                (spec.and_then(|s| s.if_condition), ctx)
+                let deferred = spec.as_ref().and_then(|s| s.deferred_matrix.clone());
+                (spec.and_then(|s| s.if_condition), ctx, deferred)
             };
             let condition_context: preloop_gha_expressions::Context =
                 serde_json::from_str(&ctx_json).unwrap_or_default();
-            let decision =
-                dependency_decision(&graph, &needs, if_condition.as_deref(), &condition_context)?;
+            let decision = dependency_decision(
+                &graph,
+                &needs,
+                if_condition.as_deref(),
+                deferred.is_some(),
+                &condition_context,
+            )?;
             if decision == DependencyDecision::Run {
                 tx.prepare_cached(
                     "UPDATE jobs SET deps_ready_at = COALESCE(deps_ready_at, ?3) \
@@ -887,7 +903,6 @@ pub(super) fn promote_run(
             }
             let spec = jobs::load_spec(tx, run_id, &job.job_id)?;
             let reusable = spec.as_ref().and_then(|s| s.reusable_call.clone());
-            let deferred = spec.as_ref().and_then(|s| s.deferred_matrix.clone());
             match decision {
                 DependencyDecision::Run if reusable.is_some() => {
                     settled = true;

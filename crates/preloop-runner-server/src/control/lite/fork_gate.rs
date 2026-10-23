@@ -563,6 +563,7 @@ fn release_parked_jobs(
                 &graph,
                 &needs,
                 spec.as_ref().and_then(|s| s.if_condition.as_deref()),
+                spec.as_ref().is_some_and(|s| s.deferred_matrix.is_some()),
                 &condition_context,
             )? {
                 crate::runtime_scheduling::DependencyDecision::Wait => continue,

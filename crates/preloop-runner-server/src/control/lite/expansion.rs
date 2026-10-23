@@ -90,14 +90,63 @@ fn expansion_plan(record: &crate::models::RunRecord, job: &QueuedJob) -> Option<
     })))
 }
 
-/// A built job's parent: its matrix parent when it expanded from one
-/// (`node_parent` in pg's dispatch).
-fn node_parent(plan: &preloop_gha_protocol::JobPlan, job_id: &JobId) -> Option<String> {
-    if plan.base_id != job_id.0 && plan.matrix_index.is_some() {
+/// A built job's parent node: the node it expanded from (`node_parent` in
+/// pg's dispatch).
+///
+/// Matrix legs hang off that node so the run graph can exclude the replaced
+/// parent. A `parallelism:` fan-out needs the same link even when the matrix
+/// produced a single cell: its legs are `<base> (shard i/N)`, so they must not
+/// replace the `<base>` placeholder row by id, and without a parent the
+/// placeholder would stay in the run graph forever and block every dependent.
+fn node_parent(plan: &preloop_gha_protocol::JobPlan, placeholder: &JobId) -> Option<String> {
+    if plan.base_id != plan.id.0 && (plan.matrix_index.is_some() || plan.base_id == placeholder.0) {
         Some(plan.base_id.clone())
     } else {
         None
     }
+}
+
+/// The run's remaining per-run job budget, from `namespace_limits`
+/// (`max_jobs_per_run`; `None` means the namespace sets no limit).
+///
+/// Runtime fan-out materializes jobs *after* submit admission, so the
+/// submit-time per-run cap no longer sees them: a deferred matrix resolving
+/// to cells × shards could otherwise add thousands of durable job/request
+/// rows to a run admitted for a handful. Expansion re-applies the same limit
+/// here, counting the rows already in the run.
+pub(super) fn remaining_job_budget(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+) -> Result<Option<u64>, ControlError> {
+    let row: Option<(Option<String>, Option<i64>, i64)> = tx
+        .prepare_cached(
+            "SELECT r.webhook_delivery_id, l.max_jobs_per_run, \
+                    (SELECT count(*) FROM jobs j WHERE j.run_id = r.run_id) \
+             FROM runs r LEFT JOIN namespace_limits l ON l.namespace_id = r.namespace_id \
+             WHERE r.run_id = ?1",
+        )
+        .map_err(db)?
+        .query_row([codec::run_key(run_id)], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()
+        .map_err(db)?;
+    let Some((webhook_delivery_id, limit, existing)) = row else {
+        return Ok(None);
+    };
+    // Webhook deliveries are never refused at submit (a push must not be
+    // lost) and wait at claim instead, so their deferred expansions stay
+    // exempt from the per-run cap too.
+    if webhook_delivery_id.is_some() {
+        return Ok(None);
+    }
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let limit = u64::try_from(limit).unwrap_or(0);
+    Ok(Some(
+        limit.saturating_sub(u64::try_from(existing).unwrap_or(0)),
+    ))
 }
 
 /// Strip runner-bound secret material out of a stored message template
@@ -250,7 +299,7 @@ fn register_built_jobs(
     // request); the run graph excludes it via the has-children predicate.
     let mut parents_needed: BTreeSet<String> = BTreeSet::new();
     for built in &jobs {
-        if let Some(parent) = node_parent(&built.plan, &built.plan.id) {
+        if let Some(parent) = node_parent(&built.plan, placeholder) {
             parents_needed.insert(parent);
         }
     }
@@ -295,7 +344,7 @@ fn register_built_jobs(
         };
         let queued = built_queued_job(run_id, &built);
         let kind = submit::kind_of(&queued);
-        let parent = node_parent(&plan, &job_id);
+        let parent = node_parent(&plan, placeholder);
         let (status, queue_state) = if unhostable.is_some() {
             (ExecutionStatus::Failure, "none")
         } else {
@@ -577,6 +626,32 @@ impl LiteBackend {
                     return Ok(outcome);
                 }
             };
+            // The runtime fan-out is the first point the real cell × shard
+            // product is known. Re-apply the per-run job limit before any
+            // leg is registered: submit counted this node as one job, so a
+            // large deferred product would otherwise bypass the cap and mint
+            // thousands of durable rows/requests.
+            let adding = match &built {
+                BuiltExpansion::Matrix { jobs } | BuiltExpansion::Reusable { jobs, .. } => {
+                    jobs.len()
+                }
+            };
+            if let Some(remaining) = remaining_job_budget(tx, run_id)?
+                && adding as u64 > remaining
+            {
+                tracing::warn!(
+                    %run_id,
+                    job = %node_id.0,
+                    adding,
+                    remaining,
+                    "runtime expansion refused by the per-run job limit"
+                );
+                settle::settle_node(tx, self, run_id, &node_id, ExecutionStatus::Failure)?;
+                outcome.failed.push((run_id, node_id.clone()));
+                jobs::refresh_run_remaining_needs(tx, run_id)?;
+                promote::promote_run(tx, self, run_id, &mut outcome)?;
+                return Ok(outcome);
+            }
             match built {
                 BuiltExpansion::Matrix { jobs } if jobs.is_empty() => {
                     // An empty matrix concludes the node as skipped.

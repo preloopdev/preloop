@@ -429,6 +429,52 @@ pub enum DependencyDecision {
     Error,
 }
 
+/// Whether a job condition must be evaluated per shard rather than on the
+/// pre-expansion node.
+///
+/// `parallelism:` is a preloop extension, so `shard` is a known expression
+/// context (`eval::CTX_JOB_IF`), but only materialized shard plans carry a
+/// value for it. On a deferred-matrix placeholder the context is absent, so
+/// `shard.index == 2` compares `null` and skips the whole job. The condition
+/// is deferred to the fan-out cells in that case.
+pub(crate) fn condition_defers_to_shards(if_condition: Option<&str>) -> bool {
+    let Some(condition) = if_condition else {
+        return false;
+    };
+    let effective = preloop_gha_expressions::effective_condition(Some(condition));
+    match preloop_gha_expressions::collect_contexts(&effective) {
+        Ok(contexts) => contexts.contains("shard"),
+        // Unparseable span: stay conservative, exactly like the parser's
+        // deferred-value check — if it mentions `shard`, do not judge it here.
+        Err(_) => effective.to_ascii_lowercase().contains("shard"),
+    }
+}
+
+/// Verdict for a deferred-matrix node whose `if:` reads `shard.*`, once its
+/// needs are terminal.
+///
+/// The placeholder has no shard identity to test, so the condition is judged
+/// on each materialized shard. Expansion must still respect the dependency
+/// gate: a failed or cancelled need skips the node, exactly as the implicit
+/// `success()` would, unless the condition explicitly overrides it with
+/// `always()`, `failure()` or `cancelled()`.
+pub(crate) fn shard_deferred_decision(
+    if_condition: Option<&str>,
+    aggregate: ExecutionStatus,
+) -> DependencyDecision {
+    let explicit_status = if_condition.is_some_and(|condition| {
+        let condition = condition.to_ascii_lowercase();
+        condition.contains("always(")
+            || condition.contains("failure(")
+            || condition.contains("cancelled(")
+    });
+    if aggregate == ExecutionStatus::Success || explicit_status {
+        DependencyDecision::Run
+    } else {
+        DependencyDecision::Skip
+    }
+}
+
 pub fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecision {
     if job.needs.is_empty() {
         return DependencyDecision::Run;
@@ -443,6 +489,13 @@ pub fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecisi
     }
     let statuses = ancestor_statuses(run, job);
     let aggregate = aggregate_need_status(&statuses).unwrap_or(ExecutionStatus::Skipped);
+    // A deferred-matrix node is a placeholder: a condition reading `shard.*`
+    // cannot be judged here (no shard identity), but the dependency gate still
+    // applies — a failed or cancelled need skips the node unless the
+    // condition explicitly overrides it. The cells evaluate the shard part.
+    if job.deferred_matrix.is_some() && condition_defers_to_shards(job.if_condition.as_deref()) {
+        return shard_deferred_decision(job.if_condition.as_deref(), aggregate);
+    }
     let context = job.condition_context.clone().with_status(
         aggregate == ExecutionStatus::Success,
         aggregate == ExecutionStatus::Failure,
@@ -1779,5 +1832,65 @@ bogus_field = true
             toml::from_str("[environments]\n\"owner/repo\" = [\"prod\"]\n")
                 .expect("bare registry must still parse");
         assert!(config.environment_rules.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod deferred_shard_condition_tests {
+    use super::{
+        DependencyDecision, ExecutionStatus, condition_defers_to_shards, shard_deferred_decision,
+    };
+
+    /// A condition that reads the preloop `shard` context cannot be judged on
+    /// the pre-expansion placeholder: it has no shard identity, so the
+    /// comparison would be against `null` and skip every shard. Everything
+    /// else keeps evaluating at promotion time.
+    #[test]
+    fn shard_conditions_defer_to_the_fan_out() {
+        assert!(condition_defers_to_shards(Some("${{ shard.index == 2 }}")));
+        assert!(condition_defers_to_shards(Some(
+            "shard.count > 1 && github.event_name == 'push'"
+        )));
+        assert!(!condition_defers_to_shards(Some(
+            "${{ matrix.os == 'ubuntu-latest' }}"
+        )));
+        assert!(!condition_defers_to_shards(Some(
+            "${{ needs.build.result == 'success' }}"
+        )));
+        assert!(!condition_defers_to_shards(None));
+    }
+
+    /// The shard-condition bypass must not outrun the dependency gate: a
+    /// failed or cancelled need skips the node unless the condition
+    /// explicitly overrides the implicit `success()`.
+    #[test]
+    fn shard_deferred_decision_keeps_the_dependency_gate() {
+        let condition = Some("${{ shard.index == 2 }}");
+        assert_eq!(
+            shard_deferred_decision(condition, ExecutionStatus::Success),
+            DependencyDecision::Run
+        );
+        assert_eq!(
+            shard_deferred_decision(condition, ExecutionStatus::Failure),
+            DependencyDecision::Skip
+        );
+        assert_eq!(
+            shard_deferred_decision(condition, ExecutionStatus::Cancelled),
+            DependencyDecision::Skip
+        );
+        assert_eq!(
+            shard_deferred_decision(
+                Some("shard.index == 2 && always()"),
+                ExecutionStatus::Failure
+            ),
+            DependencyDecision::Run
+        );
+        assert_eq!(
+            shard_deferred_decision(
+                Some("shard.index == 2 && failure()"),
+                ExecutionStatus::Failure
+            ),
+            DependencyDecision::Run
+        );
     }
 }
