@@ -508,6 +508,15 @@ impl SandboxApi for FlakyRelease {
     async fn resume(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
         self.inner.resume(sandbox_id).await
     }
+    async fn create_join_token(
+        &self,
+        ttl_secs: u64,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::CreateJoinTokenResponse> {
+        self.inner.create_join_token(ttl_secs).await
+    }
+    async fn delete_provider(&self, name: &str) -> preloop_sandbox::Result<()> {
+        self.inner.delete_provider(name).await
+    }
 }
 
 #[tokio::test]

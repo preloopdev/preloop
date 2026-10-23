@@ -28,16 +28,19 @@ pub enum Kind {
     Leases,
     /// Providers by id.
     Providers,
+    /// Single-use join tokens by id.
+    JoinTokens,
 }
 
 impl Kind {
     /// Every kind.
-    pub const ALL: [Kind; 5] = [
+    pub const ALL: [Kind; 6] = [
         Kind::Templates,
         Kind::Pools,
         Kind::Sandboxes,
         Kind::Leases,
         Kind::Providers,
+        Kind::JoinTokens,
     ];
 
     fn table(self) -> &'static str {
@@ -47,6 +50,7 @@ impl Kind {
             Kind::Sandboxes => "sandboxes",
             Kind::Leases => "leases",
             Kind::Providers => "providers",
+            Kind::JoinTokens => "join_tokens",
         }
     }
 }
@@ -115,6 +119,7 @@ const SQLITE_MIGRATIONS: &[&str] = &[
      CREATE TABLE sandboxes (id TEXT PRIMARY KEY, doc TEXT NOT NULL);
      CREATE TABLE leases (id TEXT PRIMARY KEY, doc TEXT NOT NULL);
      CREATE TABLE providers (id TEXT PRIMARY KEY, doc TEXT NOT NULL);",
+    "CREATE TABLE join_tokens (id TEXT PRIMARY KEY, doc TEXT NOT NULL);",
 ];
 
 /// SQLite store in its own file (default `<state>/sandbox.db`).
@@ -202,6 +207,7 @@ const PG_MIGRATIONS: &[&str] = &[
      CREATE TABLE sandbox.sandboxes (id text PRIMARY KEY, doc jsonb NOT NULL);
      CREATE TABLE sandbox.leases (id text PRIMARY KEY, doc jsonb NOT NULL);
      CREATE TABLE sandbox.providers (id text PRIMARY KEY, doc jsonb NOT NULL);",
+    "CREATE TABLE sandbox.join_tokens (id text PRIMARY KEY, doc jsonb NOT NULL);",
 ];
 
 /// Postgres store in the `sandbox` schema.

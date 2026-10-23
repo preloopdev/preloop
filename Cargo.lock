@@ -3013,9 +3013,12 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "hostname",
  "parking_lot",
  "postgres_rustls",
  "preloop-observability",
+ "rand 0.10.2",
+ "rcgen",
  "reqwest",
  "rusqlite",
  "rustls",
@@ -3026,12 +3029,14 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "time",
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
  "tokio-util",
  "tracing",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

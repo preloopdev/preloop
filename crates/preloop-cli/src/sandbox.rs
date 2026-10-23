@@ -2,8 +2,8 @@
 //!
 //! The engine runs a Sandbox Service in-process with this host's SmolVM
 //! driver attached through an in-process host agent; the CI runner pool
-//! gets its machines from it. The same service is reachable over HTTP
-//! (Connect) so other hosts can join as providers (`preloop sandbox agent`)
+//! gets its machines from it. The same service is reachable over HTTPS
+//! (Connect) so other hosts can enroll as providers (`preloop sandbox agent`)
 //! and other callers can acquire sandboxes (`preloop sandbox acquire`).
 
 use std::net::SocketAddr;
@@ -19,14 +19,15 @@ use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
-use preloop_sandbox::server::{Auth, router};
+use preloop_sandbox::server::{Auth, serve as serve_api};
 use preloop_sandbox::{
-    Driver, LeastLoaded, Placement, SandboxApi, SandboxClient, Service, ServiceConfig, store,
+    Driver, LeastLoaded, Placement, SandboxApi, SandboxClient, ServerTls, Service, ServiceConfig,
+    store, tls,
 };
 use tokio_util::sync::CancellationToken;
 
-/// Default loopback address of the engine's sandbox API.
-pub(crate) const DEFAULT_SANDBOX_URL: &str = "http://127.0.0.1:9191";
+/// Default address of the engine's sandbox API.
+pub(crate) const DEFAULT_SANDBOX_URL: &str = "https://127.0.0.1:9191";
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
@@ -114,7 +115,7 @@ impl LocalSandboxes {
         let state = home.join("state");
         // One destructive authority per state directory: a bake or a second
         // engine must not load and reap a running service's leases.
-        let _lock = ServiceLock::acquire(&state)?;
+        let lock = ServiceLock::acquire(&state)?;
         let store_url = env_nonempty("PRELOOP_SANDBOX_STORE_URL")
             .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
         let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
@@ -122,6 +123,14 @@ impl LocalSandboxes {
         let store = store::open(&store_url)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
+        let tls = ServerTls::load_or_create(
+            &state,
+            tls::sans_from_env(),
+            env_path("PRELOOP_SANDBOX_TLS_CERT").as_deref(),
+            env_path("PRELOOP_SANDBOX_TLS_KEY").as_deref(),
+        )
+        .context("configuring the sandbox API TLS")?;
+        config.ca = Some(tls.ca.clone());
         let service = Service::open(store, config).await?;
         let shutdown = CancellationToken::new();
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -160,18 +169,19 @@ impl LocalSandboxes {
             let addr: SocketAddr = listen
                 .parse()
                 .context("PRELOOP_SANDBOX_LISTEN must be a socket address or `off`")?;
-            let auth = api_auth(&state, &addr)?;
+            let token = resolve_client_token(&state)?;
             match bind_endpoint(&state, addr).await {
                 Ok(listener) => {
                     let bound = listener.local_addr()?;
-                    tracing::info!(addr = %bound, "sandbox API listening");
-                    let app = router(service.clone(), auth);
+                    tracing::info!(addr = %bound, "sandbox API listening (https)");
+                    let auth = Auth::for_listener(token, bound);
                     let stop = shutdown.clone();
+                    let service = service.clone();
                     let endpoint_state = state.clone();
                     tokio::spawn(async move {
-                        let _ = axum::serve(listener, app)
-                            .with_graceful_shutdown(async move { stop.cancelled().await })
-                            .await;
+                        if let Err(error) = serve_api(listener, service, auth, tls, stop).await {
+                            tracing::warn!(%error, "sandbox API server stopped");
+                        }
                         clear_endpoint(&endpoint_state, bound);
                     });
                 }
@@ -181,8 +191,13 @@ impl LocalSandboxes {
             }
         }
         // Wait for the local agent so the pool's first acquire can place.
+        // An enrollment record (no drivers yet) does not count.
         for _ in 0..200 {
-            if !service.list_providers().is_empty() {
+            if service
+                .list_providers()
+                .iter()
+                .any(|provider| !provider.drivers.is_empty())
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -194,7 +209,7 @@ impl LocalSandboxes {
             pool_driver,
             pool_capabilities,
             shutdown,
-            _lock,
+            _lock: lock,
         })
     }
 
@@ -252,48 +267,144 @@ fn local_provider_name() -> String {
     )
 }
 
-/// The API endpoint file: the address the last successful bind published.
+/// A path from a non-empty environment variable.
+fn env_path(key: &str) -> Option<PathBuf> {
+    env_nonempty(key).map(PathBuf::from)
+}
+
+/// The client token: `PRELOOP_SANDBOX_TOKEN`, else one generated on first
+/// start into `<state>/sandbox-client-token` (mode 0600).
+fn resolve_client_token(state: &Path) -> anyhow::Result<String> {
+    if let Some(token) = env_nonempty("PRELOOP_SANDBOX_TOKEN") {
+        return Ok(token);
+    }
+    let path = state.join("sandbox-client-token");
+    if let Ok(token) = std::fs::read_to_string(&path) {
+        let token = token.trim();
+        if !token.is_empty() {
+            // A token file left with a wider mode by an old build or a manual
+            // copy must not stay readable by other local users.
+            crate::set_private_file_permissions(&path)
+                .with_context(|| format!("securing {}", path.display()))?;
+            return Ok(token.to_owned());
+        }
+    }
+    let token = tls::random_hex(32);
+    tls::write_private(&path, token.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(token)
+}
+
+/// The API endpoint file: the HTTPS address the last successful bind published.
 pub(crate) const ENDPOINT_FILE: &str = "sandbox-endpoint";
 
 fn endpoint_path(state: &Path) -> PathBuf {
     state.join(ENDPOINT_FILE)
 }
 
-fn read_token_file(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
+/// A bound address as the base URL callers dial.
+fn endpoint_url(addr: SocketAddr) -> String {
+    format!("https://{addr}")
 }
 
-/// A bearer token: the configured value, else the one this state directory
-/// already holds, else a freshly generated one written with mode 0600.
-pub(crate) fn resolve_token(
-    configured: Option<String>,
+/// Publish the address a listener actually bound. Written owner-only so a
+/// local caller can trust it as the service it should send a token to; the
+/// second line names the owning process so a failed bind can tell a live
+/// listener from a stale file.
+pub(crate) fn write_endpoint(state: &Path, addr: SocketAddr) -> anyhow::Result<()> {
+    let path = endpoint_path(state);
+    tls::write_private(
+        &path,
+        format!("{}\n{}\n", endpoint_url(addr), std::process::id()).as_bytes(),
+    )
+    .with_context(|| format!("writing {}", path.display()))
+}
+
+fn read_endpoint(state: &Path) -> Option<String> {
+    std::fs::read_to_string(endpoint_path(state))
+        .ok()
+        .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
+        .filter(|base| !base.is_empty())
+}
+
+/// True when the process that published the endpoint is still alive.
+fn endpoint_owner_alive(state: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(endpoint_path(state)) else {
+        return false;
+    };
+    let Some(pid) = text
+        .lines()
+        .nth(1)
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+    else {
+        return false;
+    };
+    // SAFETY: `kill` with signal 0 only probes existence.
+    #[allow(unsafe_code)]
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    alive
+}
+
+/// Remove the endpoint file only while it still names `addr`: a newer
+/// process may have published its own address.
+pub(crate) fn clear_endpoint(state: &Path, addr: SocketAddr) {
+    let path = endpoint_path(state);
+    if read_endpoint(state).as_deref() == Some(endpoint_url(addr).as_str()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Bind and publish the endpoint, or clear a stale entry naming the address
+/// that could not be bound (a squatter must not inherit the CLI's trust).
+pub(crate) async fn bind_endpoint(
     state: &Path,
-    file_name: &str,
-) -> anyhow::Result<String> {
-    if let Some(token) = configured.filter(|token| !token.trim().is_empty()) {
-        return Ok(token);
+    addr: SocketAddr,
+) -> std::io::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            let bound = listener.local_addr()?;
+            write_endpoint(state, bound).map_err(std::io::Error::other)?;
+            Ok(listener)
+        }
+        Err(error) => {
+            // A live owner may legitimately hold the address (the embedded
+            // engine, or another `serve`); keep its endpoint file. Only a
+            // dead owner's stale file is removed, so a squatter cannot
+            // inherit the CLI's trust.
+            if !endpoint_owner_alive(state) {
+                clear_endpoint(state, addr);
+            }
+            Err(error)
+        }
     }
-    let path = state.join(file_name);
-    if let Some(token) = read_token_file(&path) {
-        // A token file left with a wider mode by an old build or a manual
-        // copy must not stay readable by other local users.
-        crate::set_private_file_permissions(&path)
-            .with_context(|| format!("securing {}", path.display()))?;
-        return Ok(token);
+}
+
+/// Resolve the address a CLI call targets: an explicit `--service` (or
+/// `PRELOOP_SANDBOX_URL`) wins; otherwise the endpoint file written by the
+/// local service. Sending the token to an address the file does not name
+/// requires the caller to ask for it explicitly.
+pub(crate) fn resolve_service(state: &Path, service: Option<String>) -> anyhow::Result<String> {
+    match service.filter(|service| !service.trim().is_empty()) {
+        Some(service) => Ok(service),
+        None => read_endpoint(state).with_context(|| {
+            format!(
+                "no sandbox endpoint file ({}); pass --service (for example {DEFAULT_SANDBOX_URL})",
+                endpoint_path(state).display()
+            )
+        }),
     }
-    // 32 random bytes, hex: stable across restarts, unguessable to a local
-    // process that cannot read the 0600 file.
-    let token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    crate::write_private_file(&path, token.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(token)
+}
+
+/// The embedded service is only needed when a pool will place VMs on it.
+pub(crate) async fn start_if_pool(
+    pool_configured: bool,
+    home: &Path,
+) -> anyhow::Result<Option<LocalSandboxes>> {
+    if !pool_configured {
+        return Ok(None);
+    }
+    Ok(Some(LocalSandboxes::start(home).await?))
 }
 
 /// Exclusive claim on a state directory, held by the one process that may
@@ -347,156 +458,40 @@ impl Drop for ServiceLock {
     }
 }
 
-/// Both bearer tokens are required, whatever the listener address. Missing
-/// ones are generated into the state directory on first start.
-fn api_auth(state: &Path, addr: &SocketAddr) -> anyhow::Result<Auth> {
-    Ok(Auth {
-        client_token: Some(resolve_token(
-            env_nonempty("PRELOOP_SANDBOX_TOKEN"),
-            state,
-            "sandbox-client-token",
-        )?),
-        provider_token: Some(resolve_token(
-            env_nonempty("PRELOOP_SANDBOX_PROVIDER_TOKEN"),
-            state,
-            "sandbox-provider-token",
-        )?),
-        loopback_only: addr.ip().is_loopback(),
-    })
-}
-
-/// Publish the address a listener actually bound. Written owner-only so a
-/// local caller can trust it as the service it should send a token to.
-pub(crate) fn write_endpoint(state: &Path, addr: SocketAddr) -> anyhow::Result<()> {
-    let path = endpoint_path(state);
-    crate::write_private_file(
-        &path,
-        format!("http://{addr}\n{}\n", std::process::id()).as_bytes(),
-    )
-    .with_context(|| format!("writing {}", path.display()))
-}
-
-fn read_endpoint(state: &Path) -> Option<String> {
-    std::fs::read_to_string(endpoint_path(state))
+/// The token a local deployment wrote, when there is one.
+fn local_client_token(home: &Path) -> Option<String> {
+    std::fs::read_to_string(home.join("state/sandbox-client-token"))
         .ok()
-        .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
-        .filter(|base| !base.is_empty())
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
 }
 
-/// True when the process that published the endpoint is still alive.
-fn endpoint_owner_alive(state: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(endpoint_path(state)) else {
-        return false;
-    };
-    let Some(pid) = text
-        .lines()
-        .nth(1)
-        .and_then(|pid| pid.trim().parse::<i32>().ok())
-    else {
-        return false;
-    };
-    // SAFETY: `kill` with signal 0 only probes existence.
-    #[allow(unsafe_code)]
-    let alive = unsafe { libc::kill(pid, 0) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    alive
+/// The CA a local deployment wrote, when there is one.
+fn local_ca(home: &Path) -> Option<PathBuf> {
+    let path = home.join("state").join(tls::CA_DIR).join(tls::CA_CERT_FILE);
+    path.is_file().then_some(path)
 }
 
-/// Remove the endpoint file only while it still names `addr`: a newer
-/// process may have published its own address.
-pub(crate) fn clear_endpoint(state: &Path, addr: SocketAddr) {
-    let path = endpoint_path(state);
-    if read_endpoint(state).as_deref() == Some(format!("http://{addr}").as_str()) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// Bind and publish the endpoint, or clear a stale entry naming the address
-/// that could not be bound (a squatter must not inherit the CLI's trust).
-pub(crate) async fn bind_endpoint(
-    state: &Path,
-    addr: SocketAddr,
-) -> std::io::Result<tokio::net::TcpListener> {
-    match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => {
-            let bound = listener.local_addr()?;
-            write_endpoint(state, bound).map_err(std::io::Error::other)?;
-            Ok(listener)
-        }
-        Err(error) => {
-            // A live owner may legitimately hold the address (the embedded
-            // engine, or another `serve`); keep its endpoint file. Only a
-            // dead owner's stale file is removed, so a squatter cannot
-            // inherit the CLI's trust.
-            if !endpoint_owner_alive(state) {
-                clear_endpoint(state, addr);
-            }
-            Err(error)
-        }
-    }
-}
-
-/// Resolve the address a CLI call targets: an explicit `--service` (or
-/// `PRELOOP_SANDBOX_URL`) wins; otherwise the endpoint file written by the
-/// local service. Sending the token to an address the file does not name
-/// requires the caller to ask for it explicitly.
-pub(crate) fn resolve_client(
-    state: &Path,
-    service: Option<String>,
+/// Build the caller client, resolving the token and CA from flags, the
+/// environment, then the local state directory.
+fn sandbox_client(
+    service: &str,
     token: Option<String>,
-) -> anyhow::Result<(String, String)> {
-    let service = match service.filter(|service| !service.trim().is_empty()) {
-        Some(service) => service,
-        None => read_endpoint(state).with_context(|| {
-            format!(
-                "no sandbox endpoint file ({}); pass --service (default {DEFAULT_SANDBOX_URL})",
-                endpoint_path(state).display()
-            )
-        })?,
-    };
-    let token = match token.filter(|token| !token.trim().is_empty()) {
-        Some(token) => token,
-        None => read_token_file(&state.join("sandbox-client-token")).context(
-            "set --token (or PRELOOP_SANDBOX_TOKEN), or run against a local service that \
-             wrote state/sandbox-client-token",
-        )?,
-    };
-    Ok((service, token))
-}
-
-fn resolve_service(state: &Path, service: Option<String>) -> anyhow::Result<String> {
-    match service.filter(|service| !service.trim().is_empty()) {
-        Some(service) => Ok(service),
-        None => read_endpoint(state).with_context(|| {
-            format!(
-                "no sandbox endpoint file ({}); pass --service",
-                endpoint_path(state).display()
-            )
-        }),
+    ca: Option<PathBuf>,
+) -> anyhow::Result<SandboxClient> {
+    let home = crate::preloop_home();
+    let token = token.or_else(|| local_client_token(&home)).context(
+        "set --token (or PRELOOP_SANDBOX_TOKEN), or run against a local service that wrote \
+         state/sandbox-client-token",
+    )?;
+    match ca.or_else(|| local_ca(&home)) {
+        Some(path) => {
+            let pem = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading sandbox CA {}", path.display()))?;
+            Ok(SandboxClient::with_tls(service, Some(token), &pem, None)?)
+        }
+        None => Ok(SandboxClient::new(service, Some(token))),
     }
-}
-
-/// An agent never generates a token: the remote service cannot know it.
-fn resolve_provider_token(configured: Option<String>, state: &Path) -> anyhow::Result<String> {
-    match configured.filter(|token| !token.trim().is_empty()) {
-        Some(token) => Ok(token),
-        None => read_token_file(&state.join("sandbox-provider-token")).context(
-            "set --provider-token (or PRELOOP_SANDBOX_PROVIDER_TOKEN) to the service's \
-             provider token, or run on the host whose service wrote \
-             state/sandbox-provider-token",
-        ),
-    }
-}
-
-/// The embedded service is only needed when a pool will place VMs on it.
-pub(crate) async fn start_if_pool(
-    pool_configured: bool,
-    home: &Path,
-) -> anyhow::Result<Option<LocalSandboxes>> {
-    if !pool_configured {
-        return Ok(None);
-    }
-    Ok(Some(LocalSandboxes::start(home).await?))
 }
 
 /// `preloop sandbox`.
@@ -505,7 +500,8 @@ pub(crate) struct SandboxArgs {
     /// Sandbox API base URL (default: the address in `<home>/state/sandbox-endpoint`).
     #[arg(long, env = "PRELOOP_SANDBOX_URL", global = true)]
     service: Option<String>,
-    /// Bearer token for the Sandboxes API.
+    /// Bearer token for the Sandboxes API. For `agent`'s first run this is the
+    /// join token (`plj1.…`).
     #[arg(
         long,
         env = "PRELOOP_SANDBOX_TOKEN",
@@ -513,6 +509,9 @@ pub(crate) struct SandboxArgs {
         hide_env_values = true
     )]
     token: Option<String>,
+    /// CA certificate for the Sandbox Service (PEM).
+    #[arg(long, env = "PRELOOP_SANDBOX_CA", global = true)]
+    ca: Option<PathBuf>,
     #[command(subcommand)]
     command: SandboxCommand,
 }
@@ -554,8 +553,33 @@ enum SandboxCommand {
     Snapshot(SnapshotArgs),
     /// List sandboxes.
     Ls,
+    /// Join tokens for provider enrollment.
+    #[command(subcommand)]
+    Token(TokenCommand),
+    /// Providers (capacity owners).
+    #[command(subcommand)]
+    Provider(ProviderCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenCommand {
+    /// Mint a single-use join token for `sandbox agent`.
+    Create {
+        /// Lifetime (`30s`, `10m`, `1h`, `2d`).
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
     /// List providers and their capabilities.
-    Providers,
+    Ls,
+    /// Remove a provider and revoke its certificates.
+    Rm {
+        /// Provider name.
+        name: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -573,12 +597,25 @@ struct ServeSandboxArgs {
 
 #[derive(Debug, Args)]
 struct AgentArgs {
-    /// Stable provider name.
+    /// Service URL to enroll with (`https://host:9191`). Required on the
+    /// first run; the URL is stored with the identity. On later runs this
+    /// overrides the stored URL; without it the agent dials the stored one.
+    #[arg(long)]
+    join: Option<String>,
+    /// Stable provider name. Stored with the identity on first run.
     #[arg(long)]
     name: Option<String>,
-    /// Provider token.
-    #[arg(long, env = "PRELOOP_SANDBOX_PROVIDER_TOKEN", hide_env_values = true)]
-    provider_token: Option<String>,
+    /// Join token (`plj1.…`) for the first run. Defaults to the global
+    /// `--token`; later runs reuse the stored identity.
+    #[arg(
+        long = "join-token",
+        env = "PRELOOP_SANDBOX_JOIN_TOKEN",
+        hide_env_values = true
+    )]
+    join_token: Option<String>,
+    /// Identity directory (default `<home>/state/sandbox-identity`).
+    #[arg(long)]
+    identity: Option<PathBuf>,
     /// Concurrent sandbox cap for the SmolVM driver (0 = none).
     #[arg(long, default_value_t = 0)]
     slots: u32,
@@ -727,6 +764,23 @@ fn parse_kv(value: &str) -> Result<(String, String), String> {
         .ok_or_else(|| format!("expected KEY=VALUE, got `{value}`"))
 }
 
+/// Parse `30s`, `10m`, `1h` or `2d`.
+fn parse_ttl(value: &str) -> anyhow::Result<Duration> {
+    let value = value.trim();
+    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let number: u64 = number
+        .parse()
+        .with_context(|| format!("expected a duration like 30m, 1h or 2d, got `{value}`"))?;
+    let seconds = match unit {
+        "s" => number,
+        "m" => number.saturating_mul(60),
+        "h" => number.saturating_mul(3600),
+        "d" => number.saturating_mul(86_400),
+        _ => anyhow::bail!("expected a duration like 30m, 1h or 2d, got `{value}`"),
+    };
+    Ok(Duration::from_secs(seconds))
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -737,171 +791,175 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
     let SandboxArgs {
         service,
         token,
+        ca,
         command,
     } = args;
     match command {
         SandboxCommand::Serve(serve) => serve_standalone(serve).await,
-        SandboxCommand::Agent(agent) => run_agent(service, agent).await,
+        // The agent's identity owns its service URL; only `--join` overrides it.
+        SandboxCommand::Agent(agent) => run_agent(token, agent).await,
         command => {
             let state = crate::preloop_home().join("state");
-            let (base, token) = resolve_client(&state, service, token)?;
-            let client = SandboxClient::new(base, Some(token));
-            match command {
-                SandboxCommand::Serve(_) | SandboxCommand::Agent(_) => {
-                    unreachable!("handled above")
-                }
-                SandboxCommand::Template(TemplateCommand::Put {
+            let base = resolve_service(&state, service)?;
+            let client = sandbox_client(&base, token, ca)?;
+            run_client(client, command).await
+        }
+    }
+}
+
+async fn run_client(client: SandboxClient, command: SandboxCommand) -> anyhow::Result<()> {
+    match command {
+        SandboxCommand::Serve(_) | SandboxCommand::Agent(_) => {
+            unreachable!("serve and agent run without a caller client")
+        }
+        SandboxCommand::Template(TemplateCommand::Put {
+            name,
+            os,
+            image,
+            recipe,
+            driver,
+        }) => print_json(
+            &client
+                .put_template(TemplateSpec {
                     name,
                     os,
                     image,
                     recipe,
-                    driver,
-                }) => print_json(
-                    &client
-                        .put_template(TemplateSpec {
-                            name,
-                            os,
-                            image,
-                            recipe,
-                            requires: Requirements {
-                                driver: driver.unwrap_or_default(),
-                                ..Requirements::default()
-                            },
-                            ..TemplateSpec::default()
-                        })
-                        .await?,
-                ),
-                SandboxCommand::Template(TemplateCommand::Ls) => {
-                    print_json(&client.list_templates().await?)
-                }
-                SandboxCommand::Template(TemplateCommand::Rm { name }) => {
-                    Ok(client.delete_template(&name).await?)
-                }
-                SandboxCommand::Pool(PoolCommand::Put {
+                    requires: Requirements {
+                        driver: driver.unwrap_or_default(),
+                        ..Requirements::default()
+                    },
+                    ..TemplateSpec::default()
+                })
+                .await?,
+        ),
+        SandboxCommand::Template(TemplateCommand::Ls) => {
+            print_json(&client.list_templates().await?)
+        }
+        SandboxCommand::Template(TemplateCommand::Rm { name }) => {
+            Ok(client.delete_template(&name).await?)
+        }
+        SandboxCommand::Pool(PoolCommand::Put {
+            name,
+            template,
+            warm,
+            max,
+            cpus,
+            memory,
+            disk,
+        }) => print_json(
+            &client
+                .put_pool(PoolSpec {
                     name,
                     template,
                     warm,
                     max,
-                    cpus,
-                    memory,
-                    disk,
-                }) => print_json(
-                    &client
-                        .put_pool(PoolSpec {
-                            name,
-                            template,
-                            warm,
-                            max,
-                            shape: Shape {
-                                cpus,
-                                memory_mib: memory,
-                                disk_gib: disk,
-                            },
-                            network: NetworkPolicy {
-                                mode: NetworkMode::Unrestricted,
-                                ..NetworkPolicy::default()
-                            },
-                            ..PoolSpec::default()
-                        })
-                        .await?,
-                ),
-                SandboxCommand::Pool(PoolCommand::Ls) => print_json(&client.list_pools().await?),
-                SandboxCommand::Pool(PoolCommand::Rm { name }) => {
-                    Ok(client.delete_pool(&name).await?)
+                    shape: Shape {
+                        cpus,
+                        memory_mib: memory,
+                        disk_gib: disk,
+                    },
+                    network: NetworkPolicy {
+                        mode: NetworkMode::Unrestricted,
+                        ..NetworkPolicy::default()
+                    },
+                    ..PoolSpec::default()
+                })
+                .await?,
+        ),
+        SandboxCommand::Pool(PoolCommand::Ls) => print_json(&client.list_pools().await?),
+        SandboxCommand::Pool(PoolCommand::Rm { name }) => Ok(client.delete_pool(&name).await?),
+        SandboxCommand::Acquire(acquire) => {
+            let mut request = AcquireRequest {
+                idempotency_key: acquire
+                    .key
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                pool: acquire.pool.unwrap_or_default(),
+                template: acquire.template.unwrap_or_default(),
+                ttl_secs: acquire.ttl,
+                purpose: if acquire.build {
+                    Purpose::Build
+                } else {
+                    Purpose::Exec
+                },
+                shape: Shape {
+                    cpus: acquire.cpus,
+                    memory_mib: acquire.memory,
+                    disk_gib: 0,
+                },
+                requires: Requirements {
+                    os: acquire.os.unwrap_or_default(),
+                    ..Requirements::default()
+                },
+                network: NetworkPolicy {
+                    mode: NetworkMode::Unrestricted,
+                    ..NetworkPolicy::default()
+                },
+                ..AcquireRequest::default()
+            };
+            request.inject.env.extend(acquire.env);
+            print_json(&client.acquire(request).await?)
+        }
+        SandboxCommand::Exec(exec) => {
+            let mut stream = client
+                .exec(ExecRequest {
+                    sandbox_id: exec.sandbox,
+                    argv: exec.argv,
+                    env: exec.env.into_iter().collect(),
+                    workdir: exec.workdir.unwrap_or_default(),
+                    ..ExecRequest::default()
+                })
+                .await?;
+            use std::io::Write as _;
+            while let Some(event) = stream.next().await {
+                let event = event?;
+                if let Some(bytes) = event.stdout {
+                    std::io::stdout().write_all(&bytes)?;
+                    std::io::stdout().flush()?;
                 }
-                SandboxCommand::Acquire(acquire) => {
-                    let pool = acquire.pool.unwrap_or_default();
-                    let template = acquire.template.unwrap_or_default();
-                    // A pool acquire takes its placement from the pool; the service
-                    // rejects template-only fields, so leave them unset.
-                    let pooled = !pool.is_empty();
-                    let mut request = AcquireRequest {
-                        idempotency_key: acquire
-                            .key
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        pool,
-                        template,
-                        ttl_secs: acquire.ttl,
-                        purpose: if acquire.build {
-                            Purpose::Build
-                        } else {
-                            Purpose::Exec
-                        },
-                        shape: Shape {
-                            cpus: acquire.cpus,
-                            memory_mib: acquire.memory,
-                            disk_gib: 0,
-                        },
-                        requires: Requirements {
-                            os: acquire.os.unwrap_or_default(),
-                            ..Requirements::default()
-                        },
-                        network: if pooled {
-                            NetworkPolicy::default()
-                        } else {
-                            NetworkPolicy {
-                                mode: NetworkMode::Unrestricted,
-                                ..NetworkPolicy::default()
-                            }
-                        },
-                        ..AcquireRequest::default()
-                    };
-                    request.inject.env.extend(acquire.env);
-                    print_json(&client.acquire(request).await?)
+                if let Some(bytes) = event.stderr {
+                    std::io::stderr().write_all(&bytes)?;
                 }
-                SandboxCommand::Exec(exec) => {
-                    let mut stream = client
-                        .exec(ExecRequest {
-                            sandbox_id: exec.sandbox,
-                            argv: exec.argv,
-                            env: exec.env.into_iter().collect(),
-                            workdir: exec.workdir.unwrap_or_default(),
-                            ..ExecRequest::default()
-                        })
-                        .await?;
-                    use std::io::Write as _;
-                    while let Some(event) = stream.next().await {
-                        let event = event?;
-                        if let Some(bytes) = event.stdout {
-                            std::io::stdout().write_all(&bytes)?;
-                            std::io::stdout().flush()?;
-                        }
-                        if let Some(bytes) = event.stderr {
-                            std::io::stderr().write_all(&bytes)?;
-                        }
-                        if let Some(code) = event.exit_code {
-                            std::process::exit(code);
-                        }
-                    }
-                    anyhow::bail!("exec stream ended without an exit status")
+                if let Some(code) = event.exit_code {
+                    std::process::exit(code);
                 }
-                SandboxCommand::Cp(cp) => copy(&client, &cp.source, &cp.destination).await,
-                SandboxCommand::Stop { sandbox } => Ok(client.stop(&sandbox).await?),
-                SandboxCommand::Start { sandbox, forkable } => {
-                    Ok(client.start(&sandbox, forkable).await?)
-                }
-                SandboxCommand::Release(release) => Ok(client
-                    .release(ReleaseRequest {
-                        lease_id: release.lease,
-                        mode: if release.preserve.is_some() {
-                            ReleaseMode::Preserve
-                        } else {
-                            ReleaseMode::Destroy
-                        },
-                        preserve_ttl_secs: release.preserve.unwrap_or_default(),
-                    })
-                    .await?),
-                SandboxCommand::Snapshot(snapshot) => print_json(
-                    &client
-                        .snapshot(SnapshotRequest {
-                            sandbox_id: snapshot.sandbox,
-                            name: snapshot.name,
-                        })
-                        .await?,
-                ),
-                SandboxCommand::Ls => print_json(&client.list().await?),
-                SandboxCommand::Providers => print_json(&client.list_providers().await?),
             }
+            anyhow::bail!("exec stream ended without an exit status")
+        }
+        SandboxCommand::Cp(cp) => copy(&client, &cp.source, &cp.destination).await,
+        SandboxCommand::Stop { sandbox } => Ok(client.stop(&sandbox).await?),
+        SandboxCommand::Start { sandbox, forkable } => Ok(client.start(&sandbox, forkable).await?),
+        SandboxCommand::Release(release) => Ok(client
+            .release(ReleaseRequest {
+                lease_id: release.lease,
+                mode: if release.preserve.is_some() {
+                    ReleaseMode::Preserve
+                } else {
+                    ReleaseMode::Destroy
+                },
+                preserve_ttl_secs: release.preserve.unwrap_or_default(),
+            })
+            .await?),
+        SandboxCommand::Snapshot(snapshot) => print_json(
+            &client
+                .snapshot(SnapshotRequest {
+                    sandbox_id: snapshot.sandbox,
+                    name: snapshot.name,
+                })
+                .await?,
+        ),
+        SandboxCommand::Ls => print_json(&client.list().await?),
+        SandboxCommand::Token(TokenCommand::Create { ttl }) => {
+            let ttl = parse_ttl(&ttl)?;
+            let response = client.create_join_token(ttl.as_secs()).await?;
+            println!("{}", response.token);
+            Ok(())
+        }
+        SandboxCommand::Provider(ProviderCommand::Ls) => {
+            print_json(&client.list_providers().await?)
+        }
+        SandboxCommand::Provider(ProviderCommand::Rm { name }) => {
+            Ok(client.delete_provider(&name).await?)
         }
     }
 }
@@ -957,6 +1015,13 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
     config.placement = placement_from_env()?;
     let store = store::open(&store_url).await?;
+    let tls = ServerTls::load_or_create(
+        &state,
+        tls::sans_from_env(),
+        env_path("PRELOOP_SANDBOX_TLS_CERT").as_deref(),
+        env_path("PRELOOP_SANDBOX_TLS_KEY").as_deref(),
+    )?;
+    config.ca = Some(tls.ca.clone());
     let service = Service::open(store, config).await?;
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -968,32 +1033,60 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
         );
         tokio::spawn(agent.run(None, shutdown.clone()));
     }
-    let auth = api_auth(&state, &args.listen)?;
     let listener = bind_endpoint(&state, args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
     let bound = listener.local_addr()?;
-    eprintln!("[preloop] sandbox service on http://{bound}");
-    axum::serve(listener, router(service, auth))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let auth = Auth::for_listener(resolve_client_token(&state)?, bound);
+    eprintln!("[preloop] sandbox service on https://{bound}");
+    let stop = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        stop.cancel();
+    });
+    let served = serve_api(listener, service, auth, tls, shutdown.clone()).await;
     clear_endpoint(&state, bound);
+    served?;
     shutdown.cancel();
     Ok(())
 }
 
-async fn run_agent(service: Option<String>, args: AgentArgs) -> anyhow::Result<()> {
-    let name = args.name.unwrap_or_else(local_provider_name);
-    let state = crate::preloop_home().join("state");
-    let service = resolve_service(&state, service)?;
-    let provider_token = resolve_provider_token(args.provider_token, &state)?;
-    let scratch = state.join("sandbox-agent");
+/// Resolve the link `sandbox agent` runs on.
+///
+/// `--join` is the only override. Without it the service URL recorded with
+/// the identity wins: the global `--service` default is for caller commands
+/// and must not silently point a restarted agent at `127.0.0.1:9191`.
+async fn agent_link(
+    identity_dir: &Path,
+    join: Option<&str>,
+    join_token: Option<&str>,
+    name: &str,
+) -> anyhow::Result<RemoteLink> {
+    Ok(RemoteLink::connect(identity_dir, join, join_token, name).await?)
+}
+
+async fn run_agent(client_token: Option<String>, args: AgentArgs) -> anyhow::Result<()> {
+    let home = crate::preloop_home();
+    let state = home.join("state");
+    let identity_dir = args
+        .identity
+        .unwrap_or_else(|| state.join("sandbox-identity"));
+    let initial_name = args.name.unwrap_or_else(local_provider_name);
+    let join_token = args.join_token.or(client_token);
+    let link = agent_link(
+        &identity_dir,
+        args.join.as_deref(),
+        join_token.as_deref(),
+        &initial_name,
+    )
+    .await?;
+    // An existing identity owns the name it was enrolled under.
+    let name = link.name().unwrap_or(initial_name);
+    let base = link.base().to_owned();
     let agent = Agent::new(
-        Arc::new(RemoteLink::new(&service, Some(provider_token))),
+        Arc::new(link),
         host_drivers(Some(&named_prefix()), args.slots, None)?,
-        AgentConfig::new(name, scratch),
+        AgentConfig::new(name, state.join("sandbox-agent")),
     );
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
@@ -1001,7 +1094,7 @@ async fn run_agent(service: Option<String>, args: AgentArgs) -> anyhow::Result<(
         let _ = tokio::signal::ctrl_c().await;
         stop.cancel();
     });
-    eprintln!("[preloop] sandbox agent joining {service}");
+    eprintln!("[preloop] sandbox agent joining {base}");
     agent.run(None, shutdown).await;
     Ok(())
 }
@@ -1009,61 +1102,116 @@ async fn run_agent(service: Option<String>, args: AgentArgs) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
+    use preloop_sandbox::tls::{AgentIdentity, IdentityMetadata, ServiceCa, generate_csr};
 
+    fn stored_identity(root: &Path, base: &str) -> AgentIdentity {
+        let ca = ServiceCa::load_or_create(&root.join("ca")).unwrap();
+        let (key_pem, csr) = generate_csr("host-a").unwrap();
+        let signed = ca
+            .sign_client(&csr, "host-a", tls::CLIENT_CERT_LIFETIME)
+            .unwrap();
+        let identity = AgentIdentity {
+            dir: root.join("identity"),
+            metadata: IdentityMetadata {
+                name: "host-a".into(),
+                base: base.into(),
+                ca_sha256: ca.sha256_hex().to_owned(),
+                issued_at: 1,
+                expires_at: 2,
+            },
+            ca_pem: ca.pem().to_owned(),
+            cert_pem: signed.cert_pem,
+            key_pem,
+        };
+        identity.save().unwrap();
+        identity
+    }
+
+    #[tokio::test]
+    async fn restart_without_join_reuses_the_stored_service_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = stored_identity(dir.path(), "https://stored.example:9191");
+        let link = agent_link(&identity.dir, None, None, "host-a")
+            .await
+            .unwrap();
+        assert_eq!(link.base(), "https://stored.example:9191");
+    }
+
+    #[tokio::test]
+    async fn join_overrides_the_stored_service_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = stored_identity(dir.path(), "https://stored.example:9191");
+        let link = agent_link(
+            &identity.dir,
+            Some("https://other.example:9191"),
+            None,
+            "host-a",
+        )
+        .await
+        .unwrap();
+        assert_eq!(link.base(), "https://other.example:9191");
+        let reloaded = AgentIdentity::load(&identity.dir).unwrap().unwrap();
+        assert_eq!(reloaded.metadata.base, "https://other.example:9191");
+    }
+
+    #[tokio::test]
+    async fn a_first_run_without_join_asks_for_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = agent_link(dir.path(), None, None, "host-a")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("--join"), "{error}");
+    }
+
+    #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    #[cfg(unix)]
     #[test]
-    fn tokens_are_generated_once_and_owner_only() {
+    fn client_token_is_generated_once_and_owner_only() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path();
-        let first = resolve_token(None, state, "sandbox-client-token").unwrap();
+        let first = resolve_client_token(state).unwrap();
         assert_eq!(first.len(), 64, "32 random bytes as hex");
         let path = state.join("sandbox-client-token");
         assert_eq!(mode(&path), 0o600);
         assert_eq!(
-            resolve_token(None, state, "sandbox-client-token").unwrap(),
+            resolve_client_token(state).unwrap(),
             first,
             "later starts reuse the generated token"
         );
         // A stale wider file is tightened, not trusted as-is.
+        use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(
-            resolve_token(None, state, "sandbox-client-token").unwrap(),
-            first
-        );
+        assert_eq!(resolve_client_token(state).unwrap(), first);
         assert_eq!(mode(&path), 0o600);
-        // A configured token wins and is not written.
-        assert_eq!(
-            resolve_token(Some("given".into()), state, "other-token").unwrap(),
-            "given"
-        );
-        assert!(!state.join("other-token").exists());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn endpoint_is_published_on_bind_and_cleared_on_failure() {
+    async fn endpoint_is_published_over_https_and_keeps_a_live_owners_file() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path();
         let listener = bind_endpoint(state, "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        assert_eq!(read_endpoint(state), Some(format!("http://{addr}")));
+        assert_eq!(read_endpoint(state), Some(format!("https://{addr}")));
         assert_eq!(mode(&endpoint_path(state)), 0o600);
 
-        // The port is still held by a live owner: a second bind fails but
+        // The port is still held by a live process: a second bind fails but
         // must not delete the endpoint other CLI calls depend on.
         let error = bind_endpoint(state, addr).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
-        assert_eq!(read_endpoint(state), Some(format!("http://{addr}")));
+        assert_eq!(read_endpoint(state), Some(format!("https://{addr}")));
 
         // A stale file owned by a dead process is removed on failed bind.
-        crate::write_private_file(
+        tls::write_private(
             &endpoint_path(state),
-            format!("http://{addr}\n{}\n", u32::MAX).as_bytes(),
+            format!("https://{addr}\n{}\n", u32::MAX).as_bytes(),
         )
         .unwrap();
         let error = bind_endpoint(state, addr).await.unwrap_err();
@@ -1083,48 +1231,6 @@ mod tests {
         ServiceLock::acquire(dir.path()).unwrap();
     }
 
-    #[test]
-    fn client_resolution_never_guesses_an_endpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path();
-        // No endpoint file and no explicit --service: refuse rather than
-        // send the bearer token to the built-in default.
-        assert!(resolve_client(state, None, Some("token".into())).is_err());
-
-        write_endpoint(state, "127.0.0.1:9191".parse().unwrap()).unwrap();
-        resolve_token(None, state, "sandbox-client-token").unwrap();
-        let (base, token) = resolve_client(state, None, None).unwrap();
-        assert_eq!(base, "http://127.0.0.1:9191");
-        assert_eq!(token.len(), 64);
-
-        // An explicit --service is trusted even though the file names
-        // another address.
-        let (base, _) = resolve_client(state, Some("http://other:1234".into()), None).unwrap();
-        assert_eq!(base, "http://other:1234");
-
-        // An endpoint without a token is still an error.
-        let other = tempfile::tempdir().unwrap();
-        write_endpoint(other.path(), "127.0.0.1:9191".parse().unwrap()).unwrap();
-        assert!(resolve_client(other.path(), None, None).is_err());
-    }
-
-    #[test]
-    fn an_agent_never_invents_a_provider_token() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(resolve_provider_token(None, dir.path()).is_err());
-        assert!(!dir.path().join("sandbox-provider-token").exists());
-        crate::write_private_file(&dir.path().join("sandbox-provider-token"), b"service-token")
-            .unwrap();
-        assert_eq!(
-            resolve_provider_token(None, dir.path()).unwrap(),
-            "service-token"
-        );
-        assert_eq!(
-            resolve_provider_token(Some("given".into()), dir.path()).unwrap(),
-            "given"
-        );
-    }
-
     #[tokio::test]
     async fn the_service_starts_only_for_a_pool() {
         let dir = tempfile::tempdir().unwrap();
@@ -1137,13 +1243,24 @@ mod tests {
     }
 
     #[test]
-    fn adapter_and_driver_share_one_provider() {
-        let provider = Arc::new(SmolVmProvider::default());
-        let driver = smolvm_driver(None, 0, (*provider).clone());
-        assert!(
-            provider.shares_lifecycle_with(driver.provider()),
-            "the adapter's sweep must take the same lifecycle lock as creates"
+    fn client_resolution_never_guesses_an_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        // No endpoint file and no explicit --service: refuse rather than
+        // send the bearer token to the built-in default.
+        assert!(resolve_service(state, None).is_err());
+
+        write_endpoint(state, "127.0.0.1:9191".parse().unwrap()).unwrap();
+        assert_eq!(
+            resolve_service(state, None).unwrap(),
+            "https://127.0.0.1:9191"
         );
-        assert!(!SmolVmProvider::default().shares_lifecycle_with(driver.provider()));
+
+        // An explicit --service is trusted even though the file names
+        // another address.
+        assert_eq!(
+            resolve_service(state, Some("https://other:1234".into())).unwrap(),
+            "https://other:1234"
+        );
     }
 }

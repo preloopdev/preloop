@@ -1,14 +1,15 @@
 //! Service/agent conformance over the process-backed fake driver, driven
-//! both in-process and across a real HTTP server with a remote agent.
+//! both in-process and across a real TLS server with a remote agent.
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink, RemoteLink};
+use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::placement::{Candidate, CandidateId, Placement, PlacementRequest};
-use preloop_sandbox::server::{Auth, router};
 use preloop_sandbox::store::{self, Kind, Store};
 use preloop_sandbox::{Code, Driver, SandboxClient, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -639,46 +640,38 @@ async fn state_survives_restart_from_sqlite() {
     assert_eq!(restored.list().len(), 1);
 }
 
-/// The same flows across a real HTTP server with a remote agent.
+/// The same flows across a real TLS server with a remote agent.
 #[tokio::test]
 async fn remote_agent_and_client_over_connect() {
     use preloop_sandbox::SandboxApi as _;
-    let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
-    let auth = Auth {
-        client_token: Some("client-secret".into()),
-        provider_token: Some("provider-secret".into()),
-        loopback_only: true,
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = router(service.clone(), auth);
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    let shutdown = CancellationToken::new();
-    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    let t = common::TestService::start().await;
+    let service = t.service.clone();
+    let dir = t.dir.path().to_path_buf();
     let fake = Arc::new(FakeDriver::new(
         "fake",
-        dir.path().join("host"),
+        dir.join("host"),
         FakeDriver::full_capabilities(),
     ));
+    let link = t.enroll("remote-host").await;
     let agent = Agent::new(
-        Arc::new(RemoteLink::new(&base, Some("provider-secret".into()))),
+        Arc::new(link),
         vec![fake as Arc<dyn Driver>],
-        AgentConfig::new("remote-host", dir.path().join("scratch")),
+        AgentConfig::new("remote-host", dir.join("scratch")),
     );
-    tokio::spawn(agent.run(None, shutdown.clone()));
+    tokio::spawn(agent.run(None, t.shutdown_token()));
 
-    // Wrong token is rejected.
-    let bad = SandboxClient::new(&base, Some("nope".into()));
+    // A wrong caller token is rejected, over the same TLS endpoint.
+    let ca = t.ca_pem();
+    let bad = SandboxClient::with_tls(&t.base, Some("nope".into()), &ca, None).unwrap();
     assert_eq!(bad.list().await.unwrap_err().code, Code::Unauthenticated);
 
-    let client = SandboxClient::new(&base, Some("client-secret".into()));
-    wait_for(|| !Service::list_providers(&service).is_empty()).await;
+    let client = t.client();
+    wait_for(|| {
+        Service::list_providers(&service)
+            .iter()
+            .any(|provider| provider.generation > 0 && !provider.drivers.is_empty())
+    })
+    .await;
     client.put_template(template("alpine")).await.unwrap();
     let lease = client
         .acquire(AcquireRequest {
@@ -706,7 +699,7 @@ async fn remote_agent_and_client_over_connect() {
     assert_eq!(stderr, b"err\n");
 
     // Upload a tar through a ticket, then download it back.
-    let src = dir.path().join("in.tar");
+    let src = dir.join("in.tar");
     {
         let mut builder = tar::Builder::new(std::fs::File::create(&src).unwrap());
         let data = b"payload";
@@ -723,7 +716,7 @@ async fn remote_agent_and_client_over_connect() {
         .upload(&lease.sandbox.id, "/work", &src)
         .await
         .unwrap();
-    let out = dir.path().join("out.tar");
+    let out = dir.join("out.tar");
     client
         .download(&lease.sandbox.id, "/work/dir", &out)
         .await
@@ -758,86 +751,61 @@ async fn remote_agent_and_client_over_connect() {
         .await
         .unwrap();
     wait_for(|| Service::list(&service).is_empty()).await;
-    shutdown.cancel();
 }
 
 #[tokio::test]
-async fn loopback_auth_requires_tokens_and_a_loopback_host() {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+async fn loopback_auth_requires_a_token_and_a_loopback_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let tls = preloop_sandbox::ServerTls::load_or_create(
+        &state,
+        vec!["127.0.0.1".to_owned(), "localhost".to_owned()],
+        None,
+        None,
+    )
+    .unwrap();
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    config.ca = Some(tls.ca.clone());
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    let http = preloop_sandbox::tls::http_client(tls.ca.pem(), None).unwrap();
+    let list = "/preloop.sandbox.v1.Sandboxes/List";
 
-    async fn raw_status(
-        addr: std::net::SocketAddr,
+    async fn status(
+        http: &reqwest::Client,
+        base: &str,
         host: &str,
         path: &str,
         bearer: Option<&str>,
-        body: &str,
     ) -> u16 {
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let auth = bearer
-            .map(|token| format!("Authorization: Bearer {token}\r\n"))
-            .unwrap_or_default();
-        let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Content-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.unwrap();
-        let head = String::from_utf8_lossy(&response);
-        head.split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .unwrap_or_else(|| panic!("no status line in {head:?}"))
+        let mut request = http
+            .post(format!("{base}{path}"))
+            .header("Host", host)
+            .body("{}");
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        request.send().await.unwrap().status().as_u16()
     }
 
-    async fn serve(service: Arc<Service>, auth: Auth) -> (std::net::SocketAddr, CancellationToken) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shutdown = CancellationToken::new();
-        let stop = shutdown.clone();
-        tokio::spawn(async move {
-            axum::serve(listener, router(service, auth))
-                .with_graceful_shutdown(async move { stop.cancelled().await })
-                .await
-                .unwrap();
-        });
-        (addr, shutdown)
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
-    let (addr, shutdown) = serve(
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("https://{addr}");
+    let shutdown = CancellationToken::new();
+    tokio::spawn(preloop_sandbox::server::serve(
+        listener,
         service.clone(),
-        Auth {
-            client_token: Some("client-secret".into()),
-            provider_token: Some("provider-secret".into()),
-            loopback_only: true,
-        },
-    )
-    .await;
-    let list = "/preloop.sandbox.v1.Sandboxes/List";
-    let providers = "/preloop.sandbox.v1.Providers/Poll";
+        preloop_sandbox::server::Auth::for_listener("client-secret", addr),
+        tls.clone(),
+        shutdown.clone(),
+    ));
 
-    // No bearer on either API: rejected.
-    assert_eq!(raw_status(addr, "127.0.0.1", list, None, "{}").await, 401);
-    assert_eq!(
-        raw_status(addr, "127.0.0.1", providers, None, "{}").await,
-        401
-    );
-    // A token for the other role is not accepted either.
-    assert_eq!(
-        raw_status(addr, "127.0.0.1", providers, Some("client-secret"), "{}").await,
-        401
-    );
+    // No bearer: rejected.
+    assert_eq!(status(&http, &base, "127.0.0.1", list, None).await, 401);
     // DNS rebinding: the bearer is valid, the Host is not.
     assert_eq!(
-        raw_status(addr, "evil.example", list, Some("client-secret"), "{}").await,
+        status(&http, &base, "evil.example", list, Some("client-secret")).await,
         403
     );
     // Loopback names and ports are fine.
@@ -848,17 +816,30 @@ async fn loopback_auth_requires_tokens_and_a_loopback_host() {
         "[::1]:9191",
     ] {
         assert_eq!(
-            raw_status(addr, host, list, Some("client-secret"), "{}").await,
+            status(&http, &base, host, list, Some("client-secret")).await,
             200,
             "Host {host} must be accepted"
         );
     }
     shutdown.cancel();
 
-    // A listener built without tokens fails closed instead of authorizing.
-    let (addr, shutdown) = serve(service, Auth::default()).await;
+    // An empty token never authorizes: the listener fails closed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("https://{addr}");
+    let shutdown = CancellationToken::new();
+    tokio::spawn(preloop_sandbox::server::serve(
+        listener,
+        service,
+        preloop_sandbox::server::Auth {
+            client_token: String::new(),
+            loopback_only: true,
+        },
+        tls,
+        shutdown.clone(),
+    ));
     assert_eq!(
-        raw_status(addr, "127.0.0.1", list, Some("anything"), "{}").await,
+        status(&http, &base, "127.0.0.1", list, Some("anything")).await,
         401
     );
     shutdown.cancel();
