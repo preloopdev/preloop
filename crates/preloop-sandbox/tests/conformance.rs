@@ -1069,7 +1069,7 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
     service.maintain().await;
     let sandboxes = service.list();
     assert!(
-        sandboxes.iter().all(|s| s.state == SandboxState::Failed),
+        !sandboxes.is_empty() && sandboxes.iter().all(|s| s.state == SandboxState::Failed),
         "{sandboxes:?}"
     );
 }
@@ -1860,8 +1860,7 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
         FakeDriver::full_capabilities(),
     ));
     let agent = Agent::new(
-        Arc::new(RemoteLink::new(&base, Some("provider-secret".into())))
-            as Arc<dyn ProviderLink>,
+        Arc::new(RemoteLink::new(&base, Some("provider-secret".into()))) as Arc<dyn ProviderLink>,
         vec![fake.clone() as Arc<dyn Driver>],
         AgentConfig::new("remote-host", dir.path().join("scratch")),
     );
@@ -2294,7 +2293,7 @@ async fn replayed_acquire_of_a_failed_sandbox_persists_its_release() {
 }
 
 #[tokio::test]
-async fn paused_pool_member_resumes_to_ready_and_survives_maintenance() {
+async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
     let h = harness().await;
     h.service.put_template(template("alpine")).await.unwrap();
     h.service
@@ -2337,14 +2336,21 @@ async fn paused_pool_member_resumes_to_ready_and_survives_maintenance() {
     assert!(paused.preserve_until > unix_now());
     h.service.resume(&id).await.unwrap();
     let resumed = h.service.get(&id).unwrap();
-    assert_eq!(resumed.state, SandboxState::Ready);
-    assert_eq!(resumed.preserve_until, 0);
+    assert_eq!(
+        resumed.state,
+        SandboxState::Preserved,
+        "a machine that held a lease must never rejoin the warm set"
+    );
+    assert!(resumed.preserve_until > unix_now());
     h.service.maintain().await;
     assert_eq!(
         h.service.get(&id).unwrap().state,
-        SandboxState::Ready,
-        "the resumed warm member must not be swept"
+        SandboxState::Preserved,
+        "the preserved member must not be swept before its deadline"
     );
+    // The next acquire gets a clean machine, not the used one.
+    let fresh = h.service.acquire(acquire("k2", "p")).await.unwrap();
+    assert_ne!(fresh.sandbox.id, id);
 }
 
 #[tokio::test]
@@ -2599,6 +2605,22 @@ async fn a_reconfigured_pool_never_serves_an_old_warm_member() {
     })
     .await;
     let old = h.service.list()[0].id.clone();
+
+    // Scaling the pool does not change how members are built.
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "one".into(),
+            warm: 2,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    h.service.maintain().await;
+    assert!(
+        h.service.get(&old).is_ok(),
+        "a warm-count change retired the warm member"
+    );
 
     h.service
         .put_pool(PoolSpec {
