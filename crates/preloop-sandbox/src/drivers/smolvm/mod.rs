@@ -58,15 +58,17 @@ impl SmolvmDriver {
         self
     }
 
+    /// The typed lifecycle primitive behind this driver. Callers that also
+    /// need host-side operations must clone this provider rather than build a
+    /// second one, so both share the lifecycle lock and fork census.
+    pub fn provider(&self) -> &SmolVmProvider {
+        &self.provider
+    }
+
     fn adopts(&self, name: &str) -> bool {
         self.named_prefix
             .as_deref()
             .is_some_and(|prefix| name.starts_with(prefix))
-    }
-
-    /// The underlying CLI provider.
-    pub fn provider(&self) -> &SmolVmProvider {
-        &self.provider
     }
 
     /// The command half of [`Driver::exec`], split out so the cancel registry
@@ -475,7 +477,7 @@ impl Driver for SmolvmDriver {
             return Err(Error::invalid("argv is required"));
         }
         let name = machine(native_ref)?;
-        let argv = crate::driver::posix_exec_argv(request);
+        let argv = crate::driver::posix_exec_argv(request)?;
         let cancel = self.cancels.start(exec_id);
         let result = self
             .exec_inner(&name, exec_id, request, &argv, output, cancel)

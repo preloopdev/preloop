@@ -56,7 +56,7 @@ async fn fixture_with_driver(dir: &tempfile::TempDir, driver: Arc<dyn Driver>) -
         vec![driver],
         AgentConfig::new("host", dir.path().join("scratch")),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     while service.list_providers().is_empty() {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -191,7 +191,7 @@ fn spec(name: &str) -> MachineSpec {
 }
 
 #[tokio::test]
-async fn secret_env_upload_archives_private_script_content() {
+async fn secret_env_upload_archives_secret_script_content() {
     let dir = tempfile::tempdir().unwrap();
     let uploaded = Arc::new(tokio::sync::Mutex::new(None));
     let inner = Arc::new(FakeDriver::new(
@@ -381,4 +381,185 @@ async fn a_restart_adopts_machines_this_process_never_created() {
         0
     );
     assert!(restarted.list().await.unwrap().contains(&name));
+}
+
+#[tokio::test]
+async fn a_stopped_machine_reports_stopped_and_can_be_recreated() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fixture(&dir).await;
+    let name = MachineName::new("pool-stopped-0-1").unwrap();
+    f.machines.create(&spec(name.as_str())).await.unwrap();
+    f.machines.start(&name).await.unwrap();
+    f.machines.stop(&name).await.unwrap();
+    assert_eq!(
+        f.machines.status(&name).await.unwrap(),
+        MachineState::Stopped,
+        "a stopped machine must not look absent"
+    );
+    // A stopped machine is deletable, and the name is free afterwards.
+    f.machines.delete(&name).await.unwrap();
+    f.machines.create(&spec(name.as_str())).await.unwrap();
+}
+
+/// An API whose next `Release` fails once, for the retry ordering test.
+struct FlakyRelease {
+    inner: Arc<dyn SandboxApi>,
+    failures: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl SandboxApi for FlakyRelease {
+    async fn put_template(
+        &self,
+        spec: preloop_sandbox::api::TemplateSpec,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::Template> {
+        self.inner.put_template(spec).await
+    }
+    async fn acquire(
+        &self,
+        request: preloop_sandbox::api::AcquireRequest,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::AcquireResponse> {
+        self.inner.acquire(request).await
+    }
+    async fn renew(
+        &self,
+        request: preloop_sandbox::api::RenewRequest,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::Lease> {
+        self.inner.renew(request).await
+    }
+    async fn release(
+        &self,
+        request: preloop_sandbox::api::ReleaseRequest,
+    ) -> preloop_sandbox::Result<()> {
+        if self.failures.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            self.failures
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return Err(preloop_sandbox::Error::unavailable("transient release"));
+        }
+        self.inner.release(request).await
+    }
+    async fn get(
+        &self,
+        sandbox_id: &str,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::Sandbox> {
+        self.inner.get(sandbox_id).await
+    }
+    async fn list(&self) -> preloop_sandbox::Result<Vec<preloop_sandbox::api::Sandbox>> {
+        self.inner.list().await
+    }
+    async fn list_templates(&self) -> preloop_sandbox::Result<Vec<preloop_sandbox::api::Template>> {
+        self.inner.list_templates().await
+    }
+    async fn delete_template(&self, name: &str) -> preloop_sandbox::Result<()> {
+        self.inner.delete_template(name).await
+    }
+    async fn put_pool(
+        &self,
+        pool: preloop_sandbox::api::PoolSpec,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::PoolSpec> {
+        self.inner.put_pool(pool).await
+    }
+    async fn list_pools(&self) -> preloop_sandbox::Result<Vec<preloop_sandbox::api::PoolSpec>> {
+        self.inner.list_pools().await
+    }
+    async fn delete_pool(&self, name: &str) -> preloop_sandbox::Result<()> {
+        self.inner.delete_pool(name).await
+    }
+    async fn list_providers(&self) -> preloop_sandbox::Result<Vec<preloop_sandbox::api::Provider>> {
+        self.inner.list_providers().await
+    }
+    async fn exec(
+        &self,
+        request: preloop_sandbox::api::ExecRequest,
+    ) -> preloop_sandbox::Result<
+        futures::stream::BoxStream<
+            'static,
+            preloop_sandbox::Result<preloop_sandbox::api::ExecEvent>,
+        >,
+    > {
+        self.inner.exec(request).await
+    }
+    async fn upload(
+        &self,
+        sandbox_id: &str,
+        guest_dir: &str,
+        tar: &std::path::Path,
+    ) -> preloop_sandbox::Result<()> {
+        self.inner.upload(sandbox_id, guest_dir, tar).await
+    }
+    async fn download(
+        &self,
+        sandbox_id: &str,
+        guest_path: &str,
+        dest: &std::path::Path,
+    ) -> preloop_sandbox::Result<()> {
+        self.inner.download(sandbox_id, guest_path, dest).await
+    }
+    async fn snapshot(
+        &self,
+        request: preloop_sandbox::api::SnapshotRequest,
+    ) -> preloop_sandbox::Result<preloop_sandbox::api::Template> {
+        self.inner.snapshot(request).await
+    }
+    async fn stop(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.stop(sandbox_id).await
+    }
+    async fn start(&self, sandbox_id: &str, forkable: bool) -> preloop_sandbox::Result<()> {
+        self.inner.start(sandbox_id, forkable).await
+    }
+    async fn pause(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.pause(sandbox_id).await
+    }
+    async fn resume(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.resume(sandbox_id).await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_release_keeps_the_entry_for_the_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeDriver::new(
+        "fake",
+        dir.path().join("host"),
+        FakeDriver::full_capabilities(),
+    ));
+    let service = Service::open(
+        store::open("memory:").await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let agent = Agent::new(
+        Arc::new(service.clone()) as Arc<dyn ProviderLink>,
+        vec![fake as Arc<dyn Driver>],
+        AgentConfig::new("host", dir.path().join("scratch")),
+    );
+    tokio::spawn(agent.run(None, shutdown.clone()));
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    while service.list_providers().is_empty() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let api = Arc::new(FlakyRelease {
+        inner: Arc::new(InProcess(service.clone())),
+        failures: std::sync::atomic::AtomicUsize::new(1),
+    });
+    let machines = SandboxMachines::new(
+        api,
+        None,
+        None,
+        Requirements::default(),
+        ProviderCapabilities::default(),
+    );
+    let name = MachineName::new("pool-retry-0-1").unwrap();
+    machines.create(&spec(name.as_str())).await.unwrap();
+    machines.start(&name).await.unwrap();
+
+    let error = machines.delete(&name).await.unwrap_err();
+    assert!(error.to_string().contains("transient release"), "{error}");
+    // The entry survived, so the retry can release the same lease.
+    assert_eq!(machines.status(&name).await.unwrap(), MachineState::Running);
+    machines.delete(&name).await.unwrap();
+    assert_eq!(machines.status(&name).await.unwrap(), MachineState::Missing);
+    shutdown.cancel();
 }

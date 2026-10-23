@@ -1394,6 +1394,16 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// pool-pending).
     async fn rebuild_dispatch_intent(&self) -> Result<(), ControlError>;
 
+    /// Repair leaked dispatch intent: every ready job with neither a
+    /// `job_assignments` nor a `provision_requests` row gets the same
+    /// config-gated derivation [`ControlBackend::rebuild_dispatch_intent`]
+    /// runs at boot. Unlike the boot rebuild this never re-stamps an
+    /// existing waitlist row (a refreshed `requested_at` would keep blocking
+    /// claims indefinitely), so it only touches jobs that have no row at
+    /// all. Returns the number of jobs repaired; a non-zero count means an
+    /// enqueue/requeue/promote path is still missing its intent derivation.
+    async fn reconcile_dispatch_intent(&self) -> Result<usize, ControlError>;
+
     // ── Runs and jobs ─────────────────────────────────────────────────
 
     /// Every live (non-archived) run whose repository equals `repository`
@@ -3355,6 +3365,12 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.rebuild_dispatch_intent().await,
             Self::Postgres(b) => b.rebuild_dispatch_intent().await,
+        }
+    }
+    async fn reconcile_dispatch_intent(&self) -> Result<usize, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.reconcile_dispatch_intent().await,
+            Self::Postgres(b) => b.reconcile_dispatch_intent().await,
         }
     }
     async fn runs_for_repository(&self, repository: &str) -> Result<Vec<RunRecord>, ControlError> {

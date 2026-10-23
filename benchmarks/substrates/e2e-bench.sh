@@ -12,7 +12,7 @@
 #     each run, so no run inherits the other's warm state;
 #   * the OCI base image is pre-pulled into both substrates before timing.
 #
-# Usage: e2e-bench.sh <substrate: aenv|smolvm> <reps> <outdir>
+# Usage: e2e-bench.sh <substrate: smolvm> <reps> <outdir>
 set -uo pipefail
 
 SUBSTRATE="${1:?substrate}"
@@ -56,7 +56,6 @@ mkdir -p "$OUTDIR"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUTDIR/driver.log" >&2; }
 
 case "$SUBSTRATE" in
-  aenv)   export PRELOOP_SANDBOX_DRIVERS=agentenv PRELOOP_SANDBOX_POOL_DRIVER=agentenv ;;
   smolvm) export PRELOOP_SANDBOX_POOL_DRIVER=smolvm ;;
   *) echo "unknown substrate $SUBSTRATE" >&2; exit 2 ;;
 esac

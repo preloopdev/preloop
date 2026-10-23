@@ -47,10 +47,16 @@ jobs:
 
       - name: Analyze
         uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        env:
+          # The action derives this key from `GET /repos/{owner}/{repo}/actions/runs/{id}`,
+          # which preloop engines before #741 do not serve; pinning it keeps
+          # analyze from depending on that lookup.
+          CODEQL_ACTION_ANALYSIS_KEY: .github/workflows/codeql.yml:analyze
         with:
           category: "/language:${{ matrix.language }}"
-          # Preloop engine runs have no GitHub code-scanning backend. Keep the
-          # SARIF in the run artifact until the SARIF ingestion endpoint exists.
+          # Preloop engine runs have no GitHub code-scanning backend on engines
+          # older than #741, which added the code-scanning shim. Switch this
+          # once every engine serving preloop-cpane runs a build that includes it.
           upload: never
           upload-database: false
           output: ${{ runner.temp }}/codeql-results

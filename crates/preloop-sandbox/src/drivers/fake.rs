@@ -4,7 +4,7 @@
 //! commands receive the root as `SANDBOX_ROOT`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt as _;
@@ -29,6 +29,8 @@ pub struct FakeDriver {
     /// How many `cancel_exec` calls the agent delivered (disconnect tests).
     pub cancel_calls: AtomicU32,
     cancels: ExecCancels,
+    /// Artificial snapshot latency (tests that need an operation in flight).
+    pub snapshot_delay_ms: AtomicU64,
 }
 
 impl FakeDriver {
@@ -44,6 +46,7 @@ impl FakeDriver {
             create_calls: AtomicU32::new(0),
             cancel_calls: AtomicU32::new(0),
             cancels: ExecCancels::default(),
+            snapshot_delay_ms: AtomicU64::new(0),
         }
     }
 
@@ -286,6 +289,12 @@ impl Driver for FakeDriver {
     }
 
     async fn snapshot(&self, native_ref: &str, template: &str) -> Result<String> {
+        let delay = self
+            .snapshot_delay_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         let source = self.dir(native_ref)?;
         let snapshot = format!(
             "snap-{}-{}",

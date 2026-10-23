@@ -355,20 +355,45 @@ impl Agent {
     }
 
     /// Run until `shutdown`, re-registering after fencing or link failures.
-    pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
+    ///
+    /// `initial` is a session the caller already registered (so a process
+    /// that needs the provider id before serving does not register twice and
+    /// fence its own in-flight work). After that session ends the agent
+    /// registers again.
+    pub async fn run(self: Arc<Self>, initial: Option<Session>, shutdown: CancellationToken) {
         std::fs::create_dir_all(&self.config.scratch).ok();
-        let mut backoff = Duration::from_millis(500);
-        while !shutdown.is_cancelled() {
-            match self.register().await {
-                Ok(session) => {
-                    info!(provider = %session.provider_id, generation = session.generation, "agent registered");
-                    backoff = Duration::from_millis(500);
-                    let error = self.clone().session(session, shutdown.clone()).await;
-                    if let Some(error) = error {
-                        warn!(%error, "agent session ended; re-registering");
-                    }
+        // A previous process may have died mid-transfer: its archives are
+        // neither needed nor safe to keep.
+        if let Ok(entries) = std::fs::read_dir(&self.config.scratch) {
+            for entry in entries.flatten() {
+                if entry.path().is_file() {
+                    let _ = std::fs::remove_file(entry.path());
                 }
-                Err(error) => warn!(%error, "agent registration failed"),
+            }
+        }
+        let mut backoff = Duration::from_millis(500);
+        let mut pending = initial;
+        while !shutdown.is_cancelled() {
+            let session = match pending.take() {
+                Some(session) => session,
+                None => match self.register().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        warn!(%error, "agent registration failed");
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(Duration::from_secs(15));
+                        continue;
+                    }
+                },
+            };
+            info!(provider = %session.provider_id, generation = session.generation, "agent registered");
+            backoff = Duration::from_millis(500);
+            let error = self.clone().session(session, shutdown.clone()).await;
+            if let Some(error) = error {
+                warn!(%error, "agent session ended; re-registering");
             }
             tokio::select! {
                 _ = shutdown.cancelled() => return,
@@ -650,23 +675,28 @@ impl Agent {
         if let Some(copy) = item.copy {
             let driver = self.driver(&copy.target.driver)?;
             let scratch = self.config.scratch.join(format!("{}.tar", copy.ticket));
-            let result = match copy.kind {
-                StreamKind::Upload => {
-                    self.link
-                        .fetch_blob(session, &copy.ticket, &scratch)
-                        .await?;
-                    driver
-                        .copy_in(&copy.target.native_ref, &scratch, &copy.path)
-                        .await
+            // Clean the scratch archive however the transfer ends; a failed
+            // fetch or copy must not leave credentials or guest bytes behind.
+            let result = async {
+                match copy.kind {
+                    StreamKind::Upload => {
+                        self.link
+                            .fetch_blob(session, &copy.ticket, &scratch)
+                            .await?;
+                        driver
+                            .copy_in(&copy.target.native_ref, &scratch, &copy.path)
+                            .await
+                    }
+                    StreamKind::Download => {
+                        driver
+                            .copy_out(&copy.target.native_ref, &copy.path, &scratch)
+                            .await?;
+                        self.link.put_blob(session, &copy.ticket, &scratch).await
+                    }
+                    StreamKind::StreamKindUnspecified => Err(Error::invalid("copy kind unset")),
                 }
-                StreamKind::Download => {
-                    driver
-                        .copy_out(&copy.target.native_ref, &copy.path, &scratch)
-                        .await?;
-                    self.link.put_blob(session, &copy.ticket, &scratch).await
-                }
-                StreamKind::StreamKindUnspecified => Err(Error::invalid("copy kind unset")),
-            };
+            }
+            .await;
             let _ = tokio::fs::remove_file(&scratch).await;
             return result.map(|_| String::new());
         }
@@ -825,6 +855,177 @@ fn prune_work(work: &mut HashMap<String, (WorkState, Instant)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{CopyWork, PollResponse, ReconcileResponse, ReportExecRequest, ReportRequest};
+    use crate::drivers::fake::FakeDriver;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct TestLink {
+        registers: AtomicUsize,
+        abort_polls: AtomicBool,
+        fail_fetch: bool,
+    }
+
+    #[async_trait]
+    impl ProviderLink for TestLink {
+        async fn register(&self, _request: RegisterRequest) -> Result<RegisterResponse> {
+            let generation = self.registers.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            Ok(RegisterResponse {
+                provider_id: "prv-test".into(),
+                generation,
+            })
+        }
+        async fn heartbeat(&self, _request: HeartbeatRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn poll(&self, _request: PollRequest) -> Result<PollResponse> {
+            if self.abort_polls.swap(false, Ordering::SeqCst) {
+                return Err(Error::aborted("fenced"));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(PollResponse::default())
+        }
+        async fn report(&self, _request: ReportRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn report_exec(&self, _request: ReportExecRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn reconcile(&self, _request: ReconcileRequest) -> Result<ReconcileResponse> {
+            Ok(ReconcileResponse::default())
+        }
+        async fn fetch_blob(&self, _id: &Session, _ticket: &str, _dest: &Path) -> Result<()> {
+            if self.fail_fetch {
+                Err(Error::unavailable("fetch failed"))
+            } else {
+                Ok(())
+            }
+        }
+        async fn put_blob(&self, _id: &Session, _ticket: &str, _src: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn session() -> Session {
+        Session {
+            provider_id: "prv-test".into(),
+            generation: 1,
+        }
+    }
+
+    async fn agent(link: Arc<TestLink>, scratch: &Path) -> Arc<Agent> {
+        Agent::new(
+            link as Arc<dyn ProviderLink>,
+            Vec::new(),
+            AgentConfig::new("test", scratch.to_owned()),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_initial_session_is_not_registered_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = Arc::new(TestLink::default());
+        let agent = agent(link.clone(), &dir.path().join("scratch")).await;
+        let initial = agent.register().await.unwrap();
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(agent.run(Some(initial), shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(link.registers.load(Ordering::SeqCst), 1);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fenced_session_registers_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = Arc::new(TestLink::default());
+        let agent = agent(link.clone(), &dir.path().join("scratch")).await;
+        let initial = agent.register().await.unwrap();
+        link.abort_polls.store(true, Ordering::SeqCst);
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(agent.run(Some(initial), shutdown.clone()));
+        for _ in 0..100 {
+            if link.registers.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            link.registers.load(Ordering::SeqCst) >= 2,
+            "the agent must re-register after a fenced session"
+        );
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+    }
+
+    #[tokio::test]
+    async fn failed_transfers_leave_no_scratch_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ticket = "tkt-test";
+        let archive = scratch.join(format!("{ticket}.tar"));
+        std::fs::write(&archive, b"partial download").unwrap();
+        let link = Arc::new(TestLink {
+            fail_fetch: true,
+            ..TestLink::default()
+        });
+        let fake = Arc::new(FakeDriver::new(
+            "fake",
+            dir.path().join("host"),
+            crate::api::Capabilities::default(),
+        ));
+        let agent = Agent::new(
+            link as Arc<dyn ProviderLink>,
+            vec![fake as Arc<dyn Driver>],
+            AgentConfig::new("test", scratch.clone()),
+        );
+        let error = agent
+            .run_work(
+                &session(),
+                &CancellationToken::new(),
+                WorkItem {
+                    id: "wrk-test".into(),
+                    copy: Some(CopyWork {
+                        target: crate::api::SandboxWork {
+                            sandbox_id: "sbx-test".into(),
+                            driver: "fake".into(),
+                            native_ref: "native-test".into(),
+                        },
+                        ticket: ticket.into(),
+                        path: "/work".into(),
+                        kind: StreamKind::Upload,
+                    }),
+                    ..WorkItem::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Unavailable);
+        assert!(
+            !archive.exists(),
+            "the scratch archive outlived the failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_sweeps_stale_scratch_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let stale = scratch.join("tkt-stale.tar");
+        std::fs::write(&stale, b"stale").unwrap();
+        let link = Arc::new(TestLink::default());
+        let agent = agent(link, &scratch).await;
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        agent.run(None, shutdown).await;
+        assert!(!stale.exists(), "startup must sweep old scratch archives");
+    }
 
     #[test]
     fn jitter_stays_inside_the_backoff_window() {
