@@ -16,6 +16,7 @@ pub mod agent;
 pub mod api;
 pub mod authz;
 pub mod backend;
+pub mod cache;
 pub mod client;
 pub mod driver;
 pub mod driver_conformance;
