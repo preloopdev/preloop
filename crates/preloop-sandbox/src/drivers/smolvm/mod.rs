@@ -95,6 +95,12 @@ impl SmolvmDriver {
     }
 }
 
+/// Caller-chosen names must sit inside the prefix this driver reports in
+/// its inventory, or reconciliation cannot tell them from foreign machines.
+pub(crate) fn name_is_owned(prefix: Option<&str>, name: &str) -> bool {
+    prefix.is_some_and(|prefix| !prefix.is_empty() && name.starts_with(prefix))
+}
+
 fn guest_arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" | "arm64" => "aarch64",
@@ -328,8 +334,16 @@ impl Driver for SmolvmDriver {
     }
 
     async fn create(&self, work: &CreateWork) -> Result<String> {
-        // A caller-chosen name doubles as the native name, so host tools
-        // (`preloop shell`, `smolvm machine exec`) address the same machine.
+        // A caller-chosen name doubles as the native name, but inventory can
+        // only recognize names inside the configured prefix: an arbitrary
+        // name would be reported lost, then its record dropped without
+        // destroying the machine. Keep the ownership boundary explicit.
+        if !work.name.is_empty() && !name_is_owned(self.named_prefix.as_deref(), &work.name) {
+            return Err(Error::invalid(format!(
+                "caller-chosen sandbox name `{}` is outside this provider's owned prefix",
+                work.name
+            )));
+        }
         let name = if work.name.is_empty() {
             native_name(&work.sandbox_id, work.incarnation)
         } else {
@@ -910,5 +924,18 @@ exit 0
         let fork = index_of(&calls, "fork").expect("machine fork");
         assert!(calls[fork].1.contains(&"--branchable".to_owned()));
         assert_eq!(index_of(&calls, "update"), None);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::name_is_owned;
+
+    #[test]
+    fn caller_names_must_be_inside_the_owned_prefix() {
+        assert!(name_is_owned(Some("preloop-runner"), "preloop-runner-3-1"));
+        assert!(!name_is_owned(Some("preloop-runner"), "someone-elses-vm"));
+        assert!(!name_is_owned(None, "preloop-runner-3-1"));
+        assert!(!name_is_owned(Some(""), "anything"));
     }
 }

@@ -420,7 +420,9 @@ impl SandboxMachines {
                 memory_mib: 0,
                 storage_gib: 0,
                 overlay_gib: None,
-                network: NetworkPolicy::Unrestricted,
+                // Never widen egress on adoption: pool machines use the
+                // public-only floor.
+                network: NetworkPolicy::PublicOnly,
                 volumes: Vec::new(),
                 sockets: Vec::new(),
                 dns: None,
@@ -865,24 +867,34 @@ impl VmProvider for SandboxMachines {
             }
             None => {
                 // Left by an earlier engine process: release whatever lease
-                // still holds a sandbox of this name.
+                // still holds a sandbox of this name. A transient failure is
+                // returned so `await_machine_gone` does not treat a leaked
+                // VM as a completed teardown.
+                let mut failure = None;
                 for sandbox in self.remote_by_name(name.as_str()).await {
-                    if !sandbox.lease_id.is_empty() {
-                        let _ = self
+                    if !sandbox.lease_id.is_empty()
+                        && let Err(error) = self
                             .api
                             .release(ReleaseRequest {
                                 lease_id: sandbox.lease_id,
                                 mode: ReleaseMode::Destroy,
                                 ..ReleaseRequest::default()
                             })
-                            .await;
+                            .await
+                        && error.code != Code::NotFound
+                    {
+                        failure.get_or_insert(error);
                     }
                 }
-                let _ = self
+                if let Err(error) = self
                     .api
                     .delete_template(&format!("golden-{}", name.as_str()))
-                    .await;
-                Ok(())
+                    .await
+                    && error.code != Code::NotFound
+                {
+                    failure.get_or_insert(error);
+                }
+                failure.map_or(Ok(()), |error| Err(sandbox_error("delete", error)))
             }
         }
     }
@@ -1014,7 +1026,8 @@ impl VmProvider for SandboxMachines {
     }
 
     async fn copy(&self, source: &str, destination: &str) -> Result<(), VmError> {
-        let scratch = tempfile::tempdir().map_err(|e| VmError::RuntimeIo { source: e })?;
+        let scratch = tempfile::tempdir_in(copy_scratch_parent(destination))
+            .map_err(|e| VmError::RuntimeIo { source: e })?;
         let tar_path = scratch.path().join("copy.tar");
         match (Self::split_guest(source), Self::split_guest(destination)) {
             (None, Some((machine, guest))) => {
@@ -1071,6 +1084,19 @@ impl VmProvider for SandboxMachines {
     }
 }
 
+/// Where a copy stages its tar. Guest -> host copies finish in a rename, which
+/// cannot cross a filesystem, so they stage next to the destination.
+fn copy_scratch_parent(destination: &str) -> PathBuf {
+    match SandboxMachines::split_guest(destination) {
+        None => Path::new(destination)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+        Some(_) => std::env::temp_dir(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,6 +1121,20 @@ mod tests {
         .unwrap();
         assert_eq!(script, "set -a; TOKEN='s3cr3t'; QUOTED='a'\\''b'; set +a;");
         assert!(!script.contains("exec"), "the wrapper must run the command");
+    }
+
+    #[test]
+    fn host_copies_stage_next_to_their_destination() {
+        assert_eq!(
+            copy_scratch_parent("/data/vol/out.tar"),
+            PathBuf::from("/data/vol")
+        );
+        assert_eq!(copy_scratch_parent("out.tar"), PathBuf::from("."));
+        // Guest destinations keep using the system temp directory.
+        assert_eq!(
+            copy_scratch_parent("sbx-1:/work/out.tar"),
+            std::env::temp_dir()
+        );
     }
 
     #[test]
