@@ -209,6 +209,7 @@ impl LocalSandboxes {
         let drivers = host_drivers(
             Some(&prefix),
             smolvm_slots(),
+            Some((*local).clone()),
             &ArtifactCache::from_env(state.join("sandbox-cache")),
             Some((*local).clone()),
         )?;
@@ -1292,6 +1293,7 @@ async fn serve_standalone(
             host_drivers(
                 Some(&named_prefix()),
                 smolvm_slots(),
+                None,
                 &ArtifactCache::from_env(state.join("sandbox-cache")),
                 None,
             )?,
