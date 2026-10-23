@@ -845,6 +845,9 @@ pub enum GithubSubsystem {
     /// Credential introspection that is not an App JWT: the static PAT's
     /// classic OAuth scope probe (`runs.rs`).
     Credentials,
+    /// OIDC mint support: the once-per-repository `created_at` lookup that
+    /// decides immutable subject claims (`github.rs`, `oidc_handlers.rs`).
+    Oidc,
 }
 
 impl GithubSubsystem {
@@ -862,10 +865,11 @@ impl GithubSubsystem {
             GithubSubsystem::Dispatch => "dispatch",
             GithubSubsystem::PushBack => "push-back",
             GithubSubsystem::Credentials => "credentials",
+            GithubSubsystem::Oidc => "oidc",
         }
     }
 
-    const ALL: [GithubSubsystem; 12] = [
+    const ALL: [GithubSubsystem; 13] = [
         GithubSubsystem::CheckRuns,
         GithubSubsystem::Actions,
         GithubSubsystem::RefResolve,
@@ -878,6 +882,7 @@ impl GithubSubsystem {
         GithubSubsystem::Dispatch,
         GithubSubsystem::PushBack,
         GithubSubsystem::Credentials,
+        GithubSubsystem::Oidc,
     ];
 }
 
@@ -1497,7 +1502,8 @@ mod tests {
                 "golden",
                 "dispatch",
                 "push-back",
-                "credentials"
+                "credentials",
+                "oidc"
             ]
         );
     }

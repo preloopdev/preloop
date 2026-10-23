@@ -613,6 +613,23 @@ pub struct TokenPermissionsCeiling {
     pub allow_create_approve_pr: bool,
 }
 
+/// OIDC provider settings (`[oidc]`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// Subject-claim format override for minted id-tokens. GitHub's
+    /// immutable subject claims embed the numeric owner/repository IDs in
+    /// `sub` (`repo:OWNER@OWNER-ID/REPO@REPO-ID:…`) so a deleted-and-
+    /// recreated repository cannot inherit its predecessor's cloud trust
+    /// policies. `Some(true)` forces the immutable form whenever both IDs
+    /// are known; `Some(false)` forces the historical name-based form.
+    /// Absent (the default), GitHub's rollout policy decides: repositories
+    /// created after 2026-07-15 mint immutable subjects, older ones keep
+    /// the name-based form. When the IDs are unknown the name-based form
+    /// is always used, regardless of this setting.
+    #[serde(default)]
+    pub immutable_subject_claims: Option<bool>,
+}
+
 /// Enforcement mode for workflow execution protections.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -831,6 +848,11 @@ pub struct ConfigFile {
     /// `None` (absent table) = no ceiling; today's behavior is unchanged.
     #[serde(default)]
     pub token_permissions_ceiling: Option<TokenPermissionsCeiling>,
+    /// OIDC provider settings (`[oidc]`): subject-claim format policy for
+    /// minted id-tokens. Empty by default: GitHub's creation-date rollout
+    /// policy decides the subject format.
+    #[serde(default)]
+    pub oidc: OidcConfig,
     /// Per-environment protection rules (`[environment_rules."owner/repo".env]`),
     /// mirroring GitHub's environment protection rules. Each rule set is
     /// optional and empty by default; a missing entry means "no rules" and
@@ -1403,7 +1425,7 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, golden: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?}, execution_protection: {:?} ({} event rules, {} actor rules) }}",
+            "ConfigFile {{ github: {:?}, golden: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, oidc: {:?}, fork_policy: {:?}, execution_protection: {:?} ({} event rules, {} actor rules) }}",
             self.github,
             self.golden,
             self.secrets.len(),
@@ -1418,6 +1440,7 @@ impl std::fmt::Debug for ConfigFile {
                     ceiling.r#default.as_str(),
                     ceiling.scopes.len()
                 )),
+            self.oidc,
             self.fork_policy,
             self.execution_protection.mode,
             self.execution_protection.event_rules.len(),
@@ -2479,6 +2502,7 @@ mod tests {
             )]),
             environments: BTreeMap::new(),
             token_permissions_ceiling: None,
+            oidc: OidcConfig::default(),
             environment_rules: BTreeMap::new(),
             fork_policy: ForkPolicyConfig::default(),
             execution_protection: ExecutionProtectionConfig::default(),
