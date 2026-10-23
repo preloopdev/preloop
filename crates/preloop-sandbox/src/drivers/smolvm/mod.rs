@@ -15,8 +15,8 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use self::cli::{
-    MachineName, MachineSpec, NetworkPolicy as VmNetwork, OutputChunk, SmolVmProvider,
-    SocketMount as VmSocket, VmError, VmProvider, VolumeMount, mark_sandbox_owned,
+    ForkInFlight, MachineName, MachineSpec, NetworkPolicy as VmNetwork, OutputChunk,
+    SmolVmProvider, SocketMount as VmSocket, VmError, VmProvider, VolumeMount, mark_sandbox_owned,
 };
 use crate::api::*;
 use crate::connect::{Code, Error, Result};
@@ -202,6 +202,9 @@ impl Driver for SmolvmDriver {
         };
         let clone = machine(&name)?;
         if !work.template.native_ref.is_empty() {
+            // The clone boots inside `fork`, before it is marked below: an
+            // orphan sweep must not run in between.
+            let _forking = ForkInFlight::enter();
             let golden = machine(&work.template.native_ref)?;
             match self.provider.fork(&golden, &clone).await {
                 Ok(()) => {

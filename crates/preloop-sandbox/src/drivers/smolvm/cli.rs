@@ -3540,6 +3540,29 @@ fn is_sandbox_owned(dir: &Path) -> bool {
     dir.join(SANDBOX_OWNER_MARKER).is_file()
 }
 
+/// Forks running in this process. A fork boots its clone inside `machine
+/// fork`, and the driver marks the clone only after that returns, so an orphan
+/// sweep meanwhile would see a live, unmarked sandbox.
+static FORKS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Holds [`FORKS_IN_FLIGHT`] raised from before a fork until its clone is
+/// marked.
+pub(crate) struct ForkInFlight;
+
+impl ForkInFlight {
+    /// Raise the count; the guard lowers it when dropped.
+    pub(crate) fn enter() -> Self {
+        FORKS_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ForkInFlight {
+    fn drop(&mut self) {
+        FORKS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanPurge {
@@ -3593,12 +3616,22 @@ pub enum OrphanPurge {
 /// that runs out of time is reported; the next tick retries. A `ps` table the
 /// capture cap cut short is reported the same way rather than swept as if it
 /// were complete (see [`complete_inventory`]).
+///
+/// While a fork runs in this process the sweep defers with an error rather
+/// than kill anything: the fork's clone is unmarked until its fork returns.
 pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
     let roots = machine_data_roots();
     if roots.is_empty() {
         return Ok(0);
     }
     let output = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
+    // Read after the process table: a fork that began before this read is
+    // already counted, and its clone may be in the table, unmarked.
+    if FORKS_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        return Err(VmError::Protocol(
+            "a sandbox fork is in flight in this process; the orphan sweep is deferred".to_owned(),
+        ));
+    }
     let text = complete_inventory("ps", &output)?;
     let mut killed = 0usize;
     for line in text.lines() {
