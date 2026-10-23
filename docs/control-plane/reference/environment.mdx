@@ -147,7 +147,7 @@ The official packed golden defaults are digest-pinned per architecture. The curr
 
 ## VM backend
 
-The engine boots each job in a microVM through SmolVM, the public driver. A host agent attaches the drivers named in `PRELOOP_SANDBOX_DRIVERS` (default `smolvm`).
+The engine boots each job in a microVM through a driver attached to its host agent. The host agent attaches the drivers named in `PRELOOP_SANDBOX_DRIVERS` (default `smolvm`); the build ships SmolVM, and other drivers attach the same way.
 
 <AccordionGroup>
   <Accordion title="Update and golden-build variables">

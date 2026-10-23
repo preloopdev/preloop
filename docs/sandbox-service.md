@@ -275,7 +275,10 @@ in-process and network APIs still return complete lists.
 The service keeps its working set in memory and writes through to its own
 store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
 `sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
-never references control tables. Writes are best-effort in the project's
+never references control tables. One process at a time holds
+`<state>/sandbox-service.lock` (flock): a second service, or a golden bake
+pointed at the same `PRELOOP_HOME`, fails instead of loading the store and
+reaping the running service's leases. Writes are best-effort in the project's
 sense: in-memory state is authoritative, so a store failure is logged at error
 level with the record kind and never fails the caller's RPC.
 
