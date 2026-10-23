@@ -121,12 +121,15 @@ impl LocalSandboxes {
             drivers,
             AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
         );
-        let session = agent.register().await.ok();
-        let provider_id = session
-            .as_ref()
-            .map(|session| session.provider_id.clone())
-            .unwrap_or_default();
-        tokio::spawn(agent.run(shutdown.clone()));
+        // Register once here so the pool can place immediately; the agent
+        // reuses this session instead of registering a second time (which
+        // would fence its own in-flight work).
+        let session = agent
+            .register()
+            .await
+            .context("registering the local sandbox provider")?;
+        let provider_id = session.provider_id.clone();
+        tokio::spawn(agent.run(Some(session), shutdown.clone()));
 
         let listen =
             env_nonempty("PRELOOP_SANDBOX_LISTEN").unwrap_or_else(|| "127.0.0.1:9191".into());
@@ -134,16 +137,20 @@ impl LocalSandboxes {
             let addr: SocketAddr = listen
                 .parse()
                 .context("PRELOOP_SANDBOX_LISTEN must be a socket address or `off`")?;
-            let auth = Auth::new(resolve_client_token(&state)?);
-            match tokio::net::TcpListener::bind(addr).await {
+            let token = resolve_client_token(&state)?;
+            match bind_endpoint(&state, addr).await {
                 Ok(listener) => {
-                    tracing::info!(%addr, "sandbox API listening (https)");
+                    let bound = listener.local_addr()?;
+                    tracing::info!(addr = %bound, "sandbox API listening (https)");
+                    let auth = Auth::for_listener(token, bound);
                     let stop = shutdown.clone();
                     let service = service.clone();
+                    let endpoint_state = state.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve_api(listener, service, auth, tls, stop).await {
                             tracing::warn!(%error, "sandbox API server stopped");
                         }
+                        clear_endpoint(&endpoint_state, bound);
                     });
                 }
                 Err(error) => {
@@ -242,6 +249,10 @@ fn resolve_client_token(state: &Path) -> anyhow::Result<String> {
     if let Ok(token) = std::fs::read_to_string(&path) {
         let token = token.trim();
         if !token.is_empty() {
+            // A token file left with a wider mode by an old build or a manual
+            // copy must not stay readable by other local users.
+            crate::set_private_file_permissions(&path)
+                .with_context(|| format!("securing {}", path.display()))?;
             return Ok(token.to_owned());
         }
     }
@@ -249,6 +260,88 @@ fn resolve_client_token(state: &Path) -> anyhow::Result<String> {
     tls::write_private(&path, token.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(token)
+}
+
+/// The API endpoint file: the HTTPS address the last successful bind published.
+pub(crate) const ENDPOINT_FILE: &str = "sandbox-endpoint";
+
+fn endpoint_path(state: &Path) -> PathBuf {
+    state.join(ENDPOINT_FILE)
+}
+
+/// A bound address as the base URL callers dial.
+fn endpoint_url(addr: SocketAddr) -> String {
+    format!("https://{addr}")
+}
+
+/// Publish the address a listener actually bound. Written owner-only so a
+/// local caller can trust it as the service it should send a token to.
+pub(crate) fn write_endpoint(state: &Path, addr: SocketAddr) -> anyhow::Result<()> {
+    let path = endpoint_path(state);
+    tls::write_private(&path, format!("{}\n", endpoint_url(addr)).as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn read_endpoint(state: &Path) -> Option<String> {
+    std::fs::read_to_string(endpoint_path(state))
+        .ok()
+        .map(|base| base.trim().to_owned())
+        .filter(|base| !base.is_empty())
+}
+
+/// Remove the endpoint file only while it still names `addr`: a newer
+/// process may have published its own address.
+pub(crate) fn clear_endpoint(state: &Path, addr: SocketAddr) {
+    let path = endpoint_path(state);
+    if read_endpoint(state).as_deref() == Some(endpoint_url(addr).as_str()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Bind and publish the endpoint, or clear a stale entry naming the address
+/// that could not be bound (a squatter must not inherit the CLI's trust).
+pub(crate) async fn bind_endpoint(
+    state: &Path,
+    addr: SocketAddr,
+) -> std::io::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            let bound = listener.local_addr()?;
+            write_endpoint(state, bound).map_err(std::io::Error::other)?;
+            Ok(listener)
+        }
+        Err(error) => {
+            clear_endpoint(state, addr);
+            Err(error)
+        }
+    }
+}
+
+/// Resolve the address a CLI call targets: an explicit `--service` (or
+/// `PRELOOP_SANDBOX_URL`) wins; otherwise the endpoint file written by the
+/// local service. Sending the token to an address the file does not name
+/// requires the caller to ask for it explicitly.
+pub(crate) fn resolve_service(state: &Path, service: Option<String>) -> anyhow::Result<String> {
+    match service.filter(|service| !service.trim().is_empty()) {
+        Some(service) => Ok(service),
+        None => read_endpoint(state).with_context(|| {
+            format!(
+                "no sandbox endpoint file ({}); pass --service (for example {DEFAULT_SANDBOX_URL})",
+                endpoint_path(state).display()
+            )
+        }),
+    }
+}
+
+/// The embedded service is only needed when a pool will place VMs on it.
+pub(crate) async fn start_if_pool(
+    pool_configured: bool,
+    home: &Path,
+) -> anyhow::Result<Option<LocalSandboxes>> {
+    if !pool_configured {
+        return Ok(None);
+    }
+    Ok(Some(LocalSandboxes::start(home).await?))
 }
 
 /// The token a local deployment wrote, when there is one.
@@ -290,9 +383,9 @@ fn sandbox_client(
 /// `preloop sandbox`.
 #[derive(Debug, Args)]
 pub(crate) struct SandboxArgs {
-    /// Sandbox API base URL.
-    #[arg(long, env = "PRELOOP_SANDBOX_URL", default_value = DEFAULT_SANDBOX_URL, global = true)]
-    service: String,
+    /// Sandbox API base URL (default: the address in `<home>/state/sandbox-endpoint`).
+    #[arg(long, env = "PRELOOP_SANDBOX_URL", global = true)]
+    service: Option<String>,
     /// Bearer token for the Sandboxes API. For `agent`'s first run this is the
     /// join token (`plj1.…`).
     #[arg(
@@ -581,11 +674,20 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 
 /// Entry point for `preloop sandbox`.
 pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
-    match args.command {
+    let SandboxArgs {
+        service,
+        token,
+        ca,
+        command,
+    } = args;
+    match command {
         SandboxCommand::Serve(serve) => serve_standalone(serve).await,
-        SandboxCommand::Agent(agent) => run_agent(args.token.clone(), agent).await,
+        // The agent's identity owns its service URL; only `--join` overrides it.
+        SandboxCommand::Agent(agent) => run_agent(token, agent).await,
         command => {
-            let client = sandbox_client(&args.service, args.token.clone(), args.ca.clone())?;
+            let state = crate::preloop_home().join("state");
+            let base = resolve_service(&state, service)?;
+            let client = sandbox_client(&base, token, ca)?;
             run_client(client, command).await
         }
     }
@@ -813,17 +915,22 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
             host_drivers(None, smolvm_slots())?,
             AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
         );
-        tokio::spawn(agent.run(shutdown.clone()));
+        tokio::spawn(agent.run(None, shutdown.clone()));
     }
-    let auth = Auth::new(resolve_client_token(&state)?);
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    eprintln!("[preloop] sandbox service on https://{}", args.listen);
+    let listener = bind_endpoint(&state, args.listen)
+        .await
+        .with_context(|| format!("binding {}", args.listen))?;
+    let bound = listener.local_addr()?;
+    let auth = Auth::for_listener(resolve_client_token(&state)?, bound);
+    eprintln!("[preloop] sandbox service on https://{bound}");
     let stop = shutdown.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         stop.cancel();
     });
-    serve_api(listener, service, auth, tls, shutdown.clone()).await?;
+    let served = serve_api(listener, service, auth, tls, shutdown.clone()).await;
+    clear_endpoint(&state, bound);
+    served?;
     shutdown.cancel();
     Ok(())
 }
@@ -872,7 +979,7 @@ async fn run_agent(client_token: Option<String>, args: AgentArgs) -> anyhow::Res
         stop.cancel();
     });
     eprintln!("[preloop] sandbox agent joining {base}");
-    agent.run(shutdown).await;
+    agent.run(None, shutdown).await;
     Ok(())
 }
 
@@ -938,5 +1045,76 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("--join"), "{error}");
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_token_is_generated_once_and_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let first = resolve_client_token(state).unwrap();
+        assert_eq!(first.len(), 64, "32 random bytes as hex");
+        let path = state.join("sandbox-client-token");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(
+            resolve_client_token(state).unwrap(),
+            first,
+            "later starts reuse the generated token"
+        );
+        // A stale wider file is tightened, not trusted as-is.
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(resolve_client_token(state).unwrap(), first);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn endpoint_is_published_over_https_and_cleared_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let listener = bind_endpoint(state, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert_eq!(read_endpoint(state), Some(format!("https://{addr}")));
+        assert_eq!(mode(&endpoint_path(state)), 0o600);
+
+        // The port is still held: the second bind fails and must not leave
+        // an endpoint naming the address behind for a caller to trust.
+        let error = bind_endpoint(state, addr).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(read_endpoint(state), None);
+
+        drop(listener);
+        clear_endpoint(state, addr);
+    }
+
+    #[test]
+    fn client_resolution_never_guesses_an_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        // No endpoint file and no explicit --service: refuse rather than
+        // send the bearer token to the built-in default.
+        assert!(resolve_service(state, None).is_err());
+
+        write_endpoint(state, "127.0.0.1:9191".parse().unwrap()).unwrap();
+        assert_eq!(
+            resolve_service(state, None).unwrap(),
+            "https://127.0.0.1:9191"
+        );
+
+        // An explicit --service is trusted even though the file names
+        // another address.
+        assert_eq!(
+            resolve_service(state, Some("https://other:1234".into())).unwrap(),
+            "https://other:1234"
+        );
     }
 }

@@ -2,7 +2,7 @@
 
 Preloop gets every VM from a Sandbox Service: a generic service that hands out
 running machines from pluggable backends. The CI runner pool is one client;
-`preloop sandbox …` The contract is
+the `preloop sandbox …` CLI is another. The contract is
 `proto/preloop/sandbox/v1/sandbox.proto` (in the repository root);
 the implementation is `crates/preloop-sandbox`, which never depends on the CI
 control plane.
@@ -72,7 +72,6 @@ parties integrate by implementing the Providers protocol.
 |---|---|---|
 | `smolvm` | public | CLI. Golden-fork: a build sandbox starts `--branchable`; `Snapshot` keeps it as the fork base; sandboxes from the snapshot template are `machine branch` clones. |
 | `fake` | public | Process-backed, for tests and conformance. |
-| Private drivers | private build | See the private repository for driver-specific implementations. |
 
 `smolvm serve` has native fork pools, but its clones lose `--mount-socket`
 relays (the CLI's branches keep them), so the driver stays on the CLI and pools
@@ -133,6 +132,14 @@ certificate. There is no plaintext mode and no loopback exemption.
 * `Report`/`ReportExec`/`Reconcile` are additionally fenced by the provider's
   registration generation, and a provider may not report output for another
   provider's exec, nor destroy another provider's machine.
+* **Loopback Host guard.** A listener bound to a loopback address rejects
+  requests whose `Host` is not `localhost`, an address in `127.0.0.0/8`, or
+  `::1`, so a DNS-rebound browser page cannot reach it by name. The port is
+  ignored; the check covers the RPC routes and the ticket data plane.
+* **Endpoint file.** The service publishes the address it actually bound to
+  `<state>/sandbox-endpoint` (mode 0600, `https://…`) and removes it on
+  shutdown; a CLI without an explicit `--service` uses that file and refuses
+  to send its token anywhere else.
 
 ## State
 
@@ -184,6 +191,10 @@ preloop sandbox ls
 preloop sandbox provider ls
 preloop sandbox provider rm host-a                     # revoke its certificates
 ```
+
+Without `--service` (or `PRELOOP_SANDBOX_URL`), the CLI reads
+`<home>/state/sandbox-endpoint`, which the local service writes when it binds,
+and refuses to send its bearer token to any other address.
 
 ## Verification
 
