@@ -29,6 +29,10 @@ use crate::store::{Kind, Store};
 pub struct ServiceConfig {
     /// Default lease TTL.
     pub lease_ttl: Duration,
+    /// How long an acquired-but-never-returned lease (one whose `Acquire` is
+    /// still provisioning, or timed out) may live before maintenance releases
+    /// it. A waiting `Acquire` keeps its lease past this window.
+    pub unclaimed_lease_ttl: Duration,
     /// Default time `Acquire` waits for a ready sandbox.
     pub acquire_wait: Duration,
     /// A provider silent this long is not placed on.
@@ -54,6 +58,7 @@ impl ServiceConfig {
     pub fn new(blob_dir: PathBuf) -> Self {
         Self {
             lease_ttl: Duration::from_secs(3600),
+            unclaimed_lease_ttl: Duration::from_secs(600),
             acquire_wait: Duration::from_secs(900),
             provider_timeout: Duration::from_secs(45),
             create_timeout: Duration::from_secs(1800),
@@ -91,6 +96,19 @@ fn now() -> i64 {
         .unwrap_or_default()
 }
 
+/// Exec env keys become shell assignments in argv-only drivers; reject
+/// anything that is not a POSIX identifier before it reaches a driver.
+fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
+    for key in env.keys() {
+        if !crate::driver::env_key_is_identifier(key) {
+            return Err(Error::invalid(format!(
+                "invalid environment variable name `{key}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn new_id(prefix: &str) -> String {
     format!(
         "{prefix}-{}",
@@ -98,10 +116,81 @@ fn new_id(prefix: &str) -> String {
     )
 }
 
+/// Copy a blob without blocking a Tokio worker for the length of the I/O.
+async fn copy_off_runtime(from: PathBuf, to: PathBuf, what: &str) -> Result<()> {
+    tokio::task::spawn_blocking(move || std::fs::copy(&from, &to))
+        .await
+        .map_err(|error| Error::internal(format!("{what}: {error}")))?
+        .map(|_| ())
+        .map_err(|error| Error::internal(format!("{what}: {error}")))
+}
+
+/// Build the inject tar readable only by its owner: its payload can carry
+/// secrets, and the guest owner is the only intended reader.
+fn build_inject_tar(tar_path: &Path, files: &[FileSpec]) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tar_path)
+        .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+    // `mode` only applies to a newly created file; a stale tar left by an
+    // earlier attempt must not keep its wider mode.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+    let mut builder = tar::Builder::new(file);
+    for spec in files {
+        let path = spec.path.trim_start_matches('/');
+        if path.is_empty() || path.split('/').any(|p| p == "..") {
+            return Err(Error::invalid(format!("bad inject path `{}`", spec.path)));
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(spec.data.len() as u64);
+        header.set_mode(if spec.mode == 0 { 0o600 } else { spec.mode });
+        header.set_mtime(now() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, spec.data.as_slice())
+            .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+    }
+    builder
+        .finish()
+        .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+    Ok(())
+}
+
 /// sha256 of the canonical JSON of a template spec.
 pub fn template_digest(spec: &TemplateSpec) -> String {
     let canonical = serde_json::to_vec(spec).unwrap_or_default();
     format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
+}
+
+/// Revision of a pool's full placement: its configuration plus the template
+/// digest it references. A warm member built for another revision must not
+/// serve a new acquire.
+fn pool_revision(state: &State, pool: &PoolSpec) -> String {
+    let template = state
+        .templates
+        .get(&pool.template)
+        .map(|template| template.digest.clone())
+        .unwrap_or_default();
+    let canonical = serde_json::to_vec(&(pool, template)).unwrap_or_default();
+    format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
+}
+
+/// State a sandbox returns to when its Pause/Stop is undone with no lease.
+fn restored_state(sandbox: &Sandbox) -> SandboxState {
+    match sandbox.prior_state {
+        // A preserved debug sandbox stays preserved (its deadline is kept).
+        SandboxState::Preserved => SandboxState::Preserved,
+        // A lease that was released while powered off: a pool member goes
+        // back to the warm set; any other sandbox stays a debug hold.
+        SandboxState::Leased if sandbox.pool.is_empty() => SandboxState::Preserved,
+        _ => SandboxState::Ready,
+    }
 }
 
 #[derive(Debug)]
@@ -125,19 +214,27 @@ enum Pending {
     },
     Pause {
         sandbox_id: String,
+        lease_id: String,
+        expected: SandboxState,
         reply: oneshot::Sender<Result<String>>,
     },
     Stop {
         sandbox_id: String,
+        lease_id: String,
+        expected: SandboxState,
         reply: oneshot::Sender<Result<String>>,
     },
     Start {
         sandbox_id: String,
+        lease_id: String,
+        expected: SandboxState,
         forkable: bool,
         reply: oneshot::Sender<Result<String>>,
     },
     Resume {
         sandbox_id: String,
+        lease_id: String,
+        expected: SandboxState,
         reply: oneshot::Sender<Result<String>>,
     },
 }
@@ -162,6 +259,8 @@ struct Blob {
     token: String,
     expires_at: i64,
     path: PathBuf,
+    /// Set by the first `claim_ticket`: a ticket is a single-use capability.
+    claimed: bool,
 }
 
 /// Per-sandbox creation parameters kept for (re)provisioning and audit.
@@ -222,6 +321,16 @@ fn close_execs(state: &mut State, sandbox_id: &str, reason: &str) {
     }
 }
 
+/// A lifecycle completion is applied only to the same sandbox incarnation
+/// that started the operation, under the same lease and in the state the
+/// operation expected to leave behind.
+fn still_in_state(state: &State, sandbox_id: &str, lease_id: &str, expected: SandboxState) -> bool {
+    state
+        .sandboxes
+        .get(sandbox_id)
+        .is_some_and(|sandbox| sandbox.lease_id == lease_id && sandbox.state == expected)
+}
+
 #[derive(Default)]
 struct State {
     templates: BTreeMap<String, Template>,
@@ -230,6 +339,9 @@ struct State {
     created_at: HashMap<String, Instant>,
     leases: BTreeMap<String, Lease>,
     lease_by_key: HashMap<String, String>,
+    /// In-process `Acquire` calls waiting for a lease, by idempotency key.
+    /// Maintenance must not expire a lease while its caller is still waiting.
+    waiting: HashMap<String, usize>,
     injected: HashSet<String>,
     providers: BTreeMap<String, ProviderRec>,
     pending: HashMap<String, PendingWork>,
@@ -237,6 +349,9 @@ struct State {
     blobs: HashMap<String, Blob>,
     /// Last creation failure per pool, to back off refills.
     pool_backoff: HashMap<String, Instant>,
+    /// Sandboxes with a snapshot in flight: release must not destroy their
+    /// base, and a second snapshot is rejected.
+    busy: HashSet<String>,
 }
 
 /// The service.
@@ -249,6 +364,45 @@ pub struct Service {
     seq: std::sync::atomic::AtomicU64,
     /// Highest sequence already written, per record.
     persisted: tokio::sync::Mutex<HashMap<(Kind, String), u64>>,
+    /// Serializes file injection per lease: concurrent same-key acquires
+    /// would otherwise stage and unlink one shared tar.
+    inject_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// An `Acquire` call waiting in this process, keyed by idempotency key.
+///
+/// Maintenance skips an expired lease while its waiter is alive: a boot or a
+/// golden unpack can outlast the unclaimed lease window.
+struct AcquireWaiter {
+    service: Arc<Service>,
+    key: String,
+}
+
+impl AcquireWaiter {
+    fn register(service: &Arc<Service>, key: &str) -> Self {
+        *service
+            .state
+            .lock()
+            .waiting
+            .entry(key.to_owned())
+            .or_default() += 1;
+        Self {
+            service: service.clone(),
+            key: key.to_owned(),
+        }
+    }
+}
+
+impl Drop for AcquireWaiter {
+    fn drop(&mut self) {
+        let mut state = self.service.state.lock();
+        if let Some(count) = state.waiting.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.waiting.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// One store write, stamped with the order it was decided in.
@@ -261,6 +415,19 @@ struct Op {
     kind: Kind,
     id: String,
     value: Option<serde_json::Value>,
+}
+
+/// Holds a sandbox in the service's busy set while a snapshot is in flight,
+/// and releases it however the call exits.
+struct SnapshotBusy<'a> {
+    service: &'a Service,
+    sandbox_id: String,
+}
+
+impl Drop for SnapshotBusy<'_> {
+    fn drop(&mut self) {
+        self.service.state.lock().busy.remove(&self.sandbox_id);
+    }
 }
 
 impl Service {
@@ -313,6 +480,7 @@ impl Service {
             config,
             seq: std::sync::atomic::AtomicU64::new(0),
             persisted: tokio::sync::Mutex::new(HashMap::new()),
+            inject_locks: Mutex::new(HashMap::new()),
         });
         service.sweep_lease_orphans().await;
         Ok(service)
@@ -418,23 +586,42 @@ impl Service {
             let mut state = self.state.lock();
             let mut ops = Vec::new();
             let t = now();
-            // Expired leases and preservation windows.
+            // Expired leases and preservation windows. A lease whose caller is
+            // still waiting in this process is not expired: a real boot or a
+            // golden unpack can outlast the unclaimed window.
+            let waiting = &state.waiting;
             let expired: Vec<String> = state
                 .leases
                 .values()
-                .filter(|lease| lease.expires_at <= t)
+                .filter(|lease| {
+                    lease.expires_at <= t && !waiting.contains_key(&lease.idempotency_key)
+                })
+                // A snapshot in flight still owns the base: do not destroy it
+                // from under the provider.
+                .filter(|lease| !state.busy.contains(&lease.sandbox_id))
                 .map(|lease| lease.id.clone())
                 .collect();
             for lease_id in expired {
                 info!(%lease_id, "lease expired; destroying sandbox");
                 self.release_locked(&mut state, &lease_id, ReleaseMode::Destroy, 0, &mut ops);
             }
-            // A stopped sandbox holds no host capacity, but it does hold
-            // disk: the create sweep below still applies to its record.
+            // Stop deliberately keeps the lease; a stopped sandbox holds no
+            // host capacity, but it does hold disk: the create sweep below
+            // still applies to its record. Paused/stopped sandboxes whose
+            // lease was preserved (or that were preserved before pausing)
+            // expire with the same window.
             let preserved: Vec<String> = state
                 .sandboxes
                 .values()
-                .filter(|s| s.state == SandboxState::Preserved && s.preserve_until <= t)
+                .filter(|s| {
+                    s.lease_id.is_empty()
+                        && matches!(
+                            s.state,
+                            SandboxState::Preserved | SandboxState::Paused | SandboxState::Stopped
+                        )
+                        && s.preserve_until > 0
+                        && s.preserve_until <= t
+                })
                 .map(|s| s.id.clone())
                 .collect();
             for id in preserved {
@@ -536,6 +723,25 @@ impl Service {
         {
             return;
         }
+        // Retire idle members built for an older pool/template revision: they
+        // no longer satisfy the configuration a new acquire expects.
+        let revision = pool_revision(state, pool);
+        let stale: Vec<String> = state
+            .sandboxes
+            .values()
+            .filter(|s| {
+                s.pool == pool.name
+                    && s.lease_id.is_empty()
+                    && s.state != SandboxState::Terminating
+                    && !s.state.is_terminal()
+                    && s.pool_revision != revision
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in stale {
+            info!(sandbox = %id, pool = %pool.name, "retiring a warm member built for an older pool revision");
+            self.destroy_locked(state, &id, ops);
+        }
         let members: Vec<&Sandbox> = state
             .sandboxes
             .values()
@@ -545,6 +751,7 @@ impl Service {
             .iter()
             .filter(|s| {
                 s.lease_id.is_empty()
+                    && s.pool_revision == revision
                     && matches!(s.state, SandboxState::Ready | SandboxState::Provisioning)
             })
             .count() as u32;
@@ -617,6 +824,18 @@ impl Service {
                 return Err(Error::precondition(format!(
                     "template `{name}` is used by pool `{}`",
                     pool.name
+                )));
+            }
+            // A fork base must outlive every clone: deleting it while a
+            // sandbox still starts from it invalidates that machine.
+            if let Some(sandbox) = state
+                .sandboxes
+                .values()
+                .find(|sandbox| sandbox.template == name && !sandbox.state.is_terminal())
+            {
+                return Err(Error::precondition(format!(
+                    "template `{name}` is still used by sandbox `{}`",
+                    sandbox.id
                 )));
             }
             let template = state
@@ -866,6 +1085,15 @@ impl Service {
         ops: &mut Vec<Op>,
     ) -> Result<String> {
         let id = new_id("sbx");
+        let revision = if pool.is_empty() {
+            String::new()
+        } else {
+            state
+                .pools
+                .get(pool)
+                .map(|spec| pool_revision(state, spec))
+                .unwrap_or_default()
+        };
         let sandbox = Sandbox {
             id: id.clone(),
             name: name.to_owned(),
@@ -877,6 +1105,7 @@ impl Service {
             state: SandboxState::Provisioning,
             purpose,
             created_at: now(),
+            pool_revision: revision,
             ..Sandbox::default()
         };
         let sandbox_driver = driver.clone();
@@ -1022,13 +1251,20 @@ impl Service {
             .is_some_and(|s| s.state == SandboxState::Failed);
         // Preservation is the one way a lease outlives `Release`: the id keeps
         // working as the debugging capability until the window closes. A
-        // second preserve extends that window instead of destroying.
+        // second preserve extends that window instead of destroying. A paused
+        // or stopped debugging machine keeps its power state (and must not be
+        // woken or destroyed just because it is no longer `Leased`).
         if preserve
             && !failed
-            && state
-                .sandboxes
-                .get(&lease.sandbox_id)
-                .is_some_and(|s| matches!(s.state, SandboxState::Leased | SandboxState::Preserved))
+            && state.sandboxes.get(&lease.sandbox_id).is_some_and(|s| {
+                matches!(
+                    s.state,
+                    SandboxState::Leased
+                        | SandboxState::Paused
+                        | SandboxState::Stopped
+                        | SandboxState::Preserved
+                )
+            })
         {
             let ttl = if preserve_ttl == 0 {
                 self.config.preserve_ttl.as_secs()
@@ -1037,7 +1273,9 @@ impl Service {
             };
             let until = now() + ttl as i64;
             if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
-                sandbox.state = SandboxState::Preserved;
+                if sandbox.state == SandboxState::Leased {
+                    sandbox.state = SandboxState::Preserved;
+                }
                 sandbox.preserve_until = until;
                 ops.push(self.put(Kind::Sandboxes, &lease.sandbox_id, &*sandbox));
             }
@@ -1076,6 +1314,42 @@ impl Service {
                 "exactly one of pool or template is required",
             ));
         }
+        if !request.pool.is_empty() {
+            // The pool path uses the pool's placement; silently dropping these
+            // would hand back a sandbox that ignores what the caller asked for.
+            let mut ignored = Vec::new();
+            if request.shape != Shape::default() {
+                ignored.push("shape");
+            }
+            if request.network != NetworkPolicy::default() {
+                ignored.push("network");
+            }
+            if !request.mounts.is_empty() {
+                ignored.push("mounts");
+            }
+            if !request.sockets.is_empty() {
+                ignored.push("sockets");
+            }
+            if !request.options.is_empty() {
+                ignored.push("options");
+            }
+            if !ignored.is_empty() {
+                return Err(Error::invalid(format!(
+                    "pool acquires cannot set {}; set these on the pool, or acquire from the template",
+                    ignored.join(", ")
+                )));
+            }
+            // A build sandbox must be started snapshot-capable, and a pool
+            // placement is fixed: take build sandboxes from the template.
+            if request.purpose == Purpose::Build {
+                return Err(Error::invalid(
+                    "pool acquires cannot be build sandboxes; acquire from the template",
+                ));
+            }
+        }
+        // From here until the response is returned this call counts as a
+        // waiter, so maintenance will not expire the lease it is provisioning.
+        let _waiter = AcquireWaiter::register(self, &request.idempotency_key);
         let wait = match request.wait_secs {
             None => self.config.acquire_wait,
             // An explicit zero means "report the current state, do not block".
@@ -1091,6 +1365,7 @@ impl Service {
                 Step::Ready(ready) => {
                     let (lease, sandbox) = *ready;
                     self.inject(&lease, &sandbox, &request.inject).await?;
+                    let lease = self.claim(&lease).await?;
                     return Ok(AcquireResponse { lease, sandbox });
                 }
                 Step::Wait(last) => {
@@ -1108,13 +1383,13 @@ impl Service {
         let mut ops = Vec::new();
         let step = {
             let mut state = self.state.lock();
-            self.try_acquire_locked(&mut state, request, &mut ops)?
+            self.try_acquire_locked(&mut state, request, &mut ops)
         };
         if !ops.is_empty() {
             self.persist(ops).await;
             self.changed.notify_waiters();
         }
-        Ok(step)
+        step
     }
 
     fn try_acquire_locked(
@@ -1131,9 +1406,10 @@ impl Service {
                 .cloned()
                 .ok_or_else(|| Error::not_found("leased sandbox is gone"))?;
             return match sandbox.state {
-                SandboxState::Leased | SandboxState::Paused | SandboxState::Preserved => {
-                    Ok(Step::Ready(Box::new((lease, sandbox))))
-                }
+                SandboxState::Leased
+                | SandboxState::Paused
+                | SandboxState::Stopped
+                | SandboxState::Preserved => Ok(Step::Ready(Box::new((lease, sandbox)))),
                 SandboxState::Provisioning => Ok(Step::Wait(None)),
                 _ => {
                     // Failed/gone: release so a retry with the same key can
@@ -1176,15 +1452,20 @@ impl Service {
                 state.pools.get(&request.pool).cloned().ok_or_else(|| {
                     Error::not_found(format!("pool `{}` not found", request.pool))
                 })?;
+            let revision = pool_revision(state, &pool);
             let warm = state
                 .sandboxes
                 .values()
                 .filter(|s| {
-                    s.pool == pool.name && s.lease_id.is_empty() && s.state == SandboxState::Ready
+                    s.pool == pool.name
+                        && s.lease_id.is_empty()
+                        && s.pool_revision == revision
+                        && s.state == SandboxState::Ready
                 })
                 .filter(|s| sandbox_meets(state, s, &request.requires))
-                .map(|s| s.id.clone())
-                .next();
+                // Oldest first, so warm members rotate and none goes stale.
+                .min_by_key(|s| (s.created_at, s.id.as_str()))
+                .map(|s| s.id.clone());
             match warm {
                 Some(id) => id,
                 None => {
@@ -1198,6 +1479,7 @@ impl Service {
                     let booting = state.sandboxes.values().any(|s| {
                         s.pool == pool.name
                             && s.lease_id.is_empty()
+                            && s.pool_revision == revision
                             && s.state == SandboxState::Provisioning
                             && sandbox_meets(state, s, &request.requires)
                     });
@@ -1260,7 +1542,10 @@ impl Service {
             sandbox_id: sandbox_id.clone(),
             pool: request.pool.clone(),
             idempotency_key: request.idempotency_key.clone(),
-            expires_at: now() + ttl as i64,
+            // Until the lease reaches a caller it may only live for the
+            // unclaimed window; delivery restores the requested TTL.
+            expires_at: now() + ttl.min(self.config.unclaimed_lease_ttl.as_secs()) as i64,
+            requested_ttl_secs: ttl,
             env: request.inject.env.clone(),
         };
         let sandbox = state
@@ -1288,49 +1573,78 @@ impl Service {
         })
     }
 
+    /// Mark a lease delivered when `Acquire` returns it: its expiry becomes
+    /// the caller's full TTL. A lease persisted before `requested_ttl_secs`
+    /// existed has 0 and is already delivered, so its expiry is left alone.
+    async fn claim(&self, lease: &Lease) -> Result<Lease> {
+        let (claimed, ops) = {
+            let mut state = self.state.lock();
+            let Some(current) = state.leases.get_mut(&lease.id) else {
+                return Ok(lease.clone());
+            };
+            if current.requested_ttl_secs == 0 {
+                return Ok(current.clone());
+            }
+            current.expires_at = now() + current.requested_ttl_secs as i64;
+            let current = current.clone();
+            let op = self.put(Kind::Leases, &current.id, &current);
+            (current, vec![op])
+        };
+        self.persist(ops).await;
+        Ok(claimed)
+    }
+
     async fn inject(
         self: &Arc<Self>,
         lease: &Lease,
         sandbox: &Sandbox,
         inject: &Inject,
     ) -> Result<()> {
-        if inject.files.is_empty() || self.state.lock().injected.contains(&lease.id) {
+        if inject.files.is_empty() {
             return Ok(());
         }
-        // Group files by directory into one tar per call: extract at `/`.
-        let tar_path = self
-            .config
-            .blob_dir
-            .join(format!("inject-{}.tar", lease.id));
-        {
-            let file = std::fs::File::create(&tar_path)
-                .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
-            let mut builder = tar::Builder::new(file);
-            for spec in &inject.files {
-                let path = spec.path.trim_start_matches('/');
-                if path.is_empty() || path.split('/').any(|p| p == "..") {
-                    return Err(Error::invalid(format!("bad inject path `{}`", spec.path)));
-                }
-                let mut header = tar::Header::new_gnu();
-                header.set_size(spec.data.len() as u64);
-                header.set_mode(if spec.mode == 0 { 0o644 } else { spec.mode });
-                header.set_mtime(now() as u64);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, path, spec.data.as_slice())
-                    .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
-            }
-            builder
-                .finish()
-                .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+        // Concurrent same-key acquires share one lease: serialize staging so
+        // they cannot truncate or unlink each other's tar.
+        let lock = self
+            .inject_locks
+            .lock()
+            .entry(lease.id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        if self.state.lock().injected.contains(&lease.id) {
+            self.inject_locks.lock().remove(&lease.id);
+            return Ok(());
         }
-        let result = self
-            .upload_path(&sandbox.id, &lease.id, "/", &tar_path)
-            .await;
-        let _ = std::fs::remove_file(&tar_path);
-        result?;
-        self.state.lock().injected.insert(lease.id.clone());
-        Ok(())
+        let result = async {
+            // Group files by directory into one tar per call: extract at `/`.
+            // A unique staging name keeps a retry of an earlier attempt from
+            // colliding with this one.
+            let tar_path = self.config.blob_dir.join(format!(
+                "inject-{}-{}.tar",
+                lease.id,
+                uuid::Uuid::new_v4().simple()
+            ));
+            let files = inject.files.clone();
+            let build_path = tar_path.clone();
+            let built = tokio::task::spawn_blocking(move || build_inject_tar(&build_path, &files))
+                .await
+                .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+            let result = match built {
+                Ok(()) => {
+                    self.upload_path(&sandbox.id, &lease.id, "/", &tar_path)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            let _ = std::fs::remove_file(&tar_path);
+            result?;
+            self.state.lock().injected.insert(lease.id.clone());
+            Ok(())
+        }
+        .await;
+        self.inject_locks.lock().remove(&lease.id);
+        result
     }
 
     /// `Renew`.
@@ -1341,11 +1655,17 @@ impl Service {
                 .leases
                 .get_mut(&request.lease_id)
                 .ok_or_else(|| Error::not_found("lease not found"))?;
-            let ttl = if request.ttl_secs == 0 {
-                self.config.lease_ttl.as_secs()
-            } else {
+            let ttl = if request.ttl_secs > 0 {
                 request.ttl_secs
+            } else if lease.requested_ttl_secs > 0 {
+                // A zero TTL means "keep the lease alive at the TTL it was
+                // acquired with", not the service default.
+                lease.requested_ttl_secs
+            } else {
+                // A lease persisted before `requested_ttl_secs` existed.
+                self.config.lease_ttl.as_secs()
             };
+            lease.requested_ttl_secs = ttl;
             lease.expires_at = now() + ttl as i64;
             let lease = lease.clone();
             let ops = vec![self.put(Kind::Leases, &lease.id, &lease)];
@@ -1359,8 +1679,13 @@ impl Service {
     pub async fn release(&self, request: ReleaseRequest) -> Result<()> {
         let ops = {
             let mut state = self.state.lock();
-            if !state.leases.contains_key(&request.lease_id) {
+            let Some(lease) = state.leases.get(&request.lease_id) else {
                 return Err(Error::not_found("lease not found"));
+            };
+            if state.busy.contains(&lease.sandbox_id) {
+                return Err(Error::precondition(
+                    "a snapshot is in progress; release after it completes",
+                ));
             }
             let mut ops = Vec::new();
             self.release_locked(
@@ -1442,6 +1767,7 @@ impl Service {
         if request.argv.is_empty() {
             return Err(Error::invalid("argv is required"));
         }
+        validate_env(&request.env)?;
         let mut state = self.state.lock();
         let sandbox = state
             .sandboxes
@@ -1451,7 +1777,8 @@ impl Service {
         authorize(&state, &sandbox, &request.lease_id)?;
         Self::usable(&sandbox)?;
         let mut merged = request.clone();
-        if let Some(lease) = state.leases.get(&request.lease_id) {
+        if let Some(lease) = state.leases.get(&sandbox.lease_id) {
+            validate_env(&lease.env)?;
             let mut env = lease.env.clone();
             env.extend(request.env.clone());
             merged.env = env;
@@ -1523,6 +1850,7 @@ impl Service {
                 token: token.clone(),
                 expires_at,
                 path: self.config.blob_dir.join(format!("{ticket}.tar")),
+                claimed: false,
             },
         );
         Ok(Ticket {
@@ -1532,9 +1860,11 @@ impl Service {
         })
     }
 
-    /// Validate a client ticket; returns `(kind, blob path)`.
+    /// Validate and consume a client ticket; returns `(kind, blob path)`.
+    /// The claim is atomic: two concurrent transfers cannot share (and
+    /// truncate) one destination.
     pub fn claim_ticket(&self, ticket: &str, token: &str) -> Result<(StreamKind, PathBuf)> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
         let blob = state
             .blobs
             .get(ticket)
@@ -1543,6 +1873,11 @@ impl Service {
         if !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
             return Err(Error::new(Code::Unauthenticated, "bad ticket token"));
         }
+        let blob = state.blobs.get_mut(ticket).expect("ticket looked up above");
+        if blob.claimed {
+            return Err(Error::not_found("ticket already claimed"));
+        }
+        blob.claimed = true;
         Ok((blob.kind, blob.path.clone()))
     }
 
@@ -1607,7 +1942,7 @@ impl Service {
     async fn stage_upload(&self, sandbox_id: &str, guest_dir: &str, tar: &Path) -> Result<()> {
         let ticket = new_id("tkt");
         let path = self.config.blob_dir.join(format!("{ticket}.tar"));
-        std::fs::copy(tar, &path).map_err(|e| Error::internal(format!("stage upload: {e}")))?;
+        copy_off_runtime(tar.to_owned(), path.clone(), "stage upload").await?;
         self.state.lock().blobs.insert(
             ticket.clone(),
             Blob {
@@ -1617,6 +1952,7 @@ impl Service {
                 token: String::new(),
                 expires_at: now() + self.config.ticket_ttl.as_secs() as i64,
                 path: path.clone(),
+                claimed: false,
             },
         );
         let result = self
@@ -1646,16 +1982,16 @@ impl Service {
                 token: String::new(),
                 expires_at: now() + self.config.ticket_ttl.as_secs() as i64,
                 path: path.clone(),
+                claimed: false,
             },
         );
         let result = self
             .copy_work(sandbox_id, &ticket, guest_path, StreamKind::Download)
-            .await
-            .and_then(|_| {
-                std::fs::copy(&path, dest)
-                    .map(|_| ())
-                    .map_err(|e| Error::internal(format!("download: {e}")))
-            });
+            .await;
+        let result = match result {
+            Ok(()) => copy_off_runtime(path.clone(), dest.to_owned(), "download").await,
+            Err(error) => Err(error),
+        };
         self.drop_ticket(&ticket);
         result
     }
@@ -1740,8 +2076,27 @@ impl Service {
                     "only a leased sandbox can be snapshotted",
                 ));
             }
-            let caps = self.driver_caps(&state, &sandbox)?;
+            if !state.busy.insert(sandbox.id.clone()) {
+                return Err(Error::precondition(
+                    "a snapshot of this sandbox is already in progress",
+                ));
+            }
+            if state.templates.contains_key(&request.name) {
+                state.busy.remove(&sandbox.id);
+                return Err(Error::new(
+                    Code::AlreadyExists,
+                    format!("template `{}` already exists", request.name),
+                ));
+            }
+            let caps = match self.driver_caps(&state, &sandbox) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    state.busy.remove(&sandbox.id);
+                    return Err(error);
+                }
+            };
             if !caps.snapshot {
+                state.busy.remove(&sandbox.id);
                 return Err(Error::precondition(format!(
                     "{}: snapshot unsupported",
                     sandbox.driver
@@ -1760,13 +2115,23 @@ impl Service {
                 }),
                 ..WorkItem::default()
             };
-            self.enqueue(
+            if let Err(error) = self.enqueue(
                 &mut state,
                 &sandbox.provider_id,
                 work,
                 Pending::Snapshot { reply: tx },
-            )?;
+            ) {
+                state.busy.remove(&sandbox.id);
+                return Err(error);
+            }
             (sandbox, source_template)
+        };
+        // The set is guarded from here on, including every error path. It is
+        // created after the state lock is released so its drop never
+        // re-enters the mutex.
+        let _busy = SnapshotBusy {
+            service: self,
+            sandbox_id: sandbox.id.clone(),
         };
         let native_ref = rx
             .await
@@ -1789,6 +2154,24 @@ impl Service {
         };
         let ops = {
             let mut state = self.state.lock();
+            // A release, failure or another lifecycle transition while the
+            // provider was working invalidates the capture: installing the
+            // template would point at a machine that is being destroyed.
+            let still_valid = state.sandboxes.get(&sandbox.id).is_some_and(|source| {
+                source.state == SandboxState::Leased
+                    && source.lease_id == sandbox.lease_id
+                    && source.incarnation == sandbox.incarnation
+            });
+            if !still_valid {
+                warn!(
+                    sandbox = %sandbox.id,
+                    "snapshot finished after its source changed; discarding the base"
+                );
+                self.drop_snapshot_locked(&mut state, &template);
+                return Err(Error::precondition(
+                    "the sandbox changed while its snapshot was in flight; result discarded",
+                ));
+            }
             let mut ops = vec![self.put(Kind::Templates, &template.spec.name, &template)];
             let replaced = state
                 .templates
@@ -1877,7 +2260,18 @@ impl Service {
                     sandbox.driver
                 )));
             }
+            if matches!(op, PowerOp::Stop)
+                && !sandbox.pool.is_empty()
+                && sandbox.lease_id.is_empty()
+                && sandbox.state == SandboxState::Ready
+            {
+                return Err(Error::precondition(
+                    "an idle pool member cannot be stopped; acquire it first",
+                ));
+            }
             let target = Self::target(&sandbox);
+            let expected = sandbox.state;
+            let lease_id = sandbox.lease_id.clone();
             let (work, kind) = match op {
                 PowerOp::Stop => (
                     WorkItem {
@@ -1887,6 +2281,8 @@ impl Service {
                     },
                     Pending::Stop {
                         sandbox_id: id.to_owned(),
+                        lease_id,
+                        expected,
                         reply: tx,
                     },
                 ),
@@ -1898,6 +2294,8 @@ impl Service {
                     },
                     Pending::Start {
                         sandbox_id: id.to_owned(),
+                        lease_id,
+                        expected,
                         forkable,
                         reply: tx,
                     },
@@ -1939,7 +2337,18 @@ impl Service {
                     sandbox.driver
                 )));
             }
+            if pause
+                && !sandbox.pool.is_empty()
+                && sandbox.lease_id.is_empty()
+                && sandbox.state == SandboxState::Ready
+            {
+                return Err(Error::precondition(
+                    "an idle pool member cannot be paused; acquire it first",
+                ));
+            }
             let target = Self::target(&sandbox);
+            let expected = sandbox.state;
+            let lease_id = sandbox.lease_id.clone();
             let (work, kind) = if pause {
                 (
                     WorkItem {
@@ -1949,6 +2358,8 @@ impl Service {
                     },
                     Pending::Pause {
                         sandbox_id: id.to_owned(),
+                        lease_id,
+                        expected,
                         reply: tx,
                     },
                 )
@@ -1961,6 +2372,8 @@ impl Service {
                     },
                     Pending::Resume {
                         sandbox_id: id.to_owned(),
+                        lease_id,
+                        expected,
                         reply: tx,
                     },
                 )
@@ -2198,60 +2611,138 @@ impl Service {
                     let _ = tx.try_send(Err(error));
                 }
             }
-            Pending::Copy { reply } | Pending::Snapshot { reply } => {
+            Pending::Copy { reply } => {
                 let _ = reply.send(result);
             }
-            Pending::Pause { sandbox_id, reply } => {
-                if result.is_ok()
-                    && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
-                {
-                    sandbox.state = SandboxState::Paused;
-                    ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                }
+            Pending::Snapshot { reply, .. } => {
+                // Validity is checked when the template is installed (the
+                // snapshot call still owns the source at this point).
                 let _ = reply.send(result);
             }
-            Pending::Stop { sandbox_id, reply } => {
-                if result.is_ok()
-                    && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
-                {
-                    sandbox.state = SandboxState::Stopped;
-                    ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                }
+            Pending::Pause {
+                sandbox_id,
+                lease_id,
+                expected,
+                reply,
+            } => {
+                let result = match result {
+                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
+                        let sandbox = state
+                            .sandboxes
+                            .get_mut(&sandbox_id)
+                            .expect("state checked above");
+                        sandbox.prior_state = sandbox.state;
+                        sandbox.state = SandboxState::Paused;
+                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
+                        Ok(String::new())
+                    }
+                    Ok(_) => Err(Error::precondition(
+                        "the sandbox changed while the pause was in flight",
+                    )),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Pending::Stop {
+                sandbox_id,
+                lease_id,
+                expected,
+                reply,
+            } => {
+                let result = match result {
+                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
+                        let sandbox = state
+                            .sandboxes
+                            .get_mut(&sandbox_id)
+                            .expect("state checked above");
+                        sandbox.prior_state = sandbox.state;
+                        sandbox.state = SandboxState::Stopped;
+                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
+                        Ok(String::new())
+                    }
+                    Ok(_) => Err(Error::precondition(
+                        "the sandbox changed while the stop was in flight",
+                    )),
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Pending::Start {
                 sandbox_id,
+                lease_id,
+                expected,
                 forkable,
                 reply,
             } => {
-                if result.is_ok()
-                    && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
-                {
-                    sandbox.state = if sandbox.lease_id.is_empty() {
-                        SandboxState::Ready
-                    } else {
-                        SandboxState::Leased
-                    };
-                    if forkable {
-                        sandbox.error.clear();
+                let result = match result {
+                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
+                        let sandbox = state
+                            .sandboxes
+                            .get_mut(&sandbox_id)
+                            .expect("state checked above");
+                        let next = if sandbox.lease_id.is_empty() {
+                            restored_state(sandbox)
+                        } else {
+                            SandboxState::Leased
+                        };
+                        self.restore_locked(sandbox, next);
+                        if forkable {
+                            sandbox.error.clear();
+                        }
+                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
+                        Ok(String::new())
                     }
-                    ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                }
+                    Ok(_) => Err(Error::precondition(
+                        "the sandbox changed while the start was in flight",
+                    )),
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
-            Pending::Resume { sandbox_id, reply } => {
-                if result.is_ok()
-                    && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
-                {
-                    sandbox.state = if sandbox.lease_id.is_empty() {
-                        SandboxState::Preserved
-                    } else {
-                        SandboxState::Leased
-                    };
-                    ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                }
+            Pending::Resume {
+                sandbox_id,
+                lease_id,
+                expected,
+                reply,
+            } => {
+                let result = match result {
+                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
+                        let sandbox = state
+                            .sandboxes
+                            .get_mut(&sandbox_id)
+                            .expect("state checked above");
+                        let next = if sandbox.lease_id.is_empty() {
+                            restored_state(sandbox)
+                        } else {
+                            SandboxState::Leased
+                        };
+                        self.restore_locked(sandbox, next);
+                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
+                        Ok(String::new())
+                    }
+                    Ok(_) => Err(Error::precondition(
+                        "the sandbox changed while the resume was in flight",
+                    )),
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
+        }
+    }
+
+    /// Apply a restored power state and its preservation bookkeeping.
+    fn restore_locked(&self, sandbox: &mut Sandbox, next: SandboxState) {
+        sandbox.state = next;
+        sandbox.prior_state = SandboxState::SandboxStateUnspecified;
+        match next {
+            SandboxState::Preserved => {
+                if sandbox.preserve_until == 0 {
+                    sandbox.preserve_until = now() + self.config.preserve_ttl.as_secs() as i64;
+                }
+            }
+            // Resuming or starting a preserved sandbox ends its debugging
+            // window; only an explicitly preserved sandbox holds one open.
+            _ => sandbox.preserve_until = 0,
         }
     }
 
@@ -2343,11 +2834,13 @@ impl Service {
                     }
                 }
             }
-            // Machines no record owns (orphans, stale incarnations).
+            // Machines no record owns (orphans, stale incarnations). Snapshot
+            // bases are protected service-wide: any provider may report the
+            // inventory, but a base belongs to the template record.
             let snapshots: HashSet<&str> = state
                 .templates
                 .values()
-                .filter(|t| t.provider_id == request.provider_id)
+                .filter(|t| !t.native_ref.is_empty())
                 .map(|t| t.native_ref.as_str())
                 .collect();
             let mut destroy = Vec::new();
@@ -2360,10 +2853,12 @@ impl Service {
                         && s.native_ref == item.native_ref
                         && (item.incarnation == 0 || s.incarnation == item.incarnation)
                 });
-                let provisioning = (!item.sandbox_id.is_empty()
-                    && state.sandboxes.get(&item.sandbox_id).is_some_and(|s| {
-                        s.state == SandboxState::Provisioning && s.incarnation == item.incarnation
-                    }))
+                // Proof this service created the machine: its id is one of
+                // ours (the driver encodes it in the native name), or a
+                // caller-named create we dispatched. Machines from another
+                // service sharing this host registry carry neither.
+                let ours = (!item.sandbox_id.is_empty()
+                    && state.sandboxes.contains_key(&item.sandbox_id))
                     || state.sandboxes.values().any(|s| {
                         s.provider_id == request.provider_id
                             && s.state == SandboxState::Provisioning
@@ -2373,20 +2868,24 @@ impl Service {
                 // Another provider's machine (two agents on one host, or a
                 // hand-created VM registered elsewhere) is never ours to
                 // reap: only orphans this provider could have created.
-                let foreign = state.sandboxes.values().any(|s| {
-                    s.provider_id != request.provider_id
-                        && !s.state.is_terminal()
-                        && (s.native_ref == item.native_ref
-                            || (!s.id.is_empty()
-                                && !item.sandbox_id.is_empty()
-                                && s.id == item.sandbox_id))
-                });
-                if !owned && !provisioning && !foreign {
+                let foreign = !item.native_ref.is_empty()
+                    && state.sandboxes.values().any(|s| {
+                        s.provider_id != request.provider_id
+                            && !s.state.is_terminal()
+                            && s.native_ref == item.native_ref
+                    });
+                if !owned && ours && !foreign {
                     destroy.push(SandboxWork {
                         sandbox_id: item.sandbox_id.clone(),
                         driver: item.driver.clone(),
                         native_ref: item.native_ref.clone(),
                     });
+                } else if !foreign {
+                    warn!(
+                        native_ref = %item.native_ref,
+                        driver = %item.driver,
+                        "inventory entry was not created by this service; leaving it alone"
+                    );
                 }
             }
             (ReconcileResponse { destroy }, ops)
@@ -2472,4 +2971,103 @@ pub async fn collect_exec(
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store;
+
+    fn ready_member(id: &str, created_at: i64) -> Sandbox {
+        Sandbox {
+            id: id.into(),
+            template: "alpine".into(),
+            pool: "p".into(),
+            state: SandboxState::Ready,
+            created_at,
+            ..Sandbox::default()
+        }
+    }
+
+    fn with_current_pool_revision(state: &State, sandbox: &mut Sandbox) {
+        if let Some(pool) = state.pools.get(&sandbox.pool) {
+            sandbox.pool_revision = pool_revision(state, pool);
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_members_rotate_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::open(
+            store::open("memory:").await.unwrap(),
+            ServiceConfig::new(dir.path().join("blobs")),
+        )
+        .await
+        .unwrap();
+        {
+            let mut state = service.state.lock();
+            state.templates.insert(
+                "alpine".into(),
+                Template {
+                    spec: TemplateSpec {
+                        name: "alpine".into(),
+                        ..TemplateSpec::default()
+                    },
+                    ..Template::default()
+                },
+            );
+            state.pools.insert(
+                "p".into(),
+                PoolSpec {
+                    name: "p".into(),
+                    template: "alpine".into(),
+                    ..PoolSpec::default()
+                },
+            );
+            // Insert the newer member first: map order must not decide.
+            let mut newer = ready_member("sbx-newer", 200);
+            with_current_pool_revision(&state, &mut newer);
+            state.sandboxes.insert("sbx-newer".into(), newer);
+            let mut older = ready_member("sbx-older", 100);
+            with_current_pool_revision(&state, &mut older);
+            state.sandboxes.insert("sbx-older".into(), older);
+        }
+        let first = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k1".into(),
+                pool: "p".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.sandbox.id, "sbx-older");
+        let second = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k2".into(),
+                pool: "p".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.sandbox.id, "sbx-newer");
+        // Equal ages break the tie by id.
+        {
+            let mut state = service.state.lock();
+            let mut y = ready_member("sbx-y", 300);
+            with_current_pool_revision(&state, &mut y);
+            state.sandboxes.insert("sbx-y".into(), y);
+            let mut x = ready_member("sbx-x", 300);
+            with_current_pool_revision(&state, &mut x);
+            state.sandboxes.insert("sbx-x".into(), x);
+        }
+        let third = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k3".into(),
+                pool: "p".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(third.sandbox.id, "sbx-x");
+    }
 }
