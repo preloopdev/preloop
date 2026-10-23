@@ -3720,6 +3720,8 @@ pub struct FileSpec {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_bytes"
     )]
     pub data: ::buffa::alloc::vec::Vec<u8>,
+    /// octal; 0 = 0600 (guest owner only)
+    ///
     /// Field 3: `mode`
     #[serde(
         rename = "mode",
@@ -4150,9 +4152,30 @@ pub struct Sandbox {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
     )]
     pub preserve_until: i64,
-    /// effective size: request fields + driver defaults
+    /// state before Pause/Stop; Resume/Start restores it
     ///
-    /// Field 15: `shape`
+    /// Field 15: `prior_state`
+    #[serde(
+        rename = "priorState",
+        alias = "prior_state",
+        with = "::buffa::json_helpers::proto_enum",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_default_enum_value"
+    )]
+    pub prior_state: ::buffa::EnumValue<SandboxState>,
+    /// pool+template configuration this member was built for
+    ///
+    /// Field 16: `pool_revision`
+    #[serde(
+        rename = "poolRevision",
+        alias = "pool_revision",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub pool_revision: ::buffa::alloc::string::String,
+    /// Effective size: request fields + driver defaults. 130-139 is the reserved
+    /// range for fields added after #619; `shape` was 15 before that split.
+    ///
+    /// Field 130: `shape`
     #[serde(
         rename = "shape",
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
@@ -4178,6 +4201,8 @@ impl ::core::fmt::Debug for Sandbox {
             .field("created_at", &self.created_at)
             .field("name", &self.name)
             .field("preserve_until", &self.preserve_until)
+            .field("prior_state", &self.prior_state)
+            .field("pool_revision", &self.pool_revision)
             .field("shape", &self.shape)
             .finish()
     }
@@ -4254,12 +4279,22 @@ impl ::buffa::Message for Sandbox {
         if self.preserve_until != 0i64 {
             size += 1u64 + ::buffa::types::int64_encoded_len(self.preserve_until) as u64;
         }
+        {
+            let val = self.prior_state.to_i32();
+            if val != 0 {
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
+            }
+        }
+        if !self.pool_revision.is_empty() {
+            size
+                += 2u64 + ::buffa::types::string_encoded_len(&self.pool_revision) as u64;
+        }
         if self.shape.is_set() {
             let __slot = __cache.reserve();
             let inner_size = self.shape.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
-                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
@@ -4317,9 +4352,18 @@ impl ::buffa::Message for Sandbox {
         if self.preserve_until != 0i64 {
             ::buffa::types::put_int64_field(14u32, self.preserve_until, buf);
         }
+        {
+            let val = self.prior_state.to_i32();
+            if val != 0 {
+                ::buffa::types::put_int32_field(15u32, val, buf);
+            }
+        }
+        if !self.pool_revision.is_empty() {
+            ::buffa::types::put_string_field(16u32, &self.pool_revision, buf);
+        }
         if self.shape.is_set() {
             ::buffa::types::put_len_delimited_header(
-                15u32,
+                130u32,
                 u64::from(__cache.consume_next()),
                 buf,
             );
@@ -4436,6 +4480,22 @@ impl ::buffa::Message for Sandbox {
             15u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.prior_state = ::buffa::EnumValue::from(
+                    ::buffa::types::decode_int32(buf)?,
+                );
+            }
+            16u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.pool_revision, buf)?;
+            }
+            130u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
                 ::buffa::Message::merge_length_delimited(
@@ -4465,6 +4525,8 @@ impl ::buffa::Message for Sandbox {
         self.created_at = 0i64;
         self.name.clear();
         self.preserve_until = 0i64;
+        self.prior_state = ::buffa::EnumValue::from(0);
+        self.pool_revision.clear();
         self.shape = ::buffa::MessageField::none();
         self.__buffa_unknown_fields.clear();
     }
@@ -4552,6 +4614,16 @@ pub struct Lease {
         ::buffa::alloc::string::String,
         ::buffa::alloc::string::String,
     >,
+    /// caller's TTL; delivery restores it
+    ///
+    /// Field 7: `requested_ttl_secs`
+    #[serde(
+        rename = "requestedTtlSecs",
+        alias = "requested_ttl_secs",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub requested_ttl_secs: u64,
     /// sha256 of the Acquire payload that owns `idempotency_key`; a reuse with a
     /// different payload is rejected. 130-139 is the reserved range for new
     /// fields on existing messages.
@@ -4577,6 +4649,7 @@ impl ::core::fmt::Debug for Lease {
             .field("idempotency_key", &self.idempotency_key)
             .field("expires_at", &self.expires_at)
             .field("env", &self.env)
+            .field("requested_ttl_secs", &self.requested_ttl_secs)
             .field("request_hash", &self.request_hash)
             .finish()
     }
@@ -4631,6 +4704,11 @@ impl ::buffa::Message for Lease {
                 ::buffa::map_codec::Str,
                 _,
             >(&self.env, 1u64);
+        if self.requested_ttl_secs != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.requested_ttl_secs) as u64;
+        }
         if !self.request_hash.is_empty() {
             size += 2u64 + ::buffa::types::string_encoded_len(&self.request_hash) as u64;
         }
@@ -4664,6 +4742,9 @@ impl ::buffa::Message for Lease {
             ::buffa::map_codec::Str,
             _,
         >(&self.env, 6u32, buf);
+        if self.requested_ttl_secs != 0u64 {
+            ::buffa::types::put_uint64_field(7u32, self.requested_ttl_secs, buf);
+        }
         if !self.request_hash.is_empty() {
             ::buffa::types::put_string_field(130u32, &self.request_hash, buf);
         }
@@ -4726,6 +4807,13 @@ impl ::buffa::Message for Lease {
                     _,
                 >(&mut self.env, buf, ctx)?;
             }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.requested_ttl_secs = ::buffa::types::decode_uint64(buf)?;
+            }
             130u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
@@ -4747,6 +4835,7 @@ impl ::buffa::Message for Lease {
         self.idempotency_key.clear();
         self.expires_at = 0i64;
         self.env.clear();
+        self.requested_ttl_secs = 0u64;
         self.request_hash.clear();
         self.__buffa_unknown_fields.clear();
     }
@@ -20816,6 +20905,8 @@ pub mod __buffa {
             ///
             /// Field 2: `data`
             pub data: &'a [u8],
+            /// octal; 0 = 0600 (guest owner only)
+            ///
             /// Field 3: `mode`
             pub mode: u32,
             pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
@@ -21089,6 +21180,8 @@ pub mod __buffa {
             pub fn data(&self) -> &'_ [u8] {
                 self.0.reborrow().data
             }
+            /// octal; 0 = 0600 (guest owner only)
+            ///
             /// Field 3: `mode`
             #[must_use]
             pub fn mode(&self) -> u32 {
@@ -21555,9 +21648,18 @@ pub mod __buffa {
             pub name: &'a str,
             /// Field 14: `preserve_until`
             pub preserve_until: i64,
-            /// effective size: request fields + driver defaults
+            /// state before Pause/Stop; Resume/Start restores it
             ///
-            /// Field 15: `shape`
+            /// Field 15: `prior_state`
+            pub prior_state: ::buffa::EnumValue<super::super::SandboxState>,
+            /// pool+template configuration this member was built for
+            ///
+            /// Field 16: `pool_revision`
+            pub pool_revision: &'a str,
+            /// Effective size: request fields + driver defaults. 130-139 is the reserved
+            /// range for fields added after #619; `shape` was 15 before that split.
+            ///
+            /// Field 130: `shape`
             pub shape: ::buffa::MessageFieldView<
                 super::super::__buffa::view::ShapeView<'a>,
             >,
@@ -21697,6 +21799,22 @@ pub mod __buffa {
                     15u32 => {
                         ::buffa::encoding::check_wire_type(
                             tag,
+                            ::buffa::encoding::WireType::Varint,
+                        )?;
+                        view.prior_state = ::buffa::EnumValue::from(
+                            ::buffa::types::decode_int32(&mut cur)?,
+                        );
+                    }
+                    16u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::LengthDelimited,
+                        )?;
+                        view.pool_revision = ::buffa::types::borrow_str(&mut cur)?;
+                    }
+                    130u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
                             ::buffa::encoding::WireType::LengthDelimited,
                         )?;
                         let __sub_ctx = ctx.descend()?;
@@ -21755,6 +21873,8 @@ pub mod __buffa {
                     created_at: self.created_at,
                     name: self.name.to_string(),
                     preserve_until: self.preserve_until,
+                    prior_state: self.prior_state,
+                    pool_revision: self.pool_revision.to_string(),
                     shape: match self.shape.as_option() {
                         Some(v) => {
                             ::buffa::MessageField::<
@@ -21841,12 +21961,24 @@ pub mod __buffa {
                             + ::buffa::types::int64_encoded_len(self.preserve_until)
                                 as u64;
                 }
+                {
+                    let val = self.prior_state.to_i32();
+                    if val != 0 {
+                        size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
+                    }
+                }
+                if !self.pool_revision.is_empty() {
+                    size
+                        += 2u64
+                            + ::buffa::types::string_encoded_len(&self.pool_revision)
+                                as u64;
+                }
                 if self.shape.is_set() {
                     let __slot = __cache.reserve();
                     let inner_size = self.shape.compute_size(__cache);
                     __cache.set(__slot, inner_size);
                     size
-                        += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                        += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                             + inner_size as u64;
                 }
                 size += self.__buffa_unknown_fields.encoded_len() as u64;
@@ -21905,9 +22037,18 @@ pub mod __buffa {
                 if self.preserve_until != 0i64 {
                     ::buffa::types::put_int64_field(14u32, self.preserve_until, buf);
                 }
+                {
+                    let val = self.prior_state.to_i32();
+                    if val != 0 {
+                        ::buffa::types::put_int32_field(15u32, val, buf);
+                    }
+                }
+                if !self.pool_revision.is_empty() {
+                    ::buffa::types::put_string_field(16u32, &self.pool_revision, buf);
+                }
                 if self.shape.is_set() {
                     ::buffa::types::put_len_delimited_header(
-                        15u32,
+                        130u32,
                         u64::from(__cache.consume_next()),
                         buf,
                     );
@@ -21982,6 +22123,14 @@ pub mod __buffa {
                             "preserveUntil",
                             &::buffa::json_helpers::ProtoJson(&self.preserve_until),
                         )?;
+                }
+                if !::buffa::json_helpers::skip_if::is_default_enum_value(
+                    &self.prior_state,
+                ) {
+                    __map.serialize_entry("priorState", &self.prior_state)?;
+                }
+                if !::buffa::json_helpers::skip_if::is_empty_str(self.pool_revision) {
+                    __map.serialize_entry("poolRevision", self.pool_revision)?;
                 }
                 {
                     if let ::core::option::Option::Some(__v) = self.shape.as_option() {
@@ -22149,9 +22298,24 @@ pub mod __buffa {
             pub fn preserve_until(&self) -> i64 {
                 self.0.reborrow().preserve_until
             }
-            /// effective size: request fields + driver defaults
+            /// state before Pause/Stop; Resume/Start restores it
             ///
-            /// Field 15: `shape`
+            /// Field 15: `prior_state`
+            #[must_use]
+            pub fn prior_state(&self) -> ::buffa::EnumValue<super::super::SandboxState> {
+                self.0.reborrow().prior_state
+            }
+            /// pool+template configuration this member was built for
+            ///
+            /// Field 16: `pool_revision`
+            #[must_use]
+            pub fn pool_revision(&self) -> &'_ str {
+                self.0.reborrow().pool_revision
+            }
+            /// Effective size: request fields + driver defaults. 130-139 is the reserved
+            /// range for fields added after #619; `shape` was 15 before that split.
+            ///
+            /// Field 130: `shape`
             #[must_use]
             pub fn shape(
                 &self,
@@ -22205,6 +22369,10 @@ pub mod __buffa {
             ///
             /// Field 6: `env` (map)
             pub env: ::buffa::MapView<'a, &'a str, &'a str>,
+            /// caller's TTL; delivery restores it
+            ///
+            /// Field 7: `requested_ttl_secs`
+            pub requested_ttl_secs: u64,
             /// sha256 of the Acquire payload that owns `idempotency_key`; a reuse with a
             /// different payload is rejected. 130-139 is the reserved range for new
             /// fields on existing messages.
@@ -22283,6 +22451,15 @@ pub mod __buffa {
                             ::buffa::encoding::WireType::Varint,
                         )?;
                         view.expires_at = ::buffa::types::decode_int64(&mut cur)?;
+                    }
+                    7u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::Varint,
+                        )?;
+                        view.requested_ttl_secs = ::buffa::types::decode_uint64(
+                            &mut cur,
+                        )?;
                     }
                     130u32 => {
                         ::buffa::encoding::check_wire_type(
@@ -22367,6 +22544,7 @@ pub mod __buffa {
                         .iter()
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect(),
+                    requested_ttl_secs: self.requested_ttl_secs,
                     request_hash: self.request_hash.to_string(),
                     __buffa_unknown_fields: self
                         .__buffa_unknown_fields
@@ -22413,6 +22591,12 @@ pub mod __buffa {
                     size
                         += 1u64 + ::buffa::encoding::varint_len(entry_size) as u64
                             + entry_size;
+                }
+                if self.requested_ttl_secs != 0u64 {
+                    size
+                        += 1u64
+                            + ::buffa::types::uint64_encoded_len(self.requested_ttl_secs)
+                                as u64;
                 }
                 if !self.request_hash.is_empty() {
                     size
@@ -22468,6 +22652,9 @@ pub mod __buffa {
                         )
                         .encode(buf);
                     ::buffa::types::encode_string(v, buf);
+                }
+                if self.requested_ttl_secs != 0u64 {
+                    ::buffa::types::put_uint64_field(7u32, self.requested_ttl_secs, buf);
                 }
                 if !self.request_hash.is_empty() {
                     ::buffa::types::put_string_field(130u32, &self.request_hash, buf);
@@ -22531,6 +22718,15 @@ pub mod __buffa {
                         }
                     }
                     __map.serialize_entry("env", &_WM(&self.env))?;
+                }
+                if !::buffa::json_helpers::skip_if::is_zero_u64(
+                    &self.requested_ttl_secs,
+                ) {
+                    __map
+                        .serialize_entry(
+                            "requestedTtlSecs",
+                            &::buffa::json_helpers::ProtoJson(&self.requested_ttl_secs),
+                        )?;
                 }
                 if !::buffa::json_helpers::skip_if::is_empty_str(self.request_hash) {
                     __map.serialize_entry("requestHash", self.request_hash)?;
@@ -22657,6 +22853,13 @@ pub mod __buffa {
             #[must_use]
             pub fn env(&self) -> &::buffa::MapView<'_, &'_ str, &'_ str> {
                 &self.0.reborrow().env
+            }
+            /// caller's TTL; delivery restores it
+            ///
+            /// Field 7: `requested_ttl_secs`
+            #[must_use]
+            pub fn requested_ttl_secs(&self) -> u64 {
+                self.0.reborrow().requested_ttl_secs
             }
             /// sha256 of the Acquire payload that owns `idempotency_key`; a reuse with a
             /// different payload is rejected. 130-139 is the reserved range for new
