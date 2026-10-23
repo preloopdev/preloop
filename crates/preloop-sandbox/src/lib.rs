@@ -26,5 +26,6 @@ pub mod tls;
 pub use client::{InProcess, SandboxApi, SandboxClient};
 pub use connect::{Code, Error, Result};
 pub use driver::Driver;
+pub use server::{HostAllowlist, ListenerSurface};
 pub use service::{ProviderIdentity, Service, ServiceConfig};
 pub use tls::{AgentIdentity, PeerIdentity, ServerTls, ServiceCa};
