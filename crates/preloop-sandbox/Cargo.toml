@@ -29,6 +29,10 @@ postgres_rustls.workspace = true
 preloop-observability = { path = "../preloop-observability" }
 rand.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
+# Sealed envelopes for the few secrets that must survive a retry (lease and
+# exec env). `ring` is already in the workspace lock at 0.17.14 through rustls;
+# this is a first-party manifest edge on that identical locked version.
+ring = "0.17"
 reqwest.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true

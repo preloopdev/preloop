@@ -14,6 +14,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod backend;
 pub mod client;
 pub mod driver;
 pub mod driver_conformance;

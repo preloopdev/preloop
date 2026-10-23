@@ -318,7 +318,14 @@ enum StreamKind {
 }
 message OpenStreamRequest { string sandbox_id = 1; StreamKind kind = 2; string path = 3; string lease_id = 100; }
 message Ticket { string url = 1; string token = 2; int64 expires_at = 3; }
-message SnapshotRequest { string sandbox_id = 1; string name = 2; string lease_id = 100; }
+message SnapshotRequest {
+  string sandbox_id = 1;
+  string name = 2;
+  // Stable retry identity for a snapshot whose successful response was lost.
+  // A replay is checked against the original capability and source identity.
+  string idempotency_key = 3;
+  string lease_id = 100;
+}
 message StartRequest { string sandbox_id = 1; bool forkable = 2; string lease_id = 100; }
 message ListProvidersResponse {
   repeated Provider providers = 1;
@@ -468,6 +475,10 @@ message CancelExecWork { string exec_id = 1; SandboxWork target = 2; }
 
 message WorkItem {
   string id = 1;                    // redelivery reuses it; Report acknowledges it
+  // Delivery attempt, incremented by the service on every claim. The agent
+  // echoes it on Report/ReportExec so a report from an older delivery is
+  // fenced instead of being mistaken for the current attempt.
+  uint64 attempt = 130;
   oneof work {
     CreateWork create = 2;
     SandboxWork destroy = 3;
@@ -494,6 +505,9 @@ message ReportRequest {
   bool ok = 4;
   string error = 5;
   string native_ref = 6;            // create / snapshot result
+  // Delivery attempt echoed from the WorkItem; 0 means an unsequenced
+  // hand-written client and is accepted only when it names the current work.
+  uint64 attempt = 130;
 }
 message ReportExecRequest {
   string provider_id = 1;
@@ -505,6 +519,8 @@ message ReportExecRequest {
   // never mistaken for a duplicate. The service drops a batch whose sequence
   // it already applied. 0 is an unsequenced batch (hand-written clients).
   uint64 sequence = 120;
+  // Delivery attempt echoed from the WorkItem. An older attempt is fenced.
+  uint64 attempt = 130;
 }
 
 message Observed {

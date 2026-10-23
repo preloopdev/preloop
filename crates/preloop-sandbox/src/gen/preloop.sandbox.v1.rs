@@ -8651,6 +8651,17 @@ pub struct SnapshotRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
+    /// Stable retry identity for a snapshot whose successful response was lost.
+    /// A replay is checked against the original capability and source identity.
+    ///
+    /// Field 3: `idempotency_key`
+    #[serde(
+        rename = "idempotencyKey",
+        alias = "idempotency_key",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub idempotency_key: ::buffa::alloc::string::String,
     /// Field 100: `lease_id`
     #[serde(
         rename = "leaseId",
@@ -8668,6 +8679,7 @@ impl ::core::fmt::Debug for SnapshotRequest {
         f.debug_struct("SnapshotRequest")
             .field("sandbox_id", &self.sandbox_id)
             .field("name", &self.name)
+            .field("idempotency_key", &self.idempotency_key)
             .field("lease_id", &self.lease_id)
             .finish()
     }
@@ -8705,6 +8717,11 @@ impl ::buffa::Message for SnapshotRequest {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
+        if !self.idempotency_key.is_empty() {
+            size
+                += 1u64
+                    + ::buffa::types::string_encoded_len(&self.idempotency_key) as u64;
+        }
         if !self.lease_id.is_empty() {
             size += 2u64 + ::buffa::types::string_encoded_len(&self.lease_id) as u64;
         }
@@ -8723,6 +8740,9 @@ impl ::buffa::Message for SnapshotRequest {
         }
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.name, buf);
+        }
+        if !self.idempotency_key.is_empty() {
+            ::buffa::types::put_string_field(3u32, &self.idempotency_key, buf);
         }
         if !self.lease_id.is_empty() {
             ::buffa::types::put_string_field(100u32, &self.lease_id, buf);
@@ -8754,6 +8774,13 @@ impl ::buffa::Message for SnapshotRequest {
                 )?;
                 ::buffa::types::merge_string(&mut self.name, buf)?;
             }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.idempotency_key, buf)?;
+            }
             100u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
@@ -8771,6 +8798,7 @@ impl ::buffa::Message for SnapshotRequest {
     fn clear(&mut self) {
         self.sandbox_id.clear();
         self.name.clear();
+        self.idempotency_key.clear();
         self.lease_id.clear();
         self.__buffa_unknown_fields.clear();
     }
@@ -14178,6 +14206,17 @@ pub struct WorkItem {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub id: ::buffa::alloc::string::String,
+    /// Delivery attempt, incremented by the service on every claim. The agent
+    /// echoes it on Report/ReportExec so a report from an older delivery is
+    /// fenced instead of being mistaken for the current attempt.
+    ///
+    /// Field 130: `attempt`
+    #[serde(
+        rename = "attempt",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub attempt: u64,
     #[serde(flatten)]
     pub work: ::core::option::Option<__buffa::oneof::work_item::Work>,
     #[serde(skip)]
@@ -14188,6 +14227,7 @@ impl ::core::fmt::Debug for WorkItem {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         f.debug_struct("WorkItem")
             .field("id", &self.id)
+            .field("attempt", &self.attempt)
             .field("work", &self.work)
             .finish()
     }
@@ -14306,6 +14346,9 @@ impl ::buffa::Message for WorkItem {
                 }
             }
         }
+        if self.attempt != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.attempt) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -14402,6 +14445,9 @@ impl ::buffa::Message for WorkItem {
                     x.write_to(__cache, buf);
                 }
             }
+        }
+        if self.attempt != 0u64 {
+            ::buffa::types::put_uint64_field(130u32, self.attempt, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -14623,6 +14669,13 @@ impl ::buffa::Message for WorkItem {
                     );
                 }
             }
+            130u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.attempt = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -14633,6 +14686,7 @@ impl ::buffa::Message for WorkItem {
     fn clear(&mut self) {
         self.id.clear();
         self.work = ::core::option::Option::None;
+        self.attempt = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -14664,6 +14718,7 @@ impl<'de> ::serde::Deserialize<'de> for WorkItem {
                 mut map: A,
             ) -> ::core::result::Result<WorkItem, A::Error> {
                 let mut __f_id: ::core::option::Option<::buffa::alloc::string::String> = None;
+                let mut __f_attempt: ::core::option::Option<u64> = None;
                 let mut __oneof_work: ::core::option::Option<
                     __buffa::oneof::work_item::Work,
                 > = None;
@@ -14682,6 +14737,21 @@ impl<'de> ::serde::Deserialize<'de> for WorkItem {
                                         D::Error,
                                     > {
                                         ::buffa::json_helpers::proto_string::deserialize(d)
+                                    }
+                                }
+                                map.next_value_seed(_S)?
+                            });
+                        }
+                        "attempt" => {
+                            __f_attempt = Some({
+                                struct _S;
+                                impl<'de> ::serde::de::DeserializeSeed<'de> for _S {
+                                    type Value = u64;
+                                    fn deserialize<D: ::serde::Deserializer<'de>>(
+                                        self,
+                                        d: D,
+                                    ) -> ::core::result::Result<u64, D::Error> {
+                                        ::buffa::json_helpers::uint64::deserialize(d)
                                     }
                                 }
                                 map.next_value_seed(_S)?
@@ -14936,6 +15006,9 @@ impl<'de> ::serde::Deserialize<'de> for WorkItem {
                 if let ::core::option::Option::Some(v) = __f_id {
                     __r.id = v;
                 }
+                if let ::core::option::Option::Some(v) = __f_attempt {
+                    __r.attempt = v;
+                }
                 __r.work = __oneof_work;
                 Ok(__r)
             }
@@ -15165,6 +15238,16 @@ pub struct ReportRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub native_ref: ::buffa::alloc::string::String,
+    /// Delivery attempt echoed from the WorkItem; 0 means an unsequenced
+    /// hand-written client and is accepted only when it names the current work.
+    ///
+    /// Field 130: `attempt`
+    #[serde(
+        rename = "attempt",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub attempt: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -15178,6 +15261,7 @@ impl ::core::fmt::Debug for ReportRequest {
             .field("ok", &self.ok)
             .field("error", &self.error)
             .field("native_ref", &self.native_ref)
+            .field("attempt", &self.attempt)
             .finish()
     }
 }
@@ -15226,6 +15310,9 @@ impl ::buffa::Message for ReportRequest {
         if !self.native_ref.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.native_ref) as u64;
         }
+        if self.attempt != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.attempt) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -15253,6 +15340,9 @@ impl ::buffa::Message for ReportRequest {
         }
         if !self.native_ref.is_empty() {
             ::buffa::types::put_string_field(6u32, &self.native_ref, buf);
+        }
+        if self.attempt != 0u64 {
+            ::buffa::types::put_uint64_field(130u32, self.attempt, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -15309,6 +15399,13 @@ impl ::buffa::Message for ReportRequest {
                 )?;
                 ::buffa::types::merge_string(&mut self.native_ref, buf)?;
             }
+            130u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.attempt = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -15323,6 +15420,7 @@ impl ::buffa::Message for ReportRequest {
         self.ok = false;
         self.error.clear();
         self.native_ref.clear();
+        self.attempt = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -15401,6 +15499,15 @@ pub struct ReportExecRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub sequence: u64,
+    /// Delivery attempt echoed from the WorkItem. An older attempt is fenced.
+    ///
+    /// Field 130: `attempt`
+    #[serde(
+        rename = "attempt",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub attempt: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -15413,6 +15520,7 @@ impl ::core::fmt::Debug for ReportExecRequest {
             .field("exec_id", &self.exec_id)
             .field("events", &self.events)
             .field("sequence", &self.sequence)
+            .field("attempt", &self.attempt)
             .finish()
     }
 }
@@ -15463,6 +15571,9 @@ impl ::buffa::Message for ReportExecRequest {
         if self.sequence != 0u64 {
             size += 2u64 + ::buffa::types::uint64_encoded_len(self.sequence) as u64;
         }
+        if self.attempt != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.attempt) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -15492,6 +15603,9 @@ impl ::buffa::Message for ReportExecRequest {
         }
         if self.sequence != 0u64 {
             ::buffa::types::put_uint64_field(120u32, self.sequence, buf);
+        }
+        if self.attempt != 0u64 {
+            ::buffa::types::put_uint64_field(130u32, self.attempt, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -15546,6 +15660,13 @@ impl ::buffa::Message for ReportExecRequest {
                 )?;
                 self.sequence = ::buffa::types::decode_uint64(buf)?;
             }
+            130u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.attempt = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -15559,6 +15680,7 @@ impl ::buffa::Message for ReportExecRequest {
         self.exec_id.clear();
         self.events.clear();
         self.sequence = 0u64;
+        self.attempt = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -30020,6 +30142,11 @@ pub mod __buffa {
             pub sandbox_id: &'a str,
             /// Field 2: `name`
             pub name: &'a str,
+            /// Stable retry identity for a snapshot whose successful response was lost.
+            /// A replay is checked against the original capability and source identity.
+            ///
+            /// Field 3: `idempotency_key`
+            pub idempotency_key: &'a str,
             /// Field 100: `lease_id`
             pub lease_id: &'a str,
             pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
@@ -30074,6 +30201,13 @@ pub mod __buffa {
                         )?;
                         view.name = ::buffa::types::borrow_str(&mut cur)?;
                     }
+                    3u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::LengthDelimited,
+                        )?;
+                        view.idempotency_key = ::buffa::types::borrow_str(&mut cur)?;
+                    }
                     100u32 => {
                         ::buffa::encoding::check_wire_type(
                             tag,
@@ -30112,6 +30246,7 @@ pub mod __buffa {
                 ::core::result::Result::Ok(super::super::SnapshotRequest {
                     sandbox_id: self.sandbox_id.to_string(),
                     name: self.name.to_string(),
+                    idempotency_key: self.idempotency_key.to_string(),
                     lease_id: self.lease_id.to_string(),
                     __buffa_unknown_fields: self
                         .__buffa_unknown_fields
@@ -30136,6 +30271,12 @@ pub mod __buffa {
                 if !self.name.is_empty() {
                     size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
                 }
+                if !self.idempotency_key.is_empty() {
+                    size
+                        += 1u64
+                            + ::buffa::types::string_encoded_len(&self.idempotency_key)
+                                as u64;
+                }
                 if !self.lease_id.is_empty() {
                     size
                         += 2u64
@@ -30157,6 +30298,9 @@ pub mod __buffa {
                 }
                 if !self.name.is_empty() {
                     ::buffa::types::put_string_field(2u32, &self.name, buf);
+                }
+                if !self.idempotency_key.is_empty() {
+                    ::buffa::types::put_string_field(3u32, &self.idempotency_key, buf);
                 }
                 if !self.lease_id.is_empty() {
                     ::buffa::types::put_string_field(100u32, &self.lease_id, buf);
@@ -30187,6 +30331,9 @@ pub mod __buffa {
                 }
                 if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
                     __map.serialize_entry("name", self.name)?;
+                }
+                if !::buffa::json_helpers::skip_if::is_empty_str(self.idempotency_key) {
+                    __map.serialize_entry("idempotencyKey", self.idempotency_key)?;
                 }
                 if !::buffa::json_helpers::skip_if::is_empty_str(self.lease_id) {
                     __map.serialize_entry("leaseId", self.lease_id)?;
@@ -30295,6 +30442,14 @@ pub mod __buffa {
             #[must_use]
             pub fn name(&self) -> &'_ str {
                 self.0.reborrow().name
+            }
+            /// Stable retry identity for a snapshot whose successful response was lost.
+            /// A replay is checked against the original capability and source identity.
+            ///
+            /// Field 3: `idempotency_key`
+            #[must_use]
+            pub fn idempotency_key(&self) -> &'_ str {
+                self.0.reborrow().idempotency_key
             }
             /// Field 100: `lease_id`
             #[must_use]
@@ -40544,6 +40699,12 @@ pub mod __buffa {
             ///
             /// Field 1: `id`
             pub id: &'a str,
+            /// Delivery attempt, incremented by the service on every claim. The agent
+            /// echoes it on Report/ReportExec so a report from an older delivery is
+            /// fenced instead of being mistaken for the current attempt.
+            ///
+            /// Field 130: `attempt`
+            pub attempt: u64,
             pub work: ::core::option::Option<
                 super::super::__buffa::view::oneof::work_item::Work<'a>,
             >,
@@ -40591,6 +40752,13 @@ pub mod __buffa {
                             ::buffa::encoding::WireType::LengthDelimited,
                         )?;
                         view.id = ::buffa::types::borrow_str(&mut cur)?;
+                    }
+                    130u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::Varint,
+                        )?;
+                        view.attempt = ::buffa::types::decode_uint64(&mut cur)?;
                     }
                     2u32 => {
                         ::buffa::encoding::check_wire_type(
@@ -40926,6 +41094,7 @@ pub mod __buffa {
                 let _ = __buffa_src;
                 ::core::result::Result::Ok(super::super::WorkItem {
                     id: self.id.to_string(),
+                    attempt: self.attempt,
                     work: match self.work.as_ref() {
                         ::core::option::Option::Some(v) => {
                             ::core::option::Option::Some(
@@ -41140,6 +41309,11 @@ pub mod __buffa {
                         }
                     }
                 }
+                if self.attempt != 0u64 {
+                    size
+                        += 2u64
+                            + ::buffa::types::uint64_encoded_len(self.attempt) as u64;
+                }
                 size += self.__buffa_unknown_fields.encoded_len() as u64;
                 ::buffa::saturate_size(size)
             }
@@ -41252,6 +41426,9 @@ pub mod __buffa {
                         }
                     }
                 }
+                if self.attempt != 0u64 {
+                    ::buffa::types::put_uint64_field(130u32, self.attempt, buf);
+                }
                 self.__buffa_unknown_fields.write_to(buf);
             }
         }
@@ -41275,6 +41452,13 @@ pub mod __buffa {
                 let mut __map = __s.serialize_map(::core::option::Option::None)?;
                 if !::buffa::json_helpers::skip_if::is_empty_str(self.id) {
                     __map.serialize_entry("id", self.id)?;
+                }
+                if !::buffa::json_helpers::skip_if::is_zero_u64(&self.attempt) {
+                    __map
+                        .serialize_entry(
+                            "attempt",
+                            &::buffa::json_helpers::ProtoJson(&self.attempt),
+                        )?;
                 }
                 if let ::core::option::Option::Some(ref __ov) = self.work {
                     match __ov {
@@ -41423,6 +41607,15 @@ pub mod __buffa {
             #[must_use]
             pub fn id(&self) -> &'_ str {
                 self.0.reborrow().id
+            }
+            /// Delivery attempt, incremented by the service on every claim. The agent
+            /// echoes it on Report/ReportExec so a report from an older delivery is
+            /// fenced instead of being mistaken for the current attempt.
+            ///
+            /// Field 130: `attempt`
+            #[must_use]
+            pub fn attempt(&self) -> u64 {
+                self.0.reborrow().attempt
             }
             /// Oneof `work`.
             #[must_use]
@@ -41782,6 +41975,11 @@ pub mod __buffa {
             ///
             /// Field 6: `native_ref`
             pub native_ref: &'a str,
+            /// Delivery attempt echoed from the WorkItem; 0 means an unsequenced
+            /// hand-written client and is accepted only when it names the current work.
+            ///
+            /// Field 130: `attempt`
+            pub attempt: u64,
             pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
         }
         impl<'a> ::buffa::MessageView<'a> for ReportRequestView<'a> {
@@ -41862,6 +42060,13 @@ pub mod __buffa {
                         )?;
                         view.native_ref = ::buffa::types::borrow_str(&mut cur)?;
                     }
+                    130u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::Varint,
+                        )?;
+                        view.attempt = ::buffa::types::decode_uint64(&mut cur)?;
+                    }
                     _ => {
                         ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                         let span_len = before_tag.len() - cur.len();
@@ -41897,6 +42102,7 @@ pub mod __buffa {
                     ok: self.ok,
                     error: self.error.to_string(),
                     native_ref: self.native_ref.to_string(),
+                    attempt: self.attempt,
                     __buffa_unknown_fields: self
                         .__buffa_unknown_fields
                         .to_owned()?
@@ -41940,6 +42146,11 @@ pub mod __buffa {
                             + ::buffa::types::string_encoded_len(&self.native_ref)
                                 as u64;
                 }
+                if self.attempt != 0u64 {
+                    size
+                        += 2u64
+                            + ::buffa::types::uint64_encoded_len(self.attempt) as u64;
+                }
                 size += self.__buffa_unknown_fields.encoded_len() as u64;
                 ::buffa::saturate_size(size)
             }
@@ -41968,6 +42179,9 @@ pub mod __buffa {
                 }
                 if !self.native_ref.is_empty() {
                     ::buffa::types::put_string_field(6u32, &self.native_ref, buf);
+                }
+                if self.attempt != 0u64 {
+                    ::buffa::types::put_uint64_field(130u32, self.attempt, buf);
                 }
                 self.__buffa_unknown_fields.write_to(buf);
             }
@@ -42011,6 +42225,13 @@ pub mod __buffa {
                 }
                 if !::buffa::json_helpers::skip_if::is_empty_str(self.native_ref) {
                     __map.serialize_entry("nativeRef", self.native_ref)?;
+                }
+                if !::buffa::json_helpers::skip_if::is_zero_u64(&self.attempt) {
+                    __map
+                        .serialize_entry(
+                            "attempt",
+                            &::buffa::json_helpers::ProtoJson(&self.attempt),
+                        )?;
                 }
                 __map.end()
             }
@@ -42139,6 +42360,14 @@ pub mod __buffa {
             pub fn native_ref(&self) -> &'_ str {
                 self.0.reborrow().native_ref
             }
+            /// Delivery attempt echoed from the WorkItem; 0 means an unsequenced
+            /// hand-written client and is accepted only when it names the current work.
+            ///
+            /// Field 130: `attempt`
+            #[must_use]
+            pub fn attempt(&self) -> u64 {
+                self.0.reborrow().attempt
+            }
         }
         impl ::core::convert::From<::buffa::OwnedView<ReportRequestView<'static>>>
         for ReportRequestOwnedView {
@@ -42190,6 +42419,10 @@ pub mod __buffa {
             ///
             /// Field 120: `sequence`
             pub sequence: u64,
+            /// Delivery attempt echoed from the WorkItem. An older attempt is fenced.
+            ///
+            /// Field 130: `attempt`
+            pub attempt: u64,
             pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
         }
         impl<'a> ::buffa::MessageView<'a> for ReportExecRequestView<'a> {
@@ -42256,6 +42489,13 @@ pub mod __buffa {
                         )?;
                         view.sequence = ::buffa::types::decode_uint64(&mut cur)?;
                     }
+                    130u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::Varint,
+                        )?;
+                        view.attempt = ::buffa::types::decode_uint64(&mut cur)?;
+                    }
                     4u32 => {
                         ::buffa::encoding::check_wire_type(
                             tag,
@@ -42314,6 +42554,7 @@ pub mod __buffa {
                         .map(|v| v.to_owned_from_source(__buffa_src))
                         .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
                     sequence: self.sequence,
+                    attempt: self.attempt,
                     __buffa_unknown_fields: self
                         .__buffa_unknown_fields
                         .to_owned()?
@@ -42357,6 +42598,11 @@ pub mod __buffa {
                         += 2u64
                             + ::buffa::types::uint64_encoded_len(self.sequence) as u64;
                 }
+                if self.attempt != 0u64 {
+                    size
+                        += 2u64
+                            + ::buffa::types::uint64_encoded_len(self.attempt) as u64;
+                }
                 size += self.__buffa_unknown_fields.encoded_len() as u64;
                 ::buffa::saturate_size(size)
             }
@@ -42387,6 +42633,9 @@ pub mod __buffa {
                 }
                 if self.sequence != 0u64 {
                     ::buffa::types::put_uint64_field(120u32, self.sequence, buf);
+                }
+                if self.attempt != 0u64 {
+                    ::buffa::types::put_uint64_field(130u32, self.attempt, buf);
                 }
                 self.__buffa_unknown_fields.write_to(buf);
             }
@@ -42430,6 +42679,13 @@ pub mod __buffa {
                         .serialize_entry(
                             "sequence",
                             &::buffa::json_helpers::ProtoJson(&self.sequence),
+                        )?;
+                }
+                if !::buffa::json_helpers::skip_if::is_zero_u64(&self.attempt) {
+                    __map
+                        .serialize_entry(
+                            "attempt",
+                            &::buffa::json_helpers::ProtoJson(&self.attempt),
                         )?;
                 }
                 __map.end()
@@ -42561,6 +42817,13 @@ pub mod __buffa {
             #[must_use]
             pub fn sequence(&self) -> u64 {
                 self.0.reborrow().sequence
+            }
+            /// Delivery attempt echoed from the WorkItem. An older attempt is fenced.
+            ///
+            /// Field 130: `attempt`
+            #[must_use]
+            pub fn attempt(&self) -> u64 {
+                self.0.reborrow().attempt
             }
         }
         impl ::core::convert::From<::buffa::OwnedView<ReportExecRequestView<'static>>>
