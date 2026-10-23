@@ -759,9 +759,16 @@ enum SandboxCommand {
 enum TokenCommand {
     /// Mint a single-use join token for `sandbox agent`.
     Create {
-        /// Lifetime (`30s`, `10m`, `1h`, `2d`).
+        /// Lifetime (`30s`, `10m`, `1h`); default 1h, maximum 24h.
         #[arg(long, default_value = "1h")]
         ttl: String,
+        /// Bind the token to this provider name. A bound token enrolls
+        /// only that provider and is the only kind that may re-enroll an
+        /// existing provider (replacing its certificates). Without
+        /// `--name` the token may only enroll a provider name that does
+        /// not exist yet.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -1265,9 +1272,11 @@ async fn run_client(
                 .await?,
         ),
         SandboxCommand::Ls => print_json(&client.list().await?),
-        SandboxCommand::Token(TokenCommand::Create { ttl }) => {
+        SandboxCommand::Token(TokenCommand::Create { ttl, name }) => {
             let ttl = parse_ttl(&ttl)?;
-            let response = client.create_join_token(ttl.as_secs()).await?;
+            let response = client
+                .create_join_token(ttl.as_secs(), name.as_deref().unwrap_or_default())
+                .await?;
             println!("{}", response.token);
             Ok(())
         }

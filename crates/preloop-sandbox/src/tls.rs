@@ -809,6 +809,56 @@ const IDENTITY_KEY: &str = "key.pem";
 const IDENTITY_CERT: &str = "cert.pem";
 const IDENTITY_CA: &str = "ca.pem";
 const IDENTITY_META: &str = "identity.json";
+const PENDING_KEY: &str = "pending-key.pem";
+const PENDING_CSR: &str = "pending-csr.pem";
+
+/// Key and CSR for an enrollment that has not produced an identity yet.
+///
+/// Persisted before the first `Enroll` so every retry — including one after
+/// an agent restart — presents the same CSR. The service recognizes that
+/// retry as the request it already signed and returns the same certificate
+/// instead of treating the join token as spent.
+pub(crate) struct PendingEnrollment {
+    pub key_pem: String,
+    pub csr_pem: String,
+}
+
+impl PendingEnrollment {
+    /// Load the pending pair, or generate and persist one (both files 0600).
+    pub(crate) fn load_or_create(dir: &Path, name: &str) -> Result<Self> {
+        let key_path = dir.join(PENDING_KEY);
+        let csr_path = dir.join(PENDING_CSR);
+        if key_path.is_file() && csr_path.is_file() {
+            return Ok(Self {
+                key_pem: read_text(&key_path)?,
+                csr_pem: read_text(&csr_path)?,
+            });
+        }
+        let (key_pem, csr_pem) = generate_csr(name)?;
+        write_private(&key_path, key_pem.as_bytes())?;
+        write_private(&csr_path, csr_pem.as_bytes())?;
+        Ok(Self { key_pem, csr_pem })
+    }
+
+    /// Drop the pending pair once the identity that supersedes it is saved.
+    ///
+    /// Failure is not fatal: `load` prefers a saved identity, so leftover
+    /// files are never used once `identity.json` exists.
+    pub(crate) fn discard(dir: &Path) {
+        for file in [PENDING_KEY, PENDING_CSR] {
+            let path = dir.join(file);
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "could not remove pending enrollment material"
+                );
+            }
+        }
+    }
+}
 
 /// What an agent remembers about its enrollment.
 #[derive(Debug, Clone, Serialize, Deserialize)]

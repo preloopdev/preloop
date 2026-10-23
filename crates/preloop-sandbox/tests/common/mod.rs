@@ -94,9 +94,18 @@ impl TestService {
         self.service.ca_pem().expect("service CA")
     }
 
-    /// Mint a join token.
+    /// Mint an unbound join token.
     pub async fn join_token(&self, ttl: Duration) -> String {
-        self.service.create_join_token(ttl).await.unwrap().token
+        self.join_token_for(ttl, "").await
+    }
+
+    /// Mint a join token bound to provider `name` (empty = unbound).
+    pub async fn join_token_for(&self, ttl: Duration, name: &str) -> String {
+        self.service
+            .create_join_token(ttl, name)
+            .await
+            .unwrap()
+            .token
     }
 
     /// Enroll `name` with a fresh single-use token and return its link.

@@ -6,7 +6,8 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -183,6 +184,12 @@ impl RemoteLink {
     /// The service CA is fetched first and checked against the token's pin,
     /// so the CSR only reaches a service that holds the CA the operator
     /// issued the token for.
+    ///
+    /// The key and CSR are persisted (0600) before the first `Enroll` and
+    /// reused by every attempt, so a response lost after the service signed
+    /// does not spend the token: the retry carries the same CSR and gets the
+    /// same certificate. Transient failures are retried with bounded
+    /// backoff; the pair is removed once the identity is saved.
     pub async fn enroll(
         base: impl Into<String>,
         token: &str,
@@ -192,15 +199,28 @@ impl RemoteLink {
         let base = base.into();
         let base = normalize_base(&base)?;
         let pin = crate::tls::parse_join_token(token)?.ca_sha256.to_owned();
-        let ca_pem = crate::tls::fetch_ca(&base).await?;
+        let ca_base = base.clone();
+        let ca_pem = retry_transient(move || {
+            let base = ca_base.clone();
+            async move { crate::tls::fetch_ca(&base).await }
+        })
+        .await?;
         if crate::tls::pem_fingerprint(&ca_pem)? != pin {
             return Err(Error::new(
                 Code::Unauthenticated,
                 "sandbox service CA does not match the join token pin",
             ));
         }
-        let (key_pem, csr_pem) = crate::tls::generate_csr(name)?;
-        let response = enroll(&base, &ca_pem, token, name, csr_pem).await?;
+        let identity_dir = identity_dir.into();
+        let pending = crate::tls::PendingEnrollment::load_or_create(&identity_dir, name)?;
+        let response = retry_transient(|| {
+            let csr = pending.csr_pem.clone();
+            let base = base.clone();
+            let ca_pem = ca_pem.clone();
+            async move { enroll(&base, &ca_pem, token, name, &csr).await }
+        })
+        .await?;
+        let key_pem = pending.key_pem;
         if crate::tls::pem_fingerprint(&response.ca_pem)? != pin {
             return Err(Error::new(
                 Code::Unauthenticated,
@@ -208,7 +228,7 @@ impl RemoteLink {
             ));
         }
         let identity = crate::tls::AgentIdentity {
-            dir: identity_dir.into(),
+            dir: identity_dir.clone(),
             metadata: crate::tls::IdentityMetadata {
                 name: name.to_owned(),
                 base: base.clone(),
@@ -221,6 +241,7 @@ impl RemoteLink {
             key_pem,
         };
         identity.save()?;
+        crate::tls::PendingEnrollment::discard(&identity_dir);
         Self::from_identity(identity)
     }
 
@@ -362,7 +383,7 @@ async fn enroll(
     ca_pem: &str,
     token: &str,
     name: &str,
-    csr_pem: String,
+    csr_pem: &str,
 ) -> Result<EnrollResponse> {
     let uri: axum::http::Uri = base
         .parse()
@@ -374,7 +395,7 @@ async fn enroll(
         .enroll(EnrollRequest {
             token: token.to_owned(),
             name: name.to_owned(),
-            csr_pem,
+            csr_pem: csr_pem.to_owned(),
             ..EnrollRequest::default()
         })
         .await?
@@ -677,6 +698,43 @@ fn jittered(base: Duration) -> Duration {
     let nanos = base.as_nanos().max(1) as u64;
     let low = nanos / 2;
     Duration::from_nanos(low + rand::random::<u64>() % (nanos - low + 1))
+}
+
+/// Enrollment attempts before a transient failure is surfaced.
+const ENROLL_ATTEMPTS: u32 = 5;
+/// First delay between enrollment attempts.
+const ENROLL_BACKOFF_MIN: Duration = Duration::from_millis(500);
+/// Ceiling for enrollment retries.
+const ENROLL_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// Whether an enrollment failure is worth retrying. The service answers
+/// `unavailable`/`deadline_exceeded` only when nothing was decided, whereas
+/// `unauthenticated` means the token was rejected and a retry cannot help.
+fn transient(error: &Error) -> bool {
+    matches!(error.code, Code::Unavailable | Code::DeadlineExceeded)
+}
+
+/// Run `attempt` until it succeeds, fails permanently, or the attempt budget
+/// is spent, backing off exponentially with jitter between transient errors.
+async fn retry_transient<T, F, Fut>(mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut delay = ENROLL_BACKOFF_MIN;
+    let mut remaining = ENROLL_ATTEMPTS;
+    loop {
+        remaining -= 1;
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) if remaining > 0 && transient(&error) => {
+                debug!(%error, "enrollment attempt failed; retrying");
+                tokio::time::sleep(jittered(delay)).await;
+                delay = (delay * 2).min(ENROLL_BACKOFF_MAX);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// First delay between registration attempts.
@@ -1794,6 +1852,68 @@ mod tests {
         assert!(fenced(&Error::aborted("stale generation")));
         assert!(fenced(&Error::not_found("exec not found")));
         assert!(!fenced(&Error::unavailable("try again")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enrollment_retries_reuse_the_pending_key_and_csr() {
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pending = crate::tls::PendingEnrollment::load_or_create(dir.path(), "host-a").unwrap();
+        // A restarted agent loads the same pair instead of generating one.
+        let reloaded = crate::tls::PendingEnrollment::load_or_create(dir.path(), "host-a").unwrap();
+        assert_eq!(pending.key_pem, reloaded.key_pem);
+        assert_eq!(pending.csr_pem, reloaded.csr_pem);
+
+        let attempts = AtomicUsize::new(0);
+        let seen = StdMutex::new(Vec::new());
+        let served = retry_transient(|| {
+            let attempt = attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            let csr = reloaded.csr_pem.clone();
+            seen.lock().unwrap().push(csr.clone());
+            async move {
+                if attempt < 2 {
+                    Err(Error::unavailable("response lost after signing"))
+                } else {
+                    Ok(csr)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|csr| csr == &reloaded.csr_pem),
+            "every retry must carry the same CSR"
+        );
+        assert_eq!(served, reloaded.csr_pem);
+
+        // Once the identity is saved the pending pair is gone.
+        crate::tls::PendingEnrollment::discard(dir.path());
+        assert!(!dir.path().join("pending-key.pem").exists());
+        assert!(!dir.path().join("pending-csr.pem").exists());
+        let fresh = crate::tls::PendingEnrollment::load_or_create(dir.path(), "host-a").unwrap();
+        assert_ne!(fresh.csr_pem, pending.csr_pem);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_enrollment_failures_are_not_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let attempts = AtomicUsize::new(0);
+        let error = retry_transient(|| {
+            attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            async { Err::<(), _>(Error::new(Code::Unauthenticated, "join token already used")) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, Code::Unauthenticated);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[test]
