@@ -13,6 +13,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod authz;
 pub mod client;
 pub mod connect;
 pub mod driver;
