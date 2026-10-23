@@ -156,16 +156,6 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, &'static str> {
     Ok(bytes)
 }
 
-/// GitHub REST root, overridable for GHES and for tests that point the server
-/// at a stub API.
-pub fn github_api_base() -> String {
-    std::env::var("PRELOOP_GITHUB_API_URL")
-        .ok()
-        .map(|base| base.trim_end_matches('/').to_owned())
-        .filter(|base| !base.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned())
-}
-
 fn record_check_reporting(shared: &Arc<SharedState>, success: bool) {
     let mut snapshot = shared.state.status_snapshot.write();
     if success {
@@ -247,7 +237,7 @@ pub async fn fetch_repository_metadata(
     permissions.insert("contents".to_owned(), "read".to_owned());
     let token = resolve_repo_token(shared, repo, &permissions).await?;
     let bucket = check_request_bucket(shared, repo, Some(&token)).await;
-    let url = format!("{}/repos/{}", github_api_base(), repo);
+    let url = format!("{}/repos/{}", shared.state.github_urls.api_base(), repo);
     let res = crate::github_breaker::send_observed_labeled(
         &shared.state.github_breakers,
         bucket,
@@ -291,7 +281,12 @@ async fn send_github_check_request(
     body: &Value,
 ) -> anyhow::Result<Value> {
     let client = crate::shared_http::CLIENT.clone();
-    let url = format!("{}/repos/{}/{}", github_api_base(), repo, path);
+    let url = format!(
+        "{}/repos/{}/{}",
+        shared.state.github_urls.api_base(),
+        repo,
+        path
+    );
     let res = crate::github_breaker::send_observed_labeled(
         &shared.state.github_breakers,
         bucket,
@@ -1897,8 +1892,8 @@ pub async fn fetch_workflows(
     repo: &str,
     git_ref: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    let api_base = github_api_base();
-    fetch_workflows_at(shared, repo, git_ref, &api_base).await
+    let api_base = shared.state.github_urls.api_base();
+    fetch_workflows_at(shared, repo, git_ref, api_base).await
 }
 
 /// The workflow files `git_ref` holds under `.github/workflows`, read with `git`
@@ -2205,8 +2200,8 @@ pub async fn resolve_ref_sha(
         }
         return Ok(None);
     }
-    let api_base = github_api_base();
-    let Some((token, bucket)) = contents_read_token(shared, repository, &api_base).await? else {
+    let api_base = shared.state.github_urls.api_base();
+    let Some((token, bucket)) = contents_read_token(shared, repository, api_base).await? else {
         return Ok(None);
     };
     let commit_ref = git_ref
@@ -2302,8 +2297,8 @@ async fn fetch_branch_protected(
     repository: &str,
     branch: &str,
 ) -> anyhow::Result<bool> {
-    let api_base = github_api_base();
-    let Some((token, bucket)) = contents_read_token(shared, repository, &api_base).await? else {
+    let api_base = shared.state.github_urls.api_base();
+    let Some((token, bucket)) = contents_read_token(shared, repository, api_base).await? else {
         return Ok(false);
     };
     // Branch names are URL-significant: `git check-ref-format` permits `#`, `%`
@@ -2732,7 +2727,7 @@ enum MergeProbe {
 /// parent matches the API's current base and whose second parent is the payload
 /// head.
 async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget) -> MergeProbe {
-    let api_base = github_api_base();
+    let api_base = shared.state.github_urls.api_base();
     let (token, bucket) = match crate::github_app::select_app_for_repo(shared, &target.repo).await {
         Some(app) => {
             let permissions = BTreeMap::from([
@@ -2740,7 +2735,7 @@ async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget)
                 ("pull_requests".to_owned(), "read".to_owned()),
             ]);
             match crate::github_app::get_or_mint_token_at(
-                &api_base,
+                api_base,
                 &app,
                 &target.repo,
                 &permissions,
@@ -2782,7 +2777,7 @@ async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget)
 
     let state = match fetch_pull_request_merge_state(
         shared,
-        &api_base,
+        api_base,
         bucket,
         &token,
         &target.repo,
@@ -2817,7 +2812,7 @@ async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget)
         };
         match merge_parentage(
             shared,
-            &api_base,
+            api_base,
             bucket,
             &token,
             &target.repo,

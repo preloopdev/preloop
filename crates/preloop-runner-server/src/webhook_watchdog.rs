@@ -349,7 +349,7 @@ async fn poll_app(
     store_healthy: bool,
 ) -> anyhow::Result<WatchdogPollOutcome> {
     let jwt = crate::github_app::sign_app_jwt(&app.app_id, &app.private_key)?;
-    let api_base = crate::github::github_api_base();
+    let api_base = shared.state.github_urls.api_base();
     let previous = shared
         .state
         .backend
@@ -406,7 +406,7 @@ async fn poll_app(
         // Judging is one-shot: anything the scan has examined is at or below
         // the watermark and will never be examined again, so repairs the
         // scan opened must be driven from the repair table itself.
-        outcome.redelivered += retry_open_repairs(shared, app, &api_base, &jwt).await?;
+        outcome.redelivered += retry_open_repairs(shared, app, api_base, &jwt).await?;
     }
     let mut newest_examined: Option<(i64, String)> = None;
     let mut cursor = previous
@@ -415,7 +415,7 @@ async fn poll_app(
     let mut reached_watermark = false;
     let mut has_more_pages = false;
     for _page in 0..max_pages().max(1) {
-        let (items, next_cursor) = list_deliveries(shared, app, &api_base, &jwt, cursor.as_deref())
+        let (items, next_cursor) = list_deliveries(shared, app, api_base, &jwt, cursor.as_deref())
             .await
             .map_err(|error| anyhow::anyhow!("listing deliveries: {error}"))?;
         if items.is_empty() {
@@ -486,7 +486,7 @@ async fn poll_app(
                             reason,
                             throttled: item.throttled_at.is_some(),
                         },
-                        &api_base,
+                        api_base,
                         &jwt,
                     )
                     .await?

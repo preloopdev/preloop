@@ -708,6 +708,20 @@ pub struct GitHubUrls {
     pub graphql_url: String,
 }
 
+impl GitHubUrls {
+    /// The REST API base in the form request URLs are built from:
+    /// `api_url` with any trailing slashes removed. The address itself is
+    /// resolved exactly once, when the state is built (the
+    /// `PRELOOP_GITHUB_API_URL` env var wins over the config file's
+    /// `[github] api_url`, which wins over the `https://api.github.com`
+    /// default). Every GitHub REST call must take its base from here —
+    /// re-reading the environment at call time misses the config-file
+    /// address and sends GHES traffic to public GitHub.
+    pub fn api_base(&self) -> &str {
+        self.api_url.trim_end_matches('/')
+    }
+}
+
 /// (owner, repo, ref) → resolution outcome with the instant it was recorded.
 ///
 /// See [`GITHUB_ENV_LOCK`] for why the tests around this are serialized.
@@ -2394,6 +2408,34 @@ mod tests {
             "a ticket for one action must not validate for a newline-split twin"
         );
     }
+    /// The API base every GitHub REST call is built from resolves exactly
+    /// once, in state: with `PRELOOP_GITHUB_API_URL` unset, the config
+    /// file's `[github] api_url` is the base. This is the GHES shape the
+    /// old per-call env reads silently missed — they fell back to
+    /// `https://api.github.com` and sent enterprise traffic to public
+    /// GitHub.
+    #[tokio::test]
+    async fn api_base_comes_from_the_config_file_when_the_env_var_is_unset() {
+        let _lock = GITHUB_ENV_LOCK.lock().await;
+        let _unset = TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[github]\napi_url = \"https://ghes.example.com/api/v3/\"\n",
+        )
+        .unwrap();
+        let state = AppState::new_with_config(temp.path().join("state"), config_path)
+            .await
+            .unwrap();
+        // The configured value keeps its trailing slash; request URLs are
+        // built as `{base}/repos/...`, so the accessor strips it.
+        assert_eq!(
+            state.github_urls.api_base(),
+            "https://ghes.example.com/api/v3"
+        );
+    }
+
     /// The fork-tier resolver used to take the scope's last `:` component,
     /// so `Actions.Results:{plan}:extra:{job}` parsed where the canonical
     /// parser rejects. Both must agree: extra components are malformed.

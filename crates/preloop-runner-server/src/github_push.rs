@@ -158,7 +158,7 @@ pub async fn push_run_to_github(
                 pr_number: state.pr_number,
                 pr_url: state.pr_number.map(|number| {
                     pr_web_url(
-                        &crate::github::github_api_base(),
+                        shared.state.github_urls.api_base(),
                         &run.submission.repository,
                         number,
                     )
@@ -525,7 +525,7 @@ pub async fn push_run_to_github(
         status: "pushed",
         pr_number,
         pr_url: pr_number
-            .map(|number| pr_web_url(&crate::github::github_api_base(), &repository, number)),
+            .map(|number| pr_web_url(shared.state.github_urls.api_base(), &repository, number)),
     })
 }
 
@@ -628,7 +628,7 @@ pub async fn github_json(
 ) -> anyhow::Result<serde_json::Value> {
     let url = format!(
         "{}/repos/{}{}",
-        crate::github::github_api_base(),
+        shared.state.github_urls.api_base(),
         repository,
         if path.is_empty() {
             String::new()

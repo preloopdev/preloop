@@ -255,6 +255,10 @@ async fn spawn_github_stub(router: Router) -> (String, tokio::task::JoinHandle<(
 
 /// Pin `PRELOOP_GITHUB_API_URL` for a stub test, holding both the process-wide
 /// env lock and the restore-on-drop variable guard.
+///
+/// Pin *before* building the fixture state: the API base is resolved into
+/// `AppState::github_urls` at construction (env over config file), not
+/// re-read from the environment at request time.
 async fn pin_api_base(
     base: &str,
 ) -> (
@@ -728,7 +732,6 @@ async fn dispatch_without_token_is_401() {
 async fn dispatch_with_garbage_token_is_401() {
     use axum::routing::get;
 
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     // github.com's honest answer to a nonsense token is 401, which preloop
     // must relay rather than read as a transport failure.
     let stub = Router::new().route(
@@ -737,6 +740,7 @@ async fn dispatch_with_garbage_token_is_401() {
     );
     let (base, handle) = spawn_github_stub(stub).await;
     let _env = pin_api_base(&base).await;
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
 
     let (status, _) = post_json(
         &app,
@@ -790,6 +794,13 @@ async fn dispatch_with_pat_authenticates() {
 async fn dispatch_with_pat_actor_resolved_from_github_user_endpoint() {
     use axum::routing::get;
 
+    let stub = Router::new().route(
+        "/user",
+        get(|| async { Json(json!({ "login": "octocat-pat" })) }),
+    );
+    let (base, handle) = spawn_github_stub(stub).await;
+    let _env = pin_api_base(&base).await;
+
     let (state, app, _temp) = {
         let temp = tempfile::tempdir().unwrap();
         let ws = temp.path().join("ws");
@@ -804,13 +815,6 @@ async fn dispatch_with_pat_actor_resolved_from_github_user_endpoint() {
         let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
         (state, app, temp)
     };
-
-    let stub = Router::new().route(
-        "/user",
-        get(|| async { Json(json!({ "login": "octocat-pat" })) }),
-    );
-    let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
 
     let (status, _) = post_json(
         &app,
@@ -1421,7 +1425,6 @@ fn installation_stub(
 
 #[tokio::test]
 async fn third_party_installation_token_dispatches_when_it_holds_actions_write() {
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     let calls = Arc::new(parking_lot::Mutex::new(0));
     let mut permissions = serde_json::Map::new();
     permissions.insert("actions".to_owned(), json!("write"));
@@ -1438,6 +1441,7 @@ async fn third_party_installation_token_dispatches_when_it_holds_actions_write()
     );
     let (base, handle) = spawn_github_stub(stub).await;
     let _env = pin_api_base(&base).await;
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
 
     let (status, body) = post_json(
         &app,
@@ -1477,7 +1481,6 @@ async fn third_party_installation_token_dispatches_when_it_holds_actions_write()
 
 #[tokio::test]
 async fn third_party_token_without_actions_write_is_403() {
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     let calls = Arc::new(parking_lot::Mutex::new(0));
     let mut permissions = serde_json::Map::new();
     permissions.insert("contents".to_owned(), json!("read"));
@@ -1489,6 +1492,7 @@ async fn third_party_token_without_actions_write_is_403() {
     );
     let (base, handle) = spawn_github_stub(stub).await;
     let _env = pin_api_base(&base).await;
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
 
     let (status, _) = post_json(
         &app,
@@ -1504,7 +1508,6 @@ async fn third_party_token_without_actions_write_is_403() {
 
 #[tokio::test]
 async fn third_party_token_without_repo_access_is_403() {
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     let calls = Arc::new(parking_lot::Mutex::new(0));
     let mut permissions = serde_json::Map::new();
     permissions.insert("actions".to_owned(), json!("write"));
@@ -1518,6 +1521,7 @@ async fn third_party_token_without_repo_access_is_403() {
     );
     let (base, handle) = spawn_github_stub(stub).await;
     let _env = pin_api_base(&base).await;
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
 
     let (status, _) = post_json(
         &app,
@@ -1535,13 +1539,13 @@ async fn third_party_token_without_repo_access_is_403() {
 async fn github_refusing_the_token_is_401_not_502() {
     use axum::routing::get;
 
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     let stub = Router::new().route(
         "/installation",
         get(|| async { (StatusCode::UNAUTHORIZED, "bad credentials") }),
     );
     let (base, handle) = spawn_github_stub(stub).await;
     let _env = pin_api_base(&base).await;
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
 
     let (status, _) = post_json(
         &app,
@@ -1557,13 +1561,13 @@ async fn github_refusing_the_token_is_401_not_502() {
 
 #[tokio::test]
 async fn all_repositories_installation_needs_no_repository_list() {
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     let calls = Arc::new(parking_lot::Mutex::new(0));
     let mut permissions = serde_json::Map::new();
     permissions.insert("actions".to_owned(), json!("admin"));
     let stub = installation_stub(Arc::clone(&calls), permissions, "all", &["octocat/repo"]);
     let (base, handle) = spawn_github_stub(stub).await;
     let _env = pin_api_base(&base).await;
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
 
     let (status, body) = post_json(
         &app,

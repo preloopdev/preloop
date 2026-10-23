@@ -513,7 +513,7 @@ async fn pat_oauth_scopes(state: &crate::state::AppState, pat: &str) -> PatScope
                 .to_owned(),
         };
     }
-    let url = format!("{}/", crate::github::github_api_base());
+    let url = format!("{}/", state.github_urls.api_base());
     let response = match crate::github_breaker::send_github(
         state,
         &crate::github_breaker::GithubCredential::bearer(

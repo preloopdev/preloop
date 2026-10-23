@@ -919,7 +919,7 @@ async fn resolve_default_branch(
         }
         return Ok("main".to_owned());
     }
-    let api_base = crate::github::github_api_base();
+    let api_base = shared.state.github_urls.api_base();
     // The bucket follows the credential: an App mint is observed against the
     // installation the mint ledger records, the ambient PAT against the PAT's
     // own budget.
@@ -928,7 +928,7 @@ async fn resolve_default_branch(
     {
         let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
         let token =
-            crate::github_app::get_or_mint_token_at(&api_base, &app, repository, &permissions)
+            crate::github_app::get_or_mint_token_at(api_base, &app, repository, &permissions)
                 .await
                 .map_err(|error| {
                     ApiError::not_found(format!(

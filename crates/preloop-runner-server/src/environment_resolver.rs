@@ -235,7 +235,7 @@ impl EnvironmentResolver {
         environment: &str,
     ) -> anyhow::Result<Arc<EnvironmentRules>> {
         self.resolve_at(
-            &crate::github::github_api_base(),
+            shared.state.github_urls.api_base(),
             shared,
             repository,
             environment,
@@ -536,7 +536,7 @@ impl EnvironmentResolver {
         };
         let members = fetch_team_members(
             shared,
-            &crate::github::github_api_base(),
+            shared.state.github_urls.api_base(),
             &token,
             bucket,
             org,

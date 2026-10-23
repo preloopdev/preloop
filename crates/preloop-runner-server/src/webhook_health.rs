@@ -88,7 +88,7 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
     // covers every App.
     let (previous, previous_checked_at_us) = shared.state.webhook_status.app_config_snapshot();
     let app_count = apps.len();
-    let api_base = crate::github::github_api_base();
+    let api_base = shared.state.github_urls.api_base();
     let expected_url = expected_webhook_url();
     let mut statuses = Vec::with_capacity(apps.len());
     let mut checked = 0usize;
@@ -131,7 +131,7 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
         let mut errors: Vec<String> = Vec::new();
 
         match crate::github_app::read_app_subscription_at_with_breaker(
-            &api_base,
+            api_base,
             &app.app_id,
             &app.private_key,
             Some((
@@ -164,7 +164,7 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
         }
 
         match crate::github_app::read_app_hook_config_at_with_breaker(
-            &api_base,
+            api_base,
             &app.app_id,
             &app.private_key,
             Some((
