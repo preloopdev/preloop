@@ -12,7 +12,7 @@
 | `preloop-cli` | The `preloop` binary (run/serve/debug/push) |
 | `preloop-orchestrator` | Golden/env provisioning + runner pool; gets VMs from the Sandbox Service |
 | `preloop-sandbox` | Sandbox Service: templates, pools, leases, host agents; public SmolVM driver (`drivers/smolvm`) |
-| `preloop-cache` / `-artifacts` / `-dap` / `-observability` / `-socket-activation` | File-backed storage, DAP bridge, logging/OTel, systemd activation |
+| `preloop-secrets` | Shared redacted secret values, credential references, file/keychain/memory backends, cache/fallback layers, namespace scoping, and private-file helpers. |
 | `preloop-conformance` / `runner-watch` | Conformance harnesses and protocol-diff tooling |
 
 Crate/module map: `docs/control-plane/architecture/overview.mdx`. Pinned official runner: `runner_version` in `versions.toml`.
