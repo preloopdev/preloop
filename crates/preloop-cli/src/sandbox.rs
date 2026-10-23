@@ -20,6 +20,7 @@ use preloop_orchestrator::RunnerPoolConfig;
 use preloop_orchestrator::fleet::SandboxMachines;
 use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
+use preloop_sandbox::backend::{BackendConfig, SandboxBackend};
 use preloop_sandbox::driver_conformance::ConformanceOptions;
 use preloop_sandbox::drivers::external::{ExternalDriver, ExternalSpec};
 use preloop_sandbox::drivers::fake::FakeDriver;
@@ -29,7 +30,7 @@ use preloop_sandbox::drivers::smolvm::pack::ArtifactCache;
 use preloop_sandbox::server::{Auth, HostAllowlist, ListenerSurface, serve_with_options};
 use preloop_sandbox::{
     Driver, LeastLoaded, Placement, SandboxApi, SandboxClient, ServerTls, Service, ServiceConfig,
-    store, tls,
+    backend, tls,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -67,6 +68,21 @@ fn placement_from_env() -> anyhow::Result<Arc<dyn Placement>> {
 /// Service tuning: defaults overridden by the documented environment.
 fn service_config(_state: &Path) -> anyhow::Result<ServiceConfig> {
     let mut config = ServiceConfig::new();
+    config.peers = ServiceConfig::peers_from_env()?;
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_NODE_ID") {
+        config.node_id = value;
+    }
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_NODE_CREDENTIAL") {
+        config.node_credential = value;
+    }
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_PEER_URL") {
+        config.peer_url = value;
+    }
+    if let Some(secs) = env_nonempty("PRELOOP_SANDBOX_NODE_LOST_AFTER_SECS")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        config.node_lost_after = Duration::from_secs(secs);
+    }
     if let Some(raw) = env_nonempty("PRELOOP_SANDBOX_BLOB_MAX_BYTES") {
         config.blob_max_bytes = raw.parse().with_context(|| {
             format!("PRELOOP_SANDBOX_BLOB_MAX_BYTES must be a byte count, got `{raw}`")
@@ -88,7 +104,43 @@ fn service_config(_state: &Path) -> anyhow::Result<ServiceConfig> {
     {
         config.exec_timeout = Duration::from_secs(secs);
     }
+    if config.node_session.is_empty() {
+        config.node_session = uuid::Uuid::new_v4().simple().to_string();
+    }
     Ok(config)
+}
+
+/// Open the durable backend for this replica.
+///
+/// The seal key and CA live outside the database: replicas share them by
+/// configuration, so a database reader cannot decrypt sealed environment or
+/// transfer material and a node whose key differs refuses at open.
+async fn open_backend(
+    url: &str,
+    state: &Path,
+    config: &ServiceConfig,
+) -> anyhow::Result<Arc<dyn SandboxBackend>> {
+    let pool_size = env_nonempty("PRELOOP_SANDBOX_PG_POOL")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8);
+    // `None` lets the backend load `PRELOOP_SANDBOX_SEAL_KEY` or a 0600 key
+    // file in the state directory (shared by replicas through configuration).
+    let seal_key = None;
+    let backend = backend::open_with(BackendConfig {
+        url: url.to_owned(),
+        state_dir: state.to_path_buf(),
+        seal_key,
+        pool_size,
+        node_id: config.node_id.clone(),
+        session_id: config.node_session.clone(),
+        node_credential_sha256: backend::credential_hash(&config.node_credential),
+        peer_url: config.peer_url.clone(),
+        node_lost_after: config.node_lost_after,
+    })
+    .await
+    .with_context(|| format!("opening sandbox store {url}"))?;
+    Ok(backend)
 }
 
 /// Refuse to start when the selected authorization policy is unknown.
@@ -248,7 +300,7 @@ impl LocalSandboxes {
             .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
         let mut config = service_config(&state)?;
         config.placement = placement_from_env()?;
-        let store = store::open(&store_url)
+        let store = open_backend(&store_url, &state, &config)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
         let listen =
@@ -327,11 +379,16 @@ impl LocalSandboxes {
         // Wait for the local agent so the pool's first acquire can place.
         // An enrollment record (no drivers yet) does not count.
         for _ in 0..200 {
-            if service
+            let registered = service
                 .list_providers()
-                .iter()
-                .any(|provider| !provider.drivers.is_empty())
-            {
+                .await
+                .map(|providers| {
+                    providers
+                        .iter()
+                        .any(|provider| !provider.drivers.is_empty())
+                })
+                .unwrap_or(false);
+            if registered {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -766,6 +823,10 @@ struct ListenerTls {
 }
 
 async fn listener_tls(state: &Path, plan: &ListenerPlan) -> anyhow::Result<ListenerTls> {
+    // Replicas of one service share the CA directory by configuration; each
+    // keeps its own local home, lock and seal key unless told otherwise.
+    let shared_state = env_path("PRELOOP_SANDBOX_CA_DIR");
+    let state = shared_state.as_deref().unwrap_or(state);
     let magic_dns = detected_magic_dns().await;
     let sans = server_sans(plan.allowed_hosts.as_deref(), magic_dns.as_deref()).await;
     let agent_tls =
@@ -1853,7 +1914,7 @@ async fn serve_standalone(
         .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
     let mut config = service_config(&state)?;
     config.placement = placement_from_env()?;
-    let store = store::open(&store_url).await?;
+    let store = open_backend(&store_url, &state, &config).await?;
     let listen = args.listen.to_string();
     let plan = ListenerPlan::from_values(
         &listen,

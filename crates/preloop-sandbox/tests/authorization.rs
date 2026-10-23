@@ -71,8 +71,8 @@ fn template(name: &str) -> TemplateSpec {
 
 async fn wait_for_provider(service: &Service) {
     for _ in 0..200 {
-        if service
-            .list_providers()
+        let providers = service.list_providers().await.expect("list providers");
+        if providers
             .iter()
             .any(|provider| provider.generation > 0 && !provider.drivers.is_empty())
         {

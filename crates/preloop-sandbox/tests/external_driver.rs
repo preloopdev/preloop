@@ -30,7 +30,7 @@ use preloop_sandbox::driver_conformance::{self, CaseResult, ConformanceOptions};
 use preloop_sandbox::driver_plugin;
 use preloop_sandbox::drivers::external::{ExternalDriver, ExternalSpec};
 use preloop_sandbox::drivers::fake::FakeDriver;
-use preloop_sandbox::{Driver, SandboxApi, Service};
+use preloop_sandbox::{Driver, SandboxApi};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -138,9 +138,13 @@ fn assert_conformance(results: &[CaseResult]) {
     );
 }
 
-async fn wait_for(mut condition: impl FnMut() -> bool) {
+async fn wait_for<F, Fut>(mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
     for _ in 0..400 {
-        if condition() {
+        if condition().await {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -287,7 +291,7 @@ async fn external_driver_carries_the_agent_flow() {
     let agent = Agent::new(Arc::new(link), vec![Arc::clone(&driver)], config);
     tokio::spawn(agent.run(None, service.shutdown_token()));
 
-    wait_for(|| !Service::list_providers(&service.service).is_empty()).await;
+    wait_for(|| async { !service.service.list_providers().await.unwrap().is_empty() }).await;
 
     let client = service.client();
     client
@@ -325,7 +329,7 @@ async fn external_driver_carries_the_agent_flow() {
         })
         .await
         .unwrap();
-    wait_for(|| Service::list(&service.service).is_empty()).await;
+    wait_for(|| async { service.service.list().await.unwrap().is_empty() }).await;
 
     // Release destroyed the machine through the plugin, not just in the
     // service's bookkeeping.
@@ -424,7 +428,7 @@ async fn spawn_mode_starts_the_plugin() {
     // Dropping the driver stops the supervised child process.
     let pid = recorded_pid(dir.path());
     drop(driver);
-    wait_for(|| !process_alive(pid)).await;
+    wait_for(|| async { !process_alive(pid) }).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -469,7 +473,7 @@ async fn spawn_mode_replaces_a_stale_socket() {
         .expect("a stale socket must be replaced, not block the start");
     let pid = recorded_pid(dir.path());
     drop(driver);
-    wait_for(|| !process_alive(pid)).await;
+    wait_for(|| async { !process_alive(pid) }).await;
 }
 
 /// The spawn-mode child: when re-executed with the marker environment, serve

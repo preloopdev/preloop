@@ -327,48 +327,110 @@ and `Provider`; the complete route mapping lives in
 
 ## State
 
-The service keeps its working set in memory and writes through to its own
-store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
-`sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
-never references control tables. One process at a time holds
-`<state>/sandbox-service.lock` (flock): a second service, or a golden bake
-pointed at the same `PRELOOP_HOME`, fails instead of loading the store and
-reaping the running service's leases. Writes are best-effort in the project's
-sense: in-memory state is authoritative, so a store failure is logged at error
-level with the record kind and never fails the caller's RPC.
+The database is the authority. Every durable decision — inventory, leases,
+provider generations, work queues, exec lifecycle, ticket metadata and
+snapshot receipts — is a typed command in one short SQL transaction. Memory
+holds only bounded live channels (an exec's output queue, one transfer's
+rendezvous) and the instants a caller is currently waiting on; it is never the
+source of truth. A read that is not answered from SQL does not exist.
 
-Records are proto3-JSON documents, and rows written by earlier builds stay
-readable: the generated messages keep the same lowerCamelCase names and accept
-the old snake_case spellings as aliases, and 64-bit numbers are parsed from
-either the string or the numeric form. There is no store migration — the first
-write of a record canonicalizes it.
+SQLite (`<state>/sandbox.db`, default) serves one node. Postgres
+(`PRELOOP_SANDBOX_STORE_URL=postgres://…`, an independent `sandbox` schema or
+database) serves several replicas: each opens its own pool, claims work with
+`SKIP LOCKED`, and coordinates through conditional updates and rows, never a
+global lock. The service never references control-plane tables.
+
+Every command is one transaction that commits or rolls back whole. Two
+replicas can still collide on a row Postgres decides to abort: a serialization
+failure (`40001`) or a detected deadlock (`40P01`) rolls the loser back. The
+whole command is then run again against the state the winner left behind, up
+to five attempts with a short jittered backoff (5 ms doubling to a 200 ms
+cap). Every command closure is SQL only, so re-entering it is safe: the failed
+attempt wrote nothing, and a retry cannot repeat an effect. The decision keys
+off a typed conflict marker carried on the engine error's source, never off a
+code or message, so a command's own `aborted` or `unavailable` result is
+returned to the caller unchanged and never re-run. SQLite has a single writer
+and no conflicts of this kind; an embedded store runs each command once.
+
+The schema is greenfield v1. On an empty database it is created and its
+version and key fingerprints are recorded in `schema_meta`; replicas may
+start against it together, so schema creation takes a transaction-scoped
+advisory lock and the key rows are inserted `ON CONFLICT` and re-read. A
+non-empty store that was not created by this service, a different schema
+version, or a different seal key is refused at open instead of being imported,
+upgraded or dual-written. There is nothing to migrate: no legacy sandbox state exists.
+`memory:` is a real in-memory SQLite database, used by tests and embedded
+single-process callers.
+
+Each host keeps its own `<state>/sandbox-service.lock`: the lock protects a
+local state directory, not a database, so replicas on one Postgres do not
+block each other. Secrets live outside the database: lease and exec
+environment is sealed with AES-256-GCM from the locked `ring` dependency,
+using a key shared by configuration (`PRELOOP_SANDBOX_SEAL_KEY`) or a 0600
+file in the state directory. `schema_meta` records the key fingerprint, so a
+node configured with a different key fails closed at open. Bearer, join and
+ticket tokens are stored only as SHA-256 hashes; CSR keys and inject payloads
+are never persisted.
+
+Multi-replica routing keeps one stable URL for callers and agents. An exec or
+transfer stream is owned by the replica that opened it, recorded as a fenced
+node/session handle. A request that lands on another replica looks up the
+owner and forwards over an authenticated internal hop: the sending node proves
+its registered node id, session and credential, and the receiving node checks
+them against its node registry. Peer base URLs come only from configuration
+(`PRELOOP_SANDBOX_PEERS`), never from request fields, and replicas share the
+service CA (`PRELOOP_SANDBOX_CA_DIR`) so that hop is verified TLS. If the
+owning replica dies, its node session expires, its live channels fail
+explicitly and its durable leases are released by maintenance; other replicas
+and their leases are untouched.
+
+### Exec replay boundary
+
+Delivery is at-least-once, execution is at-most-once. A delivery attempt is
+not an execution identity: a redelivered work item does not re-run a command.
+The agent records a started exec durably on its host and the service records a
+durable start claim (`execs.started_attempt`) before the guest command runs;
+the first claim wins and output from the same execution is accepted across
+delivery attempts. A later delivery that tries to start the same exec fails
+the exec with an explicit error instead of replaying it. An ambiguous outcome
+— the command may or may not have run — fails the caller explicitly; it is
+never retried automatically. Every accepted report also renews the work
+item's delivery window, so an exec that keeps producing output is not failed
+by the redelivery timer; a command that reports nothing for the delivery
+timeout (120 s by default) is treated as a lost delivery and fails explicitly.
+Conversely, ordinary work results (create, snapshot, power, copy) are
+persisted before any waiter observes success, so a lost response is answered
+from the durable result rather than repeated.
 
 ## Restart and failure
 
-The store is the only thing that survives a process: provider queues, pending
-work, exec streams, tickets and pool backoff are memory. Boot therefore starts
-with three decisions, before any provider is placed on or caller served:
+Only the database survives a process, and it survives every replica the same
+way: provider queues, pending work, exec/ticket rows, leases, pools and
+templates are SQL, not a boot-time reconstruction. In-memory channels are
+rebuilt from owner handles: a replica that starts again registers a new node
+session, which fences the previous process's live channels and provider
+sessions; agents re-register and resume durable leases and work. There is no
+"load the whole store into state" pass and no write-through shadow copy.
 
-* **Every provider's generation is bumped and persisted.** An agent session
-  that outlived the process is fenced (`aborted`) on its next call and
-  re-registers with a fresh generation; until it does, its records are not
-  placed on. Sandboxes, leases, pools and templates are restored as they were.
-* **A sandbox caught `PROVISIONING` becomes `FAILED`** with `restarted while
-  creating: …`. It cannot be re-driven: the create request (shape, network,
-  mounts, sockets, options) is not on the record, so a second create would be
-  a different sandbox, and nothing will ever report the first. If the machine
-  did land, no record names it and the next reconcile destroys it as an
-  orphan. The caller's retry with the same key releases the failed record and
-  starts over.
-* **A sandbox left `TERMINATING` stays so until its machine is gone.** A destroy
-  in flight is awaited however long it takes. When a destroy fails, or the
-  provider is lost with it, the next `Reconcile` asks again while the provider
-  still reports the machine. After three such failures the record becomes a
-  `GONE` tombstone instead of being dropped: `Reconcile` destroys its machine
-  directly, because the record still proves the machine is the service's. The
-  tombstone is removed once the provider stops reporting the machine. It holds
-  no capacity slot, so the pool may start one machine more than its slots until
-  that reclaim lands.
+Boot makes those decisions in SQL before serving traffic:
+
+* **A provider session that outlived its process is fenced** on its next call
+  (`aborted`) and re-registers with a fresh generation; until it does its
+  records are not placed on. Durable sandboxes, leases, pools and templates
+  are unaffected. The same agent process carries accepted work across the
+  fence: a running exec keeps its command and reports later output under the
+  newest generation, so a registration hiccup does not turn a live command
+  into an ambiguous failure. A process that never re-registers keeps its
+  stale generation and stays fenced.
+* **A sandbox caught `PROVISIONING`** keeps its durable create work: the
+  request is part of the sandbox spec row, so a replica resumes the accepted
+  provisioning instead of failing it whole. The caller's retry with the same
+  idempotency key returns the same lease.
+* **A sandbox left `TERMINATING` stays so until its machine is gone.** A
+  destroy in flight is awaited; a failed destroy is retried by `Reconcile`
+  while the provider still reports the machine, and after three failures the
+  record becomes a `GONE` tombstone that still lets `Reconcile` reclaim the
+  machine. The tombstone holds no capacity slot.
 
 Stop, start, pause, resume and snapshot are operations, not record states: the
 record moves only when their report lands, so a restart leaves the last settled
@@ -501,7 +563,15 @@ when `machine delete` refuses.
 | `PRELOOP_SANDBOX_CA` | CA bundle the CLI verifies the service with |
 | `PRELOOP_SANDBOX_JOIN_TOKEN` | join token for `sandbox agent` on its first run |
 | `PRELOOP_SANDBOX_TLS_SANS` | additional generated server certificate SANs |
-| `PRELOOP_SANDBOX_STORE_URL` | store URL |
+| `PRELOOP_SANDBOX_STORE_URL` | `sandbox` SQLite file/URL or Postgres URL (default `<state>/sandbox.db`) |
+| `PRELOOP_SANDBOX_SEAL_KEY` | 64-hex lease/exec env envelope key shared by replicas (default: a 0600 `<state>/sandbox-seal.key`) |
+| `PRELOOP_SANDBOX_CA_DIR` | shared CA directory for replicas that must trust each other's client certificates |
+| `PRELOOP_SANDBOX_PG_POOL` | Postgres connection pool ceiling (default 8) |
+| `PRELOOP_SANDBOX_NODE_ID` | this replica's node id (default: hostname; unique per serving process) |
+| `PRELOOP_SANDBOX_NODE_CREDENTIAL` | inter-node credential this replica presents on the internal hop |
+| `PRELOOP_SANDBOX_PEER_URL` | this replica's base URL as other replicas reach it |
+| `PRELOOP_SANDBOX_PEERS` | `node_id=https://host:port,…` peer directory; the only source of internal routes |
+| `PRELOOP_SANDBOX_NODE_LOST_AFTER_SECS` | node heartbeat expiry before its live channels are failed (default 30) |
 | `PRELOOP_SANDBOX_BLOB_MAX_BYTES` | per-transfer byte cap (default 8 GiB) |
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
 | `PRELOOP_SANDBOX_POOL_DRIVER` | driver the CI pool places on (default: first) |

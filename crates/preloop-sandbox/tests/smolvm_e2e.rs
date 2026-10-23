@@ -12,7 +12,7 @@ use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
-use preloop_sandbox::{Driver, Service, ServiceConfig, store};
+use preloop_sandbox::{Driver, Service, ServiceConfig, backend};
 use tokio_util::sync::CancellationToken;
 
 /// Alpine 3.20's multi-arch index digest: the e2e pulls the real image.
@@ -43,7 +43,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = ServiceConfig::new();
     config.acquire_wait = Duration::from_secs(600);
-    let service = Service::open(store::open("memory:").await.unwrap(), config)
+    let service = Service::open(backend::open("memory:").await.unwrap(), config)
         .await
         .unwrap();
     let driver = Arc::new(SmolvmDriver::new(SmolVmProvider::default(), 0));
@@ -59,7 +59,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
     );
     tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    while service.list_providers().is_empty() {
+    while service.list_providers().await.unwrap().is_empty() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -229,12 +229,16 @@ async fn smolvm_golden_fork_pool_end_to_end() {
     }
     service.delete_pool("alpine-pool").await.unwrap();
     for _ in 0..600 {
-        if service.list().is_empty() {
+        if service.list().await.unwrap().is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(service.list().is_empty(), "{:?}", service.list());
+    assert!(
+        service.list().await.unwrap().is_empty(),
+        "{:?}",
+        service.list().await.unwrap()
+    );
     // Only the golden remains on the host; drop it.
     let left: Vec<String> = driver
         .inventory()

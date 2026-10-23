@@ -17,7 +17,8 @@ use preloop_sandbox::drivers::smolvm::cli::{
 use preloop_orchestrator::fleet::SandboxMachines;
 use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink};
 use preloop_sandbox::api::Requirements;
-use preloop_sandbox::{Driver, InProcess, SandboxApi, Service, ServiceConfig, store};
+use preloop_sandbox::backend;
+use preloop_sandbox::{Driver, InProcess, SandboxApi, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
 
 /// A provider plus the service behind it, so tests can build a second
@@ -44,9 +45,12 @@ async fn fixture(dir: &tempfile::TempDir) -> Fixture {
 }
 
 async fn fixture_with_driver(_dir: &tempfile::TempDir, driver: Arc<dyn Driver>) -> Fixture {
-    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
-        .await
-        .unwrap();
+    let service = Service::open(
+        backend::open("memory:").await.unwrap(),
+        ServiceConfig::new(),
+    )
+    .await
+    .unwrap();
     let shutdown = CancellationToken::new();
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -55,7 +59,12 @@ async fn fixture_with_driver(_dir: &tempfile::TempDir, driver: Arc<dyn Driver>) 
     );
     tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    while service.list_providers().is_empty() {
+    while service
+        .list_providers()
+        .await
+        .map(|providers| providers.is_empty())
+        .unwrap_or(true)
+    {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let machines = SandboxMachines::new(
@@ -581,9 +590,12 @@ async fn a_failed_release_keeps_the_entry_for_the_retry() {
         dir.path().join("host"),
         FakeDriver::full_capabilities(),
     ));
-    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
-        .await
-        .unwrap();
+    let service = Service::open(
+        backend::open("memory:").await.unwrap(),
+        ServiceConfig::new(),
+    )
+    .await
+    .unwrap();
     let shutdown = CancellationToken::new();
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -592,7 +604,12 @@ async fn a_failed_release_keeps_the_entry_for_the_retry() {
     );
     tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    while service.list_providers().is_empty() {
+    while service
+        .list_providers()
+        .await
+        .map(|providers| providers.is_empty())
+        .unwrap_or(true)
+    {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let api = Arc::new(FlakyRelease {

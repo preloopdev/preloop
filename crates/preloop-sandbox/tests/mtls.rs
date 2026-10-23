@@ -82,7 +82,7 @@ async fn enroll_binds_a_name_and_issues_a_provider_certificate() {
     let link = t.enroll("host-a").await;
     let session = link.register(register("host-a")).await.unwrap();
     assert_eq!(session.generation, 1);
-    let providers = t.service.list_providers();
+    let providers = t.service.list_providers().await.unwrap();
     let provider = providers
         .iter()
         .find(|provider| provider.name == "host-a")
@@ -392,6 +392,8 @@ async fn renewal_keeps_the_previous_certificate_valid_until_it_expires() {
     let certificates = t
         .service
         .list_providers()
+        .await
+        .unwrap()
         .into_iter()
         .find(|provider| provider.name == "host-a")
         .map(|provider| provider.certificates)
@@ -413,7 +415,7 @@ async fn removing_a_provider_revokes_its_certificate() {
     let link = t.enroll("host-a").await;
     link.register(register("host-a")).await.unwrap();
     t.client().delete_provider("host-a").await.unwrap();
-    assert!(t.service.list_providers().is_empty());
+    assert!(t.service.list_providers().await.unwrap().is_empty());
     let error = link.register(register("host-a")).await.unwrap_err();
     assert_eq!(error.code, Code::PermissionDenied);
     assert!(
@@ -522,26 +524,31 @@ fn register_full(name: &str) -> RegisterRequest {
     }
 }
 
+/// SHA-256 fingerprints of `host-a`'s certificates, in the order the service
+/// lists them.
+async fn certificate_fingerprints(t: &TestService) -> Vec<String> {
+    t.service
+        .list_providers()
+        .await
+        .expect("list providers")
+        .into_iter()
+        .find(|provider| provider.name == "host-a")
+        .map(|provider| {
+            provider
+                .certificates
+                .iter()
+                .map(|certificate| certificate.sha256.clone())
+                .collect::<Vec<_>>()
+        })
+        .expect("provider host-a present")
+}
+
 #[tokio::test]
 async fn an_unbound_token_cannot_take_over_an_existing_provider() {
     let t = TestService::start().await;
     let victim = t.enroll("host-a").await;
     let session = victim.register(register("host-a")).await.unwrap();
-    let certificate_fingerprints = |t: &TestService| {
-        t.service
-            .list_providers()
-            .into_iter()
-            .find(|provider| provider.name == "host-a")
-            .map(|provider| {
-                provider
-                    .certificates
-                    .iter()
-                    .map(|certificate| certificate.sha256.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap()
-    };
-    let before = certificate_fingerprints(&t);
+    let before = certificate_fingerprints(&t).await;
     assert_eq!(before.len(), 1);
     // A fresh unbound token presented under the victim's name is refused:
     // replacing a live provider's certificates requires a token minted
@@ -558,13 +565,13 @@ async fn an_unbound_token_cannot_take_over_an_existing_provider() {
     );
     // The victim is untouched: same provider, same single certificate, and
     // the certificate still authenticates.
-    let providers = t.service.list_providers();
+    let providers = t.service.list_providers().await.unwrap();
     let provider = providers
         .iter()
         .find(|provider| provider.name == "host-a")
         .expect("provider still present");
     assert_eq!(provider.id, session.provider_id);
-    assert_eq!(certificate_fingerprints(&t), before);
+    assert_eq!(certificate_fingerprints(&t).await, before);
     victim
         .heartbeat(HeartbeatRequest {
             provider_id: session.provider_id,
@@ -692,13 +699,20 @@ async fn renewal_prunes_the_oldest_certificate_beyond_the_cap() {
     // Renew up to the cap: the retained set stops growing there, and one
     // renewal past it prunes the original certificate even though it has
     // not expired — rotation can evict a compromised certificate.
+    //
+    // Retention keeps the certificates with the latest `expires_at`, so
+    // renewals issued in the same second are ordered only by a random hash
+    // tie-break. Space them out to observe the eviction of the original.
     let cap = preloop_sandbox::service::MAX_PROVIDER_CERTIFICATES;
     for _ in 0..cap {
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         link.renew().await.unwrap();
     }
     let certificates = t
         .service
         .list_providers()
+        .await
+        .unwrap()
         .into_iter()
         .find(|provider| provider.name == "host-a")
         .map(|provider| provider.certificates)

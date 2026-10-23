@@ -104,7 +104,7 @@ impl SandboxApi for InProcess {
         Service::put_template(&self.0, spec).await
     }
     async fn list_templates(&self) -> Result<Vec<Template>> {
-        Ok(Service::list_templates(&self.0))
+        Ok(Service::list_templates(&self.0).await?)
     }
     async fn delete_template(&self, name: &str) -> Result<()> {
         Service::delete_template(&self.0, name).await
@@ -113,7 +113,7 @@ impl SandboxApi for InProcess {
         Service::put_pool(&self.0, pool).await
     }
     async fn list_pools(&self) -> Result<Vec<PoolSpec>> {
-        Ok(Service::list_pools(&self.0))
+        Ok(Service::list_pools(&self.0).await?)
     }
     async fn delete_pool(&self, name: &str) -> Result<()> {
         Service::delete_pool(&self.0, name).await
@@ -128,13 +128,13 @@ impl SandboxApi for InProcess {
         Service::release(&self.0, request).await
     }
     async fn get(&self, sandbox_id: &str, lease_id: &str) -> Result<Sandbox> {
-        Service::get(&self.0, sandbox_id, lease_id)
+        Service::get(&self.0, sandbox_id, lease_id).await
     }
     async fn list(&self) -> Result<Vec<Sandbox>> {
-        Ok(Service::list(&self.0))
+        Ok(Service::list(&self.0).await?)
     }
     async fn list_providers(&self) -> Result<Vec<Provider>> {
-        Ok(Service::list_providers(&self.0))
+        Ok(Service::list_providers(&self.0).await?)
     }
     async fn cordon_provider(&self, name: &str) -> Result<Provider> {
         Service::set_provider_cordon(&self.0, name, true).await
@@ -146,10 +146,10 @@ impl SandboxApi for InProcess {
         Service::drain_provider(&self.0, name).await
     }
     async fn stats(&self) -> Result<StatsResponse> {
-        Ok(Service::stats(&self.0))
+        Ok(Service::stats(&self.0).await?)
     }
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
-        Service::exec(&self.0, request)
+        Service::exec(&self.0, request).await
     }
     async fn upload(
         &self,

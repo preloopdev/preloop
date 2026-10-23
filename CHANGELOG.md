@@ -9,6 +9,32 @@ Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 ### Added
 
+- **Sandbox Service state is database-authoritative and multi-replica safe.**
+  Inventory, leases, provider generations, work queues, exec lifecycle, ticket
+  metadata and snapshot receipts are typed SQL commands in short transactions;
+  memory keeps only bounded live channels. SQLite is the single-node default
+  and Postgres serves several replicas with `SKIP LOCKED` work claims and
+  conditional-update fences. Schema v1 is greenfield: an empty store is
+  initialized (replicas may start together; schema creation takes an advisory
+  lock), while a foreign, wrongly versioned or differently sealed store is
+  refused at open — there is no import, backfill or dual-write. Lease and exec
+  environment is sealed with AES-256-GCM from the already-locked `ring`
+  dependency; bearer, join and ticket tokens are stored only as hashes.
+- **Cross-replica live routing.** Exec output and transfer streams are owned by
+  the replica that opened them and recorded as fenced node/session handles. A
+  request that lands elsewhere is forwarded over an authenticated internal
+  node hop whose peer URLs come only from configuration; the shared service CA
+  verifies it. A replica that dies fails only its own streams and leases.
+- **Durable exec start gate.** The agent records a started exec on its host and
+  the service records the winning delivery attempt before the command runs, so
+  at-least-once delivery never executes a command twice. Work the agent already
+  accepted survives a provider re-registration: a running command keeps going
+  and later reports carry the newest generation, and every accepted report
+  renews the delivery window. An ambiguous outcome fails the caller explicitly
+  instead of being replayed.
+- **Enrollment retries are durable.** A join token may be bound to one
+  provider name; a replayed exchange with the same CSR and name returns the
+  certificate the original enrollment issued instead of "token already used".
 - **Sandbox transfers stream without disk staging.** A caller's upload and the
   host agent's fetch now meet on a single-use ticket rendezvous and bytes flow
   through bounded channels — caller → service → agent → guest (or back) —
@@ -55,6 +81,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A conflicting sandbox command is retried, not surfaced.** On Postgres a
+  transaction that loses a lock race (serialization failure `40001` or a
+  detected deadlock `40P01`) is rolled back and the whole command is run again
+  against the winner's state, up to five attempts with a short jittered
+  backoff. The retry keys off a typed conflict marker on the engine error, so
+  a command's own failure is returned unchanged; SQLite keeps single-attempt
+  behaviour. This removes the spurious `unavailable` a concurrent `Acquire`,
+  `Report` or `Reconcile` could return under load.
+
 - **Sandbox telemetry is shareable and bounded.** `Stats` carries aggregates
   only — host process names, PIDs and data-directory paths stay on the
   provider that measured them — the live-sandbox gauge records zero when a
@@ -91,6 +126,14 @@ Releases before v0.27.0 predate the changelog.
   while … live clone(s)"). A template's native ref is now exempt from orphan
   reaping whichever provider reports it; deleting the template still releases
   it through its owning provider.
+
+### Fixed
+
+- Run guest CA distrust edits and trust-bundle regeneration together as root
+  or through passwordless sudo. Official golden forks execute as `runner`
+  (uid 1001); editing `/etc/ca-certificates.conf` without elevation made
+  provisioning fail before the runner could register. Refused elevation
+  now leaves the configuration unchanged.
 
 ## [0.35.6] - 2026-10-21
 

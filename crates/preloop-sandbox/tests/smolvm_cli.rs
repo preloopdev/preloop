@@ -41,7 +41,7 @@ mod unix {
         OrphanPurge, SANDBOX_OWNER_MARKER, SmolVmProvider, SocketMount, VmProvider, VolumeMount,
         machine_data_root, purge_orphaned_vms,
     };
-    use preloop_sandbox::{Service, ServiceConfig, store};
+    use preloop_sandbox::{Service, ServiceConfig, backend};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1736,16 +1736,19 @@ exit 0
                 .with_named_prefix("preloop-runner"),
         );
         let shutdown = CancellationToken::new();
-        let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
-            .await
-            .unwrap();
+        let service = Service::open(
+            backend::open("memory:").await.unwrap(),
+            ServiceConfig::new(),
+        )
+        .await
+        .unwrap();
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             vec![driver as Arc<dyn Driver>],
             AgentConfig::new("host-a"),
         );
         tokio::spawn(agent.run(None, shutdown.clone()));
-        while service.list_providers().is_empty() {
+        while service.list_providers().await.unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         service
@@ -1775,6 +1778,7 @@ exit 0
         assert_eq!(
             service
                 .get(&lease.sandbox.id, &lease.lease.id)
+                .await
                 .unwrap()
                 .state,
             SandboxState::Leased,

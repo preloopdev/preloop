@@ -15,6 +15,7 @@
 pub mod agent;
 pub mod api;
 pub mod authz;
+pub mod backend;
 pub mod client;
 pub mod driver;
 pub mod driver_conformance;
@@ -28,7 +29,6 @@ pub mod metrics;
 pub mod placement;
 pub mod server;
 pub mod service;
-pub mod store;
 pub mod tls;
 
 pub use client::{InProcess, SandboxApi, SandboxClient};

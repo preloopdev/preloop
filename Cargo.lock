@@ -3028,6 +3028,7 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-native-certs",

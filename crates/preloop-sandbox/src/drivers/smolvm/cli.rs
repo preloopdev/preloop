@@ -3145,7 +3145,7 @@ impl VmProvider for SmolVmProvider {
 
         let copy = async move {
             use tokio::io::AsyncWriteExt as _;
-            let feed = async {
+            let feed = async move {
                 while let Some(chunk) = tar.recv().await {
                     match chunk {
                         TransferChunk::Data(bytes) => {
@@ -3154,15 +3154,17 @@ impl VmProvider for SmolVmProvider {
                             }
                         }
                         TransferChunk::Failed(reason) => {
-                            let _ = stdin.shutdown().await;
                             return Err(reason);
                         }
                     }
                 }
-                stdin
-                    .shutdown()
-                    .await
-                    .map_err(|error| format!("stdin: {error}"))
+                // tokio's ChildStdin::shutdown is a no-op, so the pipe only
+                // sees EOF when the handle is dropped. The feeder owns it
+                // (`async move`); borrowing it here kept the write end alive
+                // until child.wait() returned, which the guest never did —
+                // `tar -xf -` waited on stdin forever.
+                drop(stdin);
+                Ok(())
             };
             let (fed, out, err, status) = tokio::join!(
                 feed,
@@ -7092,6 +7094,102 @@ mod tests {
         // The floor the message tells the operator to upgrade to is compiled
         // from versions.toml, never a literal in this file.
         assert!(error.to_string().contains(super::SMOLVM_MIN_VERSION));
+    }
+
+    /// A stand-in `smolvm` whose `machine exec` behaves like the guest's
+    /// `tar -xf -`: it reads its stdin to EOF into a file and only then
+    /// exits. Returns the binary and the file the "guest" wrote.
+    #[cfg(unix)]
+    fn guest_stdin_reader(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let received = dir.join("received.tar");
+        let binary = fake_smolvm(
+            dir,
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 --version) echo 'smolvm 1.30.1' ;;\n\
+                 esac\n\
+                 case \"$1 $2\" in\n\
+                 \"machine exec\") cat > '{received}' ;;\n\
+                 esac\n\
+                 exit 0\n",
+                received = received.display()
+            ),
+        );
+        (binary, received)
+    }
+
+    /// `copy_in_stream` pipes the archive into the guest's `tar -xf -` and
+    /// must end the pipe when the archive ends. tokio's `ChildStdin::shutdown`
+    /// is a no-op, so only dropping the handle delivers EOF; a feeder that
+    /// merely borrowed it kept the write end open until `child.wait()`
+    /// returned, which the guest never did because `tar` was waiting for that
+    /// EOF. The sandbox then hung until the 40-minute exec deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn copy_in_stream_ends_stdin_so_the_guest_reader_finishes() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let _agent_rootfs = AgentRootfsGuard::set();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (binary, received) = guest_stdin_reader(scratch.path());
+        let provider = super::SmolVmProvider::new(&binary);
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(TransferChunk::Data(b"archive-".to_vec()))
+            .await
+            .unwrap();
+        tx.send(TransferChunk::Data(b"bytes".to_vec()))
+            .await
+            .unwrap();
+        drop(tx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.copy_in_stream(&MachineName::new("runner-0").unwrap(), "/work", rx),
+        )
+        .await
+        .expect("copy-in hung: the guest reader never saw EOF on stdin")
+        .expect("copy-in");
+        assert_eq!(
+            std::fs::read(&received).expect("received archive"),
+            b"archive-bytes"
+        );
+    }
+
+    /// A source that fails mid-transfer still has to release the guest's
+    /// reader — otherwise the abort hangs the same way a success did — and
+    /// the caller must see the source's own reason, not a bare hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn copy_in_stream_reports_a_failed_source_and_releases_the_guest_reader() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let _agent_rootfs = AgentRootfsGuard::set();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (binary, _received) = guest_stdin_reader(scratch.path());
+        let provider = super::SmolVmProvider::new(&binary);
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(TransferChunk::Data(b"partial".to_vec()))
+            .await
+            .unwrap();
+        tx.send(TransferChunk::Failed("upload aborted by caller".into()))
+            .await
+            .unwrap();
+        drop(tx);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.copy_in_stream(&MachineName::new("runner-0").unwrap(), "/work", rx),
+        )
+        .await
+        .expect("copy-in hung: a failed source left the guest reader waiting")
+        .expect_err("a failed source must fail the copy");
+        assert!(
+            error.to_string().contains("upload aborted by caller"),
+            "the source's reason must reach the caller, got {error}"
+        );
     }
 
     /// The egress-floor policy needs a backend that carries it, so

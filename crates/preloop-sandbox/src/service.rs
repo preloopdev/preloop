@@ -1,54 +1,52 @@
 //! The Sandbox Service core: templates, pools, leases, placement, provider
-//! work queues, fencing, reconciliation and the generic warm pool.
+//! work and the live channel runtime.
 //!
-//! State lives in memory behind one mutex and is written through to the
-//! [`Store`]; the store is the restart source. Providers (in-process or
-//! remote host agents, connectors) receive work by long-polling and report
-//! results fenced by their registration generation.
+//! Durable state lives in [`crate::backend`]; this module owns only bounded
+//! live channels (exec output, transfer rendezvous), the placement policy and
+//! the instants a caller is currently waiting on. Every decision that grants
+//! capacity, a lease, a provider generation, a work claim or a live-channel
+//! owner is asked of the database in one short transaction.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use parking_lot::Mutex;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::warn;
 
 use crate::api::*;
+use crate::backend::{
+    self, AcquireCommand, AcquireStep, BackendConfig, ExecStatus, MaintenanceConfig, NewSandbox,
+    Owner, OwnerKind, PeerConfig, PlacementSnapshot, PowerOp, RefillOutcome, SandboxBackend,
+    SnapshotCommand, SnapshotStart, TicketAuthority, TicketSide, WorkResult,
+};
 use crate::driver::{EXEC_TIMED_OUT, TRANSFER_QUEUE, TransferChunk};
 use crate::error::{Code, Error, Result};
 use crate::placement::{Candidate, CandidateId, LeastLoaded, Placement, PlacementRequest};
-use crate::store::{Kind, Store};
 use crate::tls;
 
-/// Tunables.
-#[derive(Debug, Clone)]
+/// Tunables and node identity.
+#[derive(Clone)]
 pub struct ServiceConfig {
     /// Default lease TTL.
     pub lease_ttl: Duration,
+    /// Default time `Acquire` waits for a ready sandbox.
+    pub acquire_wait: Duration,
     /// How long an acquired-but-never-returned lease (one whose `Acquire` is
     /// still provisioning, or timed out) may live before maintenance releases
     /// it. A waiting `Acquire` keeps its lease past this window.
     pub unclaimed_lease_ttl: Duration,
-    /// Default time `Acquire` waits for a ready sandbox.
-    pub acquire_wait: Duration,
     /// How long an `Acquire` may wait *for capacity* — the pool is at
     /// `max`, or placement reports `resource_exhausted` — before the wait
-    /// fails with that `resource_exhausted` error. Provisioning waits are
-    /// bounded by `acquire_wait` instead: a cold create legitimately takes
-    /// minutes, but a full pool does not free up faster for waiting longer,
-    /// and a caller that cannot hear about overload within this window
-    /// cannot fail over to another pool or provider either. Without the
-    /// bound, an over-capacity `Acquire` parked for the whole
-    /// `acquire_wait` (observed ≥600 s against a 900 s default), pinning a
-    /// handler and a connection per parked caller.
+    /// fails with that error. Provisioning waits stay bounded by
+    /// `acquire_wait`: a cold create legitimately takes minutes, but a full
+    /// pool does not free up faster for waiting longer.
     pub acquire_capacity_wait: Duration,
     /// A provider silent this long is not placed on.
     pub provider_timeout: Duration,
@@ -58,33 +56,50 @@ pub struct ServiceConfig {
     pub preserve_ttl: Duration,
     /// Maximum bytes accepted for one transfer (data plane).
     pub blob_max_bytes: u64,
-    /// How long a data-plane ticket stays valid.
+    /// How long a data-plane ticket stays valid before both sides claim.
     pub ticket_ttl: Duration,
-    /// How long a caller waits for a provider to report a snapshot, copy,
-    /// pause or resume before the request is failed.
+    /// How long a caller waits for a provider report.
     pub work_timeout: Duration,
-    /// A provider silent this many times `provider_timeout` is treated as
-    /// lost: its sandboxes fail, which frees leases and closes exec streams.
+    /// A provider silent this many times `provider_timeout` is lost.
     pub provider_lost_factor: u32,
-    /// Strategy that ranks the candidates the capability filter admits.
-    /// `PRELOOP_SANDBOX_PLACEMENT` selects a built-in one in the CLI and the
-    /// engine; the default is [`LeastLoaded`].
+    /// Strategy that ranks placement candidates.
     pub placement: Arc<dyn Placement>,
-    /// `preloop.sandbox.*` instruments. Defaults to a no-op registry;
-    /// callers wanting real export build one from
-    /// `Observability::meter()` and overwrite this field.
+    /// `preloop.sandbox.*` instruments.
     pub metrics: crate::metrics::SandboxMetrics,
-    /// Most work items one `Poll` returns (`PRELOOP_SANDBOX_POLL_BATCH`).
+    /// Most work items one `Poll` returns.
     pub poll_batch: usize,
-    /// How long delivered work stays in flight before it is redelivered
-    /// (`PRELOOP_SANDBOX_DELIVERY_TIMEOUT_SECS`).
+    /// How long delivered work stays in flight before redelivery.
     pub delivery_timeout: Duration,
-    /// An exec with no explicit deadline gets this one
-    /// (`PRELOOP_SANDBOX_EXEC_TIMEOUT_SECS`).
+    /// Default exec deadline.
     pub exec_timeout: Duration,
-    /// CA that issues provider client certificates. `None` disables
-    /// `Enroll` and `RenewCertificate` (an in-process-only service).
+    /// CA that issues provider client certificates. Shared by every replica.
     pub ca: Option<Arc<crate::tls::ServiceCa>>,
+    /// This replica's node id. Must be unique per serving process.
+    pub node_id: String,
+    /// This replica's node session; generated when empty.
+    pub node_session: String,
+    /// This replica's inter-node credential. Generated for single-node use.
+    pub node_credential: String,
+    /// This replica's advertised base URL for peer routing (optional).
+    pub peer_url: String,
+    /// Peer replicas, from configuration only.
+    pub peers: Vec<PeerConfig>,
+    /// A node unheard from this long is reaped and its live channels fail.
+    pub node_lost_after: Duration,
+    /// An acquire waiter's claim lifetime (renewed in the wait loop).
+    pub waiter_timeout: Duration,
+    /// How long an injection claim is held before another retry may claim it.
+    pub injection_timeout: Duration,
+}
+
+impl std::fmt::Debug for ServiceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceConfig")
+            .field("lease_ttl", &self.lease_ttl)
+            .field("node_id", &self.node_id)
+            .field("peers", &self.peers.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ServiceConfig {
@@ -92,8 +107,8 @@ impl ServiceConfig {
     pub fn new() -> Self {
         Self {
             lease_ttl: Duration::from_secs(3600),
-            unclaimed_lease_ttl: Duration::from_secs(600),
             acquire_wait: Duration::from_secs(900),
+            unclaimed_lease_ttl: Duration::from_secs(600),
             acquire_capacity_wait: Duration::from_secs(30),
             provider_timeout: Duration::from_secs(45),
             create_timeout: Duration::from_secs(1800),
@@ -108,7 +123,40 @@ impl ServiceConfig {
             delivery_timeout: Duration::from_secs(120),
             exec_timeout: Duration::from_secs(3600),
             ca: None,
+            node_id: std::env::var("PRELOOP_SANDBOX_NODE_ID").unwrap_or_else(|_| {
+                hostname::get()
+                    .ok()
+                    .and_then(|name| name.into_string().ok())
+                    .unwrap_or_else(|| "sandbox-node".to_owned())
+            }),
+            node_session: String::new(),
+            node_credential: std::env::var("PRELOOP_SANDBOX_NODE_CREDENTIAL").unwrap_or_default(),
+            peer_url: std::env::var("PRELOOP_SANDBOX_PEER_URL").unwrap_or_default(),
+            peers: Vec::new(),
+            node_lost_after: Duration::from_secs(30),
+            waiter_timeout: Duration::from_secs(30),
+            injection_timeout: Duration::from_secs(60),
         }
+    }
+
+    /// Parse `PRELOOP_SANDBOX_PEERS` (`node_id=https://host:port,...`).
+    pub fn peers_from_env() -> Result<Vec<PeerConfig>> {
+        let Ok(value) = std::env::var("PRELOOP_SANDBOX_PEERS") else {
+            return Ok(Vec::new());
+        };
+        let mut peers = Vec::new();
+        for entry in value.split(',').filter(|entry| !entry.trim().is_empty()) {
+            let (node_id, url) = entry.trim().split_once('=').ok_or_else(|| {
+                Error::invalid_argument(
+                    "PRELOOP_SANDBOX_PEERS entries must be node_id=https://host:port",
+                )
+            })?;
+            peers.push(PeerConfig {
+                node_id: node_id.trim().to_owned(),
+                url: url.trim().to_owned(),
+            });
+        }
+        Ok(peers)
     }
 }
 
@@ -131,27 +179,9 @@ pub const MAX_PAGE_SIZE: u32 = 1000;
 pub const DEFAULT_JOIN_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Longest accepted join-token lifetime. A token is a bearer credential for
-/// one enrollment; a day is long enough for an operator to hand it to a
-/// host and short enough that a leaked token stops working.
+/// one enrollment; a day is long enough for an operator to hand it to a host
+/// and short enough that a leaked token stops working.
 pub const MAX_JOIN_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Default cap for one blob upload: 8 GiB.
-pub const DEFAULT_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-/// Unsuccessful destroy attempts after which the service stops queueing
-/// destroys for a `Terminating` record. The record is kept as a `Gone`
-/// tombstone that `Reconcile` destroys the machine through (see
-/// `tombstone_locked`): the machine stays reclaimable, and the record stops
-/// holding a pool slot.
-const MAX_DESTROY_ATTEMPTS: u32 = 3;
-
-/// How long after its deadline an exec is swept. The driver enforces the
-/// deadline itself (exit 124) and its clock starts after delivery, so the
-/// sweep waits out the delivery and report latency before ending the caller's
-/// stream as a backstop. The sweep reports the same timeout exit as the
-/// driver: whichever path gets there first, the caller sees `124`, never an
-/// error that depends on scheduling.
-const EXEC_SWEEP_GRACE: Duration = Duration::from_secs(5);
 
 /// How many simultaneously valid certificates one provider may hold: the
 /// current certificate plus two predecessors. Renewal keeps a short overlap
@@ -160,8 +190,10 @@ const EXEC_SWEEP_GRACE: Duration = Duration::from_secs(5);
 /// if unexpired, so rotating can actually evict a compromised certificate.
 pub const MAX_PROVIDER_CERTIFICATES: usize = 3;
 
-/// The provider a client certificate authenticates, resolved from the leaf's
-/// SHA-256 fingerprint.
+/// Default cap for one blob upload: 8 GiB.
+pub const DEFAULT_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The provider a client certificate authenticates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderIdentity {
     /// Provider id.
@@ -170,53 +202,18 @@ pub struct ProviderIdentity {
     pub name: String,
 }
 
-/// Names are identifiers: they reach driver-native names, snapshot paths and
-/// pool configuration, so path separators and traversal are rejected.
-fn validate_name(kind: &str, name: &str) -> Result<()> {
-    let bad = name.is_empty()
-        || name.len() > 128
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains("..")
-        || name.chars().any(|c| c.is_control());
-    if bad {
-        return Err(Error::invalid_argument(format!(
-            "invalid {kind} name `{name}`"
-        )));
-    }
-    Ok(())
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }
 
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
-}
-
-/// Wait for a copy's report, bounded by the service's work timeout.
-pub(crate) async fn await_copy(
-    reply: oneshot::Receiver<Result<String>>,
-    timeout: Duration,
-) -> Result<()> {
-    tokio::time::timeout(timeout, reply)
-        .await
-        .map_err(|_| Error::unavailable("provider did not report the copy"))?
-        .map_err(|_| Error::unavailable("provider dropped the copy"))?
-        .map(|_| ())
-}
-
-/// Exec env keys become shell assignments in argv-only drivers; reject
-/// anything that is not a POSIX identifier before it reaches a driver.
-fn validate_env(env: &buffa::__private::HashMap<String, String>) -> Result<()> {
-    for key in env.keys() {
-        if !crate::driver::env_key_is_identifier(key) {
-            return Err(Error::invalid_argument(format!(
-                "invalid environment variable name `{key}`"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn new_id(prefix: &str) -> String {
@@ -226,302 +223,80 @@ fn new_id(prefix: &str) -> String {
     )
 }
 
-/// Guest paths name files inside one sandbox; a legitimate one never
-/// needs a `..` component, and a `..` is exactly how a path escapes the
-/// sandbox on a driver that resolves paths on the host. Reject it at the
-/// service, before any driver sees the path. Both separator spellings
-/// count: a Windows guest path is `\`-separated.
-fn validate_guest_path(path: &str) -> Result<()> {
-    if path.split(['/', '\\']).any(|component| component == "..") {
-        return Err(Error::invalid_argument("guest path must not contain `..`"));
-    }
-    Ok(())
-}
-
-/// sha256 of the canonical JSON of a template spec.
+/// SHA-256 of the canonical JSON of a template spec.
 pub fn template_digest(spec: &TemplateSpec) -> String {
     let canonical = serde_json::to_vec(spec).unwrap_or_default();
     format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
 }
 
-/// Page `items` (already ordered by id) as the request asks.
-///
-/// The token is the base64url encoding of `v1:<kind>:<last returned id>`:
-/// callers pass it back untouched, an id that has since disappeared still
-/// resumes at the right position, and anything else (garbage, or a token
-/// minted for another listing) is rejected rather than silently rewinding to
-/// the first page.
-fn paginate<T>(
-    kind: &str,
-    items: impl IntoIterator<Item = (String, T)>,
-    request: &ListRequest,
-) -> Result<(Vec<T>, String)> {
-    use base64::Engine as _;
-    const PREFIX: &str = "v1";
-    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let limit = match request.page_size {
-        0 => DEFAULT_PAGE_SIZE,
-        size => size.min(MAX_PAGE_SIZE),
-    } as usize;
-    let after = if request.page_token.is_empty() {
-        None
-    } else {
-        let decoded = engine
-            .decode(request.page_token.as_bytes())
-            .map_err(|_| Error::invalid_argument("invalid page token"))?;
-        let decoded = String::from_utf8(decoded)
-            .map_err(|_| Error::invalid_argument("invalid page token"))?;
-        let (token_kind, id) = decoded
-            .strip_prefix(PREFIX)
-            .and_then(|rest| rest.strip_prefix(':'))
-            .and_then(|rest| rest.split_once(':'))
-            .ok_or_else(|| Error::invalid_argument("invalid page token"))?;
-        if token_kind != kind || id.is_empty() {
-            return Err(Error::invalid_argument("invalid page token"));
+/// Per-sandbox placement inputs.
+#[derive(Clone)]
+struct PlacementSpec {
+    template: Template,
+    shape: Shape,
+    network: NetworkPolicy,
+    mounts: Vec<Mount>,
+    sockets: Vec<SocketMount>,
+    options: StringMap,
+    requires: Requirements,
+    snapshot_capable: bool,
+}
+
+impl PlacementSpec {
+    fn request(&self) -> PlacementRequest {
+        let template = &self.template;
+        let requires = &self.requires;
+        let os = if requires.os.is_empty() {
+            template
+                .spec
+                .as_option()
+                .map(|spec| spec.os.clone())
+                .unwrap_or_default()
+        } else {
+            requires.os.clone()
+        };
+        let driver = if requires.driver.is_empty() {
+            template.driver.clone()
+        } else {
+            requires.driver.clone()
+        };
+        PlacementRequest {
+            template: template
+                .spec
+                .as_option()
+                .map(|spec| spec.name.clone())
+                .unwrap_or_default(),
+            driver,
+            os,
+            arch: requires.arch.clone(),
+            features: requires.features.clone(),
+            capabilities: requires.capabilities.clone(),
+            snapshot_capable: self.snapshot_capable,
+            network: self.network.mode.as_known().unwrap_or_default(),
+            host_mounts: !self.mounts.is_empty(),
+            socket_mounts: !self.sockets.is_empty(),
         }
-        Some(id.to_owned())
-    };
-    let items: Vec<(String, T)> = items.into_iter().collect();
-    let start = after
-        .as_ref()
-        .map_or(0, |after| items.partition_point(|(id, _)| id <= after));
-    let mut page = Vec::with_capacity(limit.min(items.len()));
-    let mut last = None;
-    for (id, item) in items.into_iter().skip(start) {
-        if page.len() == limit {
-            let token = last.expect("a full page has a last id");
-            return Ok((page, engine.encode(format!("{PREFIX}:{kind}:{token}"))));
-        }
-        last = Some(id);
-        page.push(item);
-    }
-    Ok((page, String::new()))
-}
-
-/// Fingerprint of the fields that decide *which* sandbox an idempotency key
-/// acquired: pool or template, shape, requirements, purpose, egress, mounts,
-/// sockets, options and name.
-///
-/// Call tactics (`ttl_secs`, `wait_secs`) and the lease's injected payload
-/// are deliberately excluded: a retry may change them without becoming a
-/// different request, and re-injection is idempotent by design.
-fn acquire_fingerprint(request: &AcquireRequest) -> String {
-    let identity = (
-        &request.pool,
-        &request.template,
-        &request.shape,
-        &request.requires,
-        &request.purpose,
-        &request.network,
-        &request.mounts,
-        &request.sockets,
-        &request.options,
-        &request.name,
-    );
-    let canonical = serde_json::to_vec(&identity).unwrap_or_default();
-    format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
-}
-
-/// Revision of a pool's full placement: its configuration plus the template
-/// digest it references. A warm member built for another revision must not
-/// serve a new acquire.
-fn pool_revision(state: &State, pool: &PoolSpec) -> String {
-    let template = state
-        .templates
-        .get(&pool.template)
-        .map(|template| template.digest.clone())
-        .unwrap_or_default();
-    // Scale and renewal policy do not change how a member is built: editing
-    // them must not retire every warm member.
-    let build = PoolSpec {
-        warm: 0,
-        max: 0,
-        lease_ttl_secs: 0,
-        ..pool.clone()
-    };
-    let canonical = serde_json::to_vec(&(build, template)).unwrap_or_default();
-    format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
-}
-
-/// State a sandbox returns to when its Pause/Stop is undone with no lease.
-fn restored_state(sandbox: &Sandbox) -> SandboxState {
-    match sandbox.prior_state.known() {
-        // A preserved or once-leased sandbox stays a debug hold (its
-        // deadline is kept): a used machine must never serve a new lease.
-        SandboxState::Preserved | SandboxState::Leased => SandboxState::Preserved,
-        _ => SandboxState::Ready,
     }
 }
 
-/// State a powered-off sandbox returns to when it is started or resumed.
-/// A sandbox still inside its preserve window stays a debug hold even while
-/// its lease survives, so powering a used machine on cannot put it back in
-/// the warm set.
-fn resumed_state(sandbox: &Sandbox) -> SandboxState {
-    if sandbox.preserve_until > 0 {
-        SandboxState::Preserved
-    } else if sandbox.lease_id.is_empty() {
-        restored_state(sandbox)
-    } else {
-        SandboxState::Leased
-    }
-}
-
-#[derive(Debug)]
-enum Pending {
-    Create {
-        sandbox_id: String,
-        driver: String,
-    },
-    Destroy {
-        sandbox_id: String,
-    },
-    Exec {
-        exec_id: String,
-    },
-    Copy {
-        reply: oneshot::Sender<Result<String>>,
-    },
-    Snapshot {
-        reply: oneshot::Sender<Result<String>>,
-    },
-    Pause {
-        sandbox_id: String,
-        lease_id: String,
-        expected: SandboxState,
-        reply: oneshot::Sender<Result<String>>,
-    },
-    Stop {
-        sandbox_id: String,
-        lease_id: String,
-        expected: SandboxState,
-        reply: oneshot::Sender<Result<String>>,
-    },
-    Start {
-        sandbox_id: String,
-        lease_id: String,
-        expected: SandboxState,
-        forkable: bool,
-        reply: oneshot::Sender<Result<String>>,
-    },
-    Resume {
-        sandbox_id: String,
-        lease_id: String,
-        expected: SandboxState,
-        reply: oneshot::Sender<Result<String>>,
-    },
-}
-
-struct PendingWork {
-    provider_id: String,
-    kind: Pending,
-    /// When the service stops waiting (and forgets the work).
-    deadline: Instant,
-}
-
-/// Work delivered to a provider and not yet acknowledged.
-struct InFlight {
-    work: WorkItem,
-    /// When the item becomes visible for redelivery.
-    visible_at: Instant,
-}
-
-struct ProviderRec {
-    provider: Provider,
-    seen: Instant,
-    queue: VecDeque<WorkItem>,
-    /// Delivered work, keyed by work id, until `Report` acknowledges it.
-    in_flight: HashMap<String, InFlight>,
-    wake: Arc<Notify>,
-    /// Latest reported host sample, with the instant it was received for
-    /// age reporting. Memory-only: a `Heartbeat` never persists (fenced
-    /// liveness data is a restart source, not durable state).
-    host: Option<HostSample>,
-    host_sampled_at: Option<Instant>,
-    /// Latest per-sandbox runtime facts, keyed by native ref. Replaced
-    /// wholesale on every `Heartbeat` that reports stats (never merged),
-    /// so a sandbox the driver stops reporting falls out on its own.
-    sandbox_stats: HashMap<String, SandboxRuntimeStats>,
-}
-
-/// One running exec, as seen by the service.
+/// One running exec's local output channel.
 struct Exec {
-    sandbox_id: String,
-    /// The `Report`-acknowledged work item that started it.
-    work_id: String,
-    /// How many times the exec's work item has been delivered. Delivery is
-    /// at-least-once; a count above one means the previous delivery's
-    /// report never arrived (the agent crashed, or the visibility timeout
-    /// lapsed mid-run). The agent fences re-execution from its durable
-    /// started-set; this counter is the service-side record of the attempt
-    /// dimension, kept with the exec for its whole life.
-    attempts: u32,
     tx: mpsc::Sender<Result<ExecEvent>>,
-    /// Last `ReportExec` batch sequence applied.
-    sequence: u64,
-    /// Absolute deadline for the whole command.
-    deadline: Instant,
-    /// Fires when the service stops forwarding this exec, so the watcher
-    /// that detects a dropped caller stream releases its sender.
     finished: CancellationToken,
 }
 
-/// A single-use join token; only the secret's hash is stored.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JoinTokenRecord {
-    id: String,
-    secret_sha256: String,
+/// Data-plane ticket: a single-use rendezvous for one tar stream.
+struct Blob {
+    sandbox_id: String,
+    kind: StreamKind,
+    guest_path: String,
     expires_at: i64,
-    /// Provider name the token was minted for. Empty (the default, and the
-    /// value on records persisted before name binding existed) means the
-    /// token is unbound: it may only enroll a provider name that does not
-    /// exist yet. A name-bound token may also re-enroll — replace the
-    /// certificates of — the provider it names, and no other.
-    #[serde(default)]
-    provider_name: String,
-}
-
-/// What a successfully used join token issued.
-///
-/// Kept in memory only, until the token's original expiry: a client that
-/// lost the `Enroll` response retries with the same token and CSR and gets
-/// this certificate back instead of "join token already used". A restart
-/// forgets it (the token is gone from the store too), so a retry after a
-/// restart fails as it did before retries were idempotent.
-#[derive(Debug, Clone)]
-struct UsedJoinToken {
-    secret_sha256: String,
-    /// SHA-256 of the exact CSR PEM that was signed.
-    csr_sha256: String,
-    provider_name: String,
-    cert_pem: String,
-    cert_expires_at: i64,
-    /// The token's expiry; past it the record is pruned.
-    expires_at: i64,
-}
-
-/// The caller's exec response: the event stream plus the end of a oneshot
-/// that tells the disconnect watcher the caller is gone.
-///
-/// The service keeps a sender for this exec in [`State::execs`] so
-/// `ReportExec` can forward output; watching the channel's senders for
-/// closure therefore cannot detect a caller that walked away. This guard is
-/// dropped with the response stream itself and is unaffected by that sender.
-struct ExecStream {
-    inner: BoxStream<'static, Result<ExecEvent>>,
-    _disconnect: oneshot::Sender<()>,
-}
-
-impl futures::Stream for ExecStream {
-    type Item = Result<ExecEvent>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        futures::Stream::poll_next(self.inner.as_mut(), cx)
-    }
+    producer_claimed: bool,
+    consumer_claimed: bool,
+    status: watch::Sender<TransferStatus>,
+    tx: Option<mpsc::Sender<TransferChunk>>,
+    rx: Option<mpsc::Receiver<TransferChunk>>,
+    control: Option<mpsc::Sender<TransferChunk>>,
 }
 
 /// Which end of a transfer a caller is claiming.
@@ -545,10 +320,6 @@ pub enum TransferStatus {
 }
 
 /// One side's claim on a data-plane ticket.
-///
-/// Exactly one producer and one consumer may claim a ticket, and each claim
-/// takes its endpoint out of the ticket, so a duplicate claim fails rather
-/// than aliasing a live stream.
 #[derive(Debug)]
 pub struct StreamClaim {
     /// Sandbox the copy targets.
@@ -565,417 +336,221 @@ pub struct StreamClaim {
 }
 
 impl StreamClaim {
-    /// Take the producer's sending end (only a producer claim has one).
+    /// Take the producer's sending end.
     pub fn take_producer(&mut self) -> Option<mpsc::Sender<TransferChunk>> {
         self.producer.take()
     }
 
-    /// Take the consumer's receiving end (only a consumer claim has one).
+    /// Take the consumer's receiving end.
     pub fn take_consumer(&mut self) -> Option<mpsc::Receiver<TransferChunk>> {
         self.consumer.take()
     }
 }
 
-/// Data-plane ticket: a single-use rendezvous for one tar stream.
-///
-/// The bytes move through the bounded channel created here; the ticket holds
-/// only a token, the guest path and the two claim markers, never the payload.
-struct Blob {
-    sandbox_id: String,
-    kind: StreamKind,
-    guest_path: String,
-    token: String,
-    expires_at: i64,
-    producer_claimed: bool,
-    consumer_claimed: bool,
-    status: watch::Sender<TransferStatus>,
-    tx: Option<mpsc::Sender<TransferChunk>>,
-    rx: Option<mpsc::Receiver<TransferChunk>>,
-    /// A producer-side clone the service keeps to deliver an abort reason to
-    /// the consumer. Cleared when the producer finishes or aborts, because a
-    /// lingering clone would keep the consumer's channel open forever.
-    control: Option<mpsc::Sender<TransferChunk>>,
+/// The caller's exec response stream plus its disconnect guard.
+struct ExecStream {
+    inner: BoxStream<'static, Result<ExecEvent>>,
+    _disconnect: oneshot::Sender<()>,
 }
 
-/// Per-sandbox creation parameters kept for (re)provisioning and audit.
-#[derive(Clone)]
-struct PlacementSpec {
-    template: Template,
-    shape: Shape,
-    network: NetworkPolicy,
-    mounts: Vec<Mount>,
-    sockets: Vec<SocketMount>,
-    options: StringMap,
-    requires: Requirements,
-    snapshot_capable: bool,
-}
+impl futures::Stream for ExecStream {
+    type Item = Result<ExecEvent>;
 
-impl PlacementSpec {
-    /// What the configured [`Placement`] ranks on: the request as resolved
-    /// against the template, in capability terms.
-    fn request(&self) -> PlacementRequest {
-        let template = &self.template;
-        let requires = &self.requires;
-        let os = if requires.os.is_empty() {
-            template.spec.os.clone()
-        } else {
-            requires.os.clone()
-        };
-        let driver = if requires.driver.is_empty() {
-            template.driver.clone()
-        } else {
-            requires.driver.clone()
-        };
-        PlacementRequest {
-            template: template.spec.name.clone(),
-            driver,
-            os,
-            arch: requires.arch.clone(),
-            features: requires.features.clone(),
-            capabilities: requires.capabilities.clone(),
-            snapshot_capable: self.snapshot_capable,
-            network: self.network.mode.as_known().unwrap_or_default(),
-            host_mounts: !self.mounts.is_empty(),
-            socket_mounts: !self.sockets.is_empty(),
-        }
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        futures::Stream::poll_next(self.inner.as_mut(), cx)
     }
 }
 
-/// Check that `lease_id` is the capability for `sandbox`: it must be the
-/// sandbox's active lease, and the lease must still exist. Every
-/// sandbox-scoped RPC goes through this; `List` is the only read that does
-/// not name a sandbox and therefore redacts lease ids instead.
-fn authorize(state: &State, sandbox: &Sandbox, lease_id: &str) -> Result<()> {
-    if lease_id.is_empty() {
-        return Err(Error::new(
-            Code::PermissionDenied,
-            format!(
-                "leaseId is required to use sandbox `{}`; pass the lease returned by Acquire",
-                sandbox.id
-            ),
-        ));
-    }
-    let held = sandbox.lease_id == lease_id
-        && state
-            .leases
-            .get(lease_id)
-            .is_some_and(|lease| lease.sandbox_id == sandbox.id);
-    if held {
-        Ok(())
-    } else {
-        Err(Error::new(
-            Code::PermissionDenied,
-            format!("lease `{lease_id}` does not hold sandbox `{}`", sandbox.id),
-        ))
-    }
-}
-
-/// Close every open exec stream of a sandbox, so a destroyed or failed
-/// sandbox cannot leave a caller streaming forever.
-fn close_execs(state: &mut State, sandbox_id: &str, reason: &str) {
-    let stale: Vec<String> = state
-        .execs
-        .iter()
-        .filter(|(_, exec)| exec.sandbox_id == sandbox_id)
-        .map(|(exec_id, _)| exec_id.clone())
-        .collect();
-    for exec_id in stale {
-        if let Some(exec) = state.execs.remove(&exec_id) {
-            exec.finished.cancel();
-            let _ = exec
-                .tx
-                .try_send(Err(crate::error::from_reported(reason.to_owned())));
-        }
-    }
-}
-
-/// A lifecycle completion is applied only to the same sandbox record, under
-/// the same lease and in the state the operation expected to leave behind.
-fn still_in_state(state: &State, sandbox_id: &str, lease_id: &str, expected: SandboxState) -> bool {
-    state
-        .sandboxes
-        .get(sandbox_id)
-        .is_some_and(|sandbox| sandbox.lease_id == lease_id && sandbox.state == expected)
-}
-
-/// Whether a destroy for `sandbox_id` is queued on a provider or running.
-fn destroy_in_flight(state: &State, sandbox_id: &str) -> bool {
-    state.pending.values().any(|work| {
-        matches!(&work.kind, Pending::Destroy { sandbox_id: id } if id.as_str() == sandbox_id)
-    })
-}
-
+/// Local live-channel state. Never durable inventory.
 #[derive(Default)]
-struct State {
-    templates: BTreeMap<String, Template>,
-    pools: BTreeMap<String, PoolSpec>,
-    sandboxes: BTreeMap<String, Sandbox>,
-    created_at: HashMap<String, Instant>,
-    leases: BTreeMap<String, Lease>,
-    lease_by_key: HashMap<String, String>,
-    /// In-process `Acquire` calls waiting for a lease, by idempotency key.
-    /// Maintenance must not expire a lease while its caller is still waiting.
-    waiting: HashMap<String, usize>,
-    injected: HashSet<String>,
-    providers: BTreeMap<String, ProviderRec>,
-    join_tokens: BTreeMap<String, JoinTokenRecord>,
-    /// Used tokens and what they issued, so an enrollment retry with the
-    /// same CSR is idempotent until the token expires. Memory-only.
-    used_join_tokens: HashMap<String, UsedJoinToken>,
-    pending: HashMap<String, PendingWork>,
-    execs: HashMap<String, Exec>,
-    blobs: HashMap<String, Blob>,
-    /// Last creation failure per pool, to back off refills.
-    pool_backoff: HashMap<String, Instant>,
-    /// Unsuccessful destroy attempts per `Terminating` record.
-    destroy_attempts: HashMap<String, u32>,
-    /// Sandboxes with a snapshot in flight: release must not destroy their
-    /// base, and a second snapshot is rejected.
-    busy: HashSet<String>,
+struct Runtime {
+    execs: Mutex<HashMap<String, Exec>>,
+    tickets: Mutex<HashMap<String, Blob>>,
+}
+
+/// Rebuild the owning node's typed error from an internal hop's response.
+///
+/// The hop must not downgrade `aborted` (the provider was fenced and must
+/// re-register) or `not_found` (the exec is gone) into a retryable transport
+/// failure: the caller acts on the code.
+fn forwarded_error(operation: &str, node: &str, status: reqwest::StatusCode, body: &str) -> Error {
+    #[derive(serde::Deserialize)]
+    struct Wire {
+        code: String,
+        #[serde(default)]
+        message: Option<String>,
+    }
+    if let Ok(wire) = serde_json::from_str::<Wire>(body)
+        && let Ok(code) = wire.code.parse::<Code>()
+    {
+        let message = wire
+            .message
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| format!("{operation} rejected by {node}"));
+        return Error::new(code, message);
+    }
+    Error::unavailable(format!("{operation} rejected by {node} ({status}): {body}"))
+}
+
+/// Peer replicas, from configuration only.
+struct PeerDirectory {
+    clients: BTreeMap<String, reqwest::Client>,
+    node_id: String,
+    session_id: String,
+    credential: String,
+}
+
+impl PeerDirectory {
+    fn build(config: &ServiceConfig) -> Result<Self> {
+        let mut clients = BTreeMap::new();
+        if !config.peers.is_empty() && config.ca.is_none() {
+            return Err(Error::failed_precondition(
+                "multi-replica routing requires the shared service CA",
+            ));
+        }
+        for peer in &config.peers {
+            if peer.node_id == config.node_id {
+                continue;
+            }
+            let url = peer.url.trim();
+            let parsed = reqwest::Url::parse(url).map_err(|error| {
+                Error::invalid_argument(format!("invalid peer URL for {}: {error}", peer.node_id))
+            })?;
+            if parsed.scheme() != "https" || parsed.username() != "" || parsed.password().is_some()
+            {
+                return Err(Error::invalid_argument(format!(
+                    "peer URL for {} must be an https:// base URL without credentials",
+                    peer.node_id
+                )));
+            }
+            let ca = config
+                .ca
+                .as_ref()
+                .ok_or_else(|| Error::failed_precondition("peer routing needs a CA"))?;
+            let client = tls::http_client(ca.pem(), None)?;
+            clients.insert(peer.node_id.clone(), client);
+        }
+        Ok(Self {
+            clients,
+            node_id: config.node_id.clone(),
+            session_id: config.node_session.clone(),
+            credential: config.node_credential.clone(),
+        })
+    }
+
+    fn is_local(&self, owner: &Owner) -> bool {
+        owner.node_id == self.node_id && owner.session_id == self.session_id
+    }
+
+    fn client(&self, node_id: &str) -> Result<&reqwest::Client> {
+        self.clients
+            .get(node_id)
+            .ok_or_else(|| Error::unavailable(format!("peer node `{node_id}` is not configured")))
+    }
+
+    fn auth_headers(&self) -> [(&'static str, String); 2] {
+        [
+            ("x-preloop-node-id", self.node_id.clone()),
+            ("x-preloop-node-session", self.session_id.clone()),
+        ]
+    }
 }
 
 /// The service.
 pub struct Service {
-    state: Mutex<State>,
-    changed: Notify,
-    store: Arc<dyn Store>,
+    backend: Arc<dyn SandboxBackend>,
     config: ServiceConfig,
-    /// Monotonic write order, bumped while the state lock is held.
-    seq: std::sync::atomic::AtomicU64,
-    /// Highest sequence already written, per record.
-    persisted: tokio::sync::Mutex<HashMap<(Kind, String), u64>>,
+    changed: Notify,
+    runtime: Runtime,
+    node: Owner,
+    peers: PeerDirectory,
+    pool_backoff: Mutex<HashMap<String, Instant>>,
+    /// Idempotency keys whose local `Acquire` future was dropped. The
+    /// authoritative waiter row is cleared by the next maintenance pass; the
+    /// hint makes an aborted caller release its lease without waiting for the
+    /// claim's expiry.
+    abandoned_waiters: Mutex<HashSet<String>>,
 }
 
-/// An `Acquire` call waiting in this process, keyed by idempotency key.
+/// Clears an `Acquire`'s durable waiter claim when the future is dropped.
 ///
-/// Maintenance skips an expired lease while its waiter is alive: a boot or a
-/// golden unpack can outlast the unclaimed lease window.
-struct AcquireWaiter {
+/// `Drop` cannot await, so an abandoned key becomes a local hint that
+/// maintenance drains into the database. The DB row still exists and expires
+/// on its own, so another replica is never blocked by a lost hint.
+struct AcquireWaiterGuard {
     service: Arc<Service>,
     key: String,
+    armed: bool,
 }
 
-impl AcquireWaiter {
-    fn register(service: &Arc<Service>, key: &str) -> Self {
-        *service
-            .state
-            .lock()
-            .waiting
-            .entry(key.to_owned())
-            .or_default() += 1;
-        Self {
-            service: service.clone(),
-            key: key.to_owned(),
-        }
+impl AcquireWaiterGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
-impl Drop for AcquireWaiter {
+impl Drop for AcquireWaiterGuard {
     fn drop(&mut self) {
-        let mut state = self.service.state.lock();
-        if let Some(count) = state.waiting.get_mut(&self.key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.waiting.remove(&self.key);
-            }
+        if self.armed {
+            self.service
+                .abandoned_waiters
+                .lock()
+                .insert(self.key.clone());
         }
-    }
-}
-
-/// One store write, stamped with the order it was decided in.
-///
-/// Ops are built while the state lock is held but written after it is
-/// released, so two writers can reach the store out of order. The stamp lets
-/// [`Service::persist`] drop a snapshot that a newer one already replaced.
-struct Op {
-    seq: u64,
-    kind: Kind,
-    id: String,
-    value: Option<serde_json::Value>,
-}
-
-/// Holds a sandbox in the service's busy set while a snapshot is in flight,
-/// and releases it however the call exits.
-struct SnapshotBusy<'a> {
-    service: &'a Service,
-    sandbox_id: String,
-}
-
-impl Drop for SnapshotBusy<'_> {
-    fn drop(&mut self) {
-        self.service.state.lock().busy.remove(&self.sandbox_id);
     }
 }
 
 impl Service {
-    /// Construct and restore from the store.
-    pub async fn open(store: Arc<dyn Store>, config: ServiceConfig) -> Result<Arc<Self>> {
-        let mut state = State::default();
-        for template in load::<Template>(&*store, Kind::Templates).await? {
-            state.templates.insert(template.spec.name.clone(), template);
+    /// Construct the service over a durable backend. No state is loaded into
+    /// memory: every read and mutation is authoritative SQL.
+    pub async fn open(
+        backend: Arc<dyn SandboxBackend>,
+        mut config: ServiceConfig,
+    ) -> Result<Arc<Self>> {
+        if config.node_session.is_empty() {
+            config.node_session = uuid::Uuid::new_v4().simple().to_string();
         }
-        for pool in load::<PoolSpec>(&*store, Kind::Pools).await? {
-            state.pools.insert(pool.name.clone(), pool);
+        if config.node_credential.is_empty() {
+            config.node_credential = tls::random_hex(32);
         }
-        for sandbox in load::<Sandbox>(&*store, Kind::Sandboxes).await? {
-            state.created_at.insert(sandbox.id.clone(), Instant::now());
-            state.sandboxes.insert(sandbox.id.clone(), sandbox);
+        if let Some(ca) = &config.ca {
+            backend.set_trust_fingerprint(ca.sha256_hex()).await?;
         }
-        for lease in load::<Lease>(&*store, Kind::Leases).await? {
-            // A preserved lease outlives its idempotency key, which release
-            // cleared; only live keys map back to leases. A lease persisted
-            // before `requested_ttl_secs` existed has 0 and counts as
-            // delivered: `claim` will not rewrite its expiry.
-            if !lease.idempotency_key.is_empty() {
-                state
-                    .lease_by_key
-                    .insert(lease.idempotency_key.clone(), lease.id.clone());
-            }
-            // Deliberately not marked injected: a crash between persisting the
-            // lease and uploading its files would otherwise leave the caller
-            // with a lease whose files never arrive. The next `Acquire` with
-            // this key re-runs injection, which is idempotent.
-            state.leases.insert(lease.id.clone(), lease);
-        }
-        for mut provider in load::<Provider>(&*store, Kind::Providers).await? {
-            // Fence every session that survived the previous process: the
-            // generation it holds is now stale, so its next call is Aborted
-            // and the agent re-registers (with a fresh generation) instead of
-            // consuming work against state this process no longer has.
-            provider.generation += 1;
-            state.providers.insert(
-                provider.id.clone(),
-                ProviderRec {
-                    provider,
-                    // Not placed on until it re-registers: `seen` is older
-                    // than the online window, and the bumped generation
-                    // fences everything it still believes.
-                    seen: Instant::now() - config.provider_timeout * 2,
-                    queue: VecDeque::new(),
-                    in_flight: HashMap::new(),
-                    wake: Arc::new(Notify::new()),
-                    host: None,
-                    host_sampled_at: None,
-                    sandbox_stats: HashMap::new(),
-                },
-            );
-        }
-        for token in load::<JoinTokenRecord>(&*store, Kind::JoinTokens).await? {
-            state.join_tokens.insert(token.id.clone(), token);
-        }
+        let node = Owner {
+            node_id: config.node_id.clone(),
+            session_id: config.node_session.clone(),
+        };
+        let peer_dir = PeerDirectory::build(&config)?;
+        let backend_config = BackendConfig {
+            url: String::new(),
+            state_dir: std::env::temp_dir().join("preloop-sandbox"),
+            seal_key: None,
+            pool_size: 8,
+            node_id: config.node_id.clone(),
+            session_id: config.node_session.clone(),
+            node_credential_sha256: backend::logic::token_hash(&config.node_credential),
+            peer_url: config.peer_url.clone(),
+            node_lost_after: config.node_lost_after,
+        };
+        backend.node_register(&backend_config).await?;
         let service = Arc::new(Self {
-            state: Mutex::new(state),
-            changed: Notify::new(),
-            store,
+            backend,
             config,
-            seq: std::sync::atomic::AtomicU64::new(0),
-            persisted: tokio::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
+            runtime: Runtime::default(),
+            node,
+            peers: peer_dir,
+            pool_backoff: Mutex::new(HashMap::new()),
+            abandoned_waiters: Mutex::new(HashSet::new()),
         });
-        service.persist_provider_generations().await;
-        service.sweep_lease_orphans().await;
-        service.recover_lost_work().await;
+        // One authoritative pass at open repairs crash-left rows (a sandbox
+        // whose lease row vanished) and resumes warm pools. It is a normal
+        // database transaction, not a boot-time state reconstruction.
+        service.maintain().await;
         Ok(service)
-    }
-
-    /// Persist the generation bump every restored provider took at boot.
-    ///
-    /// In-memory state is authoritative (best-effort store): a failed write
-    /// means the *next* restart bumps from the older number, which still
-    /// fences the previous process's sessions.
-    async fn persist_provider_generations(&self) {
-        let ops = {
-            let state = self.state.lock();
-            state
-                .providers
-                .values()
-                .map(|rec| self.put(Kind::Providers, &rec.provider.id, &rec.provider))
-                .collect()
-        };
-        self.persist(ops).await;
-    }
-
-    /// Decide the records whose in-flight work died with the previous
-    /// process, before any provider is placed on or any caller is served.
-    ///
-    /// Provider queues, pending work, exec streams, tickets and pool backoff
-    /// are process memory, so a record caught mid-transition has nothing left
-    /// to report to it:
-    ///
-    /// * `Provisioning` (creating) becomes `Failed`. It cannot be re-driven:
-    ///   the create request — shape, network, mounts, sockets, options — is
-    ///   not on the record, so a re-create would be a different sandbox. If
-    ///   the machine did land, no record names it and the next reconcile
-    ///   destroys it as an orphan.
-    /// * `Terminating` is left `Terminating`. Its destroy is re-queued from
-    ///   `Reconcile` once the provider reports the machine still exists —
-    ///   that inventory is the only proof there is something to destroy.
-    ///   `Reconcile` also removes the record when the machine is gone.
-    ///
-    /// Every other state is a settled machine: leases, pools and the
-    /// reconcile inventory carry it forward.
-    async fn recover_lost_work(&self) {
-        let (lost, ops) = {
-            let mut state = self.state.lock();
-            let lost: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|sandbox| sandbox.state == SandboxState::Provisioning)
-                .map(|sandbox| sandbox.id.clone())
-                .collect();
-            let mut ops = Vec::new();
-            for id in &lost {
-                self.fail_locked(
-                    &mut state,
-                    id,
-                    "restarted while creating: the create was lost with the previous process",
-                    &mut ops,
-                );
-            }
-            (lost, ops)
-        };
-        for id in &lost {
-            warn!(sandbox = %id, "restored creating sandbox failed; it cannot be re-driven");
-        }
-        self.persist(ops).await;
-    }
-
-    /// Fail restored sandboxes whose lease row is missing.
-    ///
-    /// A crash between persisting a sandbox and its lease — or a lease
-    /// deleted under a live sandbox — would otherwise leave a record holding
-    /// a machine forever, with no lease to expire. The dangling lease
-    /// reference is cleared with the failure, so the failed sandbox is
-    /// destroyed like any other and names the machine it still holds.
-    async fn sweep_lease_orphans(&self) {
-        let (orphans, ops) = {
-            let mut state = self.state.lock();
-            let orphans: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|sandbox| {
-                    !sandbox.lease_id.is_empty() && !state.leases.contains_key(&sandbox.lease_id)
-                })
-                .map(|sandbox| sandbox.id.clone())
-                .collect();
-            let mut ops = Vec::new();
-            for id in &orphans {
-                state.created_at.insert(id.clone(), Instant::now());
-                // The lease row is gone, so the reference must go too: a
-                // stale lease id would keep the failed-unleased sweep from
-                // freeing the machine the record still names.
-                if let Some(sandbox) = state.sandboxes.get_mut(id) {
-                    sandbox.lease_id.clear();
-                }
-            }
-            for id in &orphans {
-                self.fail_locked(&mut state, id, "restored without a lease", &mut ops);
-            }
-            (orphans, ops)
-        };
-        for id in &orphans {
-            warn!(sandbox = %id, "restored sandbox has no lease; failing it for cleanup");
-        }
-        self.persist(ops).await;
     }
 
     /// Service configuration.
@@ -983,87 +558,83 @@ impl Service {
         &self.config
     }
 
-    /// Stage a record write, stamped with the current order.
-    fn put<T: Serialize>(&self, kind: Kind, id: &str, value: &T) -> Op {
-        Op {
-            seq: self.seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel),
-            kind,
-            id: id.to_owned(),
-            value: Some(serde_json::to_value(value).unwrap_or_default()),
+    /// The durable backend.
+    pub fn backend(&self) -> &Arc<dyn SandboxBackend> {
+        &self.backend
+    }
+
+    /// This node's identity.
+    pub fn node(&self) -> &Owner {
+        &self.node
+    }
+
+    /// Whether this node owns a live channel.
+    pub fn is_local_owner(&self, owner: &Owner) -> bool {
+        self.peers.is_local(owner)
+    }
+
+    /// The HTTP client for a peer, from configuration.
+    pub fn peer_client(&self, node_id: &str) -> Result<&reqwest::Client> {
+        self.peers.client(node_id)
+    }
+
+    /// Headers proving this node's registered session and credential.
+    pub fn node_auth_headers(&self) -> Vec<(&'static str, String)> {
+        let mut headers = self.peers.auth_headers().to_vec();
+        headers.push(("x-preloop-node-credential", self.peers.credential.clone()));
+        headers
+    }
+
+    /// Authenticate an internal request from another replica.
+    pub async fn authenticate_node(
+        &self,
+        node_id: &str,
+        session_id: &str,
+        credential: &str,
+    ) -> Result<()> {
+        let hash = backend::logic::token_hash(credential);
+        if self
+            .backend
+            .node_authenticate(node_id, session_id, &hash)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(Error::unauthenticated(
+                "unknown or stale service node credential",
+            ))
         }
     }
 
-    /// Stage a record delete, stamped with the current order.
-    fn remove(&self, kind: Kind, id: &str) -> Op {
-        Op {
-            seq: self.seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel),
-            kind,
-            id: id.to_owned(),
-            value: None,
-        }
+    /// The node owning a live exec.
+    pub async fn exec_owner(&self, exec_id: &str) -> Result<Option<Owner>> {
+        self.backend.owner_of(OwnerKind::Exec, exec_id).await
     }
 
-    async fn persist(&self, ops: Vec<Op>) {
-        let _ = self.persist_checked(ops).await;
+    /// The node owning a live ticket.
+    pub async fn ticket_owner(&self, ticket: &str) -> Result<Option<Owner>> {
+        self.backend.owner_of(OwnerKind::Ticket, ticket).await
     }
 
-    /// [`Self::persist`], reporting a provider row the store refused. A
-    /// generation counts only once it is durable: a restart bumps the stored
-    /// generation, so one handed out and then lost can be issued again, and a
-    /// session still holding it would pass `fence` without re-registering.
-    async fn persist_checked(&self, ops: Vec<Op>) -> Result<()> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-        // Serialized so a record's writes land in decision order; a stale
-        // snapshot is dropped rather than overwriting newer truth.
-        let mut persisted = self.persisted.lock().await;
-        let mut provider_refused = None;
-        for op in ops {
-            let key = (op.kind, op.id.clone());
-            if persisted.get(&key).is_some_and(|seq| *seq > op.seq) {
-                continue;
-            }
-            let result = match &op.value {
-                Some(value) => self.store.put(op.kind, &op.id, value).await,
-                None => self.store.delete(op.kind, &op.id).await,
-            };
-            match result {
-                Ok(()) => {
-                    persisted.insert(key, op.seq);
-                }
-                // Best-effort store: in-memory state stays authoritative, so
-                // the RPC succeeds. The lost write is visible here, with the
-                // record kind, for the restart it will cost.
-                Err(cause) => {
-                    error!(
-                        kind = ?op.kind,
-                        id = %op.id,
-                        error = %cause,
-                        "sandbox store write failed; the record is not durable"
-                    );
-                    if op.kind == Kind::Providers && provider_refused.is_none() {
-                        provider_refused = Some(Error::unavailable(format!(
-                            "provider `{}` was not persisted; register again: {cause}",
-                            op.id
-                        )));
-                    }
-                }
-            }
-        }
-        match provider_refused {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    /// Run the maintenance loop (warm pools, lease/preserve expiry,
-    /// create timeouts) until `shutdown`.
-    pub async fn run_maintenance(self: Arc<Self>, shutdown: tokio_util::sync::CancellationToken) {
+    /// Run maintenance (reapers, warm pools, node heartbeat) until shutdown.
+    pub async fn run_maintenance(self: Arc<Self>, shutdown: CancellationToken) {
         let mut tick = tokio::time::interval(Duration::from_millis(500));
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => return,
+                _ = shutdown.cancelled() => {
+                    if let Err(error) = self.backend.node_close(&self.node.node_id, &self.node.session_id).await {
+                        warn!(%error, "closing the service node session failed");
+                    }
+                    self.runtime.execs.lock().clear();
+                    self.runtime.tickets.lock().clear();
+                    return;
+                }
+                _ = heartbeat.tick() => {
+                    if let Err(error) = self.backend.node_heartbeat(&self.node.node_id, &self.node.session_id).await {
+                        warn!(%error, "sandbox node heartbeat failed");
+                    }
+                }
                 _ = tick.tick() => self.maintain().await,
             }
         }
@@ -1071,605 +642,240 @@ impl Service {
 
     /// One maintenance pass (exposed for tests).
     pub async fn maintain(&self) {
-        let (ops, expired_tickets) = {
-            let mut state = self.state.lock();
-            let mut ops = Vec::new();
-            let mut expired_tickets = Vec::new();
-            let t = now();
-            // Expired leases and preservation windows. A lease whose caller is
-            // still waiting in this process is not expired: a real boot or a
-            // golden unpack can outlast the unclaimed window.
-            let waiting = &state.waiting;
-            let expired: Vec<String> = state
-                .leases
-                .values()
-                .filter(|lease| {
-                    lease.expires_at <= t && !waiting.contains_key(&lease.idempotency_key)
-                })
-                // A snapshot in flight still owns the base: do not destroy it
-                // from under the provider.
-                .filter(|lease| !state.busy.contains(&lease.sandbox_id))
-                .map(|lease| lease.id.clone())
-                .collect();
-            for lease_id in expired {
-                info!(%lease_id, "lease expired; destroying sandbox");
-                // `Destroy` releases never fail.
-                let _ =
-                    self.release_locked(&mut state, &lease_id, ReleaseMode::Destroy, 0, &mut ops);
-                self.config.metrics.record_lease_transition("expired");
-            }
-            // Stop deliberately keeps the lease; a stopped sandbox holds no
-            // host capacity, but it does hold disk: the create sweep below
-            // still applies to its record. Paused/stopped sandboxes whose
-            // lease was preserved (or that were preserved before pausing)
-            // expire with the same window.
-            let preserved: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|s| {
-                    s.lease_id.is_empty()
-                        && matches!(
-                            s.state.known(),
-                            SandboxState::Preserved | SandboxState::Paused | SandboxState::Stopped
-                        )
-                        && s.preserve_until > 0
-                        && s.preserve_until <= t
-                })
-                .map(|s| s.id.clone())
-                .collect();
-            for id in preserved {
-                self.destroy_locked(&mut state, &id, &mut ops);
-            }
-            // Creates that never reported.
-            let timed_out: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|s| {
-                    s.state == SandboxState::Provisioning
-                        && state
-                            .created_at
-                            .get(&s.id)
-                            .is_some_and(|at| at.elapsed() > self.config.create_timeout)
-                })
-                .map(|s| s.id.clone())
-                .collect();
-            for id in timed_out {
-                self.fail_locked(&mut state, &id, "create timed out", &mut ops);
-                self.config.metrics.record_create_failure("timeout");
-            }
-            // Execs past their deadline: the driver should have killed the
-            // command already; this is the backstop for a lost provider or a
-            // delayed report. The caller gets the same timeout exit the
-            // driver reports, so a slow report cannot turn its `124` into an
-            // error.
-            let over_deadline: Vec<String> = state
-                .execs
-                .iter()
-                .filter(|(_, exec)| exec.deadline + EXEC_SWEEP_GRACE <= Instant::now())
-                .map(|(exec_id, _)| exec_id.clone())
-                .collect();
-            for exec_id in over_deadline {
-                warn!(exec_id, "exec passed its deadline; reporting the timeout");
-                self.expire_exec_locked(&mut state, &exec_id);
-            }
-            // Work nobody will ever acknowledge: fail whatever still waits
-            // on it so nothing leaks when a provider loses a report.
-            let stale_work: Vec<String> = state
-                .pending
-                .iter()
-                .filter(|(_, work)| work.deadline <= Instant::now())
-                .map(|(work_id, _)| work_id.clone())
-                .collect();
-            for work_id in stale_work {
-                self.expire_pending_locked(&mut state, &work_id, &mut ops);
-            }
-            // Expired tickets: a peer never arrived (short claim TTL) or a
-            // claimed transfer outlived the work deadline. Aborting outside
-            // the lock delivers the failure to whoever is still reading.
-            let stale: Vec<String> = state
-                .blobs
-                .iter()
-                .filter(|(_, blob)| blob.expires_at <= t)
-                .map(|(ticket, _)| ticket.clone())
-                .collect();
-            expired_tickets.extend(stale);
-            // Sandboxes on a provider that has gone silent: nothing will ever
-            // report for them, so fail them rather than leave leases and exec
-            // streams open forever.
-            let silent: Vec<String> = state
-                .providers
-                .iter()
-                .filter(|(_, rec)| {
-                    rec.seen.elapsed()
-                        > self.config.provider_timeout * self.config.provider_lost_factor
-                })
-                .map(|(provider_id, _)| provider_id.clone())
-                .collect();
-            let stranded_sandboxes: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|s| silent.contains(&s.provider_id))
-                .map(|s| s.id.clone())
-                .collect();
-            // A lease on a host that stopped answering can never be honoured
-            // again — the machine is out of reach, not idle. Release it (the
-            // caller's next `Renew` reports not_found and its next `Acquire`
-            // with the same key starts over) and then fail the sandbox.
-            for id in &stranded_sandboxes {
-                self.detach_lease_locked(&mut state, id, &mut ops);
-            }
-            // A `Terminating` record on a silent provider already has its
-            // destroy with that provider. The stranded work below settles it as
-            // a failed attempt, and the record waits for that provider's next
-            // `Reconcile` instead of being failed and re-queued at a host that
-            // is not answering.
-            let orphaned: Vec<String> = stranded_sandboxes
-                .into_iter()
-                .filter(|id| {
-                    state.sandboxes.get(id).is_some_and(|s| {
-                        !s.state.is_terminal() && s.state != SandboxState::Terminating
-                    })
-                })
-                .collect();
-            for id in orphaned {
-                self.fail_locked(&mut state, &id, "provider lost (no heartbeat)", &mut ops);
-            }
-            // Its in-flight work will never report: release the waiters
-            // instead of leaking them until the process exits.
-            let stranded: Vec<String> = state
-                .pending
-                .iter()
-                .filter(|(_, work)| silent.contains(&work.provider_id))
-                .map(|(work_id, _)| work_id.clone())
-                .collect();
-            for work_id in stranded {
-                self.complete_locked(
-                    &mut state,
-                    &work_id,
-                    Err(Error::unavailable("provider lost (no heartbeat)")),
-                    &mut ops,
-                );
-            }
-            // Failed, unleased sandboxes: free whatever the host still holds.
-            let failed: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|s| s.state == SandboxState::Failed && s.lease_id.is_empty())
-                .map(|s| s.id.clone())
-                .collect();
-            for id in failed {
-                self.destroy_locked(&mut state, &id, &mut ops);
-            }
-            // Expired join tokens and client certificates: neither can
-            // authenticate anything anymore, so forget them rather than
-            // grow the store forever.
-            let stale_tokens: Vec<String> = state
-                .join_tokens
-                .iter()
-                .filter(|(_, token)| token.expires_at <= t)
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in stale_tokens {
-                state.join_tokens.remove(&id);
-                ops.push(self.remove(Kind::JoinTokens, &id));
-            }
-            // Used-token records live only until the token would have
-            // expired; past that there is nothing a retry can match.
-            state.used_join_tokens.retain(|_, used| used.expires_at > t);
-            let mut pruned = Vec::new();
-            for rec in state.providers.values_mut() {
-                let before = rec.provider.certificates.len();
-                rec.provider
-                    .certificates
-                    .retain(|certificate| certificate.expires_at > t);
-                if rec.provider.certificates.len() != before {
-                    pruned.push(rec.provider.clone());
-                }
-            }
-            for provider in pruned {
-                ops.push(self.put(Kind::Providers, &provider.id, &provider));
-            }
-            // Warm pools.
-            let pools: Vec<PoolSpec> = state.pools.values().cloned().collect();
-            for pool in pools {
-                self.fill_pool_locked(&mut state, &pool, &mut ops);
-            }
-            // Live sandboxes by state/provider/template: every combination
-            // present this tick, and a zero for every combination that was
-            // live last tick but is gone now, so a drained pool falls to 0
-            // instead of keeping its last value.
-            let mut counts: HashMap<(&'static str, String, String), u64> = HashMap::new();
-            for sandbox in state.sandboxes.values() {
-                *counts
-                    .entry((
-                        sandbox.state.as_metric_label(),
-                        sandbox.provider_id.clone(),
-                        sandbox.template.clone(),
-                    ))
-                    .or_insert(0) += 1;
-            }
-            self.config
-                .metrics
-                .record_sandbox_counts(counts.into_iter().map(
-                    |((sandbox_state, provider, template), count)| {
-                        (sandbox_state.to_owned(), provider, template, count)
-                    },
-                ));
-            (ops, expired_tickets)
-        };
-        for ticket in expired_tickets {
-            self.abort_ticket(&ticket, "transfer ticket expired").await;
+        // Turn locally abandoned waiters into released DB claims before the
+        // reaper decides whether their leases are still waited on. The
+        // durable row remains the authority and expires on its own.
+        let abandoned: Vec<String> = self.abandoned_waiters.lock().drain().collect();
+        for key in abandoned {
+            let _ = self.backend.clear_waiter(&key, &self.node).await;
         }
-        if !ops.is_empty() {
+        let config = MaintenanceConfig {
+            create_timeout: self.config.create_timeout,
+            provider_timeout: self.config.provider_timeout,
+            provider_lost_factor: self.config.provider_lost_factor,
+            exec_sweep_grace: Duration::from_secs(5),
+            max_destroy_attempts: 3,
+            node_lost_after: self.config.node_lost_after,
+            injection_timeout: self.config.injection_timeout,
+            waiter_timeout: self.config.waiter_timeout,
+        };
+        let outcome = match self.backend.maintain(&config).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                warn!(%error, "sandbox maintenance pass failed");
+                return;
+            }
+        };
+        for (exec_id, reason) in &outcome.failed_execs {
+            self.close_exec(exec_id, reason).await;
+        }
+        for ticket in &outcome.aborted_tickets {
+            self.abort_local_ticket(ticket, "transfer ticket expired")
+                .await;
+        }
+        // Exec streams live only on this node, but a destroy or snapshot on
+        // any replica finalizes their durable rows. Close the local streams
+        // from that authoritative status instead of waiting for their
+        // deadline.
+        let local_execs: Vec<String> = self.runtime.execs.lock().keys().cloned().collect();
+        for exec_id in local_execs {
+            match self.backend.exec_status(&exec_id).await {
+                Ok(Some(ExecStatus::Failed { reason })) => {
+                    self.close_exec(&exec_id, &reason).await;
+                }
+                Ok(None) => {
+                    self.close_exec(&exec_id, "the sandbox was destroyed").await;
+                }
+                _ => {}
+            }
+        }
+        for deficit in &outcome.pool_deficits {
+            self.fill_pool(deficit).await;
+        }
+        if outcome.changed {
             self.changed.notify_waiters();
         }
-        self.persist(ops).await;
     }
 
-    fn fill_pool_locked(&self, state: &mut State, pool: &PoolSpec, ops: &mut Vec<Op>) {
-        if state
-            .pool_backoff
-            .get(&pool.name)
-            .is_some_and(|at| at.elapsed() < POOL_FAILURE_BACKOFF)
-        {
+    async fn close_exec(&self, exec_id: &str, reason: &str) {
+        let exec = self.runtime.execs.lock().remove(exec_id);
+        let Some(exec) = exec else {
             return;
-        }
-        // Retire idle members built for an older pool/template revision: they
-        // no longer satisfy the configuration a new acquire expects.
-        let revision = pool_revision(state, pool);
-        let stale: Vec<String> = state
-            .sandboxes
-            .values()
-            .filter(|s| {
-                s.pool == pool.name
-                    && s.lease_id.is_empty()
-                    && s.state != SandboxState::Terminating
-                    && !s.state.is_terminal()
-                    && s.pool_revision != revision
-            })
-            .map(|s| s.id.clone())
-            .collect();
-        for id in stale {
-            info!(sandbox = %id, pool = %pool.name, "retiring a warm member built for an older pool revision");
-            self.destroy_locked(state, &id, ops);
-        }
-        let members: Vec<&Sandbox> = state
-            .sandboxes
-            .values()
-            .filter(|s| s.pool == pool.name && !s.state.is_terminal())
-            .collect();
-        let idle = members
-            .iter()
-            .filter(|s| {
-                s.lease_id.is_empty()
-                    && s.pool_revision == revision
-                    && matches!(
-                        s.state.known(),
-                        SandboxState::Ready | SandboxState::Provisioning
-                    )
-            })
-            .count() as u32;
-        self.config
-            .metrics
-            .record_pool_warm_depth(&pool.name, idle as u64);
-        let live = members
-            .iter()
-            .filter(|s| s.state != SandboxState::Terminating)
-            .count() as u32;
-        let mut missing = pool.warm.saturating_sub(idle);
-        if pool.max > 0 {
-            missing = missing.min(pool.max.saturating_sub(live));
-        }
-        for _ in 0..missing {
-            let Ok(placement) = self.pool_placement(state, pool, &Requirements::default()) else {
-                self.config.metrics.record_pool_refill_failure(&pool.name);
-                return;
-            };
-            match self.create_locked(state, placement, &pool.name, Purpose::Runner, "", ops) {
-                Ok(_) => {}
-                // No capacity right now: try again next pass.
-                Err(_) => {
-                    self.config.metrics.record_pool_refill_failure(&pool.name);
-                    return;
-                }
-            }
-        }
+        };
+        exec.finished.cancel();
+        let event = if reason == "timeout" {
+            Ok(ExecEvent::exit(EXEC_TIMED_OUT))
+        } else {
+            Err(Error::unavailable(reason.to_owned()))
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(1), exec.tx.send(event)).await;
     }
 
-    // ─── Templates and pools ───────────────────────────────────────
+    // ── Templates and pools ───────────────────────────────────────
 
     /// `PutTemplate`.
     pub async fn put_template(&self, spec: TemplateSpec) -> Result<Template> {
-        validate_name("template", &spec.name)?;
-        let sources = [
-            !spec.artifacts.is_empty(),
-            spec.recipe().is_some(),
-            spec.snapshot_of().is_some(),
-        ];
-        if sources.iter().filter(|set| **set).count() != 1 {
-            return Err(Error::invalid_argument(
-                "exactly one template source is required: artifacts, recipe, or snapshotOf",
-            ));
-        }
-        if spec.snapshot_of().is_some() {
-            return Err(Error::invalid_argument(
-                "snapshot templates are created by Snapshot",
-            ));
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        for artifact in &spec.artifacts {
-            artifact.validate().map_err(Error::invalid_argument)?;
-            if !seen.insert((artifact.format.as_str(), artifact.arch.as_str())) {
-                return Err(Error::invalid_argument(format!(
-                    "artifact for format `{}` and arch `{}` is declared twice",
-                    artifact.format, artifact.arch
-                )));
-            }
-        }
-        let template = Template {
-            digest: template_digest(&spec),
-            created_at: now(),
-            spec: spec.into(),
-            ..Template::default()
-        };
-        let ops = {
-            let mut state = self.state.lock();
-            if let Some(existing) = state.templates.get(&template.spec.name)
-                && existing.digest == template.digest
-            {
-                return Ok(existing.clone());
-            }
-            state
-                .templates
-                .insert(template.spec.name.clone(), template.clone());
-            vec![self.put(Kind::Templates, &template.spec.name, &template)]
-        };
-        self.persist(ops).await;
-        Ok(template)
+        self.backend.put_template(spec).await
     }
 
-    /// `DeleteTemplate`: snapshot templates also release their native
-    /// snapshot. Refused while a pool still references the template.
+    /// `DeleteTemplate`.
     pub async fn delete_template(&self, name: &str) -> Result<()> {
-        let ops = {
-            let mut state = self.state.lock();
-            if let Some(pool) = state.pools.values().find(|p| p.template == name) {
-                return Err(Error::failed_precondition(format!(
-                    "template `{name}` is used by pool `{}`",
-                    pool.name
-                )));
-            }
-            // A fork base must outlive every clone: deleting it while a
-            // sandbox still starts from it invalidates that machine.
-            if let Some(sandbox) = state
-                .sandboxes
-                .values()
-                .find(|sandbox| sandbox.template == name && !sandbox.state.is_terminal())
-            {
-                return Err(Error::failed_precondition(format!(
-                    "template `{name}` is still used by sandbox `{}`",
-                    sandbox.id
-                )));
-            }
-            let template = state
-                .templates
-                .remove(name)
-                .ok_or_else(|| Error::not_found(format!("template `{name}` not found")))?;
-            if !template.native_ref.is_empty() {
-                self.drop_snapshot_locked(&mut state, &template);
-            }
-            vec![self.remove(Kind::Templates, name)]
-        };
-        self.persist(ops).await;
-        Ok(())
+        self.backend.delete_template(name).await
     }
 
     /// `ListTemplates`.
-    pub fn list_templates(&self) -> Vec<Template> {
-        self.state.lock().templates.values().cloned().collect()
+    pub async fn list_templates(&self) -> Result<Vec<Template>> {
+        self.backend.list_templates_all().await
     }
 
-    /// `ListTemplates` page, ordered by name.
-    pub fn list_templates_page(&self, request: &ListRequest) -> Result<ListTemplatesResponse> {
-        let state = self.state.lock();
-        let (templates, next_page_token) = paginate(
-            "template",
-            state
-                .templates
-                .iter()
-                .map(|(name, template)| (name.clone(), template.clone())),
-            request,
-        )?;
-        Ok(ListTemplatesResponse {
-            templates,
-            next_page_token,
-            ..ListTemplatesResponse::default()
-        })
+    /// `ListTemplates` page.
+    pub async fn list_templates_page(
+        &self,
+        request: &ListRequest,
+    ) -> Result<ListTemplatesResponse> {
+        self.backend.list_templates(request).await
     }
 
     /// `PutPool`.
     pub async fn put_pool(&self, pool: PoolSpec) -> Result<PoolSpec> {
-        validate_name("pool", &pool.name)?;
-        let ops = {
-            let mut state = self.state.lock();
-            if !state.templates.contains_key(&pool.template) {
-                return Err(Error::not_found(format!(
-                    "template `{}` not found",
-                    pool.template
-                )));
-            }
-            // Surface impossible pools at configuration time.
-            self.pool_placement_check(&state, &pool)?;
-            state.pools.insert(pool.name.clone(), pool.clone());
-            vec![self.put(Kind::Pools, &pool.name, &pool)]
-        };
-        self.persist(ops).await;
+        self.pool_placement_check(&pool).await?;
+        let pool = self.backend.put_pool(pool).await?;
         self.changed.notify_waiters();
         Ok(pool)
     }
 
     /// `ListPools`.
-    pub fn list_pools(&self) -> Vec<PoolSpec> {
-        self.state.lock().pools.values().cloned().collect()
+    pub async fn list_pools(&self) -> Result<Vec<PoolSpec>> {
+        self.backend.list_pools_all().await
     }
 
-    /// `ListPools` page, ordered by name.
-    pub fn list_pools_page(&self, request: &ListRequest) -> Result<ListPoolsResponse> {
-        let state = self.state.lock();
-        let (pools, next_page_token) = paginate(
-            "pool",
-            state
-                .pools
-                .iter()
-                .map(|(name, pool)| (name.clone(), pool.clone())),
-            request,
-        )?;
-        Ok(ListPoolsResponse {
-            pools,
-            next_page_token,
-            ..ListPoolsResponse::default()
-        })
+    /// `ListPools` page.
+    pub async fn list_pools_page(&self, request: &ListRequest) -> Result<ListPoolsResponse> {
+        self.backend.list_pools(request).await
     }
 
-    /// `DeletePool`: idle members are destroyed; leased ones finish.
+    /// `DeletePool`.
     pub async fn delete_pool(&self, name: &str) -> Result<()> {
-        let ops = {
-            let mut state = self.state.lock();
-            if state.pools.remove(name).is_none() {
-                return Err(Error::not_found(format!("pool `{name}` not found")));
-            }
-            let mut ops = vec![self.remove(Kind::Pools, name)];
-            let idle: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|s| s.pool == name && s.lease_id.is_empty() && !s.state.is_terminal())
-                .map(|s| s.id.clone())
-                .collect();
-            for id in idle {
-                self.destroy_locked(&mut state, &id, &mut ops);
-            }
-            ops
-        };
-        self.persist(ops).await;
-        Ok(())
+        self.backend.delete_pool(name).await
     }
 
-    // ─── Placement ─────────────────────────────────────────────────
+    // ── Placement ─────────────────────────────────────────────────
 
-    fn pool_placement(
+    async fn pool_placement(
         &self,
-        state: &State,
         pool: &PoolSpec,
         extra: &Requirements,
+        snapshot: &PlacementSnapshot,
     ) -> Result<(PlacementSpec, String, String)> {
-        let template = state
-            .templates
-            .get(&pool.template)
-            .cloned()
-            .ok_or_else(|| Error::not_found(format!("template `{}` not found", pool.template)))?;
+        let template = self
+            .backend
+            .template_get(&pool.template)
+            .await?
+            .ok_or_else(|| Error::not_found(format!("template `{}` not found", pool.template)))?
+            .value;
         let placement = PlacementSpec {
-            requires: template.spec.requires.merged(&pool.requires).merged(extra),
+            requires: template
+                .spec
+                .as_option()
+                .map(|spec| spec.requires.as_option().cloned().unwrap_or_default())
+                .unwrap_or_default()
+                .merged(&pool.requires.as_option().cloned().unwrap_or_default())
+                .merged(extra),
             template,
-            shape: (*pool.shape).clone(),
-            network: (*pool.network).clone(),
+            shape: pool.shape.as_option().cloned().unwrap_or_default(),
+            network: pool.network.as_option().cloned().unwrap_or_default(),
             mounts: pool.mounts.clone(),
             sockets: pool.sockets.clone(),
             options: pool.options.clone(),
             snapshot_capable: false,
         };
-        let (provider, driver) = self.place(state, &placement, true)?;
+        let (provider, driver) = self.place(snapshot, &placement, true)?;
         Ok((placement, provider, driver))
     }
 
-    fn pool_placement_check(&self, state: &State, pool: &PoolSpec) -> Result<()> {
-        match self.pool_placement(state, pool, &Requirements::default()) {
+    async fn pool_placement_check(&self, pool: &PoolSpec) -> Result<()> {
+        let snapshot = self.backend.placement_snapshot().await?;
+        match self
+            .pool_placement(pool, &Requirements::default(), &snapshot)
+            .await
+        {
             Ok(_) => Ok(()),
-            // Capacity or offline providers are transient; only a pool no
-            // registered provider could ever serve is rejected.
             Err(error) if error.code == Code::FailedPrecondition => {
-                let template = &state.templates[&pool.template];
+                if snapshot.providers.is_empty() {
+                    return Ok(());
+                }
+                let template = self
+                    .backend
+                    .template_get(&pool.template)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::not_found(format!("template `{}` not found", pool.template))
+                    })?
+                    .value;
                 let placement = PlacementSpec {
-                    requires: template.spec.requires.merged(&pool.requires),
-                    template: template.clone(),
-                    shape: (*pool.shape).clone(),
-                    network: (*pool.network).clone(),
+                    requires: template
+                        .spec
+                        .as_option()
+                        .map(|spec| spec.requires.as_option().cloned().unwrap_or_default())
+                        .unwrap_or_default()
+                        .merged(&pool.requires.as_option().cloned().unwrap_or_default()),
+                    template,
+                    shape: pool.shape.as_option().cloned().unwrap_or_default(),
+                    network: pool.network.as_option().cloned().unwrap_or_default(),
                     mounts: pool.mounts.clone(),
                     sockets: pool.sockets.clone(),
                     options: pool.options.clone(),
                     snapshot_capable: false,
                 };
-                if state.providers.is_empty() {
-                    return Ok(());
-                }
-                self.place_with(state, &placement, false, false).map(|_| ())
+                self.place_with(&snapshot, &placement, false, false)
+                    .map(|_| ())
             }
             Err(_) => Ok(()),
         }
     }
 
-    /// Whether a provider's declared per-sandbox capacity can host `shape`.
-    ///
-    /// Zero on either side means "not reported" (or "driver default"), never
-    /// zero capacity: a driver that publishes no ceiling still accepts the
-    /// request rather than being rejected by placement.
-    fn fits_shape(caps: &Capabilities, shape: &Shape) -> bool {
-        let cpus_fit = caps.max_vcpus == 0 || shape.cpus == 0 || shape.cpus <= caps.max_vcpus;
-        let memory_fit = caps.max_memory_mib == 0
-            || shape.memory_mib == 0
-            || shape.memory_mib <= caps.max_memory_mib;
-        cpus_fit && memory_fit
-    }
-
-    /// Pick `(provider_id, driver)`: filter on capabilities and capacity,
-    /// then let the configured [`Placement`] rank the survivors.
-    ///
-    /// The filter is the service's: offline providers (and, for snapshot
-    /// templates, providers that do not hold the snapshot), providers whose
-    /// drivers miss a required capability, and pairs at their slot cap never
-    /// reach the placement.
     fn place(
         &self,
-        state: &State,
+        snapshot: &PlacementSnapshot,
         spec: &PlacementSpec,
         require_online: bool,
     ) -> Result<(String, String)> {
-        self.place_with(state, spec, require_online, true)
+        self.place_with(snapshot, spec, require_online, true)
     }
 
-    /// `place`, optionally honouring cordons.
-    ///
-    /// `PutPool` validates with cordons ignored: a cordon is transient, so a
-    /// pool whose only capable provider is cordoned is still valid
-    /// configuration once that provider is uncordoned.
     fn place_with(
         &self,
-        state: &State,
+        snapshot: &PlacementSnapshot,
         spec: &PlacementSpec,
         require_online: bool,
         respect_cordon: bool,
     ) -> Result<(String, String)> {
         let template = &spec.template;
+        let template_spec = template.spec.as_option().cloned().unwrap_or_default();
         let requires = &spec.requires;
         let os = if requires.os.is_empty() {
-            template.spec.os.as_str()
+            template_spec.os.clone()
         } else {
-            requires.os.as_str()
+            requires.os.clone()
         };
         let mut unmet = Vec::new();
         let mut full = false;
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut cordoned: Vec<&str> = Vec::new();
-        for (provider_id, rec) in &state.providers {
-            if require_online && rec.seen.elapsed() > self.config.provider_timeout {
+        let now = now();
+        for provider in &snapshot.providers {
+            if require_online
+                && now.saturating_sub(provider.last_seen)
+                    > self.config.provider_timeout.as_secs() as i64
+            {
                 continue;
             }
-            // Snapshot templates start only where the snapshot lives.
-            if !template.native_ref.is_empty() && template.provider_id != *provider_id {
+            if !template.native_ref.is_empty() && template.provider_id != provider.id {
                 continue;
             }
-            let is_cordoned = respect_cordon && rec.provider.cordoned;
+            let is_cordoned = respect_cordon && provider.cordoned;
             let mut capable = false;
-            for driver in &rec.provider.drivers {
+            for driver in &provider.drivers {
                 let caps = &driver.capabilities;
                 let mut reasons = Vec::new();
                 if !template.driver.is_empty() && template.driver != driver.driver {
@@ -1709,20 +915,18 @@ impl Service {
                 {
                     reasons.push(format!("network={mode:?}"));
                 }
-                if template.spec.recipe().is_some() && template.native_ref.is_empty() {
-                    // Recipes are driver-specific; the template names its driver
-                    // through `requires.driver`.
-                    if requires.driver.is_empty() && template.spec.requires.driver.is_empty() {
-                        reasons.push("recipe templates must set requires.driver".into());
-                    }
+                if template_spec.recipe().is_some()
+                    && template.native_ref.is_empty()
+                    && requires.driver.is_empty()
+                    && template_spec.requires.driver.is_empty()
+                {
+                    reasons.push("recipe templates must set requires.driver".into());
                 }
                 if !reasons.is_empty() {
-                    // A cordoned provider's gaps did not decide the
-                    // placement, so keep them out of the unmet list.
                     if !is_cordoned {
                         unmet.push(format!(
                             "{}/{}: {}",
-                            rec.provider.name,
+                            provider.name,
                             driver.driver,
                             reasons.join(", ")
                         ));
@@ -1733,10 +937,10 @@ impl Service {
                 if is_cordoned {
                     continue;
                 }
-                if !Self::fits_shape(caps, &spec.shape) {
+                if !backend::logic::fits_shape(caps, &spec.shape) {
                     unmet.push(format!(
                         "{}/{}: shape={}cpus/{}mib (max {}cpus/{}mib)",
-                        rec.provider.name,
+                        provider.name,
                         driver.driver,
                         spec.shape.cpus,
                         spec.shape.memory_mib,
@@ -1745,30 +949,26 @@ impl Service {
                     ));
                     continue;
                 }
-                let live = state
-                    .sandboxes
-                    .values()
-                    .filter(|s| {
-                        s.provider_id == *provider_id
-                            && s.driver == driver.driver
-                            && !s.state.is_terminal()
-                    })
-                    .count();
+                let live = snapshot
+                    .live
+                    .get(&(provider.id.clone(), driver.driver.clone()))
+                    .copied()
+                    .unwrap_or(0) as usize;
                 if caps.slots > 0 && live >= caps.slots as usize {
                     full = true;
                     continue;
                 }
                 candidates.push(Candidate {
                     id: CandidateId(candidates.len()),
-                    provider_id: provider_id.clone(),
-                    provider_name: rec.provider.name.clone(),
+                    provider_id: provider.id.clone(),
+                    provider_name: provider.name.clone(),
                     driver: driver.driver.clone(),
                     live,
                     slots: caps.slots,
                 });
             }
             if is_cordoned && capable {
-                cordoned.push(rec.provider.name.as_str());
+                cordoned.push(provider.name.as_str());
             }
         }
         if candidates.is_empty() {
@@ -1778,8 +978,6 @@ impl Service {
                     "every matching provider is at capacity",
                 ));
             }
-            // Every provider that could have taken this placement is
-            // cordoned: waiting cannot help, and "not online" is wrong.
             if !cordoned.is_empty() {
                 return Err(Error::failed_precondition(match cordoned.as_slice() {
                     [name] => format!("provider {name} is cordoned"),
@@ -1793,7 +991,7 @@ impl Service {
             }
             return Err(Error::failed_precondition(format!(
                 "no provider satisfies template `{}`: {}",
-                template.spec.name,
+                template_spec.name,
                 unmet.join("; ")
             )));
         }
@@ -1812,426 +1010,173 @@ impl Service {
             })
     }
 
-    fn create_locked(
+    async fn placement_for_acquire(
         &self,
-        state: &mut State,
-        (placement, provider_id, driver): (PlacementSpec, String, String),
-        pool: &str,
-        purpose: Purpose,
-        name: &str,
-        ops: &mut Vec<Op>,
-    ) -> Result<String> {
-        let id = new_id("sbx");
-        let shape = effective_shape(state, &provider_id, &driver, &placement.shape);
-        let revision = if pool.is_empty() {
-            String::new()
+        request: &AcquireRequest,
+        snapshot: &PlacementSnapshot,
+    ) -> Result<NewSandbox> {
+        if !request.pool.is_empty() {
+            let pool = self
+                .backend
+                .pool_get(&request.pool)
+                .await?
+                .ok_or_else(|| Error::not_found(format!("pool `{}` not found", request.pool)))?
+                .value;
+            let revision = self.backend.pool_revision(&pool.name).await?.unwrap_or(0);
+            let (spec, provider, driver) = self
+                .pool_placement(&pool, &request.requires, snapshot)
+                .await?;
+            Ok(NewSandbox {
+                template: spec.template,
+                pool: pool.name.clone(),
+                pool_revision: revision,
+                purpose: request
+                    .purpose
+                    .as_known()
+                    .unwrap_or(Purpose::PurposeUnspecified),
+                name: String::new(),
+                provider_id: provider,
+                driver,
+                shape: spec.shape,
+                network: spec.network,
+                mounts: spec.mounts,
+                sockets: spec.sockets,
+                options: spec.options,
+                requires: spec.requires,
+                snapshot_capable: spec.snapshot_capable,
+            })
         } else {
-            state
-                .pools
-                .get(pool)
-                .map(|spec| pool_revision(state, spec))
-                .unwrap_or_default()
-        };
-        let sandbox = Sandbox {
-            id: id.clone(),
-            name: name.to_owned(),
-            template: placement.template.spec.name.clone(),
-            pool: pool.to_owned(),
-            provider_id: provider_id.clone(),
-            driver: driver.clone(),
-            state: SandboxState::Provisioning.into(),
-            purpose: purpose.into(),
-            created_at: now(),
-            shape: shape.into(),
-            pool_revision: revision,
-            ..Sandbox::default()
-        };
-        let sandbox_driver = driver.clone();
-        let work = WorkItem::new(
-            new_id("wrk"),
-            work_item::Work::Create(
-                CreateWork {
-                    sandbox_id: id.clone(),
-                    name: name.to_owned(),
-                    driver,
-                    template: placement.template.into(),
-                    shape: placement.shape.into(),
-                    network: placement.network.into(),
-                    mounts: placement.mounts,
-                    sockets: placement.sockets,
-                    options: placement.options,
-                    snapshot_capable: placement.snapshot_capable,
-                    ..CreateWork::default()
-                }
-                .into(),
-            ),
-        );
-        self.enqueue(
-            state,
-            &provider_id,
-            work,
-            Pending::Create {
-                sandbox_id: id.clone(),
-                driver: sandbox_driver,
-            },
-        )?;
-        ops.push(self.put(Kind::Sandboxes, &id, &sandbox));
-        state.created_at.insert(id.clone(), Instant::now());
-        state.sandboxes.insert(id.clone(), sandbox);
-        Ok(id)
-    }
-
-    fn enqueue(
-        &self,
-        state: &mut State,
-        provider_id: &str,
-        work: WorkItem,
-        kind: Pending,
-    ) -> Result<()> {
-        let deadline = self.pending_deadline(state, &kind);
-        let work_id = work.id.clone();
-        state.pending.insert(
-            work_id.clone(),
-            PendingWork {
-                provider_id: provider_id.to_owned(),
-                kind,
-                deadline,
-            },
-        );
-        if let Err(error) = self.enqueue_work(state, provider_id, work) {
-            // The queue never got it; do not leave a waiter behind.
-            state.pending.remove(&work_id);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// Queue work without tracking a report (cancellations are fire-and-forget).
-    fn enqueue_work(&self, state: &mut State, provider_id: &str, work: WorkItem) -> Result<()> {
-        let rec = state
-            .providers
-            .get_mut(provider_id)
-            .ok_or_else(|| Error::unavailable(format!("provider {provider_id} is gone")))?;
-        rec.queue.push_back(work);
-        rec.wake.notify_one();
-        Ok(())
-    }
-
-    /// When the service stops waiting for a work item.
-    fn pending_deadline(&self, state: &State, kind: &Pending) -> Instant {
-        match kind {
-            Pending::Create { .. } => Instant::now() + self.config.create_timeout,
-            Pending::Exec { exec_id } => state.execs.get(exec_id).map_or_else(
-                || Instant::now() + self.config.exec_timeout + EXEC_SWEEP_GRACE,
-                |exec| exec.deadline + EXEC_SWEEP_GRACE,
-            ),
-            _ => Instant::now() + self.config.work_timeout,
+            let template = self
+                .backend
+                .template_get(&request.template)
+                .await?
+                .ok_or_else(|| {
+                    Error::not_found(format!("template `{}` not found", request.template))
+                })?
+                .value;
+            let template_spec = template.spec.as_option().cloned().unwrap_or_default();
+            let spec = PlacementSpec {
+                requires: template_spec
+                    .requires
+                    .as_option()
+                    .cloned()
+                    .unwrap_or_default()
+                    .merged(&request.requires),
+                template,
+                shape: request.shape.as_option().cloned().unwrap_or_default(),
+                network: request.network.as_option().cloned().unwrap_or_default(),
+                mounts: request.mounts.clone(),
+                sockets: request.sockets.clone(),
+                options: request.options.clone(),
+                snapshot_capable: request.purpose.as_known() == Some(Purpose::Build),
+            };
+            let (provider, driver) = self.place(snapshot, &spec, true)?;
+            Ok(NewSandbox {
+                template: spec.template,
+                pool: String::new(),
+                pool_revision: 0,
+                purpose: request
+                    .purpose
+                    .as_known()
+                    .unwrap_or(Purpose::PurposeUnspecified),
+                name: request.name.clone(),
+                provider_id: provider,
+                driver,
+                shape: spec.shape,
+                network: spec.network,
+                mounts: spec.mounts,
+                sockets: spec.sockets,
+                options: spec.options,
+                requires: spec.requires,
+                snapshot_capable: spec.snapshot_capable,
+            })
         }
     }
 
-    /// Fail a work item whose deadline passed, naming the operation.
-    fn expire_pending_locked(&self, state: &mut State, work_id: &str, ops: &mut Vec<Op>) {
-        let message = match state.pending.get(work_id).map(|work| &work.kind) {
-            Some(Pending::Create { .. }) => "create timed out",
-            Some(Pending::Exec { .. }) => "exec timed out",
-            _ => "work timed out",
-        };
-        let error = Error::new(Code::DeadlineExceeded, message);
-        self.complete_locked(state, work_id, Err(error), ops);
-    }
-
-    /// Drop an exec's work from the queue and its in-flight set: nothing will
-    /// start (or restart) the command.
-    fn forget_work_locked(state: &mut State, provider_id: &str, work_id: &str) {
-        state.pending.remove(work_id);
-        if let Some(rec) = state.providers.get_mut(provider_id) {
-            rec.in_flight.remove(work_id);
-            rec.queue.retain(|item| item.id != work_id);
-        }
-    }
-
-    /// End an exec whose deadline passed without a report: close the caller's
-    /// stream with the timeout exit ([`EXEC_TIMED_OUT`]), forget its work,
-    /// and ask the provider to kill the guest command. This is the backstop,
-    /// so it must land on the same result the driver would have reported.
-    fn expire_exec_locked(&self, state: &mut State, exec_id: &str) {
-        let Some(exec) = state.execs.remove(exec_id) else {
-            return;
-        };
-        exec.finished.cancel();
-        let tx = exec.tx;
-        let exit = ExecEvent::exit(EXEC_TIMED_OUT);
-        // Queue the exit after any output already buffered. A full channel
-        // must not cost the caller its exit status (`try_send` would), so
-        // this waits its turn off the state lock.
-        tokio::spawn(async move {
-            let _ = tx.send(Ok(exit)).await;
-        });
-        let Some(sandbox) = state.sandboxes.get(&exec.sandbox_id).cloned() else {
-            if let Some(pending) = state.pending.get(&exec.work_id) {
-                let provider_id = pending.provider_id.clone();
-                Self::forget_work_locked(state, &provider_id, &exec.work_id);
-            }
-            return;
-        };
-        Self::forget_work_locked(state, &sandbox.provider_id, &exec.work_id);
-        self.request_cancel_locked(state, &sandbox, exec_id);
-    }
-
-    /// Queue a `CancelExec` for a sandbox that still holds the command.
-    fn request_cancel_locked(&self, state: &mut State, sandbox: &Sandbox, exec_id: &str) {
-        if sandbox.state.is_terminal() || sandbox.native_ref.is_empty() {
-            return;
-        }
-        let work = WorkItem::new(
-            new_id("wrk"),
-            work_item::Work::CancelExec(
-                CancelExecWork {
-                    exec_id: exec_id.to_owned(),
-                    target: Self::target(sandbox).into(),
-                    ..CancelExecWork::default()
-                }
-                .into(),
-            ),
-        );
-        let _ = self.enqueue_work(state, &sandbox.provider_id, work);
-    }
-
-    fn target(sandbox: &Sandbox) -> SandboxWork {
-        SandboxWork {
-            sandbox_id: sandbox.id.clone(),
-            driver: sandbox.driver.clone(),
-            native_ref: sandbox.native_ref.clone(),
-            ..SandboxWork::default()
-        }
-    }
-
-    fn destroy_locked(&self, state: &mut State, id: &str, ops: &mut Vec<Op>) {
-        match state.sandboxes.get(id).map(|sandbox| sandbox.state.known()) {
-            None => return,
-            Some(SandboxState::Gone | SandboxState::Terminating) => return,
-            Some(_) => {}
-        }
-        close_execs(state, id, "sandbox was destroyed");
-        let sandbox = state.sandboxes.get_mut(id).expect("state checked above");
-        if sandbox.native_ref.is_empty() {
-            // Never created (or still provisioning): drop the record; a late
-            // create report finds no record and the reconcile removes the
-            // orphan.
-            sandbox.state = SandboxState::Gone.into();
-            let id = id.to_owned();
-            state.sandboxes.remove(&id);
-            state.created_at.remove(&id);
-            state.destroy_attempts.remove(&id);
-            ops.push(self.remove(Kind::Sandboxes, &id));
-            return;
-        }
-        sandbox.state = SandboxState::Terminating.into();
-        let snapshot = sandbox.clone();
-        ops.push(self.put(Kind::Sandboxes, id, &snapshot));
-        let work = WorkItem::new(
-            new_id("wrk"),
-            work_item::Work::Destroy(Self::target(&snapshot).into()),
-        );
-        if self
-            .enqueue(
-                state,
-                &snapshot.provider_id,
-                work,
-                Pending::Destroy {
-                    sandbox_id: id.to_owned(),
-                },
-            )
-            .is_err()
+    async fn fill_pool(&self, deficit: &backend::PoolDeficit) {
         {
-            // The provider is not registered, so nothing can destroy the
-            // machine now. Keep it as a tombstone: it is still on the host, and
-            // reconcile reclaims it once the provider reports it.
-            self.tombstone_locked(state, id, "the provider is not registered", ops);
-        }
-    }
-
-    /// Queue a destroy for a `Terminating` record whose machine the provider
-    /// still reports. Nothing is queued while a destroy for the record is
-    /// queued or running: a slow delete is awaited, not asked again. Returns
-    /// `false` only when the provider cannot take the work.
-    fn ask_destroy_locked(&self, state: &mut State, id: &str) -> bool {
-        if destroy_in_flight(state, id) {
-            return true;
-        }
-        let Some(sandbox) = state.sandboxes.get(id).cloned() else {
-            return false;
-        };
-        let work = WorkItem::new(
-            new_id("wrk"),
-            work_item::Work::Destroy(Self::target(&sandbox).into()),
-        );
-        let queued = self
-            .enqueue(
-                state,
-                &sandbox.provider_id,
-                work,
-                Pending::Destroy {
-                    sandbox_id: id.to_owned(),
-                },
-            )
-            .is_ok();
-        if queued {
-            warn!(
-                sandbox = id,
-                "terminating sandbox is still on the provider; destroy asked again"
-            );
-        }
-        queued
-    }
-
-    /// Stop queueing destroys for a `Terminating` record the service cannot
-    /// finish, and keep the record as a `Gone` tombstone. The record is what
-    /// lets `Reconcile` prove the machine is ours and destroy it directly. A
-    /// tombstone holds no capacity slot, and it is removed once the provider
-    /// stops reporting the machine.
-    fn tombstone_locked(&self, state: &mut State, id: &str, reason: &str, ops: &mut Vec<Op>) {
-        state.destroy_attempts.remove(id);
-        state.created_at.remove(id);
-        let Some(sandbox) = state.sandboxes.get_mut(id) else {
-            return;
-        };
-        sandbox.state = SandboxState::Gone.into();
-        sandbox.error = reason.to_owned();
-        ops.push(self.put(Kind::Sandboxes, id, &*sandbox));
-    }
-
-    fn fail_locked(&self, state: &mut State, id: &str, reason: &str, ops: &mut Vec<Op>) {
-        close_execs(state, id, reason);
-        if let Some(sandbox) = state.sandboxes.get_mut(id) {
-            warn!(sandbox = id, reason, "sandbox failed");
-            sandbox.state = SandboxState::Failed.into();
-            sandbox.error = reason.to_owned();
-            ops.push(self.put(Kind::Sandboxes, id, &*sandbox));
-            if !sandbox.pool.is_empty() {
-                state
-                    .pool_backoff
-                    .insert(sandbox.pool.clone(), Instant::now());
+            let backoff = self.pool_backoff.lock();
+            if backoff
+                .get(&deficit.pool)
+                .is_some_and(|at| at.elapsed() < POOL_FAILURE_BACKOFF)
+            {
+                return;
             }
         }
-        state.created_at.remove(id);
-    }
-
-    /// Release a sandbox's lease without touching the machine.
-    ///
-    /// Used when the lease can no longer be honoured (its provider is lost)
-    /// but the machine may still exist for the next reconcile: the lease row
-    /// goes, the sandbox keeps its state and native reference.
-    fn detach_lease_locked(&self, state: &mut State, sandbox_id: &str, ops: &mut Vec<Op>) {
-        let lease_id = match state.sandboxes.get(sandbox_id) {
-            Some(sandbox) if !sandbox.lease_id.is_empty() => sandbox.lease_id.clone(),
+        let snapshot = match self.backend.placement_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(%error, pool = %deficit.pool, "warm pool snapshot failed");
+                return;
+            }
+        };
+        let pool = match self.backend.pool_get(&deficit.pool).await {
+            Ok(Some(pool)) => pool.value,
             _ => return,
         };
-        if let Some(lease) = state.leases.remove(&lease_id) {
-            state.lease_by_key.remove(&lease.idempotency_key);
-            state.injected.remove(&lease_id);
-            ops.push(self.remove(Kind::Leases, &lease_id));
+        if self
+            .backend
+            .pool_revision(&deficit.pool)
+            .await
+            .ok()
+            .flatten()
+            != Some(deficit.revision)
+        {
+            return;
         }
-        if let Some(sandbox) = state.sandboxes.get_mut(sandbox_id) {
-            sandbox.lease_id.clear();
-            ops.push(self.put(Kind::Sandboxes, sandbox_id, &*sandbox));
-        }
-    }
-
-    fn release_locked(
-        &self,
-        state: &mut State,
-        lease_id: &str,
-        mode: ReleaseMode,
-        preserve_ttl: u64,
-        ops: &mut Vec<Op>,
-    ) -> Result<()> {
-        let Some(lease) = state.leases.get(lease_id).cloned() else {
-            return Ok(());
-        };
-        let preserve = mode == ReleaseMode::Preserve;
-        let failed = state
-            .sandboxes
-            .get(&lease.sandbox_id)
-            .is_some_and(|s| s.state == SandboxState::Failed);
-        // Preservation is the one way a lease outlives `Release`: the id keeps
-        // working as the debugging capability until the window closes. A
-        // second preserve extends that window instead of destroying.
-        //
-        // A stopped or paused sandbox preserves too: `Stop` exists to keep a
-        // machine and its disk around, and the debug flow is exactly "stop
-        // it, preserve-release it, inspect it later". The record keeps its
-        // power state (`Paused`/`Stopped`) so it is reported and restored
-        // faithfully; the machine itself is not touched (a stopped sandbox
-        // stays stopped and must be `Start`ed before it executes again).
-        // Anything that cannot be preserved — a failed sandbox, one still
-        // provisioning — fails the call instead of falling through to
-        // destroy under a success response, which is what this gate used to
-        // do.
-        if preserve {
-            let sandbox_state = state
-                .sandboxes
-                .get(&lease.sandbox_id)
-                .map(|s| s.state.known());
-            let preservable = !failed
-                && matches!(
-                    sandbox_state,
-                    Some(
-                        SandboxState::Leased
-                            | SandboxState::Preserved
-                            | SandboxState::Paused
-                            | SandboxState::Stopped
-                    )
-                );
-            if !preservable {
-                let state_name = sandbox_state
-                    .map(|state| format!("{state:?}"))
-                    .unwrap_or_else(|| "gone".to_owned());
-                return Err(Error::failed_precondition(format!(
-                    "sandbox {} cannot be preserved from state {state_name}; \
-                     release with DESTROY to give it up",
-                    lease.sandbox_id
-                )));
-            }
-            let ttl = if preserve_ttl == 0 {
-                self.config.preserve_ttl.as_secs()
-            } else {
-                preserve_ttl
-            };
-            let until = now() + ttl as i64;
-            if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
-                if sandbox.state == SandboxState::Leased {
-                    sandbox.state = SandboxState::Preserved.into();
+        for _ in 0..deficit.missing {
+            let placement = match self
+                .pool_placement(&pool, &Requirements::default(), &snapshot)
+                .await
+            {
+                Ok(placement) => placement,
+                Err(_) => {
+                    self.config
+                        .metrics
+                        .record_pool_refill_failure(&deficit.pool);
+                    self.pool_backoff
+                        .lock()
+                        .insert(deficit.pool.clone(), Instant::now());
+                    return;
                 }
-                sandbox.preserve_until = until;
-                ops.push(self.put(Kind::Sandboxes, &lease.sandbox_id, &*sandbox));
+            };
+            let (spec, provider, driver) = placement;
+            let member = NewSandbox {
+                template: spec.template,
+                pool: pool.name.clone(),
+                pool_revision: deficit.revision,
+                purpose: Purpose::Runner,
+                name: String::new(),
+                provider_id: provider,
+                driver,
+                shape: spec.shape,
+                network: spec.network,
+                mounts: spec.mounts,
+                sockets: spec.sockets,
+                options: spec.options,
+                requires: spec.requires,
+                snapshot_capable: spec.snapshot_capable,
+            };
+            match self
+                .backend
+                .create_pool_member(member, self.config.create_timeout)
+                .await
+            {
+                Ok(RefillOutcome::Created(_)) => {}
+                Ok(_) => return,
+                Err(error) => {
+                    warn!(%error, pool = %pool.name, "warm pool refill failed");
+                    self.config.metrics.record_pool_refill_failure(&pool.name);
+                    self.pool_backoff
+                        .lock()
+                        .insert(pool.name.clone(), Instant::now());
+                    return;
+                }
             }
-            // The idempotency key is free again (also after a restart): a
-            // retry with it starts a new sandbox, as it did before
-            // preservation kept the lease alive.
-            state.lease_by_key.remove(&lease.idempotency_key);
-            if let Some(lease) = state.leases.get_mut(lease_id) {
-                lease.expires_at = until;
-                lease.idempotency_key.clear();
-                ops.push(self.put(Kind::Leases, lease_id, &*lease));
-            }
-            self.config.metrics.record_lease_transition("preserved");
-            return Ok(());
         }
-        state.leases.remove(lease_id);
-        state.lease_by_key.remove(&lease.idempotency_key);
-        state.injected.remove(lease_id);
-        ops.push(self.remove(Kind::Leases, lease_id));
-        if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
-            sandbox.lease_id.clear();
-        }
-        // Failed sandboxes may still hold a native machine: destroy_locked
-        // handles both cases.
-        self.destroy_locked(state, &lease.sandbox_id, ops);
-        Ok(())
     }
 
-    // ─── Leases ────────────────────────────────────────────────────
+    // ── Leases ────────────────────────────────────────────────────
 
     /// `Acquire`.
     pub async fn acquire(self: &Arc<Self>, request: AcquireRequest) -> Result<AcquireResponse> {
@@ -2263,8 +1208,9 @@ impl Service {
             ));
         }
         if !request.pool.is_empty() {
-            // The pool path uses the pool's placement; silently dropping these
-            // would hand back a sandbox that ignores what the caller asked for.
+            // The pool path uses the pool's placement; silently dropping
+            // these would hand back a sandbox that ignores what the caller
+            // asked for.
             let mut ignored = Vec::new();
             if *request.shape != Shape::default() {
                 ignored.push("shape");
@@ -2295,313 +1241,176 @@ impl Service {
                 ));
             }
         }
-        // From here until the response is returned this call counts as a
-        // waiter, so maintenance will not expire the lease it is provisioning.
-        let _waiter = AcquireWaiter::register(self, &request.idempotency_key);
         let wait = match request.wait_secs {
             None => self.config.acquire_wait,
-            // An explicit zero means "report the current state, do not block".
             Some(0) => Duration::ZERO,
             Some(secs) => Duration::from_secs(secs),
         };
-        let deadline = tokio::time::Instant::now() + wait;
-        // The capacity clock starts at the first capacity-blocked step and
-        // is never reset: it bounds the total time this acquire spends
-        // unable to place for lack of room, however the steps interleave.
-        let mut capacity_deadline: Option<tokio::time::Instant> = None;
-        let mut capacity_error: Option<Error> = None;
-        // Hashed once: the request cannot change across a wait loop.
-        let fingerprint = acquire_fingerprint(&request);
-        loop {
+        let deadline = Instant::now() + wait;
+        let fingerprint = backend::logic::acquire_fingerprint(&request);
+        let ttl = if request.ttl_secs > 0 {
+            request.ttl_secs
+        } else if !request.pool.is_empty() {
+            self.backend
+                .pool_get(&request.pool)
+                .await?
+                .map(|pool| pool.value.lease_ttl_secs)
+                .filter(|ttl| *ttl > 0)
+                .unwrap_or(self.config.lease_ttl.as_secs())
+        } else {
+            self.config.lease_ttl.as_secs()
+        };
+        let mut placement: Option<NewSandbox> = None;
+        let mut attempted_with_placement = false;
+        let mut waiter_for: Option<String> = None;
+        let mut waiter_guard: Option<AcquireWaiterGuard> = None;
+        // Starts at the first capacity-blocked step and is never reset: a
+        // caller that cannot be told about overload fails over instead of
+        // parking for the whole acquire wait.
+        let mut capacity_deadline: Option<Instant> = None;
+        let result = loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            match self.try_acquire(&request, &fingerprint).await? {
-                Step::Ready(ready) => {
-                    let (lease, sandbox) = *ready;
-                    self.inject(&lease, &sandbox, &request.inject).await?;
-                    let lease = self.claim(&lease).await?;
+            let command = AcquireCommand {
+                request: request.clone(),
+                fingerprint: fingerprint.clone(),
+                ttl_secs: ttl,
+                unclaimed_ttl_secs: self.config.unclaimed_lease_ttl.as_secs(),
+                create_timeout: self.config.create_timeout,
+                placement: placement.clone(),
+                owner: self.node.clone(),
+            };
+            if placement.is_some() {
+                attempted_with_placement = true;
+            }
+            let step = self.backend.acquire(command).await?;
+            match step {
+                AcquireStep::Ready { lease, sandbox } => {
+                    self.clear_waiter_if_any(&request.idempotency_key, waiter_for.take())
+                        .await;
+                    if let Some(guard) = waiter_guard.as_mut() {
+                        guard.disarm();
+                    }
                     return Ok(AcquireResponse {
                         lease: lease.into(),
                         sandbox: sandbox.into(),
                         ..AcquireResponse::default()
                     });
                 }
-                Step::Wait(last) => {
-                    let mut wake_deadline = deadline;
-                    if let Some(error) = &last
-                        && error.code == Code::ResourceExhausted
-                    {
-                        let started = *capacity_deadline.get_or_insert(
-                            tokio::time::Instant::now() + self.config.acquire_capacity_wait,
-                        );
-                        capacity_error = Some(Error::new(
-                            error.code,
-                            crate::error::message(error).to_owned(),
-                        ));
-                        wake_deadline = wake_deadline.min(started);
-                    }
-                    if tokio::time::timeout_at(wake_deadline, changed)
-                        .await
-                        .is_err()
-                    {
-                        // Whichever bound ran out, report the failure that
-                        // bound is about: an overload the caller waited out
-                        // in full is `resource_exhausted`, not a generic
-                        // deadline — the caller fails over on it.
-                        if let Some(error) = capacity_error.take_if(|_| {
-                            capacity_deadline.is_some_and(|at| tokio::time::Instant::now() >= at)
-                        }) {
+                AcquireStep::Inject { lease, sandbox } => {
+                    let injected = self.inject(&lease, &sandbox, &request.inject).await;
+                    match injected {
+                        Ok(()) => {
+                            self.backend
+                                .finish_injection(&lease.id, &self.node, true)
+                                .await?;
+                        }
+                        Err(error) => {
+                            let _ = self
+                                .backend
+                                .finish_injection(&lease.id, &self.node, false)
+                                .await;
+                            self.clear_waiter_if_any(&request.idempotency_key, waiter_for.take())
+                                .await;
+                            if let Some(guard) = waiter_guard.as_mut() {
+                                guard.disarm();
+                            }
                             return Err(error);
                         }
-                        return Err(last.unwrap_or_else(|| {
+                    }
+                }
+                AcquireStep::Wait {
+                    last,
+                    retry_after,
+                    sandbox_id,
+                    lease_id,
+                } => {
+                    if last
+                        .as_ref()
+                        .is_some_and(|error| error.code == Code::ResourceExhausted)
+                    {
+                        let capacity_at = *capacity_deadline
+                            .get_or_insert(Instant::now() + self.config.acquire_capacity_wait);
+                        if Instant::now() >= capacity_at {
+                            break Err(last.unwrap_or_else(|| {
+                                Error::new(Code::ResourceExhausted, "no capacity")
+                            }));
+                        }
+                    }
+                    if let Some(sandbox_id) = sandbox_id {
+                        if waiter_guard.is_none() {
+                            waiter_guard = Some(AcquireWaiterGuard {
+                                service: self.clone(),
+                                key: request.idempotency_key.clone(),
+                                armed: true,
+                            });
+                        }
+                        let waiter = backend::Waiter {
+                            key: request.idempotency_key.clone(),
+                            sandbox_id,
+                            lease_id: lease_id.unwrap_or_default(),
+                            owner: self.node.clone(),
+                            expires_at_ms: now_ms() + 30_000,
+                        };
+                        let _ = self.backend.register_waiter(waiter).await;
+                        waiter_for = Some(request.idempotency_key.clone());
+                    }
+                    let wait_until =
+                        deadline.min(Instant::now() + retry_after.max(Duration::from_millis(25)));
+                    if tokio::time::timeout_at(wait_until.into(), changed)
+                        .await
+                        .is_err()
+                        && Instant::now() >= deadline
+                    {
+                        break Err(last.unwrap_or_else(|| {
                             Error::new(Code::DeadlineExceeded, "sandbox not ready in time")
                         }));
                     }
                 }
-            }
-        }
-    }
-
-    async fn try_acquire(&self, request: &AcquireRequest, fingerprint: &str) -> Result<Step> {
-        let mut ops = Vec::new();
-        // A failed replay releases its lease while holding the lock; those
-        // writes must reach the store before the error is returned.
-        let step = {
-            let mut state = self.state.lock();
-            self.try_acquire_locked(&mut state, request, fingerprint, &mut ops)
-        };
-        if !ops.is_empty() {
-            self.persist(ops).await;
-            self.changed.notify_waiters();
-        }
-        step
-    }
-
-    fn try_acquire_locked(
-        &self,
-        state: &mut State,
-        request: &AcquireRequest,
-        fingerprint: &str,
-        ops: &mut Vec<Op>,
-    ) -> Result<Step> {
-        if let Some(lease_id) = state.lease_by_key.get(&request.idempotency_key).cloned() {
-            let stored = state.leases[&lease_id].request_hash.as_str();
-            if !stored.is_empty() && stored != fingerprint {
-                return Err(Error::invalid_argument(format!(
-                    "idempotency key `{}` was used for a different acquire request",
-                    request.idempotency_key
-                )));
-            }
-            if stored.is_empty() {
-                // Leases persisted before fingerprints existed: record the
-                // first payload seen, so a later mismatch is still caught.
-                if let Some(lease) = state.leases.get_mut(&lease_id) {
-                    lease.request_hash = fingerprint.to_owned();
-                    ops.push(self.put(Kind::Leases, &lease_id, &*lease));
-                }
-            }
-            let lease = state.leases[&lease_id].clone();
-            let sandbox = state
-                .sandboxes
-                .get(&lease.sandbox_id)
-                .cloned()
-                .ok_or_else(|| Error::not_found("leased sandbox is gone"))?;
-            return match sandbox.state.known() {
-                // A stopped sandbox is a live sandbox the caller powered
-                // off on purpose: hand the lease back so the retry can
-                // `Start` it. Destroying it here made an idempotent retry —
-                // the operation whose whole point is being safe to repeat —
-                // permanently delete a machine and its disk, and the next
-                // retry then silently provisioned a different sandbox.
-                SandboxState::Leased
-                | SandboxState::Paused
-                | SandboxState::Preserved
-                | SandboxState::Stopped => Ok(Step::Ready(Box::new((lease, sandbox)))),
-                SandboxState::Provisioning => Ok(Step::Wait(None)),
-                _ => {
-                    // Failed/gone: release so a retry with the same key can
-                    // start over, and report the failure now.
-                    let error = if sandbox.error.is_empty() {
-                        format!("sandbox {} is {:?}", sandbox.id, sandbox.state)
-                    } else {
-                        sandbox.error.clone()
-                    };
-                    let _ = self.release_locked(state, &lease_id, ReleaseMode::Destroy, 0, ops);
-                    Err(crate::error::from_reported(error))
-                }
-            };
-        }
-        let ttl = if request.ttl_secs > 0 {
-            request.ttl_secs
-        } else {
-            request
-                .pool
-                .is_empty()
-                .then_some(0)
-                .or_else(|| state.pools.get(&request.pool).map(|p| p.lease_ttl_secs))
-                .filter(|ttl| *ttl > 0)
-                .unwrap_or(self.config.lease_ttl.as_secs())
-        };
-        if !request.name.is_empty()
-            && state
-                .sandboxes
-                .values()
-                .any(|s| s.name == request.name && !s.state.is_terminal())
-        {
-            return Err(Error::new(
-                Code::AlreadyExists,
-                format!("a live sandbox is already named `{}`", request.name),
-            ));
-        }
-        // Resolve the sandbox: a warm pool member, or a new one.
-        let sandbox_id = if !request.pool.is_empty() {
-            let pool =
-                state.pools.get(&request.pool).cloned().ok_or_else(|| {
-                    Error::not_found(format!("pool `{}` not found", request.pool))
-                })?;
-            let revision = pool_revision(state, &pool);
-            let warm = state
-                .sandboxes
-                .values()
-                .filter(|s| {
-                    s.pool == pool.name
-                        && s.lease_id.is_empty()
-                        && s.pool_revision == revision
-                        && s.state == SandboxState::Ready
-                })
-                .filter(|s| sandbox_meets(state, s, &request.requires))
-                // Oldest first, so warm members rotate and none goes stale.
-                .min_by_key(|s| (s.created_at, s.id.as_str()))
-                .map(|s| s.id.clone());
-            match warm {
-                Some(id) => id,
-                None => {
-                    let live = state
-                        .sandboxes
-                        .values()
-                        .filter(|s| s.pool == pool.name && !s.state.is_terminal())
-                        .count() as u32;
-                    // An idle provisioning member will become ready; do not
-                    // over-create while it boots.
-                    let booting = state.sandboxes.values().any(|s| {
-                        s.pool == pool.name
-                            && s.lease_id.is_empty()
-                            && s.pool_revision == revision
-                            && s.state == SandboxState::Provisioning
-                            && sandbox_meets(state, s, &request.requires)
-                    });
-                    if booting {
-                        return Ok(Step::Wait(None));
-                    }
-                    if pool.max > 0 && live >= pool.max {
-                        return Ok(Step::Wait(Some(Error::new(
-                            Code::ResourceExhausted,
-                            format!("pool `{}` is at max ({})", pool.name, pool.max),
-                        ))));
-                    }
-                    match self.pool_placement(state, &pool, &request.requires) {
-                        Ok(placement) => self.create_locked(
-                            state,
-                            placement,
-                            &pool.name,
-                            request.purpose.as_known().unwrap_or_default(),
-                            "",
-                            ops,
-                        )?,
-                        Err(error) if error.code == Code::FailedPrecondition => return Err(error),
-                        Err(error) => return Ok(Step::Wait(Some(error))),
+                AcquireStep::PlacementNeeded => {
+                    let snapshot = self.backend.placement_snapshot().await?;
+                    match self.placement_for_acquire(&request, &snapshot).await {
+                        Ok(member) => {
+                            placement = Some(member);
+                            // Even a zero-wait Acquire gets one placement
+                            // attempt; the caller's deadline may expire while
+                            // the new sandbox provisions, but the sandbox and
+                            // its create work must exist.
+                            continue;
+                        }
+                        Err(error) if error.code == Code::FailedPrecondition => break Err(error),
+                        Err(error) => {
+                            if Instant::now() >= deadline {
+                                break Err(error);
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
+                AcquireStep::Failed(error) => {
+                    break Err(error);
+                }
             }
-        } else {
-            let template = state
-                .templates
-                .get(&request.template)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::not_found(format!("template `{}` not found", request.template))
-                })?;
-            let placement = PlacementSpec {
-                requires: template.spec.requires.merged(&request.requires),
-                template,
-                shape: (*request.shape).clone(),
-                network: (*request.network).clone(),
-                mounts: request.mounts.clone(),
-                sockets: request.sockets.clone(),
-                options: request.options.clone(),
-                snapshot_capable: request.purpose == Purpose::Build,
-            };
-            match self.place(state, &placement, true) {
-                Ok((provider, driver)) => self.create_locked(
-                    state,
-                    (placement, provider, driver),
-                    "",
-                    request.purpose.as_known().unwrap_or_default(),
-                    &request.name,
-                    ops,
-                )?,
-                Err(error) if error.code == Code::FailedPrecondition => return Err(error),
-                Err(error) => return Ok(Step::Wait(Some(error))),
+            if Instant::now() >= deadline && !(placement.is_some() && !attempted_with_placement) {
+                break Err(Error::new(
+                    Code::DeadlineExceeded,
+                    "sandbox not ready in time",
+                ));
             }
         };
-        let lease = Lease {
-            id: new_id("lse"),
-            sandbox_id: sandbox_id.clone(),
-            pool: request.pool.clone(),
-            idempotency_key: request.idempotency_key.clone(),
-            // Until the lease reaches a caller it may only live for the
-            // unclaimed window; delivery restores the requested TTL.
-            expires_at: now() + ttl.min(self.config.unclaimed_lease_ttl.as_secs()) as i64,
-            requested_ttl_secs: ttl,
-            env: request.inject.env.clone(),
-            request_hash: fingerprint.to_owned(),
-            ..Lease::default()
-        };
-        let sandbox = state
-            .sandboxes
-            .get_mut(&sandbox_id)
-            .ok_or_else(|| Error::internal("sandbox vanished"))?;
-        sandbox.lease_id = lease.id.clone();
-        sandbox.purpose = request.purpose;
-        sandbox.name = request.name.clone();
-        if sandbox.state == SandboxState::Ready {
-            sandbox.state = SandboxState::Leased.into();
+        self.clear_waiter_if_any(&request.idempotency_key, waiter_for)
+            .await;
+        if let Some(guard) = waiter_guard.as_mut() {
+            guard.disarm();
         }
-        let ready = sandbox.state == SandboxState::Leased;
-        let snapshot = sandbox.clone();
-        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &snapshot));
-        ops.push(self.put(Kind::Leases, &lease.id, &lease));
-        state
-            .lease_by_key
-            .insert(lease.idempotency_key.clone(), lease.id.clone());
-        state.leases.insert(lease.id.clone(), lease.clone());
-        Ok(if ready {
-            Step::Ready(Box::new((lease, snapshot)))
-        } else {
-            Step::Wait(None)
-        })
+        result
     }
 
-    /// Mark a lease delivered when `Acquire` returns it: its expiry becomes
-    /// the caller's full TTL. A lease persisted before `requested_ttl_secs`
-    /// existed has 0 and is already delivered, so its expiry is left alone.
-    async fn claim(&self, lease: &Lease) -> Result<Lease> {
-        let (claimed, ops) = {
-            let mut state = self.state.lock();
-            let Some(current) = state.leases.get_mut(&lease.id) else {
-                return Ok(lease.clone());
-            };
-            if current.requested_ttl_secs == 0 {
-                return Ok(current.clone());
-            }
-            current.expires_at = now() + current.requested_ttl_secs as i64;
-            let current = current.clone();
-            let op = self.put(Kind::Leases, &current.id, &current);
-            (current, vec![op])
-        };
-        self.persist(ops).await;
-        Ok(claimed)
+    async fn clear_waiter_if_any(&self, key: &str, waiter: Option<String>) {
+        if waiter.is_some() {
+            let _ = self.backend.clear_waiter(key, &self.node).await;
+        }
     }
 
     async fn inject(
@@ -2613,16 +1422,10 @@ impl Service {
         if inject.files.is_empty() {
             return Ok(());
         }
-        // Build the tar in memory: the files arrived in the unary request and
-        // are already capped by the Connect body limit, so there is no reason
-        // to stage a copy anywhere. Extraction is at `/`.
-        if self.state.lock().injected.contains(&lease.id) {
-            return Ok(());
-        }
         let mut builder = tar::Builder::new(Vec::new());
         for spec in &inject.files {
             let path = spec.path.trim_start_matches('/');
-            if path.is_empty() || path.split('/').any(|p| p == "..") {
+            if path.is_empty() || path.split('/').any(|part| part == "..") {
                 return Err(Error::invalid_argument(format!(
                     "bad inject path `{}`",
                     spec.path
@@ -2635,339 +1438,183 @@ impl Service {
             header.set_cksum();
             builder
                 .append_data(&mut header, path, spec.data.as_slice())
-                .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
+                .map_err(|error| Error::internal(format!("inject tar: {error}")))?;
         }
         let bytes = builder
             .into_inner()
-            .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
-        self.upload_bytes(&sandbox.id, "/", bytes).await?;
-        self.state.lock().injected.insert(lease.id.clone());
-        Ok(())
+            .map_err(|error| Error::internal(format!("inject tar: {error}")))?;
+        self.upload_bytes(&sandbox.id, &lease.id, "/", bytes).await
     }
 
     /// `Renew`.
     pub async fn renew(&self, request: RenewRequest) -> Result<Lease> {
-        let (lease, ops) = {
-            let mut state = self.state.lock();
-            let sandbox_id = state
-                .leases
-                .get(&request.lease_id)
-                .map(|lease| lease.sandbox_id.clone())
-                .ok_or_else(|| Error::not_found("lease not found"))?;
-            // A lease outlives neither its machine's failure nor its destroy:
-            // extending it would promise capacity that cannot be used.
-            let sandbox_state = state
-                .sandboxes
-                .get(&sandbox_id)
-                .map(|sandbox| sandbox.state.known());
-            match sandbox_state {
-                Some(SandboxState::Failed) => {
-                    let reason = &state.sandboxes[&sandbox_id].error;
-                    let detail = if reason.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {reason}")
-                    };
-                    return Err(Error::failed_precondition(format!(
-                        "sandbox {sandbox_id} failed{detail}"
-                    )));
-                }
-                Some(SandboxState::Terminating | SandboxState::Gone) => {
-                    return Err(Error::failed_precondition(format!(
-                        "sandbox {sandbox_id} is being destroyed"
-                    )));
-                }
-                Some(_) => {}
-                None => return Err(Error::not_found("leased sandbox is gone")),
-            }
-            let lease = state
-                .leases
-                .get_mut(&request.lease_id)
-                .ok_or_else(|| Error::not_found("lease not found"))?;
-            let ttl = if request.ttl_secs > 0 {
-                request.ttl_secs
-            } else if lease.requested_ttl_secs > 0 {
-                // A zero TTL means "keep the lease alive at the TTL it was
-                // acquired with", not the service default.
-                lease.requested_ttl_secs
-            } else {
-                // A lease persisted before `requested_ttl_secs` existed.
-                self.config.lease_ttl.as_secs()
-            };
-            lease.requested_ttl_secs = ttl;
-            lease.expires_at = now() + ttl as i64;
-            let lease = lease.clone();
-            let ops = vec![self.put(Kind::Leases, &lease.id, &lease)];
-            (lease, ops)
-        };
-        self.persist(ops).await;
+        let lease = self
+            .backend
+            .renew(
+                &request.lease_id,
+                request.ttl_secs,
+                self.config.lease_ttl.as_secs(),
+            )
+            .await?;
         self.config.metrics.record_lease_transition("renewed");
         Ok(lease)
     }
 
     /// `Release`.
-    #[tracing::instrument(skip(self), fields(lease_id = %request.lease_id, mode = ?request.mode))]
     pub async fn release(&self, request: ReleaseRequest) -> Result<()> {
-        let ops = {
-            let mut state = self.state.lock();
-            let Some(lease) = state.leases.get(&request.lease_id) else {
-                return Err(Error::not_found("lease not found"));
-            };
-            if state.busy.contains(&lease.sandbox_id) {
-                return Err(Error::failed_precondition(
-                    "a snapshot is in progress; release after it completes",
-                ));
-            }
-            let mut ops = Vec::new();
-            self.release_locked(
-                &mut state,
+        self.backend
+            .release(
                 &request.lease_id,
                 request.mode.as_known().unwrap_or_default(),
                 request.preserve_ttl_secs,
-                &mut ops,
-            )?;
-            ops
-        };
-        self.persist(ops).await;
+                self.config.preserve_ttl.as_secs(),
+            )
+            .await?;
         self.changed.notify_waiters();
         Ok(())
     }
 
-    /// `Get`: one sandbox, for the caller that holds its lease.
-    pub fn get(&self, id: &str, lease_id: &str) -> Result<Sandbox> {
-        let state = self.state.lock();
-        let sandbox = state
-            .sandboxes
-            .get(id)
-            .ok_or_else(|| Error::not_found(format!("sandbox `{id}` not found")))?;
-        authorize(&state, sandbox, lease_id)?;
-        Ok(sandbox.clone())
+    /// `Get`.
+    pub async fn get(&self, id: &str, lease_id: &str) -> Result<Sandbox> {
+        self.backend.get(id, lease_id).await
     }
 
-    /// `List`: every sandbox, with lease ids redacted. Callers learn which
-    /// sandboxes exist, never which capability drives an arbitrary one.
-    pub fn list(&self) -> Vec<Sandbox> {
-        self.state
-            .lock()
-            .sandboxes
-            .values()
-            .map(|sandbox| {
-                let mut sandbox = sandbox.clone();
-                sandbox.lease_id.clear();
-                sandbox
-            })
-            .collect()
+    /// `List`, with lease ids redacted.
+    pub async fn list(&self) -> Result<Vec<Sandbox>> {
+        self.backend.list_all().await
     }
 
-    /// Look up a sandbox and require the caller's lease for it.
-    fn check_lease(&self, sandbox_id: &str, lease_id: &str) -> Result<()> {
-        let state = self.state.lock();
-        let sandbox = state
-            .sandboxes
-            .get(sandbox_id)
-            .ok_or_else(|| Error::not_found("sandbox not found"))?;
-        authorize(&state, sandbox, lease_id)
-    }
-
-    /// `List` page, ordered by id; lease ids are redacted like `list`.
-    pub fn list_page(&self, request: &ListRequest) -> Result<ListSandboxesResponse> {
-        let state = self.state.lock();
-        let (sandboxes, next_page_token) = paginate(
-            "sandbox",
-            state.sandboxes.iter().map(|(id, sandbox)| {
-                let mut sandbox = sandbox.clone();
-                sandbox.lease_id.clear();
-                (id.clone(), sandbox)
-            }),
-            request,
-        )?;
-        Ok(ListSandboxesResponse {
-            sandboxes,
-            next_page_token,
-            ..ListSandboxesResponse::default()
-        })
+    /// `List` page.
+    pub async fn list_page(&self, request: &ListRequest) -> Result<ListSandboxesResponse> {
+        self.backend.list(request).await
     }
 
     /// `ListProviders`.
-    pub fn list_providers(&self) -> Vec<Provider> {
-        self.state
-            .lock()
-            .providers
-            .values()
-            .map(|rec| rec.provider.clone())
-            .collect()
+    pub async fn list_providers(&self) -> Result<Vec<Provider>> {
+        self.backend.list_providers_all().await
     }
 
-    /// `ListProviders` page, ordered by provider id.
-    pub fn list_providers_page(&self, request: &ListRequest) -> Result<ListProvidersResponse> {
-        let state = self.state.lock();
-        let (providers, next_page_token) = paginate(
-            "provider",
-            state
-                .providers
-                .iter()
-                .map(|(id, rec)| (id.clone(), rec.provider.clone())),
-            request,
-        )?;
-        Ok(ListProvidersResponse {
-            providers,
-            next_page_token,
-            ..ListProvidersResponse::default()
-        })
+    /// `ListProviders` page.
+    pub async fn list_providers_page(
+        &self,
+        request: &ListRequest,
+    ) -> Result<ListProvidersResponse> {
+        self.backend.list_providers(request).await
     }
 
-    /// `Stats`: per-provider host sample + capacity and sandboxes by state
-    /// with their latest reported runtime facts. Aggregates only — the
-    /// stored report never carries host PIDs, process names or data-dir
-    /// paths, because every client-token holder can read this.
-    pub fn stats(&self) -> StatsResponse {
-        let state = self.state.lock();
-        let providers = state
-            .providers
-            .values()
-            .map(|rec| {
-                let sandboxes = state
-                    .sandboxes
-                    .values()
-                    .filter(|sandbox| sandbox.provider_id == rec.provider.id)
-                    .map(|sandbox| SandboxStats {
-                        sandbox: sandbox.clone().into(),
-                        runtime: rec
-                            .sandbox_stats
-                            .get(&sandbox.native_ref)
-                            .cloned()
-                            .unwrap_or_default()
-                            .into(),
-                        ..SandboxStats::default()
-                    })
-                    .collect();
-                ProviderStats {
-                    provider_id: rec.provider.id.clone(),
-                    name: rec.provider.name.clone(),
-                    drivers: rec.provider.drivers.clone(),
-                    host: rec.host.clone().unwrap_or_default().into(),
-                    host_sample_age_secs: rec
-                        .host_sampled_at
-                        .map(|at| at.elapsed().as_secs() as i64)
-                        .unwrap_or(0),
-                    sandboxes,
-                    ..ProviderStats::default()
-                }
-            })
-            .collect();
-        StatsResponse {
-            providers,
-            ..StatsResponse::default()
-        }
+    /// `Stats`.
+    pub async fn stats(&self) -> Result<StatsResponse> {
+        self.backend.stats().await
     }
 
-    /// PEM of the service CA, when TLS is configured.
+    /// PEM of the service CA.
     pub fn ca_pem(&self) -> Option<String> {
         self.config.ca.as_ref().map(|ca| ca.pem().to_owned())
     }
 
-    fn usable(sandbox: &Sandbox) -> Result<()> {
-        match sandbox.state.known() {
-            SandboxState::Leased | SandboxState::Preserved | SandboxState::Ready => Ok(()),
-            SandboxState::Stopped => Err(Error::failed_precondition(format!(
-                "sandbox {} is stopped; start it first",
-                sandbox.id
-            ))),
-            state => Err(Error::failed_precondition(format!(
-                "sandbox {} is {state:?}",
-                sandbox.id
-            ))),
-        }
-    }
+    // ── Exec ──────────────────────────────────────────────────────
 
     /// `Exec`: stream output then the exit status.
-    ///
-    /// A zero `timeout_secs` gets the service deadline
-    /// ([`ServiceConfig::exec_timeout`]). Dropping the returned stream queues
-    /// a `CancelExec` for the provider and drops the exec state.
-    pub fn exec(
+    pub async fn exec(
         self: &Arc<Self>,
         request: ExecRequest,
     ) -> Result<BoxStream<'static, Result<ExecEvent>>> {
-        let _span = tracing::info_span!("sandbox.exec", sandbox_id = %request.sandbox_id).entered();
         if request.argv.is_empty() {
             return Err(Error::invalid_argument("argv is required"));
         }
-        validate_env(&request.env)?;
-        let mut state = self.state.lock();
-        let sandbox = state
-            .sandboxes
-            .get(&request.sandbox_id)
-            .cloned()
-            .ok_or_else(|| Error::not_found("sandbox not found"))?;
-        authorize(&state, &sandbox, &request.lease_id)?;
-        Self::usable(&sandbox)?;
-        let mut merged = request.clone();
-        if let Some(lease) = state.leases.get(&request.lease_id) {
-            validate_env(&lease.env)?;
-            let mut env = lease.env.clone();
-            env.extend(request.env.clone());
-            merged.env = env;
-        }
-        // The lease is the caller's capability: a provider never sees it.
-        merged.lease_id.clear();
-        if merged.timeout_secs == 0 {
-            merged.timeout_secs = self.config.exec_timeout.as_secs().max(1);
-        }
-        let deadline = Instant::now() + Duration::from_secs(merged.timeout_secs);
         let exec_id = new_id("exe");
-        let work_id = new_id("wrk");
         let (tx, rx) = mpsc::channel(256);
         let finished = CancellationToken::new();
-        state.execs.insert(
+        let (disconnected, dropped) = oneshot::channel::<()>();
+        let timeout = if request.timeout_secs == 0 {
+            self.config.exec_timeout.as_secs().max(1)
+        } else {
+            request.timeout_secs
+        };
+        // Install the local channel before the durable handle exists, so a
+        // fast provider report cannot arrive with no stream to deliver to.
+        self.runtime.execs.lock().insert(
             exec_id.clone(),
             Exec {
-                sandbox_id: sandbox.id.clone(),
-                work_id: work_id.clone(),
-                attempts: 0,
                 tx,
-                sequence: 0,
-                deadline,
                 finished: finished.clone(),
             },
         );
-        let work = WorkItem::new(
-            work_id,
-            work_item::Work::Exec(
-                ExecWork {
-                    exec_id: exec_id.clone(),
-                    target: Self::target(&sandbox).into(),
-                    request: merged.into(),
-                    ..ExecWork::default()
-                }
-                .into(),
-            ),
-        );
-        if let Err(error) = self.enqueue(
-            &mut state,
-            &sandbox.provider_id,
-            work,
-            Pending::Exec {
-                exec_id: exec_id.clone(),
-            },
-        ) {
-            if let Some(exec) = state.execs.remove(&exec_id) {
-                exec.finished.cancel();
-            }
+        if let Err(error) = self
+            .backend
+            .create_exec(&exec_id, request, timeout, &self.node)
+            .await
+        {
+            self.runtime.execs.lock().remove(&exec_id);
+            finished.cancel();
             return Err(error);
         }
-        drop(state);
-        // The response stream owns the only end of this channel that observes
-        // the caller: its drop guard fires when the caller drops the stream,
-        // independently of the sender the service keeps in `state.execs` for
-        // `ReportExec`.
-        let (disconnected, dropped) = oneshot::channel::<()>();
         let service = Arc::clone(self);
+        let watched = exec_id.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                _ = dropped => service.cancel_disconnected(&exec_id).await,
-                _ = finished.cancelled() => {}
+            tokio::pin!(dropped);
+            let mut tick = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = &mut dropped => {
+                        let _ = service.backend.cancel_exec(&watched, &service.node).await;
+                        break;
+                    }
+
+                    _ = tick.tick() => {
+                        match service.backend.exec_status(&watched).await {
+                            Ok(Some(ExecStatus::Done { code })) => {
+                                let tx = service
+                                    .runtime
+                                    .execs
+                                    .lock()
+                                    .get(&watched)
+                                    .map(|exec| exec.tx.clone());
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(Ok(ExecEvent::exit(code))).await;
+                                }
+                                break;
+                            }
+                            Ok(Some(ExecStatus::Failed { reason })) => {
+                                let tx = service
+                                    .runtime
+                                    .execs
+                                    .lock()
+                                    .get(&watched)
+                                    .map(|exec| exec.tx.clone());
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(Err(crate::error::from_reported(reason))).await;
+                                }
+                                break;
+                            }
+                            // The durable handle is gone: the channel can no
+                            // longer be delivered to, so end the caller's
+                            // stream explicitly instead of pretending it
+                            // completed.
+                            Ok(None) => {
+                                let tx = service
+                                    .runtime
+                                    .execs
+                                    .lock()
+                                    .get(&watched)
+                                    .map(|exec| exec.tx.clone());
+                                if let Some(tx) = tx {
+                                    let _ = tx
+                                        .send(Err(Error::unavailable("the sandbox was destroyed")))
+                                        .await;
+                                }
+                                break;
+                            }
+                            Ok(Some(ExecStatus::Running)) => {}
+                            Err(error) => {
+                                tracing::debug!(%error, exec_id = %watched, "exec status check failed");
+                            }
+                        }
+                    }
+                }
             }
+            let _ = service.runtime.execs.lock().remove(&watched);
+            finished.cancel();
         });
         Ok(Box::pin(ExecStream {
             inner: record_exec_metrics(
@@ -2979,36 +1626,70 @@ impl Service {
         }))
     }
 
-    /// The caller's exec stream went away: drop the exec and tell the
-    /// provider to kill the guest command.
-    async fn cancel_disconnected(&self, exec_id: &str) {
-        let mut state = self.state.lock();
-        let Some(exec) = state.execs.remove(exec_id) else {
-            // Completed in the meantime; there is nothing to cancel.
-            return;
-        };
-        let Some(sandbox) = state.sandboxes.get(&exec.sandbox_id).cloned() else {
-            return;
-        };
-        Self::forget_work_locked(&mut state, &sandbox.provider_id, &exec.work_id);
-        self.request_cancel_locked(&mut state, &sandbox, exec_id);
+    /// `ReportExec` delivered to the owning node.
+    pub async fn report_exec_local(&self, request: ReportExecRequest) -> Result<()> {
+        match self
+            .backend
+            .report_exec(request, self.config.delivery_timeout)
+            .await?
+        {
+            backend::ReportExecOutcome::Events {
+                exec_id,
+                events,
+                terminal,
+            } => {
+                let exec = self
+                    .runtime
+                    .execs
+                    .lock()
+                    .get(&exec_id)
+                    .map(|exec| (exec.tx.clone(), exec.finished.clone()));
+                let Some((tx, finished)) = exec else {
+                    if terminal {
+                        return Ok(());
+                    }
+                    return Err(Error::not_found("exec not found"));
+                };
+                for event in events {
+                    if tx.send(Ok(event)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                if terminal {
+                    self.runtime.execs.lock().remove(&exec_id);
+                    finished.cancel();
+                }
+                Ok(())
+            }
+            backend::ReportExecOutcome::Duplicate => Ok(()),
+            backend::ReportExecOutcome::AlreadyStarted { exec_id, reason } => {
+                let exec = self.runtime.execs.lock().remove(&exec_id);
+                if let Some(exec) = exec {
+                    exec.finished.cancel();
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        exec.tx.send(Err(Error::aborted(reason))),
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            backend::ReportExecOutcome::Gone => Err(Error::not_found("exec not found")),
+        }
     }
 
-    /// Run a command to completion, collecting output (convenience).
+    /// Run a command to completion, collecting output.
     pub async fn exec_collect(
         self: &Arc<Self>,
         request: ExecRequest,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        collect_exec(self.exec(request)?).await
+        collect_exec(self.exec(request).await?).await
     }
 
-    // ─── Data plane ────────────────────────────────────────────────
+    // ── Data plane ────────────────────────────────────────────────
 
     /// `OpenStream`: issue a ticket.
-    ///
-    /// The ticket is a single-use rendezvous, not a file: the caller and the
-    /// agent claim opposite sides and the tar bytes flow between them.
-    pub fn open_stream(&self, request: OpenStreamRequest) -> Result<Ticket> {
+    pub async fn open_stream(&self, request: OpenStreamRequest) -> Result<Ticket> {
         if request.kind.as_known().unwrap_or_default() == StreamKind::StreamKindUnspecified {
             return Err(Error::invalid_argument("kind is required"));
         }
@@ -3018,52 +1699,56 @@ impl Service {
         if !request.path.starts_with('/') && !windows_absolute {
             return Err(Error::invalid_argument("path must be absolute"));
         }
-        validate_guest_path(&request.path)?;
-        let mut state = self.state.lock();
-        let sandbox = state
-            .sandboxes
-            .get(&request.sandbox_id)
-            .ok_or_else(|| Error::not_found("sandbox not found"))?;
-        authorize(&state, sandbox, &request.lease_id)?;
-        Self::usable(sandbox)?;
+        let sandbox = self.get(&request.sandbox_id, &request.lease_id).await?;
+        backend::logic::usable(&sandbox)?;
         let token = uuid::Uuid::new_v4().simple().to_string();
+        let ticket_id = new_id("tkt");
+        let kind = request.kind.as_known().unwrap_or_default();
         let expires_at = now() + self.config.ticket_ttl.as_secs() as i64;
-        let ticket = Self::insert_ticket_locked(
-            &mut state,
-            expires_at,
+        self.backend
+            .create_ticket(
+                &ticket_id,
+                &request.sandbox_id,
+                &request.lease_id,
+                kind,
+                &request.path,
+                &backend::logic::token_hash(&token),
+                expires_at,
+                &self.node,
+            )
+            .await?;
+        self.insert_ticket(
+            &ticket_id,
             request.sandbox_id,
-            request.kind.as_known().unwrap_or_default(),
+            kind,
             request.path,
-            token.clone(),
+            expires_at,
         );
         Ok(Ticket {
-            url: format!("/sandbox/v1/streams/{ticket}"),
+            url: format!("/sandbox/v1/streams/{ticket_id}"),
             token,
             expires_at,
             ..Ticket::default()
         })
     }
 
-    /// Insert a ticket with fresh channel ends. Caller holds the state lock.
-    fn insert_ticket_locked(
-        state: &mut State,
-        expires_at: i64,
+    fn insert_ticket(
+        &self,
+        ticket: &str,
         sandbox_id: String,
         kind: StreamKind,
         guest_path: String,
-        token: String,
-    ) -> String {
-        let ticket = new_id("tkt");
+        expires_at: i64,
+    ) {
         let (tx, rx) = mpsc::channel(TRANSFER_QUEUE);
         let control = tx.clone();
         let (status, _) = watch::channel(TransferStatus::Open);
-        state.blobs.insert(
-            ticket.clone(),
+        self.runtime.tickets.lock().insert(
+            ticket.to_owned(),
             Blob {
                 sandbox_id,
                 kind,
                 guest_path,
-                token,
                 expires_at,
                 producer_claimed: false,
                 consumer_claimed: false,
@@ -3073,23 +1758,94 @@ impl Service {
                 control: Some(control),
             },
         );
-        ticket
     }
 
-    /// Claim one side of a ticket. Caller holds the state lock.
-    ///
-    /// Only a caller upload and an agent fetch may produce/consume an upload
-    /// ticket; a download ticket is the mirror image. Each side is claimable
-    /// once, and the second claim releases the rendezvous.
-    fn claim_locked(
+    /// A losing transfer-claim is an HTTP precondition failure. The Connect
+    /// code alone maps to 400, which a caller cannot distinguish from a bad
+    /// request; the duplicate side is a "this was already claimed" state.
+    fn claim_failure(error: Error) -> Error {
+        if error.code == Code::FailedPrecondition {
+            error.with_http_status(StatusCode::PRECONDITION_FAILED)
+        } else {
+            error
+        }
+    }
+
+    /// Claim the caller's side of a ticket with its bearer token.
+    pub async fn claim_caller(
         &self,
-        state: &mut State,
+        ticket: &str,
+        token: &str,
+        side: TransferSide,
+    ) -> Result<StreamClaim> {
+        let expected = match side {
+            TransferSide::Producer => StreamKind::Upload,
+            TransferSide::Consumer => StreamKind::Download,
+        };
+        self.backend
+            .claim_ticket(
+                ticket,
+                ticket_side(side),
+                expected,
+                self.config.work_timeout.as_secs() as i64,
+                TicketAuthority::Caller { token },
+            )
+            .await
+            .map_err(Self::claim_failure)?;
+        self.claim_local(ticket, side).map_err(Self::claim_failure)
+    }
+
+    /// Claim the agent's side (the provider must own the sandbox).
+    pub async fn claim_agent(
+        &self,
+        provider_id: &str,
+        generation: u64,
         ticket: &str,
         side: TransferSide,
     ) -> Result<StreamClaim> {
-        let ticket_ttl = self.config.work_timeout;
-        let blob = state
-            .blobs
+        self.backend
+            .claim_ticket(
+                ticket,
+                ticket_side(side),
+                self.local_ticket_kind(ticket)?,
+                self.config.work_timeout.as_secs() as i64,
+                TicketAuthority::Provider {
+                    provider_id,
+                    generation,
+                },
+            )
+            .await
+            .map_err(Self::claim_failure)?;
+        self.claim_local(ticket, side).map_err(Self::claim_failure)
+    }
+
+    fn local_ticket_kind(&self, ticket: &str) -> Result<StreamKind> {
+        self.runtime
+            .tickets
+            .lock()
+            .get(ticket)
+            .map(|blob| blob.kind)
+            .ok_or_else(|| Error::not_found("ticket not found or expired"))
+    }
+
+    /// Claim the service's own side of an internally issued ticket.
+    async fn claim_internal(&self, ticket: &str, side: TransferSide) -> Result<StreamClaim> {
+        self.backend
+            .claim_ticket(
+                ticket,
+                ticket_side(side),
+                self.local_ticket_kind(ticket)?,
+                self.config.work_timeout.as_secs() as i64,
+                TicketAuthority::Internal,
+            )
+            .await
+            .map_err(Self::claim_failure)?;
+        self.claim_local(ticket, side).map_err(Self::claim_failure)
+    }
+
+    fn claim_local(&self, ticket: &str, side: TransferSide) -> Result<StreamClaim> {
+        let mut tickets = self.runtime.tickets.lock();
+        let blob = tickets
             .get_mut(ticket)
             .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
         let already = match side {
@@ -3103,16 +1859,8 @@ impl Service {
         }
         if blob.producer_claimed && blob.consumer_claimed {
             blob.status.send_replace(TransferStatus::Ready);
+            blob.expires_at = now() + self.config.work_timeout.as_secs() as i64;
         }
-        // A claimed transfer gets a fresh window; once both peers are present
-        // it becomes the longer work deadline, so a large copy is never cut
-        // off by the claim window.
-        let window = if blob.producer_claimed && blob.consumer_claimed {
-            ticket_ttl
-        } else {
-            self.config.ticket_ttl
-        };
-        blob.expires_at = blob.expires_at.max(now() + window.as_secs() as i64);
         let (producer, consumer) = match side {
             TransferSide::Producer => (blob.tx.take(), None),
             TransferSide::Consumer => (None, blob.rx.take()),
@@ -3128,95 +1876,7 @@ impl Service {
         })
     }
 
-    /// Claim the caller's side of a ticket with its bearer token.
-    ///
-    /// Upload tickets are claimed by their producer (`PUT /streams`),
-    /// download tickets by their consumer (`GET /streams`).
-    pub fn claim_caller(
-        &self,
-        ticket: &str,
-        token: &str,
-        side: TransferSide,
-    ) -> Result<StreamClaim> {
-        let mut state = self.state.lock();
-        let blob = state
-            .blobs
-            .get(ticket)
-            .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
-        if blob.expires_at <= now() {
-            return Err(Error::not_found("ticket not found or expired"));
-        }
-        // In-process tickets have no token: never let a tokenless request
-        // match them. The comparison stays constant-time.
-        if blob.token.is_empty() || !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
-            return Err(Error::new(Code::Unauthenticated, "bad ticket token"));
-        }
-        let expected = match side {
-            TransferSide::Producer => StreamKind::Upload,
-            TransferSide::Consumer => StreamKind::Download,
-        };
-        if blob.kind != expected {
-            return Err(Error::invalid_argument(if expected == StreamKind::Upload {
-                "ticket is not an upload"
-            } else {
-                "ticket is not a download"
-            }));
-        }
-        self.claim_locked(&mut state, ticket, side)
-    }
-
-    /// Validate a caller ticket without consuming it.
-    ///
-    /// The HTTP layer uses this before authorization so a denied transfer
-    /// cannot consume a single-use ticket.
-    pub(crate) fn validate_ticket(&self, ticket: &str, token: &str) -> Result<()> {
-        let state = self.state.lock();
-        let blob = state
-            .blobs
-            .get(ticket)
-            .filter(|blob| blob.expires_at > now())
-            .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
-        if blob.token.is_empty() || !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
-            return Err(Error::new(Code::Unauthenticated, "bad ticket token"));
-        }
-        Ok(())
-    }
-
-    /// Claim the agent's side of a ticket (provider must own the sandbox).
-    pub fn claim_agent(
-        &self,
-        provider_id: &str,
-        generation: u64,
-        ticket: &str,
-        side: TransferSide,
-    ) -> Result<StreamClaim> {
-        let mut state = self.state.lock();
-        self.fence(&state, provider_id, generation)?;
-        let blob = state
-            .blobs
-            .get(ticket)
-            .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
-        let owner = state
-            .sandboxes
-            .get(&blob.sandbox_id)
-            .map(|s| s.provider_id.as_str());
-        if owner != Some(provider_id) {
-            return Err(Error::new(
-                Code::PermissionDenied,
-                "ticket belongs to another provider",
-            ));
-        }
-        let expected = match side {
-            TransferSide::Consumer => StreamKind::Upload,
-            TransferSide::Producer => StreamKind::Download,
-        };
-        if blob.kind != expected {
-            return Err(Error::invalid_argument("ticket direction does not match"));
-        }
-        self.claim_locked(&mut state, ticket, side)
-    }
-
-    /// Wait until both sides have claimed `claim`'s ticket.
+    /// Wait until both sides have claimed the ticket.
     pub async fn wait_peer(&self, claim: &mut StreamClaim) -> Result<()> {
         let wait = async {
             loop {
@@ -3237,23 +1897,24 @@ impl Service {
             .map_err(|_| Error::unavailable("the peer did not claim the transfer"))?
     }
 
-    /// Close the producer side cleanly: the consumer sees EOF.
-    ///
-    /// The producer's own sender must already be gone (the handler drops it
-    /// after its last chunk); this drops the service's control clone so the
-    /// channel does not stay open just because the ticket still exists.
-    pub fn finish_ticket(&self, ticket: &str) {
-        if let Some(blob) = self.state.lock().blobs.get_mut(ticket) {
+    /// Close the producer side cleanly.
+    pub async fn finish_ticket(&self, ticket: &str) {
+        if let Some(blob) = self.runtime.tickets.lock().get_mut(ticket) {
             blob.control.take();
         }
+        let _ = self.backend.finish_ticket(ticket, "done", "").await;
     }
 
-    /// Abort a transfer: the consumer gets a failure item, then the ticket is
-    /// forgotten. Safe to call after the peer already finished.
+    /// Abort a transfer.
     pub async fn abort_ticket(&self, ticket: &str, reason: &str) {
+        self.abort_local_ticket(ticket, reason).await;
+        let _ = self.backend.finish_ticket(ticket, "aborted", reason).await;
+    }
+
+    async fn abort_local_ticket(&self, ticket: &str, reason: &str) {
         let control = {
-            let mut state = self.state.lock();
-            let Some(blob) = state.blobs.get_mut(ticket) else {
+            let mut tickets = self.runtime.tickets.lock();
+            let Some(blob) = tickets.get_mut(ticket) else {
                 return;
             };
             blob.status
@@ -3267,41 +1928,39 @@ impl Service {
             )
             .await;
         }
-        self.remove_ticket(ticket);
+        self.runtime.tickets.lock().remove(ticket);
     }
 
-    /// Forget a ticket. The endpoints already handed to the peers decide when
-    /// their stream ends.
-    pub fn remove_ticket(&self, ticket: &str) {
-        self.state.lock().blobs.remove(ticket);
+    /// Retire a ticket: the local rendezvous and its durable row.
+    pub async fn remove_ticket(&self, ticket: &str) {
+        self.runtime.tickets.lock().remove(ticket);
+        let _ = self.backend.finish_ticket(ticket, "done", "").await;
     }
 
-    /// Extract a local tar into the guest (in-process callers). The caller
-    /// must hold the sandbox's lease; data-plane tickets are their own
-    /// capability.
+    /// Upload a local tar into the guest.
     pub async fn upload_path(
         self: &Arc<Self>,
         sandbox_id: &str,
         lease_id: &str,
         guest_dir: &str,
-        tar: &Path,
+        tar: &std::path::Path,
     ) -> Result<()> {
-        self.check_lease(sandbox_id, lease_id)?;
-        validate_guest_path(guest_dir)?;
+        self.get(sandbox_id, lease_id).await?;
         let file = tokio::fs::File::open(tar)
             .await
-            .map_err(|e| Error::internal(format!("upload: {e}")))?;
+            .map_err(|error| Error::internal(format!("upload: {error}")))?;
         let source = tokio_util::io::ReaderStream::new(file).map(|chunk| match chunk {
             Ok(bytes) => TransferChunk::Data(bytes.to_vec()),
             Err(error) => TransferChunk::Failed(format!("upload: {error}")),
         });
-        self.upload_stream(sandbox_id, guest_dir, source).await
+        self.upload_stream(sandbox_id, lease_id, guest_dir, source)
+            .await
     }
 
-    /// Send in-memory bytes through the same memory-only transfer path.
     async fn upload_bytes(
         self: &Arc<Self>,
         sandbox_id: &str,
+        lease_id: &str,
         guest_dir: &str,
         bytes: Vec<u8>,
     ) -> Result<()> {
@@ -3309,24 +1968,38 @@ impl Service {
             .chunks(64 * 1024)
             .map(|chunk| TransferChunk::Data(chunk.to_vec()))
             .collect();
-        self.upload_stream(sandbox_id, guest_dir, futures::stream::iter(chunks))
-            .await
+        self.upload_stream(
+            sandbox_id,
+            lease_id,
+            guest_dir,
+            futures::stream::iter(chunks),
+        )
+        .await
     }
 
-    /// Stream a tar into the guest through a fresh upload ticket.
     async fn upload_stream<S>(
         self: &Arc<Self>,
         sandbox_id: &str,
+        lease_id: &str,
         guest_dir: &str,
         mut source: S,
     ) -> Result<()>
     where
         S: futures::Stream<Item = TransferChunk> + Send + Unpin,
     {
-        let mut claim = self.open_internal(sandbox_id, StreamKind::Upload, guest_dir)?;
+        let mut claim = self
+            .open_internal(sandbox_id, lease_id, StreamKind::Upload, guest_dir)
+            .await?;
         let ticket = claim.ticket.clone();
-        let reply = self
-            .start_copy(sandbox_id, &ticket, guest_dir, StreamKind::Upload)
+        let work_id = self
+            .backend
+            .start_copy(
+                sandbox_id,
+                &ticket,
+                guest_dir,
+                StreamKind::Upload,
+                &self.node,
+            )
             .await?;
         if let Err(error) = self.wait_peer(&mut claim).await {
             self.abort_ticket(&ticket, crate::error::message(&error))
@@ -3363,36 +2036,42 @@ impl Service {
             Ok(())
         }
         .await;
-        // Close the consumer's stream before waiting for its report: the
-        // driver only finishes extraction at EOF and reports afterwards.
-        self.finish_ticket(&ticket);
+        self.finish_ticket(&ticket).await;
         let result = match feed {
-            Ok(()) => await_copy(reply, self.config.work_timeout).await,
+            Ok(()) => self.work_result(&work_id, self.config.work_timeout).await,
             Err(error) => {
                 self.abort_ticket(&ticket, crate::error::message(&error))
                     .await;
                 Err(error)
             }
         };
-        self.remove_ticket(&ticket);
+        self.remove_ticket(&ticket).await;
         result
     }
 
-    /// Tar a guest path into a local file (in-process callers).
+    /// Download a guest path into a local tar.
     pub async fn download_path(
         self: &Arc<Self>,
         sandbox_id: &str,
         lease_id: &str,
         guest_path: &str,
-        dest: &Path,
+        dest: &std::path::Path,
     ) -> Result<()> {
         use tokio::io::AsyncWriteExt as _;
-        self.check_lease(sandbox_id, lease_id)?;
-        validate_guest_path(guest_path)?;
-        let mut claim = self.open_internal(sandbox_id, StreamKind::Download, guest_path)?;
+        self.get(sandbox_id, lease_id).await?;
+        let mut claim = self
+            .open_internal(sandbox_id, lease_id, StreamKind::Download, guest_path)
+            .await?;
         let ticket = claim.ticket.clone();
-        let reply = self
-            .start_copy(sandbox_id, &ticket, guest_path, StreamKind::Download)
+        let work_id = self
+            .backend
+            .start_copy(
+                sandbox_id,
+                &ticket,
+                guest_path,
+                StreamKind::Download,
+                &self.node,
+            )
             .await?;
         if let Err(error) = self.wait_peer(&mut claim).await {
             self.abort_ticket(&ticket, crate::error::message(&error))
@@ -3404,14 +2083,14 @@ impl Service {
         };
         let mut file = tokio::fs::File::create(dest)
             .await
-            .map_err(|e| Error::internal(format!("download: {e}")))?;
+            .map_err(|error| Error::internal(format!("download: {error}")))?;
         let result = async {
             while let Some(chunk) = rx.recv().await {
                 match chunk {
                     TransferChunk::Data(bytes) => file
                         .write_all(&bytes)
                         .await
-                        .map_err(|e| Error::internal(format!("download: {e}")))?,
+                        .map_err(|error| Error::internal(format!("download: {error}")))?,
                     TransferChunk::Failed(reason) => {
                         return Err(Error::unavailable(reason));
                     }
@@ -3419,36 +2098,41 @@ impl Service {
             }
             file.flush()
                 .await
-                .map_err(|e| Error::internal(format!("download: {e}")))
+                .map_err(|error| Error::internal(format!("download: {error}")))
         }
         .await;
         drop(rx);
         let result = match result {
-            Ok(()) => await_copy(reply, self.config.work_timeout).await,
+            Ok(()) => self.work_result(&work_id, self.config.work_timeout).await,
             Err(error) => Err(error),
         };
         if result.is_err() {
             let _ = tokio::fs::remove_file(dest).await;
         }
-        self.remove_ticket(&ticket);
+        self.remove_ticket(&ticket).await;
         result
     }
 
-    /// Create a ticket and claim the service's side of it.
-    fn open_internal(
-        &self,
+    async fn open_internal(
+        self: &Arc<Self>,
         sandbox_id: &str,
+        lease_id: &str,
         kind: StreamKind,
         guest_path: &str,
     ) -> Result<StreamClaim> {
-        let mut state = self.state.lock();
-        let ticket = Self::insert_ticket_locked(
-            &mut state,
-            now() + self.config.ticket_ttl.as_secs() as i64,
+        let ticket = new_id("tkt");
+        let expires_at = now() + self.config.ticket_ttl.as_secs() as i64;
+        self.backend
+            .create_ticket(
+                &ticket, sandbox_id, lease_id, kind, guest_path, "", expires_at, &self.node,
+            )
+            .await?;
+        self.insert_ticket(
+            &ticket,
             sandbox_id.to_owned(),
             kind,
             guest_path.to_owned(),
-            String::new(),
+            expires_at,
         );
         let side = match kind {
             StreamKind::Upload => TransferSide::Producer,
@@ -3457,650 +2141,266 @@ impl Service {
                 return Err(Error::invalid_argument("transfer kind is unset"));
             }
         };
-        self.claim_locked(&mut state, &ticket, side)
+        self.claim_internal(&ticket, side).await
     }
 
-    /// Queue the copy work item and return the report receiver.
-    ///
-    /// The caller enqueues before either side waits: the agent learns about
-    /// the ticket only from this item, so it can never claim first.
-    pub(crate) async fn start_copy(
+    /// Queue the provider copy for an already-claimed ticket.
+    pub async fn start_copy(
         &self,
         sandbox_id: &str,
         ticket: &str,
         guest_path: &str,
         kind: StreamKind,
-    ) -> Result<oneshot::Receiver<Result<String>>> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut state = self.state.lock();
-            // A copy may legitimately run until the work timeout, which is
-            // longer than a ticket's TTL: keep the blob alive for the
-            // copy's own bound so the sweeper cannot delete it
-            // mid-transfer.
-            if let Some(blob) = state.blobs.get_mut(ticket) {
-                blob.expires_at = blob
-                    .expires_at
-                    .max(now() + self.config.work_timeout.as_secs() as i64);
-            }
-            let sandbox = state
-                .sandboxes
-                .get(sandbox_id)
-                .cloned()
-                .ok_or_else(|| Error::not_found("sandbox not found"))?;
-            let work = WorkItem::new(
-                new_id("wrk"),
-                work_item::Work::Copy(
-                    CopyWork {
-                        target: Self::target(&sandbox).into(),
-                        ticket: ticket.to_owned(),
-                        path: guest_path.to_owned(),
-                        kind: kind.into(),
-                        ..CopyWork::default()
-                    }
-                    .into(),
-                ),
-            );
-            self.enqueue(
-                &mut state,
-                &sandbox.provider_id,
-                work,
-                Pending::Copy { reply: tx },
-            )?;
-        }
-        Ok(rx)
-    }
-
-    // ─── Snapshot / pause / resume ─────────────────────────────────
-
-    /// `Snapshot`: capture a leased, snapshot-capable sandbox as a template.
-    /// The source sandbox is consumed (its lease ends).
-    pub async fn snapshot(&self, request: SnapshotRequest) -> Result<Template> {
-        validate_name("template", &request.name)?;
-        let (tx, rx) = oneshot::channel();
-        let (sandbox, source_template) = {
-            let mut state = self.state.lock();
-            let sandbox = state
-                .sandboxes
-                .get(&request.sandbox_id)
-                .cloned()
-                .ok_or_else(|| Error::not_found("sandbox not found"))?;
-            authorize(&state, &sandbox, &request.lease_id)?;
-            if sandbox.state != SandboxState::Leased {
-                return Err(Error::failed_precondition(
-                    "only a leased sandbox can be snapshotted",
-                ));
-            }
-            if !state.busy.insert(sandbox.id.clone()) {
-                return Err(Error::failed_precondition(
-                    "a snapshot of this sandbox is already in progress",
-                ));
-            }
-            if state.templates.contains_key(&request.name) {
-                state.busy.remove(&sandbox.id);
-                return Err(Error::new(
-                    Code::AlreadyExists,
-                    format!("template `{}` already exists", request.name),
-                ));
-            }
-            let caps = match self.driver_caps(&state, &sandbox) {
-                Ok(caps) => caps,
-                Err(error) => {
-                    state.busy.remove(&sandbox.id);
-                    return Err(error);
-                }
-            };
-            if !caps.snapshot {
-                state.busy.remove(&sandbox.id);
-                return Err(Error::failed_precondition(format!(
-                    "{}: snapshot unsupported",
-                    sandbox.driver
-                )));
-            }
-            let source_template = state
-                .templates
-                .get(&sandbox.template)
-                .cloned()
-                .unwrap_or_default();
-            let work = WorkItem::new(
-                new_id("wrk"),
-                work_item::Work::Snapshot(
-                    SnapshotWork {
-                        target: Self::target(&sandbox).into(),
-                        template: request.name.clone(),
-                        ..SnapshotWork::default()
-                    }
-                    .into(),
-                ),
-            );
-            if let Err(error) = self.enqueue(
-                &mut state,
-                &sandbox.provider_id,
-                work,
-                Pending::Snapshot { reply: tx },
-            ) {
-                state.busy.remove(&sandbox.id);
-                return Err(error);
-            }
-            (sandbox, source_template)
-        };
-        // The set is guarded from here on, including every error path. It is
-        // created after the state lock is released so its drop never
-        // re-enters the mutex.
-        let _busy = SnapshotBusy {
-            service: self,
-            sandbox_id: sandbox.id.clone(),
-        };
-        let native_ref = tokio::time::timeout(self.config.work_timeout, rx)
+    ) -> Result<String> {
+        self.backend
+            .start_copy(sandbox_id, ticket, guest_path, kind, &self.node)
             .await
-            .map_err(|_| Error::unavailable("provider did not report the snapshot"))?
-            .map_err(|_| Error::unavailable("provider dropped the snapshot"))??;
-        let spec = TemplateSpec {
-            name: request.name.clone(),
-            os: source_template.spec.os.clone(),
-            source: Some(template_spec::Source::SnapshotOf(sandbox.id.clone())),
-            requires: source_template.spec.requires.clone(),
-            labels: source_template.spec.labels.clone(),
-            ..TemplateSpec::default()
-        };
-        let template = Template {
-            digest: template_digest(&spec),
-            spec: spec.into(),
-            provider_id: sandbox.provider_id.clone(),
-            driver: sandbox.driver.clone(),
-            native_ref,
-            created_at: now(),
-            ..Template::default()
-        };
-        let ops = {
-            let mut state = self.state.lock();
-            // A release, failure or another lifecycle transition while the
-            // provider was working invalidates the capture: installing the
-            // template would point at a machine that is being destroyed.
-            let still_valid = state.sandboxes.get(&sandbox.id).is_some_and(|source| {
-                source.state == SandboxState::Leased && source.lease_id == sandbox.lease_id
-            });
-            if !still_valid {
-                warn!(
-                    sandbox = %sandbox.id,
-                    "snapshot finished after its source changed; discarding the base"
-                );
-                self.drop_snapshot_locked(&mut state, &template);
-                return Err(Error::failed_precondition(
-                    "the sandbox changed while its snapshot was in flight; result discarded",
-                ));
-            }
-            let mut ops = vec![self.put(Kind::Templates, &template.spec.name, &template)];
-            let replaced = state
-                .templates
-                .insert(template.spec.name.clone(), template.clone());
-            if let Some(old) = replaced.filter(|old| {
-                !old.native_ref.is_empty()
-                    && (old.native_ref != template.native_ref
-                        || old.provider_id != template.provider_id)
-            }) {
-                // Retire the previous snapshot once nothing still starts from it.
-                self.drop_snapshot_locked(&mut state, &old);
-            }
-            // The source sandbox now backs the snapshot (or was freed by the
-            // driver): end its lease without destroying it.
-            if let Some(source) = state.sandboxes.remove(&sandbox.id) {
-                // End its execs the way destroy does: close the callers'
-                // streams (a stream left open would hang until the exec
-                // deadline, up to an hour) and tell the provider to stop
-                // the commands, which otherwise keep running against a
-                // sandbox the driver just consumed.
-                let open: Vec<(String, String)> = state
-                    .execs
-                    .iter()
-                    .filter(|(_, exec)| exec.sandbox_id == source.id)
-                    .map(|(exec_id, exec)| (exec_id.clone(), exec.work_id.clone()))
-                    .collect();
-                if !open.is_empty() {
-                    close_execs(&mut state, &source.id, "sandbox was snapshotted");
-                    for (exec_id, work_id) in open {
-                        Self::forget_work_locked(&mut state, &source.provider_id, &work_id);
-                        self.request_cancel_locked(&mut state, &source, &exec_id);
-                    }
-                }
-                if let Some(lease) = state.leases.remove(&source.lease_id) {
-                    state.lease_by_key.remove(&lease.idempotency_key);
-                    ops.push(self.remove(Kind::Leases, &lease.id));
-                }
-                ops.push(self.remove(Kind::Sandboxes, &source.id));
-            }
-            ops
-        };
-        self.persist(ops).await;
-        Ok(template)
     }
 
-    fn drop_snapshot_locked(&self, state: &mut State, template: &Template) {
-        let work = WorkItem::new(
-            new_id("wrk"),
-            work_item::Work::Destroy(
-                SandboxWork {
-                    sandbox_id: String::new(),
-                    driver: template.driver.clone(),
-                    native_ref: format!("snapshot:{}", template.native_ref),
-                    ..SandboxWork::default()
-                }
-                .into(),
-            ),
-        );
-        let _ = self.enqueue(
-            state,
-            &template.provider_id,
-            work,
-            Pending::Destroy {
-                sandbox_id: String::new(),
-            },
-        );
+    /// Wait for one queued work item's durable result.
+    pub async fn await_work(&self, work_id: &str, timeout: Duration) -> Result<()> {
+        self.work_result(work_id, timeout).await
     }
 
-    fn driver_caps(&self, state: &State, sandbox: &Sandbox) -> Result<Capabilities> {
-        state
-            .providers
-            .get(&sandbox.provider_id)
-            .and_then(|rec| {
-                rec.provider
-                    .drivers
-                    .iter()
-                    .find(|d| d.driver == sandbox.driver)
+    async fn work_result(&self, work_id: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(result) = self.backend.work_result(work_id).await? {
+                result.into_result()?;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::unavailable("provider did not report the request"));
+            }
+            let changed = self.changed.notified();
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                _ = changed => {}
+            }
+        }
+    }
+
+    async fn work_value(&self, work_id: &str, timeout: Duration) -> Result<WorkResult> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(result) = self.backend.work_result(work_id).await? {
+                return Ok(result);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::unavailable("provider did not report the request"));
+            }
+            let changed = self.changed.notified();
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                _ = changed => {}
+            }
+        }
+    }
+
+    // ── Snapshot / power ──────────────────────────────────────────
+
+    /// `Snapshot`.
+    pub async fn snapshot(&self, request: SnapshotRequest) -> Result<Template> {
+        let start = self
+            .backend
+            .snapshot_start(SnapshotCommand {
+                sandbox_id: request.sandbox_id.clone(),
+                name: request.name.clone(),
+                lease_id: request.lease_id.clone(),
+                idempotency_key: request.idempotency_key.clone(),
+                owner: self.node.clone(),
+                timeout: self.config.work_timeout,
             })
-            .map(|d| (*d.capabilities).clone())
-            .ok_or_else(|| Error::unavailable("sandbox provider is gone"))
+            .await?;
+        match start {
+            SnapshotStart::Replay(template) => Ok(template),
+            SnapshotStart::Queued { work_id } => {
+                let result = self
+                    .work_value(&work_id, self.config.work_timeout)
+                    .await
+                    .map_err(|error| {
+                        if error.code == Code::Unavailable {
+                            Error::unavailable("provider did not report the snapshot")
+                        } else {
+                            error
+                        }
+                    })?;
+                if !result.ok {
+                    return Err(crate::error::from_reported(result.error));
+                }
+                result
+                    .template
+                    .ok_or_else(|| Error::internal("snapshot completed without a template receipt"))
+            }
+        }
     }
 
-    /// `Stop`: power off, keeping the machine and its disk.
+    /// `Stop`.
     pub async fn stop(&self, id: &str, lease_id: &str) -> Result<()> {
         self.power(id, lease_id, PowerOp::Stop).await
     }
 
-    /// `Start`: boot a stopped machine, optionally as a branch base.
+    /// `Start`.
     pub async fn start(&self, id: &str, lease_id: &str, forkable: bool) -> Result<()> {
         self.power(id, lease_id, PowerOp::Start { forkable }).await
     }
 
-    async fn power(&self, id: &str, lease_id: &str, op: PowerOp) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut state = self.state.lock();
-            let sandbox = state
-                .sandboxes
-                .get(id)
-                .cloned()
-                .ok_or_else(|| Error::not_found("sandbox not found"))?;
-            authorize(&state, &sandbox, lease_id)?;
-            let caps = self.driver_caps(&state, &sandbox)?;
-            if !caps.pause {
-                return Err(Error::failed_precondition(format!(
-                    "{}: stop/start unsupported",
-                    sandbox.driver
-                )));
-            }
-            if matches!(op, PowerOp::Stop)
-                && !sandbox.pool.is_empty()
-                && sandbox.lease_id.is_empty()
-                && sandbox.state == SandboxState::Ready
-            {
-                return Err(Error::failed_precondition(
-                    "an idle pool member cannot be stopped; acquire it first",
-                ));
-            }
-            let target = Self::target(&sandbox);
-            let expected = sandbox.state.known();
-            let lease_id = sandbox.lease_id.clone();
-            let (work, kind) = match op {
-                PowerOp::Stop => (
-                    WorkItem::new(new_id("wrk"), work_item::Work::Stop(target.into())),
-                    Pending::Stop {
-                        sandbox_id: id.to_owned(),
-                        lease_id,
-                        expected,
-                        reply: tx,
-                    },
-                ),
-                PowerOp::Start { forkable } => (
-                    WorkItem::new(
-                        new_id("wrk"),
-                        work_item::Work::Start(
-                            StartWork {
-                                target: target.into(),
-                                forkable,
-                                ..StartWork::default()
-                            }
-                            .into(),
-                        ),
-                    ),
-                    Pending::Start {
-                        sandbox_id: id.to_owned(),
-                        lease_id,
-                        expected,
-                        forkable,
-                        reply: tx,
-                    },
-                ),
-            };
-            self.enqueue(&mut state, &sandbox.provider_id, work, kind)?;
-        }
-        tokio::time::timeout(self.config.work_timeout, rx)
-            .await
-            .map_err(|_| Error::unavailable("provider did not report the request"))?
-            .map_err(|_| Error::unavailable("provider dropped the request"))?
-            .map(|_| ())
-    }
-
     /// `Pause`.
     pub async fn pause(&self, id: &str, lease_id: &str) -> Result<()> {
-        self.pause_resume(id, lease_id, true).await
+        self.power(id, lease_id, PowerOp::Pause).await
     }
 
     /// `Resume`.
     pub async fn resume(&self, id: &str, lease_id: &str) -> Result<()> {
-        self.pause_resume(id, lease_id, false).await
+        self.power(id, lease_id, PowerOp::Resume).await
     }
 
-    async fn pause_resume(&self, id: &str, lease_id: &str, pause: bool) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut state = self.state.lock();
-            let sandbox = state
-                .sandboxes
-                .get(id)
-                .cloned()
-                .ok_or_else(|| Error::not_found("sandbox not found"))?;
-            authorize(&state, &sandbox, lease_id)?;
-            let caps = self.driver_caps(&state, &sandbox)?;
-            if !caps.pause {
-                return Err(Error::failed_precondition(format!(
-                    "{}: pause unsupported",
-                    sandbox.driver
-                )));
-            }
-            if pause
-                && !sandbox.pool.is_empty()
-                && sandbox.lease_id.is_empty()
-                && sandbox.state == SandboxState::Ready
-            {
-                return Err(Error::failed_precondition(
-                    "an idle pool member cannot be paused; acquire it first",
-                ));
-            }
-            let target = Self::target(&sandbox);
-            let expected = sandbox.state.known();
-            let lease_id = sandbox.lease_id.clone();
-            let (work, kind) = if pause {
-                (
-                    WorkItem::new(new_id("wrk"), work_item::Work::Pause(target.into())),
-                    Pending::Pause {
-                        sandbox_id: id.to_owned(),
-                        lease_id,
-                        expected,
-                        reply: tx,
-                    },
-                )
-            } else {
-                (
-                    WorkItem::new(new_id("wrk"), work_item::Work::Resume(target.into())),
-                    Pending::Resume {
-                        sandbox_id: id.to_owned(),
-                        lease_id,
-                        expected,
-                        reply: tx,
-                    },
-                )
-            };
-            self.enqueue(&mut state, &sandbox.provider_id, work, kind)?;
-        }
-        tokio::time::timeout(self.config.work_timeout, rx)
-            .await
-            .map_err(|_| Error::unavailable("provider did not report the request"))?
-            .map_err(|_| Error::unavailable("provider dropped the request"))?
-            .map(|_| ())
+    async fn power(&self, id: &str, lease_id: &str, op: PowerOp) -> Result<()> {
+        let work_id = self
+            .backend
+            .power(id, lease_id, op, self.config.work_timeout)
+            .await?;
+        self.work_result(&work_id, self.config.work_timeout).await
     }
 
-    // ─── Providers ─────────────────────────────────────────────────
+    // ── Providers ─────────────────────────────────────────────────
 
-    fn fence(&self, state: &State, provider_id: &str, generation: u64) -> Result<()> {
-        let rec = state
-            .providers
-            .get(provider_id)
-            .ok_or_else(|| Error::not_found("provider not registered"))?;
-        if rec.provider.generation != generation {
-            return Err(Error::aborted(format!(
-                "stale generation {generation} (current {})",
-                rec.provider.generation
-            )));
-        }
-        Ok(())
-    }
-
-    /// Find a provider by its registered name, falling back to its id.
-    fn provider_id_for(state: &State, reference: &str) -> Result<String> {
-        if reference.is_empty() {
-            return Err(Error::invalid_argument("provider name is required"));
-        }
-        for (id, rec) in &state.providers {
-            if id == reference || rec.provider.name == reference {
-                return Ok(id.clone());
-            }
-        }
-        Err(Error::not_found(format!(
-            "provider `{reference}` not found"
-        )))
-    }
-
-    /// `CordonProvider` / `UncordonProvider`: stop or resume placements.
-    /// Existing leases and warm members are untouched.
-    pub async fn set_provider_cordon(&self, reference: &str, cordoned: bool) -> Result<Provider> {
-        let (provider, ops) = {
-            let mut state = self.state.lock();
-            let id = Self::provider_id_for(&state, reference)?;
-            let rec = state.providers.get_mut(&id).expect("provider looked up");
-            rec.provider.cordoned = cordoned;
-            let provider = rec.provider.clone();
-            let ops = vec![self.put(Kind::Providers, &id, &provider)];
-            (provider, ops)
-        };
-        info!(provider = %provider.id, cordoned, "provider cordon changed");
-        self.persist(ops).await;
-        self.changed.notify_waiters();
-        Ok(provider)
-    }
-
-    /// `DrainProvider`: cordon, release idle pool members, and report the
-    /// leases still running. Leased sandboxes are not killed.
-    pub async fn drain_provider(&self, reference: &str) -> Result<DrainProviderResult> {
-        let (result, ops) = {
-            let mut state = self.state.lock();
-            let id = Self::provider_id_for(&state, reference)?;
-            let rec = state.providers.get_mut(&id).expect("provider looked up");
-            rec.provider.cordoned = true;
-            let provider = rec.provider.clone();
-            let mut ops = vec![self.put(Kind::Providers, &id, &provider)];
-            let idle: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|sandbox| {
-                    sandbox.provider_id == id
-                        && !sandbox.pool.is_empty()
-                        && sandbox.lease_id.is_empty()
-                        && sandbox.state != SandboxState::Terminating
-                        && !sandbox.state.is_terminal()
-                })
-                .map(|sandbox| sandbox.id.clone())
-                .collect();
-            let released_pool_members = idle.len() as u32;
-            for sandbox_id in idle {
-                self.destroy_locked(&mut state, &sandbox_id, &mut ops);
-            }
-            let leased_remaining = state
-                .sandboxes
-                .values()
-                .filter(|sandbox| {
-                    sandbox.provider_id == id
-                        && !sandbox.lease_id.is_empty()
-                        && !sandbox.state.is_terminal()
-                })
-                .count() as u32;
-            (
-                DrainProviderResult {
-                    released_pool_members,
-                    leased_remaining,
-                    ..DrainProviderResult::default()
-                },
-                ops,
-            )
-        };
-        info!(
-            provider = %reference,
-            released = result.released_pool_members,
-            leased = result.leased_remaining,
-            "provider drained"
-        );
-        self.persist(ops).await;
-        self.changed.notify_waiters();
-        Ok(result)
-    }
-
-    /// `Register`: same name → same id, next generation. Work the previous
-    /// generation holds in flight is redelivered to the new one; its
-    /// sandboxes wait for `Reconcile`.
+    /// `Register`.
     pub async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse> {
-        self.register_inner(request, None).await
+        self.backend.register(request, None, &self.node).await
     }
 
-    /// `Register` for a provider authenticated by a client certificate.
-    ///
-    /// The provider id came from the certificate fingerprint. Re-checking it
-    /// under the same lock as the registration closes the window where a
-    /// concurrently removed provider could otherwise be re-created by name.
+    /// `Register` for a certificate-authenticated provider.
     pub async fn register_enrolled(
         &self,
         request: RegisterRequest,
         provider_id: &str,
     ) -> Result<RegisterResponse> {
-        self.register_inner(request, Some(provider_id)).await
+        self.backend
+            .register(request, Some(provider_id), &self.node)
+            .await
     }
 
-    async fn register_inner(
-        &self,
-        request: RegisterRequest,
-        enrolled: Option<&str>,
-    ) -> Result<RegisterResponse> {
-        if request.name.is_empty() {
-            return Err(Error::invalid_argument("name is required"));
-        }
-        if request.protocol_version != crate::PROTOCOL_VERSION {
-            return Err(Error::failed_precondition(format!(
-                "agent speaks protocol version {}, this service speaks protocol version {}",
-                request.protocol_version,
-                crate::PROTOCOL_VERSION
-            )));
-        }
-        let (response, ops) = {
-            let mut state = self.state.lock();
-            if let Some(provider_id) = enrolled {
-                let rec = state.providers.get(provider_id).ok_or_else(|| {
-                    Error::new(Code::PermissionDenied, "client certificate is not enrolled")
-                })?;
-                if rec.provider.name != request.name {
-                    return Err(Error::new(
-                        Code::PermissionDenied,
-                        "provider name does not match the client certificate",
-                    ));
-                }
+    /// `Heartbeat`.
+    pub async fn heartbeat(&self, request: HeartbeatRequest) -> Result<()> {
+        self.backend.heartbeat(request).await
+    }
+
+    /// `Poll`: long-poll for work.
+    pub async fn poll(&self, request: PollRequest) -> Result<PollResponse> {
+        let deadline = Instant::now() + Duration::from_secs(request.wait_secs.min(55));
+        loop {
+            let work = self
+                .backend
+                .poll_work(
+                    &request.provider_id,
+                    request.generation,
+                    self.config.poll_batch,
+                    self.config.delivery_timeout,
+                )
+                .await?;
+            if !work.is_empty() {
+                return Ok(PollResponse {
+                    work,
+                    ..PollResponse::default()
+                });
             }
-            let id = match enrolled {
-                Some(provider_id) => provider_id.to_owned(),
-                None => state
-                    .providers
-                    .values()
-                    .find(|rec| rec.provider.name == request.name)
-                    .map(|rec| rec.provider.id.clone())
-                    .unwrap_or_else(|| new_id("prv")),
-            };
-            let generation = state
-                .providers
-                .get(&id)
-                .map_or(1, |rec| rec.provider.generation + 1);
-            // Cordon is an operator decision about the provider record: a
-            // re-registration must not clear it.
-            let cordoned = state
-                .providers
-                .get(&id)
-                .is_some_and(|rec| rec.provider.cordoned);
-            // Enrollment owns the identity: re-registering keeps the
-            // certificates that authenticate this provider.
-            let certificates = state
-                .providers
-                .get(&id)
-                .map(|rec| rec.provider.certificates.clone())
-                .unwrap_or_default();
-            let provider = Provider {
-                id: id.clone(),
-                name: request.name,
-                generation,
-                drivers: request.drivers,
-                last_seen: now(),
-                cordoned,
-                certificates,
-                ..Provider::default()
-            };
-            // Everything the old generation had queued or in flight is
-            // unacknowledged: hand it to the new one.
-            let (queue, wake) = match state.providers.remove(&id) {
-                Some(rec) => {
-                    let mut queue = rec.queue;
-                    let mut redeliver: Vec<InFlight> = rec.in_flight.into_values().collect();
-                    redeliver.sort_by_key(|item| item.visible_at);
-                    for item in redeliver.into_iter().rev() {
-                        queue.push_front(item.work);
-                    }
-                    (queue, rec.wake)
-                }
-                None => (VecDeque::new(), Arc::new(Notify::new())),
-            };
-            state.providers.insert(
-                id.clone(),
-                ProviderRec {
-                    provider: provider.clone(),
-                    seen: Instant::now(),
-                    queue,
-                    in_flight: HashMap::new(),
-                    wake: wake.clone(),
-                    host: None,
-                    host_sampled_at: None,
-                    sandbox_stats: HashMap::new(),
-                },
-            );
-            wake.notify_waiters();
-            let ops = vec![self.put(Kind::Providers, &id, &provider)];
-            (
-                RegisterResponse {
-                    provider_id: id,
-                    generation,
-                    ..RegisterResponse::default()
-                },
-                ops,
-            )
-        };
-        info!(provider = %response.provider_id, generation = response.generation, "provider registered");
-        self.persist_checked(ops).await?;
+            if Instant::now() >= deadline {
+                return Ok(PollResponse::default());
+            }
+            let changed = self.changed.notified();
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = changed => {}
+            }
+        }
+    }
+
+    /// `Report`.
+    pub async fn report(&self, request: ReportRequest) -> Result<()> {
+        self.backend.report(request).await?;
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// `ReportExec` from any node; routes to the owning node.
+    pub async fn report_exec(&self, request: ReportExecRequest) -> Result<()> {
+        let owner = self.exec_owner(&request.exec_id).await?;
+        match owner {
+            Some(owner) if !self.is_local_owner(&owner) => {
+                self.forward_report_exec(&owner, &request).await
+            }
+            Some(_) => self.report_exec_local(request).await,
+            None => Err(Error::not_found("exec not found")),
+        }
+    }
+
+    async fn forward_report_exec(&self, owner: &Owner, request: &ReportExecRequest) -> Result<()> {
+        let client = self.peers.client(&owner.node_id)?;
+        let url = self
+            .config
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == owner.node_id)
+            .map(|peer| {
+                format!(
+                    "{}/sandbox/v1/internal/report-exec",
+                    peer.url.trim_end_matches('/')
+                )
+            })
+            .ok_or_else(|| Error::unavailable("owning peer is not configured"))?;
+        let mut builder = client.post(url).json(request);
+        for (name, value) in self.node_auth_headers() {
+            builder = builder.header(name, value);
+        }
+        let response = builder.send().await.map_err(|error| {
+            Error::unavailable(format!(
+                "forwarding ReportExec to {}: {error}",
+                owner.node_id
+            ))
+        })?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Err(forwarded_error("ReportExec", &owner.node_id, status, &body))
+        }
+    }
+
+    /// `Reconcile`.
+    pub async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse> {
+        let response = self.backend.reconcile(request).await?;
         self.changed.notify_waiters();
         Ok(response)
     }
 
-    // ─── Enrollment and identity ───────────────────────────────────
+    /// `CordonProvider` / `UncordonProvider`.
+    pub async fn set_provider_cordon(&self, reference: &str, cordoned: bool) -> Result<Provider> {
+        let provider = self.backend.set_cordon(reference, cordoned).await?;
+        self.changed.notify_waiters();
+        Ok(provider)
+    }
 
-    /// Mint a single-use join token for provider enrollment.
+    /// `DrainProvider`.
+    pub async fn drain_provider(&self, reference: &str) -> Result<DrainProviderResult> {
+        let result = self.backend.drain(reference).await?;
+        self.changed.notify_waiters();
+        Ok(result)
+    }
+
+    /// `DeleteProvider`.
+    pub async fn delete_provider(&self, name: &str) -> Result<()> {
+        self.backend.delete_provider(name).await?;
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Mint a single-use join token, optionally bound to one provider name.
     ///
-    /// `provider_name` binds the token to one provider identity: a bound
-    /// token enrolls only that name, and is the only kind that may
+    /// A bound token enrolls only that name and is the only kind that may
     /// re-enroll an existing provider (replacing its certificates). An
-    /// empty name mints an unbound token, which may only enroll a
-    /// provider name that does not exist yet.
+    /// unbound token may only enroll a name that does not exist yet.
     pub async fn create_join_token(
         &self,
         ttl: Duration,
@@ -4110,7 +2410,7 @@ impl Service {
             Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
         })?;
         if !provider_name.is_empty() {
-            validate_name("provider", provider_name)?;
+            backend::logic::validate_name("provider", provider_name)?;
         }
         let ttl = if ttl.is_zero() {
             DEFAULT_JOIN_TOKEN_TTL
@@ -4127,18 +2427,14 @@ impl Service {
         let secret = tls::random_hex(32);
         let seconds = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
         let expires_at = now().saturating_add(seconds);
-        let record = JoinTokenRecord {
-            id: id.clone(),
-            secret_sha256: tls::sha256_hex(secret.as_bytes()),
-            expires_at,
-            provider_name: provider_name.to_owned(),
-        };
-        self.state
-            .lock()
-            .join_tokens
-            .insert(id.clone(), record.clone());
-        self.persist(vec![self.put(Kind::JoinTokens, &id, &record)])
-            .await;
+        self.backend
+            .create_join_token(
+                &id,
+                &tls::sha256_hex(secret.as_bytes()),
+                expires_at,
+                provider_name,
+            )
+            .await?;
         Ok(CreateJoinTokenResponse {
             token: tls::join_token(&id, &secret, ca.sha256_hex()),
             expires_at,
@@ -4146,48 +2442,20 @@ impl Service {
         })
     }
 
-    /// The provider a client certificate authenticates, by leaf fingerprint.
-    ///
-    /// Removed providers and revoked certificates (pruned at expiry) are not
-    /// found, which is what denies them at the RPC boundary.
-    pub fn provider_identity(&self, fingerprint_sha256: &str) -> Result<ProviderIdentity> {
-        let t = now();
-        let state = self.state.lock();
-        state
-            .providers
-            .values()
-            .find(|rec| {
-                rec.provider.certificates.iter().any(|certificate| {
-                    certificate.sha256 == fingerprint_sha256 && certificate.expires_at > t
-                })
-            })
-            .map(|rec| ProviderIdentity {
-                provider_id: rec.provider.id.clone(),
-                name: rec.provider.name.clone(),
-            })
-            .ok_or_else(|| Error::new(Code::PermissionDenied, "client certificate is not enrolled"))
+    /// The provider a client certificate authenticates.
+    pub async fn provider_identity(&self, fingerprint_sha256: &str) -> Result<ProviderIdentity> {
+        self.backend.provider_identity(fingerprint_sha256).await
     }
 
-    /// `Enroll`: exchange a join token for a client certificate.
+    /// `Enroll`: exchange a single-use join token for a client certificate.
     ///
-    /// The certificate is signed before the token is consumed, so a malformed
-    /// CSR does not burn a valid token; a token that reaches the store lookup
-    /// is removed whether or not binding the provider then succeeds.
-    ///
-    /// A successful enrollment keeps an in-memory record — token id, CSR
-    /// hash, certificate and provider name — until the token's own expiry.
-    /// Repeating the call with the same token, CSR and name returns that
-    /// certificate, so a response lost on the wire can be retried; reusing
-    /// the token with anything else is refused with "join token already
-    /// used". The record is not persisted: a restart forgets it (and the
-    /// token), so then a retry fails exactly as before.
-    ///
-    /// Every other token-validation failure — malformed, issued for another
-    /// CA, unknown or used, expired, wrong secret — returns the same
-    /// `Unauthenticated` error, so this endpoint cannot be used as an oracle
-    /// for which component of a token is wrong; the specific reason is only
-    /// logged. Name-binding failures are authorization errors about an
-    /// otherwise valid token, and keep their own codes.
+    /// Every token-validation failure returns the same `Unauthenticated`
+    /// error, so the endpoint cannot be used as an oracle for which part of
+    /// a token is wrong. A retry with the same token, secret, CSR and name
+    /// returns the certificate the original enrollment issued; a different
+    /// CSR or name is refused as "join token already used". Name-binding
+    /// failures are authorization errors about an otherwise valid token and
+    /// keep their own codes.
     pub async fn enroll(&self, request: EnrollRequest) -> Result<EnrollResponse> {
         let ca = self.config.ca.clone().ok_or_else(|| {
             Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
@@ -4198,170 +2466,44 @@ impl Service {
         };
         let parts =
             tls::parse_join_token(&request.token).map_err(|_| invalid("malformed join token"))?;
-        if !constant_time_eq(parts.ca_sha256.as_bytes(), ca.sha256_hex().as_bytes()) {
+        if !backend::logic::constant_time_eq(parts.ca_sha256.as_bytes(), ca.sha256_hex().as_bytes())
+        {
             return Err(invalid("join token was issued for a different CA"));
         }
-        validate_name("provider", &request.name)?;
-        let csr_sha256 = tls::sha256_hex(request.csr_pem.as_bytes());
-        let secret_sha256 = tls::sha256_hex(parts.secret.as_bytes());
-        let (signed, ops) = {
-            let mut state = self.state.lock();
-            let t = now();
-            // Retry of an enrollment that was already accepted: same token,
-            // same CSR and same name gets the same certificate back. A
-            // different CSR or name is a different request and is refused.
-            // The secret is re-checked so knowing the token id is not enough
-            // to learn anything or fetch the certificate.
-            if let Some(used) = state.used_join_tokens.get(parts.id) {
-                if used.expires_at <= t {
-                    state.used_join_tokens.remove(parts.id);
-                } else {
-                    if !constant_time_eq(used.secret_sha256.as_bytes(), secret_sha256.as_bytes()) {
-                        return Err(invalid("bad join token"));
-                    }
-                    if used.csr_sha256 == csr_sha256 && used.provider_name == request.name {
-                        return Ok(EnrollResponse {
-                            cert_pem: used.cert_pem.clone(),
-                            ca_pem: ca.pem().to_owned(),
-                            expires_at: used.cert_expires_at,
-                            ..EnrollResponse::default()
-                        });
-                    }
-                    warn!(
-                        reason = "join token reused with a different CSR or provider name",
-                        provider = %request.name,
-                        "enroll rejected"
-                    );
-                    return Err(Error::new(Code::Unauthenticated, "join token already used"));
-                }
-            }
-            let (bound_name, token_expires_at) = {
-                let record = state
-                    .join_tokens
-                    .get(parts.id)
-                    .ok_or_else(|| invalid("unknown or used join token"))?;
-                if record.expires_at <= t {
-                    return Err(invalid("join token expired"));
-                }
-                if !constant_time_eq(record.secret_sha256.as_bytes(), secret_sha256.as_bytes()) {
-                    return Err(invalid("bad join token"));
-                }
-                (record.provider_name.clone(), record.expires_at)
-            };
-            let existing = state
-                .providers
-                .values()
-                .find(|rec| rec.provider.name == request.name)
-                .map(|rec| rec.provider.id.clone());
-            // Name binding: a token may only claim the identity it was
-            // minted for. A name-bound token presented for any other name
-            // is refused, and an unbound token may enroll a new provider
-            // but must not take over an existing one — replacing a live
-            // provider's certificates requires a token bound to its name.
-            // A refused attempt does not consume the token.
-            if !bound_name.is_empty() && bound_name != request.name {
-                return Err(Error::new(
-                    Code::PermissionDenied,
-                    "join token was issued for a different provider name",
-                ));
-            }
-            if bound_name.is_empty() && existing.is_some() {
-                return Err(Error::new(
-                    Code::AlreadyExists,
-                    "provider name is already enrolled: re-enrolling it requires \
-                     a join token bound to that name",
-                ));
-            }
-            // Sign before consuming: a malformed CSR must not burn the
-            // token. Persisting the used record below keeps this
-            // certificate available to a retry until the token expires.
-            let signed =
-                ca.sign_client(&request.csr_pem, &request.name, tls::CLIENT_CERT_LIFETIME)?;
-            state.join_tokens.remove(parts.id);
-            state.used_join_tokens.insert(
-                parts.id.to_owned(),
-                UsedJoinToken {
-                    secret_sha256,
-                    csr_sha256,
-                    provider_name: request.name.clone(),
-                    cert_pem: signed.cert_pem.clone(),
-                    cert_expires_at: signed.expires_at,
-                    expires_at: token_expires_at,
-                },
-            );
-            let mut ops = vec![self.remove(Kind::JoinTokens, parts.id)];
-            let id = existing.unwrap_or_else(|| new_id("prv"));
-            // Take the previous record out: everything it held carries
-            // over except the certificates (replaced below) — in
-            // particular its in-flight work returns to the queue for
-            // redelivery, exactly as on re-registration, instead of being
-            // dropped while its `pending` entries linger.
-            let previous = state.providers.remove(&id);
-            let (seen, queue, wake, mut provider) = match previous {
-                Some(rec) => {
-                    let mut queue = rec.queue;
-                    let mut redeliver: Vec<InFlight> = rec.in_flight.into_values().collect();
-                    redeliver.sort_by_key(|item| item.visible_at);
-                    for item in redeliver.into_iter().rev() {
-                        queue.push_front(item.work);
-                    }
-                    (rec.seen, queue, rec.wake, rec.provider)
-                }
-                None => (
-                    // Enrolled but never registered: not placeable yet.
-                    Instant::now() - self.config.provider_timeout * 2,
-                    VecDeque::new(),
-                    Arc::new(Notify::new()),
-                    Provider {
-                        id: id.clone(),
-                        name: request.name.clone(),
-                        ..Provider::default()
-                    },
-                ),
-            };
-            provider.name = request.name.clone();
-            // Re-enrolling replaces earlier certificates: issuing a new token
-            // means these credentials, not accumulated old ones.
-            provider.certificates = vec![ProviderCertificate {
-                sha256: signed.sha256.clone(),
-                expires_at: signed.expires_at,
-                ..ProviderCertificate::default()
-            }];
-            state.providers.insert(
-                id.clone(),
-                ProviderRec {
-                    provider: provider.clone(),
-                    seen,
-                    queue,
-                    in_flight: HashMap::new(),
-                    wake: wake.clone(),
-                    host: None,
-                    host_sampled_at: None,
-                    sandbox_stats: HashMap::new(),
-                },
-            );
-            wake.notify_waiters();
-            ops.push(self.put(Kind::Providers, &id, &provider));
-            (signed, ops)
+        backend::logic::validate_name("provider", &request.name)?;
+        // Signing happens before the token is consumed, so a malformed CSR
+        // never burns a valid token. A replay discards this fresh signature
+        // and returns the stored one.
+        let signed = ca.sign_client(&request.csr_pem, &request.name, tls::CLIENT_CERT_LIFETIME)?;
+        let outcome = self
+            .backend
+            .enroll(
+                parts.id,
+                &tls::sha256_hex(parts.secret.as_bytes()),
+                &request.name,
+                &tls::sha256_hex(request.csr_pem.as_bytes()),
+                &signed.sha256,
+                &signed.cert_pem,
+                signed.expires_at,
+            )
+            .await?;
+        let (cert_pem, expires_at) = match outcome {
+            backend::EnrollOutcome::Issued => (signed.cert_pem, signed.expires_at),
+            backend::EnrollOutcome::Replay {
+                cert_pem,
+                expires_at,
+            } => (cert_pem, expires_at),
         };
-        self.persist(ops).await;
-        self.changed.notify_waiters();
-        info!(provider = %request.name, "provider enrolled");
+        tracing::info!(provider = %request.name, "provider enrolled");
         Ok(EnrollResponse {
-            cert_pem: signed.cert_pem,
+            cert_pem,
             ca_pem: ca.pem().to_owned(),
-            expires_at: signed.expires_at,
+            expires_at,
             ..EnrollResponse::default()
         })
     }
 
-    /// `RenewCertificate`: issue a new certificate for an enrolled provider.
-    ///
-    /// The previous fingerprint stays valid until it expires, so a client
-    /// that fails to store the new key keeps working — but the retained set
-    /// is capped at [`MAX_PROVIDER_CERTIFICATES`], pruning the oldest, so a
-    /// compromised certificate is evicted after a bounded number of
-    /// rotations instead of living (and self-renewing) forever.
+    /// `RenewCertificate`.
     pub async fn renew_certificate(
         &self,
         request: RenewCertificateRequest,
@@ -4370,49 +2512,14 @@ impl Service {
         let ca = self.config.ca.clone().ok_or_else(|| {
             Error::failed_precondition("enrollment is unavailable: the service has no TLS CA")
         })?;
-        let (signed, ops) = {
-            let mut state = self.state.lock();
-            let t = now();
-            let id = state
-                .providers
-                .values()
-                .find(|rec| {
-                    rec.provider.certificates.iter().any(|certificate| {
-                        certificate.sha256 == fingerprint_sha256 && certificate.expires_at > t
-                    })
-                })
-                .map(|rec| rec.provider.id.clone())
-                .ok_or_else(|| {
-                    Error::new(Code::PermissionDenied, "client certificate is not enrolled")
-                })?;
-            let rec = state.providers.get_mut(&id).expect("resolved above");
-            let signed = ca.sign_client(
-                &request.csr_pem,
-                &rec.provider.name,
-                tls::CLIENT_CERT_LIFETIME,
-            )?;
-            rec.provider
-                .certificates
-                .retain(|certificate| certificate.expires_at > t);
-            rec.provider.certificates.push(ProviderCertificate {
-                sha256: signed.sha256.clone(),
-                expires_at: signed.expires_at,
-                ..ProviderCertificate::default()
-            });
-            // Bound the live set: certificates are in issuance order, so
-            // the front is the oldest. Without a cap every renewal would
-            // leave the superseded certificate valid until its own expiry
-            // and able to renew itself, making rotation unable to evict a
-            // compromised certificate.
-            while rec.provider.certificates.len() > MAX_PROVIDER_CERTIFICATES {
-                rec.provider.certificates.remove(0);
-            }
-            rec.seen = Instant::now();
-            rec.provider.last_seen = t;
-            let provider = rec.provider.clone();
-            (signed, vec![self.put(Kind::Providers, &id, &provider)])
-        };
-        self.persist(ops).await;
+        let signed = ca.sign_client(
+            &request.csr_pem,
+            &self.provider_identity(fingerprint_sha256).await?.name,
+            tls::CLIENT_CERT_LIFETIME,
+        )?;
+        self.backend
+            .renew_certificate(fingerprint_sha256, &signed.sha256, signed.expires_at)
+            .await?;
         Ok(RenewCertificateResponse {
             cert_pem: signed.cert_pem,
             expires_at: signed.expires_at,
@@ -4420,776 +2527,29 @@ impl Service {
         })
     }
 
-    /// Remove a provider, its certificates and its machine records.
-    ///
-    /// The host's machines are unreachable once it can no longer authenticate,
-    /// so their records and leases are dropped instead of pinning names and
-    /// capacity until a reconcile that can never come.
-    pub async fn delete_provider(&self, name: &str) -> Result<()> {
-        let ops = {
-            let mut state = self.state.lock();
-            let Some(id) = state
-                .providers
-                .values()
-                .find(|rec| rec.provider.name == name)
-                .map(|rec| rec.provider.id.clone())
-            else {
-                return Err(Error::not_found(format!(
-                    "provider `{name}` is not registered"
-                )));
-            };
-            state.providers.remove(&id);
-            let mut ops = vec![self.remove(Kind::Providers, &id)];
-            let stale: Vec<String> = state
-                .pending
-                .iter()
-                .filter(|(_, work)| work.provider_id == id)
-                .map(|(work_id, _)| work_id.clone())
-                .collect();
-            for work_id in stale {
-                self.complete_locked(
-                    &mut state,
-                    &work_id,
-                    Err(Error::unavailable("provider was removed")),
-                    &mut ops,
-                );
-            }
-            let sandboxes: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|sandbox| sandbox.provider_id == id)
-                .map(|sandbox| sandbox.id.clone())
-                .collect();
-            let leases: Vec<String> = state
-                .leases
-                .values()
-                .filter(|lease| sandboxes.contains(&lease.sandbox_id))
-                .map(|lease| lease.id.clone())
-                .collect();
-            for lease_id in leases {
-                if let Some(lease) = state.leases.remove(&lease_id) {
-                    state.lease_by_key.remove(&lease.idempotency_key);
-                    state.injected.remove(&lease_id);
-                    ops.push(self.remove(Kind::Leases, &lease_id));
-                }
-            }
-            for sandbox_id in sandboxes {
-                self.destroy_locked(&mut state, &sandbox_id, &mut ops);
-            }
-            ops
-        };
-        self.persist(ops).await;
-        self.changed.notify_waiters();
-        info!(provider = name, "provider removed");
-        Ok(())
-    }
+    // ── Routing helpers for the HTTP surface ─────────────────────
 
-    /// `Heartbeat`.
-    pub fn heartbeat(&self, request: HeartbeatRequest) -> Result<()> {
-        let mut state = self.state.lock();
-        self.fence(&state, &request.provider_id, request.generation)?;
-        if let Some(rec) = state.providers.get_mut(&request.provider_id) {
-            rec.seen = Instant::now();
-            rec.provider.last_seen = now();
-            if let Some(host) = request.host.into_option() {
-                rec.host = Some(host);
-                rec.host_sampled_at = Some(Instant::now());
-            }
-            if !request.sandboxes.is_empty() || !rec.sandbox_stats.is_empty() {
-                rec.sandbox_stats = request
-                    .sandboxes
-                    .into_iter()
-                    .filter(|stats| !stats.native_ref.is_empty())
-                    .map(|stats| (stats.native_ref.clone(), stats))
-                    .collect();
-            }
-        }
-        Ok(())
-    }
-
-    /// `Poll`: long-poll for work.
-    ///
-    /// At most [`ServiceConfig::poll_batch`] items per call. Delivered items
-    /// stay in flight until `Report` acknowledges them; in-flight items whose
-    /// visibility timeout expired become visible again and are redelivered,
-    /// and a re-registration releases everything the previous generation held
-    /// (see [`Service::register`]).
-    pub async fn poll(&self, request: PollRequest) -> Result<PollResponse> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(request.wait_secs.min(55));
-        loop {
-            let (wake, next_visible) = {
-                let mut state = self.state.lock();
-                self.fence(&state, &request.provider_id, request.generation)?;
-                let mut delivered: Vec<WorkItem> = Vec::new();
-                let (wake, next) = {
-                    let rec = state
-                        .providers
-                        .get_mut(&request.provider_id)
-                        .ok_or_else(|| Error::not_found("provider not registered"))?;
-                    rec.seen = Instant::now();
-                    rec.provider.last_seen = now();
-                    let at = Instant::now();
-                    // Visibility timeout: unacknowledged work is delivered again.
-                    let expired: Vec<String> = rec
-                        .in_flight
-                        .iter()
-                        .filter(|(_, item)| item.visible_at <= at)
-                        .map(|(work_id, _)| work_id.clone())
-                        .collect();
-                    for work_id in expired {
-                        if let Some(item) = rec.in_flight.remove(&work_id) {
-                            rec.queue.push_back(item.work);
-                        }
-                    }
-                    let batch = self.config.poll_batch.max(1);
-                    while delivered.len() < batch {
-                        let Some(item) = rec.queue.pop_front() else {
-                            break;
-                        };
-                        rec.in_flight.insert(
-                            item.id.clone(),
-                            InFlight {
-                                work: item.clone(),
-                                visible_at: at + self.config.delivery_timeout,
-                            },
-                        );
-                        delivered.push(item);
-                    }
-                    let next = rec.in_flight.values().map(|item| item.visible_at).min();
-                    (rec.wake.clone(), next)
-                };
-                if !delivered.is_empty() {
-                    // Stamp the attempt on every exec this delivery carries:
-                    // the record of how many times the work went out, kept
-                    // with the exec. Re-execution itself is fenced by the
-                    // agent's durable started-set (see `agent.rs`).
-                    let exec_ids: Vec<String> = delivered
-                        .iter()
-                        .filter_map(|item| match state.pending.get(&item.id) {
-                            Some(pending) => match &pending.kind {
-                                Pending::Exec { exec_id } => Some(exec_id.clone()),
-                                _ => None,
-                            },
-                            None => None,
-                        })
-                        .collect();
-                    for exec_id in &exec_ids {
-                        if let Some(exec) = state.execs.get_mut(exec_id) {
-                            exec.attempts += 1;
-                            if exec.attempts > 1 {
-                                warn!(
-                                    exec_id,
-                                    attempts = exec.attempts,
-                                    "exec work redelivered; the agent fences re-execution"
-                                );
-                            }
-                        }
-                    }
-                    return Ok(PollResponse {
-                        work: delivered,
-                        ..PollResponse::default()
-                    });
-                }
-                (wake, next)
-            };
-            let wake = wake.notified();
-            tokio::pin!(wake);
-            let until = next_visible.map_or(deadline, tokio::time::Instant::from_std);
-            tokio::select! {
-                _ = tokio::time::sleep_until(until.min(deadline)) => {}
-                _ = &mut wake => {}
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(PollResponse::default());
-            }
-        }
-    }
-
-    /// `Report`.
-    pub async fn report(&self, request: ReportRequest) -> Result<()> {
-        let ops = {
-            let mut state = self.state.lock();
-            self.fence(&state, &request.provider_id, request.generation)?;
-            let Some(owner) = state
-                .pending
-                .get(&request.work_id)
-                .map(|work| work.provider_id.clone())
-            else {
-                // Completed work, or a fire-and-forget cancellation: accept
-                // the acknowledgement so the delivery is not repeated.
-                if let Some(rec) = state.providers.get_mut(&request.provider_id) {
-                    rec.in_flight.remove(&request.work_id);
-                    rec.queue.retain(|item| item.id != request.work_id);
-                }
-                return Err(Error::not_found("unknown or completed work"));
-            };
-            if owner != request.provider_id {
-                return Err(Error::new(
-                    Code::PermissionDenied,
-                    "work belongs to another provider",
-                ));
-            }
-            let result = if request.ok {
-                Ok(request.native_ref)
-            } else {
-                Err(crate::error::from_reported(request.error))
-            };
-            let mut ops = Vec::new();
-            self.complete_locked(&mut state, &request.work_id, result, &mut ops);
-            ops
-        };
-        self.persist(ops).await;
-        self.changed.notify_waiters();
-        Ok(())
-    }
-
-    fn complete_locked(
-        &self,
-        state: &mut State,
-        work_id: &str,
-        result: Result<String>,
-        ops: &mut Vec<Op>,
-    ) {
-        let Some(work) = state.pending.remove(work_id) else {
-            return;
-        };
-        let provider_id = work.provider_id;
-        if let Some(rec) = state.providers.get_mut(&provider_id) {
-            // The work may have been redelivered (queued) between the
-            // provider reading it and this report.
-            rec.in_flight.remove(work_id);
-            rec.queue.retain(|item| item.id != work_id);
-        }
-        match work.kind {
-            Pending::Create { sandbox_id, driver } => match result {
-                Ok(native_ref) => {
-                    let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id) else {
-                        // Released while provisioning: destroy the late machine.
-                        let work = WorkItem::new(
-                            new_id("wrk"),
-                            work_item::Work::Destroy(
-                                SandboxWork {
-                                    sandbox_id: sandbox_id.clone(),
-                                    driver,
-                                    native_ref,
-                                    ..SandboxWork::default()
-                                }
-                                .into(),
-                            ),
-                        );
-                        let _ = self.enqueue(
-                            state,
-                            &provider_id,
-                            work,
-                            Pending::Destroy { sandbox_id },
-                        );
-                        return;
-                    };
-                    sandbox.native_ref = native_ref;
-                    sandbox.state = if sandbox.lease_id.is_empty() {
-                        SandboxState::Ready
-                    } else {
-                        SandboxState::Leased
-                    }
-                    .into();
-                    ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                    state.created_at.remove(&sandbox_id);
-                }
-                Err(error) => {
-                    self.config.metrics.record_create_failure("reported");
-                    self.fail_locked(state, &sandbox_id, crate::error::message(&error), ops);
-                }
-            },
-            Pending::Destroy { sandbox_id } => match result {
-                Ok(_) => {
-                    state.destroy_attempts.remove(&sandbox_id);
-                    if state.sandboxes.remove(&sandbox_id).is_some() {
-                        ops.push(self.remove(Kind::Sandboxes, &sandbox_id));
-                    }
-                }
-                Err(error) => {
-                    // No record: a destroy queued for a late create. There is
-                    // no `Terminating` record to count against or keep.
-                    if state.sandboxes.contains_key(&sandbox_id) {
-                        let attempts = {
-                            let count = state
-                                .destroy_attempts
-                                .entry(sandbox_id.clone())
-                                .or_default();
-                            *count += 1;
-                            *count
-                        };
-                        if attempts < MAX_DESTROY_ATTEMPTS {
-                            warn!(%sandbox_id, attempts, %error, "destroy failed; the next reconcile asks again");
-                        } else {
-                            warn!(%sandbox_id, attempts, %error, "destroy failed too often; keeping the record so reconcile can reclaim the machine");
-                            let reason = format!(
-                                "destroy failed {attempts} times: {}",
-                                error.message.as_deref().unwrap_or_default()
-                            );
-                            self.tombstone_locked(state, &sandbox_id, &reason, ops);
-                        }
-                    }
-                }
-            },
-            Pending::Exec { exec_id } => {
-                // Success is signalled by the exit event (`ReportExec`); a
-                // failed exec work ends the stream with the error.
-                if let Err(error) = result
-                    && let Some(exec) = state.execs.remove(&exec_id)
-                {
-                    exec.finished.cancel();
-                    let _ = exec.tx.try_send(Err(error));
-                }
-            }
-            Pending::Copy { reply } => {
-                let _ = reply.send(result);
-            }
-            Pending::Snapshot { reply, .. } => {
-                // Validity is checked when the template is installed (the
-                // snapshot call still owns the source at this point).
-                let _ = reply.send(result);
-            }
-            Pending::Pause {
-                sandbox_id,
-                lease_id,
-                expected,
-                reply,
-            } => {
-                let result = match result {
-                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
-                        let sandbox = state
-                            .sandboxes
-                            .get_mut(&sandbox_id)
-                            .expect("state checked above");
-                        sandbox.prior_state = sandbox.state;
-                        sandbox.state = SandboxState::Paused.into();
-                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                        Ok(String::new())
-                    }
-                    Ok(_) => Err(Error::failed_precondition(
-                        "the sandbox changed while the pause was in flight",
-                    )),
-                    Err(error) => Err(error),
-                };
-                let _ = reply.send(result);
-            }
-            Pending::Stop {
-                sandbox_id,
-                lease_id,
-                expected,
-                reply,
-            } => {
-                let result = match result {
-                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
-                        let sandbox = state
-                            .sandboxes
-                            .get_mut(&sandbox_id)
-                            .expect("state checked above");
-                        sandbox.prior_state = sandbox.state;
-                        sandbox.state = SandboxState::Stopped.into();
-                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                        Ok(String::new())
-                    }
-                    Ok(_) => Err(Error::failed_precondition(
-                        "the sandbox changed while the stop was in flight",
-                    )),
-                    Err(error) => Err(error),
-                };
-                let _ = reply.send(result);
-            }
-            Pending::Start {
-                sandbox_id,
-                lease_id,
-                expected,
-                forkable,
-                reply,
-            } => {
-                let result = match result {
-                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
-                        let sandbox = state
-                            .sandboxes
-                            .get_mut(&sandbox_id)
-                            .expect("state checked above");
-                        let next = resumed_state(sandbox);
-                        self.restore_locked(sandbox, next);
-                        if forkable {
-                            sandbox.error.clear();
-                        }
-                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                        Ok(String::new())
-                    }
-                    Ok(_) => Err(Error::failed_precondition(
-                        "the sandbox changed while the start was in flight",
-                    )),
-                    Err(error) => Err(error),
-                };
-                let _ = reply.send(result);
-            }
-            Pending::Resume {
-                sandbox_id,
-                lease_id,
-                expected,
-                reply,
-            } => {
-                let result = match result {
-                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
-                        let sandbox = state
-                            .sandboxes
-                            .get_mut(&sandbox_id)
-                            .expect("state checked above");
-                        let next = resumed_state(sandbox);
-                        self.restore_locked(sandbox, next);
-                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                        Ok(String::new())
-                    }
-                    Ok(_) => Err(Error::failed_precondition(
-                        "the sandbox changed while the resume was in flight",
-                    )),
-                    Err(error) => Err(error),
-                };
-                let _ = reply.send(result);
-            }
-        }
-    }
-
-    /// Apply a restored power state and its preservation bookkeeping.
-    fn restore_locked(&self, sandbox: &mut Sandbox, next: SandboxState) {
-        sandbox.state = next.into();
-        sandbox.prior_state = SandboxState::SandboxStateUnspecified.into();
-        match next {
-            SandboxState::Preserved => {
-                if sandbox.preserve_until == 0 {
-                    sandbox.preserve_until = now() + self.config.preserve_ttl.as_secs() as i64;
-                }
-            }
-            // Resuming or starting a preserved sandbox ends its debugging
-            // window; only an explicitly preserved sandbox holds one open.
-            _ => sandbox.preserve_until = 0,
-        }
-    }
-
-    /// `ReportExec`: forward output; an exit event ends the stream.
-    ///
-    /// Batches carry a per-exec `sequence`; a batch the service already
-    /// applied (a retried `ReportExec`) is acknowledged and dropped. The
-    /// caller's stream closes on the exit event even if later batches arrive.
-    pub async fn report_exec(&self, request: ReportExecRequest) -> Result<()> {
-        let tx = {
-            let mut state = self.state.lock();
-            self.fence(&state, &request.provider_id, request.generation)?;
-            let sandbox_id = state
-                .execs
-                .get(&request.exec_id)
-                .map(|exec| exec.sandbox_id.clone())
-                .ok_or_else(|| {
-                    // Caller went away (or the exec finished); stop the agent.
-                    Error::not_found("exec not found")
-                })?;
-            // Only the provider that owns the sandbox may report output for
-            // its exec: a leaked exec id must not inject output into another
-            // provider's stream.
-            let mine = state
-                .sandboxes
-                .get(&sandbox_id)
-                .is_some_and(|sandbox| sandbox.provider_id == request.provider_id);
-            if !mine {
-                return Err(Error::new(
-                    Code::PermissionDenied,
-                    "exec belongs to another provider",
-                ));
-            }
-            let exec = state
-                .execs
-                .get_mut(&request.exec_id)
-                .ok_or_else(|| Error::not_found("exec not found"))?;
-            if request.sequence != 0 {
-                if request.sequence <= exec.sequence {
-                    // A retry of a batch already delivered.
-                    return Ok(());
-                }
-                exec.sequence = request.sequence;
-            }
-            exec.tx.clone()
-        };
-        let mut exited = false;
-        for event in request.events {
-            let exit = matches!(event.event, Some(exec_event::Event::ExitCode(_)));
-            if tx.send(Ok(event)).await.is_err() {
-                // The caller dropped its stream: leave the state for the
-                // disconnect watcher, which cancels the guest command.
-                return Ok(());
-            }
-            if exit {
-                exited = true;
-                break;
-            }
-        }
-        if exited && let Some(exec) = self.state.lock().execs.remove(&request.exec_id) {
-            exec.finished.cancel();
-        }
-        Ok(())
-    }
-
-    /// `Reconcile`: diff a provider's inventory against the records.
-    #[tracing::instrument(skip(self, request), fields(provider_id = %request.provider_id))]
-    pub async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse> {
-        let (response, ops) = {
-            let mut state = self.state.lock();
-            self.fence(&state, &request.provider_id, request.generation)?;
-            let mut ops = Vec::new();
-            let observed: HashSet<&str> = request
-                .sandboxes
-                .iter()
-                .map(|o| o.native_ref.as_str())
-                .collect();
-            // Records the host no longer has.
-            let lost: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|s| {
-                    s.provider_id == request.provider_id
-                        && !s.native_ref.is_empty()
-                        && !s.state.is_terminal()
-                        && !observed.contains(s.native_ref.as_str())
-                })
-                .map(|s| s.id.clone())
-                .collect();
-            self.config.metrics.record_reconcile_lost(lost.len() as u64);
-            for id in lost {
-                warn!(sandbox = %id, "sandbox missing from provider inventory");
-                if state
-                    .sandboxes
-                    .get(&id)
-                    .is_some_and(|s| s.state == SandboxState::Terminating)
-                {
-                    // The destroy landed (or the machine went away): the
-                    // record stops holding capacity now.
-                    state.sandboxes.remove(&id);
-                    state.created_at.remove(&id);
-                    state.destroy_attempts.remove(&id);
-                    ops.push(self.remove(Kind::Sandboxes, &id));
-                } else {
-                    self.fail_locked(
-                        &mut state,
-                        &id,
-                        "lost: missing from provider inventory",
-                        &mut ops,
-                    );
-                    if let Some(sandbox) = state.sandboxes.get_mut(&id) {
-                        sandbox.native_ref.clear();
-                    }
-                }
-            }
-            // Terminating records whose machine the provider still reports,
-            // with no destroy queued or running: the previous destroy died with
-            // its process, or its report was lost, so ask again. A destroy
-            // already in flight is awaited however long it takes; only
-            // completed failures count toward giving up (`complete_locked`).
-            let stuck: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|s| {
-                    s.provider_id == request.provider_id
-                        && s.state == SandboxState::Terminating
-                        && !s.native_ref.is_empty()
-                        && observed.contains(s.native_ref.as_str())
-                })
-                .map(|s| s.id.clone())
-                .collect();
-            for id in stuck {
-                if !self.ask_destroy_locked(&mut state, &id) {
-                    self.tombstone_locked(
-                        &mut state,
-                        &id,
-                        "the provider cannot take a destroy",
-                        &mut ops,
-                    );
-                }
-            }
-            // A tombstone whose machine this provider no longer reports is
-            // finished: there is nothing left to reclaim.
-            let finished: Vec<String> = state
-                .sandboxes
-                .values()
-                .filter(|s| {
-                    s.provider_id == request.provider_id
-                        && s.state == SandboxState::Gone
-                        && !s.native_ref.is_empty()
-                        && !observed.contains(s.native_ref.as_str())
-                })
-                .map(|s| s.id.clone())
-                .collect();
-            for id in finished {
-                state.sandboxes.remove(&id);
-                state.created_at.remove(&id);
-                ops.push(self.remove(Kind::Sandboxes, &id));
-            }
-            // Machines no record owns (orphans, stale incarnations).
-            //
-            // A template's `native_ref` is its fork base (SmolVM's golden):
-            // a live machine with no sandbox record. It is never an orphan,
-            // whichever provider reports it, so snapshot bases are protected
-            // service-wide: any provider may report the inventory, but a base
-            // belongs to the template record. Two agents can share one host's
-            // engine home and each lists every machine there, and the base
-            // belongs to the template rather than to the agent that happened
-            // to create it. Reaping it wedges every later fork ("cannot be
-            // re-launched while … live clone(s)"); the owning provider
-            // destroys it when the template is deleted, and nowhere else.
-            //
-            // Narrowing the driver's inventory to machines carrying this
-            // agent's ownership marker would not do instead: the marker names
-            // the machine, not the agent, and a provider must still see the
-            // other agent's genuinely orphaned machines to reap them.
-            let goldens: HashSet<&str> = state
-                .templates
-                .values()
-                .map(|t| t.native_ref.as_str())
-                .filter(|native_ref| !native_ref.is_empty())
-                .collect();
-            let mut destroy = Vec::new();
-            for item in &request.sandboxes {
-                if goldens.contains(item.native_ref.as_str()) {
-                    continue;
-                }
-                // A tombstone no longer owns its machine: reconcile reclaims it.
-                let owned = state.sandboxes.values().any(|s| {
-                    s.provider_id == request.provider_id
-                        && s.native_ref == item.native_ref
-                        && s.state != SandboxState::Gone
-                });
-                // Proof this service created the machine: its id is one of
-                // ours (the driver encodes it in the native name), or a
-                // caller-named create we dispatched. Machines from another
-                // service sharing this host registry carry neither. A
-                // tombstone proves it by its native reference alone: a
-                // caller-named machine is reported without an id.
-                let ours = (!item.sandbox_id.is_empty()
-                    && state.sandboxes.contains_key(&item.sandbox_id))
-                    || state.sandboxes.values().any(|s| {
-                        s.provider_id == request.provider_id
-                            && s.state == SandboxState::Provisioning
-                            && !s.name.is_empty()
-                            && s.name == item.native_ref
-                    })
-                    || state.sandboxes.values().any(|s| {
-                        s.provider_id == request.provider_id
-                            && s.state == SandboxState::Gone
-                            && !s.native_ref.is_empty()
-                            && s.native_ref == item.native_ref
-                    });
-                // Another provider's machine (two agents on one host, or a
-                // hand-created VM registered elsewhere) is never ours to
-                // reap: only orphans this provider could have created.
-                // A tombstone claims its machine for its own provider's
-                // reclaim, so it is foreign here as well.
-                let foreign = !item.native_ref.is_empty()
-                    && state.sandboxes.values().any(|s| {
-                        s.provider_id != request.provider_id
-                            && (!s.state.is_terminal() || s.state == SandboxState::Gone)
-                            && s.native_ref == item.native_ref
-                    });
-                if !owned && ours && !foreign {
-                    destroy.push(SandboxWork {
-                        sandbox_id: item.sandbox_id.clone(),
-                        driver: item.driver.clone(),
-                        native_ref: item.native_ref.clone(),
-                        ..SandboxWork::default()
-                    });
-                } else if !foreign {
-                    warn!(
-                        native_ref = %item.native_ref,
-                        driver = %item.driver,
-                        "inventory entry was not created by this service; leaving it alone"
-                    );
-                }
-            }
-            self.config
-                .metrics
-                .record_reconcile_orphans(destroy.len() as u64);
-            (
-                ReconcileResponse {
-                    destroy,
-                    ..ReconcileResponse::default()
-                },
-                ops,
-            )
-        };
-        self.persist(ops).await;
-        self.changed.notify_waiters();
-        Ok(response)
+    /// The owner URL and client for a peer, from configuration only.
+    pub fn peer_endpoint(&self, owner: &Owner) -> Result<(String, &reqwest::Client)> {
+        let configured = self
+            .config
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == owner.node_id)
+            .ok_or_else(|| {
+                Error::unavailable(format!("peer node `{}` is not configured", owner.node_id))
+            })?;
+        let base = configured.url.trim_end_matches('/').to_owned();
+        let client = self.peers.client(&owner.node_id)?;
+        Ok((base, client))
     }
 }
 
-enum PowerOp {
-    Stop,
-    Start { forkable: bool },
-}
-
-enum Step {
-    Ready(Box<(Lease, Sandbox)>),
-    Wait(Option<Error>),
-}
-
-fn sandbox_meets(state: &State, sandbox: &Sandbox, requires: &Requirements) -> bool {
-    if requires == &Requirements::default() {
-        return true;
+fn ticket_side(side: TransferSide) -> TicketSide {
+    match side {
+        TransferSide::Producer => TicketSide::Producer,
+        TransferSide::Consumer => TicketSide::Consumer,
     }
-    state
-        .providers
-        .get(&sandbox.provider_id)
-        .and_then(|rec| {
-            rec.provider
-                .drivers
-                .iter()
-                .find(|d| d.driver == sandbox.driver)
-        })
-        .is_some_and(|driver| {
-            let caps = &driver.capabilities;
-            (requires.os.is_empty() || caps.os == requires.os)
-                && (requires.arch.is_empty() || caps.arch.contains(&requires.arch))
-                && requires.features.iter().all(|f| caps.features.contains(f))
-                && requires.capabilities.iter().all(|c| caps.has(c))
-                && (requires.driver.is_empty() || requires.driver == driver.driver)
-        })
-}
-
-/// A new sandbox's effective size: the request's fields, with the driver's
-/// advertised defaults filling the zeros.
-fn effective_shape(state: &State, provider_id: &str, driver: &str, requested: &Shape) -> Shape {
-    let defaults = state
-        .providers
-        .get(provider_id)
-        .and_then(|rec| {
-            rec.provider
-                .drivers
-                .iter()
-                .find(|info| info.driver == driver)
-        })
-        .map(|info| info.capabilities.default_shape.clone())
-        .unwrap_or_default();
-    let pick = |requested: u32, default: u32| {
-        if requested == 0 { default } else { requested }
-    };
-    Shape {
-        cpus: pick(requested.cpus, defaults.cpus),
-        memory_mib: pick(requested.memory_mib, defaults.memory_mib),
-        disk_gib: pick(requested.disk_gib, defaults.disk_gib),
-        ..Shape::default()
-    }
-}
-
-async fn load<T: DeserializeOwned>(store: &dyn Store, kind: Kind) -> Result<Vec<T>> {
-    store
-        .load(kind)
-        .await?
-        .into_iter()
-        .map(|value| {
-            serde_json::from_value(value)
-                .map_err(|e| Error::internal(format!("sandbox store decode: {e}")))
-        })
-        .collect()
 }
 
 fn tokio_stream_from(
@@ -5198,8 +2558,7 @@ fn tokio_stream_from(
     futures::stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed()
 }
 
-/// Wrap an exec stream so its duration and exit class are recorded once its
-/// terminal event (an exit code, or a stream error) passes through.
+/// Record an exec's duration and exit class when its terminal event passes.
 fn record_exec_metrics(
     metrics: crate::metrics::SandboxMetrics,
     started: Instant,
@@ -5228,8 +2587,6 @@ fn record_exec_metrics(
                     metrics.record_exec(started.elapsed(), "error");
                     Some((Err(error), (stream, true)))
                 }
-                // Dropped without a terminal event (e.g. the pending work
-                // was stranded): still a real duration worth recording.
                 None => {
                     metrics.record_exec(started.elapsed(), "unknown");
                     None
@@ -5257,561 +2614,4 @@ pub async fn collect_exec(
     Err(Error::unavailable(
         "exec stream ended without an exit status",
     ))
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store;
-
-    fn items(count: usize) -> Vec<(String, usize)> {
-        (0..count)
-            .map(|index| (format!("id-{index:04}"), index))
-            .collect()
-    }
-
-    fn encode_token(token: &str) -> String {
-        use base64::Engine as _;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token)
-    }
-
-    #[test]
-    fn pages_are_ordered_and_carry_a_token_until_exhausted() {
-        let mut request = ListRequest::default();
-        let (page, token) = paginate("widget", items(250), &request).unwrap();
-        assert_eq!(page, (0..100usize).collect::<Vec<_>>());
-        assert!(!token.is_empty());
-        request.page_token = token;
-        let (page, token) = paginate("widget", items(250), &request).unwrap();
-        assert_eq!(page, (100..200usize).collect::<Vec<_>>());
-        assert!(!token.is_empty());
-        request.page_token = token;
-        let (page, token) = paginate("widget", items(250), &request).unwrap();
-        assert_eq!(page, (200..250usize).collect::<Vec<_>>());
-        assert!(token.is_empty());
-    }
-
-    #[test]
-    fn page_size_is_capped_and_tokens_are_validated() {
-        let request = ListRequest {
-            page_size: 5000,
-            page_token: String::new(),
-            ..ListRequest::default()
-        };
-        let (page, _) = paginate("widget", items(1500), &request).unwrap();
-        assert_eq!(page.len(), MAX_PAGE_SIZE as usize);
-
-        let request = ListRequest {
-            page_token: "not base64!".into(),
-            ..ListRequest::default()
-        };
-        let error = paginate("widget", items(3), &request).unwrap_err();
-        assert_eq!(error.code, Code::InvalidArgument);
-    }
-
-    #[test]
-    fn a_bogus_page_token_is_rejected_instead_of_restarting_at_page_one() {
-        // `base64url("not-a-sandbox")`, the token the end-to-end run used.
-        let request = ListRequest {
-            page_size: 2,
-            page_token: "bm90LWEtc2FuZGJveA".into(),
-            ..ListRequest::default()
-        };
-        let error = paginate("sandbox", items(4), &request).unwrap_err();
-        assert_eq!(
-            error.code,
-            Code::InvalidArgument,
-            "{}",
-            crate::error::message(&error)
-        );
-
-        // A cursor minted for another listing is not a cursor for this one.
-        let first = ListRequest {
-            page_size: 2,
-            page_token: String::new(),
-            ..ListRequest::default()
-        };
-        let (_, token) = paginate("template", items(4), &first).unwrap();
-        let request = ListRequest {
-            page_size: 2,
-            page_token: token,
-            ..ListRequest::default()
-        };
-        let error = paginate("sandbox", items(4), &request).unwrap_err();
-        assert_eq!(
-            error.code,
-            Code::InvalidArgument,
-            "{}",
-            crate::error::message(&error)
-        );
-    }
-
-    #[test]
-    fn a_token_whose_id_disappeared_still_resumes_after_it() {
-        let request = ListRequest {
-            page_size: 2,
-            page_token: String::new(),
-            ..ListRequest::default()
-        };
-        let (_, token) = paginate("widget", items(4), &request).unwrap();
-        // The token names `id-0001`, which is gone by the second page.
-        let remaining: Vec<_> = items(4)
-            .into_iter()
-            .filter(|(id, _)| id != "id-0001")
-            .collect();
-        let request = ListRequest {
-            page_size: 2,
-            page_token: token,
-            ..ListRequest::default()
-        };
-        let (page, _) = paginate("widget", remaining, &request).unwrap();
-        assert_eq!(page, vec![2, 3]);
-    }
-
-    #[test]
-    fn a_page_token_with_a_missing_value_is_rejected() {
-        let request = ListRequest {
-            page_token: encode_token("v1:sandbox:"),
-            ..ListRequest::default()
-        };
-        let error = paginate("sandbox", items(3), &request).unwrap_err();
-        assert_eq!(error.code, Code::InvalidArgument);
-    }
-
-    async fn blob_test_service(
-        ticket_ttl: Duration,
-        work_timeout: Duration,
-    ) -> (Arc<Service>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = ServiceConfig::new();
-        config.ticket_ttl = ticket_ttl;
-        config.work_timeout = work_timeout;
-        let service = Service::open(crate::store::open("memory:").await.unwrap(), config)
-            .await
-            .unwrap();
-        (service, dir)
-    }
-
-    fn insert_blob(service: &Service, ticket: &str, token: &str, expires_at: i64) {
-        let (tx, rx) = mpsc::channel(TRANSFER_QUEUE);
-        let (status, _) = watch::channel(TransferStatus::Open);
-        service.state.lock().blobs.insert(
-            ticket.to_owned(),
-            Blob {
-                sandbox_id: "sbx-test".into(),
-                kind: StreamKind::Upload,
-                guest_path: "/work".into(),
-                token: token.to_owned(),
-                expires_at,
-                producer_claimed: false,
-                consumer_claimed: false,
-                status,
-                control: Some(tx.clone()),
-                tx: Some(tx),
-                rx: Some(rx),
-            },
-        );
-    }
-
-    #[tokio::test]
-    async fn an_empty_token_never_authenticates_a_ticket() {
-        let (service, _dir) =
-            blob_test_service(Duration::from_secs(30), Duration::from_secs(2)).await;
-        insert_blob(&service, "tkt-1", "real-token", now() + 60);
-        let error = service
-            .claim_caller("tkt-1", "", TransferSide::Producer)
-            .unwrap_err();
-        assert_eq!(error.code, Code::Unauthenticated, "{error}");
-        let error = service
-            .claim_caller("tkt-1", "wrong-token", TransferSide::Producer)
-            .unwrap_err();
-        assert_eq!(error.code, Code::Unauthenticated, "{error}");
-        // A failed attempt does not consume the ticket.
-        assert!(
-            service
-                .claim_caller("tkt-1", "real-token", TransferSide::Producer)
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_ticket_side_claims_exactly_once() {
-        let (service, _dir) =
-            blob_test_service(Duration::from_secs(30), Duration::from_secs(2)).await;
-        insert_blob(&service, "tkt-1", "tok", now() + 60);
-        let mut claim = service
-            .claim_caller("tkt-1", "tok", TransferSide::Producer)
-            .unwrap();
-        assert!(claim.take_producer().is_some());
-        // The claim is the single use of that side: a second claim — even
-        // with the right token — is refused, so two transfers can never
-        // share one ticket's channel ends.
-        let error = service
-            .claim_caller("tkt-1", "tok", TransferSide::Producer)
-            .unwrap_err();
-        assert_eq!(error.code, Code::FailedPrecondition, "{error}");
-    }
-
-    #[tokio::test]
-    async fn expiry_is_enforced_at_claim_and_a_claim_gets_a_full_ttl() {
-        let (service, _dir) =
-            blob_test_service(Duration::from_secs(30), Duration::from_secs(2)).await;
-        // Expired before the claim: rejected at claim time, and the
-        // sweeper still reaps the unclaimed record.
-        insert_blob(&service, "tkt-old", "tok", now() - 1);
-        let error = service
-            .claim_caller("tkt-old", "tok", TransferSide::Producer)
-            .unwrap_err();
-        assert_eq!(error.code, Code::NotFound, "{error}");
-        service.maintain().await;
-        assert!(!service.state.lock().blobs.contains_key("tkt-old"));
-        // Claimed just before expiry: the claim extends the ticket by a
-        // full TTL, so the sweeper cannot delete an in-flight transfer's
-        // channel ends from under it.
-        insert_blob(&service, "tkt-live", "tok", now() + 1);
-        service
-            .claim_caller("tkt-live", "tok", TransferSide::Producer)
-            .unwrap();
-        let expires_at = service.state.lock().blobs["tkt-live"].expires_at;
-        assert!(
-            expires_at >= now() + 29,
-            "claim must extend the ticket to a full TTL, expires_at={expires_at}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_copy_keeps_its_ticket_alive_for_the_work_timeout() {
-        let (service, _dir) =
-            blob_test_service(Duration::from_secs(30), Duration::from_secs(2)).await;
-        {
-            let mut state = service.state.lock();
-            state.sandboxes.insert(
-                "sbx-test".into(),
-                Sandbox {
-                    id: "sbx-test".into(),
-                    provider_id: "prv-test".into(),
-                    ..Sandbox::default()
-                },
-            );
-            state.providers.insert(
-                "prv-test".into(),
-                ProviderRec {
-                    provider: Provider {
-                        id: "prv-test".into(),
-                        ..Provider::default()
-                    },
-                    seen: Instant::now(),
-                    queue: VecDeque::new(),
-                    in_flight: HashMap::new(),
-                    wake: Arc::new(Notify::new()),
-                    host: None,
-                    host_sampled_at: None,
-                    sandbox_stats: HashMap::new(),
-                },
-            );
-        }
-        // The ticket is already past its TTL when the copy is enqueued; the
-        // copy's own bound is what must govern it.
-        insert_blob(&service, "tkt-copy", "tok", now() - 5);
-        let copy = service
-            .start_copy("sbx-test", "tkt-copy", "/work", StreamKind::Upload)
-            .await;
-        assert!(copy.is_ok(), "the copy is enqueued");
-        let expires_at = service.state.lock().blobs["tkt-copy"].expires_at;
-        assert!(
-            expires_at > now(),
-            "enqueueing a copy must extend its ticket's life, expires_at={expires_at}"
-        );
-    }
-
-    /// Every delivery of an exec's work item is counted on the exec record,
-    /// so a redelivery — the attempt that must never become a second
-    /// execution — is recorded where the exec lives. (Re-execution itself is
-    /// fenced by the agent's durable started-set; see `agent.rs`.)
-    #[tokio::test]
-    async fn exec_deliveries_are_counted_on_the_exec_record() {
-        let mut config = ServiceConfig::new();
-        config.delivery_timeout = Duration::from_millis(50);
-        let service = Service::open(crate::store::open("memory:").await.unwrap(), config)
-            .await
-            .unwrap();
-        let digest = format!("sha256:{}", "0".repeat(64));
-        service
-            .put_template(TemplateSpec {
-                name: "alpine".into(),
-                os: "linux".into(),
-                artifacts: vec![Artifact {
-                    format: Artifact::OCI_IMAGE.into(),
-                    arch: std::env::consts::ARCH.into(),
-                    r#ref: format!("ghcr.io/preloop/alpine@{digest}"),
-                    digest,
-                    ..Artifact::default()
-                }],
-                ..TemplateSpec::default()
-            })
-            .await
-            .unwrap();
-        let provider = service
-            .register(RegisterRequest {
-                name: "manual".into(),
-                drivers: vec![DriverInfo {
-                    driver: "fake".into(),
-                    capabilities: crate::drivers::fake::FakeDriver::full_capabilities().into(),
-                    ..DriverInfo::default()
-                }],
-                protocol_version: crate::PROTOCOL_VERSION,
-                ..RegisterRequest::default()
-            })
-            .await
-            .unwrap();
-        async fn poll_work(service: &Service, provider: &RegisterResponse) -> Vec<WorkItem> {
-            service
-                .poll(PollRequest {
-                    provider_id: provider.provider_id.clone(),
-                    generation: provider.generation,
-                    wait_secs: 0,
-                    ..PollRequest::default()
-                })
-                .await
-                .unwrap()
-                .work
-        }
-        // Provision one sandbox by hand (no agent): queue the create,
-        // report it, then pick the lease up with the same key.
-        let error = service
-            .acquire(AcquireRequest {
-                idempotency_key: "k".into(),
-                template: "alpine".into(),
-                wait_secs: Some(0),
-                ..AcquireRequest::default()
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, Code::DeadlineExceeded);
-        let create = poll_work(&service, &provider).await;
-        assert_eq!(create.len(), 1);
-        service
-            .report(ReportRequest {
-                provider_id: provider.provider_id.clone(),
-                generation: provider.generation,
-                work_id: create[0].id.clone(),
-                ok: true,
-                native_ref: "psbx-unit-1".into(),
-                error: String::new(),
-                ..ReportRequest::default()
-            })
-            .await
-            .unwrap();
-        let lease = service
-            .acquire(AcquireRequest {
-                idempotency_key: "k".into(),
-                template: "alpine".into(),
-                ..AcquireRequest::default()
-            })
-            .await
-            .unwrap();
-        let _stream = service
-            .exec(ExecRequest {
-                sandbox_id: lease.sandbox.id.clone(),
-                lease_id: lease.lease.id.clone(),
-                argv: vec!["true".into()],
-                ..ExecRequest::default()
-            })
-            .unwrap();
-        let delivered = poll_work(&service, &provider).await;
-        assert_eq!(delivered.len(), 1);
-        let exec_id = match delivered[0].work.as_ref().expect("exec work") {
-            work_item::Work::Exec(exec) => exec.exec_id.clone(),
-            other => panic!("expected exec work, got {other:?}"),
-        };
-        let attempts = |service: &Service| service.state.lock().execs[&exec_id].attempts;
-        assert_eq!(attempts(&service), 1, "the first delivery is attempt 1");
-        // The report never arrives; past the visibility timeout the work
-        // is delivered again and the record shows the second attempt.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let redelivered = poll_work(&service, &provider).await;
-        assert_eq!(redelivered.len(), 1);
-        assert_eq!(redelivered[0].id, delivered[0].id, "same work, redelivered");
-        assert_eq!(attempts(&service), 2, "the redelivery is attempt 2");
-    }
-
-    fn ready_member(id: &str, created_at: i64) -> Sandbox {
-        Sandbox {
-            id: id.into(),
-            template: "alpine".into(),
-            pool: "p".into(),
-            state: SandboxState::Ready.into(),
-            created_at,
-            ..Sandbox::default()
-        }
-    }
-
-    fn with_current_pool_revision(state: &State, sandbox: &mut Sandbox) {
-        if let Some(pool) = state.pools.get(&sandbox.pool) {
-            sandbox.pool_revision = pool_revision(state, pool);
-        }
-    }
-
-    #[tokio::test]
-    async fn warm_members_rotate_oldest_first() {
-        let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
-            .await
-            .unwrap();
-        {
-            let mut state = service.state.lock();
-            state.templates.insert(
-                "alpine".into(),
-                Template {
-                    spec: TemplateSpec {
-                        name: "alpine".into(),
-                        ..TemplateSpec::default()
-                    }
-                    .into(),
-                    ..Template::default()
-                },
-            );
-            state.pools.insert(
-                "p".into(),
-                PoolSpec {
-                    name: "p".into(),
-                    template: "alpine".into(),
-                    ..PoolSpec::default()
-                },
-            );
-            // Insert the newer member first: map order must not decide.
-            let mut newer = ready_member("sbx-newer", 200);
-            with_current_pool_revision(&state, &mut newer);
-            state.sandboxes.insert("sbx-newer".into(), newer);
-            let mut older = ready_member("sbx-older", 100);
-            with_current_pool_revision(&state, &mut older);
-            state.sandboxes.insert("sbx-older".into(), older);
-        }
-        let first = service
-            .acquire(AcquireRequest {
-                idempotency_key: "k1".into(),
-                pool: "p".into(),
-                ..AcquireRequest::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(first.sandbox.id, "sbx-older");
-        let second = service
-            .acquire(AcquireRequest {
-                idempotency_key: "k2".into(),
-                pool: "p".into(),
-                ..AcquireRequest::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(second.sandbox.id, "sbx-newer");
-        // Equal ages break the tie by id.
-        {
-            let mut state = service.state.lock();
-            let mut y = ready_member("sbx-y", 300);
-            with_current_pool_revision(&state, &mut y);
-            state.sandboxes.insert("sbx-y".into(), y);
-            let mut x = ready_member("sbx-x", 300);
-            with_current_pool_revision(&state, &mut x);
-            state.sandboxes.insert("sbx-x".into(), x);
-        }
-        let third = service
-            .acquire(AcquireRequest {
-                idempotency_key: "k3".into(),
-                pool: "p".into(),
-                ..AcquireRequest::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(third.sandbox.id, "sbx-x");
-    }
-
-    #[tokio::test]
-    async fn an_empty_ticket_token_never_authorizes() {
-        let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
-            .await
-            .unwrap();
-        let (tx, rx) = mpsc::channel(TRANSFER_QUEUE);
-        let (status, _) = watch::channel(TransferStatus::Open);
-        service.state.lock().blobs.insert(
-            "tkt-internal".into(),
-            Blob {
-                sandbox_id: String::new(),
-                kind: StreamKind::Download,
-                guest_path: "/work".into(),
-                token: String::new(),
-                expires_at: now() + 60,
-                producer_claimed: false,
-                consumer_claimed: false,
-                status,
-                control: Some(tx.clone()),
-                tx: Some(tx),
-                rx: Some(rx),
-            },
-        );
-        let error = service
-            .claim_caller("tkt-internal", "", TransferSide::Consumer)
-            .unwrap_err();
-        assert_eq!(error.code, Code::Unauthenticated);
-    }
-
-    async fn enrollment_service() -> (Arc<Service>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let ca = Arc::new(
-            crate::tls::ServiceCa::load_or_create(&dir.path().join("ca")).expect("service CA"),
-        );
-        let mut config = ServiceConfig::new();
-        config.ca = Some(ca);
-        let service = Service::open(crate::store::open("memory:").await.unwrap(), config)
-            .await
-            .unwrap();
-        (service, dir)
-    }
-
-    fn enroll_request(token: &str, csr_pem: &str) -> EnrollRequest {
-        EnrollRequest {
-            token: token.to_owned(),
-            name: "host-a".into(),
-            csr_pem: csr_pem.to_owned(),
-            ..EnrollRequest::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn a_used_join_token_is_forgotten_at_expiry() {
-        let (service, _dir) = enrollment_service().await;
-        let token = service
-            .create_join_token(Duration::from_secs(60), "")
-            .await
-            .unwrap()
-            .token;
-        let (_key, csr) = crate::tls::generate_csr("host-a").unwrap();
-
-        let first = service.enroll(enroll_request(&token, &csr)).await.unwrap();
-        assert_eq!(service.state.lock().used_join_tokens.len(), 1);
-        // While the token's TTL lasts, the same request gets the same cert.
-        let second = service.enroll(enroll_request(&token, &csr)).await.unwrap();
-        assert_eq!(first.cert_pem, second.cert_pem);
-
-        // Expire the record; maintenance drops it, so the retry falls back
-        // to "unknown or used" and the memory does not grow.
-        let id = crate::tls::parse_join_token(&token).unwrap().id.to_owned();
-        service
-            .state
-            .lock()
-            .used_join_tokens
-            .get_mut(&id)
-            .expect("used record")
-            .expires_at = 0;
-        service.maintain().await;
-        assert!(service.state.lock().used_join_tokens.is_empty());
-        let error = service
-            .enroll(enroll_request(&token, &csr))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, Code::Unauthenticated);
-    }
 }

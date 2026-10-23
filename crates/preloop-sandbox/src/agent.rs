@@ -72,7 +72,7 @@ impl ProviderLink for Arc<Service> {
         Service::register(self, request).await
     }
     async fn heartbeat(&self, request: HeartbeatRequest) -> Result<()> {
-        Service::heartbeat(self, request)
+        Service::heartbeat(self, request).await
     }
     async fn poll(&self, request: PollRequest) -> Result<PollResponse> {
         Service::poll(self, request).await
@@ -91,12 +91,14 @@ impl ProviderLink for Arc<Service> {
         id: &Session,
         ticket: &str,
     ) -> Result<mpsc::Receiver<TransferChunk>> {
-        let mut claim = self.claim_agent(
-            &id.provider_id,
-            id.generation,
-            ticket,
-            crate::service::TransferSide::Consumer,
-        )?;
+        let mut claim = self
+            .claim_agent(
+                &id.provider_id,
+                id.generation,
+                ticket,
+                crate::service::TransferSide::Consumer,
+            )
+            .await?;
         self.wait_peer(&mut claim).await?;
         claim
             .take_consumer()
@@ -108,12 +110,14 @@ impl ProviderLink for Arc<Service> {
         ticket: &str,
         mut tar: mpsc::Receiver<TransferChunk>,
     ) -> Result<()> {
-        let mut claim = self.claim_agent(
-            &id.provider_id,
-            id.generation,
-            ticket,
-            crate::service::TransferSide::Producer,
-        )?;
+        let mut claim = self
+            .claim_agent(
+                &id.provider_id,
+                id.generation,
+                ticket,
+                crate::service::TransferSide::Producer,
+            )
+            .await?;
         self.wait_peer(&mut claim).await?;
         let Some(tx) = claim.take_producer() else {
             return Err(Error::internal("download ticket has no producer side"));
@@ -139,7 +143,7 @@ impl ProviderLink for Arc<Service> {
                 Err(Error::unavailable(reason))
             }
             None => {
-                self.finish_ticket(ticket);
+                self.finish_ticket(ticket).await;
                 Ok(())
             }
         }
@@ -795,7 +799,14 @@ pub struct Agent {
     active: Mutex<HashMap<String, Instant>>,
     permits: Arc<Semaphore>,
     /// Delivered work by id, so redelivery is not re-executed.
-    work: tokio::sync::Mutex<HashMap<String, (WorkState, Instant)>>,
+    work: tokio::sync::Mutex<HashMap<String, (WorkState, Instant, u64)>>,
+    /// The session the agent last registered. A fenced session that
+    /// re-registers keeps the work it already accepted, and its reports move
+    /// to the new generation instead of dying with the old one.
+    current_session: tokio::sync::Mutex<Option<Session>>,
+    /// Process-wide shutdown. Accepted work outlives a fenced session; only
+    /// the process going away cancels it.
+    work_stop: tokio::sync::Mutex<Option<CancellationToken>>,
 }
 
 impl Agent {
@@ -847,6 +858,8 @@ impl Agent {
             active: Mutex::new(HashMap::new()),
             permits,
             work: tokio::sync::Mutex::new(HashMap::new()),
+            current_session: tokio::sync::Mutex::new(None),
+            work_stop: tokio::sync::Mutex::new(None),
         }))
     }
 
@@ -882,6 +895,7 @@ impl Agent {
     /// fence its own in-flight work). After that session ends the agent
     /// registers again.
     pub async fn run(self: Arc<Self>, initial: Option<Session>, shutdown: CancellationToken) {
+        *self.work_stop.lock().await = Some(shutdown.clone());
         let mut backoff = REGISTER_BACKOFF_MIN;
         let mut pending = initial;
         while !shutdown.is_cancelled() {
@@ -904,6 +918,7 @@ impl Agent {
                 },
             };
             info!(provider = %session.provider_id, generation = session.generation, "agent registered");
+            *self.current_session.lock().await = Some(session.clone());
             backoff = REGISTER_BACKOFF_MIN;
             let error = self.clone().session(session, shutdown.clone()).await;
             if let Some(error) = error {
@@ -924,6 +939,15 @@ impl Agent {
         shutdown: CancellationToken,
     ) -> Option<Error> {
         let stop = shutdown.child_token();
+        // Polling, heartbeat and reconcile die with the session. Accepted
+        // work does not: it reports through whatever session is current and
+        // stops only when the process does.
+        let work_stop = self
+            .work_stop
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| stop.clone());
         let heartbeat = {
             let agent = self.clone();
             let session = session.clone();
@@ -981,7 +1005,8 @@ impl Agent {
                 Ok(response) => {
                     backoff = self.config.retry_backoff;
                     for item in response.work {
-                        self.dispatch(session.clone(), stop.clone(), item).await;
+                        self.dispatch(session.clone(), work_stop.clone(), item)
+                            .await;
                     }
                 }
                 Err(error) if fenced(&error) => {
@@ -1012,11 +1037,22 @@ impl Agent {
         let previous = {
             let mut work = self.work.lock().await;
             prune_work(&mut work);
-            match work.get(&work_id) {
-                Some((WorkState::Running, _)) => Some(None),
-                Some((WorkState::Done(outcome), _)) => Some(Some(outcome.clone())),
+            match work.get_mut(&work_id) {
+                Some((WorkState::Running, _, current)) => {
+                    // A redelivery while the command is still running: adopt
+                    // the newer delivery identity without re-executing it.
+                    *current = item.attempt;
+                    Some(None)
+                }
+                Some((WorkState::Done(outcome), _, current)) => {
+                    *current = item.attempt;
+                    Some(Some(outcome.clone()))
+                }
                 None => {
-                    work.insert(work_id.clone(), (WorkState::Running, Instant::now()));
+                    work.insert(
+                        work_id.clone(),
+                        (WorkState::Running, Instant::now(), item.attempt),
+                    );
                     None
                 }
             }
@@ -1223,7 +1259,8 @@ impl Agent {
     /// service acknowledges it (or fences this session).
     async fn handle(self: Arc<Self>, session: Session, stop: CancellationToken, item: WorkItem) {
         let work_id = item.id.clone();
-        let outcome = WorkOutcome::from_result(self.run_work(&session, &stop, item).await);
+        let outcome =
+            WorkOutcome::from_result(self.run_work(&session, &stop, &work_id, item).await);
         if !outcome.ok {
             warn!(%work_id, error = %outcome.error, "work failed");
         }
@@ -1235,12 +1272,70 @@ impl Agent {
 
         {
             let mut work = self.work.lock().await;
+            let attempt = work
+                .get(&work_id)
+                .map(|(_, _, attempt)| *attempt)
+                .unwrap_or(0);
             work.insert(
                 work_id.clone(),
-                (WorkState::Done(outcome.clone()), Instant::now()),
+                (WorkState::Done(outcome.clone()), Instant::now(), attempt),
             );
         }
         self.report_work(&session, &stop, work_id, &outcome).await;
+    }
+
+    /// The session reports should carry right now.
+    ///
+    /// A fenced session that re-registers keeps the work it already accepted;
+    /// the next report belongs to the new generation. A process that did not
+    /// re-register (for example, a stale agent replaced by another process
+    /// with the same provider name) keeps its old generation and is fenced by
+    /// the service, which is the point of the fence.
+    async fn session_now(&self, fallback: &Session) -> Session {
+        self.current_session
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    /// Wait, bounded, for the run loop to publish a newer registration.
+    ///
+    /// A fence aborts the old session's calls, but accepted work keeps
+    /// going through the re-registration: reporting again under the stale
+    /// generation cannot work, so wait for the new one. `None` means the
+    /// process is stopping or no newer session appeared (for example the
+    /// provider was deleted, so re-registration never succeeds).
+    async fn await_new_session(
+        &self,
+        stale: &Session,
+        stop: &CancellationToken,
+    ) -> Option<Session> {
+        let started = Instant::now();
+        loop {
+            if let Some(current) = self.current_session.lock().await.clone()
+                && current.generation != stale.generation
+            {
+                return Some(current);
+            }
+            if stop.is_cancelled() || started.elapsed() > Duration::from_secs(15) {
+                return None;
+            }
+            tokio::select! {
+                _ = stop.cancelled() => return None,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
+    /// The latest delivery attempt observed for one work id.
+    async fn current_attempt(&self, work_id: &str) -> u64 {
+        self.work
+            .lock()
+            .await
+            .get(work_id)
+            .map(|(_, _, attempt)| *attempt)
+            .unwrap_or(0)
     }
 
     /// Retry `Report` until the service acknowledges it; stop when fenced.
@@ -1251,14 +1346,20 @@ impl Agent {
         work_id: String,
         outcome: &WorkOutcome,
     ) {
+        let mut session = self.session_now(session).await;
         let mut backoff = self.config.retry_backoff;
         loop {
+            // A re-registration may have finished while the last attempt was
+            // in flight: report under the newest session, not the stale one.
+            session = self.session_now(&session).await;
+            let attempt = self.current_attempt(&work_id).await;
             match self
                 .link
                 .report(ReportRequest {
                     provider_id: session.provider_id.clone(),
                     generation: session.generation,
                     work_id: work_id.clone(),
+                    attempt,
                     ok: outcome.ok,
                     error: outcome.error.clone(),
                     native_ref: outcome.native_ref.clone(),
@@ -1268,6 +1369,12 @@ impl Agent {
             {
                 Ok(()) => return,
                 Err(error) if fenced(&error) => {
+                    if error.code == Code::Aborted
+                        && let Some(next) = self.await_new_session(&session, stop).await
+                    {
+                        session = next;
+                        continue;
+                    }
                     debug!(%work_id, %error, "report stopped");
                     return;
                 }
@@ -1294,6 +1401,7 @@ impl Agent {
         &self,
         session: &Session,
         stop: &CancellationToken,
+        work_id: &str,
         item: WorkItem,
     ) -> Result<String> {
         // Record activity before running: a slow exec is exactly the
@@ -1356,7 +1464,20 @@ impl Agent {
                     // duplicate run the record exists to prevent.
                     Err(error) => return Err(error),
                 }
-                self.run_exec(session, stop, *exec).await?;
+                // Claim the durable start gate before the guest command runs.
+                // One start claim wins; a later delivery that tries to start
+                // the same exec again is fenced instead of re-run.
+                if !self.start_exec(session, stop, &exec.exec_id, work_id).await {
+                    return Err(Error::new(
+                        Code::Aborted,
+                        format!(
+                            "exec {} was already started by an earlier delivery; refusing to \
+                             run it twice",
+                            exec.exec_id
+                        ),
+                    ));
+                }
+                self.run_exec(session, stop, work_id, *exec).await?;
                 Ok(String::new())
             }
             work_item::Work::Copy(copy) => {
@@ -1421,6 +1542,7 @@ impl Agent {
         &self,
         session: &Session,
         stop: &CancellationToken,
+        work_id: &str,
         exec: ExecWork,
     ) -> Result<()> {
         let driver = self.driver(&exec.target.driver)?;
@@ -1448,7 +1570,7 @@ impl Agent {
                     Ok(next) => next,
                     Err(_) => {
                         caller_gone |= !self
-                            .flush(session, stop, &exec_id, &mut sequence, &mut batch)
+                            .flush(session, stop, work_id, &exec_id, &mut sequence, &mut batch)
                             .await;
                         size = 0;
                         continue;
@@ -1464,7 +1586,7 @@ impl Agent {
             batch.push(event);
             if size >= 64 * 1024 {
                 caller_gone |= !self
-                    .flush(session, stop, &exec_id, &mut sequence, &mut batch)
+                    .flush(session, stop, work_id, &exec_id, &mut sequence, &mut batch)
                     .await;
                 size = 0;
             }
@@ -1479,10 +1601,63 @@ impl Agent {
             .map_err(|e| Error::internal(format!("exec task: {e}")))??;
         batch.push(ExecEvent::exit(code));
         if !caller_gone {
-            self.flush(session, stop, &exec_id, &mut sequence, &mut batch)
+            self.flush(session, stop, work_id, &exec_id, &mut sequence, &mut batch)
                 .await;
         }
         Ok(())
+    }
+
+    /// Claim the durable execution start gate before the guest command runs.
+    ///
+    /// The first empty `ReportExec` for an exec records that this delivery
+    /// started it; a redelivery after that point is refused by the service
+    /// instead of executing the command twice. The call is retried while the
+    /// failure is transient, so a lost acknowledgement does not stop a
+    /// command that is about to run.
+    async fn start_exec(
+        &self,
+        session: &Session,
+        stop: &CancellationToken,
+        exec_id: &str,
+        work_id: &str,
+    ) -> bool {
+        let mut session = self.session_now(session).await;
+        let mut backoff = self.config.retry_backoff;
+        loop {
+            session = self.session_now(&session).await;
+            let attempt = self.current_attempt(work_id).await;
+            match self
+                .link
+                .report_exec(ReportExecRequest {
+                    provider_id: session.provider_id.clone(),
+                    generation: session.generation,
+                    exec_id: exec_id.to_owned(),
+                    events: Vec::new(),
+                    sequence: 0,
+                    attempt,
+                    ..ReportExecRequest::default()
+                })
+                .await
+            {
+                Ok(()) => return true,
+                Err(error) if fenced(&error) => {
+                    if error.code == Code::Aborted
+                        && let Some(next) = self.await_new_session(&session, stop).await
+                    {
+                        session = next;
+                        continue;
+                    }
+                    return false;
+                }
+                Err(error) => {
+                    debug!(exec_id, %error, "exec start not accepted; retrying");
+                    if !self.wait_backoff(stop, backoff).await {
+                        return false;
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_CAP);
+                }
+            }
+        }
     }
 
     /// Report one batch, retrying until it is applied or the service fences
@@ -1491,6 +1666,7 @@ impl Agent {
         &self,
         session: &Session,
         stop: &CancellationToken,
+        work_id: &str,
         exec_id: &str,
         sequence: &mut u64,
         batch: &mut Vec<ExecEvent>,
@@ -1498,11 +1674,16 @@ impl Agent {
         if batch.is_empty() {
             return true;
         }
+        let mut session = self.session_now(session).await;
         *sequence += 1;
         let sequence = *sequence;
         let events = std::mem::take(batch);
         let mut backoff = self.config.retry_backoff;
         loop {
+            // The session may have re-registered between batches or while a
+            // failed attempt was backing off; always report under the newest.
+            session = self.session_now(&session).await;
+            let attempt = self.current_attempt(work_id).await;
             match self
                 .link
                 .report_exec(ReportExecRequest {
@@ -1511,12 +1692,19 @@ impl Agent {
                     exec_id: exec_id.to_owned(),
                     events: events.clone(),
                     sequence,
+                    attempt,
                     ..ReportExecRequest::default()
                 })
                 .await
             {
                 Ok(()) => return true,
                 Err(error) if fenced(&error) => {
+                    if error.code == Code::Aborted
+                        && let Some(next) = self.await_new_session(&session, stop).await
+                    {
+                        session = next;
+                        continue;
+                    }
                     debug!(exec_id, %error, "exec output stopped");
                     return false;
                 }
@@ -1582,8 +1770,8 @@ fn cap_heartbeat_sandboxes(
 }
 
 /// Forget completed work ids after [`DONE_RETENTION`]; running ones stay.
-fn prune_work(work: &mut HashMap<String, (WorkState, Instant)>) {
-    work.retain(|_, (state, at)| match state {
+fn prune_work(work: &mut HashMap<String, (WorkState, Instant, u64)>) {
+    work.retain(|_, (state, at, _)| match state {
         WorkState::Running => true,
         WorkState::Done(_) => at.elapsed() < DONE_RETENTION,
     });
