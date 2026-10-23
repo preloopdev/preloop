@@ -859,6 +859,7 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
     assert_eq!(
         h.service
             .get(&lease.sandbox.id, &lease.lease.id)
+            .await
             .unwrap()
             .state,
         SandboxState::Preserved
@@ -2011,7 +2012,7 @@ async fn stop_and_start_round_trip_a_sandbox() {
     assert_eq!(error.code, Code::FailedPrecondition);
     assert!(message(&error).contains("stopped"), "{}", message(&error));
     assert_eq!(
-        h.service.get(&id, &lease_id).unwrap().state,
+        h.service.get(&id, &lease_id).await.unwrap().state,
         SandboxState::Stopped
     );
     // A stopped sandbox keeps its lease, so a golden can be packed and
@@ -2019,10 +2020,10 @@ async fn stop_and_start_round_trip_a_sandbox() {
     h.service.start(&id, &lease_id, true).await.unwrap();
     assert_eq!(exec(vec!["true".into()]).await.unwrap().0, 0);
     assert_eq!(
-        h.service.get(&id, &lease_id).unwrap().state,
+        h.service.get(&id, &lease_id).await.unwrap().state,
         SandboxState::Leased
     );
-    assert_eq!(h.service.list().len(), 1);
+    assert_eq!(h.service.list().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -2072,7 +2073,11 @@ async fn reconcile_never_destroys_another_providers_machine() {
         response.destroy
     );
     assert_eq!(
-        h.service.get(&sandbox_id, &lease.lease.id).unwrap().state,
+        h.service
+            .get(&sandbox_id, &lease.lease.id)
+            .await
+            .unwrap()
+            .state,
         SandboxState::Leased
     );
 
@@ -2343,7 +2348,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
         .unwrap();
     let sandbox_id = a.sandbox.id.clone();
     for lease_id in ["", b.lease.id.as_str()] {
-        let get = h.service.get(&sandbox_id, lease_id).unwrap_err();
+        let get = h.service.get(&sandbox_id, lease_id).await.unwrap_err();
         assert_eq!(get.code, Code::PermissionDenied, "{get}");
         let exec = h
             .service
@@ -2396,7 +2401,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
     // The holder still works, and an unknown sandbox is not found (never a
     // permission hint about another tenant).
     assert_eq!(
-        h.service.get(&sandbox_id, &a.lease.id).unwrap().id,
+        h.service.get(&sandbox_id, &a.lease.id).await.unwrap().id,
         sandbox_id
     );
     assert_eq!(
@@ -2412,7 +2417,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
             .0,
         0
     );
-    let missing = h.service.get("sbx-missing", &a.lease.id).unwrap_err();
+    let missing = h.service.get("sbx-missing", &a.lease.id).await.unwrap_err();
     assert_eq!(missing.code, Code::NotFound, "{missing}");
     h.service
         .release(ReleaseRequest {
@@ -3607,7 +3612,7 @@ async fn list_pagination_round_trips_across_250_items() {
     };
     let mut names = Vec::new();
     loop {
-        let page = service.list_templates_page(&request).unwrap();
+        let page = service.list_templates_page(&request).await.unwrap();
         assert!(page.templates.len() <= 100);
         names.extend(page.templates.into_iter().map(|t| t.spec.name.clone()));
         if page.next_page_token.is_empty() {
@@ -3629,6 +3634,7 @@ async fn list_pagination_round_trips_across_250_items() {
             page_token: "bm90LWEtc2FuZGJveA".into(),
             ..ListRequest::default()
         })
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument, "{}", message(&error));
 
@@ -3639,6 +3645,7 @@ async fn list_pagination_round_trips_across_250_items() {
             page_token: String::new(),
             ..ListRequest::default()
         })
+        .await
         .unwrap()
         .next_page_token;
     let error = service
@@ -3647,6 +3654,7 @@ async fn list_pagination_round_trips_across_250_items() {
             page_token: foreign,
             ..ListRequest::default()
         })
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument, "{}", message(&error));
 
@@ -3709,6 +3717,8 @@ async fn restart_fences_the_agent_and_it_re_registers() {
     assert_eq!(error.code, Code::Aborted, "{}", message(&error));
     let bumped = restored
         .list_providers()
+        .await
+        .unwrap()
         .into_iter()
         .find(|provider| provider.id == provider_id)
         .expect("the provider row survives the restart");
@@ -3725,6 +3735,8 @@ async fn restart_fences_the_agent_and_it_re_registers() {
     let re_registered = h
         .service
         .list_providers()
+        .await
+        .unwrap()
         .into_iter()
         .find(|provider| provider.id == provider_id)
         .expect("the re-registered agent keeps its provider id");
@@ -3799,7 +3811,7 @@ async fn a_creating_record_is_failed_after_restart() {
             .await
             .unwrap_err();
         assert_eq!(error.code, Code::DeadlineExceeded);
-        let sandboxes = service.list();
+        let sandboxes = service.list().await.unwrap();
         assert_eq!(sandboxes.len(), 1);
         assert_eq!(sandboxes[0].state, SandboxState::Provisioning);
         sandboxes[0].id.clone()
