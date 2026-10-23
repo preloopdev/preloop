@@ -202,13 +202,6 @@ fn row_count(db: &std::path::Path, sql: &str) -> i64 {
     connection.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
-/// Run statements against a file-backed SQLite store, outside the backend.
-fn execute_sql(db: &std::path::Path, sql: &str) {
-    let connection = rusqlite::Connection::open(db).unwrap();
-    connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-    connection.execute_batch(sql).unwrap();
-}
-
 /// Run one statement bound to a single text parameter, outside the backend.
 fn execute_bound(db: &std::path::Path, sql: &str, value: &str) {
     let connection = rusqlite::Connection::open(db).unwrap();
@@ -3824,6 +3817,8 @@ async fn a_creating_record_is_failed_after_restart() {
     .unwrap();
     let sandbox = restored
         .list()
+        .await
+        .unwrap()
         .into_iter()
         .find(|sandbox| sandbox.id == sandbox_id)
         .expect("the creating record survives the restart");
@@ -3936,7 +3931,7 @@ async fn release_until_tombstoned(h: &Harness, lease_id: &str, sandbox_id: &str)
         })
         .await
         .unwrap();
-    let provider = h.service.list_providers().remove(0);
+    let provider = h.service.list_providers().await.unwrap().remove(0);
     for _ in 0..200 {
         let sandboxes = h.fake.inventory().await.unwrap();
         h.service
@@ -4107,7 +4102,7 @@ async fn a_destroy_that_fails_three_times_leaves_the_machine_reclaimable_after_r
         "the restarted agent reclaims the machine"
     );
     // Once the provider no longer reports the machine, the tombstone is done.
-    let provider = h.service.list_providers().remove(0);
+    let provider = h.service.list_providers().await.unwrap().remove(0);
     let sandboxes = h.fake.inventory().await.unwrap();
     h.service
         .reconcile(ReconcileRequest {
@@ -4119,7 +4114,7 @@ async fn a_destroy_that_fails_three_times_leaves_the_machine_reclaimable_after_r
         .await
         .unwrap();
     assert!(
-        sandbox_record(&h, &sandbox_id).is_none(),
+        sandbox_record(&h, &sandbox_id).await.is_none(),
         "the tombstone is removed once its machine is gone"
     );
 }
@@ -4141,7 +4136,7 @@ async fn a_tombstoned_machine_is_reclaimed_when_reported_without_its_id() {
         .await
         .unwrap();
     release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
-    let provider = h.service.list_providers().remove(0);
+    let provider = h.service.list_providers().await.unwrap().remove(0);
     let response = h
         .service
         .reconcile(ReconcileRequest {
@@ -4216,7 +4211,7 @@ async fn a_tombstone_is_not_reaped_by_another_provider() {
         response.destroy
     );
     assert_eq!(
-        sandbox_record(&h, &lease.sandbox.id).unwrap().state,
+        sandbox_record(&h, &lease.sandbox.id).await.unwrap().state,
         SandboxState::Gone,
         "the owning provider still holds the tombstone"
     );
@@ -4470,9 +4465,10 @@ async fn renew_on_a_failed_sandbox_is_rejected() {
     // The machine disappears behind the service's back; the reconcile fails
     // the record but the caller still holds its lease.
     h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .get(&lease.sandbox.id, &lease.lease.id)
+            .await
             .is_ok_and(|sandbox| sandbox.state == SandboxState::Failed)
     })
     .await;
@@ -5020,7 +5016,7 @@ async fn dropping_an_exec_stream_cancels_the_command() {
     // Let the work reach the agent, then walk away.
     tokio::time::sleep(Duration::from_millis(200)).await;
     drop(stream);
-    wait_for(|| h.fake.cancel_calls.load(Ordering::Acquire) > 0).await;
+    wait_for(|| async { h.fake.cancel_calls.load(Ordering::Acquire) > 0 }).await;
     // The sandbox is still usable: the dropped exec left no state behind.
     let (code, _, _) = h
         .service
@@ -5172,7 +5168,7 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
     // Let the work reach the agent, then walk away while the service lives.
     tokio::time::sleep(Duration::from_millis(300)).await;
     drop(stream);
-    wait_for(|| fake.cancel_calls.load(Ordering::Acquire) > 0).await;
+    wait_for(|| async { fake.cancel_calls.load(Ordering::Acquire) > 0 }).await;
     // The sandbox is still usable: the dropped exec left no state behind.
     let (code, _, _) = client
         .exec_collect(ExecRequest {
@@ -5287,6 +5283,7 @@ async fn preserve_release_keeps_paused_and_stopped_sandboxes() {
     let kept = h
         .service
         .get(&stopped.sandbox.id, &stopped.lease.id)
+        .await
         .unwrap();
     assert_eq!(kept.state, SandboxState::Stopped);
     // The machine stayed stopped: it must be started before it executes.
@@ -5324,7 +5321,11 @@ async fn preserve_release_keeps_paused_and_stopped_sandboxes() {
         .await
         .unwrap();
     preserve(paused.lease.id.clone()).await.unwrap();
-    let kept = h.service.get(&paused.sandbox.id, &paused.lease.id).unwrap();
+    let kept = h
+        .service
+        .get(&paused.sandbox.id, &paused.lease.id)
+        .await
+        .unwrap();
     assert_eq!(kept.state, SandboxState::Paused);
     h.service
         .resume(&paused.sandbox.id, &paused.lease.id)
@@ -5365,8 +5366,11 @@ async fn preserve_release_from_provisioning_fails_and_changes_nothing() {
     assert!(message(&error).contains("cannot be preserved"));
     // Nothing was destroyed or preserved: the lease and the provisioning
     // sandbox are both still there, and a DESTROY release still works.
-    assert_eq!(service.list().len(), 1);
-    assert_eq!(service.list()[0].state, SandboxState::Provisioning);
+    assert_eq!(service.list().await.unwrap().len(), 1);
+    assert_eq!(
+        service.list().await.unwrap()[0].state,
+        SandboxState::Provisioning
+    );
     service
         .release(ReleaseRequest {
             lease_id,
@@ -5432,7 +5436,7 @@ async fn snapshot_closes_in_flight_execs() {
         message(&error)
     );
     // The provider was told to stop the orphaned command.
-    wait_for(|| {
+    wait_for(|| async {
         h.fake
             .cancel_calls
             .load(std::sync::atomic::Ordering::Acquire)
@@ -5639,8 +5643,10 @@ async fn a_restarted_agent_refuses_to_run_an_exec_twice() {
         })
         .await
         .unwrap();
-    wait_for(|| std::fs::read_to_string(&marker).is_ok_and(|content| content.contains("run")))
-        .await;
+    wait_for(|| async {
+        std::fs::read_to_string(&marker).is_ok_and(|content| content.contains("run"))
+    })
+    .await;
 
     // The agent process dies. (Its session ends here; the orphaned guest
     // command keeps running, and the exec work stays unacknowledged.)
@@ -5883,7 +5889,10 @@ async fn pool_acquire_rejects_template_placement_fields() {
             message(&error)
         );
     }
-    assert!(h.service.list().is_empty(), "nothing was created");
+    assert!(
+        h.service.list().await.unwrap().is_empty(),
+        "nothing was created"
+    );
 }
 
 #[tokio::test]
@@ -5900,10 +5909,14 @@ async fn abandoned_unclaimed_lease_is_released_after_the_unclaimed_ttl() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::DeadlineExceeded);
-    assert_eq!(service.list().len(), 1, "the lease is provisioning");
+    assert_eq!(
+        service.list().await.unwrap().len(),
+        1,
+        "the lease is provisioning"
+    );
     service.maintain().await;
     assert!(
-        service.list().is_empty(),
+        service.list().await.unwrap().is_empty(),
         "the abandoned lease was released"
     );
 }
@@ -5924,14 +5937,18 @@ async fn waiting_acquire_keeps_its_lease_past_the_unclaimed_ttl() {
                 .await
         }
     });
-    wait_for(|| service.list().len() == 1).await;
+    wait_for(|| async { service.list().await.unwrap().len() == 1 }).await;
     service.maintain().await;
-    assert_eq!(service.list().len(), 1, "a waiting caller keeps its lease");
+    assert_eq!(
+        service.list().await.unwrap().len(),
+        1,
+        "a waiting caller keeps its lease"
+    );
     handle.abort();
     let _ = handle.await;
     service.maintain().await;
     assert!(
-        service.list().is_empty(),
+        service.list().await.unwrap().is_empty(),
         "once no caller waits the lease expires"
     );
 }
@@ -6175,14 +6192,16 @@ async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
         })
         .await
         .unwrap();
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .list()
+            .await
+            .unwrap()
             .iter()
             .any(|s| s.pool == "p" && s.state == SandboxState::Ready)
     })
     .await;
-    let idle = h.service.list()[0].clone();
+    let idle = h.service.list().await.unwrap()[0].clone();
     // Idle members carry no lease: without the capability there is nothing
     // to pause, so an unleased caller is refused outright.
     let error = h.service.pause(&idle.id, "").await.unwrap_err();
@@ -6200,7 +6219,7 @@ async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
         })
         .await
         .unwrap();
-    let paused = h.service.get(&id, &lease.lease.id).unwrap();
+    let paused = h.service.get(&id, &lease.lease.id).await.unwrap();
     assert_eq!(
         paused.state,
         SandboxState::Paused,
@@ -6208,7 +6227,7 @@ async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
     );
     assert!(paused.preserve_until > unix_now());
     h.service.resume(&id, &lease.lease.id).await.unwrap();
-    let resumed = h.service.get(&id, &lease.lease.id).unwrap();
+    let resumed = h.service.get(&id, &lease.lease.id).await.unwrap();
     assert_eq!(
         resumed.state,
         SandboxState::Preserved,
@@ -6217,7 +6236,7 @@ async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
     assert!(resumed.preserve_until > unix_now());
     h.service.maintain().await;
     assert_eq!(
-        h.service.get(&id, &lease.lease.id).unwrap().state,
+        h.service.get(&id, &lease.lease.id).await.unwrap().state,
         SandboxState::Preserved,
         "the preserved member must not be swept before its deadline"
     );
@@ -6252,6 +6271,7 @@ async fn paused_and_stopped_debug_sandboxes_expire_from_the_preserve_window() {
     assert_eq!(
         h.service
             .get(&paused.sandbox.id, &paused.lease.id)
+            .await
             .unwrap()
             .state,
         SandboxState::Paused
@@ -6275,6 +6295,7 @@ async fn paused_and_stopped_debug_sandboxes_expire_from_the_preserve_window() {
     assert_eq!(
         h.service
             .get(&stopped.sandbox.id, &stopped.lease.id)
+            .await
             .unwrap()
             .state,
         SandboxState::Stopped
@@ -6282,10 +6303,17 @@ async fn paused_and_stopped_debug_sandboxes_expire_from_the_preserve_window() {
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
     h.service.maintain().await;
-    wait_for(|| h.service.get(&paused.sandbox.id, &paused.lease.id).is_err()).await;
-    wait_for(|| {
+    wait_for(|| async {
+        h.service
+            .get(&paused.sandbox.id, &paused.lease.id)
+            .await
+            .is_err()
+    })
+    .await;
+    wait_for(|| async {
         h.service
             .get(&stopped.sandbox.id, &stopped.lease.id)
+            .await
             .is_err()
     })
     .await;
@@ -6463,6 +6491,8 @@ async fn a_snapshot_in_flight_reserves_its_source() {
     assert!(
         h.service
             .list_templates()
+            .await
+            .unwrap()
             .iter()
             .all(|t| t.spec.name != "golden")
     );
@@ -6482,14 +6512,16 @@ async fn a_reconfigured_pool_never_serves_an_old_warm_member() {
         })
         .await
         .unwrap();
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .list()
+            .await
+            .unwrap()
             .iter()
             .any(|s| s.state == SandboxState::Ready && s.template == "one")
     })
     .await;
-    let old = h.service.list()[0].id.clone();
+    let old = h.service.list().await.unwrap()[0].id.clone();
 
     // Scaling the pool does not change how members are built.
     h.service
@@ -6503,7 +6535,7 @@ async fn a_reconfigured_pool_never_serves_an_old_warm_member() {
         .unwrap();
     h.service.maintain().await;
     assert!(
-        h.service.list().iter().any(|s| s.id == old),
+        h.service.list().await.unwrap().iter().any(|s| s.id == old),
         "a warm-count change retired the warm member"
     );
 
@@ -6517,15 +6549,17 @@ async fn a_reconfigured_pool_never_serves_an_old_warm_member() {
         .await
         .unwrap();
     h.service.maintain().await;
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .list()
+            .await
+            .unwrap()
             .iter()
             .any(|s| s.state == SandboxState::Ready && s.template == "two")
     })
     .await;
     assert!(
-        h.service.list().iter().all(|s| s.id != old),
+        h.service.list().await.unwrap().iter().all(|s| s.id != old),
         "the old-revision warm member was not retired"
     );
     let lease = h.service.acquire(acquire("k", "p")).await.unwrap();

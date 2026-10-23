@@ -39,11 +39,18 @@ async fn secrets_reach_the_guest_without_entering_argv() {
     );
     tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    while service.list_providers().is_empty() {
+    while service
+        .list_providers()
+        .await
+        .map(|providers| providers.is_empty())
+        .unwrap_or(true)
+    {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let provider_id = service
         .list_providers()
+        .await
+        .unwrap()
         .first()
         .map(|provider| provider.id.clone())
         .expect("agent registered");
@@ -139,11 +146,18 @@ async fn a_packed_artifact_becomes_a_runnable_machine() {
     );
     tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    while service.list_providers().is_empty() {
+    while service
+        .list_providers()
+        .await
+        .map(|providers| providers.is_empty())
+        .unwrap_or(true)
+    {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let provider_id = service
         .list_providers()
+        .await
+        .unwrap()
         .first()
         .map(|provider| provider.id.clone())
         .expect("agent registered");
