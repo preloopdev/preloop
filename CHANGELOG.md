@@ -19,6 +19,14 @@ Releases before v0.27.0 predate the changelog.
   capped at 4 MiB and blob uploads at `PRELOOP_SANDBOX_BLOB_MAX_BYTES`
   (default 8 GiB), with orphaned blobs swept at boot.
 
+### Fixed
+
+- Run guest CA distrust edits and trust-bundle regeneration together as root
+  or through passwordless sudo. Official golden forks execute as `runner`
+  (uid 1001); editing `/etc/ca-certificates.conf` without elevation made
+  provisioning fail before the runner could register. Refused elevation
+  now leaves the configuration unchanged.
+
 ## [0.35.6] - 2026-10-21
 
 ### Added
