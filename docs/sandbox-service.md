@@ -249,13 +249,30 @@ certificate. There is no plaintext mode and no loopback exemption.
   canonicalized, so `..` traversal and symlinks cannot step outside an allowed
   tree. Forks arrive as `Create` work and take the same check. The default is
   empty: deny every host mount and socket until an operator names the prefixes.
-* **Enrollment** is a single-use token:
-  `preloop sandbox token create --ttl 1h` prints
+* **Enrollment** uses a single-use join token:
+  `preloop sandbox token create --ttl 1h --name provider-a` prints
   `plj1.<id>.<secret>.<ca_sha256>` and the store keeps only a hash of the
-  secret. `preloop sandbox agent --join https://hub:9191 --token plj1.…`
-  exchanges it for a 24h certificate and records the leaf's fingerprint on the
-  provider. The agent fetches the service CA first and refuses to send its CSR
-  unless that CA hashes to the token's pin. The identity (`key.pem`, `cert.pem`,
+  secret. The TTL defaults to 1h and is capped at 24h; a larger `--ttl` is
+  rejected with `invalid_argument`. `--name` binds the token to one provider:
+  it enrolls only that name and is the only kind that may re-enroll — replace
+  the certificates of — an existing provider. Without `--name` the token may
+  enroll only a provider name that does not exist yet. A refused binding does
+  not spend the token. `preloop sandbox agent --join https://hub:9191 --token
+  plj1.…` exchanges it for a 24h certificate and records the leaf's
+  fingerprint on the provider. The agent fetches the service CA first and
+  refuses to send its CSR unless that CA hashes to the token's pin.
+  A retry is idempotent until the token expires: the service keeps an
+  in-memory record of the token id, CSR hash, issued certificate and provider
+  name until the token's original expiry, and a repeat with the same token,
+  CSR and name returns that same certificate. The same token with a different
+  CSR or name is refused with `unauthenticated` "join token already used".
+  Maintenance drops the record at expiry, and a service restart loses it
+  (only the token itself is persisted, briefly), so after either a retry
+  fails as it did when tokens were strictly single-shot. The agent persists
+  the key and CSR of an unfinished enrollment (`pending-key.pem`,
+  `pending-csr.pem`, 0600) before its first `Enroll`, retries transient
+  failures with bounded backoff, and removes them once the identity is saved.
+  The identity (`key.pem`, `cert.pem`,
   `ca.pem`, `identity.json`, all 0600) lives under
   `<home>/state/sandbox-identity/`; later starts reuse it with no token.
   `--join` is recorded in `identity.json`, and a restart without it dials that
@@ -266,11 +283,16 @@ certificate. There is no plaintext mode and no loopback exemption.
   rather than retrying the handshake in a loop), and the service logs the
   rejected TLS handshake — or, when the certificate chains to its CA but is not
   enrolled, the rejected RPC with the client certificate's fingerprint.
-  Re-enrolling an existing name with a new token replaces its fingerprints.
+  Re-enrolling an existing name with a token bound to it replaces its
+  fingerprints; an unbound token presented for an existing name is refused and
+  spent nowhere.
 * **Renewal** is automatic: the agent asks for a new certificate once two
   thirds of the lifetime have passed and hot-reloads its client identity. The
-  previous fingerprint stays valid until it expires, so a failure between the
+  previous certificate stays valid until it expires, so a failure between the
   service signing and the agent persisting the new key does not lock it out.
+  At most three certificates are retained (the current one and two
+  predecessors); older ones are pruned on renewal, so rotating can evict a
+  compromised certificate.
 * **Revocation** is `preloop sandbox provider rm <name>`, which deletes the
   provider record and its fingerprints. Its machine records are dropped too:
   once the host cannot authenticate, nothing will ever reconcile them.
@@ -490,7 +512,7 @@ or `preloop sandbox agent` uses only those variables.
 
 ```sh
 preloop sandbox serve --listen 0.0.0.0:9191            # standalone service (+ local SmolVM)
-preloop sandbox token create --ttl 1h                  # join token for a provider
+preloop sandbox token create --ttl 1h --name host-a    # join token bound to one provider
 preloop sandbox agent --join https://hub:9191 --token plj1.…  # enroll, then reuse the identity
 preloop sandbox agent                                         # later starts reuse the stored URL
 preloop sandbox template put --name alpine --artifact \
