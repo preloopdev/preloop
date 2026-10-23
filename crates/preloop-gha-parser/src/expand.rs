@@ -521,29 +521,47 @@ fn resolved_environment(
         Value::Object(values) => values.get("name")?.as_str()?,
         _ => return None,
     };
+    // Only `matrix.*` is knowable at expansion time; substitute every
+    // occurrence, whether the expression is the whole name or embedded in a
+    // literal (`prod-${{ matrix.target }}`). Any other expression — or a
+    // matrix key the cell does not define — leaves the name unresolved:
+    // return None rather than recording the raw template, which would mint
+    // tokens claiming an environment that does not exist under that name.
+    // Runtime hydration resolves deferred names for the job message, and
+    // the recorded OIDC context follows the hydrated name.
     let trimmed = value.trim();
-    let expression = trimmed.strip_prefix("${{")?.strip_suffix("}}")?.trim();
-    let key = expression.strip_prefix("matrix.")?;
-    matrix.get(key).and_then(|value| match value {
-        Value::String(value) => Some(value.clone()),
-        Value::Number(value) => Some(value.to_string()),
-        Value::Bool(value) => Some(value.to_string()),
-        _ => None,
-    })
+    let mut resolved = String::new();
+    let mut rest = trimmed;
+    while let Some(start) = rest.find("${{") {
+        let end = rest[start..].find("}}").map(|offset| start + offset + 2)?;
+        let key = rest[start + 3..end - 2].trim().strip_prefix("matrix.")?;
+        let replacement = matrix.get(key).and_then(|value| match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        })?;
+        resolved.push_str(&rest[..start]);
+        resolved.push_str(&replacement);
+        rest = &rest[end..];
+    }
+    resolved.push_str(rest);
+    Some(resolved)
 }
 
 fn oidc_environment(
     environment: Option<&Value>,
     matrix: &indexmap::IndexMap<String, Value>,
 ) -> Option<String> {
-    match environment? {
-        Value::String(value) if !value.trim().starts_with("${{") => Some(value.clone()),
-        Value::Object(values) => match values.get("name")?.as_str()? {
-            value if !value.trim().starts_with("${{") => Some(value.to_owned()),
-            _ => resolved_environment(environment, matrix),
-        },
-        Value::String(_) => resolved_environment(environment, matrix),
-        _ => None,
+    let value = match environment? {
+        Value::String(value) => value.as_str(),
+        Value::Object(values) => values.get("name")?.as_str()?,
+        _ => return None,
+    };
+    if value.contains("${{") {
+        resolved_environment(environment, matrix)
+    } else {
+        Some(value.to_owned())
     }
 }
 
