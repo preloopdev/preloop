@@ -33,6 +33,7 @@ mod unix {
     use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink};
     use preloop_sandbox::api::{
         AcquireRequest, CreateWork, Requirements, SandboxState, Template, TemplateSpec,
+        template_spec,
     };
     use preloop_sandbox::drivers::smolvm::SmolvmDriver;
     use preloop_sandbox::drivers::smolvm::cli::{
@@ -1545,14 +1546,17 @@ exit 0
                     artifacts: vec![preloop_sandbox::api::Artifact {
                         format: preloop_sandbox::api::Artifact::OCI_IMAGE.into(),
                         arch: preloop_sandbox::api::host_arch().into(),
-                        reference: format!("alpine@sha256:{}", "0".repeat(64)),
+                        r#ref: format!("alpine@sha256:{}", "0".repeat(64)),
                         digest: format!("sha256:{}", "0".repeat(64)),
                         size_bytes: 0,
+                        ..preloop_sandbox::api::Artifact::default()
                     }],
                     ..TemplateSpec::default()
-                },
+                }
+                .into(),
                 ..Template::default()
-            },
+            }
+            .into(),
             ..CreateWork::default()
         };
         // The fake never creates the data dir on `machine create`, exactly
@@ -1751,11 +1755,12 @@ exit 0
             .put_template(TemplateSpec {
                 name: "alpine".into(),
                 os: "linux".into(),
-                recipe: Some("image:alpine:3.20".into()),
+                source: Some(template_spec::Source::Recipe("image:alpine:3.20".into())),
                 requires: Requirements {
                     driver: "smolvm".into(),
                     ..Requirements::default()
-                },
+                }
+                .into(),
                 ..TemplateSpec::default()
             })
             .await
@@ -1869,9 +1874,11 @@ exit 0
                     name: "alpine".into(),
                     os: "linux".into(),
                     ..TemplateSpec::default()
-                },
+                }
+                .into(),
                 ..Template::default()
-            },
+            }
+            .into(),
             ..CreateWork::default()
         };
         let driver = Arc::new(SmolvmDriver::new(SmolVmProvider::new(&executable), 0));

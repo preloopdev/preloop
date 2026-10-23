@@ -74,9 +74,10 @@ async fn smolvm_golden_fork_pool_end_to_end() {
             artifacts: vec![Artifact {
                 format: Artifact::OCI_IMAGE.into(),
                 arch: host_arch().into(),
-                reference: format!("docker.io/library/alpine@{ALPINE_3_20}"),
+                r#ref: format!("docker.io/library/alpine@{ALPINE_3_20}"),
                 digest: ALPINE_3_20.into(),
                 size_bytes: 0,
+                ..Artifact::default()
             }],
             ..TemplateSpec::default()
         })
@@ -86,20 +87,26 @@ async fn smolvm_golden_fork_pool_end_to_end() {
         .acquire(AcquireRequest {
             idempotency_key: "bake".into(),
             template: "alpine".into(),
-            purpose: Purpose::Build,
+            purpose: Purpose::Build.into(),
             shape: Shape {
                 cpus: 2,
                 memory_mib: 1024,
                 disk_gib: 4,
-            },
+                ..Shape::default()
+            }
+            .into(),
             network: NetworkPolicy {
-                mode: NetworkMode::Unrestricted,
+                mode: NetworkMode::Unrestricted.into(),
                 ..NetworkPolicy::default()
-            },
-            options: [("dns".to_owned(), "8.8.8.8".to_owned())].into(),
+            }
+            .into(),
+            options: [("dns".to_owned(), "8.8.8.8".to_owned())]
+                .into_iter()
+                .collect(),
             sockets: vec![SocketMount {
                 host: socket.display().to_string(),
                 guest: "/run/engine.sock".into(),
+                ..SocketMount::default()
             }],
             ..AcquireRequest::default()
         })
@@ -118,6 +125,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
             sandbox_id: build.sandbox.id.clone(),
             lease_id: build.lease.id.clone(),
             name: "alpine-golden".into(),
+            ..SnapshotRequest::default()
         })
         .await
         .expect("snapshot");
@@ -138,14 +146,19 @@ async fn smolvm_golden_fork_pool_end_to_end() {
         let mut request = AcquireRequest {
             idempotency_key: key.into(),
             pool: "alpine-pool".into(),
-            purpose: Purpose::Runner,
+            purpose: Purpose::Runner.into(),
             ..AcquireRequest::default()
         };
-        request.inject.env.insert("JOB".into(), key.into());
-        request.inject.files.push(FileSpec {
-            path: "/run/preloop/token".into(),
-            data: format!("token-{key}").into_bytes(),
-            mode: 0o600,
+        request.inject.modify(|inject| {
+            inject.env.insert("JOB".into(), key.into());
+        });
+        request.inject.modify(|inject| {
+            inject.files.push(FileSpec {
+                path: "/run/preloop/token".into(),
+                data: format!("token-{key}").into_bytes(),
+                mode: 0o600,
+                ..FileSpec::default()
+            });
         });
         let lease = service.acquire(request).await.expect("pool acquire");
         eprintln!(
@@ -207,8 +220,8 @@ async fn smolvm_golden_fork_pool_end_to_end() {
     for lease in leases {
         service
             .release(ReleaseRequest {
-                lease_id: lease.lease.id,
-                mode: ReleaseMode::Destroy,
+                lease_id: lease.lease.id.clone(),
+                mode: ReleaseMode::Destroy.into(),
                 ..ReleaseRequest::default()
             })
             .await

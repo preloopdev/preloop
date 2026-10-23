@@ -26,11 +26,11 @@ use self::cli::{
 };
 use self::pack::{ArtifactCache, ArtifactPin, LocalImage, PackFormat, select_artifact};
 use crate::api::*;
-use crate::connect::{Code, Error, Result};
 use crate::driver::{
     Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, ExecCancels, NATIVE_PREFIX, native_name,
     parse_native_name, shell_quote,
 };
+use crate::error::{Code, Error, Result};
 
 /// Driver name.
 pub const NAME: &str = "smolvm";
@@ -51,7 +51,7 @@ const DEFAULT_STORAGE_GIB: u32 = 20;
 
 /// The size a create request actually gets: its own fields, with SmolVM's
 /// defaults filling the zeros.
-fn effective_shape(requested: Shape) -> Shape {
+fn effective_shape(requested: &Shape) -> Shape {
     Shape {
         cpus: if requested.cpus == 0 {
             DEFAULT_CPUS
@@ -68,6 +68,7 @@ fn effective_shape(requested: Shape) -> Shape {
         } else {
             requested.disk_gib
         },
+        ..Shape::default()
     }
 }
 
@@ -177,15 +178,17 @@ impl SmolvmDriver {
     /// cache, the pin that keeps them resident for the machine's lifetime.
     async fn image_for(&self, template: &Template) -> Result<(String, Option<ArtifactPin>)> {
         if template.spec.artifacts.is_empty() {
-            if let Some(recipe) = &template.spec.recipe {
+            if let Some(recipe) = template.spec.recipe() {
                 let path = recipe
                     .strip_prefix(SMOLMACHINE_RECIPE)
                     .or_else(|| recipe.strip_prefix(IMAGE_RECIPE))
                     .map(str::to_owned)
-                    .ok_or_else(|| Error::invalid(format!("smolvm: unknown recipe `{recipe}`")))?;
+                    .ok_or_else(|| {
+                        Error::invalid_argument(format!("smolvm: unknown recipe `{recipe}`"))
+                    })?;
                 return Ok((path, None));
             }
-            return Err(Error::invalid(format!(
+            return Err(Error::invalid_argument(format!(
                 "template `{}` has no artifacts",
                 template.spec.name
             )));
@@ -437,14 +440,15 @@ fn machine(native_ref: &str) -> Result<MachineName> {
 /// Decode a JSON driver option the CI pool encoded from its `MachineSpec`.
 fn json_option<T: serde::de::DeserializeOwned>(raw: Option<&str>, key: &str) -> Result<Option<T>> {
     raw.map(|raw| {
-        serde_json::from_str(raw)
-            .map_err(|error| Error::invalid(format!("smolvm: invalid `{key}` option: {error}")))
+        serde_json::from_str(raw).map_err(|error| {
+            Error::invalid_argument(format!("smolvm: invalid `{key}` option: {error}"))
+        })
     })
     .transpose()
 }
 
 fn network(policy: &NetworkPolicy) -> VmNetwork {
-    match policy.mode {
+    match policy.mode.as_known().unwrap_or_default() {
         NetworkMode::Disabled => VmNetwork::Disabled,
         NetworkMode::PublicOnly => VmNetwork::PublicOnly,
         NetworkMode::Restricted => VmNetwork::Restricted {
@@ -458,7 +462,7 @@ fn network(policy: &NetworkPolicy) -> VmNetwork {
 /// Fork egress policy: `None` keeps the fork base's policy, unlike a cold
 /// boot, where an unset mode means unrestricted.
 fn fork_network(policy: &NetworkPolicy) -> Option<VmNetwork> {
-    match policy.mode {
+    match policy.mode.as_known().unwrap_or_default() {
         NetworkMode::NetworkModeUnspecified => None,
         NetworkMode::Disabled => Some(VmNetwork::Disabled),
         NetworkMode::PublicOnly => Some(VmNetwork::PublicOnly),
@@ -514,7 +518,7 @@ fn fork_request(work: &CreateWork) -> Result<(ForkLaunch, MachineUpdate)> {
         }
     }
     if !unsupported.is_empty() {
-        return Err(Error::precondition(format!(
+        return Err(Error::failed_precondition(format!(
             "smolvm: forking cannot apply {}: a clone inherits {} from its fork base",
             unsupported.join(", "),
             if unsupported.len() == 1 { "it" } else { "them" },
@@ -525,7 +529,7 @@ fn fork_request(work: &CreateWork) -> Result<(ForkLaunch, MachineUpdate)> {
     if work.shape.cpus > 0 {
         update.cpus = Some(
             u16::try_from(work.shape.cpus)
-                .map_err(|_| Error::invalid("smolvm: shape.cpus is too large"))?,
+                .map_err(|_| Error::invalid_argument("smolvm: shape.cpus is too large"))?,
         );
     }
     if work.shape.memory_mib > 0 {
@@ -537,7 +541,7 @@ fn fork_request(work: &CreateWork) -> Result<(ForkLaunch, MachineUpdate)> {
     if let Some(raw) = option("overlay_gib") {
         update.overlay_gib = Some(
             raw.parse()
-                .map_err(|_| Error::invalid("smolvm: invalid `overlay_gib` option"))?,
+                .map_err(|_| Error::invalid_argument("smolvm: invalid `overlay_gib` option"))?,
         );
     }
     update.network = fork_network(&work.network);
@@ -629,17 +633,18 @@ impl Driver for SmolvmDriver {
             socket_mounts: true,
             host_mounts: true,
             network_modes: vec![
-                NetworkMode::Disabled,
-                NetworkMode::Unrestricted,
-                NetworkMode::PublicOnly,
-                NetworkMode::Restricted,
+                NetworkMode::Disabled.into(),
+                NetworkMode::Unrestricted.into(),
+                NetworkMode::PublicOnly.into(),
+                NetworkMode::Restricted.into(),
             ],
             slots: self.slots,
             native_pool: false,
             one_shot: false,
             max_vcpus,
             max_memory_mib,
-            default_shape: effective_shape(Shape::default()),
+            default_shape: buffa::MessageField::some(effective_shape(&Shape::default())),
+            ..Capabilities::default()
         }
     }
 
@@ -649,7 +654,7 @@ impl Driver for SmolvmDriver {
         // name would be reported lost, then its record dropped without
         // destroying the machine. Keep the ownership boundary explicit.
         if !work.name.is_empty() && !name_is_owned(self.named_prefix.as_deref(), &work.name) {
-            return Err(Error::invalid(format!(
+            return Err(Error::invalid_argument(format!(
                 "caller-chosen sandbox name `{}` is outside this provider's owned prefix",
                 work.name
             )));
@@ -707,7 +712,7 @@ impl Driver for SmolvmDriver {
         }
         let (image, pin) = self.image_for(&work.template).await?;
         let option = |key: &str| work.options.get(key).map(String::as_str);
-        let shape = effective_shape(work.shape);
+        let shape = effective_shape(&work.shape);
         let spec = MachineSpec {
             name: clone.clone(),
             image,
@@ -784,7 +789,7 @@ impl Driver for SmolvmDriver {
         output: mpsc::Sender<ExecEvent>,
     ) -> Result<i32> {
         if request.argv.is_empty() {
-            return Err(Error::invalid("argv is required"));
+            return Err(Error::invalid_argument("argv is required"));
         }
         let name = machine(native_ref)?;
         let argv = crate::driver::posix_exec_argv(request)?;
@@ -881,7 +886,7 @@ impl Driver for SmolvmDriver {
         match self.provider.status(&name).await.map_err(vm_error)? {
             cli::MachineState::Running | cli::MachineState::Stopped => {}
             state => {
-                return Err(Error::precondition(format!(
+                return Err(Error::failed_precondition(format!(
                     "smolvm: snapshot source {native_ref} is {state:?}"
                 )));
             }
@@ -939,6 +944,7 @@ impl Driver for SmolvmDriver {
                     driver: NAME.into(),
                     native_ref: name.as_str().to_owned(),
                     sandbox_id,
+                    ..Observed::default()
                 }
             })
             .collect())
@@ -1058,10 +1064,12 @@ exit 0
                     name: "golden".into(),
                     os: "linux".into(),
                     ..TemplateSpec::default()
-                },
+                }
+                .into(),
                 native_ref: "golden".into(),
                 ..Template::default()
-            },
+            }
+            .into(),
             ..CreateWork::default()
         }
     }
@@ -1079,11 +1087,12 @@ exit 0
         let driver = driver(&directory);
         let defaults = driver.capabilities().default_shape;
         assert_eq!(
-            defaults,
+            *defaults,
             Shape {
                 cpus: 2,
                 memory_mib: 4096,
                 disk_gib: 20,
+                ..Shape::default()
             }
         );
         let work = CreateWork {
@@ -1096,14 +1105,17 @@ exit 0
                     artifacts: vec![crate::api::Artifact {
                         format: crate::api::Artifact::OCI_IMAGE.into(),
                         arch: crate::api::host_arch().into(),
-                        reference: format!("alpine@sha256:{}", "0".repeat(64)),
+                        r#ref: format!("alpine@sha256:{}", "0".repeat(64)),
                         digest: format!("sha256:{}", "0".repeat(64)),
                         size_bytes: 0,
+                        ..crate::api::Artifact::default()
                     }],
                     ..TemplateSpec::default()
-                },
+                }
+                .into(),
                 ..Template::default()
-            },
+            }
+            .into(),
             ..CreateWork::default()
         };
 
@@ -1138,19 +1150,23 @@ exit 0
         let driver = driver(&directory);
         let mut work = fork_work();
         work.network = NetworkPolicy {
-            mode: NetworkMode::Disabled,
+            mode: NetworkMode::Disabled.into(),
             ..NetworkPolicy::default()
-        };
+        }
+        .into();
         work.mounts = vec![Mount {
             host: host.display().to_string(),
             guest: "/workspace".into(),
             readonly: true,
+            ..Mount::default()
         }];
         work.shape = Shape {
             cpus: 4,
             memory_mib: 2048,
             disk_gib: 0,
-        };
+            ..Shape::default()
+        }
+        .into();
 
         driver.create(&work).await.unwrap();
 
@@ -1187,9 +1203,10 @@ exit 0
         let driver = driver(&directory);
         let mut work = fork_work();
         work.network = NetworkPolicy {
-            mode: NetworkMode::PublicOnly,
+            mode: NetworkMode::PublicOnly.into(),
             ..NetworkPolicy::default()
-        };
+        }
+        .into();
 
         driver.create(&work).await.unwrap();
 
@@ -1213,6 +1230,7 @@ exit 0
                     work.sockets = vec![SocketMount {
                         host: "/tmp/engine.sock".into(),
                         guest: "/run/engine.sock".into(),
+                        ..SocketMount::default()
                     }];
                 }) as Box<dyn Fn(&mut CreateWork)>,
             ),
@@ -1236,7 +1254,11 @@ exit 0
             mutate(&mut work);
             let error = driver.create(&work).await.unwrap_err();
             assert_eq!(error.code, Code::FailedPrecondition, "{field}");
-            assert!(error.message.contains(field), "{field}: {}", error.message);
+            assert!(
+                crate::error::message(&error).contains(field),
+                "{field}: {}",
+                crate::error::message(&error)
+            );
             assert!(
                 calls(&directory.path().join("smolvm")).is_empty(),
                 "{field}: nothing may reach smolvm"

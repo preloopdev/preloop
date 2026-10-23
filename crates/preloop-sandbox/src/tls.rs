@@ -35,7 +35,7 @@ use time::OffsetDateTime;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use crate::connect::{Code, Error, Result};
+use crate::error::{Code, Error, Result};
 
 /// Directory holding the service CA, under the service state directory.
 pub const CA_DIR: &str = "sandbox-ca";
@@ -148,7 +148,7 @@ pub fn pem_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
     if let Some(der) = pem_blocks(pem, "EC PRIVATE KEY").into_iter().next() {
         return Ok(PrivateKeyDer::Sec1(der.into()));
     }
-    Err(Error::invalid("no private key in PEM document"))
+    Err(Error::invalid_argument("no private key in PEM document"))
 }
 
 /// SHA-256 of the first certificate in a PEM document.
@@ -156,7 +156,7 @@ pub fn pem_fingerprint(pem: &str) -> Result<String> {
     pem_certificates(pem)
         .first()
         .map(|der| sha256_hex(der))
-        .ok_or_else(|| Error::invalid("no certificate in PEM document"))
+        .ok_or_else(|| Error::invalid_argument("no certificate in PEM document"))
 }
 
 /// Whether `value` is a plausible DNS name for a SAN.
@@ -289,7 +289,7 @@ impl ServiceCa {
         let cert_der = pem_certificates(cert_pem)
             .into_iter()
             .next()
-            .ok_or_else(|| Error::invalid("CA certificate PEM holds no certificate"))?;
+            .ok_or_else(|| Error::invalid_argument("CA certificate PEM holds no certificate"))?;
         let key = KeyPair::from_pem(key_pem).map_err(tls_error)?;
         // Only the issuer's subject and key identity matter when signing, so
         // the parameters are reconstructed deterministically rather than
@@ -327,8 +327,9 @@ impl ServiceCa {
         name: &str,
         lifetime: Duration,
     ) -> Result<SignedCertificate> {
-        let csr = CertificateSigningRequestParams::from_pem(csr_pem)
-            .map_err(|e| Error::invalid(format!("bad certificate signing request: {e}")))?;
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem).map_err(|e| {
+            Error::invalid_argument(format!("bad certificate signing request: {e}"))
+        })?;
         let mut params = csr.params;
         params.distinguished_name = DistinguishedName::new();
         params.distinguished_name.push(DnType::CommonName, name);
@@ -416,7 +417,7 @@ impl ServerTls {
             }
             (None, None) => ca.issue_server(&sans)?,
             _ => {
-                return Err(Error::invalid(
+                return Err(Error::invalid_argument(
                     "PRELOOP_SANDBOX_TLS_CERT and PRELOOP_SANDBOX_TLS_KEY must be set together",
                 ));
             }
@@ -644,7 +645,7 @@ pub fn generate_csr(name: &str) -> Result<(String, String)> {
 /// certificate (`identity_pem` holds the certificate chain and the key).
 pub fn http_client(ca_pem: &str, identity_pem: Option<&[u8]>) -> Result<reqwest::Client> {
     let ca = reqwest::Certificate::from_pem(ca_pem.as_bytes())
-        .map_err(|e| Error::invalid(format!("CA certificate: {e}")))?;
+        .map_err(|e| Error::invalid_argument(format!("CA certificate: {e}")))?;
     // Only this CA is trusted: a public certificate for the same hostname
     // must not be able to stand in for the Sandbox Service.
     let mut builder = reqwest::Client::builder()
@@ -653,12 +654,60 @@ pub fn http_client(ca_pem: &str, identity_pem: Option<&[u8]>) -> Result<reqwest:
     if let Some(identity) = identity_pem {
         builder = builder.identity(
             reqwest::Identity::from_pem(identity)
-                .map_err(|e| Error::invalid(format!("client identity: {e}")))?,
+                .map_err(|e| Error::invalid_argument(format!("client identity: {e}")))?,
         );
     }
     builder
         .build()
         .map_err(|e| Error::internal(format!("tls client: {e}")))
+}
+
+/// A rustls client-config builder with this crate's crypto provider named
+/// explicitly.
+///
+/// `ClientConfig::builder()` defers to a process-level provider and panics
+/// when the linked features alone cannot pick one: the binary contains both
+/// ring (via `rustls`) and aws-lc-rs (via reqwest's `rustls` feature), so
+/// there is nothing to infer. CA-less clients (`SandboxClient::new`) are
+/// built before any service setup installs a default, which is exactly the
+/// path that used to abort. Naming the provider keeps every config
+/// independent of process-wide state.
+pub(crate) fn client_config_builder()
+-> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>> {
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| tls_error(format!("TLS client config: {e}")))
+}
+
+/// A rustls client configuration trusting only `ca_pem` and presenting the
+/// client certificate in `identity_pem` (certificate chain followed by its
+/// key), for the ConnectRPC client transport.
+pub fn client_config(
+    ca_pem: &str,
+    identity_pem: Option<&[u8]>,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let mut roots = RootCertStore::empty();
+    for certificate in pem_certificates(ca_pem) {
+        roots
+            .add(certificate)
+            .map_err(|e| tls_error(format!("CA certificate: {e}")))?;
+    }
+    let builder = client_config_builder()?.with_root_certificates(roots);
+    let config = match identity_pem {
+        Some(identity) => {
+            let identity = std::str::from_utf8(identity)
+                .map_err(|e| tls_error(format!("client identity: {e}")))?;
+            let chain = pem_certificates(identity);
+            if chain.is_empty() {
+                return Err(tls_error("client identity has no certificate"));
+            }
+            builder
+                .with_client_auth_cert(chain, pem_private_key(identity)?)
+                .map_err(|e| tls_error(format!("client identity: {e}")))?
+        }
+        None => builder.with_no_client_auth(),
+    };
+    Ok(Arc::new(config))
 }
 
 /// Whether `error` is a TLS handshake failure because the server's
@@ -672,7 +721,7 @@ pub fn http_client(ca_pem: &str, identity_pem: Option<&[u8]>) -> Result<reqwest:
 /// while a new CA reusing the subject name (every service uses the same CA
 /// common name) makes path building pick the stored CA and fail its signature
 /// check, which webpki reports as `BadSignature`.
-pub fn is_untrusted_service_ca(error: &reqwest::Error) -> bool {
+pub fn is_untrusted_service_ca(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = source {
         if let Some(rustls::Error::InvalidCertificate(certificate_error)) =
@@ -697,7 +746,7 @@ pub fn is_untrusted_service_ca(error: &reqwest::Error) -> bool {
 
 /// Whether the server refused the client certificate during the handshake
 /// (an identity the service does not know, e.g. one issued before a re-key).
-pub fn is_client_certificate_rejected(error: &reqwest::Error) -> bool {
+pub fn is_client_certificate_rejected(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = source {
         if let Some(rustls::Error::AlertReceived(alert)) = error.downcast_ref::<rustls::Error>() {

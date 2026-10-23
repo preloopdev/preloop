@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::api::{Capabilities, CreateWork, ExecEvent, ExecRequest, HostReport, Observed};
-use crate::connect::{Error, Result};
+use crate::error::{Error, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -116,7 +116,7 @@ pub trait Driver: Send + Sync {
 
 /// The error for an operation a backend does not declare.
 pub fn unsupported(driver: &str, operation: &str) -> Error {
-    Error::precondition(format!("{driver}: {operation} unsupported"))
+    Error::failed_precondition(format!("{driver}: {operation} unsupported"))
 }
 
 /// Prefix of every native machine name the sandbox layer creates.
@@ -158,7 +158,7 @@ pub fn posix_exec_argv(request: &ExecRequest) -> Result<Vec<String>> {
     use base64::Engine as _;
     for key in request.env.keys() {
         if !env_key_is_identifier(key) {
-            return Err(Error::invalid(format!(
+            return Err(Error::invalid_argument(format!(
                 "invalid environment variable name `{key}`"
             )));
         }
@@ -284,8 +284,8 @@ mod tests {
         };
         request.env.insert("A; touch /tmp/pwned".into(), "1".into());
         let error = posix_exec_argv(&request).unwrap_err();
-        assert_eq!(error.code, crate::connect::Code::InvalidArgument);
-        assert!(error.message.contains("A; touch /tmp/pwned"));
+        assert_eq!(error.code, crate::Code::InvalidArgument);
+        assert!(crate::error::message(&error).contains("A; touch /tmp/pwned"));
 
         for key in ["", "1A", "A-B", "A.B", "A B"] {
             request.env.clear();

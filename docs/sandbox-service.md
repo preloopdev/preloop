@@ -27,8 +27,10 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
   `List` is the only sandbox read that is not scoped to one (and it redacts
   lease ids).
 * **Providers** (capacity owners): `Enroll` (single-use join token → 24h
-  client certificate), `Register` (drivers + capabilities → provider id and
-  fencing generation), `Heartbeat`, `Poll` (long-poll for work), `Report` /
+  client certificate), `Register` (drivers + capabilities + the agent's
+  `protocolVersion` → provider id and fencing generation; a version the
+  service does not speak is `failed_precondition` naming both versions),
+  `Heartbeat`, `Poll` (long-poll for work), `Report` /
   `ReportExec` (fenced by generation), `Reconcile` (full inventory: lost
   sandboxes fail, orphans are destroyed, a `Terminating` machine that is
   still there gets its destroy asked again unless one is in flight, and a
@@ -73,10 +75,31 @@ never turn the caller's result into an error. `Acquire` is bounded by its wait
 window, and every request that waits on a provider to report (`Snapshot`,
 copy, power) is bounded by the same work timeout.
 
-The Connect layer is hand-rolled (`crates/preloop-sandbox/src/connect.rs`):
-adding `connectrpc` would bring its own protobuf runtime, while the subset used
-here — JSON unary and server streaming — is small. Any Connect client generated
-from the `.proto` interoperates.
+The Connect layer is generated from the proto, not hand-written.
+`scripts/gen-sandbox-proto.sh` runs `protoc` with two plugins:
+`protoc-gen-buffa` (0.9.x) for the message types and their proto3 JSON
+mapping, and `connectrpc-codegen`'s `protoc-gen-connect-rust` for the
+`Sandboxes`/`Providers` service traits, typed clients and method specs. The
+output is checked in under `crates/preloop-sandbox/src/gen/` and re-exported
+through `api`, so there is exactly one definition of every message and every
+RPC; changing the wire is a `.proto` edit plus a regeneration, never a
+parallel Rust mirror. Any Connect client generated from the same `.proto`
+interoperates.
+
+### Wire encoding
+
+The generated types speak the proto3 JSON mapping:
+
+* **64-bit integers are JSON strings.** `int64`/`uint64` fields (`createdAt`,
+  `expiresAt`, `sizeBytes`, `ttlSecs`, lease epochs, …) encode as decimal
+  strings, as proto3 JSON requires; 32-bit fields stay JSON numbers. Clients
+  must accept a quoted decimal.
+* **Enums are open.** A value this build does not know decodes into
+  `EnumValue::Unknown(n)` and re-encodes as `n` rather than failing the
+  message; service predicates treat an unknown sandbox state as neither
+  terminal nor ready. Adding an enum value is therefore additive.
+* **Message fields are presence-aware.** Absent submessages stay absent
+  instead of materializing a default, and `null` reads as unset.
 
 ## Model
 
@@ -282,6 +305,12 @@ pointed at the same `PRELOOP_HOME`, fails instead of loading the store and
 reaping the running service's leases. Writes are best-effort in the project's
 sense: in-memory state is authoritative, so a store failure is logged at error
 level with the record kind and never fails the caller's RPC.
+
+Records are proto3-JSON documents, and rows written by earlier builds stay
+readable: the generated messages keep the same lowerCamelCase names and accept
+the old snake_case spellings as aliases, and 64-bit numbers are parsed from
+either the string or the numeric form. There is no store migration — the first
+write of a record canonicalizes it.
 
 ## Restart and failure
 
