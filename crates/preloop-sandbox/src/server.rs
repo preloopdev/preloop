@@ -19,6 +19,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::authz::{Action, Authorizer, Principal, PrincipalKind, TokenAuthorizer};
+
 use crate::api::*;
 use crate::connect::{self, Code, Error};
 use crate::service::{ProviderIdentity, Service};
@@ -59,6 +61,7 @@ impl Auth {
 struct AppState {
     service: Arc<Service>,
     auth: Auth,
+    authorizer: Arc<dyn Authorizer>,
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -134,11 +137,65 @@ fn check(expected: &str, headers: &HeaderMap) -> Result<(), Error> {
     }
 }
 
+fn authorize(
+    authorizer: &dyn Authorizer,
+    principal: Principal,
+    action: Action,
+) -> Result<(), Error> {
+    authorizer.authorize(&principal, action)
+}
+
+fn client_principal() -> Principal {
+    Principal {
+        kind: PrincipalKind::Client,
+        name: "client".to_owned(),
+    }
+}
+
+fn anonymous_principal() -> Principal {
+    Principal {
+        kind: PrincipalKind::Anonymous,
+        name: "anonymous".to_owned(),
+    }
+}
+
+fn provider_principal(identity: &ProviderIdentity) -> Principal {
+    Principal {
+        kind: PrincipalKind::Provider,
+        name: if identity.name.is_empty() {
+            "provider".to_owned()
+        } else {
+            identity.name.clone()
+        },
+    }
+}
+
+fn sandbox_action(method: &str) -> Option<Action> {
+    Some(match method {
+        "ListTemplates" | "ListPools" | "Get" | "List" | "ListProviders" => Action::Read,
+        "DeleteProvider" | "CreateJoinToken" => Action::Admin,
+        "Exec" | "OpenStream" => Action::Exec,
+        "PutTemplate" | "DeleteTemplate" | "PutPool" | "DeletePool" | "Acquire" | "Renew"
+        | "Release" | "Snapshot" | "Stop" | "Start" | "Pause" | "Resume" => Action::Write,
+        _ => return None,
+    })
+}
+
 /// Build the router.
 ///
-/// `Providers` reads the peer certificate from `ConnectInfo<PeerIdentity>`, so
-/// serve it with [`serve`] (or `Router::into_make_service_with_connect_info`).
+/// This convenience form uses the built-in authorizer. [`serve`] selects the
+/// configured policy before it starts listening; embedders that already have a
+/// policy can use [`router_with_authorizer`] or [`serve_with_authorizer`].
 pub fn router(service: Arc<Service>, auth: Auth) -> Router {
+    router_with_authorizer(service, auth, Arc::new(TokenAuthorizer))
+}
+
+/// Build the router with an explicit authorization policy.
+pub fn router_with_authorizer(
+    service: Arc<Service>,
+    auth: Auth,
+    authorizer: Arc<dyn Authorizer>,
+) -> Router {
     Router::new()
         .route("/preloop.sandbox.v1.Sandboxes/{method}", post(sandboxes))
         .route("/preloop.sandbox.v1.Providers/{method}", post(providers))
@@ -151,8 +208,12 @@ pub fn router(service: Arc<Service>, auth: Auth) -> Router {
             get(agent_blob_get).put(agent_blob_put),
         )
         .route("/sandbox/v1/ca.pem", get(ca_pem))
-        .route("/sandbox/v1/healthz", get(|| async { "ok" }))
-        .with_state(AppState { service, auth })
+        .route("/sandbox/v1/healthz", get(healthz))
+        .with_state(AppState {
+            service,
+            auth,
+            authorizer,
+        })
 }
 
 /// Serve the API over TLS until `shutdown`.
@@ -166,7 +227,21 @@ pub async fn serve(
     tls: Arc<ServerTls>,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let app = router(service, auth);
+    let authorizer = crate::authz::from_config()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    serve_with_authorizer(listener, service, auth, tls, shutdown, authorizer).await
+}
+
+/// Serve the API with an explicitly selected authorization policy.
+pub async fn serve_with_authorizer(
+    listener: tokio::net::TcpListener,
+    service: Arc<Service>,
+    auth: Auth,
+    tls: Arc<ServerTls>,
+    shutdown: CancellationToken,
+    authorizer: Arc<dyn Authorizer>,
+) -> std::io::Result<()> {
+    let app = router_with_authorizer(service, auth, authorizer);
     axum::serve(
         TlsListener::new(listener, tls.acceptor.clone()),
         app.into_make_service_with_connect_info::<PeerIdentity>(),
@@ -177,6 +252,9 @@ pub async fn serve(
 
 /// The service CA, for agents that pin it before enrolling.
 async fn ca_pem(State(app): State<AppState>) -> Response {
+    if let Err(error) = authorize(&*app.authorizer, anonymous_principal(), Action::Enroll) {
+        return error.into_response();
+    }
     match app.service.ca_pem() {
         Some(pem) => (
             StatusCode::OK,
@@ -185,6 +263,13 @@ async fn ca_pem(State(app): State<AppState>) -> Response {
         )
             .into_response(),
         None => Error::not_found("this service has no CA").into_response(),
+    }
+}
+
+async fn healthz(State(app): State<AppState>) -> Response {
+    match authorize(&*app.authorizer, anonymous_principal(), Action::Read) {
+        Ok(()) => "ok".into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
@@ -198,6 +283,12 @@ async fn sandboxes(
         return error.into_response();
     }
     if let Err(error) = check(&app.auth.client_token, &headers) {
+        return error.into_response();
+    }
+    let Some(action) = sandbox_action(&method) else {
+        return Error::new(Code::Unimplemented, format!("unknown method {method}")).into_response();
+    };
+    if let Err(error) = authorize(&*app.authorizer, client_principal(), action) {
         return error.into_response();
     }
     let service = app.service;
@@ -323,10 +414,14 @@ async fn providers(
         return error.into_response();
     }
     let service = app.service;
+    let authorizer = app.authorizer;
     use connect::{decode, unary_response as reply};
     // `Enroll` is the one RPC authenticated by its join token instead of a
     // client certificate; every other method needs an enrolled identity.
     if method == "Enroll" {
+        if let Err(error) = authorize(&*authorizer, anonymous_principal(), Action::Enroll) {
+            return error.into_response();
+        }
         return match decode::<EnrollRequest>(&body) {
             Ok(request) => reply(service.enroll(request).await),
             Err(error) => error.into_response(),
@@ -354,6 +449,13 @@ async fn providers(
             return error.into_response();
         }
     };
+    if let Err(error) = authorize(
+        &*authorizer,
+        provider_principal(&identity),
+        Action::Provider,
+    ) {
+        return error.into_response();
+    }
     match method.as_str() {
         "Register" => match decode::<RegisterRequest>(&body) {
             Ok(request) => reply(
@@ -447,6 +549,8 @@ async fn stream_upload(
     let token = bearer(&headers).unwrap_or_default();
     let result = async {
         check_host(app.auth.loopback_only, &headers)?;
+        app.service.validate_ticket(&ticket, token)?;
+        authorize(&*app.authorizer, client_principal(), Action::Transfer)?;
         let (kind, path) = app.service.claim_ticket(&ticket, token)?;
         if kind != StreamKind::Upload {
             return Err(Error::invalid("ticket is not an upload"));
@@ -482,6 +586,8 @@ async fn stream_download(
     let token = bearer(&headers).unwrap_or_default();
     let result = async {
         check_host(app.auth.loopback_only, &headers)?;
+        app.service.validate_ticket(&ticket, token)?;
+        authorize(&*app.authorizer, client_principal(), Action::Transfer)?;
         let (kind, _) = app.service.claim_ticket(&ticket, token)?;
         if kind != StreamKind::Download {
             return Err(Error::invalid("ticket is not a download"));
@@ -520,6 +626,11 @@ async fn agent_blob_get(
         let identity = app.service.provider_identity(peer.fingerprint()?)?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
+        authorize(
+            &*app.authorizer,
+            provider_principal(&identity),
+            Action::Transfer,
+        )?;
         let path = app.service.agent_blob(&id, generation, &ticket)?;
         file_response(&path).await
     }
@@ -539,6 +650,11 @@ async fn agent_blob_put(
         let identity = app.service.provider_identity(peer.fingerprint()?)?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
+        authorize(
+            &*app.authorizer,
+            provider_principal(&identity),
+            Action::Transfer,
+        )?;
         let path = app.service.agent_blob(&id, generation, &ticket)?;
         write_body(&path, body).await
     }

@@ -1935,6 +1935,23 @@ impl Service {
         Ok((blob.kind, blob.path.clone()))
     }
 
+    /// Validate a caller ticket without consuming it.
+    ///
+    /// The HTTP layer uses this before authorization so a denied transfer
+    /// cannot consume a single-use ticket.
+    pub(crate) fn validate_ticket(&self, ticket: &str, token: &str) -> Result<()> {
+        let state = self.state.lock();
+        let blob = state
+            .blobs
+            .get(ticket)
+            .filter(|blob| blob.expires_at > now())
+            .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
+        if blob.token.is_empty() || !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
+            return Err(Error::new(Code::Unauthenticated, "bad ticket token"));
+        }
+        Ok(())
+    }
+
     /// Complete an upload ticket whose tar landed at its blob path: extract
     /// it in the guest. Consumes the ticket.
     pub async fn finish_upload(&self, ticket: &str) -> Result<()> {
