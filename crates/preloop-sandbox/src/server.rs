@@ -18,13 +18,20 @@ use crate::service::Service;
 /// Maximum request body for one Connect RPC.
 pub const CONNECT_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
-/// Bearer tokens. `None` disables the check (loopback / tests only).
+/// Bearer tokens plus the optional loopback Host guard.
+///
+/// A `None` token never authorizes a caller: a listener without a configured
+/// token fails closed. Production constructors always supply both tokens.
 #[derive(Debug, Clone, Default)]
 pub struct Auth {
     /// Token for `Sandboxes` callers.
     pub client_token: Option<String>,
     /// Token for `Providers` (host agents, connectors).
     pub provider_token: Option<String>,
+    /// Reject requests whose `Host` is not loopback. Set when the listener is
+    /// bound to a loopback address, so a DNS-rebound page cannot reach it
+    /// through a name that resolves to `127.0.0.1`.
+    pub loopback_only: bool,
 }
 
 #[derive(Clone)]
@@ -41,9 +48,58 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
+/// The host part of a `Host` header, without its port.
+fn host_without_port(value: &str) -> Option<&str> {
+    if let Some(rest) = value.strip_prefix('[') {
+        // `[::1]` or `[::1]:9191`.
+        let (host, tail) = rest.split_once(']')?;
+        if !tail.is_empty() && !tail.starts_with(':') {
+            return None;
+        }
+        return Some(host);
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => Some(host),
+        _ => Some(value),
+    }
+}
+
+/// Accept only names that reach a listener on this machine: `localhost`, any
+/// `127.0.0.0/8` address, or `::1`.
+fn loopback_host(value: &str) -> bool {
+    let Some(host) = host_without_port(value.trim()) else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn check_host(loopback_only: bool, headers: &HeaderMap) -> Result<(), Error> {
+    if !loopback_only {
+        return Ok(());
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Error::new(Code::PermissionDenied, "Host header is required"))?;
+    if !loopback_host(host) {
+        return Err(Error::new(
+            Code::PermissionDenied,
+            format!("Host `{host}` is not a loopback address"),
+        ));
+    }
+    Ok(())
+}
+
 fn check(expected: &Option<String>, headers: &HeaderMap) -> Result<(), Error> {
     let Some(expected) = expected else {
-        return Ok(());
+        return Err(Error::new(
+            Code::Unauthenticated,
+            "no bearer token is configured",
+        ));
     };
     match bearer(headers) {
         Some(token)
@@ -89,6 +145,9 @@ async fn sandboxes(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = check_host(app.auth.loopback_only, &headers) {
+        return error.into_response();
+    }
     if let Err(error) = check(&app.auth.client_token, &headers) {
         return error.into_response();
     }
@@ -203,6 +262,9 @@ async fn providers(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = check_host(app.auth.loopback_only, &headers) {
+        return error.into_response();
+    }
     if let Err(error) = check(&app.auth.provider_token, &headers) {
         return error.into_response();
     }
@@ -351,27 +413,39 @@ async fn stream_upload(
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
     let max_bytes = app.service.config().blob_max_bytes;
-    let (kind, path) = match app.service.claim_ticket(&ticket, token) {
-        Ok(claimed) => claimed,
-        Err(error) => return error.into_response(),
-    };
-    if kind != StreamKind::Upload {
-        return Error::invalid("ticket is not an upload").into_response();
-    }
-    if content_length(&headers).is_some_and(|length| length > max_bytes) {
-        return payload_too_large(max_bytes);
-    }
-    match write_body(&path, body, max_bytes).await {
-        Ok(()) => match app.service.finish_upload(&ticket).await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(error) => error.into_response(),
-        },
-        Err(error) => {
+    let result = async {
+        check_host(app.auth.loopback_only, &headers)?;
+        let (kind, path) = app.service.claim_ticket(&ticket, token)?;
+        if kind != StreamKind::Upload {
+            return Err(Error::invalid("ticket is not an upload").into());
+        }
+        if content_length(&headers).is_some_and(|length| length > max_bytes) {
+            app.service.drop_ticket(&ticket);
+            return Err(BodyWriteError::TooLarge(max_bytes));
+        }
+        // Write beside the destination and rename on success: a reader can
+        // never observe a partially written blob.
+        let staging = path.with_file_name(format!(".{ticket}.part"));
+        let written = write_body(&staging, body, max_bytes).await;
+        let uploaded: Result<(), BodyWriteError> = match written {
+            Ok(()) => tokio::fs::rename(&staging, &path).await.map_err(|error| {
+                BodyWriteError::from(Error::internal(format!("blob rename: {error}")))
+            }),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = uploaded {
+            let _ = tokio::fs::remove_file(&staging).await;
             // The ticket's bytes are incomplete: consume it so nothing can
             // extract a truncated tar.
             app.service.drop_ticket(&ticket);
-            error.into_response()
+            return Err(error);
         }
+        Ok(app.service.finish_upload(&ticket).await?)
+    }
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
@@ -382,6 +456,7 @@ async fn stream_download(
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
     let result = async {
+        check_host(app.auth.loopback_only, &headers)?;
         let (kind, _) = app.service.claim_ticket(&ticket, token)?;
         if kind != StreamKind::Download {
             return Err(Error::invalid("ticket is not a download"));
@@ -415,6 +490,7 @@ async fn agent_blob_get(
     headers: HeaderMap,
 ) -> Response {
     let result = async {
+        check_host(app.auth.loopback_only, &headers)?;
         check(&app.auth.provider_token, &headers)?;
         let (id, generation) = provider_headers(&headers)?;
         let path = app.service.agent_blob(&id, generation, &ticket)?;
@@ -431,6 +507,7 @@ async fn agent_blob_put(
     body: Body,
 ) -> Response {
     let result = async {
+        check_host(app.auth.loopback_only, &headers)?;
         check(&app.auth.provider_token, &headers)?;
         let (id, generation) = provider_headers(&headers)?;
         let path = app.service.agent_blob(&id, generation, &ticket)?;
@@ -448,5 +525,43 @@ async fn agent_blob_put(
     match write_body(&path, body, max_bytes).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_hosts_accept_local_names_and_ports() {
+        for host in [
+            "localhost",
+            "localhost:9191",
+            "LOCALHOST:1",
+            "127.0.0.1",
+            "127.0.0.1:9191",
+            "127.42.0.9",
+            "::1",
+            "[::1]",
+            "[::1]:9191",
+        ] {
+            assert!(loopback_host(host), "{host} must be accepted");
+        }
+    }
+
+    #[test]
+    fn non_loopback_hosts_are_rejected() {
+        for host in [
+            "example.com",
+            "example.com:9191",
+            "10.0.0.1",
+            "0.0.0.0",
+            "192.168.1.1:80",
+            "[2001:db8::1]:9191",
+            "127.0.0.1.evil.test",
+            "",
+        ] {
+            assert!(!loopback_host(host), "{host} must be rejected");
+        }
     }
 }

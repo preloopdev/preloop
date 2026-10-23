@@ -591,6 +591,34 @@ fn shell_export(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// The script the guest sources: it only exports the secrets. The command
+/// itself is the wrapper's argv, so nothing after the exports can stop the
+/// wrapper from removing the carrier.
+fn secret_env_script(secrets: &[(String, SecretSource)]) -> Result<String, VmError> {
+    let mut script = String::from("set -a; ");
+    for (key, source) in secrets {
+        let value = resolve_secret(source)?;
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(VmError::InvalidSpec(format!("bad secret name `{key}`")));
+        }
+        script.push_str(&format!("{key}={}; ", shell_export(&value)));
+    }
+    script.push_str("set +a;");
+    Ok(script)
+}
+
+/// Write a host file readable only by its owner, tightening a stale file.
+fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true).mode(0o600);
+    let mut file = options.open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(contents)
+}
+
 fn tar_one(source: &Path, entry: &str, tar_path: &Path) -> std::io::Result<()> {
     tar_one_with_mode(source, entry, tar_path, None)
 }
@@ -760,47 +788,60 @@ impl VmProvider for SandboxMachines {
     }
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
-        let entry = self.entries.lock().await.remove(name.as_str());
+        // Keep the entry until the service has actually released the lease: a
+        // transient failure must leave a retry something to retry.
+        let entry = { self.entries.lock().await.get(name.as_str()).cloned() };
         match entry {
             Some(Entry::Live {
                 lease_id,
                 sandbox_id,
                 ..
-            }) => {
-                match self
-                    .api
-                    .release(ReleaseRequest {
-                        lease_id,
-                        mode: ReleaseMode::Destroy,
-                        ..ReleaseRequest::default()
-                    })
-                    .await
-                {
-                    Ok(()) => {
-                        // The service destroys in the background; wait until
-                        // the record is gone so a caller recreating the same
-                        // name (re-arm, retry) does not race it.
-                        for _ in 0..100 {
-                            match self.api.get(&sandbox_id).await {
-                                Ok(sandbox) if !sandbox.state.is_terminal() => {
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                }
-                                _ => break,
-                            }
-                        }
-                        Ok(())
-                    }
-                    Err(error) if error.code == Code::NotFound => Ok(()),
-                    Err(error) => Err(sandbox_error("delete", error)),
-                }
-            }
-            Some(Entry::Golden { template, .. }) => match self.api.delete_template(&template).await
+            }) => match self
+                .api
+                .release(ReleaseRequest {
+                    lease_id,
+                    mode: ReleaseMode::Destroy,
+                    ..ReleaseRequest::default()
+                })
+                .await
             {
-                Ok(()) => Ok(()),
-                Err(error) if error.code == Code::NotFound => Ok(()),
+                Ok(()) => {
+                    self.entries.lock().await.remove(name.as_str());
+                    // The service destroys in the background; wait until
+                    // the record is gone so a caller recreating the same
+                    // name (re-arm, retry) does not race it.
+                    for _ in 0..100 {
+                        match self.api.get(&sandbox_id).await {
+                            Ok(sandbox) if !sandbox.state.is_terminal() => {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            _ => break,
+                        }
+                    }
+                    Ok(())
+                }
+                Err(error) if error.code == Code::NotFound => {
+                    self.entries.lock().await.remove(name.as_str());
+                    Ok(())
+                }
                 Err(error) => Err(sandbox_error("delete", error)),
             },
-            Some(Entry::Defined(_)) => Ok(()),
+            Some(Entry::Golden { template, .. }) => match self.api.delete_template(&template).await
+            {
+                Ok(()) => {
+                    self.entries.lock().await.remove(name.as_str());
+                    Ok(())
+                }
+                Err(error) if error.code == Code::NotFound => {
+                    self.entries.lock().await.remove(name.as_str());
+                    Ok(())
+                }
+                Err(error) => Err(sandbox_error("delete", error)),
+            },
+            Some(Entry::Defined(_)) => {
+                self.entries.lock().await.remove(name.as_str());
+                Ok(())
+            }
             None => {
                 // Left by an earlier engine process: release whatever lease
                 // still holds a sandbox of this name.
@@ -853,7 +894,7 @@ impl VmProvider for SandboxMachines {
                 SandboxState::Leased | SandboxState::Preserved | SandboxState::Ready => {
                     MachineState::Running
                 }
-                SandboxState::Paused => MachineState::Stopped,
+                SandboxState::Paused | SandboxState::Stopped => MachineState::Stopped,
                 SandboxState::Provisioning => MachineState::Unknown,
                 _ => MachineState::Missing,
             }),
@@ -901,22 +942,11 @@ impl VmProvider for SandboxMachines {
         // argv or an exec env map. Deliver it as a 0600 file the command
         // sources, then remove it.
         let (sandbox_id, _) = self.live(name).await?;
-        let mut script = String::from("set -a; ");
-        for (key, source) in secrets {
-            let value = resolve_secret(source)?;
-            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return Err(VmError::InvalidSpec(format!("bad secret name `{key}`")));
-            }
-            script.push_str(&format!("{key}={}; ", shell_export(&value)));
-        }
-        script.push_str("set +a; exec");
-        for arg in argv {
-            script.push(' ');
-            script.push_str(&shell_export(arg));
-        }
+        let script = secret_env_script(secrets)?;
         let dir = tempfile::tempdir().map_err(|e| VmError::RuntimeIo { source: e })?;
         let script_path = dir.path().join("secret-env.sh");
-        std::fs::write(&script_path, &script).map_err(|e| VmError::RuntimeIo { source: e })?;
+        write_private(&script_path, script.as_bytes())
+            .map_err(|e| VmError::RuntimeIo { source: e })?;
         let tar_path = dir.path().join("secret-env.tar");
         // `/var/tmp`, not `/tmp`: SmolVM's `machine cp` writes into the disk
         // image, and a guest tmpfs mounted over `/tmp` shadows it.
@@ -1017,5 +1047,46 @@ impl VmProvider for SandboxMachines {
                 "pack needs the sandbox on this host's SmolVM".into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn secret_script_exports_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "s3cr3t\n").unwrap();
+        let script = secret_env_script(&[
+            ("TOKEN".into(), SecretSource::HostFile(secret)),
+            (
+                "QUOTED".into(),
+                SecretSource::HostFile({
+                    let path = dir.path().join("quoted");
+                    std::fs::write(&path, "a'b\n").unwrap();
+                    path
+                }),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(script, "set -a; TOKEN='s3cr3t'; QUOTED='a'\\''b'; set +a;");
+        assert!(!script.contains("exec"), "the wrapper must run the command");
+    }
+
+    #[test]
+    fn private_script_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script.sh");
+        std::fs::write(&path, "stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, b"contents").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "contents");
     }
 }

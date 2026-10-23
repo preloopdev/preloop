@@ -36,8 +36,8 @@ just dogfood    # E2E with the real runner
 - **VM substrates**: every VM comes from the Sandbox Service
   (`crates/preloop-sandbox`, contract `proto/preloop/sandbox/v1/sandbox.proto`).
   Drivers attach through host agents (`PRELOOP_SANDBOX_DRIVERS`); the public
-  build ships SmolVM, while AgentENV and other private backends live in the
-  private repository. Placement uses declared capabilities, never driver names.
+  build ships SmolVM, and other drivers attach the same way. Placement uses
+  declared capabilities, never driver names.
   See [Sandbox architecture](docs/control-plane/architecture/sandboxes.mdx) and
   `docs/sandbox-service.md` before touching pool, sandbox or driver code.
 
