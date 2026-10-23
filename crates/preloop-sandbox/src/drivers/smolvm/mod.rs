@@ -124,7 +124,6 @@ impl SmolvmDriver {
             .as_deref()
             .is_some_and(|prefix| name.starts_with(prefix))
     }
-}
 
     /// Mark a machine the CI pool does not own as a Sandbox Service sandbox.
     ///
@@ -412,6 +411,8 @@ enum End {
     TimedOut,
     /// [`Driver::cancel_exec`] dropped the host-side client.
     Cancelled,
+}
+
 /// Caller-chosen names must sit inside the prefix this driver reports in
 /// its inventory, or reconciliation cannot tell them from foreign machines.
 pub(crate) fn name_is_owned(prefix: Option<&str>, name: &str) -> bool {

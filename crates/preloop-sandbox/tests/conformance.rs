@@ -671,12 +671,7 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
             .state,
         SandboxState::Preserved
     );
-    wait_for(|| {
-        h.service
-            .get(&short.sandbox.id, &short.lease.id)
-            .is_err()
-    })
-    .await;
+    wait_for(|| h.service.get(&short.sandbox.id, &short.lease.id).is_err()).await;
     // The long window outlived it: the short sandbox ended by its TTL, not
     // by reconcile.
     assert_eq!(
@@ -4093,7 +4088,7 @@ async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
     h.service.pause(&id, &lease.lease.id).await.unwrap();
     h.service
         .release(ReleaseRequest {
-            lease_id: lease.lease.id,
+            lease_id: lease.lease.id.clone(),
             mode: ReleaseMode::Preserve,
             preserve_ttl_secs: 60,
         })
@@ -4141,7 +4136,7 @@ async fn paused_and_stopped_debug_sandboxes_expire_from_the_preserve_window() {
         .unwrap();
     h.service
         .release(ReleaseRequest {
-            lease_id: paused.lease.id,
+            lease_id: paused.lease.id.clone(),
             mode: ReleaseMode::Preserve,
             preserve_ttl_secs: 1,
         })
@@ -4163,7 +4158,7 @@ async fn paused_and_stopped_debug_sandboxes_expire_from_the_preserve_window() {
         .unwrap();
     h.service
         .release(ReleaseRequest {
-            lease_id: stopped.lease.id,
+            lease_id: stopped.lease.id.clone(),
             mode: ReleaseMode::Preserve,
             preserve_ttl_secs: 1,
         })
@@ -4180,7 +4175,12 @@ async fn paused_and_stopped_debug_sandboxes_expire_from_the_preserve_window() {
     tokio::time::sleep(Duration::from_millis(1200)).await;
     h.service.maintain().await;
     wait_for(|| h.service.get(&paused.sandbox.id, &paused.lease.id).is_err()).await;
-    wait_for(|| h.service.get(&stopped.sandbox.id, &stopped.lease.id).is_err()).await;
+    wait_for(|| {
+        h.service
+            .get(&stopped.sandbox.id, &stopped.lease.id)
+            .is_err()
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -4335,7 +4335,7 @@ async fn a_snapshot_in_flight_reserves_its_source() {
     let release = h
         .service
         .release(ReleaseRequest {
-            lease_id: lease.lease.id,
+            lease_id: lease.lease.id.clone(),
             mode: ReleaseMode::Destroy,
             ..ReleaseRequest::default()
         })
@@ -4584,6 +4584,7 @@ async fn concurrent_same_key_acquires_inject_once() {
         .service
         .exec_collect(ExecRequest {
             sandbox_id: first.sandbox.id,
+            lease_id: first.lease.id.clone(),
             argv: vec!["cat".into(), "work/value".into()],
             ..ExecRequest::default()
         })

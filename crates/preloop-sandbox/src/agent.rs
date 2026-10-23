@@ -1456,6 +1456,7 @@ mod tests {
         shutdown.cancel();
         agent.run(None, shutdown).await;
         assert!(!stale.exists(), "startup must sweep old scratch archives");
+    }
 
     fn create(mounts: Vec<Mount>, sockets: Vec<SocketMount>) -> CreateWork {
         CreateWork {

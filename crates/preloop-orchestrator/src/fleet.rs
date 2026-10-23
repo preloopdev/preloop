@@ -1497,6 +1497,7 @@ mod tests {
             0o600
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "contents");
+    }
 
     #[tokio::test]
     async fn a_local_pack_registers_by_content_digest() {

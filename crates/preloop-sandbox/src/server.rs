@@ -58,8 +58,6 @@ impl Auth {
     }
 }
 
-}
-
 #[derive(Clone)]
 struct AppState {
     service: Arc<Service>,

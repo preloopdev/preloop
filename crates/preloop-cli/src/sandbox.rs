@@ -985,28 +985,26 @@ async fn run_client(
                         .collect::<anyhow::Result<Vec<_>>>()?,
                     recipe,
                     driver,
-                }) => print_json(
-                    &client
-                        .put_template(TemplateSpec {
-                            name,
-                            os,
-                            image,
-                            recipe,
-                            requires: Requirements {
-                                driver: driver.unwrap_or_default(),
-                                ..Requirements::default()
-                            },
-                            ..TemplateSpec::default()
-                        })
-                        .await?,
-                ),
-                SandboxCommand::Template(TemplateCommand::Ls) => {
-                    print_json(&client.list_templates().await?)
-                }
-                SandboxCommand::Template(TemplateCommand::Rm { name }) => {
-                    Ok(client.delete_template(&name).await?)
-                }
-                SandboxCommand::Pool(PoolCommand::Put {
+                })
+                .await?,
+        ),
+        SandboxCommand::Template(TemplateCommand::Ls) => {
+            print_json(&client.list_templates().await?)
+        }
+        SandboxCommand::Template(TemplateCommand::Rm { name }) => {
+            Ok(client.delete_template(&name).await?)
+        }
+        SandboxCommand::Pool(PoolCommand::Put {
+            name,
+            template,
+            warm,
+            max,
+            cpus,
+            memory,
+            disk,
+        }) => print_json(
+            &client
+                .put_pool(PoolSpec {
                     name,
                     template,
                     warm,
@@ -1463,6 +1461,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("--join"), "{error}");
+    }
 
     fn mode(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1535,7 +1534,7 @@ mod tests {
     async fn the_service_starts_only_for_a_pool() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        assert!(start_if_pool(false, &home).await.unwrap().is_none());
+        assert!(start_if_pool(None, &home).await.unwrap().is_none());
         assert!(
             !home.exists(),
             "no pool must not open the store or touch the state directory"

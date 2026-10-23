@@ -363,6 +363,20 @@ fn restored_state(sandbox: &Sandbox) -> SandboxState {
     }
 }
 
+/// State a powered-off sandbox returns to when it is started or resumed.
+/// A sandbox still inside its preserve window stays a debug hold even while
+/// its lease survives, so powering a used machine on cannot put it back in
+/// the warm set.
+fn resumed_state(sandbox: &Sandbox) -> SandboxState {
+    if sandbox.preserve_until > 0 {
+        SandboxState::Preserved
+    } else if sandbox.lease_id.is_empty() {
+        restored_state(sandbox)
+    } else {
+        SandboxState::Leased
+    }
+}
+
 #[derive(Debug)]
 enum Pending {
     Create {
@@ -2001,13 +2015,20 @@ impl Service {
             .is_some_and(|s| s.state == SandboxState::Failed);
         // Preservation is the one way a lease outlives `Release`: the id keeps
         // working as the debugging capability until the window closes. A
-        // second preserve extends that window instead of destroying.
+        // second preserve extends that window instead of destroying. A paused
+        // or stopped debugging machine keeps its power state (and must not be
+        // woken or destroyed just because it is no longer `Leased`).
         if preserve
             && !failed
-            && state
-                .sandboxes
-                .get(&lease.sandbox_id)
-                .is_some_and(|s| matches!(s.state, SandboxState::Leased | SandboxState::Preserved))
+            && state.sandboxes.get(&lease.sandbox_id).is_some_and(|s| {
+                matches!(
+                    s.state,
+                    SandboxState::Leased
+                        | SandboxState::Paused
+                        | SandboxState::Stopped
+                        | SandboxState::Preserved
+                )
+            })
         {
             let ttl = if preserve_ttl == 0 {
                 self.config.preserve_ttl.as_secs()
@@ -2016,7 +2037,9 @@ impl Service {
             };
             let until = now() + ttl as i64;
             if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
-                sandbox.state = SandboxState::Preserved;
+                if sandbox.state == SandboxState::Leased {
+                    sandbox.state = SandboxState::Preserved;
+                }
                 sandbox.preserve_until = until;
                 ops.push(self.put(Kind::Sandboxes, &lease.sandbox_id, &*sandbox));
             }
@@ -2436,7 +2459,10 @@ impl Service {
                 .await
                 .map_err(|e| Error::internal(format!("inject tar: {e}")))?;
             let result = match built {
-                Ok(()) => self.upload_path(&sandbox.id, &lease.id, "/", &tar_path).await,
+                Ok(()) => {
+                    self.upload_path(&sandbox.id, &lease.id, "/", &tar_path)
+                        .await
+                }
                 Err(error) => Err(error),
             };
             let _ = std::fs::remove_file(&tar_path);
@@ -4125,11 +4151,7 @@ impl Service {
                             .sandboxes
                             .get_mut(&sandbox_id)
                             .expect("state checked above");
-                        let next = if sandbox.lease_id.is_empty() {
-                            restored_state(sandbox)
-                        } else {
-                            SandboxState::Leased
-                        };
+                        let next = resumed_state(sandbox);
                         self.restore_locked(sandbox, next);
                         if forkable {
                             sandbox.error.clear();
@@ -4156,11 +4178,7 @@ impl Service {
                             .sandboxes
                             .get_mut(&sandbox_id)
                             .expect("state checked above");
-                        let next = if sandbox.lease_id.is_empty() {
-                            restored_state(sandbox)
-                        } else {
-                            SandboxState::Leased
-                        };
+                        let next = resumed_state(sandbox);
                         self.restore_locked(sandbox, next);
                         ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
                         Ok(String::new())
@@ -4180,11 +4198,14 @@ impl Service {
         sandbox.state = next;
         sandbox.prior_state = SandboxState::SandboxStateUnspecified;
         match next {
-            SandboxState::Ready => sandbox.preserve_until = 0,
-            SandboxState::Preserved if sandbox.preserve_until == 0 => {
-                sandbox.preserve_until = now() + self.config.preserve_ttl.as_secs() as i64;
+            SandboxState::Preserved => {
+                if sandbox.preserve_until == 0 {
+                    sandbox.preserve_until = now() + self.config.preserve_ttl.as_secs() as i64;
+                }
             }
-            _ => {}
+            // Resuming or starting a preserved sandbox ends its debugging
+            // window; only an explicitly preserved sandbox holds one open.
+            _ => sandbox.preserve_until = 0,
         }
     }
 

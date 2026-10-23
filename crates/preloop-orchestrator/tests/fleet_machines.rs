@@ -445,8 +445,9 @@ impl SandboxApi for FlakyRelease {
     async fn get(
         &self,
         sandbox_id: &str,
+        lease_id: &str,
     ) -> preloop_sandbox::Result<preloop_sandbox::api::Sandbox> {
-        self.inner.get(sandbox_id).await
+        self.inner.get(sandbox_id, lease_id).await
     }
     async fn list(&self) -> preloop_sandbox::Result<Vec<preloop_sandbox::api::Sandbox>> {
         self.inner.list().await
@@ -504,18 +505,24 @@ impl SandboxApi for FlakyRelease {
     async fn upload(
         &self,
         sandbox_id: &str,
+        lease_id: &str,
         guest_dir: &str,
         tar: &std::path::Path,
     ) -> preloop_sandbox::Result<()> {
-        self.inner.upload(sandbox_id, guest_dir, tar).await
+        self.inner
+            .upload(sandbox_id, lease_id, guest_dir, tar)
+            .await
     }
     async fn download(
         &self,
         sandbox_id: &str,
+        lease_id: &str,
         guest_path: &str,
         dest: &std::path::Path,
     ) -> preloop_sandbox::Result<()> {
-        self.inner.download(sandbox_id, guest_path, dest).await
+        self.inner
+            .download(sandbox_id, lease_id, guest_path, dest)
+            .await
     }
     async fn snapshot(
         &self,
@@ -523,17 +530,22 @@ impl SandboxApi for FlakyRelease {
     ) -> preloop_sandbox::Result<preloop_sandbox::api::Template> {
         self.inner.snapshot(request).await
     }
-    async fn stop(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
-        self.inner.stop(sandbox_id).await
+    async fn stop(&self, sandbox_id: &str, lease_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.stop(sandbox_id, lease_id).await
     }
-    async fn start(&self, sandbox_id: &str, forkable: bool) -> preloop_sandbox::Result<()> {
-        self.inner.start(sandbox_id, forkable).await
+    async fn start(
+        &self,
+        sandbox_id: &str,
+        lease_id: &str,
+        forkable: bool,
+    ) -> preloop_sandbox::Result<()> {
+        self.inner.start(sandbox_id, lease_id, forkable).await
     }
-    async fn pause(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
-        self.inner.pause(sandbox_id).await
+    async fn pause(&self, sandbox_id: &str, lease_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.pause(sandbox_id, lease_id).await
     }
-    async fn resume(&self, sandbox_id: &str) -> preloop_sandbox::Result<()> {
-        self.inner.resume(sandbox_id).await
+    async fn resume(&self, sandbox_id: &str, lease_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.resume(sandbox_id, lease_id).await
     }
 }
 
