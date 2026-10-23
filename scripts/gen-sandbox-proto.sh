@@ -24,7 +24,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$ROOT/crates/preloop-sandbox/src/gen"
-PROTO="$ROOT/proto/preloop/sandbox/v1/sandbox.proto"
+PROTOS=(
+    "$ROOT/proto/preloop/sandbox/v1/sandbox.proto"
+    "$ROOT/proto/preloop/sandbox/driver/v1/driver.proto"
+)
 
 PROTOC="${PROTOC:-protoc}"
 if [[ -n "${CONNECTRPC_TOOLS:-}" ]]; then
@@ -47,11 +50,13 @@ mkdir -p "$OUT/messages" "$OUT/services"
     --buffa_opt=file_per_package=true,views=true,json=true \
     --connect-rust_out="$OUT/services" \
     --connect-rust_opt=buffa_module=crate::generated,file_per_package \
-    "$PROTO"
+    "${PROTOS[@]}"
 
 mkdir -p "$DEST"
 cp "$OUT/messages/preloop.sandbox.v1.rs" "$DEST/preloop.sandbox.v1.rs"
 cp "$OUT/services/preloop.sandbox.v1.rs" "$DEST/preloop.sandbox.v1.connect.rs"
+cp "$OUT/messages/preloop.sandbox.driver.v1.rs" "$DEST/preloop.sandbox.driver.v1.rs"
+cp "$OUT/services/preloop.sandbox.driver.v1.rs" "$DEST/preloop.sandbox.driver.v1.connect.rs"
 
 # connectrpc-codegen 0.9.0 calls the `Register` RPC as `svc.register(ctx, req)`
 # inside the generated registration glue. The service has an RPC named

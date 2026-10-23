@@ -20,6 +20,9 @@ use preloop_orchestrator::RunnerPoolConfig;
 use preloop_orchestrator::fleet::SandboxMachines;
 use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
+use preloop_sandbox::driver_conformance::ConformanceOptions;
+use preloop_sandbox::drivers::external::{ExternalDriver, ExternalSpec};
+use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::drivers::smolvm::SmolvmDriver;
 use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
 use preloop_sandbox::drivers::smolvm::pack::ArtifactCache;
@@ -101,25 +104,39 @@ fn sandbox_agent_config(name: impl Into<String>, scratch: PathBuf) -> AgentConfi
 }
 
 /// Drivers attached to this host: `PRELOOP_SANDBOX_DRIVERS`, comma-separated
-/// (default `smolvm`). `named_prefix` lets the SmolVM inventory adopt the CI
-/// pool's caller-named machines; `cache` holds the packed artifacts drivers
-/// materialize. `local` is the provider an adapter will use for host-side
-/// operations; passing it here (as a clone of the same handle) keeps the
-/// driver and adapter on one lifecycle lock.
-pub(crate) fn host_drivers(
+/// (default `smolvm`). An `external:<spec>` entry starts a driver plugin (see
+/// [`ExternalSpec`]); `runtime_dir` holds their sockets. `named_prefix` lets
+/// the SmolVM inventory adopt the CI pool's caller-named machines; `cache`
+/// holds the packed artifacts drivers materialize. `local` is the provider an
+/// adapter will use for host-side operations; passing it here (as a clone of
+/// the same handle) keeps the driver and adapter on one lifecycle lock.
+pub(crate) async fn host_drivers(
     named_prefix: Option<&str>,
     slots: u32,
     cache: &ArtifactCache,
     local: Option<SmolVmProvider>,
+    runtime_dir: &Path,
 ) -> anyhow::Result<Vec<Arc<dyn Driver>>> {
     let names = env_nonempty("PRELOOP_SANDBOX_DRIVERS").unwrap_or_else(|| "smolvm".into());
-    let mut drivers: Vec<Arc<dyn Driver>> = Vec::new();
-    for name in names
+    let entries: Vec<&str> = names
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
-    {
-        drivers.push(match name {
+        .collect();
+    configured_driver_names(&entries)?;
+    let mut drivers: Vec<Arc<dyn Driver>> = Vec::new();
+    for entry in entries {
+        if let Some(spec) = entry.strip_prefix("external:") {
+            let spec = ExternalSpec::parse(spec)
+                .with_context(|| format!("PRELOOP_SANDBOX_DRIVERS entry `{entry}`"))?;
+            drivers.push(
+                ExternalDriver::start(spec, runtime_dir)
+                    .await
+                    .with_context(|| format!("starting external driver from `{entry}`"))?,
+            );
+            continue;
+        }
+        drivers.push(match entry {
             "smolvm" => {
                 let driver = smolvm_driver(
                     named_prefix,
@@ -134,6 +151,35 @@ pub(crate) fn host_drivers(
         });
     }
     Ok(drivers)
+}
+
+/// Registration names of the configured entries, validated before any plugin
+/// is started.
+///
+/// Drivers are addressed by name, so two entries that register the same one
+/// would leave a driver unreachable. Name both raw entries — that is what the
+/// operator has to edit — rather than only the resulting driver.
+fn configured_driver_names(entries: &[&str]) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::with_capacity(entries.len());
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for entry in entries {
+        let driver_name = match entry.strip_prefix("external:") {
+            Some(spec) => {
+                ExternalSpec::parse(spec)
+                    .with_context(|| format!("PRELOOP_SANDBOX_DRIVERS entry `{entry}`"))?
+                    .name
+            }
+            None => (*entry).to_owned(),
+        };
+        if let Some(previous) = seen.insert(driver_name.clone(), entry) {
+            anyhow::bail!(
+                "duplicate sandbox driver name `{driver_name}` in PRELOOP_SANDBOX_DRIVERS: \
+                 `{previous}` and `{entry}` both register it; give each entry a unique name"
+            );
+        }
+        names.push(driver_name);
+    }
+    Ok(names)
 }
 
 fn smolvm_driver(
@@ -211,7 +257,9 @@ impl LocalSandboxes {
             smolvm_slots(),
             &ArtifactCache::from_env(state.join("sandbox-cache")),
             Some((*local).clone()),
-        )?;
+            &state.join("driver-sockets"),
+        )
+        .await?;
         let pool_driver = env_nonempty("PRELOOP_SANDBOX_POOL_DRIVER").unwrap_or_else(|| {
             drivers
                 .first()
@@ -231,11 +279,12 @@ impl LocalSandboxes {
             sandbox_agent_config(local_provider_name(), state.join("sandbox-agent"))
                 .with_access(access);
         agent_config.metrics = metrics;
-        let agent = Agent::new(
+        let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             drivers,
             agent_config,
-        );
+        )
+        .context("configuring this host's sandbox drivers")?;
         // Register once here so the pool can place immediately; the agent
         // reuses this session instead of registering a second time (which
         // would fence its own in-flight work).
@@ -347,6 +396,48 @@ impl LocalSandboxes {
 impl Drop for LocalSandboxes {
     fn drop(&mut self) {
         self.shutdown.cancel();
+    }
+}
+
+/// SIGINT and SIGTERM handlers, installed up front.
+///
+/// The service manager that stops this process (launchd, systemd, a
+/// container runtime) sends SIGTERM; Ctrl-C sends SIGINT. Both must run the
+/// same graceful shutdown, or a SIGTERM kills the process before spawned
+/// driver plugins are terminated and leaves them orphaned.
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn install() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        Self {
+            interrupt: signal(SignalKind::interrupt()).expect("install SIGINT handler"),
+            terminate: signal(SignalKind::terminate()).expect("install SIGTERM handler"),
+        }
+    }
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
+/// Wait until the process is asked to stop (SIGINT or SIGTERM).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        ShutdownSignals::install().wait().await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -622,6 +713,9 @@ enum SandboxCommand {
     Serve(ServeSandboxArgs),
     /// Join a Sandbox Service as a provider with this host's drivers.
     Agent(AgentArgs),
+    /// Driver plugins: serve one over a Unix socket, or run conformance.
+    #[command(subcommand)]
+    Driver(DriverCommand),
     /// Templates.
     #[command(subcommand)]
     Template(TemplateCommand),
@@ -697,6 +791,40 @@ enum ProviderCommand {
         /// Provider name.
         name: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DriverCommand {
+    /// Serve an in-process driver as a plugin on a Unix socket.
+    Serve(DriverServeArgs),
+    /// Run the driver conformance suite against a driver.
+    Conformance(DriverConformanceArgs),
+}
+
+#[derive(Debug, Args)]
+struct DriverServeArgs {
+    /// In-process driver to serve: `smolvm` or `fake`.
+    #[arg(long, default_value = "smolvm")]
+    driver: String,
+    /// Unix socket to serve on.
+    #[arg(long)]
+    socket: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct DriverConformanceArgs {
+    /// Driver to test: `smolvm`, `fake`, or an external spec
+    /// (`external:name=/path/to/plugin [args…]` or
+    /// `external:name=unix:///path.sock`). The `external:` prefix may be
+    /// omitted.
+    #[arg(long)]
+    driver: String,
+    /// Artifact as comma-separated `key=value` pairs:
+    /// `format=oci-image|smolmachine,arch=…,ref=…,digest=sha256:…[,size=…]`.
+    /// Repeat for several formats or architectures. Without it the driver
+    /// applies its own default template.
+    #[arg(long = "artifact", value_name = "KEY=VALUE,…")]
+    artifact: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -952,6 +1080,7 @@ pub(crate) async fn run(
     match command {
         SandboxCommand::Serve(serve) => serve_standalone(serve, observability).await,
         SandboxCommand::Agent(agent) => run_agent(token, agent, observability).await,
+        SandboxCommand::Driver(driver) => run_driver(driver).await,
         command => {
             let state = crate::preloop_home().join("state");
             let base = resolve_service(&state, service)?;
@@ -976,8 +1105,8 @@ async fn run_client(
         Ok(lease.clone())
     };
     match command {
-        SandboxCommand::Serve(_) | SandboxCommand::Agent(_) => {
-            unreachable!("serve and agent run without a caller client")
+        SandboxCommand::Serve(_) | SandboxCommand::Agent(_) | SandboxCommand::Driver(_) => {
+            unreachable!("serve, agent and driver run without a caller client")
         }
         SandboxCommand::Template(TemplateCommand::Put {
             name,
@@ -1317,16 +1446,19 @@ async fn serve_standalone(
         let mut agent_config =
             sandbox_agent_config(local_provider_name(), state.join("sandbox-agent"));
         agent_config.metrics = metrics;
-        let agent = Agent::new(
+        let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             host_drivers(
                 Some(&named_prefix()),
                 smolvm_slots(),
                 &ArtifactCache::from_env(state.join("sandbox-cache")),
                 None,
-            )?,
+                &state.join("driver-sockets"),
+            )
+            .await?,
             agent_config.with_access(HostAccess::from_env()),
-        );
+        )
+        .context("configuring this host's sandbox drivers")?;
         tokio::spawn(agent.run(None, shutdown.clone()));
     }
     let listener = bind_endpoint(&state, args.listen)
@@ -1337,7 +1469,7 @@ async fn serve_standalone(
     eprintln!("[preloop] sandbox service on https://{bound}");
     let stop = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        shutdown_signal().await;
         stop.cancel();
     });
     let served = serve_api(listener, service, auth, tls, shutdown.clone()).await;
@@ -1387,20 +1519,23 @@ async fn run_agent(
         sandbox_agent_config(name, state.join("sandbox-agent")).with_access(HostAccess::from_env());
     agent_config.metrics =
         preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
-    let agent = Agent::new(
+    let agent = Agent::try_new(
         Arc::new(link),
         host_drivers(
             None,
             args.slots,
             &ArtifactCache::from_env(state.join("sandbox-cache")),
             None,
-        )?,
+            &state.join("driver-sockets"),
+        )
+        .await?,
         agent_config,
-    );
+    )
+    .context("configuring this host's sandbox drivers")?;
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        shutdown_signal().await;
         stop.cancel();
     });
     eprintln!("[preloop] sandbox agent joining {base}");
@@ -1408,9 +1543,172 @@ async fn run_agent(
     Ok(())
 }
 
+/// An in-process backend for the driver commands.
+fn in_process_driver(name: &str, state: &Path) -> anyhow::Result<Arc<dyn Driver>> {
+    match name {
+        "smolvm" => Ok(Arc::new(
+            SmolvmDriver::new(SmolVmProvider::default(), smolvm_slots())
+                .with_cache(ArtifactCache::from_env(state.join("sandbox-cache"))),
+        )),
+        "fake" => {
+            let root = state.join("driver-fake");
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("creating {}", root.display()))?;
+            Ok(Arc::new(FakeDriver::new(
+                "fake",
+                root,
+                FakeDriver::full_capabilities(),
+            )))
+        }
+        other => anyhow::bail!("`{other}` is not an in-process driver; use `smolvm` or `fake`"),
+    }
+}
+
+/// Conformance options for the `driver conformance` command.
+///
+/// Without `--artifact`, the driver applies its own default template. With
+/// artifacts, they form a `conformance` template so a real VM driver boots a
+/// digest-pinned image instead of whatever happens to be the default.
+fn conformance_options(artifact: &[String]) -> anyhow::Result<ConformanceOptions> {
+    if artifact.is_empty() {
+        return Ok(ConformanceOptions::default());
+    }
+    let artifacts = artifact
+        .iter()
+        .map(|raw| parse_artifact(raw))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ConformanceOptions::new(Template {
+        spec: TemplateSpec {
+            name: "conformance".to_owned(),
+            os: "linux".to_owned(),
+            artifacts,
+            ..TemplateSpec::default()
+        }
+        .into(),
+        ..Template::default()
+    }))
+}
+
+/// `preloop sandbox driver …`.
+async fn run_driver(command: DriverCommand) -> anyhow::Result<()> {
+    let state = crate::preloop_home().join("state");
+    match command {
+        DriverCommand::Serve(args) => {
+            let driver = in_process_driver(&args.driver, &state)?;
+            let shutdown = CancellationToken::new();
+            let stop = shutdown.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                stop.cancel();
+            });
+            eprintln!(
+                "[preloop] serving driver `{}` on unix://{}",
+                driver.name(),
+                args.socket.display()
+            );
+            preloop_sandbox::driver_plugin::serve(driver, &args.socket, shutdown).await?;
+            Ok(())
+        }
+        DriverCommand::Conformance(args) => {
+            let driver = match args.driver.as_str() {
+                "smolvm" | "fake" => in_process_driver(&args.driver, &state)?,
+                raw => {
+                    let spec = ExternalSpec::parse(raw).with_context(|| {
+                        format!(
+                            "`{raw}` is not an in-process driver (`smolvm`, `fake`) and not a \
+                             valid external spec"
+                        )
+                    })?;
+                    ExternalDriver::start(spec, &state.join("driver-sockets")).await?
+                }
+            };
+            eprintln!("[preloop] driver conformance: {}", driver.name());
+            let options = conformance_options(&args.artifact)?;
+            let results = preloop_sandbox::driver_conformance::run(driver, &options).await;
+            let mut failed: Vec<&str> = Vec::new();
+            let mut skipped = 0usize;
+            println!("{:<28} {:<6} detail", "case", "result");
+            for case in &results {
+                if case.skipped {
+                    skipped += 1;
+                    println!("{:<28} {:<6}", case.name, "skip");
+                    continue;
+                }
+                match &case.outcome {
+                    Ok(()) => println!("{:<28} {:<6}", case.name, "pass"),
+                    Err(error) => {
+                        println!(
+                            "{:<28} {:<6} {}",
+                            case.name,
+                            "fail",
+                            error.replace('\n', " ")
+                        );
+                        failed.push(case.name);
+                    }
+                }
+            }
+            println!(
+                "\n{} passed, {} failed, {} skipped",
+                results.len() - failed.len() - skipped,
+                failed.len(),
+                skipped
+            );
+            if !failed.is_empty() {
+                anyhow::bail!("driver conformance failed: {}", failed.join(", "));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn driver_conformance_parses_repeated_artifacts() {
+        use clap::Parser as _;
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let oci = format!(
+            "format=oci-image,arch=aarch64,ref=ghcr.io/acme/image@{digest},digest={digest}"
+        );
+        let pack = format!("format=smolmachine,arch=aarch64,ref=file:///tmp/pack,digest={digest}");
+        let cli = crate::Cli::try_parse_from([
+            "preloop",
+            "sandbox",
+            "driver",
+            "conformance",
+            "--driver",
+            "smolvm",
+            "--artifact",
+            &oci,
+            "--artifact",
+            &pack,
+        ])
+        .unwrap();
+        let crate::Command::Sandbox(args) = cli.command else {
+            panic!("expected the sandbox command");
+        };
+        let SandboxCommand::Driver(DriverCommand::Conformance(args)) = args.command else {
+            panic!("expected driver conformance");
+        };
+        assert_eq!(args.driver, "smolvm");
+        assert_eq!(args.artifact, vec![oci, pack]);
+
+        let options = conformance_options(&args.artifact).unwrap();
+        let spec = options
+            .template
+            .spec
+            .into_option()
+            .expect("artifacts build a template");
+        assert_eq!(spec.name, "conformance");
+        assert_eq!(spec.artifacts.len(), 2);
+        assert_eq!(spec.artifacts[0].format, Artifact::OCI_IMAGE);
+        assert_eq!(spec.artifacts[1].format, Artifact::SMOLMACHINE);
+
+        let default = conformance_options(&[]).unwrap();
+        assert!(default.template.spec.into_option().is_none());
+    }
 
     #[tokio::test]
     async fn pump_exec_forwards_output_and_returns_the_exit_code() {
@@ -1493,10 +1791,110 @@ mod tests {
         assert!(error.to_string().contains("--join"), "{error}");
     }
 
+    /// Set for the re-executed test binary that waits on [`ShutdownSignals`].
+    const SIGTERM_CHILD_ENV: &str = "PRELOOP_TEST_SANDBOX_SIGTERM_CHILD";
+
+    #[test]
+    fn duplicate_driver_entries_name_both_entries() {
+        let names = configured_driver_names(&["smolvm"]).unwrap();
+        assert_eq!(names, ["smolvm"]);
+
+        let names =
+            configured_driver_names(&["smolvm", "external:smolvm-ext=/usr/bin/plugin"]).unwrap();
+        assert_eq!(names, ["smolvm", "smolvm-ext"]);
+
+        let error =
+            configured_driver_names(&["smolvm", "external:smolvm=/usr/local/bin/other-smolvm"])
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("duplicate sandbox driver name `smolvm`"),
+            "{error}"
+        );
+        assert!(error.contains("`smolvm` and `external:smolvm="), "{error}");
+    }
+
+    /// The child half of [`sigterm_resolves_the_shutdown_future`]: install the
+    /// handlers, report readiness, then wait. A SIGTERM with the default
+    /// disposition would kill this process instead of letting it return.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_child_waits_for_shutdown() {
+        if std::env::var_os(SIGTERM_CHILD_ENV).is_none() {
+            return;
+        }
+        use std::io::Write as _;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Signal streams need the runtime's reactor.
+            let mut signals = ShutdownSignals::install();
+            println!("ready");
+            std::io::stdout().flush().unwrap();
+            tokio::time::timeout(Duration::from_secs(30), signals.wait())
+                .await
+                .expect("SIGTERM must resolve the shutdown future");
+        });
+    }
+
     #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_resolves_the_shutdown_future() {
+        use std::io::{BufRead as _, BufReader};
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "sandbox::tests::sigterm_child_waits_for_shutdown",
+                "--nocapture",
+            ])
+            .env(SIGTERM_CHILD_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            // Keep draining after readiness: closing the read end would make
+            // the child's own test harness exit on EPIPE instead of reporting
+            // the result we assert on.
+            let mut announced = false;
+            for line in BufReader::new(stdout).lines() {
+                if !announced && line.unwrap_or_default().contains("ready") {
+                    announced = true;
+                    let _ = ready_tx.send(());
+                }
+            }
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the child installs its handlers and reports readiness");
+
+        // SAFETY: the child is alive and waiting; SIGTERM is the signal a
+        // service manager sends on stop.
+        let killed = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        assert_eq!(killed, 0, "SIGTERM delivery");
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read as _;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        assert!(
+            status.success(),
+            "the child must exit cleanly on SIGTERM, not die from it: {status}\n{stderr}"
+        );
     }
 
     #[cfg(unix)]

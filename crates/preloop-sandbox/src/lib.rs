@@ -16,6 +16,8 @@ pub mod agent;
 pub mod api;
 pub mod client;
 pub mod driver;
+pub mod driver_conformance;
+pub mod driver_plugin;
 pub mod drivers;
 pub mod error;
 #[path = "gen/mod.rs"]

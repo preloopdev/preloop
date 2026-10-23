@@ -33,5 +33,11 @@ pub mod preloop {
             include!("preloop.sandbox.v1.rs");
             include!("preloop.sandbox.v1.connect.rs");
         }
+        pub mod driver {
+            pub mod v1 {
+                include!("preloop.sandbox.driver.v1.rs");
+                include!("preloop.sandbox.driver.v1.connect.rs");
+            }
+        }
     }
 }
