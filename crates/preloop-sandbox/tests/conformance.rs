@@ -1923,6 +1923,61 @@ async fn a_tombstone_is_not_reaped_by_another_provider() {
     );
 }
 
+/// A store that refuses provider rows, as a full or read-only disk would.
+struct RefusesProviderRows(Arc<dyn Store>);
+
+#[async_trait::async_trait]
+impl Store for RefusesProviderRows {
+    async fn put(
+        &self,
+        kind: Kind,
+        id: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), preloop_sandbox::Error> {
+        if kind == Kind::Providers {
+            return Err(preloop_sandbox::Error::internal("disk full"));
+        }
+        self.0.put(kind, id, value).await
+    }
+
+    async fn delete(&self, kind: Kind, id: &str) -> Result<(), preloop_sandbox::Error> {
+        self.0.delete(kind, id).await
+    }
+
+    async fn load(&self, kind: Kind) -> Result<Vec<serde_json::Value>, preloop_sandbox::Error> {
+        self.0.load(kind).await
+    }
+}
+
+/// A generation counts only once the store has kept it. A restart bumps the
+/// stored generation, so a generation handed out and then lost can be issued
+/// again, and the session that still holds it would pass `fence` without
+/// re-registering.
+#[tokio::test]
+async fn a_generation_the_store_cannot_keep_is_never_handed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = store::open("memory:").await.unwrap();
+    let service = Service::open(
+        Arc::new(RefusesProviderRows(inner)),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let request = || RegisterRequest {
+        name: "host-a".into(),
+        drivers: vec![DriverInfo {
+            driver: "fake".into(),
+            capabilities: FakeDriver::full_capabilities(),
+        }],
+    };
+    for _ in 0..2 {
+        let Err(error) = service.register(request()).await else {
+            panic!("a generation the store refused was handed to the agent");
+        };
+        assert_eq!(error.code, Code::Unavailable, "{}", error.message);
+    }
+}
+
 /// A lease on a host that stopped answering is released, not held to its TTL:
 /// the caller learns it is gone, and the machine is left for reconcile.
 #[tokio::test]

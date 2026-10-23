@@ -15,6 +15,12 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A registration the store cannot keep is refused, not handed out.** Registration
+  persisted the provider's generation best-effort, so a store failure could leave a
+  restart to bump the stored generation back to one an agent already held, and that
+  session would pass the fence without registering again. Registration now fails
+  until its provider row is kept, and the agent registers again.
+
 - **A slow or failing machine destroy no longer loses its record.** A destroy in
   flight is awaited instead of asked again, and only completed failures count
   toward giving up. After three of them the record becomes a `GONE` tombstone

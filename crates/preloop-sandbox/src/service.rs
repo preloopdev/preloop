@@ -634,12 +634,21 @@ impl Service {
     }
 
     async fn persist(&self, ops: Vec<Op>) {
+        let _ = self.persist_checked(ops).await;
+    }
+
+    /// [`Self::persist`], reporting a provider row the store refused. A
+    /// generation counts only once it is durable: a restart bumps the stored
+    /// generation, so one handed out and then lost can be issued again, and a
+    /// session still holding it would pass `fence` without re-registering.
+    async fn persist_checked(&self, ops: Vec<Op>) -> Result<()> {
         if ops.is_empty() {
-            return;
+            return Ok(());
         }
         // Serialized so a record's writes land in decision order; a stale
         // snapshot is dropped rather than overwriting newer truth.
         let mut persisted = self.persisted.lock().await;
+        let mut provider_refused = None;
         for op in ops {
             let key = (op.kind, op.id.clone());
             if persisted.get(&key).is_some_and(|seq| *seq > op.seq) {
@@ -656,13 +665,25 @@ impl Service {
                 // Best-effort store: in-memory state stays authoritative, so
                 // the RPC succeeds. The lost write is visible here, with the
                 // record kind, for the restart it will cost.
-                Err(cause) => error!(
-                    kind = ?op.kind,
-                    id = %op.id,
-                    error = %cause,
-                    "sandbox store write failed; the record is not durable"
-                ),
+                Err(cause) => {
+                    error!(
+                        kind = ?op.kind,
+                        id = %op.id,
+                        error = %cause,
+                        "sandbox store write failed; the record is not durable"
+                    );
+                    if op.kind == Kind::Providers && provider_refused.is_none() {
+                        provider_refused = Some(Error::unavailable(format!(
+                            "provider `{}` was not persisted; register again: {cause}",
+                            op.id
+                        )));
+                    }
+                }
             }
+        }
+        match provider_refused {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -2641,7 +2662,7 @@ impl Service {
             )
         };
         info!(provider = %response.provider_id, generation = response.generation, "provider registered");
-        self.persist(ops).await;
+        self.persist_checked(ops).await?;
         self.changed.notify_waiters();
         Ok(response)
     }
