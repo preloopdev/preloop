@@ -1,19 +1,24 @@
 //! HTTP surface: the generated ConnectRPC services plus the ticketed data
-//! plane.
+//! plane, served on separate caller and agent listeners.
 //!
-//! Everything is served over TLS. Callers hold the one client bearer token;
-//! capacity owners authenticate with a client certificate issued by the
-//! service CA (see [`crate::tls`]), except for `Enroll` which is authenticated
-//! by a single-use join token.
+//! TLS is used by default. Callers hold the one client bearer token; capacity
+//! owners authenticate with a client certificate issued by the service CA
+//! (see [`crate::tls`]), except for `Enroll` which uses a single-use join token.
 //!
-//! The RPC routes ([`crate::generated`]) run under an axum fallback so the
-//! ticketed data plane — plain `GET`/`PUT` routes that stream tar bodies —
-//! shares the listener and the connection-scoped [`PeerIdentity`]. The
-//! generated dispatch hands each handler a [`connectrpc::RequestContext`]
+//! The generated RPC routes ([`crate::generated`]) run under an axum fallback
+//! so the ticketed data plane — plain `GET`/`PUT` routes that stream tar
+//! bodies — shares the listener and the connection-scoped [`PeerIdentity`].
+//! The generated dispatch hands each handler a [`connectrpc::RequestContext`]
 //! whose extensions are the request's own: `ConnectInfo<PeerIdentity>`
 //! inserted by axum's listener is how `Providers` sees the client
 //! certificate.
+//!
+//! [`ListenerSurface`] decides which RPC service and which data-plane routes a
+//! listener exposes: the caller listener never serves provider RPCs or agent
+//! blob routes, and the agent listener never serves caller RPCs or caller
+//! streams.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
@@ -43,6 +48,126 @@ use crate::tls::{PeerIdentity, ServerTls, TlsListener};
 
 /// Maximum request body for one Connect RPC.
 pub const CONNECT_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Which part of the Sandbox Service a listener exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerSurface {
+    /// Caller RPCs and caller data-plane streams.
+    Client,
+    /// Provider RPCs, enrollment, CA retrieval and provider blobs.
+    Agent,
+    /// The compatibility mode where one listener exposes both surfaces.
+    Combined,
+}
+
+/// Host names accepted by the client listener's DNS-rebinding guard.
+#[derive(Debug, Clone, Default)]
+pub struct HostAllowlist {
+    bound: Option<IpAddr>,
+    patterns: Vec<HostPattern>,
+    enforced: bool,
+}
+
+#[derive(Debug, Clone)]
+enum HostPattern {
+    Exact(String),
+    Wildcard(String),
+}
+
+impl HostAllowlist {
+    /// Disable Host checking.
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// Build a policy from the bound address and comma-separated setting.
+    ///
+    /// The setting is considered explicit when `raw` is `Some`, including an
+    /// empty value. Loopback listeners are guarded even without the setting.
+    pub fn from_config(
+        bound: SocketAddr,
+        raw: Option<&str>,
+        extra_exact: impl IntoIterator<Item = String>,
+    ) -> std::result::Result<Self, String> {
+        let mut patterns = Vec::new();
+        if let Some(raw) = raw {
+            for value in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                patterns.push(parse_host_pattern(value)?);
+            }
+        }
+        for value in extra_exact {
+            patterns.push(HostPattern::Exact(normalize_host(&value)?));
+        }
+        Ok(Self {
+            bound: (!bound.ip().is_unspecified()).then_some(bound.ip()),
+            patterns,
+            enforced: raw.is_some() || bound.ip().is_loopback(),
+        })
+    }
+
+    /// Whether this policy accepts a Host header value.
+    pub fn accepts(&self, value: &str) -> bool {
+        let Some(host) = host_without_port(value.trim()).map(normalize_host_lossy) else {
+            return false;
+        };
+        if host == "localhost"
+            || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            || self
+                .bound
+                .is_some_and(|ip| host.parse::<IpAddr>() == Ok(ip))
+        {
+            return true;
+        }
+        self.patterns.iter().any(|pattern| match pattern {
+            HostPattern::Exact(expected) => host == *expected,
+            HostPattern::Wildcard(suffix) => host
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains('.')),
+        })
+    }
+
+    /// Whether this policy should be applied to requests.
+    pub fn enforced(&self) -> bool {
+        self.enforced
+    }
+}
+
+fn normalize_host(value: &str) -> std::result::Result<String, String> {
+    let host = host_without_port(value.trim())
+        .ok_or_else(|| format!("invalid host in PRELOOP_SANDBOX_ALLOWED_HOSTS: `{value}`"))?
+        .trim_end_matches('.');
+    if host.is_empty()
+        || host == "*"
+        || host.contains('*')
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains(' ')
+        || host.parse::<IpAddr>().is_err() && host.contains(':')
+    {
+        return Err(format!(
+            "invalid host in PRELOOP_SANDBOX_ALLOWED_HOSTS: `{value}`"
+        ));
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+fn normalize_host_lossy(value: &str) -> String {
+    value.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn parse_host_pattern(value: &str) -> std::result::Result<HostPattern, String> {
+    if let Some(suffix) = value.strip_prefix("*.") {
+        let suffix = normalize_host(suffix)?;
+        if suffix.is_empty() {
+            return Err(format!(
+                "invalid host in PRELOOP_SANDBOX_ALLOWED_HOSTS: `{value}`"
+            ));
+        }
+        Ok(HostPattern::Wildcard(format!(".{suffix}")))
+    } else {
+        Ok(HostPattern::Exact(normalize_host(value)?))
+    }
+}
 
 /// Bearer token for `Sandboxes` callers plus the optional loopback Host guard.
 ///
@@ -75,6 +200,12 @@ impl Auth {
     }
 }
 
+#[derive(Clone)]
+struct AppState {
+    service: Arc<Service>,
+    auth: Auth,
+    hosts: HostAllowlist,
+}
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -100,7 +231,7 @@ fn host_without_port(value: &str) -> Option<&str> {
 }
 
 /// Accept only names that reach a listener on this machine: `localhost`, any
-/// `127.0.0.0/8` address, or `::1`.
+/// loopback address, the bound address and configured names.
 fn loopback_host(value: &str) -> bool {
     let Some(host) = host_without_port(value.trim()) else {
         return false;
@@ -108,22 +239,36 @@ fn loopback_host(value: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-fn check_host(loopback_only: bool, headers: &HeaderMap) -> Result<()> {
-    if !loopback_only {
+fn check_host(
+    policy: &HostAllowlist,
+    legacy_loopback_only: bool,
+    headers: &HeaderMap,
+) -> Result<(), Error> {
+    if !policy.enforced() && !legacy_loopback_only {
         return Ok(());
     }
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| Error::permission_denied("Host header is required"))?;
-    if !loopback_host(host) {
-        return Err(Error::permission_denied(format!(
-            "Host `{host}` is not a loopback address"
-        )));
+        .ok_or_else(|| Error::new(Code::PermissionDenied, "Host header is required"))?;
+    let accepted = if policy.enforced() {
+        policy.accepts(host)
+    } else {
+        loopback_host(host)
+    };
+    if !accepted {
+        let setting = if policy.enforced() {
+            "PRELOOP_SANDBOX_ALLOWED_HOSTS"
+        } else {
+            "the loopback Host policy"
+        };
+        return Err(Error::new(
+            Code::PermissionDenied,
+            format!("Host `{host}` is not allowed; change {setting}"),
+        ));
     }
     Ok(())
 }
@@ -142,11 +287,12 @@ fn token_eq(candidate: &str, expected: &str) -> bool {
 struct SandboxesService {
     service: Arc<Service>,
     auth: Auth,
+    hosts: HostAllowlist,
 }
 
 impl SandboxesService {
     fn authorize(&self, ctx: &RequestContext) -> Result<()> {
-        check_host(self.auth.loopback_only, ctx.headers())?;
+        check_host(&self.hosts, self.auth.loopback_only, ctx.headers())?;
         let token = ctx
             .header(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -163,13 +309,14 @@ struct ProvidersService {
     service: Arc<Service>,
     /// Reject RPCs whose `Host` is not loopback; see [`Auth::loopback_only`].
     loopback_only: bool,
+    hosts: HostAllowlist,
 }
 
 impl ProvidersService {
     /// The enrolled provider the request's client certificate authenticates,
     /// plus the fingerprint it was resolved from.
     fn identity(&self, ctx: &RequestContext) -> Result<(ProviderIdentity, String)> {
-        check_host(self.loopback_only, ctx.headers())?;
+        check_host(&self.hosts, self.loopback_only, ctx.headers())?;
         let peer = ctx
             .extensions()
             .get::<ConnectInfo<PeerIdentity>>()
@@ -750,66 +897,108 @@ struct AppState {
     auth: Auth,
 }
 
-/// Build the router.
+/// Build the compatibility router exposing both surfaces.
+///
+/// This is the single-listener deployment mode: caller and agent routes share
+/// one router, as they did before the listener split.
+pub fn router(service: Arc<Service>, auth: Auth) -> Router {
+    router_with_options(
+        service,
+        auth,
+        ListenerSurface::Combined,
+        HostAllowlist::disabled(),
+    )
+}
+
+/// Build a router for one listener surface.
 ///
 /// The ConnectRPC services own the fallback; the data-plane routes are plain
 /// axum routes on the same listener. `Providers` reads the peer certificate
-/// from `ConnectInfo<PeerIdentity>`, so serve it with [`serve`] (or
-/// `Router::into_make_service_with_connect_info`).
-pub fn router(service: Arc<Service>, auth: Auth) -> Router {
-    let sandboxes = Arc::new(SandboxesService {
-        service: service.clone(),
-        auth: auth.clone(),
-    });
-    let providers = Arc::new(ProvidersService {
-        service: service.clone(),
-        loopback_only: auth.loopback_only,
-    });
-    let rpc = sandboxes.register(providers.register(connectrpc::Router::new()));
+/// from `ConnectInfo<PeerIdentity>`, so serve it with [`serve_with_options`]
+/// (or `Router::into_make_service_with_connect_info`).
+pub fn router_with_options(
+    service: Arc<Service>,
+    auth: Auth,
+    surface: ListenerSurface,
+    hosts: HostAllowlist,
+) -> Router {
+    let mut rpc = connectrpc::Router::new();
+    let mut router = Router::new();
+    if matches!(surface, ListenerSurface::Client | ListenerSurface::Combined) {
+        let sandboxes = Arc::new(SandboxesService {
+            service: service.clone(),
+            auth: auth.clone(),
+            hosts: hosts.clone(),
+        });
+        rpc = sandboxes.register(rpc);
+        router = router
+            .route(
+                "/sandbox/v1/streams/{ticket}",
+                get(stream_download).put(stream_upload),
+            )
+            .route("/sandbox/v1/healthz", get(|| async { "ok" }));
+    }
+    if matches!(surface, ListenerSurface::Agent | ListenerSurface::Combined) {
+        let providers = Arc::new(ProvidersService {
+            service: service.clone(),
+            loopback_only: auth.loopback_only,
+            hosts: hosts.clone(),
+        });
+        rpc = providers.register(rpc);
+        router = router
+            .route(
+                "/sandbox/v1/agent/blobs/{ticket}",
+                get(agent_blob_get).put(agent_blob_put),
+            )
+            .route("/sandbox/v1/ca.pem", get(ca_pem));
+    }
     // Bulk bytes travel over the ticketed data plane, never in RPCs. The
     // buffering middleware bounds every unary request (and the single Exec
     // envelope), and the data-plane routes below stream their own bodies.
     let rpc = axum::Router::new()
         .fallback_service(rpc.into_axum_service())
         .layer(middleware::from_fn(cap_rpc_body));
-    Router::new()
-        .route(
-            "/sandbox/v1/streams/{ticket}",
-            get(stream_download).put(stream_upload),
-        )
-        .route(
-            "/sandbox/v1/agent/blobs/{ticket}",
-            get(agent_blob_get).put(agent_blob_put),
-        )
-        .route("/sandbox/v1/ca.pem", get(ca_pem))
-        .route("/sandbox/v1/healthz", get(|| async { "ok" }))
-        .fallback_service(rpc)
-        .with_state(AppState {
-            service,
-            auth: auth.clone(),
-        })
+    router.fallback_service(rpc).with_state(AppState {
+        service,
+        auth,
+        hosts,
+    })
 }
 
-/// Reject an RPC body above [`CONNECT_BODY_LIMIT`] with `413`.
-///
-/// The generated dispatch reads the body itself and would answer a body over
-/// its own limit with a Connect `resource_exhausted`; this middleware keeps
-/// the service's documented HTTP answer and bounds buffering before dispatch.
-async fn cap_rpc_body(request: axum::extract::Request, next: Next) -> Response {
-    let (parts, body) = request.into_parts();
-    match axum::body::to_bytes(body, CONNECT_BODY_LIMIT).await {
-        Ok(bytes) => {
-            let request = axum::extract::Request::from_parts(parts, Body::from(bytes));
-            next.run(request).await
-        }
-        Err(_) => payload_too_large(CONNECT_BODY_LIMIT as u64),
+/// Build a router for one listener surface.
+pub fn router_with_options(
+    service: Arc<Service>,
+    auth: Auth,
+    surface: ListenerSurface,
+    hosts: HostAllowlist,
+) -> Router {
+    let mut router = Router::new();
+    if matches!(surface, ListenerSurface::Client | ListenerSurface::Combined) {
+        router = router
+            .route("/preloop.sandbox.v1.Sandboxes/{method}", post(sandboxes))
+            .route(
+                "/sandbox/v1/streams/{ticket}",
+                get(stream_download).put(stream_upload),
+            )
+            .route("/sandbox/v1/healthz", get(|| async { "ok" }));
     }
+    if matches!(surface, ListenerSurface::Agent | ListenerSurface::Combined) {
+        router = router
+            .route("/preloop.sandbox.v1.Providers/{method}", post(providers))
+            .route(
+                "/sandbox/v1/agent/blobs/{ticket}",
+                get(agent_blob_get).put(agent_blob_put),
+            )
+            .route("/sandbox/v1/ca.pem", get(ca_pem));
+    }
+    router.with_state(AppState {
+        service,
+        auth,
+        hosts,
+    })
 }
 
-/// Serve the API over TLS until `shutdown`.
-///
-/// Each connection completes a handshake first; the peer's certificate (when
-/// presented) becomes [`ConnectInfo<PeerIdentity>`] for the handlers.
+/// Serve the compatibility API over TLS until `shutdown`.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     service: Arc<Service>,
@@ -817,13 +1006,44 @@ pub async fn serve(
     tls: Arc<ServerTls>,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let app = router(service, auth);
-    axum::serve(
-        TlsListener::new(listener, tls.acceptor.clone()),
-        app.into_make_service_with_connect_info::<PeerIdentity>(),
+    serve_with_options(
+        listener,
+        service,
+        auth,
+        Some(tls),
+        ListenerSurface::Combined,
+        HostAllowlist::disabled(),
+        shutdown,
     )
-    .with_graceful_shutdown(async move { shutdown.cancelled().await })
     .await
+}
+
+/// Serve one listener surface over TLS or plain HTTP.
+pub async fn serve_with_options(
+    listener: tokio::net::TcpListener,
+    service: Arc<Service>,
+    auth: Auth,
+    tls: Option<Arc<ServerTls>>,
+    surface: ListenerSurface,
+    hosts: HostAllowlist,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let app = router_with_options(service, auth, surface, hosts);
+    if let Some(tls) = tls {
+        axum::serve(
+            TlsListener::new(listener, tls.acceptor.clone()),
+            app.into_make_service_with_connect_info::<PeerIdentity>(),
+        )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+    } else {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<PeerIdentity>(),
+        )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+    }
 }
 
 /// The service CA, for agents that pin it before enrolling.
@@ -979,7 +1199,7 @@ async fn stream_upload(
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
     let max_bytes = app.service.config().blob_max_bytes;
-    if let Err(error) = check_host(app.auth.loopback_only, &headers) {
+    if let Err(error) = check_host(&app.hosts, app.auth.loopback_only, &headers) {
         return error.into_response();
     }
     let mut claim =
@@ -1046,7 +1266,7 @@ async fn stream_download(
     headers: HeaderMap,
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
-    if let Err(error) = check_host(app.auth.loopback_only, &headers) {
+    if let Err(error) = check_host(&app.hosts, app.auth.loopback_only, &headers) {
         return error.into_response();
     }
     let mut claim =
@@ -1118,6 +1338,14 @@ fn provider_headers(headers: &HeaderMap) -> Result<(String, u64)> {
     Ok((id.to_owned(), generation))
 }
 
+fn missing_client_certificate() -> Error {
+    Error::new(
+        Code::Unauthenticated,
+        "no client certificate was presented; the agent listener must be exposed as raw TCP \
+         behind a proxy or tunnel, not through TLS termination (see docs/sandbox-service.md#deployment)",
+    )
+}
+
 /// The agent fetches an upload ticket's bytes (consumer side).
 async fn agent_blob_get(
     State(app): State<AppState>,
@@ -1126,8 +1354,11 @@ async fn agent_blob_get(
     headers: HeaderMap,
 ) -> Response {
     let result = async {
-        check_host(app.auth.loopback_only, &headers)?;
-        let identity = app.service.provider_identity(peer.fingerprint()?)?;
+        check_host(&app.hosts, app.auth.loopback_only, &headers)?;
+        let identity = app.service.provider_identity(
+            peer.fingerprint()
+                .map_err(|_| missing_client_certificate())?,
+        )?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
         let mut claim = app.service.claim_agent(
@@ -1169,8 +1400,11 @@ async fn agent_blob_put(
     body: Body,
 ) -> Response {
     let result = async {
-        check_host(app.auth.loopback_only, &headers)?;
-        let identity = app.service.provider_identity(peer.fingerprint()?)?;
+        check_host(&app.hosts, app.auth.loopback_only, &headers)?;
+        let identity = app.service.provider_identity(
+            peer.fingerprint()
+                .map_err(|_| missing_client_certificate())?,
+        )?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
         app.service.claim_agent(
@@ -1251,5 +1485,41 @@ mod tests {
         ] {
             assert!(!loopback_host(host), "{host} must be rejected");
         }
+    }
+
+    #[test]
+    fn allowlist_matches_exact_wildcard_ports_and_bound_address() {
+        let policy = HostAllowlist::from_config(
+            "192.0.2.10:9191".parse().unwrap(),
+            Some("api.example.test,*.svc.example.test,[2001:db8::10]"),
+            std::iter::empty(),
+        )
+        .unwrap();
+        for host in [
+            "API.EXAMPLE.TEST:9191",
+            "worker.svc.example.test.",
+            "192.0.2.10:1",
+            "[2001:db8::10]:9191",
+            "localhost.",
+            "127.0.0.42",
+            "[::1]:9191",
+        ] {
+            assert!(policy.accepts(host), "{host} must be accepted");
+        }
+        for host in [
+            "evil.example.test",
+            "worker.deep.svc.example.test",
+            "api.example.test.evil",
+        ] {
+            assert!(!policy.accepts(host), "{host} must be rejected");
+        }
+        assert!(
+            HostAllowlist::from_config(
+                "127.0.0.1:9191".parse().unwrap(),
+                Some("*"),
+                std::iter::empty(),
+            )
+            .is_err()
+        );
     }
 }
