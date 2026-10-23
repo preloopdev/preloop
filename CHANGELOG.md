@@ -15,6 +15,12 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A slow or failing machine destroy no longer loses its record.** A destroy in
+  flight is awaited instead of asked again, and only completed failures count
+  toward giving up. After three of them the record becomes a `GONE` tombstone
+  that reconcile destroys the machine through, instead of being dropped: a
+  dropped record left a marked machine that nothing could reclaim.
+
 - **A second agent on one host no longer destroys a snapshot template's fork
   base.** `Reconcile` spared a golden only when the reporting provider owned
   the template, and a golden has no sandbox record: an agent sharing the same

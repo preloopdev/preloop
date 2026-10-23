@@ -1628,6 +1628,301 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
     );
 }
 
+/// Releases a sandbox with every destroy failing, and reconciles the way the
+/// agent does, until its record is a tombstone. The machine is still on the
+/// host when this returns.
+async fn release_until_tombstoned(h: &Harness, lease_id: &str, sandbox_id: &str) {
+    h.fake
+        .fail_destroys
+        .store(1000, std::sync::atomic::Ordering::Release);
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease_id.into(),
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    let provider = h.service.list_providers().remove(0);
+    for _ in 0..200 {
+        let sandboxes = h.fake.inventory().await.unwrap();
+        h.service
+            .reconcile(ReconcileRequest {
+                provider_id: provider.id.clone(),
+                generation: provider.generation,
+                sandboxes,
+            })
+            .await
+            .unwrap();
+        match h.service.get(sandbox_id) {
+            Ok(sandbox) if sandbox.state == SandboxState::Gone => return,
+            Ok(sandbox) => assert_eq!(
+                sandbox.state,
+                SandboxState::Terminating,
+                "the record holds until the third failure"
+            ),
+            Err(error) => panic!(
+                "the record was dropped before its machine was destroyed: {}",
+                error.message
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the destroy never reached its third failure");
+}
+
+/// A destroy that outlasts several reconcile rounds keeps its record: each
+/// round finds it in flight and leaves it alone, so it is neither asked again
+/// nor counted toward giving up, and the record completes once the machine is
+/// gone.
+#[tokio::test]
+async fn a_slow_destroy_keeps_its_record_until_it_reports() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let sandbox_id = lease.sandbox.id.clone();
+    h.fake
+        .destroy_delay_ms
+        .store(1500, std::sync::atomic::Ordering::Release);
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    let provider = h.service.list_providers().remove(0);
+    for _ in 0..4 {
+        let sandboxes = h.fake.inventory().await.unwrap();
+        h.service
+            .reconcile(ReconcileRequest {
+                provider_id: provider.id.clone(),
+                generation: provider.generation,
+                sandboxes,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            h.service.get(&sandbox_id).unwrap().state,
+            SandboxState::Terminating,
+            "a destroy in flight keeps its record"
+        );
+    }
+    wait_for(|| h.service.get(&sandbox_id).is_err()).await;
+    // Let any destroy asked a second time run before counting the calls.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        h.fake
+            .destroy_calls
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the slow destroy was never asked again"
+    );
+    let machines = h.fake.inventory().await.unwrap();
+    assert!(
+        machines
+            .iter()
+            .all(|observed| observed.native_ref != lease.sandbox.native_ref),
+        "the machine is gone once its destroy reports"
+    );
+}
+
+/// A destroy that keeps failing leaves its machine reclaimable: the record
+/// holds through the first two failures, becomes a tombstone at the third, and
+/// once the service restarts the new agent's first reconcile destroys the
+/// machine.
+#[tokio::test]
+async fn a_destroy_that_fails_three_times_leaves_the_machine_reclaimable_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let host = dir.path().join("host");
+    let (sandbox_id, native_ref) = {
+        let h = harness_with_host(
+            store::open(db.to_str().unwrap()).await.unwrap(),
+            tempfile::tempdir().unwrap(),
+            host.clone(),
+            FakeDriver::full_capabilities(),
+        )
+        .await;
+        h.service.put_template(template("alpine")).await.unwrap();
+        let lease = h
+            .service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                template: "alpine".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
+        let record = h.service.get(&lease.sandbox.id).unwrap();
+        assert_eq!(record.state, SandboxState::Gone);
+        assert!(
+            record.error.contains("destroy failed 3 times"),
+            "{}",
+            record.error
+        );
+        // Every destroy failed, the agent's own orphan destroys included, so
+        // the machine is still on the host when the service goes down.
+        assert!(
+            h.fake
+                .inventory()
+                .await
+                .unwrap()
+                .iter()
+                .any(|observed| observed.native_ref == lease.sandbox.native_ref),
+            "the machine is still on the host"
+        );
+        (lease.sandbox.id.clone(), lease.sandbox.native_ref.clone())
+    };
+    // Restart: the tombstone comes back from the store, and the new agent's
+    // first reconcile destroys the machine it still reports.
+    let h = harness_with_host(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        tempfile::tempdir().unwrap(),
+        host,
+        FakeDriver::full_capabilities(),
+    )
+    .await;
+    for _ in 0..200 {
+        if h.fake
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .all(|observed| observed.native_ref != native_ref)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        h.fake
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .all(|observed| observed.native_ref != native_ref),
+        "the restarted agent reclaims the machine"
+    );
+    // Once the provider no longer reports the machine, the tombstone is done.
+    let provider = h.service.list_providers().remove(0);
+    let sandboxes = h.fake.inventory().await.unwrap();
+    h.service
+        .reconcile(ReconcileRequest {
+            provider_id: provider.id.clone(),
+            generation: provider.generation,
+            sandboxes,
+        })
+        .await
+        .unwrap();
+    assert!(
+        h.service.get(&sandbox_id).is_err(),
+        "the tombstone is removed once its machine is gone"
+    );
+}
+
+/// A tombstone keeps its machine provably the service's when the provider
+/// reports it without the sandbox id, as a caller-named machine is reported:
+/// reconcile hands the machine back for destruction.
+#[tokio::test]
+async fn a_tombstoned_machine_is_reclaimed_when_reported_without_its_id() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
+    let provider = h.service.list_providers().remove(0);
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: provider.id.clone(),
+            generation: provider.generation,
+            sandboxes: vec![Observed {
+                driver: "fake".into(),
+                native_ref: lease.sandbox.native_ref.clone(),
+                sandbox_id: String::new(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(
+        response
+            .destroy
+            .iter()
+            .any(|work| work.native_ref == lease.sandbox.native_ref),
+        "a tombstone's machine is reclaimed without its id: {:?}",
+        response.destroy
+    );
+}
+
+/// A tombstone belongs to the provider that created its machine. Another agent
+/// on the same host reports that machine too, and must leave it alone.
+#[tokio::test]
+async fn a_tombstone_is_not_reaped_by_another_provider() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
+    let other = h
+        .service
+        .register(RegisterRequest {
+            name: "host-b".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities(),
+            }],
+        })
+        .await
+        .unwrap();
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id.clone(),
+            generation: other.generation,
+            sandboxes: h.fake.inventory().await.unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        response
+            .destroy
+            .iter()
+            .all(|work| work.native_ref != lease.sandbox.native_ref),
+        "another provider reaped a tombstone it does not own: {:?}",
+        response.destroy
+    );
+    assert_eq!(
+        h.service.get(&lease.sandbox.id).unwrap().state,
+        SandboxState::Gone,
+        "the owning provider still holds the tombstone"
+    );
+}
+
 /// A lease on a host that stopped answering is released, not held to its TTL:
 /// the caller learns it is gone, and the machine is left for reconcile.
 #[tokio::test]

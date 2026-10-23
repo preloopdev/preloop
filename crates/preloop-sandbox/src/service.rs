@@ -74,11 +74,11 @@ impl ServiceConfig {
 /// Pause between warm-pool refills after a creation failure.
 const POOL_FAILURE_BACKOFF: Duration = Duration::from_secs(10);
 
-/// How often `Reconcile` re-queues a destroy for a `Terminating` record whose
-/// machine is still in the provider's inventory. A provider that keeps
-/// reporting the machine alive is not making progress: after this many
-/// attempts the record is dropped and the machine becomes an orphan the same
-/// reconcile destroys.
+/// Unsuccessful destroy attempts after which the service stops queueing
+/// destroys for a `Terminating` record. The record is kept as a `Gone`
+/// tombstone that `Reconcile` destroys the machine through (see
+/// `tombstone_locked`): the machine stays reclaimable, and the record stops
+/// holding a pool slot.
 const MAX_DESTROY_ATTEMPTS: u32 = 3;
 
 /// Names are identifiers: they reach driver-native names, snapshot paths and
@@ -337,6 +337,13 @@ fn still_in_state(state: &State, sandbox_id: &str, lease_id: &str, expected: San
         .is_some_and(|sandbox| sandbox.lease_id == lease_id && sandbox.state == expected)
 }
 
+/// Whether a destroy for `sandbox_id` is queued on a provider or running.
+fn destroy_in_flight(state: &State, sandbox_id: &str) -> bool {
+    state.pending.values().any(|work| {
+        matches!(&work.kind, Pending::Destroy { sandbox_id: id } if id.as_str() == sandbox_id)
+    })
+}
+
 #[derive(Default)]
 struct State {
     templates: BTreeMap<String, Template>,
@@ -355,7 +362,7 @@ struct State {
     blobs: HashMap<String, Blob>,
     /// Last creation failure per pool, to back off refills.
     pool_backoff: HashMap<String, Instant>,
-    /// Destroy re-queued for a `Terminating` record, per sandbox.
+    /// Unsuccessful destroy attempts per `Terminating` record.
     destroy_attempts: HashMap<String, u32>,
     /// Sandboxes with a snapshot in flight: release must not destroy their
     /// base, and a second snapshot is rejected.
@@ -771,13 +778,17 @@ impl Service {
             for id in &stranded_sandboxes {
                 self.detach_lease_locked(&mut state, id, &mut ops);
             }
+            // A `Terminating` record on a silent provider already has its
+            // destroy with that provider. The stranded work below settles it as
+            // a failed attempt, and the record waits for that provider's next
+            // `Reconcile` instead of being failed and re-queued at a host that
+            // is not answering.
             let orphaned: Vec<String> = stranded_sandboxes
                 .into_iter()
                 .filter(|id| {
-                    state
-                        .sandboxes
-                        .get(id)
-                        .is_some_and(|s| !s.state.is_terminal())
+                    state.sandboxes.get(id).is_some_and(|s| {
+                        !s.state.is_terminal() && s.state != SandboxState::Terminating
+                    })
                 })
                 .collect();
             for id in orphaned {
@@ -1316,22 +1327,20 @@ impl Service {
             )
             .is_err()
         {
-            // Provider gone: reconcile on re-registration destroys it.
-            state.sandboxes.remove(id);
-            state.created_at.remove(id);
-            state.destroy_attempts.remove(id);
-            ops.push(self.remove(Kind::Sandboxes, id));
+            // The provider is not registered, so nothing can destroy the
+            // machine now. Keep it as a tombstone: it is still on the host, and
+            // reconcile reclaims it once the provider reports it.
+            self.tombstone_locked(state, id, "the provider is not registered", ops);
         }
     }
 
-    /// Ask the provider to destroy a `Terminating` record's machine again,
-    /// bounding how many times a reconcile can do so. Returns `false` when the
-    /// retries are spent: the caller drops the record so the machine becomes
-    /// an orphan the same reconcile destroys.
-    fn requeue_destroy_locked(&self, state: &mut State, id: &str) -> bool {
-        let attempts = state.destroy_attempts.get(id).copied().unwrap_or(0);
-        if attempts >= MAX_DESTROY_ATTEMPTS {
-            return false;
+    /// Queue a destroy for a `Terminating` record whose machine the provider
+    /// still reports. Nothing is queued while a destroy for the record is
+    /// queued or running: a slow delete is awaited, not asked again. Returns
+    /// `false` only when the provider cannot take the work.
+    fn ask_destroy_locked(&self, state: &mut State, id: &str) -> bool {
+        if destroy_in_flight(state, id) {
+            return true;
         }
         let Some(sandbox) = state.sandboxes.get(id).cloned() else {
             return false;
@@ -1352,14 +1361,28 @@ impl Service {
             )
             .is_ok();
         if queued {
-            state.destroy_attempts.insert(id.to_owned(), attempts + 1);
             warn!(
                 sandbox = id,
-                attempt = attempts + 1,
-                "terminating sandbox is still on the provider; destroy re-queued"
+                "terminating sandbox is still on the provider; destroy asked again"
             );
         }
         queued
+    }
+
+    /// Stop queueing destroys for a `Terminating` record the service cannot
+    /// finish, and keep the record as a `Gone` tombstone. The record is what
+    /// lets `Reconcile` prove the machine is ours and destroy it directly. A
+    /// tombstone holds no capacity slot, and it is removed once the provider
+    /// stops reporting the machine.
+    fn tombstone_locked(&self, state: &mut State, id: &str, reason: &str, ops: &mut Vec<Op>) {
+        state.destroy_attempts.remove(id);
+        state.created_at.remove(id);
+        let Some(sandbox) = state.sandboxes.get_mut(id) else {
+            return;
+        };
+        sandbox.state = SandboxState::Gone;
+        sandbox.error = reason.to_owned();
+        ops.push(self.put(Kind::Sandboxes, id, &*sandbox));
     }
 
     fn fail_locked(&self, state: &mut State, id: &str, reason: &str, ops: &mut Vec<Op>) {
@@ -2737,17 +2760,36 @@ impl Service {
                 }
                 Err(error) => self.fail_locked(state, &sandbox_id, &error.message, ops),
             },
-            Pending::Destroy { sandbox_id } => {
-                // A failed destroy still drops the record: the machine is
-                // then an orphan the next reconcile removes.
-                if let Err(error) = &result {
-                    warn!(%sandbox_id, %error, "destroy failed; reconcile will retry");
+            Pending::Destroy { sandbox_id } => match result {
+                Ok(_) => {
+                    state.destroy_attempts.remove(&sandbox_id);
+                    if state.sandboxes.remove(&sandbox_id).is_some() {
+                        ops.push(self.remove(Kind::Sandboxes, &sandbox_id));
+                    }
                 }
-                state.destroy_attempts.remove(&sandbox_id);
-                if state.sandboxes.remove(&sandbox_id).is_some() {
-                    ops.push(self.remove(Kind::Sandboxes, &sandbox_id));
+                Err(error) => {
+                    // No record: a destroy queued for a late create. There is
+                    // no `Terminating` record to count against or keep.
+                    if state.sandboxes.contains_key(&sandbox_id) {
+                        let attempts = {
+                            let count = state
+                                .destroy_attempts
+                                .entry(sandbox_id.clone())
+                                .or_default();
+                            *count += 1;
+                            *count
+                        };
+                        if attempts < MAX_DESTROY_ATTEMPTS {
+                            warn!(%sandbox_id, attempts, %error, "destroy failed; the next reconcile asks again");
+                        } else {
+                            warn!(%sandbox_id, attempts, %error, "destroy failed too often; keeping the record so reconcile can reclaim the machine");
+                            let reason =
+                                format!("destroy failed {attempts} times: {}", error.message);
+                            self.tombstone_locked(state, &sandbox_id, &reason, ops);
+                        }
+                    }
                 }
-            }
+            },
             Pending::Exec { exec_id } => {
                 // Success is signalled by the exit event (`ReportExec`); a
                 // failed exec work ends the stream with the error.
@@ -2981,11 +3023,11 @@ impl Service {
                     }
                 }
             }
-            // Terminating records whose machine is still on the host: the
-            // destroy that was in flight died with the previous process (or
-            // its report was lost), so ask again. Bounded: a provider that
-            // keeps the machine while reporting it alive is not making
-            // progress, and the record must stop holding a slot.
+            // Terminating records whose machine the provider still reports,
+            // with no destroy queued or running: the previous destroy died with
+            // its process, or its report was lost, so ask again. A destroy
+            // already in flight is awaited however long it takes; only
+            // completed failures count toward giving up (`complete_locked`).
             let stuck: Vec<String> = state
                 .sandboxes
                 .values()
@@ -2998,17 +3040,32 @@ impl Service {
                 .map(|s| s.id.clone())
                 .collect();
             for id in stuck {
-                if !self.requeue_destroy_locked(&mut state, &id) {
-                    warn!(
-                        sandbox = %id,
-                        attempts = MAX_DESTROY_ATTEMPTS,
-                        "terminating sandbox out of destroy retries; dropping the record so it stops holding a slot (the machine has no record and reconcile will not reap it as its owner is unknown)"
+                if !self.ask_destroy_locked(&mut state, &id) {
+                    self.tombstone_locked(
+                        &mut state,
+                        &id,
+                        "the provider cannot take a destroy",
+                        &mut ops,
                     );
-                    state.sandboxes.remove(&id);
-                    state.created_at.remove(&id);
-                    state.destroy_attempts.remove(&id);
-                    ops.push(self.remove(Kind::Sandboxes, &id));
                 }
+            }
+            // A tombstone whose machine this provider no longer reports is
+            // finished: there is nothing left to reclaim.
+            let finished: Vec<String> = state
+                .sandboxes
+                .values()
+                .filter(|s| {
+                    s.provider_id == request.provider_id
+                        && s.state == SandboxState::Gone
+                        && !s.native_ref.is_empty()
+                        && !observed.contains(s.native_ref.as_str())
+                })
+                .map(|s| s.id.clone())
+                .collect();
+            for id in finished {
+                state.sandboxes.remove(&id);
+                state.created_at.remove(&id);
+                ops.push(self.remove(Kind::Sandboxes, &id));
             }
             // Machines no record owns (orphans, stale incarnations).
             //
@@ -3039,13 +3096,18 @@ impl Service {
                 if snapshots.contains(item.native_ref.as_str()) {
                     continue;
                 }
+                // A tombstone no longer owns its machine: reconcile reclaims it.
                 let owned = state.sandboxes.values().any(|s| {
-                    s.provider_id == request.provider_id && s.native_ref == item.native_ref
+                    s.provider_id == request.provider_id
+                        && s.native_ref == item.native_ref
+                        && s.state != SandboxState::Gone
                 });
                 // Proof this service created the machine: its id is one of
                 // ours (the driver encodes it in the native name), or a
                 // caller-named create we dispatched. Machines from another
-                // service sharing this host registry carry neither.
+                // service sharing this host registry carry neither. A
+                // tombstone proves it by its native reference alone: a
+                // caller-named machine is reported without an id.
                 let ours = (!item.sandbox_id.is_empty()
                     && state.sandboxes.contains_key(&item.sandbox_id))
                     || state.sandboxes.values().any(|s| {
@@ -3053,14 +3115,22 @@ impl Service {
                             && s.state == SandboxState::Provisioning
                             && !s.name.is_empty()
                             && s.name == item.native_ref
+                    })
+                    || state.sandboxes.values().any(|s| {
+                        s.provider_id == request.provider_id
+                            && s.state == SandboxState::Gone
+                            && !s.native_ref.is_empty()
+                            && s.native_ref == item.native_ref
                     });
                 // Another provider's machine (two agents on one host, or a
                 // hand-created VM registered elsewhere) is never ours to
                 // reap: only orphans this provider could have created.
+                // A tombstone claims its machine for its own provider's
+                // reclaim, so it is foreign here as well.
                 let foreign = !item.native_ref.is_empty()
                     && state.sandboxes.values().any(|s| {
                         s.provider_id != request.provider_id
-                            && !s.state.is_terminal()
+                            && (!s.state.is_terminal() || s.state == SandboxState::Gone)
                             && s.native_ref == item.native_ref
                     });
                 if !owned && ours && !foreign {
