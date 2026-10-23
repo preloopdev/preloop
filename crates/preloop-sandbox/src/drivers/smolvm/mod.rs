@@ -161,11 +161,6 @@ impl SmolvmDriver {
         }
     }
 
-    /// The underlying CLI provider.
-    pub fn provider(&self) -> &SmolVmProvider {
-        &self.provider
-    }
-
     /// The artifact cache this driver materializes packs into.
     pub fn cache(&self) -> &ArtifactCache {
         &self.cache

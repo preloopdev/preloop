@@ -674,9 +674,9 @@ impl Agent {
         while !shutdown.is_cancelled() {
             let mut failed = None;
             let session = match pending.take() {
-                Some(session) => Some(session),
+                Some(session) => session,
                 None => match self.register().await {
-                    Ok(session) => Some(session),
+                    Ok(session) => session,
                     Err(error) => {
                         warn!(%error, "agent registration failed");
                         failed = Some(error);

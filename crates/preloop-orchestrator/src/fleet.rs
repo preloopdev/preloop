@@ -1443,6 +1443,12 @@ fn copy_scratch_parent(destination: &str) -> PathBuf {
             .unwrap_or_else(|| PathBuf::from(".")),
         Some(_) => std::env::temp_dir(),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn secret_script_exports_only() {

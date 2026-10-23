@@ -2192,9 +2192,11 @@ impl Service {
 
     async fn try_acquire(&self, request: &AcquireRequest, fingerprint: &str) -> Result<Step> {
         let mut ops = Vec::new();
+        // A failed replay releases its lease while holding the lock; those
+        // writes must reach the store before the error is returned.
         let step = {
             let mut state = self.state.lock();
-            self.try_acquire_locked(&mut state, request, fingerprint, &mut ops)?
+            self.try_acquire_locked(&mut state, request, fingerprint, &mut ops)
         };
         if !ops.is_empty() {
             self.persist(ops).await;

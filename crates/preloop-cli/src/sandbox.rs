@@ -209,7 +209,6 @@ impl LocalSandboxes {
         let drivers = host_drivers(
             Some(&prefix),
             smolvm_slots(),
-            Some((*local).clone()),
             &ArtifactCache::from_env(state.join("sandbox-cache")),
             Some((*local).clone()),
         )?;
@@ -414,12 +413,58 @@ fn local_ca(home: &Path) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// A bound address as the base URL callers dial.
+fn endpoint_url(addr: SocketAddr) -> String {
+    format!("https://{addr}")
+}
+
+/// True when the process that published the endpoint is still alive.
+fn endpoint_owner_alive(state: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(endpoint_path(state)) else {
+        return false;
+    };
+    let Some(pid) = text
+        .lines()
+        .nth(1)
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+    else {
+        return false;
+    };
+    // SAFETY: `kill` with signal 0 only probes existence.
+    #[allow(unsafe_code)]
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    alive
+}
+
 /// Remove the endpoint file only while it still names `addr`: a newer
 /// process may have published its own address.
 pub(crate) fn clear_endpoint(state: &Path, addr: SocketAddr) {
     let path = endpoint_path(state);
     if read_endpoint(state).as_deref() == Some(endpoint_url(addr).as_str()) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Build the caller client, resolving the token and CA from flags, the
+/// environment, then the local state directory.
+fn sandbox_client(
+    service: &str,
+    token: Option<String>,
+    ca: Option<PathBuf>,
+) -> anyhow::Result<SandboxClient> {
+    let home = crate::preloop_home();
+    let token = token.or_else(|| local_client_token(&home)).context(
+        "set --token (or PRELOOP_SANDBOX_TOKEN), or run against a local service that wrote \
+         state/sandbox-client-token",
+    )?;
+    match ca.or_else(|| local_ca(&home)) {
+        Some(path) => {
+            let pem = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading sandbox CA {}", path.display()))?;
+            Ok(SandboxClient::with_tls(service, Some(token), &pem, None)?)
+        }
+        None => Ok(SandboxClient::new(service, Some(token))),
     }
 }
 
@@ -475,12 +520,14 @@ impl Drop for ServiceLock {
 }
 
 /// Publish the address a listener actually bound. Written owner-only so a
-/// local caller can trust it as the service it should send a token to.
+/// local caller can trust it as the service it should send a token to; the
+/// second line names the owning process so a failed bind can tell a live
+/// listener from a stale file.
 pub(crate) fn write_endpoint(state: &Path, addr: SocketAddr) -> anyhow::Result<()> {
     let path = endpoint_path(state);
-    crate::write_private_file(
+    tls::write_private(
         &path,
-        format!("http://{addr}\n{}\n", std::process::id()).as_bytes(),
+        format!("{}\n{}\n", endpoint_url(addr), std::process::id()).as_bytes(),
     )
     .with_context(|| format!("writing {}", path.display()))
 }
@@ -488,23 +535,8 @@ pub(crate) fn write_endpoint(state: &Path, addr: SocketAddr) -> anyhow::Result<(
 fn read_endpoint(state: &Path) -> Option<String> {
     std::fs::read_to_string(endpoint_path(state))
         .ok()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
-}
-
-/// The CA a local deployment wrote, when there is one.
-fn local_ca(home: &Path) -> Option<PathBuf> {
-    let path = home.join("state").join(tls::CA_DIR).join(tls::CA_CERT_FILE);
-    path.is_file().then_some(path)
-}
-
-/// Remove the endpoint file only while it still names `addr`: a newer
-/// process may have published its own address.
-pub(crate) fn clear_endpoint(state: &Path, addr: SocketAddr) {
-    let path = endpoint_path(state);
-    if read_endpoint(state).as_deref() == Some(format!("http://{addr}").as_str()) {
-        let _ = std::fs::remove_file(path);
-    }
+        .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
+        .filter(|base| !base.is_empty())
 }
 
 /// Bind and publish the endpoint, or clear a stale entry naming the address
@@ -537,7 +569,7 @@ fn resolve_service(state: &Path, service: Option<String>) -> anyhow::Result<Stri
         Some(service) => Ok(service),
         None => read_endpoint(state).with_context(|| {
             format!(
-                "no sandbox endpoint file ({}); pass --service",
+                "no sandbox endpoint file ({}); pass --service (for example {DEFAULT_SANDBOX_URL})",
                 endpoint_path(state).display()
             )
         }),
@@ -963,7 +995,11 @@ async fn run_client(
                         .map(|raw| parse_artifact(raw))
                         .collect::<anyhow::Result<Vec<_>>>()?,
                     recipe,
-                    driver,
+                    requires: Requirements {
+                        driver: driver.unwrap_or_default(),
+                        ..Requirements::default()
+                    },
+                    ..TemplateSpec::default()
                 })
                 .await?,
         ),
@@ -1061,7 +1097,6 @@ async fn run_client(
                 Some(code) => std::process::exit(code),
                 None => std::process::exit(INTERRUPTED),
             }
-            anyhow::bail!("exec stream ended without an exit status")
         }
         SandboxCommand::Cp(cp) => copy(&client, &cp.source, &cp.destination, &lease_id()?).await,
         SandboxCommand::Stop { sandbox } => Ok(client.stop(&sandbox, &lease_id()?).await?),
@@ -1272,7 +1307,6 @@ async fn serve_standalone(
             host_drivers(
                 Some(&named_prefix()),
                 smolvm_slots(),
-                None,
                 &ArtifactCache::from_env(state.join("sandbox-cache")),
                 None,
             )?,

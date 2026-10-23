@@ -125,7 +125,7 @@ async fn harness_with_host_config_access(
         vec![fake.clone() as Arc<dyn Driver>],
         agent_config.with_access(access),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     wait_for_registered(&service).await;
     Harness {
@@ -732,11 +732,12 @@ async fn reconcile_destroys_orphans_and_fails_lost_sandboxes() {
         })
         .await
         .unwrap();
-    // An orphan the service never created appears on the host.
+    // A stale copy of one of our own sandboxes (a native ref no record
+    // names) appears on the host; reconcile may reap it.
     let orphan = h
         .fake
         .create(&CreateWork {
-            sandbox_id: "sbx-orphan".into(),
+            sandbox_id: lease.sandbox.id.clone(),
             driver: "fake".into(),
             ..CreateWork::default()
         })
@@ -1139,7 +1140,7 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
     agent_config.heartbeat = Duration::from_millis(50);
     let link = t.enroll("remote-host").await;
     let agent = Agent::new(Arc::new(link), vec![fake as Arc<dyn Driver>], agent_config);
-    tokio::spawn(agent.run(t.shutdown_token()));
+    tokio::spawn(agent.run(None, t.shutdown_token()));
 
     let client = t.client();
     wait_for(|| !Service::list_providers(&service).is_empty()).await;
@@ -1210,6 +1211,7 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
         .unwrap();
 }
 
+#[tokio::test]
 async fn loopback_auth_requires_a_token_and_a_loopback_host() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
@@ -1621,7 +1623,6 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         before.len() == 1 && before[0].state == SandboxState::Provisioning,
         "{before:?}"
     );
-    let sandbox_id = before[0].id.clone();
     // The host stops answering: wait past the timeout the service declares
     // it lost by, not past the last heartbeat.
     alive.cancel();
@@ -1752,7 +1753,7 @@ async fn reconcile_never_destroys_another_providers_machine() {
     let response = h
         .service
         .reconcile(ReconcileRequest {
-            provider_id: other.provider_id,
+            provider_id: other.provider_id.clone(),
             generation: other.generation,
             sandboxes: observed,
         })
@@ -1771,7 +1772,7 @@ async fn reconcile_never_destroys_another_providers_machine() {
     let response = h
         .service
         .reconcile(ReconcileRequest {
-            provider_id: other.provider_id,
+            provider_id: other.provider_id.clone(),
             generation: other.generation,
             sandboxes: vec![Observed {
                 driver: "fake".into(),
@@ -2453,7 +2454,7 @@ async fn blob_upload_cap_rejects_and_removes_the_partial_file() {
         vec![fake as Arc<dyn Driver>],
         AgentConfig::new("host-a", dir.path().join("scratch")),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     wait_for(|| !service.list_providers().is_empty()).await;
     service.put_template(template("alpine")).await.unwrap();
@@ -2863,7 +2864,7 @@ async fn a_lost_provider_releases_its_leases() {
         vec![fake as Arc<dyn Driver>],
         agent_config,
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     wait_for(|| !service.list_providers().is_empty()).await;
     service.put_template(template("alpine")).await.unwrap();
     let lease = service
@@ -3611,7 +3612,7 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
         vec![fake.clone() as Arc<dyn Driver>],
         AgentConfig::new("remote-host", dir.join("scratch")),
     );
-    tokio::spawn(agent.run(t.shutdown_token()));
+    tokio::spawn(agent.run(None, t.shutdown_token()));
     let client = t.client();
     wait_for(|| !service.list_providers().is_empty()).await;
     client.put_template(template("alpine")).await.unwrap();

@@ -29,9 +29,11 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use preloop_sandbox::Driver as _;
+    use preloop_sandbox::Driver;
     use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink};
-    use preloop_sandbox::api::{AcquireRequest, CreateWork, SandboxState, Template, TemplateSpec};
+    use preloop_sandbox::api::{
+        AcquireRequest, CreateWork, Requirements, SandboxState, Template, TemplateSpec,
+    };
     use preloop_sandbox::drivers::smolvm::SmolvmDriver;
     use preloop_sandbox::drivers::smolvm::cli::{
         ExecOutput, GuestVolume, MachineRole, MachineSpec, MachineState, NetworkPolicy,
@@ -1749,7 +1751,11 @@ exit 0
             .put_template(TemplateSpec {
                 name: "alpine".into(),
                 os: "linux".into(),
-                image: Some("alpine:3.20".into()),
+                recipe: Some("image:alpine:3.20".into()),
+                requires: Requirements {
+                    driver: "smolvm".into(),
+                    ..Requirements::default()
+                },
                 ..TemplateSpec::default()
             })
             .await
@@ -1765,7 +1771,10 @@ exit 0
             .unwrap();
         assert_eq!(lease.sandbox.native_ref, "preloop-runner-7-1");
         assert_eq!(
-            service.get(&lease.sandbox.id).unwrap().state,
+            service
+                .get(&lease.sandbox.id, &lease.lease.id)
+                .unwrap()
+                .state,
             SandboxState::Leased,
             "the caller-named sandbox holds a live lease"
         );
