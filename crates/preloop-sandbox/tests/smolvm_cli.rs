@@ -1806,4 +1806,118 @@ exit 0
         let _ = live.wait();
         shutdown.cancel();
     }
+
+    /// Whether a process is still running. `kill -0` only probes it.
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// A fork boots its clone before the driver can mark it. An orphan sweep
+    /// that runs meanwhile must leave that clone alone: the lease it serves has
+    /// to outlive an engine that exits or restarts mid-fork.
+    #[tokio::test]
+    async fn an_orphan_sweep_spares_a_clone_while_its_fork_is_in_flight() {
+        let _env_guard = TEST_ENV_MUTEX.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        write_agent_rootfs(&directory.path().join("agent-rootfs"), "1.30.1", true);
+        let keys = ["PRELOOP_HOME", "SMOLVM_DATA_DIR", "SMOLVM_AGENT_ROOTFS"];
+        let _restore = EnvRestore(keys.map(|key| (key, std::env::var_os(key))).into());
+        // SAFETY: TEST_ENV_MUTEX serializes the environment-mutating tests.
+        unsafe {
+            std::env::set_var("PRELOOP_HOME", directory.path().join("home"));
+            std::env::remove_var("SMOLVM_DATA_DIR");
+            std::env::remove_var("SMOLVM_AGENT_ROOTFS");
+        }
+        let clone_dir = machine_data_root()
+            .expect("this home resolves to a data root")
+            .join("0123456789abcdef");
+        let pidfile = directory.path().join("clone.pid");
+        let forked = directory.path().join("forked");
+        let executable = directory.path().join("smolvm");
+        let release = directory.path().join("release");
+        // `machine fork` boots a hypervisor for the clone, records it, and only
+        // returns once the test releases it: the driver marks the clone after
+        // this command, so the clone stays unmarked for as long as it waits.
+        write_executable(
+            &executable,
+            &format!(
+                r##"#!/bin/sh
+if [ "${{1-}}" = "--version" ]; then
+  printf 'smolvm 1.30.1\n'
+fi
+case "${{1-}}:${{2-}}" in
+  machine:fork)
+    sh -c 'sleep 60 & wait' _boot-vm '{clone}/boot-config.json' </dev/null >/dev/null 2>&1 &
+    echo $! > '{pidfile}'
+    touch '{forked}'
+    i=0
+    while [ ! -e '{release}' ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i+1)); done ;;
+  machine:data-dir) printf '%s\n' '{clone}' ;;
+esac
+exit 0
+"##,
+                clone = clone_dir.display(),
+                pidfile = pidfile.display(),
+                forked = forked.display(),
+                release = release.display(),
+            ),
+        );
+        let work = CreateWork {
+            sandbox_id: "sbx-3f2a9c".into(),
+            driver: "smolvm".into(),
+            template: Template {
+                native_ref: "golden".into(),
+                spec: TemplateSpec {
+                    name: "alpine".into(),
+                    os: "linux".into(),
+                    ..TemplateSpec::default()
+                },
+                ..Template::default()
+            },
+            ..CreateWork::default()
+        };
+        let driver = Arc::new(SmolvmDriver::new(SmolVmProvider::new(&executable), 0));
+        let creating = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.create(&work).await }
+        });
+        for _ in 0..3000 {
+            if forked.exists() || creating.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !forked.exists() {
+            panic!("the fork never ran: {:?}", creating.await);
+        }
+        let clone_pid: u32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The clone is running and not yet marked: the sweep must not take it.
+        let swept = purge_orphaned_vms(OrphanPurge::All);
+        assert!(
+            swept.is_err(),
+            "the sweep must defer while a fork is in flight, got {swept:?}"
+        );
+        assert!(
+            process_alive(clone_pid),
+            "the clone booted by an in-flight fork was killed"
+        );
+        // Let the fork return: only then is the clone marked.
+        fs::write(&release, b"").unwrap();
+        let native = creating.await.unwrap().expect("the fork completes");
+        assert_eq!(native, "psbx-3f2a9c");
+        assert!(
+            clone_dir.join(SANDBOX_OWNER_MARKER).is_file(),
+            "the clone is marked once its fork returns"
+        );
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &clone_pid.to_string()])
+            .status();
+    }
 }
