@@ -52,7 +52,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
         vec![driver.clone() as Arc<dyn Driver>],
         AgentConfig::new("e2e-smolvm", dir.path().join("scratch")),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     while service.list_providers().is_empty() {
         tokio::time::sleep(Duration::from_millis(50)).await;
