@@ -37,14 +37,48 @@ use preloop_gha_protocol::debug_session::{
 /// touch the guest, or the watcher will suspend the sandbox out from under
 /// the session and, worse, a suspension it performed is only ever undone by
 /// seeing this marker.
+/// Retry `probe` up to `attempts` times, 200 ms apart.
+async fn wait_until<F, Fut>(attempts: usize, mut probe: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..attempts {
+        if probe().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// Run `true` in the guest; a resumed machine answers, a suspended one does
+/// not (or fails while the watcher is still resuming it).
+async fn guest_answers(machine: &str) -> bool {
+    let Ok(mut command) = crate::guest_exec_command(machine) else {
+        return false;
+    };
+    command
+        .arg("true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    tokio::task::spawn_blocking(move || command.status().is_ok_and(|status| status.success()))
+        .await
+        .unwrap_or(false)
+}
+
 pub(crate) struct DebugAttach {
     marker: PathBuf,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DebugAttach {
-    /// Write ACTIVE, start the heartbeat, and resume a suspended guest.
-    /// `None` when the session has no machine to guard.
+    /// Write ACTIVE, start the heartbeat, and wait (bounded) for the guest to
+    /// answer. The engine watcher resumes a suspended guest after seeing the
+    /// marker; callers (`--export`, the REPL) may exec immediately, so `claim`
+    /// must not return before the guest is usable. `None` when the session
+    /// has no machine to guard.
     pub(crate) async fn claim(machine: Option<&str>) -> Result<Option<Self>> {
         let Some(machine) = machine else {
             return Ok(None);
@@ -56,15 +90,12 @@ impl DebugAttach {
         if let Some(parent) = marker.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Resume before claiming: the ACTIVE marker tells the engine's watcher
-        // to resume a suspended sandbox, and `resume_guest_if_needed` is the
-        // fallback for an engine that is not watching (restart, different
-        // host). Either way a failed resume must not leave a heartbeat
-        // rewriting ACTIVE for a controller that never attached: the guard
-        // below is never constructed on error, and a dropped JoinHandle
-        // detaches rather than cancels.
-        crate::resume_guest_if_needed(machine).await?;
+        // A dropped JoinHandle below detaches rather than cancels, so the
+        // heartbeat only starts once the marker is written.
         std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE)?;
+        // The watcher polls the marker; wait for the resumed guest rather
+        // than racing the first exec.
+        Self::wait_until_guest_answers(machine).await?;
         let heartbeat_marker = marker.clone();
         let heartbeat = tokio::spawn(async move {
             loop {
@@ -80,6 +111,18 @@ impl DebugAttach {
             marker,
             heartbeat: Some(heartbeat),
         }))
+    }
+
+    /// Poll until the guest answers, bounded so a stuck machine fails loudly.
+    async fn wait_until_guest_answers(machine: &str) -> Result<()> {
+        let answered = wait_until(75, || guest_answers(machine)).await;
+        if !answered {
+            anyhow::bail!(
+                "guest `{machine}` did not become ready after debug claim; the machine may still \
+                 be resuming"
+            );
+        }
+        Ok(())
     }
 
     /// Stop the heartbeat and demote the marker to IDLE.
@@ -945,7 +988,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
         if std::io::stdin().read_line(&mut line)? == 0 {
             // Ctrl-D. Leaving must never destroy the session.
             println!();
-            println!("Detached — the job stays paused; AgentENV may suspend the VM.");
+            println!("Detached — the job stays paused; the backend may suspend the VM.");
             print_reattach(&session);
             return Ok(ReplOutcome::Detached);
         }
@@ -1085,7 +1128,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                 Err(error) => println!("  sync failed: {error:#}"),
             },
             "detach" => {
-                println!("Detached — the job stays paused; AgentENV may suspend the VM.");
+                println!("Detached — the job stays paused; the backend may suspend the VM.");
                 print_reattach(&session);
                 return Ok(ReplOutcome::Detached);
             }
@@ -1434,7 +1477,7 @@ fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
         return Ok(());
     }
 
-    let destination = std::env::current_dir()?.join("preloop-vm-changes.patch");
+    let destination = std::env::current_dir()?.join("preloop-changes.patch");
     std::fs::write(&destination, patch.as_bytes())
         .with_context(|| format!("writing {}", destination.display()))?;
     let files = patch.lines().filter(|l| l.starts_with("+++ b/")).count();
@@ -1697,6 +1740,21 @@ mod tests {
         AttemptRecord, Diagnostic, FailedStep, SessionState, StepSummary,
     };
     use preloop_gha_protocol::{JobId, RunId};
+
+    #[tokio::test]
+    async fn wait_until_is_bounded_and_retries() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let answered = wait_until(5, || {
+            let current = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { current >= 2 }
+        })
+        .await;
+        assert!(answered);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let never = wait_until(2, || async { false }).await;
+        assert!(!never, "a silent guest must exhaust the attempts");
+    }
 
     fn session() -> DebugSession {
         DebugSession {

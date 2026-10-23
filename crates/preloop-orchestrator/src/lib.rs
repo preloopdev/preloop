@@ -3,6 +3,7 @@
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
 pub mod environment;
+pub mod fleet;
 mod keys;
 pub mod node_externals;
 pub mod oci;
@@ -23,11 +24,11 @@ pub use preloop_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
 
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
-use preloop_vm::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
-use preloop_vm::{
+use preloop_sandbox::drivers::smolvm::cli::{
     MachineName, MachineRole, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
 };
+use preloop_sandbox::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
@@ -436,19 +437,6 @@ pub fn effective_runner_bundle_path(
         mirror.display(),
         externals_dir.join("externals").display(),
     )))
-}
-
-/// The version pins stamped into every AgentENV runner volume.
-///
-/// `versions.toml` is compiled into this crate (and the CLI) by `build.rs`, not
-/// into `preloop-vm`, which archives the tree — so the provider is handed the
-/// manifest by whoever constructs it.
-pub fn runner_bundle_manifest() -> preloop_vm::agentenv::volume::BundleManifest {
-    preloop_vm::agentenv::volume::BundleManifest::new(
-        RUNNER_VERSION,
-        NODE20_EXTERNALS_VERSION,
-        NODE24_EXTERNALS_VERSION,
-    )
 }
 
 /// Publish an engine-owned bundle carrying the runner binary and the validated
@@ -932,7 +920,7 @@ pub fn golden_builder_storage_gib(storage_gib: u32) -> u32 {
 /// Volume golden and job-VM disks land on; the artifact directory stands in
 /// when the SmolVM data root cannot be resolved.
 fn golden_disk_root(config: &RunnerPoolConfig) -> PathBuf {
-    preloop_vm::machine_data_root().unwrap_or_else(|| {
+    preloop_sandbox::drivers::smolvm::cli::machine_data_root().unwrap_or_else(|| {
         config
             .artifact_stem
             .parent()
@@ -952,7 +940,7 @@ fn format_gib(bytes: u64) -> String {
 /// when they are not free. A volume `df` cannot measure is not a refusal: the
 /// check exists to fail early, never to block a host it cannot read.
 fn ensure_free_disk(path: &Path, required: u64, purpose: &str, remedy: &str) -> Result<(), String> {
-    let free = match preloop_vm::filesystem_available_bytes(path) {
+    let free = match preloop_sandbox::drivers::smolvm::cli::filesystem_available_bytes(path) {
         Ok(free) => free,
         Err(error) => {
             warn!(path = %path.display(), %error, purpose, "free disk space unmeasurable; skipping check");
@@ -1107,7 +1095,7 @@ impl JobVmDiskReserve {
     pub fn from_env() -> Self {
         Self::new(
             min_free_disk_bytes(std::env::var(MIN_FREE_DISK_ENV).ok().as_deref()),
-            preloop_vm::filesystem_available_bytes,
+            preloop_sandbox::drivers::smolvm::cli::filesystem_available_bytes,
         )
     }
 
@@ -1329,7 +1317,11 @@ async fn reconcile_orphans<P: VmProvider + 'static>(
         match deadline::run_blocking(
             HOST_CLEANUP_TIMEOUT,
             "periodic orphaned hypervisor purge",
-            || preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::RemovedDataDir),
+            || {
+                preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms(
+                    preloop_sandbox::drivers::smolvm::cli::OrphanPurge::RemovedDataDir,
+                )
+            },
         )
         .await
         {
@@ -2279,10 +2271,9 @@ const GUEST_STACK_ULIMIT_BEST_EFFORT: &str = GOLDEN_STACK_ULIMIT_RAISE_BEST_EFFO
 /// `/etc/security/limits.conf`; a probe job on a hosted runner reads back
 /// `Max open files 65536 / 65536` in a step, in a `container:` job and in an
 /// ad-hoc `docker run` alike. A preloop job inherits the exec channel's
-/// defaults instead — 1024 soft / 4096 hard on AgentENV, where jobs arrive
-/// through `aenv exec` off `envd` — which is below what suites that raise
-/// their own soft limit ask for (valkey's test suite requests 10032) and
-/// makes the runner die with `EPERM` on `setrlimit`.
+/// defaults instead — 1024 soft / 4096 hard on some guest exec channels,
+/// below what suites that raise their own soft limit ask for (valkey's test
+/// suite requests 10032), making the runner die with `EPERM` on `setrlimit`.
 ///
 /// Applied next to [`GUEST_STACK_ULIMIT`] on the same launch sites: the runner
 /// wrapper raises before it drops privileges (raising a hard limit needs
@@ -3270,7 +3261,7 @@ fn guest_sysctl_script_at(root: &str) -> String {
 /// machine by [`guest_hosted_runtime_init_script`].
 ///
 /// Resolving is not enough. A guest can boot with a hosts file that maps its
-/// name to an address the machine does **not** own — an AgentENV guest carried
+/// name to an address the machine does **not** own — one guest carried
 /// `10.1.0.59 runnervm… runnervmvrwv9` while its interfaces held
 /// `169.254.0.21` — and a check that only asks `getent hosts <name>` passes
 /// there while every consumer of the name gets an unreachable address. A
@@ -3517,8 +3508,8 @@ fn guest_resolver_stub_script_at(
 /// service, so the image's `/etc/sysctl.d`, `/etc/security/limits.conf` and
 /// hostname setup all apply before a step runs. A preloop guest enters the job
 /// workload through the VM's exec channel instead: the smolvm guest's PID 1 is
-/// `/run/smolvm/init`, with no systemd at all, and an AgentENV job arrives via
-/// `aenv exec` off `envd`, outside systemd and PAM. The golden carries
+/// `/run/smolvm/init`, with no systemd at all, and jobs enter through an exec
+/// channel outside systemd and PAM. The golden carries
 /// GitHub's files, but nothing ever applies them. This is the per-guest half
 /// of that gap — the kernel values, the machine's own name and the resolver
 /// file, applied once on the post-boot exec path, before the runner registers.
@@ -5024,9 +5015,9 @@ async fn adopt_golden<P: VmProvider>(
 ///   published official golden, or one baked here from a configured image —
 ///   into a machine. A pack is the only shape whose guest writes a fork
 ///   reliably inherits, which is why every golden on this backend is one;
-/// * a backend that keeps its packs server-side (AgentENV) has no artifact to
+/// * a backend that keeps its packs server-side has no artifact to
 ///   unpack: boot the image, apply the contract in the guest, and let
-///   `start --forkable` capture the result, which that backend's snapshots do
+///   `start --forkable` capture the result, which its snapshots do
 ///   carry into forks.
 ///
 /// Fatal on any failure. A pool without its golden cannot serve a job, and the
@@ -5664,7 +5655,7 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
 ///
 /// `All` is the only scope that may kill a *live* hypervisor, so it is only
 /// ever used where nothing of ours can be running: pool startup and pool
-/// teardown ([`preloop_vm::purge_orphaned_vms`]). Those two moments differ in
+/// teardown ([`preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms`]). Those two moments differ in
 /// what an abandoned sweep costs, which is all this decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrphanPurgeDuty {
@@ -5734,8 +5725,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             return self.teardown(&golden_cache).await;
         };
         installed?;
-        // A backend whose packs are not host files (AgentENV keeps them as
-        // server-side snapshots) has no artifact to build, download, or
+        // A provider whose packs are not host files (a snapshot service keeps
+        // them inside the backend) has no artifact to build, download, or
         // relocate: its golden is prepared directly from the base image by
         // `prepare_fork_base` below.
         //
@@ -5758,7 +5749,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // The builder is a machine this pool owns, booted before most of
             // the steps that can fail. The error exit must not strand it: the
             // CLI's exit guard reaps SmolVM hypervisors, but not the layer
-            // mounts they hold or AgentENV sandboxes.
+            // mounts they hold or provider-owned sandboxes.
             if let Err(teardown) = self.teardown(&golden_cache).await {
                 warn!(%teardown, "pool teardown after the artifact build failed");
             }
@@ -6297,7 +6288,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // runs while serving uses `RemovedDataDir`, which spares any process
         // whose boot config still exists.
         match deadline::run_blocking(HOST_CLEANUP_TIMEOUT, "orphaned hypervisor purge", || {
-            preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All)
+            preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms(
+                preloop_sandbox::drivers::smolvm::cli::OrphanPurge::All,
+            )
         })
         .await
         {
@@ -6334,7 +6327,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         match deadline::run_blocking(
             HOST_CLEANUP_TIMEOUT,
             "orphaned layer-mount detach",
-            preloop_vm::detach_orphaned_layer_mounts,
+            preloop_sandbox::drivers::smolvm::cli::detach_orphaned_layer_mounts,
         )
         .await
         {
@@ -6814,7 +6807,7 @@ impl Drop for ClearPreparingOnDrop {
     }
 }
 
-/// How long an unattached AgentENV debug VM stays running before suspension.
+/// How long an unattached, suspendable debug VM stays running before suspension.
 const DEBUG_SUSPEND_IDLE: Duration = Duration::from_secs(15);
 
 /// How often the pool probes a running machine's pause marker.
@@ -6863,7 +6856,7 @@ async fn watch_guest_pause<P: VmProvider + 'static>(
 
 /// Watch a debug pause and, for a state-preserving provider, suspend the VM
 /// while no controller is attached. The host marker is deliberately separate
-/// from the guest pause marker: the latter becomes unreachable once AgentENV
+/// from the guest pause marker: the latter becomes unreachable once the backend
 /// pauses the sandbox.
 async fn watch_guest_pause_with_suspension<P: VmProvider + 'static>(
     provider: Arc<P>,
@@ -8814,7 +8807,7 @@ fn as_runner_user(
     // [`GUEST_NOFILE_ULIMIT`] mirror the hosted pair, because the guest
     // applies neither the image's systemd units nor its PAM limits; without
     // them the runner chain keeps the VM init's half-sized stack and the exec
-    // channel's descriptor limit (1024 soft / 4096 hard on AgentENV), and
+    // channel's descriptor limit (1024 soft / 4096 hard), and
     // suites that raise their own soft limit — valkey's test suite asks for
     // 10032 — die with EPERM on setrlimit. The earlier 524288 hard limit here
     // was a guess at what GitHub's runner service inherits; a probe of a
@@ -8898,7 +8891,7 @@ async fn hold_for_debugging<P: VmProvider + 'static>(
         warn!(
             machine = name.as_str(),
             %error,
-            "could not suspend preserved AgentENV VM; leaving it running"
+            "could not suspend preserved VM; leaving it running"
         );
     }
 
@@ -8948,7 +8941,7 @@ async fn hold_for_debugging<P: VmProvider + 'static>(
                     warn!(
                         machine = name.as_str(),
                         %error,
-                        "could not resume preserved AgentENV VM for attach"
+                        "could not resume preserved VM for attach"
                     );
                 }
             } else if !now_attached && attached {
@@ -8958,7 +8951,7 @@ async fn hold_for_debugging<P: VmProvider + 'static>(
                     warn!(
                         machine = name.as_str(),
                         %error,
-                        "could not re-suspend preserved AgentENV VM after detach"
+                        "could not re-suspend preserved VM after detach"
                     );
                 }
             }
@@ -9003,7 +8996,7 @@ mod lifecycle_tests {
     use super::*;
     use async_trait::async_trait;
     use base64::Engine as _;
-    use preloop_vm::{ExecOutput, OutputChunk, ProviderCapabilities};
+    use preloop_sandbox::drivers::smolvm::cli::{ExecOutput, OutputChunk, ProviderCapabilities};
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
@@ -9105,7 +9098,7 @@ mod lifecycle_tests {
         /// When set, `exec` answers exit 1 for any argv whose debug form
         /// contains this marker — models a guest command that fails.
         fail_exec_containing: Mutex<Option<String>>,
-        /// Whether this provider keeps packs as host files. AgentENV does not.
+        /// Whether this provider keeps packs as host files; a snapshot backend does not.
         file_packs: bool,
     }
 
@@ -9150,7 +9143,7 @@ mod lifecycle_tests {
             }
         }
 
-        /// A backend whose packs are not host files (AgentENV): its golden is
+        /// A backend whose packs are not host files: its golden is
         /// prepared in the guest instead of unpacked from an artifact.
         fn no_packs(mut self) -> Self {
             self.file_packs = false;
@@ -9367,7 +9360,7 @@ mod lifecycle_tests {
         watch.abort();
         let _ = watch.await;
     }
-    /// An AgentENV-style debug pause must suspend the sandbox while no
+    /// A suspendable debug pause must suspend the sandbox while no
     /// controller is attached, and resume it the moment a live `preloop
     /// debug`/`preloop shell` marker appears — the money story: nobody
     /// attached, nobody paying for a running VM.
@@ -10496,7 +10489,7 @@ done
         );
     }
 
-    /// The AgentENV case the first version of this script skipped: the guest
+    /// A stale foreign hostname mapping case: the guest
     /// boots with a hosts file mapping its own name to an address it does not
     /// own (`10.1.0.59 runnervm… runnervmvrwv9` while the machine's interfaces
     /// carry `169.254.0.21`). `getent hosts <name>` answers, so a check that
@@ -12925,7 +12918,7 @@ done
     /// The strict nofile raise must reach the hosted 65536/65536 from both
     /// inherited pairs, whichever direction they are in.
     ///
-    /// Below the target, AgentENV's exec channel starts at soft 1024 under a
+    /// Below the target, a guest exec channel starts at soft 1024 under a
     /// hard 4096: the old soft-first form raised the soft first, hit `EPERM`
     /// above the old hard, and was swallowed by `|| true` at the best-effort
     /// sites — then the hard raise left the pair at 1024/65536 and the parity
@@ -12971,7 +12964,7 @@ done
         let uid = std::process::Command::new("id").arg("-u").output().unwrap();
         let root = String::from_utf8_lossy(&uid.stdout).trim() == "0";
 
-        // (soft 1024, hard 4096): the pair AgentENV's exec channel hands a
+        // (soft 1024, hard 4096): the pair a guest exec channel hands a
         // job. Only root can raise the hard limit, so an unprivileged strict
         // raise must end the launch rather than leave the pair below the
         // hosted one.
@@ -13057,7 +13050,7 @@ done
     /// entirely, so `/etc/sudoers.d` does not exist and `useradd` is not on
     /// the exec shell's default PATH. Every best-effort provisioning step
     /// must tolerate that instead of aborting the script: verified live on
-    /// AgentENV, where the bare `ubuntu:24.04` sandbox hit exactly this and
+    /// a snapshot backend, where the bare `ubuntu:24.04` sandbox hit exactly this and
     /// the runner came up with an unchowned root and no account.
     #[test]
     fn runner_user_wrapper_survives_a_sudoless_bare_base() {
@@ -16892,7 +16885,7 @@ fi"#,
         );
     }
 
-    /// A backend without host-side packs (AgentENV) has no artifact to unpack,
+    /// A backend without host-side packs has no artifact to unpack,
     /// so the golden is prepared in-guest: boot the image, apply the contract,
     /// and freeze the result as the fork base.
     #[tokio::test]

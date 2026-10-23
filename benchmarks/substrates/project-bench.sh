@@ -2,7 +2,7 @@
 # project-bench.sh — run representative open-source CI workloads through
 # preloop on a forked golden for AgentENV or SmolVM.
 #
-# Usage: project-bench.sh <aenv|smolvm> <reps> <outdir>
+# Usage: project-bench.sh <smolvm> <reps> <outdir>
 set -euo pipefail
 
 SUBSTRATE="${1:?substrate}"
@@ -36,8 +36,7 @@ mkdir -p "$OUTDIR"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUTDIR/driver.log" >&2; }
 
 case "$SUBSTRATE" in
-  aenv) export PRELOOP_VM_BACKEND=agentenv ;;
-  smolvm) export PRELOOP_VM_BACKEND=smolvm ;;
+  smolvm) export PRELOOP_SANDBOX_POOL_DRIVER=smolvm ;;
   *) echo "unknown substrate: $SUBSTRATE" >&2; exit 2 ;;
 esac
 

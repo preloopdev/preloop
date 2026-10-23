@@ -114,12 +114,12 @@ fn is_https_downgrade(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
 
 /// Minimum SmolVM release `preloop update` accepts as already compatible,
 /// compiled from `smolvm_min_version` in the workspace `versions.toml` by
-/// `crates/preloop-vm/build.rs` (which the device-budget diagnostic in
-/// `preloop-vm` reads too, so one pin feeds both).
+/// `crates/preloop-sandbox/build.rs` (which the device-budget diagnostic in
+/// the SmolVM driver reads too, so one pin feeds both).
 ///
 /// The configured floor is the first release that satisfies all runtime
-/// invariants: packed-machine ownership preservation (v1.8.1),
-/// `machine fork --freeze-source` (v1.18.1), which preloop-vm passes on every
+/// invariants: packed-machine ownership preservation (v1.8.1) and
+/// `machine fork --freeze-source` (v1.18.1), which the SmolVM driver passes on every
 /// fork so goldens keep a frozen reusable branch base instead of
 /// live-forking the source, and the x86_64 virtio device budget (v1.23.0,
 /// which raised libkrun's MMIO IRQ allocation for virtio devices from 11 to
@@ -127,7 +127,7 @@ fn is_https_downgrade(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
 /// and fail to start with `no more IRQs are available`). Newer stable
 /// releases satisfy it without another code change.
 static SMOLVM_MIN_COMPATIBLE_VERSION: LazyLock<Version> = LazyLock::new(|| {
-    Version::parse(preloop_vm::SMOLVM_MIN_VERSION)
+    Version::parse(preloop_sandbox::drivers::smolvm::cli::SMOLVM_MIN_VERSION)
         .expect("smolvm_min_version in versions.toml must be a semver version")
 });
 
@@ -432,10 +432,11 @@ fn resolved_smolvm_install() -> Option<SmolvmInstall> {
     // second `lib/` tree. The PATH-resolved prefix is tracked separately so a
     // rootfs refresh repairs the sibling the engine actually boots from.
     let prefix = home.join(".smolvm");
-    let resolved_prefix = preloop_vm::agent_rootfs::resolve_binary(Path::new("smolvm"))
-        .and_then(|binary| binary.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| prefix.clone());
-    let runtime = preloop_vm::agent_rootfs::Runtime::from_env();
+    let resolved_prefix =
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::resolve_binary(Path::new("smolvm"))
+            .and_then(|binary| binary.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| prefix.clone());
+    let runtime = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime::from_env();
     Some(SmolvmInstall {
         prefix,
         resolved_prefix,
@@ -447,7 +448,10 @@ fn resolved_smolvm_install() -> Option<SmolvmInstall> {
 
 /// The directory the engine exports the guest agent from, by the engine's own
 /// rule (`SMOLVM_DATA_DIR`, else the effective Preloop home's `smolvm`).
-fn engine_agent_dir(runtime: &preloop_vm::agent_rootfs::Runtime, fallback: &Path) -> PathBuf {
+fn engine_agent_dir(
+    runtime: &preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime,
+    fallback: &Path,
+) -> PathBuf {
     runtime
         .data_dir
         .clone()
@@ -472,7 +476,7 @@ fn smolvm_platform() -> Option<&'static str> {
 ///
 /// The wrapper scripts can report a recent `--version` while resolving to
 /// an old binary, so the flag's presence in the help text is the reliable
-/// check (the same probe preloop-vm runs before provisioning).
+/// check (the same probe the SmolVM driver runs before provisioning).
 async fn probe_mount_socket(binary: &Path) -> bool {
     probe_mount_socket_with(binary, SMOLVM_PROBE_TIMEOUT).await
 }
@@ -608,7 +612,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
         bail!(
             "SmolVM release {} is below configured minimum {}",
             release.tag_name,
-            preloop_vm::SMOLVM_MIN_VERSION
+            preloop_sandbox::drivers::smolvm::cli::SMOLVM_MIN_VERSION
         );
     }
     let archive_name = format!("smolvm-{version}-{platform}.tar.gz");
@@ -650,7 +654,8 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
 /// restored or hand-copied tree cannot pass on its stamp alone — and it carries
 /// the shutdown handshake whenever the host is new enough to require one.
 fn agent_rootfs_serves(rootfs: &Path, host_version: &str) -> bool {
-    let inspected = preloop_vm::agent_rootfs::AgentRootfs::inspect(rootfs);
+    let inspected =
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::AgentRootfs::inspect(rootfs);
     if !inspected.agent_present() || inspected.version() != Some(host_version) {
         return false;
     }
@@ -666,15 +671,16 @@ fn agent_rootfs_serves(rootfs: &Path, host_version: &str) -> bool {
 
 /// Whether two rootfs trees hold the same agent bytes.
 fn agent_bytes_match(left: &Path, right: &Path) -> bool {
-    let left = preloop_vm::agent_rootfs::AgentRootfs::inspect(left);
-    let right = preloop_vm::agent_rootfs::AgentRootfs::inspect(right);
+    let left = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::AgentRootfs::inspect(left);
+    let right = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::AgentRootfs::inspect(right);
     left.digest().is_some() && left.digest() == right.digest()
 }
 
 /// Whether a host reporting `host_version` refuses to stop a guest whose agent
 /// lacks the `quiesced-shutdown-v1` handshake (the engine's own rule).
 fn host_requires_quiesced_shutdown(host_version: &str) -> bool {
-    let (major, minor, patch) = preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST;
+    let (major, minor, patch) =
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST;
     Version::parse(host_version)
         .ok()
         .is_some_and(|version| version >= Version::new(major, minor, patch))
@@ -710,7 +716,8 @@ async fn ensure_agent_rootfs(
     // An operator pin outranks every tree below, so a refresh of those trees
     // cannot change what the engine boots: say so instead of reporting a
     // repair that leaves the pin in place.
-    if let Some(pinned) = preloop_vm::agent_rootfs::Runtime::from_env().explicit_rootfs
+    if let Some(pinned) =
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime::from_env().explicit_rootfs
         && !agent_rootfs_serves(&pinned, host_version)
     {
         bail!(
@@ -833,7 +840,7 @@ async fn refresh_agent_rootfs_from_release(
 /// ships next to the binary in step.
 ///
 /// The stamp (`<rootfs>/.preloop-agent-version`) is what lets the guard in
-/// `preloop_vm::agent_rootfs` tell a stale pinned rootfs from a matching one
+/// `preloop_sandbox::drivers::smolvm::cli::agent_rootfs` tell a stale pinned rootfs from a matching one
 /// without hashing the agent binary on every engine start.
 fn install_agent_rootfs(
     source: &Path,
@@ -870,7 +877,8 @@ fn install_agent_rootfs(
         copy_dir_all(source, &destination)?;
         if destination == exported {
             fs::write(
-                destination.join(preloop_vm::agent_rootfs::VERSION_STAMP),
+                destination
+                    .join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP),
                 format!("{version}\n"),
             )?;
         }
@@ -1970,7 +1978,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         // Parse-check the floor constant; the loop below pins the concrete
         // versions that must pass or fail against it.
-        let _minimum = Version::parse(preloop_vm::SMOLVM_MIN_VERSION).unwrap();
+        let _minimum =
+            Version::parse(preloop_sandbox::drivers::smolvm::cli::SMOLVM_MIN_VERSION).unwrap();
         for (version, flag, expected) in [
             ("1.30.1", "--mount-socket <HOST:GUEST>", true),
             ("1.30.2", "--mount-socket <HOST:GUEST>", true),
@@ -2205,7 +2214,7 @@ mod tests {
                 install
                     .data_dir
                     .join("agent-rootfs")
-                    .join(preloop_vm::agent_rootfs::VERSION_STAMP)
+                    .join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP)
             )
             .unwrap(),
             "9.9.9\n",
@@ -2284,7 +2293,7 @@ mod tests {
         .unwrap();
         if let Some(stamp) = stamp {
             std::fs::write(
-                target.join(preloop_vm::agent_rootfs::VERSION_STAMP),
+                target.join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP),
                 format!("{stamp}\n"),
             )
             .unwrap();
@@ -2309,7 +2318,8 @@ mod tests {
         binary.extend_from_slice(version.as_bytes());
         if capability {
             binary.extend_from_slice(
-                preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_CAPABILITY.as_bytes(),
+                preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_CAPABILITY
+                    .as_bytes(),
             );
         }
         binary
@@ -2318,14 +2328,14 @@ mod tests {
     /// Version recorded beside a rootfs: the stamp Preloop wrote, else the
     /// version baked into the agent binary.
     fn agent_rootfs_version(rootfs: &Path) -> Option<String> {
-        preloop_vm::agent_rootfs::AgentRootfs::inspect(rootfs)
+        preloop_sandbox::drivers::smolvm::cli::agent_rootfs::AgentRootfs::inspect(rootfs)
             .version()
             .map(str::to_owned)
     }
 
     #[test]
     fn the_agent_dir_follows_the_engines_own_rule() {
-        let pinned = preloop_vm::agent_rootfs::Runtime {
+        let pinned = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime {
             host_home: None,
             data_dir: Some(PathBuf::from("/tmp/preloop-home/smolvm")),
             explicit_rootfs: None,
@@ -2335,7 +2345,7 @@ mod tests {
             PathBuf::from("/tmp/preloop-home/smolvm"),
             "the engine exports the data dir it resolves, not smolvm's own"
         );
-        let unset = preloop_vm::agent_rootfs::Runtime::default();
+        let unset = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::Runtime::default();
         assert_eq!(
             engine_agent_dir(&unset, Path::new("/tmp/platform/smolvm")),
             PathBuf::from("/tmp/platform/smolvm"),
@@ -2382,7 +2392,7 @@ mod tests {
         // one: the recorded version is the host's, the bytes are not.
         let restored = agent_tree(root, "restored", "1.14.2", false);
         fs::write(
-            restored.join(preloop_vm::agent_rootfs::VERSION_STAMP),
+            restored.join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP),
             "1.30.1\n",
         )
         .unwrap();
@@ -2412,9 +2422,9 @@ mod tests {
         assert!(
             !agent_rootfs_serves(&incapable, "1.30.1"),
             "a {}.{}.{}+ host refuses to stop an agent without the capability",
-            preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.0,
-            preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.1,
-            preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.2,
+            preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.0,
+            preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.1,
+            preloop_sandbox::drivers::smolvm::cli::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.2,
         );
         assert!(
             !agent_rootfs_serves(&old, "1.30.1"),
@@ -2517,7 +2527,10 @@ mod tests {
             "the installed rootfs must be the host's agent"
         );
         assert_eq!(
-            std::fs::read_to_string(target.join(preloop_vm::agent_rootfs::VERSION_STAMP)).unwrap(),
+            std::fs::read_to_string(
+                target.join(preloop_sandbox::drivers::smolvm::cli::agent_rootfs::VERSION_STAMP)
+            )
+            .unwrap(),
             "1.30.1\n",
             "the refresh must record the release it installed"
         );

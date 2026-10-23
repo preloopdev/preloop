@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
+### Added
+
+- **Sandbox Service** (`preloop-sandbox`) replaces `preloop-vm`; the
+  `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
+  service.
 
 ## [0.35.6] - 2026-10-21
 

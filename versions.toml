@@ -9,8 +9,8 @@ runner_version = "2.337.0"
 #   run as root, the per-VM uid drop presents packed layers through a count-1
 #   idmapped mount and every non-zero uid surfaces as the overflow uid (65534).
 # * `machine fork --freeze-source` (v1.18.1, upstream PR #1376), which
-#   preloop-vm passes on every fork so the golden stays frozen as a reusable
-#   branch base instead of live-forking onto new CoW layers. Live forking
+#   the SmolVM driver passes on every fork so the golden stays frozen as a
+#   reusable branch base instead of live-forking onto new CoW layers. Live forking
 #   accumulates qcow2 backing layers until MAX_FORK_LINEAGE_DEPTH (32) wedges
 #   the pool, and on macOS it re-checkpoints the source on every fork — the
 #   failure mode the retained fork patch fixed before upstream carried the flag.
@@ -25,10 +25,10 @@ runner_version = "2.337.0"
 #   can exceed the budget and never boot. The arm64/macOS ceiling has not been
 #   measured; `preloop update --ensure-runtime` accepts any stable release >=
 #   this and installs the latest stable when the local runtime is below the
-#   floor or lacks the required socket capability. Compiled into preloop-vm
-#   (see `crates/preloop-vm/build.rs`), which preloop-cli reads. Keep it at the
-#   first release that satisfies all runtime invariants; the golden release pin
-#   below is Renovate-managed.
+#   floor or lacks the required socket capability. Compiled into
+#   preloop-sandbox (see `crates/preloop-sandbox/build.rs`), which preloop-cli
+#   reads. Keep it at the first release that satisfies all runtime invariants;
+#   the golden release pin below is Renovate-managed.
 smolvm_min_version = "1.30.1"
 
 # SmolVM release the golden-image workflow (.github/workflows/release-golden.yml)

@@ -3,7 +3,7 @@ use preloop_orchestrator::{
     DEBUG_MARKER_IDLE, JobVmDiskReserve, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig,
     artifact_payload, node_externals,
 };
-use preloop_vm::{
+use preloop_sandbox::drivers::smolvm::cli::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
     ProviderCapabilities, SecretSource, SocketMount, VmError, VmProvider, VolumeMount,
 };
@@ -51,7 +51,7 @@ struct RecordingVmProvider {
     state: Mutex<ProviderState>,
     run_actions: Mutex<Vec<RunAction>>,
     changed: Notify,
-    /// Whether packs are host files (SmolVM) or live server-side (AgentENV).
+    /// Whether packs are host files (SmolVM) or live server-side (a snapshot backend).
     /// A backend without host-side packs has no artifact to unpack, so its
     /// golden is baked in the guest instead.
     file_packs: bool,
@@ -82,7 +82,7 @@ impl RecordingVmProvider {
         }
     }
 
-    /// Model a backend whose packs are not host files (AgentENV): there is no
+    /// Model a backend whose packs are not host files: there is no
     /// artifact to unpack, so the pool prepares its golden in the guest.
     fn no_packs(mut self) -> Self {
         self.file_packs = false;
@@ -719,7 +719,7 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
 /// An artifact build that fails after the builder booted must not strand the
 /// builder: the pool's error path tears its machines down like every other
 /// exit. The CLI's exit guard only reaps hypervisor processes — not the
-/// layer mounts a killed hypervisor holds, and not AgentENV sandboxes.
+/// layer mounts a killed hypervisor holds, and not provider-owned sandboxes.
 #[tokio::test]
 async fn artifact_build_failure_tears_the_builder_down() {
     let fixture = Fixture::new("artifact-fail", false);
