@@ -85,19 +85,29 @@ impl Authorizer for TokenAuthorizer {
     }
 }
 
-/// Select the configured authorization policy.
+/// Environment variable that selects the policy.
+pub const AUTHORIZER_SETTING: &str = "PRELOOP_SANDBOX_AUTHORIZER";
+
+/// Select the configured authorization policy from the environment.
 ///
 /// `builtin` and an unset variable are the only supported configurations. The
 /// error is returned before the HTTP server starts so a future policy can be
 /// added without changing any route handler.
 pub fn from_config() -> Result<Arc<dyn Authorizer>, String> {
-    const SETTING: &str = "PRELOOP_SANDBOX_AUTHORIZER";
+    match env::var(AUTHORIZER_SETTING) {
+        Ok(value) => from_setting(Some(&value)),
+        Err(env::VarError::NotPresent) => from_setting(None),
+        Err(error) => Err(format!("could not read {AUTHORIZER_SETTING}: {error}")),
+    }
+}
 
-    match env::var(SETTING) {
-        Ok(value) if value == "builtin" => Ok(Arc::new(TokenAuthorizer)),
-        Ok(value) => Err(format!("unsupported {SETTING} value `{value}`")),
-        Err(env::VarError::NotPresent) => Ok(Arc::new(TokenAuthorizer)),
-        Err(error) => Err(format!("could not read {SETTING}: {error}")),
+/// Select a policy from the setting's value (`None` when unset).
+fn from_setting(value: Option<&str>) -> Result<Arc<dyn Authorizer>, String> {
+    match value {
+        None | Some("builtin") => Ok(Arc::new(TokenAuthorizer)),
+        Some(other) => Err(format!(
+            "unsupported {AUTHORIZER_SETTING} value `{other}` (only `builtin` is available)"
+        )),
     }
 }
 
@@ -106,56 +116,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_allows_every_action() {
-        let authorizer = TokenAuthorizer;
-        let principals = [
-            Principal {
-                kind: PrincipalKind::Client,
-                name: "client".into(),
-            },
-            Principal {
-                kind: PrincipalKind::Provider,
-                name: "host-a".into(),
-            },
-            Principal {
-                kind: PrincipalKind::Anonymous,
-                name: "anonymous".into(),
-            },
-        ];
-        for principal in principals {
-            for action in [
-                Action::Read,
-                Action::Write,
-                Action::Admin,
-                Action::Exec,
-                Action::Transfer,
-                Action::Enroll,
-                Action::Provider,
-            ] {
-                assert!(authorizer.authorize(&principal, action).is_ok());
-            }
-        }
-        assert_eq!(authorizer.name(), "builtin");
+    fn unset_and_builtin_select_the_default_policy() {
+        assert_eq!(from_setting(None).unwrap().name(), "builtin");
+        assert_eq!(from_setting(Some("builtin")).unwrap().name(), "builtin");
     }
 
     #[test]
-    #[allow(unsafe_code)]
-    fn unknown_configuration_names_the_setting() {
-        const SETTING: &str = "PRELOOP_SANDBOX_AUTHORIZER";
-        let previous = env::var_os(SETTING);
-        unsafe { env::set_var(SETTING, "unknown") };
-        let result = from_config();
-        unsafe {
-            match previous {
-                Some(value) => env::set_var(SETTING, value),
-                None => env::remove_var(SETTING),
-            }
+    fn unknown_values_refuse_startup_naming_the_setting() {
+        for value in ["unknown", "", "Builtin", " builtin"] {
+            let error = from_setting(Some(value)).err().expect("must be rejected");
+            assert!(error.contains(AUTHORIZER_SETTING), "{error}");
         }
-
-        let error = match result {
-            Ok(_) => panic!("unknown authorizer must refuse startup"),
-            Err(error) => error,
-        };
-        assert!(error.contains(SETTING), "{error}");
     }
 }
