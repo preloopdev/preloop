@@ -603,9 +603,8 @@ fn close_execs(state: &mut State, sandbox_id: &str, reason: &str) {
     }
 }
 
-/// A lifecycle completion is applied only to the same sandbox incarnation
-/// that started the operation, under the same lease and in the state the
-/// operation expected to leave behind.
+/// A lifecycle completion is applied only to the same sandbox record, under
+/// the same lease and in the state the operation expected to leave behind.
 fn still_in_state(state: &State, sandbox_id: &str, lease_id: &str, expected: SandboxState) -> bool {
     state
         .sandboxes
@@ -3164,9 +3163,7 @@ impl Service {
             // provider was working invalidates the capture: installing the
             // template would point at a machine that is being destroyed.
             let still_valid = state.sandboxes.get(&sandbox.id).is_some_and(|source| {
-                source.state == SandboxState::Leased
-                    && source.lease_id == sandbox.lease_id
-                    && source.incarnation == sandbox.incarnation
+                source.state == SandboxState::Leased && source.lease_id == sandbox.lease_id
             });
             if !still_valid {
                 warn!(
@@ -4343,7 +4340,7 @@ impl Service {
                     warn!(
                         sandbox = %id,
                         attempts = MAX_DESTROY_ATTEMPTS,
-                        "terminating sandbox out of destroy retries; dropping the record so the machine is reaped as an orphan"
+                        "terminating sandbox out of destroy retries; dropping the record so it stops holding a slot (the machine has no record and reconcile will not reap it as its owner is unknown)"
                     );
                     state.sandboxes.remove(&id);
                     state.created_at.remove(&id);
@@ -4351,11 +4348,13 @@ impl Service {
                     ops.push(self.remove(Kind::Sandboxes, &id));
                 }
             }
-            // Machines no record owns (orphans).
+            // Machines no record owns (orphans, stale incarnations).
             //
             // A template's `native_ref` is its fork base (SmolVM's golden):
             // a live machine with no sandbox record. It is never an orphan,
-            // whichever provider reports it. Two agents can share one host's
+            // whichever provider reports it, so snapshot bases are protected
+            // service-wide: any provider may report the inventory, but a base
+            // belongs to the template record. Two agents can share one host's
             // engine home and each lists every machine there, and the base
             // belongs to the template rather than to the agent that happened
             // to create it. Reaping it wedges every later fork ("cannot be

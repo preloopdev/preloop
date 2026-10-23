@@ -416,11 +416,14 @@ template instead of silently reusing the old one.
 The engine also sweeps orphaned SmolVM hypervisors under its home at pool
 startup and teardown (`OrphanPurge::All`). Those sweeps only see a machine's
 data directory, so the SmolVM driver writes an ownership marker into every
-machine it serves for a caller that is not the CI pool; the sweeps spare
-marked machines. Another caller's leased sandbox therefore survives an engine
-restart or stop, while pool machines stay unmarked and the sweep remains their
-crash backstop. The service's own delete path escalates to a targeted kill when
-`machine delete` refuses.
+machine it creates, pool machines included, and the sweeps spare marked
+machines. Another caller's leased sandbox therefore survives an engine restart
+or stop. The pool has no sweep backstop for its own machines: it deletes them
+through the service on teardown, and its startup cleanup releases leftovers
+through the service. A pool that the guest-agent guard disables starts no
+service and runs no cleanup, so its leftover runners keep running until the
+pool next starts. The service's own delete path escalates to a targeted kill
+when `machine delete` refuses.
 
 | Variable | Effect |
 |---|---|

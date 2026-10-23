@@ -52,6 +52,17 @@ Releases before v0.27.0 predate the changelog.
   counts what it drops, and an unavailable `Stats` read reports the engine
   fleet as unknown instead of empty.
 
+### Fixed
+
+- **A second agent on one host no longer destroys a snapshot template's fork
+  base.** `Reconcile` spared a golden only when the reporting provider owned
+  the template, and a golden has no sandbox record: an agent sharing the same
+  SmolVM home listed it in its inventory and the service reaped it as an
+  orphan, after which the template could not fork ("cannot be re-launched
+  while … live clone(s)"). A template's native ref is now exempt from orphan
+  reaping whichever provider reports it; deleting the template still releases
+  it through its owning provider.
+
 ## [0.35.6] - 2026-10-21
 
 ### Added

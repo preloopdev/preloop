@@ -125,21 +125,21 @@ impl SmolvmDriver {
             .is_some_and(|prefix| name.starts_with(prefix))
     }
 
-    /// Mark a machine the CI pool does not own as a Sandbox Service sandbox.
+    /// Mark a machine this driver creates as a Sandbox Service sandbox.
     ///
     /// The engine's start/teardown sweep (`OrphanPurge::All`) kills every
-    /// hypervisor under this home it cannot attribute, which used to include
-    /// sandboxes leased to other callers. The sweep sees only a machine's
-    /// data directory, so that is where the ownership marker goes. Pool
-    /// machines (`named_prefix`) stay unmarked: the pool deletes them itself
-    /// on teardown and the sweep is its crash backstop.
+    /// hypervisor under this home it cannot attribute, and a leased sandbox
+    /// must never be one of them. The sweep sees only a machine's data
+    /// directory, so that is where the ownership marker goes, whatever the
+    /// machine is named: a caller may name a sandbox inside the pool's prefix,
+    /// and the pool's own machines are created through the service too. The
+    /// pool does not rely on the sweep as a crash backstop: it deletes its
+    /// machines through the service on teardown, and its startup cleanup
+    /// (`remove_stale_runner_machines`) releases leftovers through the service.
     ///
     /// A marker that cannot be written fails the create: an unmarked sandbox
     /// could be killed under a live lease at the next engine start or stop.
     async fn mark_owned(&self, name: &MachineName) -> Result<()> {
-        if self.adopts(name.as_str()) {
-            return Ok(());
-        }
         let data_dir = self
             .provider
             .machine_data_dir(name)

@@ -1524,6 +1524,13 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::DeadlineExceeded);
+    // Non-vacuous: the host held exactly one sandbox, still provisioning.
+    let before = service.list();
+    assert!(
+        before.len() == 1 && before[0].state == SandboxState::Provisioning,
+        "{before:?}"
+    );
+    let sandbox_id = before[0].id.clone();
     // The host stops answering: wait past the timeout the service declares
     // it lost by, not past the last heartbeat.
     alive.cancel();
@@ -1660,7 +1667,33 @@ async fn reconcile_never_destroys_another_providers_machine() {
         })
         .await
         .unwrap();
-    assert!(response.destroy.iter().any(|w| w.native_ref == orphan));
+    assert!(
+        !response.destroy.iter().any(|w| w.native_ref == orphan),
+        "an unknown machine was reaped: {:?}",
+        response.destroy
+    );
+
+    // A machine reported under a sandbox id we own is ours even when its
+    // native reference is unknown: a stale copy of one of our sandboxes must
+    // be reaped rather than left running.
+    let stale = "sbx-stale-machine".to_owned();
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id,
+            generation: other.generation,
+            sandboxes: vec![Observed {
+                driver: "fake".into(),
+                native_ref: stale.clone(),
+                sandbox_id: sandbox_id.clone(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(
+        response.destroy.iter().any(|w| w.native_ref == stale),
+        "a stale copy of our own sandbox must be reaped"
+    );
 }
 
 /// A golden is a template's fork base, not a sandbox: it has no record, so
