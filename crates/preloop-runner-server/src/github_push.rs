@@ -592,7 +592,14 @@ pub async fn push_credential(
     // the owner may hold an installation that cannot reach this repository
     // (e.g. a selected-repositories installation), and a later App can.
     for app_creds in crate::github_app::candidate_apps_for_repo(shared, repository).await {
-        match crate::github_app::get_or_mint_token(&app_creds, repository, &permissions).await {
+        match crate::github_app::get_or_mint_token_at(
+            shared.state.github_urls.api_base(),
+            &app_creds,
+            repository,
+            &permissions,
+        )
+        .await
+        {
             Ok(token) => {
                 let bucket = match app_creds.mint_ledger.lookup(&token) {
                     Some(entry) => GithubCredentialBucket::Installation(entry.installation_id),

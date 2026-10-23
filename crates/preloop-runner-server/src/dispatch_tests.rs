@@ -2366,9 +2366,15 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
 
 /// Two registered Apps with distinct webhook secrets and exact-repository
 /// installation answers served by the loopback stub.
-async fn webhook_coverage_fixture() -> (tempfile::TempDir, AppState, Router) {
+///
+/// `api_base` is the stub's base: callers start the stub (and pin the env
+/// var) before building the fixture, and the base is written into the
+/// state's resolved URLs because the coverage lookup reads the address
+/// from state, not from the environment at request time.
+async fn webhook_coverage_fixture(api_base: &str) -> (tempfile::TempDir, AppState, Router) {
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+    state.github_urls.api_url = api_base.to_owned();
     let (mut registry, _) = two_app_registry();
     registry.apps[0].webhook_secret = Some("default-secret".to_owned());
     state.webhook_secret = Some("legacy-secret".to_owned());
@@ -2390,9 +2396,9 @@ fn coverage_installation(app_id: u64) -> Value {
 /// nothing; a valid removal invalidates the signer's answer immediately.
 #[tokio::test]
 async fn signed_lifecycle_events_invalidate_only_their_own_app_coverage() {
-    let (_temp, _state, app) = webhook_coverage_fixture().await;
     let stub = WebhookCoverageStub::start(false).await;
     let _env = pin_api_base(&stub.base).await;
+    let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
 
     assert_eq!(
@@ -2487,9 +2493,9 @@ async fn signed_lifecycle_events_invalidate_only_their_own_app_coverage() {
 /// active coverage.
 #[tokio::test]
 async fn lifecycle_suspension_and_deletion_deny_the_next_delivery() {
-    let (_temp, _state, app) = webhook_coverage_fixture().await;
     let stub = WebhookCoverageStub::start(false).await;
     let _env = pin_api_base(&stub.base).await;
+    let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
 
     assert_eq!(
@@ -2547,9 +2553,9 @@ async fn lifecycle_suspension_and_deletion_deny_the_next_delivery() {
 /// answer, so the next ordinary delivery confirms current access.
 #[tokio::test]
 async fn adding_a_repository_invalidates_its_previous_answer() {
-    let (_temp, _state, app) = webhook_coverage_fixture().await;
     let stub = WebhookCoverageStub::start(false).await;
     let _env = pin_api_base(&stub.base).await;
+    let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
 
     // First delivery sees a definitive 404 and is denied; the 404 is not
     // retained, so a later grant works without waiting for a TTL.
@@ -2593,9 +2599,9 @@ async fn adding_a_repository_invalidates_its_previous_answer() {
 /// it must neither repopulate the cache nor authorize its own delivery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_positive_after_invalidation_neither_repopulates_nor_authorizes() {
-    let (_temp, _state, app) = webhook_coverage_fixture().await;
     let stub = WebhookCoverageStub::start(true).await;
     let _env = pin_api_base(&stub.base).await;
+    let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
 
     let app_for_slow = app.clone();
@@ -2649,9 +2655,9 @@ async fn slow_positive_after_invalidation_neither_repopulates_nor_authorizes() {
 /// an independent repository does not wait behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn simultaneous_webhook_deliveries_coalesce_by_repository() {
-    let (_temp, state, app) = webhook_coverage_fixture().await;
     let stub = WebhookCoverageStub::start(true).await;
     let _env = pin_api_base(&stub.base).await;
+    let (_temp, state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
     stub.set("org-a/other", 200, coverage_installation(424));
     let app_creds = state
@@ -2713,9 +2719,9 @@ async fn simultaneous_webhook_deliveries_coalesce_by_repository() {
 /// teaching the cache; a healthy answer immediately after is accepted.
 #[tokio::test]
 async fn unusable_coverage_answers_are_retried_not_cached() {
-    let (_temp, _state, app) = webhook_coverage_fixture().await;
     let stub = WebhookCoverageStub::start(false).await;
     let _env = pin_api_base(&stub.base).await;
+    let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
 
     for (status, body) in [
         (200, json!({ "id": 77, "app_id": 999 })),
@@ -2753,9 +2759,9 @@ async fn unusable_coverage_answers_are_retried_not_cached() {
 /// records no App identity.
 #[tokio::test]
 async fn verified_signer_is_persisted_for_durable_processing() {
-    let (_temp, state, app) = webhook_coverage_fixture().await;
     let stub = WebhookCoverageStub::start(false).await;
     let _env = pin_api_base(&stub.base).await;
+    let (_temp, state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
 
     assert_eq!(

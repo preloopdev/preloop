@@ -1531,6 +1531,7 @@ pub async fn mint_dispatch_github_token(
     }
     let ceiling_clamped = !ceiling.clamped.is_empty();
     let minted = match crate::github_app::get_or_mint_token_declared(
+        shared.state.github_urls.api_base(),
         &app,
         &request.repository,
         &ceiling.permissions,

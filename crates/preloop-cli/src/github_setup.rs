@@ -19,6 +19,19 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+/// The GitHub API base for CLI flows. The CLI has no server state to resolve
+/// the address from, so — as elsewhere in the CLI (`app_manifest`, `init`) —
+/// it reads `PRELOOP_GITHUB_API_URL` at this boundary and defaults to
+/// github.com's API. Server-side code never resolves an address itself; it
+/// uses the one address resolved into `AppState::github_urls`.
+fn api_base() -> String {
+    std::env::var("PRELOOP_GITHUB_API_URL")
+        .ok()
+        .map(|base| base.trim().trim_end_matches('/').to_owned())
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned())
+}
+
 /// `preloop setup` — engine configuration commands.
 #[derive(Debug, Parser)]
 pub struct SetupArgs {
@@ -721,8 +734,14 @@ where
 /// whole point.
 async fn apply_app_webhook(app_id: &str, pem: &str, update: &WebhookUpdate) -> anyhow::Result<()> {
     persist_secret_then_point_hook(app_id, update, |secret| async move {
-        preloop_runner_server::github_app::set_app_webhook_config(app_id, pem, &update.url, &secret)
-            .await
+        preloop_runner_server::github_app::set_app_webhook_config_at(
+            &api_base(),
+            app_id,
+            pem,
+            &update.url,
+            &secret,
+        )
+        .await
     })
     .await?;
     println!("App {app_id} webhook now delivers to {}", update.url);
@@ -975,7 +994,14 @@ fn scalar_permission_lines(access: &str) -> Vec<String> {
 pub(crate) async fn doctor_app(app_id: &str, pem: &str, repos: &[String]) -> anyhow::Result<()> {
     let mut failed = false;
     for repo in repos {
-        match preloop_runner_server::github_app::verify_app_config(app_id, pem, repo).await {
+        match preloop_runner_server::github_app::verify_app_config_at(
+            &api_base(),
+            app_id,
+            pem,
+            repo,
+        )
+        .await
+        {
             Ok(granted) => {
                 let names = granted
                     .iter()
@@ -997,7 +1023,9 @@ pub(crate) async fn doctor_app(app_id: &str, pem: &str, repos: &[String]) -> any
 pub(crate) async fn doctor_pat(token: &str, repos: &[String]) -> anyhow::Result<()> {
     let mut failed = false;
     for repo in repos {
-        match preloop_runner_server::github_app::verify_repo_access_with_token(token, repo).await {
+        match preloop_runner_server::github_app::verify_repo_access_at(&api_base(), token, repo)
+            .await
+        {
             Ok(granted) => {
                 let names = granted
                     .iter()

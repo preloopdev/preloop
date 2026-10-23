@@ -305,14 +305,18 @@ impl EnvironmentResolver {
             for creds in &candidates {
                 // The installation id is the rate-limit identity; never
                 // invent one (same convention as check runs).
-                let bucket = match crate::github_app::installation_for_repo(creds, repository).await
-                {
-                    Ok(installation) if installation != 0 => {
-                        crate::github_breaker::GithubCredentialBucket::Installation(installation)
-                    }
-                    _ => crate::github_breaker::GithubCredentialBucket::Pat,
-                };
-                let fetched = match environment_token(creds, repository).await {
+                let bucket =
+                    match crate::github_app::installation_for_repo(api_base, creds, repository)
+                        .await
+                    {
+                        Ok(installation) if installation != 0 => {
+                            crate::github_breaker::GithubCredentialBucket::Installation(
+                                installation,
+                            )
+                        }
+                        _ => crate::github_breaker::GithubCredentialBucket::Pat,
+                    };
+                let fetched = match environment_token(api_base, creds, repository).await {
                     Ok(token) => {
                         fetch_environment_rules(
                             shared,
@@ -519,9 +523,20 @@ impl EnvironmentResolver {
             let mut permissions = std::collections::BTreeMap::new();
             permissions.insert("members".to_owned(), "read".to_owned());
             permissions.insert("contents".to_owned(), "read".to_owned());
-            let token =
-                crate::github_app::get_or_mint_token(&creds, repository, &permissions).await?;
-            let bucket = match crate::github_app::installation_for_repo(&creds, repository).await {
+            let token = crate::github_app::get_or_mint_token_at(
+                shared.state.github_urls.api_base(),
+                &creds,
+                repository,
+                &permissions,
+            )
+            .await?;
+            let bucket = match crate::github_app::installation_for_repo(
+                shared.state.github_urls.api_base(),
+                &creds,
+                repository,
+            )
+            .await
+            {
                 Ok(installation) if installation != 0 => {
                     crate::github_breaker::GithubCredentialBucket::Installation(installation)
                 }
@@ -562,13 +577,14 @@ fn url_path_segment(value: &str) -> String {
 /// (docs.github.com/en/rest/authentication/permissions-required-for-github-apps),
 /// so the mint requests it alongside `contents: read`.
 async fn environment_token(
+    api_base: &str,
     creds: &crate::github_app::GitHubAppCredentials,
     repository: &str,
 ) -> anyhow::Result<String> {
     let mut permissions = std::collections::BTreeMap::new();
     permissions.insert("contents".to_owned(), "read".to_owned());
     permissions.insert("actions".to_owned(), "read".to_owned());
-    crate::github_app::get_or_mint_token(creds, repository, &permissions).await
+    crate::github_app::get_or_mint_token_at(api_base, creds, repository, &permissions).await
 }
 
 /// GET `path` under the token, decoding JSON. `Ok(None)` on 404.

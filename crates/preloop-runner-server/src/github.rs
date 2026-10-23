@@ -179,7 +179,14 @@ async fn resolve_repo_token(
         // being read; a single retry keeps a transient rejection from
         // stranding the report.
         for attempt in 0..2 {
-            match crate::github_app::get_or_mint_token(app_creds, repo, permissions).await {
+            match crate::github_app::get_or_mint_token_at(
+                shared.state.github_urls.api_base(),
+                app_creds,
+                repo,
+                permissions,
+            )
+            .await
+            {
                 Ok(token) => return Some(token),
                 Err(error) if attempt == 0 => {
                     tracing::warn!(
@@ -721,7 +728,13 @@ impl CheckRunSender {
 /// installation id.
 async fn resolve_check_run_rate_key(shared: &Arc<SharedState>, repo: &str) -> CheckRunRateKey {
     match crate::github_app::select_app_for_repo(shared, repo).await {
-        Some(app) => match crate::github_app::installation_for_repo(&app, repo).await {
+        Some(app) => match crate::github_app::installation_for_repo(
+            shared.state.github_urls.api_base(),
+            &app,
+            repo,
+        )
+        .await
+        {
             Ok(installation) if installation != 0 => CheckRunRateKey::Installation(installation),
             _ => CheckRunRateKey::Pat,
         },
@@ -2055,7 +2068,9 @@ pub async fn fetch_workflows_at(
                         .await?;
                 // The installation id is the rate-limit identity; never
                 // invent one (same convention as check runs).
-                let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+                let bucket = match crate::github_app::installation_for_repo(api_base, &app, repo)
+                    .await
+                {
                     Ok(installation) if installation != 0 => {
                         crate::github_breaker::GithubCredentialBucket::Installation(installation)
                     }
@@ -2245,12 +2260,13 @@ async fn contents_read_token(
                 .await?;
         // The installation id is the rate-limit identity; never invent one
         // (same convention as check runs).
-        let bucket = match crate::github_app::installation_for_repo(&app, repository).await {
-            Ok(installation) if installation != 0 => {
-                crate::github_breaker::GithubCredentialBucket::Installation(installation)
-            }
-            _ => crate::github_breaker::GithubCredentialBucket::Pat,
-        };
+        let bucket =
+            match crate::github_app::installation_for_repo(api_base, &app, repository).await {
+                Ok(installation) if installation != 0 => {
+                    crate::github_breaker::GithubCredentialBucket::Installation(installation)
+                }
+                _ => crate::github_breaker::GithubCredentialBucket::Pat,
+            };
         return Ok(Some((token, bucket)));
     }
     // The env PAT here mirrors the pre-existing credential ladder; the
@@ -2432,7 +2448,8 @@ pub async fn resolve_pr_changed_files_at(
             let permissions = BTreeMap::from([("pull_requests".to_owned(), "read".to_owned())]);
             let token =
                 crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?;
-            let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+            let bucket = match crate::github_app::installation_for_repo(api_base, &app, repo).await
+            {
                 Ok(installation) if installation != 0 => {
                     crate::github_breaker::GithubCredentialBucket::Installation(installation)
                 }
@@ -2745,15 +2762,20 @@ async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget)
                 Ok(token) => {
                     // The installation id is the rate-limit identity; never
                     // invent one (same convention as check runs).
-                    let bucket =
-                        match crate::github_app::installation_for_repo(&app, &target.repo).await {
-                            Ok(installation) if installation != 0 => {
-                                crate::github_breaker::GithubCredentialBucket::Installation(
-                                    installation,
-                                )
-                            }
-                            _ => crate::github_breaker::GithubCredentialBucket::Pat,
-                        };
+                    let bucket = match crate::github_app::installation_for_repo(
+                        api_base,
+                        &app,
+                        &target.repo,
+                    )
+                    .await
+                    {
+                        Ok(installation) if installation != 0 => {
+                            crate::github_breaker::GithubCredentialBucket::Installation(
+                                installation,
+                            )
+                        }
+                        _ => crate::github_breaker::GithubCredentialBucket::Pat,
+                    };
                     (Some(token), bucket)
                 }
                 Err(error) => {
@@ -3226,7 +3248,11 @@ async fn pr_head_commit_skips_ci(
             match crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await
             {
                 Ok(token) => {
-                    let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+                    let bucket = match crate::github_app::installation_for_repo(
+                        api_base, &app, repo,
+                    )
+                    .await
+                    {
                         Ok(installation) if installation != 0 => {
                             crate::github_breaker::GithubCredentialBucket::Installation(
                                 installation,
@@ -3495,7 +3521,12 @@ pub async fn handle_github_webhook(
                 "installation lifecycle event invalidated cached repository coverage"
             );
         } else if let Some(claimed) = claimed_repository(&body)
-            && !crate::github_app::app_covers_repository(app, &claimed).await
+            && !crate::github_app::app_covers_repository(
+                shared.state.github_urls.api_base(),
+                app,
+                &claimed,
+            )
+            .await
         {
             warn!(
                 app_id = %app_id,
@@ -4219,7 +4250,9 @@ async fn webhook_delivery_bucket(
     let Some(app) = crate::github_app::select_app_for_repo(shared, &repo).await else {
         return GithubCredentialBucket::Pat;
     };
-    match crate::github_app::installation_for_repo(&app, &repo).await {
+    match crate::github_app::installation_for_repo(shared.state.github_urls.api_base(), &app, &repo)
+        .await
+    {
         Ok(installation) if installation != 0 => GithubCredentialBucket::Installation(installation),
         _ => GithubCredentialBucket::Pat,
     }
@@ -4782,9 +4815,8 @@ async fn process_delivery_payload_with_lease(
         delivery.event.as_str(),
         "pull_request" | "pull_request_target"
     ) {
-        let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-            .unwrap_or_else(|_| "https://api.github.com".to_owned());
-        if pr_head_commit_skips_ci(shared, &repo_full_name, &payload_val, &api_base).await {
+        let api_base = shared.state.github_urls.api_base();
+        if pr_head_commit_skips_ci(shared, &repo_full_name, &payload_val, api_base).await {
             info!("[skip ci] on internal pull-request head commit — suppressing delivery");
             return WebhookOutcome::Success;
         }
@@ -4802,12 +4834,10 @@ async fn process_delivery_payload_with_lease(
                     .and_then(|pr| pr.get("number"))
             })
             .and_then(|value| value.as_u64());
-        let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-            .unwrap_or_else(|_| "https://api.github.com".to_owned());
+        let api_base = shared.state.github_urls.api_base();
         let fetched = match pr_number {
             Some(number) => {
-                match resolve_pr_changed_files_at(shared, &repo_full_name, number, &api_base).await
-                {
+                match resolve_pr_changed_files_at(shared, &repo_full_name, number, api_base).await {
                     Ok(files) => files,
                     Err(error) => {
                         error!(?error, "failed to resolve pull request changed files");
@@ -5724,8 +5754,7 @@ async fn exchange_manifest_code(
     state: &crate::state::AppState,
     code: &str,
 ) -> Result<AppManifestConversion, StatusCode> {
-    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-        .unwrap_or_else(|_| "https://api.github.com".to_owned());
+    let api_base = state.github_urls.api_base();
     let url = format!(
         "{}/app-manifests/{}/conversions",
         api_base,
@@ -8587,6 +8616,10 @@ mod tests {
         );
         app.installation_id = Some(installation_id);
         let mut state = state.clone();
+        // The cloned state's resolved URLs were built before the stub pin
+        // above; point them at the stub too, since call sites now read the
+        // base from state rather than the environment at call time.
+        state.github_urls.api_url = api.clone();
         state.github_app = Some(app.clone());
         state.github_apps = Some(crate::github_app::GitHubApps {
             apps: vec![app],
