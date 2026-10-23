@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::generated::preloop::sandbox::v1::{
     Empty, Providers, ProvidersExt, Sandboxes, SandboxesExt,
 };
+use crate::backend::Owner;
 use crate::service::{ProviderIdentity, Service};
 use crate::tls::{PeerIdentity, ServerTls, TlsListener};
 
@@ -106,19 +107,19 @@ struct ProvidersService {
 impl ProvidersService {
     /// The enrolled provider the request's client certificate authenticates,
     /// plus the fingerprint it was resolved from.
-    fn identity(&self, ctx: &RequestContext) -> Result<(ProviderIdentity, String)> {
+    async fn identity(&self, ctx: &RequestContext) -> Result<(ProviderIdentity, String)> {
         let peer = ctx
             .extensions()
             .get::<ConnectInfo<PeerIdentity>>()
             .map(|info| &info.0)
             .ok_or_else(|| Error::unauthenticated("a client certificate is required"))?;
         let fingerprint = peer.fingerprint()?.to_owned();
-        let identity = self.service.provider_identity(&fingerprint)?;
+        let identity = self.service.provider_identity(&fingerprint).await?;
         Ok((identity, fingerprint))
     }
 
-    fn bound(&self, ctx: &RequestContext, provider_id: &str) -> Result<()> {
-        let (identity, _) = self.identity(ctx)?;
+    async fn bound(&self, ctx: &RequestContext, provider_id: &str) -> Result<()> {
+        let (identity, _) = self.identity(ctx).await?;
         require_identity(&identity, provider_id)
     }
 }
@@ -166,7 +167,7 @@ impl Sandboxes for SandboxesService {
         let request = request.to_owned_message();
         async move {
             self.authorize(&ctx)?;
-            RpcResponse::ok(self.service.list_templates_page(&request)?)
+            RpcResponse::ok(self.service.list_templates_page(&request).await?)
         }
     }
 
@@ -214,7 +215,7 @@ impl Sandboxes for SandboxesService {
         let request = request.to_owned_message();
         async move {
             self.authorize(&ctx)?;
-            RpcResponse::ok(self.service.list_pools_page(&request)?)
+            RpcResponse::ok(self.service.list_pools_page(&request).await?)
         }
     }
 
@@ -288,7 +289,7 @@ impl Sandboxes for SandboxesService {
         async move {
             self.authorize(&ctx)?;
             let request = request;
-            RpcResponse::ok(self.service.get(&request.sandbox_id, &request.lease_id)?)
+            RpcResponse::ok(self.service.get(&request.sandbox_id, &request.lease_id).await?)
         }
     }
 
@@ -303,7 +304,7 @@ impl Sandboxes for SandboxesService {
         let request = request.to_owned_message();
         async move {
             self.authorize(&ctx)?;
-            RpcResponse::ok(self.service.list_page(&request)?)
+            RpcResponse::ok(self.service.list_page(&request).await?)
         }
     }
 
@@ -322,7 +323,7 @@ impl Sandboxes for SandboxesService {
         let service = self.service.clone();
         async move {
             allowed?;
-            Ok(RpcResponse::stream(service.exec(request)?))
+            Ok(RpcResponse::stream(service.exec(request).await?))
         }
     }
 
@@ -336,7 +337,7 @@ impl Sandboxes for SandboxesService {
         let request = request.to_owned_message();
         async move {
             self.authorize(&ctx)?;
-            RpcResponse::ok(self.service.open_stream(request)?)
+            RpcResponse::ok(self.service.open_stream(request).await?)
         }
     }
 
@@ -437,7 +438,7 @@ impl Sandboxes for SandboxesService {
         let request = request.to_owned_message();
         async move {
             self.authorize(&ctx)?;
-            RpcResponse::ok(self.service.list_providers_page(&request)?)
+            RpcResponse::ok(self.service.list_providers_page(&request).await?)
         }
     }
 
@@ -502,7 +503,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         async move {
             self.authorize(&ctx)?;
-            RpcResponse::ok(self.service.stats())
+            RpcResponse::ok(self.service.stats().await?)
         }
     }
 
@@ -565,7 +566,7 @@ impl Providers for ProvidersService {
     + 'a {
         let request = request.to_owned_message();
         async move {
-            let (identity, _) = self.identity(&ctx)?;
+            let (identity, _) = self.identity(&ctx).await?;
             RpcResponse::ok(
                 self.service
                     .register_enrolled(request, &identity.provider_id)
@@ -584,8 +585,8 @@ impl Providers for ProvidersService {
         let request = request.to_owned_message();
         async move {
             let request = request;
-            self.bound(&ctx, &request.provider_id)?;
-            self.service.heartbeat(request)?;
+            self.bound(&ctx, &request.provider_id).await?;
+            self.service.heartbeat(request).await?;
             RpcResponse::ok(Empty::default())
         }
     }
@@ -601,7 +602,7 @@ impl Providers for ProvidersService {
         let request = request.to_owned_message();
         async move {
             let request = request;
-            self.bound(&ctx, &request.provider_id)?;
+            self.bound(&ctx, &request.provider_id).await?;
             RpcResponse::ok(self.service.poll(request).await?)
         }
     }
@@ -616,7 +617,7 @@ impl Providers for ProvidersService {
         let request = request.to_owned_message();
         async move {
             let request = request;
-            self.bound(&ctx, &request.provider_id)?;
+            self.bound(&ctx, &request.provider_id).await?;
             self.service.report(request).await?;
             RpcResponse::ok(Empty::default())
         }
@@ -632,7 +633,7 @@ impl Providers for ProvidersService {
         let request = request.to_owned_message();
         async move {
             let request = request;
-            self.bound(&ctx, &request.provider_id)?;
+            self.bound(&ctx, &request.provider_id).await?;
             self.service.report_exec(request).await?;
             RpcResponse::ok(Empty::default())
         }
@@ -649,7 +650,7 @@ impl Providers for ProvidersService {
         let request = request.to_owned_message();
         async move {
             let request = request;
-            self.bound(&ctx, &request.provider_id)?;
+            self.bound(&ctx, &request.provider_id).await?;
             RpcResponse::ok(self.service.reconcile(request).await?)
         }
     }
@@ -664,7 +665,7 @@ impl Providers for ProvidersService {
     + 'a {
         let request = request.to_owned_message();
         async move {
-            let (_, fingerprint) = self.identity(&ctx)?;
+            let (_, fingerprint) = self.identity(&ctx).await?;
             RpcResponse::ok(
                 self.service
                     .renew_certificate(request, &fingerprint)
@@ -681,10 +682,10 @@ struct AppState {
 
 /// Build the router.
 ///
-/// The ConnectRPC services own the fallback; the data-plane routes are plain
-/// axum routes on the same listener. `Providers` reads the peer certificate
-/// from `ConnectInfo<PeerIdentity>`, so serve it with [`serve`] (or
-/// `Router::into_make_service_with_connect_info`).
+/// The ConnectRPC services own the fallback; the data-plane and internal
+/// relay routes are plain axum routes on the same listener. `Providers` reads
+/// the peer certificate from `ConnectInfo<PeerIdentity>`, so serve it with
+/// [`serve`] (or `Router::into_make_service_with_connect_info`).
 pub fn router(service: Arc<Service>, auth: Auth) -> Router {
     let sandboxes = Arc::new(SandboxesService {
         service: service.clone(),
@@ -694,9 +695,6 @@ pub fn router(service: Arc<Service>, auth: Auth) -> Router {
         service: service.clone(),
     });
     let rpc = sandboxes.register(providers.register(connectrpc::Router::new()));
-    // Bulk bytes travel over the ticketed data plane, never in RPCs. The
-    // buffering middleware bounds every unary request (and the single Exec
-    // envelope), and the data-plane routes below stream their own bodies.
     let rpc = axum::Router::new()
         .fallback_service(rpc.into_axum_service())
         .layer(middleware::from_fn(cap_rpc_body));
@@ -709,6 +707,14 @@ pub fn router(service: Arc<Service>, auth: Auth) -> Router {
             "/sandbox/v1/agent/blobs/{ticket}",
             get(agent_blob_get).put(agent_blob_put),
         )
+        .route(
+            "/sandbox/v1/internal/streams/{ticket}",
+            get(internal_stream_get).put(internal_stream_put),
+        )
+        .route(
+            "/sandbox/v1/internal/report-exec",
+            axum::routing::post(internal_report_exec),
+        )
         .route("/sandbox/v1/ca.pem", get(ca_pem))
         .route("/sandbox/v1/healthz", get(|| async { "ok" }))
         .fallback_service(rpc)
@@ -716,10 +722,6 @@ pub fn router(service: Arc<Service>, auth: Auth) -> Router {
 }
 
 /// Reject an RPC body above [`CONNECT_BODY_LIMIT`] with `413`.
-///
-/// The generated dispatch reads the body itself and would answer a body over
-/// its own limit with a Connect `resource_exhausted`; this middleware keeps
-/// the service's documented HTTP answer and bounds buffering before dispatch.
 async fn cap_rpc_body(request: axum::extract::Request, next: Next) -> Response {
     let (parts, body) = request.into_parts();
     match axum::body::to_bytes(body, CONNECT_BODY_LIMIT).await {
@@ -732,9 +734,6 @@ async fn cap_rpc_body(request: axum::extract::Request, next: Next) -> Response {
 }
 
 /// Serve the API over TLS until `shutdown`.
-///
-/// Each connection completes a handshake first; the peer's certificate (when
-/// presented) becomes [`ConnectInfo<PeerIdentity>`] for the handlers.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     service: Arc<Service>,
@@ -808,11 +807,6 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 }
 
 /// Pump a request body into a transfer's producer channel.
-///
-/// The cap is enforced here, on the bytes actually received, so a lying
-/// `Content-Length` cannot overrun it. A body error or a vanished consumer
-/// sends `Failed`, which the peer turns into a failed extraction instead of a
-/// plausible-looking truncated archive.
 async fn pump_upload(
     body: Body,
     tx: mpsc::Sender<TransferChunk>,
@@ -844,8 +838,7 @@ async fn pump_upload(
     Ok(())
 }
 
-/// Remove a finished ticket when the response body (or the handler's stream
-/// state) is dropped, including when the caller disconnects mid-download.
+/// Remove a finished ticket when the response body is dropped.
 struct TicketGuard {
     service: Arc<Service>,
     ticket: String,
@@ -853,7 +846,9 @@ struct TicketGuard {
 
 impl Drop for TicketGuard {
     fn drop(&mut self) {
-        self.service.remove_ticket(&self.ticket);
+        let service = self.service.clone();
+        let ticket = self.ticket.clone();
+        tokio::spawn(async move { service.remove_ticket(&ticket).await; });
     }
 }
 
@@ -864,7 +859,6 @@ fn chunk_item(chunk: TransferChunk) -> std::result::Result<Vec<u8>, std::io::Err
     }
 }
 
-/// A response body that streams a transfer's consumer side.
 fn transfer_body(
     rx: mpsc::Receiver<TransferChunk>,
     first: Option<TransferChunk>,
@@ -883,8 +877,6 @@ fn transfer_body(
     ))
 }
 
-/// Take the first transfer item, bounded so an agent that claimed but never
-/// sends cannot hold the caller's headers open forever.
 async fn first_item(
     service: &Service,
     rx: &mut mpsc::Receiver<TransferChunk>,
@@ -896,69 +888,119 @@ async fn first_item(
     }
 }
 
+/// Resolve a ticket's owner, or 404 when it is gone.
+async fn ticket_owner(service: &Service, ticket: &str) -> std::result::Result<Owner, Response> {
+    match service.ticket_owner(ticket).await {
+        Ok(Some(owner)) => Ok(owner),
+        Ok(None) => Err(Error::not_found("ticket not found or expired").into_response()),
+        Err(error) => Err(error.into_response()),
+    }
+}
+
+fn is_hop_by_hop(name: &axum::http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "host"
+    )
+}
+
+/// Forward a data-plane request to the node that owns the ticket.
+async fn proxy_stream(
+    service: &Arc<Service>,
+    owner: &Owner,
+    method: axum::http::Method,
+    ticket: &str,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let result = async {
+        let (base, client) = service.peer_endpoint(owner)?;
+        let url = format!("{base}/sandbox/v1/internal/streams/{ticket}");
+        let mut request = client.request(method.clone(), url);
+        for (name, value) in &headers {
+            if is_hop_by_hop(name) || name.as_str().starts_with("x-preloop-") {
+                continue;
+            }
+            request = request.header(name, value);
+        }
+        for (name, value) in service.node_auth_headers() {
+            request = request.header(name, value);
+        }
+        if method == axum::http::Method::PUT {
+            request = request.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+        }
+        let response = request.send().await.map_err(|error| {
+            Error::unavailable(format!("forwarding transfer to {}: {error}", owner.node_id))
+        })?;
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let mut builder = Response::builder().status(status);
+        for (name, value) in &response_headers {
+            if !is_hop_by_hop(name) {
+                builder = builder.header(name, value);
+            }
+        }
+        builder
+            .body(Body::from_stream(response.bytes_stream()))
+            .map_err(|error| Error::internal(format!("relay response: {error}")))
+    }
+    .await;
+    result.unwrap_or_else(IntoResponse::into_response)
+}
+
+fn provider_headers(headers: &HeaderMap) -> Result<(String, u64)> {
+    let id = headers
+        .get("x-provider-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Error::invalid_argument("x-provider-id required"))?;
+    let generation = headers
+        .get("x-provider-generation")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| Error::invalid_argument("x-provider-generation required"))?;
+    Ok((id.to_owned(), generation))
+}
+
+async fn node_auth(service: &Service, headers: &HeaderMap) -> Result<()> {
+    let node_id = headers
+        .get("x-preloop-node-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Error::unauthenticated("internal route requires a node identity"))?;
+    let session = headers
+        .get("x-preloop-node-session")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Error::unauthenticated("internal route requires a node session"))?;
+    let credential = headers
+        .get("x-preloop-node-credential")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Error::unauthenticated("internal route requires a node credential"))?;
+    service
+        .authenticate_node(node_id, session, credential)
+        .await
+}
+
 async fn stream_upload(
     State(app): State<AppState>,
     Path(ticket): Path<String>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let token = bearer(&headers).unwrap_or_default();
-    let max_bytes = app.service.config().blob_max_bytes;
-    let mut claim =
-        match app
-            .service
-            .claim_caller(&ticket, token, crate::service::TransferSide::Producer)
-        {
-            Ok(claim) => claim,
-            Err(error) => return error.into_response(),
-        };
-    if content_length(&headers).is_some_and(|length| length > max_bytes) {
-        app.service
-            .abort_ticket(&ticket, "blob exceeds the size limit")
-            .await;
-        return payload_too_large(max_bytes);
-    }
-    let reply = match app
-        .service
-        .start_copy(&claim.sandbox_id, &ticket, &claim.guest_path, claim.kind)
-        .await
-    {
-        Ok(reply) => reply,
-        Err(error) => {
-            app.service
-                .abort_ticket(&ticket, crate::error::message(&error))
-                .await;
-            return error.into_response();
+    match ticket_owner(&app.service, &ticket).await {
+        Ok(owner) if !app.service.is_local_owner(&owner) => {
+            proxy_stream(&app.service, &owner, axum::http::Method::PUT, &ticket, headers, body)
+                .await
         }
-    };
-    if let Err(error) = app.service.wait_peer(&mut claim).await {
-        app.service
-            .abort_ticket(&ticket, crate::error::message(&error))
-            .await;
-        return error.into_response();
-    }
-    let Some(tx) = claim.take_producer() else {
-        app.service.remove_ticket(&ticket);
-        return Error::internal("upload ticket has no producer side").into_response();
-    };
-    match pump_upload(body, tx, max_bytes).await {
-        Ok(()) => {
-            // Close the consumer's stream first; the agent reports only after
-            // its extraction sees EOF.
-            app.service.finish_ticket(&ticket);
-            let result = crate::service::await_copy(reply, app.service.config().work_timeout).await;
-            app.service.remove_ticket(&ticket);
-            match result {
-                Ok(()) => StatusCode::NO_CONTENT.into_response(),
-                Err(error) => error.into_response(),
-            }
-        }
-        Err(error) => {
-            app.service
-                .abort_ticket(&ticket, "upload did not complete")
-                .await;
-            error.into_response()
-        }
+        Ok(_) => caller_upload(&app.service, &ticket, &headers, body).await,
+        Err(response) => response,
     }
 }
 
@@ -967,51 +1009,153 @@ async fn stream_download(
     Path(ticket): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let token = bearer(&headers).unwrap_or_default();
-    let mut claim =
-        match app
-            .service
-            .claim_caller(&ticket, token, crate::service::TransferSide::Consumer)
-        {
-            Ok(claim) => claim,
-            Err(error) => return error.into_response(),
-        };
-    if let Err(error) = app
-        .service
-        .start_copy(&claim.sandbox_id, &ticket, &claim.guest_path, claim.kind)
+    match ticket_owner(&app.service, &ticket).await {
+        Ok(owner) if !app.service.is_local_owner(&owner) => {
+            proxy_stream(
+                &app.service,
+                &owner,
+                axum::http::Method::GET,
+                &ticket,
+                headers,
+                Body::empty(),
+            )
+            .await
+        }
+        Ok(_) => caller_download(&app.service, &ticket, &headers).await,
+        Err(response) => response,
+    }
+}
+
+async fn internal_stream_get(
+    State(app): State<AppState>,
+    Path(ticket): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = node_auth(&app.service, &headers).await {
+        return error.into_response();
+    }
+    if headers.contains_key("x-provider-id") {
+        agent_get(&app.service, &ticket, &headers).await
+    } else {
+        caller_download(&app.service, &ticket, &headers).await
+    }
+}
+
+async fn internal_stream_put(
+    State(app): State<AppState>,
+    Path(ticket): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if let Err(error) = node_auth(&app.service, &headers).await {
+        return error.into_response();
+    }
+    if headers.contains_key("x-provider-id") {
+        agent_put(&app.service, &ticket, &headers, body).await
+    } else {
+        caller_upload(&app.service, &ticket, &headers, body).await
+    }
+}
+
+async fn caller_upload(service: &Arc<Service>, ticket: &str, headers: &HeaderMap, body: Body) -> Response {
+    let token = bearer(headers).unwrap_or_default();
+    let max_bytes = service.config().blob_max_bytes;
+    let mut claim = match service
+        .claim_caller(ticket, token, crate::service::TransferSide::Producer)
         .await
     {
-        app.service
-            .abort_ticket(&ticket, crate::error::message(&error))
+        Ok(claim) => claim,
+        Err(error) => return error.into_response(),
+    };
+    if content_length(headers).is_some_and(|length| length > max_bytes) {
+        service.abort_ticket(ticket, "blob exceeds the size limit").await;
+        return payload_too_large(max_bytes);
+    }
+    let work_id = match service
+        .start_copy(&claim.sandbox_id, ticket, &claim.guest_path, claim.kind)
+        .await
+    {
+        Ok(work_id) => work_id,
+        Err(error) => {
+            service
+                .abort_ticket(ticket, crate::error::message(&error))
+                .await;
+            return error.into_response();
+        }
+    };
+    if let Err(error) = service.wait_peer(&mut claim).await {
+        service
+            .abort_ticket(ticket, crate::error::message(&error))
             .await;
         return error.into_response();
     }
-    if let Err(error) = app.service.wait_peer(&mut claim).await {
-        app.service
-            .abort_ticket(&ticket, crate::error::message(&error))
+    let Some(tx) = claim.take_producer() else {
+        service.remove_ticket(ticket).await;
+        return Error::internal("upload ticket has no producer side").into_response();
+    };
+    match pump_upload(body, tx, max_bytes).await {
+        Ok(()) => {
+            service.finish_ticket(ticket).await;
+            let result = service
+                .await_work(&work_id, service.config().work_timeout)
+                .await;
+            service.remove_ticket(ticket).await;
+            match result {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(error) => error.into_response(),
+            }
+        }
+        Err(error) => {
+            service.abort_ticket(ticket, "upload did not complete").await;
+            error.into_response()
+        }
+    }
+}
+
+async fn caller_download(service: &Arc<Service>, ticket: &str, headers: &HeaderMap) -> Response {
+    let token = bearer(headers).unwrap_or_default();
+    let mut claim = match service
+        .claim_caller(ticket, token, crate::service::TransferSide::Consumer)
+        .await
+    {
+        Ok(claim) => claim,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = service
+        .start_copy(&claim.sandbox_id, ticket, &claim.guest_path, claim.kind)
+        .await
+    {
+        service
+            .abort_ticket(ticket, crate::error::message(&error))
+            .await;
+        return error.into_response();
+    }
+    if let Err(error) = service.wait_peer(&mut claim).await {
+        service
+            .abort_ticket(ticket, crate::error::message(&error))
             .await;
         return error.into_response();
     }
     let Some(mut rx) = claim.take_consumer() else {
-        app.service.remove_ticket(&ticket);
+        service.remove_ticket(ticket).await;
         return Error::internal("download ticket has no consumer side").into_response();
     };
-    let first = match first_item(&app.service, &mut rx).await {
+    let first = match first_item(service, &mut rx).await {
         Ok(TransferChunk::Data(bytes)) => TransferChunk::Data(bytes),
         Ok(TransferChunk::Failed(reason)) => {
-            app.service.remove_ticket(&ticket);
+            service.remove_ticket(ticket).await;
             return Error::unavailable(reason).into_response();
         }
         Err(error) => {
-            app.service
-                .abort_ticket(&ticket, crate::error::message(&error))
+            service
+                .abort_ticket(ticket, crate::error::message(&error))
                 .await;
             return error.into_response();
         }
     };
     let guard = TicketGuard {
-        service: app.service.clone(),
-        ticket,
+        service: service.clone(),
+        ticket: ticket.to_owned(),
     };
     (
         StatusCode::OK,
@@ -1024,41 +1168,91 @@ async fn stream_download(
         .into_response()
 }
 
-fn provider_headers(headers: &HeaderMap) -> Result<(String, u64)> {
-    let id = headers
-        .get("x-provider-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Error::invalid_argument("x-provider-id required"))?;
-    let generation = headers
-        .get("x-provider-generation")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(|| Error::invalid_argument("x-provider-generation required"))?;
-    Ok((id.to_owned(), generation))
-}
-
-/// The agent fetches an upload ticket's bytes (consumer side).
 async fn agent_blob_get(
     State(app): State<AppState>,
     Path(ticket): Path<String>,
     ConnectInfo(peer): ConnectInfo<PeerIdentity>,
     headers: HeaderMap,
 ) -> Response {
+    let identity = match app.service.provider_identity(peer.fingerprint().unwrap_or_default()).await {
+        Ok(identity) => identity,
+        Err(error) => return error.into_response(),
+    };
+    let (id, _) = match provider_headers(&headers) {
+        Ok(values) => values,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = require_identity(&identity, &id) {
+        return error.into_response();
+    }
+    match ticket_owner(&app.service, &ticket).await {
+        Ok(owner) if !app.service.is_local_owner(&owner) => {
+            proxy_stream(
+                &app.service,
+                &owner,
+                axum::http::Method::GET,
+                &ticket,
+                headers,
+                Body::empty(),
+            )
+            .await
+        }
+        Ok(_) => agent_get(&app.service, &ticket, &headers).await,
+        Err(response) => response,
+    }
+}
+
+async fn agent_blob_put(
+    State(app): State<AppState>,
+    Path(ticket): Path<String>,
+    ConnectInfo(peer): ConnectInfo<PeerIdentity>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let identity = match app.service.provider_identity(peer.fingerprint().unwrap_or_default()).await {
+        Ok(identity) => identity,
+        Err(error) => return error.into_response(),
+    };
+    let (id, _) = match provider_headers(&headers) {
+        Ok(values) => values,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = require_identity(&identity, &id) {
+        return error.into_response();
+    }
+    match ticket_owner(&app.service, &ticket).await {
+        Ok(owner) if !app.service.is_local_owner(&owner) => {
+            proxy_stream(
+                &app.service,
+                &owner,
+                axum::http::Method::PUT,
+                &ticket,
+                headers,
+                body,
+            )
+            .await
+        }
+        Ok(_) => agent_put(&app.service, &ticket, &headers, body).await,
+        Err(response) => response,
+    }
+}
+
+async fn agent_get(service: &Arc<Service>, ticket: &str, headers: &HeaderMap) -> Response {
     let result = async {
-        let identity = app.service.provider_identity(peer.fingerprint()?)?;
-        let (id, generation) = provider_headers(&headers)?;
-        require_identity(&identity, &id)?;
-        let mut claim = app.service.claim_agent(
-            &id,
-            generation,
-            &ticket,
-            crate::service::TransferSide::Consumer,
-        )?;
-        app.service.wait_peer(&mut claim).await?;
+        let (id, generation) = provider_headers(headers)?;
+        let mut claim = service
+            .claim_agent(
+                &id,
+                generation,
+                ticket,
+                crate::service::TransferSide::Consumer,
+            )
+            .await?;
+        service.wait_peer(&mut claim).await?;
         let Some(mut rx) = claim.take_consumer() else {
             return Err(Error::internal("upload ticket has no consumer side"));
         };
-        let first = first_item(&app.service, &mut rx).await?;
+        let first = first_item(service, &mut rx).await?;
         if let TransferChunk::Failed(reason) = first {
             return Err(Error::unavailable(reason));
         }
@@ -1068,8 +1262,6 @@ async fn agent_blob_get(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/x-tar"),
             )],
-            // The caller owns this ticket's lifetime; the agent's response
-            // body must not remove it.
             transfer_body(rx, Some(first), None),
         )
             .into_response())
@@ -1078,57 +1270,67 @@ async fn agent_blob_get(
     result.unwrap_or_else(IntoResponse::into_response)
 }
 
-/// The agent produces a download ticket's bytes (producer side).
-async fn agent_blob_put(
-    State(app): State<AppState>,
-    Path(ticket): Path<String>,
-    ConnectInfo(peer): ConnectInfo<PeerIdentity>,
-    headers: HeaderMap,
+async fn agent_put(
+    service: &Arc<Service>,
+    ticket: &str,
+    headers: &HeaderMap,
     body: Body,
 ) -> Response {
     let result = async {
-        let identity = app.service.provider_identity(peer.fingerprint()?)?;
-        let (id, generation) = provider_headers(&headers)?;
-        require_identity(&identity, &id)?;
-        app.service.claim_agent(
-            &id,
-            generation,
-            &ticket,
-            crate::service::TransferSide::Producer,
-        )
+        let (id, generation) = provider_headers(headers)?;
+        service
+            .claim_agent(
+                &id,
+                generation,
+                ticket,
+                crate::service::TransferSide::Producer,
+            )
+            .await
     }
     .await;
     let mut claim = match result {
         Ok(claim) => claim,
         Err(error) => return error.into_response(),
     };
-    let max_bytes = app.service.config().blob_max_bytes;
-    if content_length(&headers).is_some_and(|length| length > max_bytes) {
-        app.service
-            .abort_ticket(&ticket, "blob exceeds the size limit")
-            .await;
+    let max_bytes = service.config().blob_max_bytes;
+    if content_length(headers).is_some_and(|length| length > max_bytes) {
+        service.abort_ticket(ticket, "blob exceeds the size limit").await;
         return payload_too_large(max_bytes);
     }
-    if let Err(error) = app.service.wait_peer(&mut claim).await {
-        app.service
-            .abort_ticket(&ticket, crate::error::message(&error))
+    if let Err(error) = service.wait_peer(&mut claim).await {
+        service
+            .abort_ticket(ticket, crate::error::message(&error))
             .await;
         return error.into_response();
     }
     let Some(tx) = claim.take_producer() else {
-        app.service.remove_ticket(&ticket);
+        service.remove_ticket(ticket).await;
         return Error::internal("download ticket has no producer side").into_response();
     };
     match pump_upload(body, tx, max_bytes).await {
         Ok(()) => {
-            app.service.finish_ticket(&ticket);
+            service.finish_ticket(ticket).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => {
-            app.service
-                .abort_ticket(&ticket, "download did not complete")
+            service
+                .abort_ticket(ticket, "download did not complete")
                 .await;
             error.into_response()
         }
+    }
+}
+
+async fn internal_report_exec(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<ReportExecRequest>,
+) -> Response {
+    if let Err(error) = node_auth(&app.service, &headers).await {
+        return error.into_response();
+    }
+    match app.service.report_exec_local(request).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
     }
 }

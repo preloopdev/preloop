@@ -177,6 +177,11 @@ pub(crate) async fn complete_work(
     let kind = row.text("kind")?.to_owned();
     let provider_id = row.text("provider_id")?.to_owned();
     let generation = row.u64("generation")?;
+    let mut result = result;
+    if kind == "snapshot" && result.ok {
+        let template = apply_snapshot_receipt(tx, &payload, &result).await?;
+        result.template = Some(template);
+    }
     let result_json = serde_json::to_string(&result).unwrap_or_default();
     let version = bump_version(tx).await?;
     tx.execute(
@@ -295,11 +300,9 @@ pub(crate) async fn complete_work(
                 save_sandbox(tx, &sandbox).await?;
             }
         }
-        "snapshot" => {
-            if result.ok {
-                apply_snapshot_receipt(tx, &payload, &result).await?;
-            }
-        }
+        // The snapshot receipt is applied before the work row is finalized,
+        // so `result_json` can carry the created template.
+        "snapshot" => {}
         _ => {}
     }
     Ok(())
@@ -346,12 +349,12 @@ async fn apply_snapshot_receipt(
     tx: &mut dyn SqlTx,
     payload: &WorkPayload,
     result: &WorkResult,
-) -> Result<()> {
+) -> Result<Template> {
     let (sandbox_id, template_name) = match &payload.work.work {
         Some(work_item::Work::Snapshot(snapshot)) => {
             (snapshot.target.sandbox_id.clone(), snapshot.template.clone())
         }
-        _ => return Ok(()),
+        _ => return Err(Error::internal("snapshot work has no target")),
     };
     let source = payload.source_template.clone().unwrap_or_default();
     let spec = TemplateSpec {
@@ -435,7 +438,15 @@ async fn apply_snapshot_receipt(
     .await?;
     // The source sandbox is consumed by the snapshot.
     purge_sandbox(tx, &sandbox_id).await?;
-    Ok(())
+    Ok(Template {
+        spec: spec.into(),
+        digest,
+        provider_id,
+        native_ref: result.native_ref.clone(),
+        created_at: now_secs(),
+        driver,
+        ..Template::default()
+    })
 }
 
 /// Delete a sandbox record and everything that could still act on it.
@@ -519,6 +530,7 @@ pub(crate) async fn register(
     store: &SqlStore,
     request: RegisterRequest,
     enrolled: Option<&str>,
+    owner: &Owner,
 ) -> Result<RegisterResponse> {
     if request.name.is_empty() {
         return Err(Error::invalid_argument("name is required"));
@@ -534,6 +546,7 @@ pub(crate) async fn register(
         .run_tx(|tx| {
             let request = request.clone();
             let enrolled = enrolled.map(str::to_owned);
+            let owner = owner.clone();
             Box::pin(async move {
                 if let Some(provider_id) = &enrolled {
                     let provider = provider_by_id(tx, provider_id).await?.ok_or_else(|| {
@@ -570,11 +583,12 @@ pub(crate) async fn register(
                 tx.execute(
                     "INSERT INTO providers \
                      (id, name, generation, drivers_json, last_seen, seen_at, cordoned, \
-                      host_json, host_sampled_at, stats_json) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, '[]') \
+                      host_json, host_sampled_at, stats_json, owner_node, owner_session) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, '[]', $8, $9) \
                      ON CONFLICT (id) DO UPDATE SET name = $2, generation = $3, \
                       drivers_json = $4, last_seen = $5, seen_at = $6, cordoned = $7, \
-                      host_json = NULL, host_sampled_at = NULL, stats_json = '[]'",
+                      host_json = NULL, host_sampled_at = NULL, stats_json = '[]', \
+                      owner_node = $8, owner_session = $9",
                     &[
                         id.as_str().into(),
                         request.name.as_str().into(),
@@ -583,6 +597,8 @@ pub(crate) async fn register(
                         now_secs().into(),
                         now_ms().into(),
                         cordoned.into(),
+                        owner.node_id.as_str().into(),
+                        owner.session_id.as_str().into(),
                     ],
                 )
                 .await?;
@@ -971,7 +987,7 @@ pub(crate) async fn enroll(
                     });
                 let generation = existing
                     .as_ref()
-                    .map_or(1, |provider| provider.generation);
+                    .map_or(0, |provider| provider.generation);
                 let drivers_json = existing
                     .as_ref()
                     .map(|provider| serde_json::to_string(&provider.drivers).unwrap_or_default())
@@ -1248,13 +1264,31 @@ pub(crate) async fn report(store: &SqlStore, request: ReportRequest) -> Result<(
                         "work belongs to another provider",
                     ));
                 }
-                if row.text("status")? == "done" {
-                    return Ok(());
-                }
                 if let Some(attempt) = attempt
                     && attempt != row.u64("attempt")?
                 {
                     return Err(Error::aborted("stale work delivery attempt"));
+                }
+                if row.text("status")? == "done" {
+                    // A retried positive attempt is an acknowledgement. An
+                    // unsequenced duplicate is "unknown or completed" for
+                    // idempotent commands, while an exec's success is already
+                    // durable and acknowledging it stops redelivery.
+                    if attempt.is_some() {
+                        return Ok(());
+                    }
+                    let kind = tx
+                        .query("SELECT kind FROM work_items WHERE id = $1", &[work_id.into()])
+                        .await?
+                        .first()
+                        .map(|row| row.text("kind").map(str::to_owned))
+                        .transpose()?
+                        .unwrap_or_default();
+                    return if kind == "exec" {
+                        Ok(())
+                    } else {
+                        Err(Error::not_found("unknown or completed work"))
+                    };
                 }
                 let result = if request.ok {
                     WorkResult::ok(request.native_ref)

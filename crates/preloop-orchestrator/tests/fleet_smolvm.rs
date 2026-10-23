@@ -15,7 +15,7 @@ use preloop_sandbox::drivers::smolvm::cli::SmolVmProvider;
 use preloop_sandbox::drivers::smolvm::cli::{
     MachineName, MachineSpec, NetworkPolicy, ProviderCapabilities, SecretSource, VmProvider,
 };
-use preloop_sandbox::store;
+use preloop_sandbox::backend;
 use preloop_sandbox::{Driver, InProcess, SandboxApi, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +26,7 @@ async fn secrets_reach_the_guest_without_entering_argv() {
         return;
     }
     let _dir = tempfile::tempdir().unwrap();
-    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+    let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
         .await
         .unwrap();
     let shutdown = CancellationToken::new();
@@ -38,11 +38,18 @@ async fn secrets_reach_the_guest_without_entering_argv() {
     );
     tokio::spawn(agent.run(shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    while service.list_providers().is_empty() {
+    while service
+        .list_providers()
+        .await
+        .map(|providers| providers.is_empty())
+        .unwrap_or(true)
+    {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let provider_id = service
         .list_providers()
+        .await
+        .unwrap()
         .first()
         .map(|provider| provider.id.clone())
         .expect("agent registered");
@@ -124,7 +131,7 @@ async fn a_packed_artifact_becomes_a_runnable_machine() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+    let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
         .await
         .unwrap();
     let shutdown = CancellationToken::new();
@@ -137,11 +144,18 @@ async fn a_packed_artifact_becomes_a_runnable_machine() {
     );
     tokio::spawn(agent.run(shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    while service.list_providers().is_empty() {
+    while service
+        .list_providers()
+        .await
+        .map(|providers| providers.is_empty())
+        .unwrap_or(true)
+    {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let provider_id = service
         .list_providers()
+        .await
+        .unwrap()
         .first()
         .map(|provider| provider.id.clone())
         .expect("agent registered");

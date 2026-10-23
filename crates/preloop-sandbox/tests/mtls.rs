@@ -82,7 +82,7 @@ async fn enroll_binds_a_name_and_issues_a_provider_certificate() {
     let link = t.enroll("host-a").await;
     let session = link.register(register("host-a")).await.unwrap();
     assert_eq!(session.generation, 1);
-    let providers = t.service.list_providers();
+    let providers = t.service.list_providers().await.unwrap();
     let provider = providers
         .iter()
         .find(|provider| provider.name == "host-a")
@@ -250,6 +250,8 @@ async fn renewal_keeps_the_previous_certificate_valid_until_it_expires() {
     let certificates = t
         .service
         .list_providers()
+        .await
+        .unwrap()
         .into_iter()
         .find(|provider| provider.name == "host-a")
         .map(|provider| provider.certificates)
@@ -271,7 +273,7 @@ async fn removing_a_provider_revokes_its_certificate() {
     let link = t.enroll("host-a").await;
     link.register(register("host-a")).await.unwrap();
     t.client().delete_provider("host-a").await.unwrap();
-    assert!(t.service.list_providers().is_empty());
+    assert!(t.service.list_providers().await.unwrap().is_empty());
     let error = link.register(register("host-a")).await.unwrap_err();
     assert_eq!(error.code, Code::PermissionDenied);
     assert!(

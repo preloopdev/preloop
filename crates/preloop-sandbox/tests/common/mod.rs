@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use preloop_sandbox::agent::RemoteLink;
+use preloop_sandbox::backend;
 use preloop_sandbox::server::{Auth, serve};
-use preloop_sandbox::store;
 use preloop_sandbox::{SandboxClient, ServerTls, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -49,7 +49,7 @@ impl TestService {
         .expect("server tls");
         let mut config = ServiceConfig::new();
         config.ca = Some(tls.ca.clone());
-        let service = Service::open(store::open("memory:").await.unwrap(), config)
+        let service = Service::open(backend::open("memory:").await.unwrap(), config)
             .await
             .unwrap();
         let client_token = "test-client-token".to_owned();

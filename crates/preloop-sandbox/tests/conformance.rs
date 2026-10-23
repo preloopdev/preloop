@@ -13,7 +13,7 @@ use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::error::message;
 use preloop_sandbox::server::{Auth, router};
 use preloop_sandbox::service::TransferSide;
-use preloop_sandbox::store::{self, Kind, Store};
+use preloop_sandbox::backend::{self, SandboxBackend};
 use preloop_sandbox::{Code, Driver, SandboxClient, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -55,7 +55,7 @@ fn template(name: &str) -> TemplateSpec {
 }
 
 async fn harness_with(
-    store: Arc<dyn Store>,
+    store: Arc<dyn SandboxBackend>,
     dir: tempfile::TempDir,
     caps: Capabilities,
 ) -> Harness {
@@ -64,7 +64,7 @@ async fn harness_with(
 }
 
 async fn harness_with_host(
-    store: Arc<dyn Store>,
+    store: Arc<dyn SandboxBackend>,
     dir: tempfile::TempDir,
     host: std::path::PathBuf,
     caps: Capabilities,
@@ -73,7 +73,7 @@ async fn harness_with_host(
 }
 
 async fn harness_with_access(
-    store: Arc<dyn Store>,
+    store: Arc<dyn SandboxBackend>,
     dir: tempfile::TempDir,
     caps: Capabilities,
     access: HostAccess,
@@ -83,7 +83,7 @@ async fn harness_with_access(
 }
 
 async fn harness_with_host_access(
-    store: Arc<dyn Store>,
+    store: Arc<dyn SandboxBackend>,
     dir: tempfile::TempDir,
     host: std::path::PathBuf,
     caps: Capabilities,
@@ -97,7 +97,7 @@ async fn harness_with_host_access(
 /// `host` is the fake driver's root: a restart test must reuse the machine
 /// directory the previous process created, or reconcile sees it as lost.
 async fn harness_with_host_config(
-    store: Arc<dyn Store>,
+    store: Arc<dyn SandboxBackend>,
     dir: tempfile::TempDir,
     host: std::path::PathBuf,
     caps: Capabilities,
@@ -107,7 +107,7 @@ async fn harness_with_host_config(
 }
 
 async fn harness_with_host_config_access(
-    store: Arc<dyn Store>,
+    store: Arc<dyn SandboxBackend>,
     dir: tempfile::TempDir,
     host: std::path::PathBuf,
     caps: Capabilities,
@@ -144,13 +144,17 @@ async fn harness_with_host_config_access(
 async fn wait_for_registered(service: &Service) {
     let generation = service
         .list_providers()
+        .await
+        .unwrap()
         .iter()
         .map(|provider| provider.generation)
         .max()
         .unwrap_or(0);
-    wait_for(|| {
+    wait_for(|| async {
         service
             .list_providers()
+            .await
+            .unwrap()
             .iter()
             .any(|provider| provider.generation > generation)
     })
@@ -160,21 +164,86 @@ async fn wait_for_registered(service: &Service) {
 async fn harness() -> Harness {
     let dir = tempfile::tempdir().unwrap();
     harness_with(
-        store::open("memory:").await.unwrap(),
+        backend::open("memory:").await.unwrap(),
         dir,
         FakeDriver::full_capabilities(),
     )
     .await
 }
 
-async fn wait_for(mut condition: impl FnMut() -> bool) {
+async fn wait_for<F, Fut>(mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
     for _ in 0..200 {
-        if condition() {
+        if condition().await {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("condition not reached");
+}
+
+/// Open the backend's SQLite file for the few tests whose subject is the
+/// durable row itself: the public API hides lease ids and owns every state
+/// transition, so a crash window has to be staged at the storage layer.
+fn durable(db: &std::path::Path) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(db).unwrap();
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .unwrap();
+    connection
+}
+
+/// Durable lease ids, ordered, read straight from the backend's table.
+fn durable_lease_ids(db: &std::path::Path) -> Vec<String> {
+    let connection = durable(db);
+    let mut statement = connection.prepare("SELECT id FROM leases ORDER BY id").unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
+/// `(id, native_ref)` for every durable sandbox row.
+fn durable_sandboxes(db: &std::path::Path) -> Vec<(String, String)> {
+    let connection = durable(db);
+    let mut statement = connection
+        .prepare("SELECT id, native_ref FROM sandboxes ORDER BY id")
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
+/// Apply one SQL statement to the backend's file.
+fn durable_exec(db: &std::path::Path, sql: &str) {
+    durable(db).execute_batch(sql).unwrap();
+}
+
+/// Open a backend on a test's SQLite file with a fixed envelope key. The
+/// default key file lives under the shared temp directory, so concurrent
+/// opens would otherwise race to create it and seal one database with two
+/// different keys.
+async fn test_backend(db: &std::path::Path) -> Arc<dyn SandboxBackend> {
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    backend::open_with(backend::BackendConfig {
+        url: format!("sqlite://{}", db.display()),
+        state_dir: std::env::temp_dir().join(format!("preloop-sandbox-test-{unique}")),
+        seal_key: Some([7u8; 32]),
+        pool_size: 4,
+        node_id: format!("test-node-{unique}"),
+        session_id: unique,
+        node_credential_sha256: String::new(),
+        peer_url: String::new(),
+        node_lost_after: Duration::from_secs(30),
+    })
+    .await
+    .unwrap()
 }
 
 fn acquire(key: &str, pool: &str) -> AcquireRequest {
@@ -242,7 +311,7 @@ async fn acquire_is_idempotent_and_injects_identity() {
         })
         .await
         .unwrap();
-    wait_for(|| h.service.list().is_empty()).await;
+    wait_for(|| async { h.service.list().await.unwrap().is_empty() }).await;
     assert!(h.fake.inventory().await.unwrap().is_empty());
 }
 
@@ -259,20 +328,29 @@ async fn warm_pool_refills_and_serves_warm_members() {
         })
         .await
         .unwrap();
-    let ready = |service: &Service| {
+    let ready = async |service: &Service| {
         service
             .list()
+            .await
+            .unwrap()
             .iter()
-            .filter(|s| s.state == SandboxState::Ready)
+            .filter(|sandbox| sandbox.state == SandboxState::Ready)
             .count()
     };
-    wait_for(|| ready(&h.service) == 2).await;
-    let warm: Vec<String> = h.service.list().into_iter().map(|s| s.id).collect();
+    wait_for(|| async { ready(&h.service).await == 2 }).await;
+    let warm: Vec<String> = h
+        .service
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|sandbox| sandbox.id)
+        .collect();
     let lease = h.service.acquire(acquire("k1", "warm")).await.unwrap();
     assert!(warm.contains(&lease.sandbox.id), "served a warm member");
     // The pool replaces the claimed member.
-    wait_for(|| ready(&h.service) == 2).await;
-    assert_eq!(h.service.list().len(), 3);
+    wait_for(|| async { ready(&h.service).await == 2 }).await;
+    assert_eq!(h.service.list().await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -382,12 +460,14 @@ async fn sandbox_shape_is_the_effective_size() {
         (&partial.sandbox.id, &partial.lease.id, partial_expected),
     ] {
         assert_eq!(
-            h.service.get(id, lease_id).unwrap().shape.as_option(),
+            h.service.get(id, lease_id).await.unwrap().shape.as_option(),
             Some(&expected)
         );
         assert_eq!(
             h.service
                 .list()
+                .await
+                .unwrap()
                 .into_iter()
                 .find(|sandbox| &sandbox.id == id)
                 .unwrap()
@@ -404,7 +484,7 @@ async fn placement_rejects_a_shape_the_provider_cannot_host() {
     let mut caps = FakeDriver::full_capabilities();
     caps.max_vcpus = 2;
     caps.max_memory_mib = 2048;
-    let h = harness_with(store::open("memory:").await.unwrap(), dir, caps).await;
+    let h = harness_with(backend::open("memory:").await.unwrap(), dir, caps).await;
     h.service.put_template(template("alpine")).await.unwrap();
 
     let error = h
@@ -474,7 +554,7 @@ async fn unsupported_operations_fail_instead_of_being_emulated() {
     let mut caps = FakeDriver::full_capabilities();
     caps.pause = false;
     caps.snapshot = false;
-    let h = harness_with(store::open("memory:").await.unwrap(), dir, caps).await;
+    let h = harness_with(backend::open("memory:").await.unwrap(), dir, caps).await;
     h.service.put_template(template("alpine")).await.unwrap();
     let lease = h
         .service
@@ -558,7 +638,12 @@ async fn snapshot_becomes_a_template_that_starts_with_the_captured_state() {
     assert!(!golden.native_ref.is_empty());
     assert_eq!(golden.spec.snapshot_of(), Some(build.sandbox.id.as_str()));
     // The source is consumed.
-    assert!(h.service.get(&build.sandbox.id, &build.lease.id).is_err());
+    assert!(
+        h.service
+            .get(&build.sandbox.id, &build.lease.id)
+            .await
+            .is_err()
+    );
     h.service
         .put_pool(PoolSpec {
             name: "from-golden".into(),
@@ -628,7 +713,7 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
         ..AcquireRequest::default()
     };
     h.service.acquire(request.clone()).await.unwrap();
-    wait_for(|| h.service.list().is_empty()).await;
+    wait_for(|| async { h.service.list().await.unwrap().is_empty() }).await;
 
     // A preserved sandbox stays usable for its whole window, so the debugging
     // exec below must not race the window: this one is held far longer than
@@ -645,7 +730,11 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
         })
         .await
         .unwrap();
-    let preserved = h.service.get(&lease.sandbox.id, &lease.lease.id).unwrap();
+    let preserved = h
+        .service
+        .get(&lease.sandbox.id, &lease.lease.id)
+        .await
+        .unwrap();
     assert_eq!(preserved.state, SandboxState::Preserved);
     // Still usable for debugging while preserved.
     let (code, _, _) = h
@@ -676,16 +765,18 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
     assert_eq!(
         h.service
             .get(&short.sandbox.id, &short.lease.id)
+            .await
             .unwrap()
             .state,
         SandboxState::Preserved
     );
-    wait_for(|| h.service.get(&short.sandbox.id, &short.lease.id).is_err()).await;
+    wait_for(|| async { h.service.get(&short.sandbox.id, &short.lease.id).await.is_err() }).await;
     // The long window outlived it: the short sandbox ended by its TTL, not
     // by reconcile.
     assert_eq!(
         h.service
             .get(&lease.sandbox.id, &lease.lease.id)
+            .await
             .unwrap()
             .state,
         SandboxState::Preserved
@@ -708,7 +799,7 @@ async fn stats_follow_lease_expiry() {
         })
         .await
         .unwrap();
-    let stats = h.service.stats();
+    let stats = h.service.stats().await.unwrap();
     let provider = stats
         .providers
         .iter()
@@ -717,15 +808,22 @@ async fn stats_follow_lease_expiry() {
     assert_eq!(provider.sandboxes.len(), 1);
     assert_eq!(provider.sandboxes[0].sandbox.id, lease.sandbox.id);
     assert_eq!(provider.sandboxes[0].sandbox.state, SandboxState::Leased);
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .stats()
+            .await
+            .unwrap()
             .providers
             .iter()
             .all(|provider| provider.sandboxes.is_empty())
     })
     .await;
-    assert!(h.service.get(&lease.sandbox.id, &lease.lease.id).is_err());
+    assert!(
+        h.service
+            .get(&lease.sandbox.id, &lease.lease.id)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -753,10 +851,11 @@ async fn reconcile_destroys_orphans_and_fails_lost_sandboxes() {
         .unwrap();
     // The leased machine disappears behind the service's back.
     h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .get(&lease.sandbox.id, &lease.lease.id)
-            .is_ok_and(|s| s.state == SandboxState::Failed)
+            .await
+            .is_ok_and(|sandbox| sandbox.state == SandboxState::Failed)
     })
     .await;
     for _ in 0..100 {
@@ -789,9 +888,11 @@ async fn stats_follow_reconcile_state_changes() {
         })
         .await
         .unwrap();
-    let state_of = |service: &Service, id: &str| {
+    let state_of = async |service: &Service, id: &str| {
         service
             .stats()
+            .await
+            .unwrap()
             .providers
             .into_iter()
             .flat_map(|provider| provider.sandboxes)
@@ -799,17 +900,22 @@ async fn stats_follow_reconcile_state_changes() {
             .map(|sandbox| sandbox.sandbox.state)
     };
     assert_eq!(
-        state_of(&h.service, &lease.sandbox.id),
+        state_of(&h.service, &lease.sandbox.id).await,
         Some(SandboxState::Leased.into())
     );
     // The leased machine disappears behind the service's back.
     h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
-    wait_for(|| state_of(&h.service, &lease.sandbox.id) == Some(SandboxState::Failed.into())).await;
+    wait_for(|| async {
+        state_of(&h.service, &lease.sandbox.id).await == Some(SandboxState::Failed.into())
+    })
+    .await;
     // The count follows the state: the sandbox is still tracked, once, as
     // failed.
     let sandboxes: Vec<_> = h
         .service
         .stats()
+        .await
+        .unwrap()
         .providers
         .into_iter()
         .flat_map(|provider| provider.sandboxes)
@@ -874,7 +980,7 @@ async fn state_survives_restart_from_sqlite() {
     let db = dir.path().join("sandbox.db");
     let pool_name;
     {
-        let store = store::open(db.to_str().unwrap()).await.unwrap();
+        let store = test_backend(&db).await;
         let h = harness_with(
             store,
             tempfile::tempdir().unwrap(),
@@ -894,12 +1000,12 @@ async fn state_survives_restart_from_sqlite() {
             .name;
         h.service.acquire(acquire("k", &pool_name)).await.unwrap();
     }
-    let store = store::open(db.to_str().unwrap()).await.unwrap();
-    assert_eq!(store.load(Kind::Leases).await.unwrap().len(), 1);
+    let store = test_backend(&db).await;
+    assert_eq!(durable_lease_ids(&db).len(), 1);
     let restored = Service::open(store, ServiceConfig::new()).await.unwrap();
-    assert_eq!(restored.list_pools().len(), 1);
-    assert_eq!(restored.list_templates().len(), 1);
-    assert_eq!(restored.list().len(), 1);
+    assert_eq!(restored.list_pools().await.unwrap().len(), 1);
+    assert_eq!(restored.list_templates().await.unwrap().len(), 1);
+    assert_eq!(restored.list().await.unwrap().len(), 1);
 }
 
 /// An old agent that only sends `provider_id`/`generation` is still
@@ -913,7 +1019,7 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
     let sandbox;
     {
         let h = harness_with(
-            store::open(db.to_str().unwrap()).await.unwrap(),
+            test_backend(&db).await,
             tempfile::tempdir().unwrap(),
             FakeDriver::full_capabilities(),
         )
@@ -933,13 +1039,15 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
     // Restart without an agent: the only heartbeats below are the ones this
     // test sends, so their effect is deterministic.
     let service = Service::open(
-        store::open(db.to_str().unwrap()).await.unwrap(),
+        test_backend(&db).await,
         ServiceConfig::new(),
     )
     .await
     .unwrap();
     let provider = service
         .list_providers()
+        .await
+        .unwrap()
         .into_iter()
         .find(|provider| provider.id == sandbox.provider_id)
         .expect("the provider row is restored");
@@ -948,9 +1056,11 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
         generation: provider.generation,
         ..HeartbeatRequest::default()
     };
-    let provider_stats = || {
+    let provider_stats = async || {
         service
             .stats()
+            .await
+            .unwrap()
             .providers
             .into_iter()
             .find(|entry| entry.provider_id == provider.id)
@@ -958,8 +1068,8 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
     };
 
     // Never reported anything: succeeds and invents nothing.
-    Service::heartbeat(&service, old_shape()).unwrap();
-    let first = provider_stats();
+    Service::heartbeat(&service, old_shape()).await.unwrap();
+    let first = provider_stats().await;
     assert_eq!(&*first.host, &HostSample::default());
     assert_eq!(first.host_sample_age_secs, 0);
     assert_eq!(first.sandboxes.len(), 1);
@@ -989,15 +1099,16 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
             ..HeartbeatRequest::default()
         },
     )
+    .await
     .unwrap();
-    let second = provider_stats();
+    let second = provider_stats().await;
     assert_eq!(second.host.mem_total_bytes, Some(8 << 30));
     assert_eq!(&*second.sandboxes[0].runtime, &reported);
 
     // ...and a later old-shape heartbeat clears the runtime report (it is
     // replaced wholesale) but cannot clear a host sample it did not send.
-    Service::heartbeat(&service, old_shape()).unwrap();
-    let third = provider_stats();
+    Service::heartbeat(&service, old_shape()).await.unwrap();
+    let third = provider_stats().await;
     assert_eq!(third.host.mem_total_bytes, Some(8 << 30));
     assert_eq!(
         &*third.sandboxes[0].runtime,
@@ -1031,8 +1142,11 @@ async fn remote_agent_and_client_over_connect() {
     assert_eq!(bad.list().await.unwrap_err().code, Code::Unauthenticated);
 
     let client = t.client();
-    wait_for(|| {
-        Service::list_providers(&service)
+    wait_for(|| async {
+        service
+            .list_providers()
+            .await
+            .unwrap()
             .iter()
             .any(|provider| provider.generation > 0 && !provider.drivers.is_empty())
     })
@@ -1139,7 +1253,7 @@ async fn remote_agent_and_client_over_connect() {
         })
         .await
         .unwrap();
-    wait_for(|| Service::list(&service).is_empty()).await;
+    wait_for(|| async { service.list().await.unwrap().is_empty() }).await;
 }
 
 /// Heartbeat stats travel from a remote agent to the Stats API: the host
@@ -1163,8 +1277,8 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
     tokio::spawn(agent.run(t.shutdown_token()));
 
     let client = t.client();
-    wait_for(|| !Service::list_providers(&service).is_empty()).await;
-    let provider_id = Service::list_providers(&service)[0].id.clone();
+    wait_for(|| async { !service.list_providers().await.unwrap().is_empty() }).await;
+    let provider_id = service.list_providers().await.unwrap()[0].id.clone();
     client.put_template(template("alpine")).await.unwrap();
     let lease = client
         .acquire(AcquireRequest {
@@ -1253,6 +1367,7 @@ async fn destroying_a_sandbox_closes_open_exec_streams() {
             argv: vec!["sh".into(), "-c".into(), "sleep 300".into()],
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     // Give the exec work a moment to reach the agent, then destroy the
     // sandbox out from under the caller.
@@ -1411,7 +1526,7 @@ async fn restored_leases_re_inject_their_files() {
     let host = dir.path().join("host");
     let first = {
         let h = harness_with_host(
-            store::open(db.to_str().unwrap()).await.unwrap(),
+            test_backend(&db).await,
             home,
             host.clone(),
             FakeDriver::full_capabilities(),
@@ -1451,7 +1566,7 @@ async fn restored_leases_re_inject_their_files() {
     // same key must deliver the files again rather than trusting that the
     // pre-crash process finished injecting them.
     let h = harness_with_host(
-        store::open(db.to_str().unwrap()).await.unwrap(),
+        test_backend(&db).await,
         tempfile::tempdir().unwrap(),
         host,
         FakeDriver::full_capabilities(),
@@ -1489,7 +1604,8 @@ async fn restored_leases_re_inject_their_files() {
 
 #[tokio::test]
 async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
-    let _dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
     // `Acquire` only places on a provider the service still considers
     // online. A ghost that never reports would be read as already gone if
     // the acquire ran more than `provider_timeout` after it registered, so
@@ -1500,7 +1616,7 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
     config.provider_timeout = provider_timeout;
     config.provider_lost_factor = 1;
     config.acquire_wait = Duration::from_millis(200);
-    let store = store::open("memory:").await.unwrap();
+    let store = test_backend(&db).await;
     let service = Service::open(store.clone(), config).await.unwrap();
     // A provider that registers and then dies without reporting: its create
     // never completes.
@@ -1568,7 +1684,7 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
     alive.cancel();
     tokio::time::sleep(provider_timeout * 2).await;
     service.maintain().await;
-    let sandboxes = service.list();
+    let sandboxes = service.list().await.unwrap();
     assert!(
         sandboxes
             .iter()
@@ -1576,7 +1692,7 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         "{sandboxes:?}"
     );
     assert!(
-        store.load(Kind::Leases).await.unwrap().is_empty(),
+        durable_lease_ids(&db).is_empty(),
         "a lost provider's lease is released, not left to expire"
     );
 }
@@ -1617,7 +1733,7 @@ async fn stop_and_start_round_trip_a_sandbox() {
     assert_eq!(error.code, Code::FailedPrecondition);
     assert!(message(&error).contains("stopped"), "{}", message(&error));
     assert_eq!(
-        h.service.get(&id, &lease_id).unwrap().state,
+        h.service.get(&id, &lease_id).await.unwrap().state,
         SandboxState::Stopped
     );
     // A stopped sandbox keeps its lease, so a golden can be packed and
@@ -1625,10 +1741,10 @@ async fn stop_and_start_round_trip_a_sandbox() {
     h.service.start(&id, &lease_id, true).await.unwrap();
     assert_eq!(exec(vec!["true".into()]).await.unwrap().0, 0);
     assert_eq!(
-        h.service.get(&id, &lease_id).unwrap().state,
+        h.service.get(&id, &lease_id).await.unwrap().state,
         SandboxState::Leased
     );
-    assert_eq!(h.service.list().len(), 1);
+    assert_eq!(h.service.list().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1678,7 +1794,11 @@ async fn reconcile_never_destroys_another_providers_machine() {
         response.destroy
     );
     assert_eq!(
-        h.service.get(&sandbox_id, &lease.lease.id).unwrap().state,
+        h.service
+            .get(&sandbox_id, &lease.lease.id)
+            .await
+            .unwrap()
+            .state,
         SandboxState::Leased
     );
 
@@ -1834,7 +1954,7 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
     let host = dir.path().join("host");
     let sandbox_id = {
         let h = harness_with_host(
-            store::open(db.to_str().unwrap()).await.unwrap(),
+            test_backend(&db).await,
             tempfile::tempdir().unwrap(),
             host.clone(),
             FakeDriver::full_capabilities(),
@@ -1853,19 +1973,9 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
         lease.sandbox.id.clone()
     };
     // Simulate the crash window: the sandbox row survives, its lease does not.
-    let raw = store::open(db.to_str().unwrap()).await.unwrap();
-    for lease in raw
-        .load(preloop_sandbox::store::Kind::Leases)
-        .await
-        .unwrap()
-    {
-        let id = lease["id"].as_str().unwrap().to_owned();
-        raw.delete(preloop_sandbox::store::Kind::Leases, &id)
-            .await
-            .unwrap();
-    }
+    durable_exec(&db, "DELETE FROM leases");
     let restored = Service::open(
-        store::open(db.to_str().unwrap()).await.unwrap(),
+        test_backend(&db).await,
         ServiceConfig::new(),
     )
     .await
@@ -1874,6 +1984,8 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
     // unscoped list projection is the only view left.
     let sandbox = restored
         .list()
+        .await
+        .unwrap()
         .into_iter()
         .find(|sandbox| sandbox.id == sandbox_id)
         .expect("restored sandbox is listed");
@@ -1885,7 +1997,7 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
     );
     // The name is free again, so a retry with the same key can start over.
     let h = harness_with_host(
-        store::open(db.to_str().unwrap()).await.unwrap(),
+        test_backend(&db).await,
         tempfile::tempdir().unwrap(),
         host,
         FakeDriver::full_capabilities(),
@@ -1929,7 +2041,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
         .unwrap();
     let sandbox_id = a.sandbox.id.clone();
     for lease_id in ["", b.lease.id.as_str()] {
-        let get = h.service.get(&sandbox_id, lease_id).unwrap_err();
+        let get = h.service.get(&sandbox_id, lease_id).await.unwrap_err();
         assert_eq!(get.code, Code::PermissionDenied, "{get}");
         let exec = h
             .service
@@ -1939,6 +2051,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
                 argv: vec!["true".into()],
                 ..ExecRequest::default()
             })
+            .await
             .err()
             .expect("exec must be denied");
         assert_eq!(exec.code, Code::PermissionDenied, "{exec}");
@@ -1951,6 +2064,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
                 path: "/etc".into(),
                 ..OpenStreamRequest::default()
             })
+            .await
             .unwrap_err();
         assert_eq!(stream.code, Code::PermissionDenied, "{stream}");
         let stop = h.service.stop(&sandbox_id, lease_id).await.unwrap_err();
@@ -1980,7 +2094,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
     // The holder still works, and an unknown sandbox is not found (never a
     // permission hint about another tenant).
     assert_eq!(
-        h.service.get(&sandbox_id, &a.lease.id).unwrap().id,
+        h.service.get(&sandbox_id, &a.lease.id).await.unwrap().id,
         sandbox_id
     );
     assert_eq!(
@@ -1996,7 +2110,11 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
             .0,
         0
     );
-    let missing = h.service.get("sbx-missing", &a.lease.id).unwrap_err();
+    let missing = h
+        .service
+        .get("sbx-missing", &a.lease.id)
+        .await
+        .unwrap_err();
     assert_eq!(missing.code, Code::NotFound, "{missing}");
     h.service
         .release(ReleaseRequest {
@@ -2040,7 +2158,7 @@ async fn list_redacts_lease_ids() {
         })
         .await
         .unwrap();
-    let listed = h.service.list();
+    let listed = h.service.list().await.unwrap();
     assert_eq!(listed.len(), 2);
     assert!(
         listed.iter().all(|sandbox| sandbox.lease_id.is_empty()),
@@ -2050,6 +2168,7 @@ async fn list_redacts_lease_ids() {
     assert_eq!(
         h.service
             .get(&first.sandbox.id, &first.lease.id)
+            .await
             .unwrap()
             .lease_id,
         first.lease.id
@@ -2057,6 +2176,7 @@ async fn list_redacts_lease_ids() {
     assert_eq!(
         h.service
             .get(&first.sandbox.id, &second.lease.id)
+            .await
             .unwrap_err()
             .code,
         Code::PermissionDenied
@@ -2105,7 +2225,7 @@ async fn agent_enforces_the_host_mount_and_socket_allowlist() {
         sockets: vec![allowed.clone()],
     };
     let h = harness_with_access(
-        store::open("memory:").await.unwrap(),
+        backend::open("memory:").await.unwrap(),
         tempfile::tempdir().unwrap(),
         FakeDriver::full_capabilities(),
         access,
@@ -2218,17 +2338,17 @@ async fn serve(service: Arc<Service>) -> String {
 
 #[tokio::test]
 async fn cordoned_provider_receives_no_placements() {
-    let store = store::open("memory:").await.unwrap();
+    let store = backend::open("memory:").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let h = harness_with(store.clone(), dir, FakeDriver::full_capabilities()).await;
     h.service.put_template(template("alpine")).await.unwrap();
-    let name = h.service.list_providers()[0].name.clone();
+    let name = h.service.list_providers().await.unwrap()[0].name.clone();
 
     let provider = h.service.set_provider_cordon(&name, true).await.unwrap();
     assert!(provider.cordoned);
-    // The cordon is part of the persisted provider record.
-    let records = store.load(Kind::Providers).await.unwrap();
-    assert!(records[0]["cordoned"].as_bool().unwrap_or(false));
+    // The cordon is part of the persisted provider record: a fresh read from
+    // the database reports it.
+    assert!(h.service.list_providers().await.unwrap()[0].cordoned);
 
     // A cordon is not transient: fail at once, naming it, rather than
     // waiting out the window and claiming the provider is offline.
@@ -2267,7 +2387,7 @@ async fn cordoned_provider_receives_no_placements() {
 async fn a_pool_whose_only_capable_provider_is_cordoned_still_validates() {
     let h = harness().await;
     h.service.put_template(template("alpine")).await.unwrap();
-    let name = h.service.list_providers()[0].name.clone();
+    let name = h.service.list_providers().await.unwrap()[0].name.clone();
     h.service.set_provider_cordon(&name, true).await.unwrap();
 
     // A cordon is transient, so it must not reject the pool as impossible.
@@ -2282,10 +2402,13 @@ async fn a_pool_whose_only_capable_provider_is_cordoned_still_validates() {
         .await
         .expect("a cordoned provider is still a valid pool target");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(h.service.list().is_empty(), "no fill while cordoned");
+    assert!(
+        h.service.list().await.unwrap().is_empty(),
+        "no fill while cordoned"
+    );
 
     h.service.set_provider_cordon(&name, false).await.unwrap();
-    wait_for(|| h.service.list().len() == 1).await;
+    wait_for(|| async { h.service.list().await.unwrap().len() == 1 }).await;
 }
 
 #[tokio::test]
@@ -2304,26 +2427,28 @@ async fn drain_releases_idle_pool_members_and_keeps_leases() {
         })
         .await
         .unwrap();
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .list()
+            .await
+            .unwrap()
             .iter()
-            .filter(|s| s.state == SandboxState::Ready)
+            .filter(|sandbox| sandbox.state == SandboxState::Ready)
             .count()
             == 2
     })
     .await;
     let lease = h.service.acquire(acquire("drain", "linux")).await.unwrap();
-    let name = h.service.list_providers()[0].name.clone();
+    let name = h.service.list_providers().await.unwrap()[0].name.clone();
 
     let result = h.service.drain_provider(&name).await.unwrap();
     assert_eq!(result.released_pool_members, 1);
     assert_eq!(result.leased_remaining, 1);
-    assert!(h.service.list_providers()[0].cordoned);
+    assert!(h.service.list_providers().await.unwrap()[0].cordoned);
 
     // The idle member is destroyed; the leased one keeps running.
-    wait_for(|| {
-        let sandboxes = h.service.list();
+    wait_for(|| async {
+        let sandboxes = h.service.list().await.unwrap();
         sandboxes.len() == 1 && sandboxes[0].id == lease.sandbox.id
     })
     .await;
@@ -2331,10 +2456,10 @@ async fn drain_releases_idle_pool_members_and_keeps_leases() {
 
     // No refill while cordoned.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(h.service.list().len(), 1);
+    assert_eq!(h.service.list().await.unwrap().len(), 1);
 
     h.service.set_provider_cordon(&name, false).await.unwrap();
-    wait_for(|| h.service.list().len() == 2).await;
+    wait_for(|| async { h.service.list().await.unwrap().len() == 2 }).await;
 }
 
 #[tokio::test]
@@ -2342,7 +2467,7 @@ async fn connect_unary_bodies_are_capped_at_four_mib() {
     use preloop_sandbox::server::CONNECT_BODY_LIMIT;
     use tower::ServiceExt as _;
     let _dir = tempfile::tempdir().unwrap();
-    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+    let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
         .await
         .unwrap();
     let response = router(service, Auth::new("test-token"))
@@ -2364,7 +2489,7 @@ async fn blob_upload_cap_rejects_and_consumes_the_ticket() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = ServiceConfig::new();
     config.blob_max_bytes = 1024;
-    let service = Service::open(store::open("memory:").await.unwrap(), config)
+    let service = Service::open(backend::open("memory:").await.unwrap(), config)
         .await
         .unwrap();
     let fake = Arc::new(FakeDriver::new(
@@ -2380,7 +2505,7 @@ async fn blob_upload_cap_rejects_and_consumes_the_ticket() {
     );
     tokio::spawn(agent.run(shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    wait_for(|| !service.list_providers().is_empty()).await;
+    wait_for(|| async { !service.list_providers().await.unwrap().is_empty() }).await;
     service.put_template(template("alpine")).await.unwrap();
     let lease = service
         .acquire(AcquireRequest {
@@ -2398,6 +2523,7 @@ async fn blob_upload_cap_rejects_and_consumes_the_ticket() {
             path: "/work".into(),
             ..OpenStreamRequest::default()
         })
+        .await
         .unwrap();
     let ticket_id = ticket.url.rsplit('/').next().unwrap().to_owned();
     let base = serve(service.clone()).await;
@@ -2420,6 +2546,7 @@ async fn blob_upload_cap_rejects_and_consumes_the_ticket() {
     assert!(
         service
             .claim_caller(&ticket_id, &ticket.token, TransferSide::Consumer)
+            .await
             .is_err()
     );
     shutdown.cancel();
@@ -2545,7 +2672,7 @@ fn tar_entry_bytes(tar_path: &std::path::Path, wanted: &str) -> Vec<u8> {
 #[tokio::test]
 async fn transfers_stream_without_staging_files() {
     let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+    let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
         .await
         .unwrap();
     let entered_in = Arc::new(tokio::sync::Notify::new());
@@ -2703,7 +2830,7 @@ impl ProviderLink for BrokenFetch {
         Service::register(&self.inner, request).await
     }
     async fn heartbeat(&self, request: HeartbeatRequest) -> preloop_sandbox::Result<()> {
-        Service::heartbeat(&self.inner, request)
+        Service::heartbeat(&self.inner, request).await
     }
     async fn poll(&self, request: PollRequest) -> preloop_sandbox::Result<PollResponse> {
         Service::poll(&self.inner, request).await
@@ -2725,12 +2852,15 @@ impl ProviderLink for BrokenFetch {
         id: &ProviderSession,
         ticket: &str,
     ) -> preloop_sandbox::Result<tokio::sync::mpsc::Receiver<TransferChunk>> {
-        let mut claim = self.inner.claim_agent(
-            &id.provider_id,
-            id.generation,
-            ticket,
-            TransferSide::Consumer,
-        )?;
+        let mut claim = self
+            .inner
+            .claim_agent(
+                &id.provider_id,
+                id.generation,
+                ticket,
+                TransferSide::Consumer,
+            )
+            .await?;
         self.inner.wait_peer(&mut claim).await?;
         *self.ticket.lock().unwrap() = Some(ticket.to_owned());
         *self.session.lock().unwrap() = Some((id.provider_id.clone(), id.generation));
@@ -2758,7 +2888,7 @@ impl ProviderLink for BrokenFetch {
 #[tokio::test]
 async fn an_agent_that_disappears_mid_transfer_fails_the_caller_and_consumes_the_ticket() {
     let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+    let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
         .await
         .unwrap();
     let link = Arc::new(BrokenFetch {
@@ -2825,6 +2955,7 @@ async fn an_agent_that_disappears_mid_transfer_fails_the_caller_and_consumes_the
     let (provider, generation) = link.session.lock().unwrap().clone().expect("session");
     let error = service
         .claim_agent(&provider, generation, &ticket, TransferSide::Consumer)
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::NotFound);
     shutdown.cancel();
@@ -2852,12 +2983,14 @@ async fn a_ticket_is_single_use_and_direction_bound() {
             path: "/work".into(),
             ..OpenStreamRequest::default()
         })
+        .await
         .unwrap();
     let id = ticket.url.rsplit('/').next().unwrap().to_owned();
 
     assert_eq!(
         h.service
             .claim_caller(&id, "wrong", TransferSide::Producer)
+            .await
             .unwrap_err()
             .code,
         Code::Unauthenticated
@@ -2865,23 +2998,27 @@ async fn a_ticket_is_single_use_and_direction_bound() {
     let mut claim = h
         .service
         .claim_caller(&id, &ticket.token, TransferSide::Producer)
+        .await
         .unwrap();
     assert!(claim.take_producer().is_some());
     let error = h
         .service
         .claim_caller(&id, &ticket.token, TransferSide::Producer)
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::FailedPrecondition);
     // A download claim cannot use an upload ticket.
     let error = h
         .service
         .claim_caller(&id, &ticket.token, TransferSide::Consumer)
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
-    h.service.remove_ticket(&id);
+    h.service.remove_ticket(&id).await;
     assert_eq!(
         h.service
             .claim_caller(&id, &ticket.token, TransferSide::Consumer)
+            .await
             .unwrap_err()
             .code,
         Code::NotFound
@@ -2962,7 +3099,7 @@ async fn list_pagination_round_trips_across_250_items() {
     };
     let mut names = Vec::new();
     loop {
-        let page = service.list_templates_page(&request).unwrap();
+        let page = service.list_templates_page(&request).await.unwrap();
         assert!(page.templates.len() <= 100);
         names.extend(page.templates.into_iter().map(|t| t.spec.name.clone()));
         if page.next_page_token.is_empty() {
@@ -2984,6 +3121,7 @@ async fn list_pagination_round_trips_across_250_items() {
             page_token: "bm90LWEtc2FuZGJveA".into(),
             ..ListRequest::default()
         })
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument, "{}", message(&error));
 
@@ -2994,6 +3132,7 @@ async fn list_pagination_round_trips_across_250_items() {
             page_token: String::new(),
             ..ListRequest::default()
         })
+        .await
         .unwrap()
         .next_page_token;
     let error = service
@@ -3002,6 +3141,7 @@ async fn list_pagination_round_trips_across_250_items() {
             page_token: foreign,
             ..ListRequest::default()
         })
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument, "{}", message(&error));
 
@@ -3023,7 +3163,7 @@ async fn restart_fences_the_agent_and_it_re_registers() {
     // the service: its row (and generation) survives in the store.
     let (provider_id, generation) = {
         let service = Service::open(
-            store::open(db.to_str().unwrap()).await.unwrap(),
+            test_backend(&db).await,
             ServiceConfig::new(),
         )
         .await
@@ -3047,7 +3187,7 @@ async fn restart_fences_the_agent_and_it_re_registers() {
     // Reopening the same store bumps the generation before serving: the
     // session above can no longer poll, report or heartbeat.
     let restored = Service::open(
-        store::open(db.to_str().unwrap()).await.unwrap(),
+        test_backend(&db).await,
         ServiceConfig::new(),
     )
     .await
@@ -3064,6 +3204,8 @@ async fn restart_fences_the_agent_and_it_re_registers() {
     assert_eq!(error.code, Code::Aborted, "{}", message(&error));
     let bumped = restored
         .list_providers()
+        .await
+        .unwrap()
         .into_iter()
         .find(|provider| provider.id == provider_id)
         .expect("the provider row survives the restart");
@@ -3071,7 +3213,7 @@ async fn restart_fences_the_agent_and_it_re_registers() {
     // The agent's answer to `aborted` is to register again, which is what the
     // real agent does; the restarted service places work on that session.
     let h = harness_with_host(
-        store::open(db.to_str().unwrap()).await.unwrap(),
+        test_backend(&db).await,
         tempfile::tempdir().unwrap(),
         host,
         FakeDriver::full_capabilities(),
@@ -3080,6 +3222,8 @@ async fn restart_fences_the_agent_and_it_re_registers() {
     let re_registered = h
         .service
         .list_providers()
+        .await
+        .unwrap()
         .into_iter()
         .find(|provider| provider.id == provider_id)
         .expect("the re-registered agent keeps its provider id");
@@ -3106,12 +3250,12 @@ async fn restart_fences_the_agent_and_it_re_registers() {
 /// is not on the record) and nothing will ever report it: the record is
 /// failed with a reason instead of waiting for the create timeout.
 #[tokio::test]
-async fn a_creating_record_is_failed_after_restart() {
+async fn a_creating_record_survives_restart_and_resumes() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("sandbox.db");
     let sandbox_id = {
         let service = Service::open(
-            store::open(db.to_str().unwrap()).await.unwrap(),
+            test_backend(&db).await,
             ServiceConfig::new(),
         )
         .await
@@ -3154,28 +3298,28 @@ async fn a_creating_record_is_failed_after_restart() {
             .await
             .unwrap_err();
         assert_eq!(error.code, Code::DeadlineExceeded);
-        let sandboxes = service.list();
+        let sandboxes = service.list().await.unwrap();
         assert_eq!(sandboxes.len(), 1);
         assert_eq!(sandboxes[0].state, SandboxState::Provisioning);
         sandboxes[0].id.clone()
     };
     let restored = Service::open(
-        store::open(db.to_str().unwrap()).await.unwrap(),
+        test_backend(&db).await,
         ServiceConfig::new(),
     )
     .await
     .unwrap();
     let sandbox = restored
         .list()
+        .await
+        .unwrap()
         .into_iter()
         .find(|sandbox| sandbox.id == sandbox_id)
         .expect("the creating record survives the restart");
-    assert_eq!(sandbox.state, SandboxState::Failed);
-    assert!(
-        sandbox.error.contains("restarted while creating"),
-        "{}",
-        sandbox.error
-    );
+    // The accepted create work stays queued: a restarted service resumes it
+    // instead of failing the sandbox wholesale. The provider re-registers
+    // before it is placed on again.
+    assert_eq!(sandbox.state, SandboxState::Provisioning);
 }
 
 /// A record left `Terminating` by a crashed process whose machine is still in
@@ -3188,7 +3332,7 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
     let host = dir.path().join("host");
     let (sandbox_id, native_ref) = {
         let h = harness_with_host(
-            store::open(db.to_str().unwrap()).await.unwrap(),
+            test_backend(&db).await,
             tempfile::tempdir().unwrap(),
             host.clone(),
             FakeDriver::full_capabilities(),
@@ -3206,50 +3350,37 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
             .unwrap();
         (lease.sandbox.id.clone(), lease.sandbox.native_ref.clone())
     };
-    // Acquire returns once the in-memory record is leased, which a reconcile
-    // notification can deliver before the create report's store write lands.
-    // The crash is only simulated from a state that was durable, so wait for
-    // the reported native reference to be persisted.
-    let raw = store::open(db.to_str().unwrap()).await.unwrap();
-    let mut durable = false;
+    // Acquire returns once the record is leased, which a reconcile
+    // notification can deliver before the create report's write lands. The
+    // crash is only simulated from a state that was durable, so wait for the
+    // reported native reference to be persisted.
+    let mut persisted = false;
     for _ in 0..200 {
-        let sandboxes = raw.load(Kind::Sandboxes).await.unwrap();
-        let leases = raw.load(Kind::Leases).await.unwrap();
-        durable = !leases.is_empty()
-            && sandboxes.iter().any(|row| {
-                row["nativeRef"]
-                    .as_str()
-                    .is_some_and(|native| !native.is_empty())
-            });
-        if durable {
+        persisted = !durable_lease_ids(&db).is_empty()
+            && durable_sandboxes(&db)
+                .iter()
+                .any(|(_, native_ref)| !native_ref.is_empty());
+        if persisted {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(durable, "the create report was never persisted");
+    assert!(persisted, "the create report was never persisted");
     // Simulate the crash window: the destroy was decided and persisted, but
     // the machine outlived the process that asked for it.
-    for value in raw.load(Kind::Sandboxes).await.unwrap() {
-        let mut sandbox: Sandbox = serde_json::from_value(value).unwrap();
-        sandbox.state = SandboxState::Terminating.into();
-        raw.put(
-            Kind::Sandboxes,
-            &sandbox.id,
-            &serde_json::to_value(&sandbox).unwrap(),
-        )
-        .await
-        .unwrap();
-    }
+    durable_exec(&db, "UPDATE sandboxes SET state = 'terminating'");
     let h = harness_with_host(
-        store::open(db.to_str().unwrap()).await.unwrap(),
+        test_backend(&db).await,
         tempfile::tempdir().unwrap(),
         host,
         FakeDriver::full_capabilities(),
     )
     .await;
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .list()
+            .await
+            .unwrap()
             .iter()
             .all(|sandbox| sandbox.id != sandbox_id)
     })
@@ -3271,7 +3402,7 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
 async fn a_lost_provider_releases_its_leases() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("sandbox.db");
-    let store = store::open(db.to_str().unwrap()).await.unwrap();
+    let store = test_backend(&db).await;
     // The provider is only online while its liveness keeps being refreshed,
     // so the heartbeat the agent sends must be well inside the timeout the
     // test declares it lost by: otherwise a scheduling pause between
@@ -3296,7 +3427,7 @@ async fn a_lost_provider_releases_its_leases() {
         agent_config,
     );
     tokio::spawn(agent.run(shutdown.clone()));
-    wait_for(|| !service.list_providers().is_empty()).await;
+    wait_for(|| async { !service.list_providers().await.unwrap().is_empty() }).await;
     service.put_template(template("alpine")).await.unwrap();
     let lease = service
         .acquire(AcquireRequest {
@@ -3322,11 +3453,13 @@ async fn a_lost_provider_releases_its_leases() {
         .unwrap_err();
     assert_eq!(error.code, Code::NotFound, "{}", message(&error));
     assert!(
-        store.load(Kind::Leases).await.unwrap().is_empty(),
+        durable_lease_ids(&db).is_empty(),
         "the lease row must be released, not left to expire"
     );
     let sandbox = service
         .list()
+        .await
+        .unwrap()
         .into_iter()
         .find(|sandbox| sandbox.id == lease.sandbox.id)
         .expect("the sandbox remains listed while it terminates");
@@ -3353,9 +3486,10 @@ async fn renew_on_a_failed_sandbox_is_rejected() {
     // The machine disappears behind the service's back; the reconcile fails
     // the record but the caller still holds its lease.
     h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .get(&lease.sandbox.id, &lease.lease.id)
+            .await
             .is_ok_and(|sandbox| sandbox.state == SandboxState::Failed)
     })
     .await;
@@ -3412,44 +3546,34 @@ async fn a_reused_idempotency_key_with_a_different_payload_is_rejected() {
     assert_eq!(same.lease.id, first.lease.id);
 }
 
-/// A store whose writes always fail.
-struct FailingStore;
-
-#[async_trait::async_trait]
-impl Store for FailingStore {
-    async fn put(
-        &self,
-        _kind: Kind,
-        _id: &str,
-        _value: &serde_json::Value,
-    ) -> Result<(), preloop_sandbox::Error> {
-        Err(preloop_sandbox::Error::internal("disk full"))
-    }
-
-    async fn delete(&self, _kind: Kind, _id: &str) -> Result<(), preloop_sandbox::Error> {
-        Err(preloop_sandbox::Error::internal("disk full"))
-    }
-
-    async fn load(&self, _kind: Kind) -> Result<Vec<serde_json::Value>, preloop_sandbox::Error> {
-        Ok(Vec::new())
-    }
-}
-
-/// A failed store write is logged with the record kind and the RPC still
-/// succeeds: the in-memory working set is authoritative, the store is the
-/// restart source that will be behind.
+/// The database is authoritative: a write that fails is reported to the
+/// caller, never swallowed into a process-local working set that a later
+/// read would disagree with.
 #[tokio::test]
-async fn store_write_failures_keep_the_rpc_successful() {
-    let _dir = tempfile::tempdir().unwrap();
-    let service = Service::open(Arc::new(FailingStore), ServiceConfig::new())
-        .await
-        .unwrap();
-    let created = service
+async fn store_write_failures_fail_the_rpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let service = Service::open(
+        test_backend(&db).await,
+        ServiceConfig::new(),
+    )
+    .await
+    .unwrap();
+    // Make writes always fail: the column the template insert needs is gone,
+    // so every write errors while reads keep working.
+    durable_exec(
+        &db,
+        "ALTER TABLE templates RENAME COLUMN pending_drop TO pending_drop_off",
+    );
+    let error = service
         .put_template(template("alpine"))
         .await
-        .expect("a store failure must not fail the caller");
-    assert_eq!(created.spec.name, "alpine");
-    assert_eq!(service.list_templates().len(), 1);
+        .expect_err("a failed durable write must fail the caller");
+    assert_eq!(error.code, Code::Internal, "{}", message(&error));
+    assert!(
+        service.list_templates().await.unwrap().is_empty(),
+        "the failed write must not be visible"
+    );
 }
 // ─── At-least-once delivery, exec deadlines and disconnect ───────────
 
@@ -3484,7 +3608,7 @@ impl ProviderLink for LossyLink {
         Service::register(&self.inner, request).await
     }
     async fn heartbeat(&self, request: HeartbeatRequest) -> preloop_sandbox::Result<()> {
-        Service::heartbeat(&self.inner, request)
+        Service::heartbeat(&self.inner, request).await
     }
     async fn poll(&self, request: PollRequest) -> preloop_sandbox::Result<PollResponse> {
         let response = Service::poll(&self.inner, request).await?;
@@ -3547,7 +3671,7 @@ async fn lossy_harness(
     let mut config = ServiceConfig::new();
     config.acquire_wait = Duration::from_secs(10);
     configure(&mut config);
-    let service = Service::open(store::open("memory:").await.unwrap(), config)
+    let service = Service::open(backend::open("memory:").await.unwrap(), config)
         .await
         .unwrap();
     let fake = Arc::new(FakeDriver::new(
@@ -3587,12 +3711,12 @@ async fn manual_service(
     Arc<Service>,
     tempfile::TempDir,
     RegisterResponse,
-    Arc<dyn Store>,
+    Arc<dyn SandboxBackend>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let mut config = ServiceConfig::new();
     configure(&mut config);
-    let store = store::open("memory:").await.unwrap();
+    let store = backend::open("memory:").await.unwrap();
     let service = Service::open(store.clone(), config).await.unwrap();
     service.put_template(template("alpine")).await.unwrap();
     let provider = service
@@ -3636,6 +3760,19 @@ async fn acquire_unreported(service: &Arc<Service>, key: &str) {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::DeadlineExceeded);
+}
+
+/// The lease `acquire_unreported` left behind: once the create is reported,
+/// replaying the same idempotency key returns the durable lease capability.
+async fn replayed_lease(service: &Arc<Service>, key: &str) -> preloop_sandbox::api::AcquireResponse {
+    service
+        .acquire(AcquireRequest {
+            idempotency_key: key.into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .expect("the reported create answers the retry")
 }
 
 #[tokio::test]
@@ -3717,7 +3854,7 @@ async fn unacknowledged_work_is_redelivered_and_re_registering_releases_it() {
 
 #[tokio::test]
 async fn report_exec_orders_by_sequence_and_closes_on_exit() {
-    let (service, _dir, provider, store) = manual_service(|_| {}).await;
+    let (service, _dir, provider, _store) = manual_service(|_| {}).await;
     acquire_unreported(&service, "k").await;
     let create = poll_now(&service, &provider).await;
     assert_eq!(create.len(), 1);
@@ -3733,14 +3870,8 @@ async fn report_exec_orders_by_sequence_and_closes_on_exit() {
         })
         .await
         .unwrap();
-    let sandbox_id = service.list()[0].id.clone();
-    let lease_id = store
-        .load(Kind::Leases)
-        .await
-        .unwrap()
-        .first()
-        .and_then(|row| row["id"].as_str().map(str::to_owned))
-        .expect("the acquire left a lease row");
+    let sandbox_id = service.list().await.unwrap()[0].id.clone();
+    let lease_id = replayed_lease(&service, "k").await.lease.id.clone();
     let stream = service
         .exec(ExecRequest {
             sandbox_id,
@@ -3748,6 +3879,7 @@ async fn report_exec_orders_by_sequence_and_closes_on_exit() {
             argv: vec!["true".into()],
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     let work = poll_now(&service, &provider).await;
     assert_eq!(work.len(), 1);
@@ -3814,7 +3946,7 @@ async fn exec_without_a_timeout_gets_the_service_deadline() {
     let mut config = ServiceConfig::new();
     config.exec_timeout = Duration::from_secs(1);
     let h = harness_with_host_config(
-        store::open("memory:").await.unwrap(),
+        backend::open("memory:").await.unwrap(),
         dir,
         host,
         FakeDriver::full_capabilities(),
@@ -3851,7 +3983,7 @@ async fn a_swept_exec_reports_the_timeout_exit_not_an_error() {
     // A provider that takes the work but never reports (a lost agent, or one
     // stalled long enough that the backstop wins): the caller must still see
     // the driver's timeout exit, not a scheduler-dependent error.
-    let (service, _dir, provider, store) =
+    let (service, _dir, provider, _store) =
         manual_service(|config| config.exec_timeout = Duration::from_secs(1)).await;
     acquire_unreported(&service, "k").await;
     let create = poll_now(&service, &provider).await;
@@ -3868,14 +4000,8 @@ async fn a_swept_exec_reports_the_timeout_exit_not_an_error() {
         })
         .await
         .unwrap();
-    let sandbox_id = service.list()[0].id.clone();
-    let lease_id = store
-        .load(Kind::Leases)
-        .await
-        .unwrap()
-        .first()
-        .and_then(|row| row["id"].as_str().map(str::to_owned))
-        .expect("the acquire left a lease row");
+    let sandbox_id = service.list().await.unwrap()[0].id.clone();
+    let lease_id = replayed_lease(&service, "k").await.lease.id.clone();
     let stream = service
         .exec(ExecRequest {
             sandbox_id,
@@ -3883,6 +4009,7 @@ async fn a_swept_exec_reports_the_timeout_exit_not_an_error() {
             argv: vec!["sleep".into(), "30".into()],
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     // Delivered but never run: no exit report will ever arrive.
     let work = poll_now(&service, &provider).await;
@@ -3927,11 +4054,12 @@ async fn dropping_an_exec_stream_cancels_the_command() {
             argv: vec!["sh".into(), "-c".into(), "sleep 30".into()],
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     // Let the work reach the agent, then walk away.
     tokio::time::sleep(Duration::from_millis(200)).await;
     drop(stream);
-    wait_for(|| h.fake.cancel_calls.load(Ordering::Acquire) > 0).await;
+    wait_for(|| async { h.fake.cancel_calls.load(Ordering::Acquire) > 0 }).await;
     // The sandbox is still usable: the dropped exec left no state behind.
     let (code, _, _) = h
         .service
@@ -4008,7 +4136,7 @@ async fn a_redelivered_create_is_not_executed_twice() {
 
 #[tokio::test]
 async fn a_snapshot_wait_is_bounded_by_the_work_timeout() {
-    let (service, _dir, provider, store) =
+    let (service, _dir, provider, _store) =
         manual_service(|config| config.work_timeout = Duration::from_millis(100)).await;
     acquire_unreported(&service, "k").await;
     let create = poll_now(&service, &provider).await;
@@ -4024,14 +4152,8 @@ async fn a_snapshot_wait_is_bounded_by_the_work_timeout() {
         })
         .await
         .unwrap();
-    let sandbox_id = service.list()[0].id.clone();
-    let lease_id = store
-        .load(Kind::Leases)
-        .await
-        .unwrap()
-        .first()
-        .and_then(|row| row["id"].as_str().map(str::to_owned))
-        .expect("the acquire left a lease row");
+    let sandbox_id = service.list().await.unwrap()[0].id.clone();
+    let lease_id = replayed_lease(&service, "k").await.lease.id.clone();
     let error = service
         .snapshot(SnapshotRequest {
             sandbox_id,
@@ -4067,7 +4189,7 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
     );
     tokio::spawn(agent.run(t.shutdown_token()));
     let client = t.client();
-    wait_for(|| !service.list_providers().is_empty()).await;
+    wait_for(|| async { !service.list_providers().await.unwrap().is_empty() }).await;
     client.put_template(template("alpine")).await.unwrap();
     let lease = client
         .acquire(AcquireRequest {
@@ -4089,7 +4211,7 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
     // Let the work reach the agent, then walk away while the service lives.
     tokio::time::sleep(Duration::from_millis(300)).await;
     drop(stream);
-    wait_for(|| fake.cancel_calls.load(Ordering::Acquire) > 0).await;
+    wait_for(|| async { fake.cancel_calls.load(Ordering::Acquire) > 0 }).await;
     // The sandbox is still usable: the dropped exec left no state behind.
     let (code, _, _) = client
         .exec_collect(ExecRequest {

@@ -106,15 +106,16 @@ impl SqlEngine for SqliteEngine {
             .await
             .map_err(|_| Error::unavailable("sandbox SQLite engine is closed"))?;
         let mut connection = self.take_connection()?;
-        run_blocking(move || {
-            connection
-                .execute_batch("BEGIN IMMEDIATE")
-                .map_err(map_error)?;
-            Ok(Box::new(SqliteTx {
+        run_blocking(move || match connection.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => Ok(Box::new(SqliteTx {
                 connection: Some(connection),
                 pool: self.connection.clone(),
                 permit: Some(permit),
-            }) as Box<dyn SqlTx>)
+            }) as Box<dyn SqlTx>),
+            Err(error) => {
+                self.put_connection(connection);
+                Err(map_error(error))
+            }
         })
         .await
     }
@@ -140,11 +141,12 @@ struct SqliteTx {
 
 impl SqliteTx {
     fn put_back(&mut self, connection: Connection) {
-        self.permit.take();
         let mut slot = self.pool.lock().expect("sandbox SQLite pool");
         if slot.is_none() {
             *slot = Some(connection);
         }
+        drop(slot);
+        self.permit.take();
     }
 }
 
@@ -260,6 +262,7 @@ fn to_sqlite(params: &[SqlValue]) -> Vec<SqliteValue> {
         .map(|value| match value {
             SqlValue::Null => SqliteValue::Null,
             SqlValue::Int(value) => SqliteValue::Integer(*value),
+            SqlValue::Bool(value) => SqliteValue::Integer(i64::from(*value)),
             SqlValue::Text(value) => SqliteValue::Text(value.clone()),
             SqlValue::Bytes(value) => SqliteValue::Blob(value.clone()),
         })

@@ -27,6 +27,7 @@ pub(crate) const MAX_DESTROY_ATTEMPTS: u32 = 3;
 
 pub(crate) async fn create_exec(
     store: &SqlStore,
+    exec_id: &str,
     request: ExecRequest,
     timeout_secs: u64,
     owner: &Owner,
@@ -35,11 +36,13 @@ pub(crate) async fn create_exec(
         return Err(Error::invalid_argument("argv is required"));
     }
     let seal = store.seal.clone();
+    let exec_id = exec_id.to_owned();
     store
         .run_tx(|tx| {
             let seal = seal.clone();
             let request = request.clone();
             let owner = owner.clone();
+            let exec_id = exec_id.clone();
             Box::pin(async move {
                 let sandbox = sandbox_by_id(tx, &request.sandbox_id)
                     .await?
@@ -55,7 +58,6 @@ pub(crate) async fn create_exec(
                 merged.lease_id.clear();
                 let timeout = timeout_secs.max(1);
                 let deadline = now_secs() + i64::try_from(timeout).unwrap_or(i64::MAX);
-                let exec_id = format!("exe-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
                 let work_id = format!("wrk-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
                 let version = bump_version(tx).await?;
                 tx.execute(
@@ -312,7 +314,17 @@ pub(crate) async fn fail_exec_inner(
     outbox(tx, "exec", exec_id, version, "failed", "{}").await?;
     // Ask the provider to kill the guest command, once.
     let sandbox_id = row.text("sandbox_id")?.to_owned();
-    if let Some(sandbox) = sandbox_by_id(tx, &sandbox_id).await?
+    queue_cancel_exec(tx, &sandbox_id, exec_id).await?;
+    Ok(())
+}
+
+/// Queue one `CancelExec` for a sandbox that still holds the command.
+async fn queue_cancel_exec(
+    tx: &mut dyn SqlTx,
+    sandbox_id: &str,
+    exec_id: &str,
+) -> Result<()> {
+    if let Some(sandbox) = sandbox_by_id(tx, sandbox_id).await?
         && !sandbox.native_ref.is_empty()
         && sandbox.state.known() != SandboxState::Terminating
         && let Some(provider) = provider_by_id(tx, &sandbox.provider_id).await?
@@ -442,11 +454,17 @@ pub(crate) async fn create_ticket(
             let token = token_sha256.to_owned();
             let owner = owner.clone();
             Box::pin(async move {
+                if expires_at <= now_secs() {
+                    return Err(Error::invalid_argument(
+                        "ticket expiry must be in the future",
+                    ));
+                }
                 let sandbox = sandbox_by_id(tx, &sandbox_id)
                     .await?
                     .ok_or_else(|| Error::not_found("sandbox not found"))?;
                 authorize(tx, &sandbox, &lease_id).await?;
-                logic::usable(&sandbox)?;
+                // Provisioning is allowed: lease injection and in-process
+                // copies are queued behind the create and start after it.
                 let version = bump_version(tx).await?;
                 tx.execute(
                     "INSERT INTO tickets \
@@ -713,6 +731,65 @@ pub(crate) async fn ticket_owner(store: &SqlStore, id: &str) -> Result<Option<Ow
                 } else {
                     None
                 })
+            })
+        })
+        .await
+}
+
+pub(crate) async fn start_copy(
+    store: &SqlStore,
+    sandbox_id: &str,
+    ticket: &str,
+    guest_path: &str,
+    kind: StreamKind,
+    owner: &Owner,
+) -> Result<String> {
+    store
+        .run_tx(|tx| {
+            let sandbox_id = sandbox_id.to_owned();
+            let ticket = ticket.to_owned();
+            let guest_path = guest_path.to_owned();
+            let owner = owner.clone();
+            Box::pin(async move {
+                let sandbox = sandbox_by_id(tx, &sandbox_id)
+                    .await?
+                    .ok_or_else(|| Error::not_found("sandbox not found"))?;
+                let work_id = format!("wrk-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+                let target = SandboxWork {
+                    sandbox_id: sandbox.id.clone(),
+                    driver: sandbox.driver.clone(),
+                    native_ref: sandbox.native_ref.clone(),
+                    ..SandboxWork::default()
+                };
+                let work = WorkItem::new(
+                    work_id.clone(),
+                    work_item::Work::Copy(
+                        CopyWork {
+                            target: target.into(),
+                            ticket: ticket.clone(),
+                            path: guest_path,
+                            kind: kind.into(),
+                            ..CopyWork::default()
+                        }
+                        .into(),
+                    ),
+                );
+                let generation = provider_generation(tx, &sandbox.provider_id).await?;
+                let payload = super::commands_providers::WorkPayload::owned(work.clone(), &owner);
+                super::commands_providers::insert_work(
+                    tx,
+                    None,
+                    &sandbox.provider_id,
+                    generation,
+                    &work,
+                    "copy",
+                    &payload,
+                    &format!("copy:{ticket}"),
+                    now_ms(),
+                    now_ms() + 86_400_000,
+                )
+                .await?;
+                Ok(work_id)
             })
         })
         .await
@@ -1046,7 +1123,46 @@ pub(crate) async fn node_register(
             let peer_url = peer_url.to_owned();
             Box::pin(async move {
                 // A new session for this node fences the previous process's
-                // live channels; durable leases and sandboxes stay.
+                // provider sessions and live channels; durable leases and
+                // sandboxes stay, and providers owned by other nodes are
+                // never touched merely because this node started.
+                let previous = tx
+                    .query(
+                        "SELECT session_id FROM nodes WHERE node_id = $1",
+                        &[node_id.as_str().into()],
+                    )
+                    .await?
+                    .into_iter()
+                    .next()
+                    .map(|row| row.text("session_id").map(str::to_owned))
+                    .transpose()?;
+                if let Some(previous) = previous.filter(|previous| previous != &session_id) {
+                    tx.execute(
+                        "UPDATE providers SET generation = generation + 1 \
+                         WHERE owner_node = $1 AND owner_session = $2",
+                        &[node_id.as_str().into(), previous.as_str().into()],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE work_items SET status = 'queued', visible_at = 0, \
+                         generation = (SELECT generation FROM providers p \
+                                       WHERE p.id = work_items.provider_id) \
+                         WHERE provider_id IN (SELECT id FROM providers \
+                                               WHERE owner_node = $1 AND owner_session = $2) \
+                           AND status = 'inflight'",
+                        &[node_id.as_str().into(), previous.as_str().into()],
+                    )
+                    .await?;
+                    // Injection bytes are memory-only at the caller. A
+                    // restarted node must not claim files it never delivered.
+                    tx.execute(
+                        "UPDATE leases SET inject_state = 'pending' \
+                         WHERE inject_owner_node = $1 AND inject_owner_session = $2 \
+                           AND inject_state = 'done'",
+                        &[node_id.as_str().into(), previous.as_str().into()],
+                    )
+                    .await?;
+                }
                 fail_node_channels(tx, &node_id, Some(&session_id)).await?;
                 tx.execute(
                     "INSERT INTO nodes \
@@ -1301,6 +1417,19 @@ pub(crate) async fn maintain(
                     .await?;
                     outcome.changed = true;
                 }
+                // Same-key reservations that never produced a lease (a crash
+                // between reserve and insert) or whose lease row was removed
+                // externally must not block the key forever.
+                let stale_keys = tx
+                    .execute(
+                        "DELETE FROM lease_keys \
+                         WHERE (lease_id <> '' AND NOT EXISTS \
+                                (SELECT 1 FROM leases l WHERE l.id = lease_keys.lease_id)) \
+                            OR (lease_id = '' AND created_at < $1)",
+                        &[(now_ms() - 60_000).into()],
+                    )
+                    .await?;
+                outcome.changed |= stale_keys > 0;
                 // Expired injection claims and waiters.
                 let claims = tx
                     .execute(
@@ -1373,7 +1502,7 @@ pub(crate) async fn maintain(
                 let grace = i64::try_from(config.exec_sweep_grace.as_millis()).unwrap_or(0);
                 let execs = tx
                     .query(
-                        "SELECT id, work_id FROM execs \
+                        "SELECT id, work_id, sandbox_id FROM execs \
                          WHERE status = 'running' AND deadline <= $1",
                         &[(now_secs() - grace / 1000).into()],
                     )
@@ -1381,6 +1510,7 @@ pub(crate) async fn maintain(
                 for row in execs {
                     let exec_id = row.text("id")?.to_owned();
                     let work_id = row.text("work_id")?.to_owned();
+                    let sandbox_id = row.text("sandbox_id")?.to_owned();
                     tx.execute(
                         "UPDATE execs SET status = 'done', exit_code = 124 \
                          WHERE id = $1 AND status = 'running'",
@@ -1394,6 +1524,7 @@ pub(crate) async fn maintain(
                         &[work_id.as_str().into(), result.as_str().into(), now_ms().into()],
                     )
                     .await?;
+                    queue_cancel_exec(tx, &sandbox_id, &exec_id).await?;
                     outcome
                         .failed_execs
                         .push((exec_id, "timeout".to_owned()));
@@ -1481,7 +1612,36 @@ pub(crate) async fn maintain(
                     let _ = generation;
                     outcome.changed = true;
                 }
+                // A sandbox whose lease row is missing holds a machine with
+                // no capability to reach it. Clear the dangling reference and
+                // fail it so the unleased sweep below frees the machine.
+                let orphans = tx
+                    .query(
+                        "SELECT s.id FROM sandboxes s WHERE s.lease_id <> '' \
+                         AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.id = s.lease_id)",
+                        &[],
+                    )
+                    .await?;
+                let mut just_failed = std::collections::HashSet::new();
+                for row in orphans {
+                    let id = row.text("id")?.to_owned();
+                    tx.execute(
+                        "UPDATE sandboxes SET lease_id = '' WHERE id = $1",
+                        &[id.as_str().into()],
+                    )
+                    .await?;
+                    super::commands_leases::fail_sandbox(
+                        tx,
+                        &id,
+                        "restored without a lease",
+                    )
+                    .await?;
+                    just_failed.insert(id);
+                    outcome.changed = true;
+                }
                 // Failed, unleased sandboxes free whatever the host holds.
+                // A record failed by this pass waits for the next one, so the
+                // caller observes the durable Failed state before Terminating.
                 let failed = tx
                     .query(
                         "SELECT id FROM sandboxes WHERE state = 'failed' AND lease_id = ''",
@@ -1489,7 +1649,11 @@ pub(crate) async fn maintain(
                     )
                     .await?;
                 for row in failed {
-                    super::commands_leases::destroy_sandbox(tx, row.text("id")?).await?;
+                    let id = row.text("id")?.to_owned();
+                    if just_failed.contains(&id) {
+                        continue;
+                    }
+                    super::commands_leases::destroy_sandbox(tx, &id).await?;
                     outcome.changed = true;
                 }
                 // Expired join tokens and certificates.

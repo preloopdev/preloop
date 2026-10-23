@@ -29,8 +29,9 @@ use preloop_sandbox::drivers::smolvm::pack::ArtifactCache;
 use preloop_sandbox::server::{Auth, serve as serve_api};
 use preloop_sandbox::{
     Driver, LeastLoaded, Placement, SandboxApi, SandboxClient, ServerTls, Service, ServiceConfig,
-    store, tls,
+    backend, tls,
 };
+use preloop_sandbox::backend::{BackendConfig, SandboxBackend};
 use tokio_util::sync::CancellationToken;
 
 /// Default address of the engine's sandbox API.
@@ -62,6 +63,21 @@ fn placement_from_env() -> anyhow::Result<Arc<dyn Placement>> {
 /// Service tuning: defaults overridden by the documented environment.
 fn service_config(_state: &Path) -> anyhow::Result<ServiceConfig> {
     let mut config = ServiceConfig::new();
+    config.peers = ServiceConfig::peers_from_env()?;
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_NODE_ID") {
+        config.node_id = value;
+    }
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_NODE_CREDENTIAL") {
+        config.node_credential = value;
+    }
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_PEER_URL") {
+        config.peer_url = value;
+    }
+    if let Some(secs) = env_nonempty("PRELOOP_SANDBOX_NODE_LOST_AFTER_SECS")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        config.node_lost_after = Duration::from_secs(secs);
+    }
     if let Some(raw) = env_nonempty("PRELOOP_SANDBOX_BLOB_MAX_BYTES") {
         config.blob_max_bytes = raw.parse().with_context(|| {
             format!("PRELOOP_SANDBOX_BLOB_MAX_BYTES must be a byte count, got `{raw}`")
@@ -83,7 +99,37 @@ fn service_config(_state: &Path) -> anyhow::Result<ServiceConfig> {
     {
         config.exec_timeout = Duration::from_secs(secs);
     }
+    if config.node_session.is_empty() {
+        config.node_session = uuid::Uuid::new_v4().simple().to_string();
+    }
     Ok(config)
+}
+
+/// Open the durable backend for this replica. The seal key and CA are shared
+/// between replicas by configuration, never by the database.
+async fn open_backend(
+    url: &str,
+    state: &Path,
+    config: &ServiceConfig,
+) -> anyhow::Result<Arc<dyn SandboxBackend>> {
+    let pool_size = env_nonempty("PRELOOP_SANDBOX_PG_POOL")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8);
+    let backend = backend::open_with(BackendConfig {
+        url: url.to_owned(),
+        state_dir: state.to_path_buf(),
+        seal_key: None,
+        pool_size,
+        node_id: config.node_id.clone(),
+        session_id: config.node_session.clone(),
+        node_credential_sha256: backend::credential_hash(&config.node_credential),
+        peer_url: config.peer_url.clone(),
+        node_lost_after: config.node_lost_after,
+    })
+    .await
+    .with_context(|| format!("opening sandbox store {url}"))?;
+    Ok(backend)
 }
 
 /// Agent tuning: defaults overridden by the documented environment.
@@ -206,11 +252,10 @@ impl LocalSandboxes {
             .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
         let mut config = service_config(&state)?;
         config.placement = placement_from_env()?;
-        let store = store::open(&store_url)
-            .await
-            .with_context(|| format!("opening sandbox store {store_url}"))?;
+        let store = open_backend(&store_url, &state, &config).await?;
+        let tls_state = env_path("PRELOOP_SANDBOX_CA_DIR").unwrap_or_else(|| state.clone());
         let tls = ServerTls::load_or_create(
-            &state,
+            &tls_state,
             tls::sans_from_env(),
             env_path("PRELOOP_SANDBOX_TLS_CERT").as_deref(),
             env_path("PRELOOP_SANDBOX_TLS_KEY").as_deref(),
@@ -289,11 +334,12 @@ impl LocalSandboxes {
         // Wait for the local agent so the pool's first acquire can place.
         // An enrollment record (no drivers yet) does not count.
         for _ in 0..200 {
-            if service
+            let registered = service
                 .list_providers()
-                .iter()
-                .any(|provider| !provider.drivers.is_empty())
-            {
+                .await
+                .map(|providers| providers.iter().any(|provider| !provider.drivers.is_empty()))
+                .unwrap_or(false);
+            if registered {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1209,9 +1255,10 @@ async fn serve_standalone(
         .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
     let mut config = service_config(&state)?;
     config.placement = placement_from_env()?;
-    let store = store::open(&store_url).await?;
+    let store = open_backend(&store_url, &state, &config).await?;
+    let tls_state = env_path("PRELOOP_SANDBOX_CA_DIR").unwrap_or_else(|| state.clone());
     let tls = ServerTls::load_or_create(
-        &state,
+        &tls_state,
         tls::sans_from_env(),
         env_path("PRELOOP_SANDBOX_TLS_CERT").as_deref(),
         env_path("PRELOOP_SANDBOX_TLS_KEY").as_deref(),

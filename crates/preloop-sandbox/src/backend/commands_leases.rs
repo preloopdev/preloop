@@ -326,19 +326,9 @@ pub(crate) async fn acquire(
                             let lease = lease_by_id(tx, &lease_id, &seal)
                                 .await?
                                 .ok_or_else(|| Error::not_found("lease not found"))?;
-                            let inject_state = row.text("inject_state")?.to_owned();
-                            if inject_state != "done" {
-                                if claim_injection(
-                                    tx,
-                                    &lease_id,
-                                    &owner,
-                                    Duration::from_secs(60),
-                                )
-                                .await?
-                                {
-                                    return Ok(AcquireStep::Inject { lease, sandbox });
-                                }
-                            }
+                            // Files are uploaded only after the machine
+                            // exists: the copy work must see a native ref.
+                            let _ = lease;
                             return Ok(AcquireStep::Wait {
                                 last: None,
                                 retry_after: Duration::from_millis(100),
@@ -599,18 +589,25 @@ pub(crate) async fn acquire(
                 .await?;
                 let sandbox_version = bump_version(tx).await?;
                 tx.execute(
-                    "UPDATE sandboxes SET lease_id = $2, purpose = $3, name = $4, \
+                    "UPDATE sandboxes SET lease_id = $2, name = $3, \
                      state = CASE WHEN state = 'ready' THEN 'leased' ELSE state END, \
-                     version = $5 WHERE id = $1",
+                     version = $4 WHERE id = $1",
                     &[
                         sandbox_id.as_str().into(),
                         lease_id.as_str().into(),
+                        request.name.as_str().into(),
+                        sandbox_version.into(),
+                    ],
+                )
+                .await?;
+                tx.execute(
+                    "UPDATE sandbox_specs SET purpose = $2 WHERE id = $1",
+                    &[
+                        sandbox_id.as_str().into(),
                         rows::purpose_label(
                             request.purpose.as_known().unwrap_or(Purpose::PurposeUnspecified),
                         )
                         .into(),
-                        request.name.as_str().into(),
-                        sandbox_version.into(),
                     ],
                 )
                 .await?;
@@ -621,7 +618,9 @@ pub(crate) async fn acquire(
                 let sandbox = sandbox_by_id(tx, &sandbox_id)
                     .await?
                     .ok_or_else(|| Error::internal("inserted sandbox vanished"))?;
-                if inject_state == "pending" {
+                if inject_state == "pending"
+                    && sandbox.state.known() != SandboxState::Provisioning
+                {
                     if claim_injection(tx, &lease_id, &owner, Duration::from_secs(60)).await? {
                         Ok(AcquireStep::Inject { lease, sandbox })
                     } else {
@@ -749,15 +748,25 @@ pub(crate) async fn finish_injection(
             let owner = owner.clone();
             Box::pin(async move {
                 let state = if ok { "done" } else { "pending" };
+                let (owner_node, owner_session) = if ok {
+                    (
+                        owner.node_id.clone(),
+                        owner.session_id.clone(),
+                    )
+                } else {
+                    (String::new(), String::new())
+                };
                 let changed = tx
                     .execute(
-                        "UPDATE leases SET inject_state = $2, inject_owner_node = '', \
-                         inject_owner_session = '', inject_claim_expires_at = 0 \
-                         WHERE id = $1 AND inject_owner_node = $3 AND inject_owner_session = $4 \
+                        "UPDATE leases SET inject_state = $2, inject_owner_node = $3, \
+                         inject_owner_session = $4, inject_claim_expires_at = 0 \
+                         WHERE id = $1 AND inject_owner_node = $5 AND inject_owner_session = $6 \
                            AND inject_state = 'claimed'",
                         &[
                             lease_id.as_str().into(),
                             state.into(),
+                            owner_node.as_str().into(),
+                            owner_session.as_str().into(),
                             owner.node_id.as_str().into(),
                             owner.session_id.as_str().into(),
                         ],

@@ -8,11 +8,13 @@
 
 mod backend;
 mod engine;
-mod logic;
+pub(crate) mod logic;
 mod postgres;
 mod seal;
 mod sqlite;
 mod store;
+#[cfg(test)]
+mod tests;
 mod types;
 
 pub(crate) mod commands_leases;
@@ -63,6 +65,19 @@ fn default_node_id() -> String {
         .ok()
         .and_then(|name| name.into_string().ok())
         .unwrap_or_else(|| "sandbox-node".to_owned())
+}
+
+/// Hash one inter-node credential for storage/verification.
+pub fn credential_hash(credential: &str) -> String {
+    logic::token_hash(credential)
+}
+
+/// Current epoch milliseconds (for durable claim expiry fields).
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }
 
 /// Parse a store URL into a backend family.

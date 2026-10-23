@@ -204,7 +204,10 @@ impl SqlTx for PgTx {
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
-        client.execute(sql, &refs).await.map_err(map_error)
+        client.execute(sql, &refs).await.map_err(|error| {
+            let mapped = map_error(error);
+            Error::internal(format!("{} [sql: {}]", mapped.message.as_deref().unwrap_or(""), sql))
+        })
     }
 
     async fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
@@ -217,7 +220,10 @@ impl SqlTx for PgTx {
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
-        let rows = client.query(sql, &refs).await.map_err(map_error)?;
+        let rows = client.query(sql, &refs).await.map_err(|error| {
+            let mapped = map_error(error);
+            Error::internal(format!("{} [sql: {}]", mapped.message.as_deref().unwrap_or(""), sql))
+        })?;
         rows.into_iter().map(decode_row).collect()
     }
 
@@ -264,6 +270,7 @@ impl Drop for PgTx {
 enum PgParam {
     Null,
     Int(i64),
+    Bool(bool),
     Text(String),
     Bytes(Vec<u8>),
 }
@@ -277,7 +284,12 @@ impl ToSql for PgParam {
     {
         match self {
             Self::Null => Ok(tokio_postgres::types::IsNull::Yes),
-            Self::Int(value) => value.to_sql(ty, out),
+            Self::Int(value) => match *ty {
+                Type::INT2 => i16::try_from(*value).unwrap_or_default().to_sql(ty, out),
+                Type::INT4 => i32::try_from(*value).unwrap_or_default().to_sql(ty, out),
+                _ => value.to_sql(ty, out),
+            },
+            Self::Bool(value) => value.to_sql(ty, out),
             Self::Text(value) => value.to_sql(ty, out),
             Self::Bytes(value) => value.to_sql(ty, out),
         }
@@ -303,6 +315,7 @@ fn pg_params(params: &[SqlValue]) -> Vec<PgParam> {
         .map(|value| match value {
             SqlValue::Null => PgParam::Null,
             SqlValue::Int(value) => PgParam::Int(*value),
+            SqlValue::Bool(value) => PgParam::Bool(*value),
             SqlValue::Text(value) => PgParam::Text(value.clone()),
             SqlValue::Bytes(value) => PgParam::Bytes(value.clone()),
         })
@@ -313,25 +326,37 @@ fn decode_row(row: PgRow) -> Result<Row> {
     let mut values = std::collections::HashMap::new();
     for (index, column) in row.columns().iter().enumerate() {
         let name = column.name().to_owned();
+        let column_type = column.type_().clone();
         let value = match *column.type_() {
-            Type::INT2 | Type::INT4 | Type::INT8 => row
+            Type::INT2 => row
+                .try_get::<_, Option<i16>>(index)
+                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
+                .map_or(SqlValue::Null, |value| SqlValue::Int(i64::from(value))),
+            Type::INT4 => row
+                .try_get::<_, Option<i32>>(index)
+                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
+                .map_or(SqlValue::Null, |value| SqlValue::Int(i64::from(value))),
+            Type::INT8 => row
                 .try_get::<_, Option<i64>>(index)
-                .map_err(map_error)?
+                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
                 .map_or(SqlValue::Null, SqlValue::Int),
             Type::BOOL => row
                 .try_get::<_, Option<bool>>(index)
-                .map_err(map_error)?
-                .map_or(SqlValue::Null, |value| SqlValue::Int(i64::from(value))),
+                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
+                .map_or(SqlValue::Null, SqlValue::Bool),
             Type::BYTEA => row
                 .try_get::<_, Option<Vec<u8>>>(index)
-                .map_err(map_error)?
+                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
                 .map_or(SqlValue::Null, SqlValue::Bytes),
             _ => row
                 .try_get::<_, Option<String>>(index)
-                .map_err(map_error)?
+                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
                 .map_or(SqlValue::Null, SqlValue::Text),
         };
-        values.insert(name, value);
+        values.insert(name.clone(), value);
+        if std::env::var("PRELOOP_DEBUG_PG").is_ok() {
+            eprintln!("pg column {index} {name} {column_type:?}");
+        }
     }
     Ok(Row::new(values))
 }
@@ -419,6 +444,11 @@ pub(crate) fn map_error(error: tokio_postgres::Error) -> Error {
         if db_error.code().code() == "40001" || db_error.code().code() == "40P01" {
             return Error::unavailable("sandbox Postgres serialization failure");
         }
+        return Error::internal(format!(
+            "sandbox Postgres ({}): {}",
+            db_error.code().code(),
+            db_error.message()
+        ));
     }
     Error::internal(format!("sandbox Postgres: {error}"))
 }

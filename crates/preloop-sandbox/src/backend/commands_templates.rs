@@ -119,6 +119,25 @@ pub(crate) async fn pool_get(store: &SqlStore, name: &str) -> Result<Option<Vers
         .await
 }
 
+pub(crate) async fn pool_build_revision(
+    store: &SqlStore,
+    name: &str,
+) -> Result<Option<u64>> {
+    store
+        .run_tx(|tx| {
+            let name = name.to_owned();
+            Box::pin(async move {
+                Ok(tx
+                    .query("SELECT revision FROM pools WHERE name = $1", &[name.into()])
+                    .await?
+                    .first()
+                    .map(|row| row.u64("revision"))
+                    .transpose()?)
+            })
+        })
+        .await
+}
+
 pub(crate) async fn driver_get(
     store: &SqlStore,
     provider_id: &str,

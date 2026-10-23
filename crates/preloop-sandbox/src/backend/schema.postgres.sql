@@ -156,7 +156,9 @@ CREATE TABLE IF NOT EXISTS providers (
     cordoned     BOOLEAN NOT NULL DEFAULT FALSE,
     host_json    TEXT,
     host_sampled_at BIGINT,
-    stats_json   TEXT NOT NULL DEFAULT '[]'
+    stats_json   TEXT NOT NULL DEFAULT '[]',
+    owner_node    TEXT NOT NULL DEFAULT '',
+    owner_session TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS provider_certificates (

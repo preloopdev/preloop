@@ -17,8 +17,10 @@ use crate::error::{Error, Result};
 pub enum SqlValue {
     /// SQL NULL.
     Null,
-    /// An integer (booleans are 0/1).
+    /// An integer.
     Int(i64),
+    /// A boolean.
+    Bool(bool),
     /// UTF-8 text.
     Text(String),
     /// Opaque bytes.
@@ -39,7 +41,7 @@ impl From<u64> for SqlValue {
 
 impl From<bool> for SqlValue {
     fn from(value: bool) -> Self {
-        Self::Int(i64::from(value))
+        Self::Bool(value)
     }
 }
 
@@ -83,6 +85,7 @@ impl Row {
     pub fn int(&self, name: &str) -> Result<i64> {
         match self.values.get(name) {
             Some(SqlValue::Int(value)) => Ok(*value),
+            Some(SqlValue::Bool(value)) => Ok(i64::from(*value)),
             Some(other) => Err(decode_error(name, other)),
             None => Err(decode_error(name, &SqlValue::Null)),
         }
@@ -95,13 +98,19 @@ impl Row {
 
     /// A required boolean column (0/1).
     pub fn bool(&self, name: &str) -> Result<bool> {
-        Ok(self.int(name)? != 0)
+        match self.values.get(name) {
+            Some(SqlValue::Bool(value)) => Ok(*value),
+            Some(SqlValue::Int(value)) => Ok(*value != 0),
+            Some(other) => Err(decode_error(name, other)),
+            None => Err(decode_error(name, &SqlValue::Null)),
+        }
     }
 
     /// An optional integer column.
     pub fn opt_int(&self, name: &str) -> Result<Option<i64>> {
         match self.values.get(name) {
             Some(SqlValue::Int(value)) => Ok(Some(*value)),
+            Some(SqlValue::Bool(value)) => Ok(Some(i64::from(*value))),
             Some(SqlValue::Null) | None => Ok(None),
             Some(other) => Err(decode_error(name, other)),
         }

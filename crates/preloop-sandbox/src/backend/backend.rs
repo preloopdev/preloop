@@ -46,6 +46,10 @@ pub trait SandboxBackend: Send + Sync {
     /// A pool payload and its authoritative row version in one read.
     async fn pool_get(&self, name: &str) -> Result<Option<Versioned<PoolSpec>>>;
 
+    /// The pool's build revision (template digest + build inputs, excluding
+    /// scaling and TTL). Distinct from the row version.
+    async fn pool_revision(&self, name: &str) -> Result<Option<u64>>;
+
     /// One provider driver capability record, versioned by provider
     /// generation.
     async fn driver_get(
@@ -166,6 +170,7 @@ pub trait SandboxBackend: Send + Sync {
         &self,
         request: RegisterRequest,
         enrolled: Option<&str>,
+        owner: &Owner,
     ) -> Result<RegisterResponse>;
 
     /// `Heartbeat` (also refreshes durable liveness).
@@ -233,11 +238,23 @@ pub trait SandboxBackend: Send + Sync {
     /// `Reconcile`.
     async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse>;
 
+    /// Queue one Copy work item for an already-issued ticket. Returns its
+    /// work id; the result is read with `work_result`.
+    async fn start_copy(
+        &self,
+        sandbox_id: &str,
+        ticket: &str,
+        guest_path: &str,
+        kind: StreamKind,
+        owner: &Owner,
+    ) -> Result<String>;
+
     // ── Execs ─────────────────────────────────────────────────────
 
     /// Validate and create an exec plus its queued work.
     async fn create_exec(
         &self,
+        exec_id: &str,
         request: ExecRequest,
         timeout_secs: u64,
         owner: &Owner,

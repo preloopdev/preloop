@@ -169,7 +169,9 @@ CREATE TABLE IF NOT EXISTS providers (
     cordoned     INTEGER NOT NULL DEFAULT 0,
     host_json    TEXT,
     host_sampled_at INTEGER,
-    stats_json   TEXT NOT NULL DEFAULT '[]'
+    stats_json   TEXT NOT NULL DEFAULT '[]',
+    owner_node    TEXT NOT NULL DEFAULT '',
+    owner_session TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS provider_certificates (

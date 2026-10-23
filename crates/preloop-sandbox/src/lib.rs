@@ -28,7 +28,6 @@ pub mod metrics;
 pub mod placement;
 pub mod server;
 pub mod service;
-pub mod store;
 pub mod tls;
 
 pub use client::{InProcess, SandboxApi, SandboxClient};

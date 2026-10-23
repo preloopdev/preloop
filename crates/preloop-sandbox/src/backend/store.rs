@@ -498,6 +498,10 @@ impl super::SandboxBackend for SqlStore {
         super::commands_templates::pool_get(self, name).await
     }
 
+    async fn pool_revision(&self, name: &str) -> Result<Option<u64>> {
+        super::commands_templates::pool_build_revision(self, name).await
+    }
+
     async fn driver_get(
         &self,
         provider_id: &str,
@@ -657,8 +661,9 @@ impl super::SandboxBackend for SqlStore {
         &self,
         request: RegisterRequest,
         enrolled: Option<&str>,
+        owner: &super::Owner,
     ) -> Result<RegisterResponse> {
-        super::commands_providers::register(self, request, enrolled).await
+        super::commands_providers::register(self, request, enrolled, owner).await
     }
 
     async fn heartbeat(&self, request: HeartbeatRequest) -> Result<()> {
@@ -761,13 +766,26 @@ impl super::SandboxBackend for SqlStore {
         super::commands_providers::reconcile(self, request).await
     }
 
+    async fn start_copy(
+        &self,
+        sandbox_id: &str,
+        ticket: &str,
+        guest_path: &str,
+        kind: StreamKind,
+        owner: &super::Owner,
+    ) -> Result<String> {
+        super::commands_runtime::start_copy(self, sandbox_id, ticket, guest_path, kind, owner)
+            .await
+    }
+
     async fn create_exec(
         &self,
+        exec_id: &str,
         request: ExecRequest,
         timeout_secs: u64,
         owner: &super::Owner,
     ) -> Result<super::ExecHandle> {
-        super::commands_runtime::create_exec(self, request, timeout_secs, owner).await
+        super::commands_runtime::create_exec(self, exec_id, request, timeout_secs, owner).await
     }
 
     async fn report_exec(
