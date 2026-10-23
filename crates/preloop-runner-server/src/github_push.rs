@@ -158,7 +158,7 @@ pub async fn push_run_to_github(
                 pr_number: state.pr_number,
                 pr_url: state.pr_number.map(|number| {
                     pr_web_url(
-                        shared.state.github_urls.api_base(),
+                        &shared.state.github_urls.server_url,
                         &run.submission.repository,
                         number,
                     )
@@ -525,7 +525,7 @@ pub async fn push_run_to_github(
         status: "pushed",
         pr_number,
         pr_url: pr_number
-            .map(|number| pr_web_url(shared.state.github_urls.api_base(), &repository, number)),
+            .map(|number| pr_web_url(&shared.state.github_urls.server_url, &repository, number)),
     })
 }
 
@@ -679,11 +679,39 @@ fn classify(message: &str) -> ApiError {
     }
 }
 
-fn pr_web_url(api_base: &str, repository: &str, number: u64) -> String {
-    let host = api_base
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    let host = host.strip_prefix("api.").unwrap_or(host);
-    format!("https://{host}/{repository}/pull/{number}")
+/// The browser URL of a pull request: the forge's web root
+/// (`github_urls.server_url` — `https://github.com`, or the GHES host)
+/// plus the repository path. Never derive this from the REST API base:
+/// on GHES the API lives under `<host>/api/v3`, so an API-derived link
+/// names a REST path, not the PR page.
+fn pr_web_url(server_url: &str, repository: &str, number: u64) -> String {
+    format!(
+        "{}/{repository}/pull/{number}",
+        server_url.trim_end_matches('/')
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pr_web_url;
+
+    #[test]
+    fn pr_web_url_uses_the_forge_web_root() {
+        // github.com: server_url is the web root itself.
+        assert_eq!(
+            pr_web_url("https://github.com", "owner/repo", 1),
+            "https://github.com/owner/repo/pull/1"
+        );
+        // GHES: the API base is `https://ghes.example.com/api/v3`, but the
+        // PR page lives at the server root — no `/api/v3` segment.
+        assert_eq!(
+            pr_web_url("https://ghes.example.com", "owner/repo", 1),
+            "https://ghes.example.com/owner/repo/pull/1"
+        );
+        // A trailing slash on the configured server URL is tolerated.
+        assert_eq!(
+            pr_web_url("https://ghes.example.com/", "owner/repo", 42),
+            "https://ghes.example.com/owner/repo/pull/42"
+        );
+    }
 }

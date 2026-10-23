@@ -76,6 +76,17 @@ jobs:
 /// `.github/workflows/`. The workspace is a real git repo with `main`, so the
 /// dispatch ref/SHA resolution path works.
 async fn dispatch_fixture(workflows: &[(&str, &str)]) -> (AppState, Router, tempfile::TempDir) {
+    dispatch_fixture_at(workflows, None).await
+}
+
+/// [`dispatch_fixture`] with the GitHub API base pointed at a stub (or a
+/// dead address): `api_base` is written into the state's resolved URLs
+/// before the router is built — the `webhook_coverage_fixture` pattern —
+/// so the test needs no process-global env pin.
+async fn dispatch_fixture_at(
+    workflows: &[(&str, &str)],
+    api_base: Option<&str>,
+) -> (AppState, Router, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let ws = temp.path().join("ws");
     std::fs::create_dir_all(ws.join(".github/workflows")).unwrap();
@@ -86,6 +97,9 @@ async fn dispatch_fixture(workflows: &[(&str, &str)]) -> (AppState, Router, temp
     let mut state = AppState::new(temp.path().join("state").to_path_buf())
         .await
         .unwrap();
+    if let Some(api_base) = api_base {
+        state.github_urls.api_url = api_base.to_owned();
+    }
     state.local_workspace = Some(ws);
     let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
     (state, app, temp)
@@ -97,6 +111,16 @@ async fn dispatch_fixture(workflows: &[(&str, &str)]) -> (AppState, Router, temp
 async fn dispatch_fixture_with_app(
     workflows: &[(&str, &str)],
 ) -> (AppState, Router, rsa::RsaPrivateKey, tempfile::TempDir) {
+    dispatch_fixture_with_app_at(workflows, None).await
+}
+
+/// [`dispatch_fixture_with_app`] with the GitHub API base pointed at a
+/// stub (or a dead address), written into the state's resolved URLs
+/// before the router is built; see [`dispatch_fixture_at`].
+async fn dispatch_fixture_with_app_at(
+    workflows: &[(&str, &str)],
+    api_base: Option<&str>,
+) -> (AppState, Router, rsa::RsaPrivateKey, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let ws = temp.path().join("ws");
     std::fs::create_dir_all(ws.join(".github/workflows")).unwrap();
@@ -107,6 +131,9 @@ async fn dispatch_fixture_with_app(
     let mut state = AppState::new(temp.path().join("state").to_path_buf())
         .await
         .unwrap();
+    if let Some(api_base) = api_base {
+        state.github_urls.api_url = api_base.to_owned();
+    }
     state.local_workspace = Some(ws);
     let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     state.github_app = Some(crate::github_app::GitHubAppCredentials::for_tests(
@@ -251,23 +278,6 @@ async fn spawn_github_stub(router: Router) -> (String, tokio::task::JoinHandle<(
         axum::serve(listener, router).await.unwrap();
     });
     (base, handle)
-}
-
-/// Pin `PRELOOP_GITHUB_API_URL` for a stub test, holding both the process-wide
-/// env lock and the restore-on-drop variable guard.
-///
-/// Pin *before* building the fixture state: the API base is resolved into
-/// `AppState::github_urls` at construction (env over config file), not
-/// re-read from the environment at request time.
-async fn pin_api_base(
-    base: &str,
-) -> (
-    crate::state::TestEnvVar,
-    tokio::sync::MutexGuard<'static, ()>,
-) {
-    let guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let var = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", base);
-    (var, guard)
 }
 
 // ─── Endpoints: workflow_dispatch ──────────────────────────────────────────
@@ -739,8 +749,8 @@ async fn dispatch_with_garbage_token_is_401() {
         get(|| async { (StatusCode::UNAUTHORIZED, "bad credentials") }),
     );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let (state, app, _temp) =
+        dispatch_fixture_at(&[("dispatch.yml", DISPATCH_WORKFLOW)], Some(&base)).await;
 
     let (status, _) = post_json(
         &app,
@@ -756,10 +766,10 @@ async fn dispatch_with_garbage_token_is_401() {
 
 #[tokio::test]
 async fn dispatch_with_pat_authenticates() {
-    // Pin the API base to an unreachable loopback port: the PAT actor
-    // fallback depends on github.com being unreachable, and pinning makes
-    // that deterministic regardless of any ambient PRELOOP_GITHUB_API_URL.
-    let _env = pin_api_base("http://127.0.0.1:1").await;
+    // Point the API base at an unreachable loopback port: the PAT actor
+    // fallback depends on github.com being unreachable, and writing the
+    // dead address into the state's resolved URLs makes that deterministic
+    // regardless of any ambient PRELOOP_GITHUB_API_URL.
     let (state, app, _temp) = {
         let temp = tempfile::tempdir().unwrap();
         let ws = temp.path().join("ws");
@@ -769,6 +779,7 @@ async fn dispatch_with_pat_authenticates() {
         let mut state = AppState::new(temp.path().join("state").to_path_buf())
             .await
             .unwrap();
+        state.github_urls.api_url = "http://127.0.0.1:1".to_owned();
         state.local_workspace = Some(ws);
         state.github_pat = Some(preloop_gha_protocol::SecretString::new("ghp_dispatch_test"));
         let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
@@ -799,7 +810,6 @@ async fn dispatch_with_pat_actor_resolved_from_github_user_endpoint() {
         get(|| async { Json(json!({ "login": "octocat-pat" })) }),
     );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
 
     let (state, app, _temp) = {
         let temp = tempfile::tempdir().unwrap();
@@ -810,6 +820,7 @@ async fn dispatch_with_pat_actor_resolved_from_github_user_endpoint() {
         let mut state = AppState::new(temp.path().join("state").to_path_buf())
             .await
             .unwrap();
+        state.github_urls.api_url = base.clone();
         state.local_workspace = Some(ws);
         state.github_pat = Some(preloop_gha_protocol::SecretString::new("ghp_dispatch_test"));
         let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
@@ -899,12 +910,14 @@ async fn dispatch_with_expired_app_jwt_is_401() {
 #[tokio::test]
 async fn dispatch_with_own_minted_token_authenticates_offline_via_ledger() {
     // The offline ledger path resolves the bot actor from the App (`GET /app`
-    // when reachable); pin the API base to a closed port so the fallback
+    // when reachable); point the API base at a closed port so the fallback
     // `{app_id}[bot]` is deterministic instead of depending on the ambient
     // network.
-    let (_env, _env_lock) = pin_api_base("http://127.0.0.1:1").await;
-    let (state, app, _key, _temp) =
-        dispatch_fixture_with_app(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let (state, app, _key, _temp) = dispatch_fixture_with_app_at(
+        &[("dispatch.yml", DISPATCH_WORKFLOW)],
+        Some("http://127.0.0.1:1"),
+    )
+    .await;
     record_ledger_token(
         &state,
         "ghs_own_minted_token",
@@ -979,11 +992,13 @@ async fn ledger_token_scoped_to_another_repo_is_403() {
 
 #[tokio::test]
 async fn read_endpoints_reject_ledger_token_scoped_to_another_repo() {
-    // Pin the API base to a closed port so the ledger actor fallback
+    // Point the API base at a closed port so the ledger actor fallback
     // (`{app_id}[bot]`) is deterministic regardless of ambient network.
-    let (_env, _env_lock) = pin_api_base("http://127.0.0.1:1").await;
-    let (state, app, _key, _temp) =
-        dispatch_fixture_with_app(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let (state, app, _key, _temp) = dispatch_fixture_with_app_at(
+        &[("dispatch.yml", DISPATCH_WORKFLOW)],
+        Some("http://127.0.0.1:1"),
+    )
+    .await;
     record_ledger_token(
         &state,
         "ghs_other_repo_read_token",
@@ -1012,11 +1027,13 @@ async fn read_endpoints_reject_ledger_token_scoped_to_another_repo() {
 
 #[tokio::test]
 async fn unknown_token_fails_closed_when_github_is_unreachable() {
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
-
     // Point the API base at a closed port: connection refused is a transport
     // failure, which must NOT be read as "anonymous" — the dispatch fails.
-    let _env = pin_api_base("http://127.0.0.1:1").await;
+    let (state, app, _temp) = dispatch_fixture_at(
+        &[("dispatch.yml", DISPATCH_WORKFLOW)],
+        Some("http://127.0.0.1:1"),
+    )
+    .await;
     let (status, _) = post_json(
         &app,
         "/repos/octocat/repo/dispatches",
@@ -1037,7 +1054,6 @@ async fn unknown_token_fails_closed_when_github_is_unreachable() {
 /// closed (502), never anonymous.
 #[tokio::test]
 async fn open_breaker_refuses_a_third_party_dispatch_without_touching_github() {
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     let calls = Arc::new(parking_lot::Mutex::new(0));
     let mut permissions = serde_json::Map::new();
     permissions.insert("actions".to_owned(), json!("write"));
@@ -1048,7 +1064,8 @@ async fn open_breaker_refuses_a_third_party_dispatch_without_touching_github() {
         &["octocat/repo"],
     );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
+    let (state, app, _temp) =
+        dispatch_fixture_at(&[("dispatch.yml", DISPATCH_WORKFLOW)], Some(&base)).await;
 
     // Three dependency failures on the bucket dispatch auth validates an
     // unattributable installation token under: the token's own fingerprint,
@@ -1171,12 +1188,12 @@ async fn webhook_signer_is_bound_to_the_claimed_repository() {
             }),
         );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
 
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().join("state").to_path_buf())
         .await
         .unwrap();
+    state.github_urls.api_url = base.clone();
     state.webhook_secret = Some("legacy-secret".to_owned());
     let (registry, _) = two_app_registry();
     state.github_apps = Some(registry);
@@ -1248,12 +1265,12 @@ async fn a_secret_an_app_claims_is_bound_to_its_installations() {
             }),
         );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
 
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().join("state").to_path_buf())
         .await
         .unwrap();
+    state.github_urls.api_url = base.clone();
     let (mut registry, _) = two_app_registry();
     // The fresh-engine shape: the default App's secret is registered on the
     // App and is also the value in the legacy slot.
@@ -1332,12 +1349,12 @@ async fn select_app_for_repo_picks_the_app_installed_on_the_owner() {
         }),
     );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
 
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().join("state").to_path_buf())
         .await
         .unwrap();
+    state.github_urls.api_url = base.clone();
     let (registry, _second_key) = two_app_registry();
     state.github_apps = Some(registry);
     let shared = Arc::new(SharedState {
@@ -1440,8 +1457,8 @@ async fn third_party_installation_token_dispatches_when_it_holds_actions_write()
         &["octocat/repo"],
     );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let (state, app, _temp) =
+        dispatch_fixture_at(&[("dispatch.yml", DISPATCH_WORKFLOW)], Some(&base)).await;
 
     let (status, body) = post_json(
         &app,
@@ -1491,8 +1508,8 @@ async fn third_party_token_without_actions_write_is_403() {
         &["octocat/repo"],
     );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let (state, app, _temp) =
+        dispatch_fixture_at(&[("dispatch.yml", DISPATCH_WORKFLOW)], Some(&base)).await;
 
     let (status, _) = post_json(
         &app,
@@ -1520,8 +1537,8 @@ async fn third_party_token_without_repo_access_is_403() {
         &["octocat/other"],
     );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let (state, app, _temp) =
+        dispatch_fixture_at(&[("dispatch.yml", DISPATCH_WORKFLOW)], Some(&base)).await;
 
     let (status, _) = post_json(
         &app,
@@ -1544,8 +1561,8 @@ async fn github_refusing_the_token_is_401_not_502() {
         get(|| async { (StatusCode::UNAUTHORIZED, "bad credentials") }),
     );
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let (state, app, _temp) =
+        dispatch_fixture_at(&[("dispatch.yml", DISPATCH_WORKFLOW)], Some(&base)).await;
 
     let (status, _) = post_json(
         &app,
@@ -1566,8 +1583,8 @@ async fn all_repositories_installation_needs_no_repository_list() {
     permissions.insert("actions".to_owned(), json!("admin"));
     let stub = installation_stub(Arc::clone(&calls), permissions, "all", &["octocat/repo"]);
     let (base, handle) = spawn_github_stub(stub).await;
-    let _env = pin_api_base(&base).await;
-    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let (state, app, _temp) =
+        dispatch_fixture_at(&[("dispatch.yml", DISPATCH_WORKFLOW)], Some(&base)).await;
 
     let (status, body) = post_json(
         &app,
@@ -2367,10 +2384,9 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
 /// Two registered Apps with distinct webhook secrets and exact-repository
 /// installation answers served by the loopback stub.
 ///
-/// `api_base` is the stub's base: callers start the stub (and pin the env
-/// var) before building the fixture, and the base is written into the
-/// state's resolved URLs because the coverage lookup reads the address
-/// from state, not from the environment at request time.
+/// `api_base` is the stub's base, written into the state's resolved URLs
+/// because the coverage lookup reads the address from state, not from the
+/// environment at request time.
 async fn webhook_coverage_fixture(api_base: &str) -> (tempfile::TempDir, AppState, Router) {
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().join("state")).await.unwrap();
@@ -2397,7 +2413,6 @@ fn coverage_installation(app_id: u64) -> Value {
 #[tokio::test]
 async fn signed_lifecycle_events_invalidate_only_their_own_app_coverage() {
     let stub = WebhookCoverageStub::start(false).await;
-    let _env = pin_api_base(&stub.base).await;
     let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
 
@@ -2494,7 +2509,6 @@ async fn signed_lifecycle_events_invalidate_only_their_own_app_coverage() {
 #[tokio::test]
 async fn lifecycle_suspension_and_deletion_deny_the_next_delivery() {
     let stub = WebhookCoverageStub::start(false).await;
-    let _env = pin_api_base(&stub.base).await;
     let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
 
@@ -2554,7 +2568,6 @@ async fn lifecycle_suspension_and_deletion_deny_the_next_delivery() {
 #[tokio::test]
 async fn adding_a_repository_invalidates_its_previous_answer() {
     let stub = WebhookCoverageStub::start(false).await;
-    let _env = pin_api_base(&stub.base).await;
     let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
 
     // First delivery sees a definitive 404 and is denied; the 404 is not
@@ -2600,7 +2613,6 @@ async fn adding_a_repository_invalidates_its_previous_answer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_positive_after_invalidation_neither_repopulates_nor_authorizes() {
     let stub = WebhookCoverageStub::start(true).await;
-    let _env = pin_api_base(&stub.base).await;
     let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
 
@@ -2656,7 +2668,6 @@ async fn slow_positive_after_invalidation_neither_repopulates_nor_authorizes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn simultaneous_webhook_deliveries_coalesce_by_repository() {
     let stub = WebhookCoverageStub::start(true).await;
-    let _env = pin_api_base(&stub.base).await;
     let (_temp, state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
     stub.set("org-a/other", 200, coverage_installation(424));
@@ -2720,7 +2731,6 @@ async fn simultaneous_webhook_deliveries_coalesce_by_repository() {
 #[tokio::test]
 async fn unusable_coverage_answers_are_retried_not_cached() {
     let stub = WebhookCoverageStub::start(false).await;
-    let _env = pin_api_base(&stub.base).await;
     let (_temp, _state, app) = webhook_coverage_fixture(&stub.base).await;
 
     for (status, body) in [
@@ -2760,7 +2770,6 @@ async fn unusable_coverage_answers_are_retried_not_cached() {
 #[tokio::test]
 async fn verified_signer_is_persisted_for_durable_processing() {
     let stub = WebhookCoverageStub::start(false).await;
-    let _env = pin_api_base(&stub.base).await;
     let (_temp, state, app) = webhook_coverage_fixture(&stub.base).await;
     stub.set("org-a/repo", 200, coverage_installation(424));
 

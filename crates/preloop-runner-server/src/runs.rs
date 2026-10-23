@@ -503,13 +503,17 @@ async fn pat_oauth_scopes(state: &crate::state::AppState, pat: &str) -> PatScope
     // a live 401 and a `403 refusing to embed an invalid PAT`. Unverifiable
     // scopes are already a handled outcome — the PAT is withheld and the run
     // proceeds on the job-scoped runtime token — so tests that need a verdict
-    // set `PRELOOP_GITHUB_API_URL` at their own stub, which this guard leaves
-    // alone.
+    // point the resolved API base at their own stub, which this guard leaves
+    // alone. The guard reads the same resolved base the request below uses
+    // (`state.github_urls`, captured at construction): checking the live
+    // environment instead would let a test that sets `PRELOOP_GITHUB_API_URL`
+    // after building its state pass the guard while the probe still goes to
+    // the default public API.
     #[cfg(any(test, feature = "test-support"))]
-    if std::env::var_os("PRELOOP_GITHUB_API_URL").is_none() {
+    if state.github_urls.api_base() == "https://api.github.com" {
         return PatScopeOutcome::Unverifiable {
             reason: "test-support: PAT scope introspection is disabled for the default GitHub API \
-                     base; point PRELOOP_GITHUB_API_URL at a stub to exercise it"
+                     base; point the API base at a stub to exercise it"
                 .to_owned(),
         };
     }

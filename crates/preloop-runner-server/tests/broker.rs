@@ -3161,7 +3161,7 @@ async fn static_pat_broader_than_declared_permissions_rejects_run() {
     // hash process-wide, so sharing one value across tests would leak cached
     // scopes between them.
     std::fs::write(&config_path, "[github]\npat = \"broad-pat\"\n").unwrap();
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+    let mut state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
         .await
         .unwrap();
     assert!(
@@ -3185,7 +3185,10 @@ async fn static_pat_broader_than_declared_permissions_rejects_run() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    // Install the stub base into the state's resolved URLs: the scope probe
+    // reads the base captured in `github_urls`, so setting the env var here
+    // (after construction) would leave the probe aimed at the public API.
+    state.github_urls.api_url = api_base.clone();
 
     let shared = Arc::new(SharedState {
         state: state.clone(),
@@ -3221,7 +3224,7 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"narrow-pat\"\n").unwrap();
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+    let mut state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
         .await
         .unwrap();
     assert!(
@@ -3243,7 +3246,9 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    // Install the stub base into the state's resolved URLs, as in the
+    // broader-PAT test above: the probe reads `github_urls`, not the env.
+    state.github_urls.api_url = api_base.clone();
 
     let shared = Arc::new(SharedState {
         state: state.clone(),
@@ -3307,10 +3312,16 @@ async fn static_pat_reaches_a_job_claimed_after_the_scope_cache_expired() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"queued-pat\"\n").unwrap();
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+    let mut state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
         .await
         .unwrap();
     let _api_url = live_pat_scope_api("").await;
+    // The helper points the env var at the stub, but this state was built
+    // before that; install the same base into the state's resolved URLs,
+    // which is where the scope probe (at submit and again at acquire)
+    // reads it from. The env lock above makes the read-back deterministic.
+    state.github_urls.api_url =
+        std::env::var("PRELOOP_GITHUB_API_URL").expect("live_pat_scope_api sets the stub base");
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown: CancellationToken::new(),
