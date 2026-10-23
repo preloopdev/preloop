@@ -1,7 +1,7 @@
 use super::*;
 use futures::StreamExt;
 use preloop_gha_protocol::azdo::{
-    ActionDownloadInfo, ActionDownloadInfoCollection, ActionReferenceList,
+    ActionDownloadInfo, ActionDownloadInfoCollection, ActionReference, ActionReferenceList,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -688,8 +688,84 @@ pub fn action_download_ticket(
 pub const MAX_ACTION_BATCH_SIZE: usize = 256;
 /// Maximum concurrent outbound GitHub ref resolution requests.
 pub const MAX_ACTION_CONCURRENCY: usize = 16;
+/// Most manifests one adjudication fetches from GitHub. Manifests already in
+/// the nested-uses memo cost nothing; only uncached reads draw on this budget.
+/// A manifest past the budget is not read, so whatever only it would authorize
+/// stays denied for this wave and is retried on the next one.
+const MAX_MANIFEST_FETCHES_PER_ADJUDICATION: usize = 256;
+/// Most subdirectories one adjudication fans out to for one repository at one
+/// ref: those the workflow declares or a manifest names, for a request that
+/// names no directory. A request's own directory, the root manifest and ledger
+/// seeds are not counted, and the fetch budget bounds the reads either way.
+const MAX_MANIFEST_DIRECTORIES_PER_REF: usize = 64;
 
 type ResolvedActionParts = (String, String, String, Option<String>, String);
+
+/// A remote action named by a workflow or a composite manifest: its
+/// `owner/repo` scope (lowercased) and the directory holding its manifest
+/// (`None` at the repository root). Keeping the directory type-level makes
+/// every hop that carries an action — workflow, nested manifest, request,
+/// ledger — carry the manifest location with it.
+pub(crate) type ManifestAction = (String, Option<String>);
+
+/// One manifest to read: `owner/repo`, the ref it is read at, and its
+/// directory (`None` at the repository root).
+type ManifestSource = (String, String, Option<String>);
+
+/// Which manifest directory an action request names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RequestedDirectory {
+    /// No path. The request may be for the repository root or for any subpath
+    /// the run declares or a manifest names, so all of those are read.
+    Unspecified,
+    /// A path that cannot be fetched safely. Only the root manifest is read,
+    /// the conservative answer the reference alone gives.
+    Root,
+    /// The manifest directory the request names.
+    Subpath(String),
+}
+
+/// One action reference a runner asked to resolve, normalized from either
+/// protocol shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ActionRequest {
+    /// The reference the resolver keys and mints a ticket for. A
+    /// `runnerresolve` reference may already carry a subpath.
+    action: String,
+    /// The ref override the request supplied; `None` when `action` embeds it.
+    version: Option<String>,
+    /// The manifest directory the request names.
+    directory: RequestedDirectory,
+}
+
+impl ActionRequest {
+    fn new(action: String, version: Option<String>) -> Self {
+        let directory = match reference_subpath(&action) {
+            Some(path) => requested_directory(&path),
+            None => RequestedDirectory::Unspecified,
+        };
+        Self {
+            action,
+            version,
+            directory,
+        }
+    }
+
+    /// Build from the official `ActionDownloadInfo` reference, whose `path`
+    /// names the subdirectory of a composite action's manifest. An empty path
+    /// names nothing; an unsafe one falls back to the root manifest.
+    fn from_reference(reference: ActionReference) -> Option<Self> {
+        if reference.name_with_owner.is_empty() {
+            return None;
+        }
+        let version = (!reference.r#ref.is_empty()).then_some(reference.r#ref);
+        let mut request = Self::new(reference.name_with_owner, version);
+        if let Some(path) = reference.path.as_deref().filter(|path| !path.is_empty()) {
+            request.directory = requested_directory(path);
+        }
+        Some(request)
+    }
+}
 
 pub async fn collect_runnerresolve_refs(
     shared: &SharedState,
@@ -700,7 +776,7 @@ pub async fn collect_runnerresolve_refs(
     actions: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), ApiError> {
     let state = &shared.state;
-    let mut requests: Vec<(String, Option<String>)> = Vec::new();
+    let mut requests: Vec<ActionRequest> = Vec::new();
     collect_runnerresolve_requests(value, &mut requests);
     let mut seen = std::collections::HashSet::new();
     requests.retain(|request| seen.insert(request.clone()));
@@ -711,8 +787,8 @@ pub async fn collect_runnerresolve_refs(
     extend_with_local_composites(shared, run_id, &mut declared, &requests).await?;
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
-    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        resolve_action_download_parts(state, &action, version.as_deref()).await
+    let stream = futures::stream::iter(requests.into_iter().map(|request| async move {
+        resolve_action_download_parts(state, &request.action, request.version.as_deref()).await
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
@@ -747,18 +823,16 @@ pub async fn collect_action_download_infos(
     value: &serde_json::Value,
 ) -> Result<ActionDownloadInfoCollection, ApiError> {
     let state = &shared.state;
-    let mut requests: Vec<(String, Option<String>)> = Vec::new();
+    let mut requests: Vec<ActionRequest> = Vec::new();
     if let Ok(list) = serde_json::from_value::<ActionReferenceList>(value.clone()) {
-        for item in list.actions.into_iter() {
-            if !item.name_with_owner.is_empty() {
-                let ref_opt = if item.r#ref.is_empty() {
-                    None
-                } else {
-                    Some(item.r#ref)
-                };
-                requests.push((item.name_with_owner, ref_opt));
-            }
-        }
+        // The official reference carries the composite action's subdirectory
+        // in `path`; keep it, or the manifest of `owner/repo/sub@ref` is read
+        // from the repository root and its nested `uses:` are denied.
+        requests.extend(
+            list.actions
+                .into_iter()
+                .filter_map(ActionRequest::from_reference),
+        );
     } else {
         collect_runnerresolve_requests(value, &mut requests);
     }
@@ -771,8 +845,8 @@ pub async fn collect_action_download_infos(
     extend_with_local_composites(shared, run_id, &mut declared, &requests).await?;
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
-    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        resolve_action_download_parts(state, &action, version.as_deref()).await
+    let stream = futures::stream::iter(requests.into_iter().map(|request| async move {
+        resolve_action_download_parts(state, &request.action, request.version.as_deref()).await
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
@@ -834,6 +908,61 @@ pub fn normalize_action_owner_repo(uses: &str) -> Option<String> {
     Some(format!("{}/{}", owner.to_lowercase(), repo.to_lowercase()))
 }
 
+/// The repository subdirectory holding a remote action's manifest.
+///
+/// A step may name a composite action stored in a subdirectory
+/// (`owner/repo/.github/setup@ref`); its `action.yml` sits beside that path,
+/// not at the repository root. Returns `None` for root actions and for
+/// paths that cannot be fetched safely (dynamic expressions, `.`/`..`
+/// segments): the conservative answer is the root manifest, which never
+/// authorizes anything the reference did not already name.
+fn action_manifest_directory(uses: &str) -> Option<String> {
+    reference_subpath(uses).and_then(|path| manifest_directory_from_path(&path))
+}
+
+/// The path after `owner/repo` in a `uses:`-style reference, before any `@ref`.
+/// `None` when the reference names only the repository.
+fn reference_subpath(reference: &str) -> Option<String> {
+    let repo_part = reference.split('@').next().unwrap_or(reference);
+    let mut segments = repo_part.split('/');
+    segments.next()?;
+    segments.next()?;
+    let path: Vec<&str> = segments.collect();
+    (!path.is_empty()).then(|| path.join("/"))
+}
+
+/// Classify a manifest path a reference names.
+fn requested_directory(path: &str) -> RequestedDirectory {
+    match manifest_directory_from_path(path) {
+        Some(directory) => RequestedDirectory::Subpath(directory),
+        None => RequestedDirectory::Root,
+    }
+}
+
+/// Normalize a repository-relative directory from a `uses:` path or an
+/// `ActionDownloadInfo` reference's `path`.
+///
+/// A directory that cannot be fetched safely (any empty segment, so leading,
+/// trailing and doubled slashes too, or `.`/`..` segments, dynamic expressions,
+/// backslashes, NUL) yields `None`; callers fall back to the root manifest,
+/// which never authorizes anything the reference did not already name.
+fn manifest_directory_from_path(path: &str) -> Option<String> {
+    let mut directory: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.contains('\\')
+            || segment.contains('\0')
+            || segment.contains("${{")
+        {
+            return None;
+        }
+        directory.push(segment);
+    }
+    Some(directory.join("/"))
+}
+
 /// Normalize a bare `owner/repo` slug (e.g. the run's repository) to its
 /// lowercased form, or `None` when it is not exactly two clean segments.
 fn normalize_repo_slug(slug: &str) -> Option<String> {
@@ -862,6 +991,49 @@ fn normalize_repo_slug(slug: &str) -> Option<String> {
 /// own limit, so the allowlist sees the same tree the expander did.
 const DECLARED_ACTION_REUSABLE_DEPTH: usize = preloop_gha_parser::MAX_REUSABLE_WORKFLOW_DEPTH;
 
+/// The run's directly declared action scopes plus the subdirectories that
+/// hold the manifests of subpath composite actions among them.
+///
+/// The download request names only `owner/repo`; the path after it lives in
+/// the workflow's `uses:` line. Keeping it here is what lets a later wave
+/// fetch `path/action.yml` for a declared composite such as
+/// `TanStack/config/.github/setup@ref`. A scope named both at its root and at
+/// a subpath keeps both forms: each manifest authorizes its own nested uses,
+/// and dropping either one denies the actions only it names.
+#[derive(Debug, Default)]
+struct DeclaredActions {
+    scopes: BTreeSet<String>,
+    directories: BTreeMap<String, BTreeSet<Option<String>>>,
+}
+
+impl DeclaredActions {
+    /// Declare `scope`, recording the directory of the manifest this
+    /// reference names (`None` for the repository root).
+    fn insert(&mut self, scope: String, directory: Option<String>) {
+        self.directories
+            .entry(scope.clone())
+            .or_default()
+            .insert(directory);
+        self.scopes.insert(scope);
+    }
+
+    /// The manifest directories declared for `scope`. `None` for a scope
+    /// declared without step-level detail (a reusable-workflow callee, the
+    /// run's own repository): only the repository root is known.
+    fn directories_for(&self, scope: &str) -> Option<&BTreeSet<Option<String>>> {
+        self.directories.get(scope)
+    }
+}
+
+impl From<BTreeSet<String>> for DeclaredActions {
+    fn from(scopes: BTreeSet<String>) -> Self {
+        Self {
+            scopes,
+            directories: BTreeMap::new(),
+        }
+    }
+}
+
 /// The actions a run may download, named directly by its workflow: every
 /// `owner/repo` in a step `uses:` or a job-level reusable `uses:`
 /// (transitively through local and already-fetched remote callee YAML),
@@ -875,8 +1047,8 @@ fn direct_declared_actions(
     workflow_yaml: &str,
     reusable_workflows: &BTreeMap<String, String>,
     repository: &str,
-) -> BTreeSet<String> {
-    let mut declared = BTreeSet::new();
+) -> DeclaredActions {
+    let mut declared = DeclaredActions::default();
     let workflow = match preloop_gha_parser::parse_workflow(workflow_yaml) {
         Ok(workflow) => workflow,
         Err(error) => {
@@ -886,7 +1058,7 @@ fn direct_declared_actions(
     };
     // `$/path` self-references resolve to the workflow's own repository.
     if let Some(slug) = normalize_repo_slug(repository) {
-        declared.insert(slug);
+        declared.insert(slug, None);
     }
     let mut visited = BTreeMap::new();
     collect_workflow_declared(
@@ -902,7 +1074,7 @@ fn direct_declared_actions(
 fn collect_workflow_declared(
     workflow: &preloop_gha_parser::Workflow,
     reusable_workflows: &BTreeMap<String, String>,
-    declared: &mut BTreeSet<String>,
+    declared: &mut DeclaredActions,
     visited: &mut BTreeMap<String, usize>,
     depth: usize,
 ) {
@@ -912,10 +1084,11 @@ fn collect_workflow_declared(
     for job in workflow.jobs.values() {
         // A job-level `uses:` is a reusable-workflow call: the callee repo
         // is declared, and the callee's own steps are too (recurse into the
-        // callee YAML stashed on the submission at submit time).
+        // callee YAML stashed on the submission at submit time). Its path is
+        // a workflow file, not a composite manifest directory.
         if let Some(uses) = job.uses.as_deref() {
             if let Some(owner_repo) = normalize_action_owner_repo(uses) {
-                declared.insert(owner_repo);
+                declared.scopes.insert(owner_repo);
             }
             if walk_callee_at(visited, uses, depth)
                 && let Some(yaml) = reusable_callee_yaml(uses, reusable_workflows)
@@ -934,7 +1107,11 @@ fn collect_workflow_declared(
             if let Some(uses) = step.uses.as_deref()
                 && let Some(owner_repo) = normalize_action_owner_repo(uses)
             {
-                declared.insert(owner_repo);
+                // `None` records a root declaration; a subpath records the
+                // directory that holds that action's manifest. Both are kept,
+                // so `owner/repo@v1` and `owner/repo/sub@v1` in one workflow
+                // each keep authorizing their own nested uses.
+                declared.insert(owner_repo, action_manifest_directory(uses));
             }
         }
     }
@@ -972,7 +1149,7 @@ fn reusable_callee_yaml<'a>(
 async fn declared_actions_for_plan(
     shared: &SharedState,
     plan_id: &str,
-) -> Result<(RunId, BTreeSet<String>), ApiError> {
+) -> Result<(RunId, DeclaredActions), ApiError> {
     let state = &shared.state;
     use crate::control::backend::RequestKey;
     let run_id = match state
@@ -1000,7 +1177,7 @@ async fn declared_actions_for_runnerresolve(
     shared: &SharedState,
     orchestration_id: &str,
     job_id: &str,
-) -> Result<(RunId, BTreeSet<String>), ApiError> {
+) -> Result<(RunId, DeclaredActions), ApiError> {
     let state = &shared.state;
     use crate::control::backend::RequestKey;
     let mut run_id = None;
@@ -1040,7 +1217,7 @@ async fn declared_actions_for_runnerresolve(
 async fn declared_actions_for_run_id(
     shared: &SharedState,
     run_id: RunId,
-) -> Result<BTreeSet<String>, ApiError> {
+) -> Result<DeclaredActions, ApiError> {
     let state = &shared.state;
     let run = state
         .backend
@@ -1058,20 +1235,24 @@ async fn declared_actions_for_run_id(
 
 /// Add the remote actions a run's local composites reach to `declared`, but only
 /// when a request names a remote action the workflow does not declare directly.
-/// Ordinary jobs never pay for the manifest traversal.
+/// Ordinary jobs never pay for the manifest traversal. Each action keeps the
+/// directory of its manifest, so a local composite naming
+/// `owner/repo/sub@ref` still points the next wave at `sub/action.yml`.
 async fn extend_with_local_composites(
     shared: &SharedState,
     run_id: RunId,
-    declared: &mut BTreeSet<String>,
-    requests: &[(String, Option<String>)],
+    declared: &mut DeclaredActions,
+    requests: &[ActionRequest],
 ) -> Result<(), ApiError> {
-    let undeclared = requests.iter().any(|(action, _)| {
-        normalize_action_owner_repo(action)
-            .is_some_and(|owner_repo| !declared.contains(&owner_repo))
+    let undeclared = requests.iter().any(|request| {
+        normalize_action_owner_repo(&request.action)
+            .is_some_and(|owner_repo| !declared.scopes.contains(&owner_repo))
     });
     if undeclared {
         let local = local_composite_declared_for_run(shared, run_id).await?;
-        declared.extend(local.iter().cloned());
+        for (scope, directory) in local.iter() {
+            declared.insert(scope.clone(), directory.clone());
+        }
     }
     Ok(())
 }
@@ -1082,7 +1263,7 @@ async fn extend_with_local_composites(
 async fn local_composite_declared_for_run(
     shared: &SharedState,
     run_id: RunId,
-) -> Result<Arc<BTreeSet<String>>, ApiError> {
+) -> Result<Arc<BTreeSet<ManifestAction>>, ApiError> {
     let state = &shared.state;
     if let Ok(memo) = state.local_composite_declared.lock()
         && let Some(cached) = memo.get(&run_id)
@@ -1176,16 +1357,17 @@ enum LocalManifests<'a> {
     },
 }
 
-/// The nested `uses:` of one composite manifest: remote `owner/repo` scopes,
-/// then the local `./`, `../`, and `$/` references to resolve in the tree.
-type NestedUses = (BTreeSet<String>, Vec<String>);
+/// The nested `uses:` of one composite manifest: remote actions (scope and
+/// manifest directory), then the local `./`, `../`, and `$/` references to
+/// resolve in the tree.
+type NestedUses = (BTreeSet<ManifestAction>, Vec<String>);
 
 /// The remote actions a run's local composites reach. `complete` is false when
 /// GitHub could not answer for some path: that answer serves this request only
 /// and is not remembered for the run.
 #[derive(Default)]
 struct LocalDeclared {
-    actions: BTreeSet<String>,
+    actions: BTreeSet<ManifestAction>,
     complete: bool,
 }
 
@@ -1996,50 +2178,65 @@ async fn read_snapshot_file(
     Ok(Some(bytes))
 }
 
-/// Nested `uses:` scopes from a composite action's manifest, memoized per
-/// (`owner`, `repo`, `ref`). Only definitive answers are cached (see
-/// [`ActionManifestNestedUses`]); a transient failure returns an empty set
-/// uncached so the next adjudication retries.
+/// Nested `uses:` of a composite action's manifest, memoized per
+/// (`owner`, `repo`, `ref`, directory). Each nested action keeps the directory
+/// holding its own manifest. Only definitive answers are cached (see
+/// [`ActionManifestNestedUses`]); a transient failure answers empty uncached so
+/// the next adjudication retries. A manifest that is neither cached nor within
+/// `fetches_left` is not read, and `None` tells the caller it was skipped.
 async fn nested_action_uses(
     state: &AppState,
     owner: &str,
     repo: &str,
+    directory: Option<&str>,
     git_ref: &str,
-) -> BTreeSet<String> {
+    fetches_left: &mut usize,
+) -> Option<BTreeSet<ManifestAction>> {
     let key = (
         owner.to_lowercase(),
         repo.to_lowercase(),
         git_ref.to_owned(),
+        directory.unwrap_or_default().to_owned(),
     );
     if let Ok(cache) = state.action_manifest_nested_uses.lock()
         && let Some(cached) = cache.get(&key)
     {
-        return cached.clone();
+        return Some(cached.clone());
     }
-    // A transient failure yields `None`: fail closed for this adjudication
-    // without poisoning the cache — the next wave retries the fetch.
+    if *fetches_left == 0 {
+        return None;
+    }
+    *fetches_left -= 1;
+    // A transient failure yields an empty answer for this adjudication without
+    // poisoning the cache — the next wave retries the fetch.
     // Definitive answers (even empty: a non-composite action, or a repo
     // with no manifest, never grows nested uses at this ref) are cached.
-    let Some(nested) = fetch_action_manifest_nested_uses(state, owner, repo, git_ref).await else {
-        return BTreeSet::new();
+    let Some(nested) =
+        fetch_action_manifest_nested_uses(state, owner, repo, directory, git_ref).await
+    else {
+        return Some(BTreeSet::new());
     };
     if let Ok(mut cache) = state.action_manifest_nested_uses.lock() {
+        if cache.len() >= crate::state::MAX_ACTION_MANIFEST_MEMO {
+            cache.clear();
+        }
         cache.insert(key, nested.clone());
     }
-    nested
+    Some(nested)
 }
 
-/// Fetch `action.yml`/`action.yaml` for (`owner`, `repo`, `ref`) through
-/// the forge contents API and extract nested `uses:` scopes when the action
-/// is composite. Returns `None` on transient failures (not cached);
-/// `Some` (possibly empty) for definitive answers: a manifest was read, or
-/// no manifest exists (404), or the forge definitively refused.
+/// Fetch `action.yml`/`action.yaml` at `directory` for (`owner`, `repo`,
+/// `ref`) through the forge contents API and extract its nested `uses:` when
+/// the action is composite. Returns `None` on transient failures (not
+/// cached); `Some` (possibly empty) for definitive answers: a manifest was
+/// read, or no manifest exists (404), or the forge definitively refused.
 async fn fetch_action_manifest_nested_uses(
     state: &AppState,
     owner: &str,
     repo: &str,
+    directory: Option<&str>,
     git_ref: &str,
-) -> Option<BTreeSet<String>> {
+) -> Option<BTreeSet<ManifestAction>> {
     // The (owner, repo) pair reaching here was already resolved for this run
     // (it is in the run's declared set or was admitted through it), so
     // fetching its manifest spends quota the run's own execution would
@@ -2047,9 +2244,17 @@ async fn fetch_action_manifest_nested_uses(
     let api_base = state.github_urls.api_url.trim_end_matches('/').to_owned();
     let enc_owner = percent_encode_path_segment(owner);
     let enc_repo = percent_encode_path_segment(repo);
+    let directory_prefix = directory.map_or_else(String::new, |directory| {
+        let encoded = directory
+            .split('/')
+            .map(percent_encode_path_segment)
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{encoded}/")
+    });
     for manifest in ["action.yml", "action.yaml"] {
         let url = format!(
-            "{api_base}/repos/{enc_owner}/{enc_repo}/contents/{manifest}?ref={}",
+            "{api_base}/repos/{enc_owner}/{enc_repo}/contents/{directory_prefix}{manifest}?ref={}",
             percent_encode_path_segment(git_ref)
         );
         let mut request = crate::shared_http::CLIENT.get(&url);
@@ -2115,7 +2320,7 @@ fn yaml_get<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yam
 /// action manifest. Only composite actions (`runs.using: composite`) can
 /// nest remote `uses:`; anything else — Node/Docker actions, unparseable
 /// bodies — yields an empty set.
-fn manifest_nested_uses(body: &serde_json::Value) -> BTreeSet<String> {
+fn manifest_nested_uses(body: &serde_json::Value) -> BTreeSet<ManifestAction> {
     contents_manifest_bytes(body).map_or_else(BTreeSet::new, |decoded| {
         manifest_nested_uses_from_yaml(&decoded).0
     })
@@ -2152,7 +2357,9 @@ fn contents_file_bytes(body: &serde_json::Value) -> Option<Vec<u8>> {
 /// Extract remote and local nested `uses:` references from a composite action
 /// manifest. Local references are returned separately so callers can resolve
 /// them against a checked-out tree rather than treating them as repositories.
-fn manifest_nested_uses_from_yaml(decoded: &[u8]) -> (BTreeSet<String>, Vec<String>) {
+/// A remote reference keeps its subpath, so `owner/repo/sub@ref` points the
+/// next wave at `sub/action.yml` instead of the repository root.
+fn manifest_nested_uses_from_yaml(decoded: &[u8]) -> (BTreeSet<ManifestAction>, Vec<String>) {
     let mut nested = BTreeSet::new();
     let mut local = Vec::new();
     let manifest: serde_yaml::Value = match serde_yaml::from_slice(decoded) {
@@ -2176,7 +2383,7 @@ fn manifest_nested_uses_from_yaml(decoded: &[u8]) -> (BTreeSet<String>, Vec<Stri
             continue;
         };
         if let Some(owner_repo) = normalize_action_owner_repo(uses) {
-            nested.insert(owner_repo);
+            nested.insert((owner_repo, action_manifest_directory(uses)));
         } else if uses.starts_with("./") || uses.starts_with("../") || uses.starts_with("$/") {
             local.push(uses.to_owned());
         }
@@ -2184,109 +2391,143 @@ fn manifest_nested_uses_from_yaml(decoded: &[u8]) -> (BTreeSet<String>, Vec<Stri
     (nested, local)
 }
 
+/// One action request that names a remote action, with its place in the batch.
+struct RemoteRequest {
+    index: usize,
+    scope: String,
+    git_ref: String,
+    directory: RequestedDirectory,
+}
+
 /// Enforce the run's declared-action allowlist on one resolution batch.
 ///
-/// Every requested remote action must be in `declared`, or be nested inside
-/// the manifest of an action this run already resolved (the transitive
-/// composite closure: a composite action's nested `uses:` arrive in later
-/// waves, after the parent's own download, so they cannot be in the
-/// workflow's direct set). Anything else fails the whole batch with 403 —
-/// no ticket is minted for an undeclared action, closing the download
-/// oracle.
+/// Every requested remote action must be declared in the workflow, or be named
+/// by a manifest this run reads. A composite action's nested `uses:` arrive in
+/// later waves, after the parent's own download, so the closure starts from the
+/// manifests the run's earlier waves recorded on its ledger. Anything else
+/// fails the whole batch with 403: no ticket is minted for an undeclared
+/// action, closing the download oracle.
 ///
-/// Requests that are not remote actions (local `./`, `docker://`,
-/// self-repo `$/`, expression-driven) are left to the resolver, which drops
-/// them exactly as before: they can never mint a ticket.
+/// A repository is admitted only when the workflow or a manifest already read
+/// names it. A directory only selects which manifest of an admitted repository
+/// is read: a request names its directory, and a request that names none reads
+/// the root and every directory the run knows for its repository. Each such
+/// directory is read at every ref the run works with, so a subdirectory named
+/// by a manifest is read even when the request for its repository came in an
+/// earlier wave.
 ///
-/// On success, this batch's admitted (`owner/repo`, `ref`) triples are
-/// recorded on the run's resolution ledger for later waves.
+/// Requests that are not remote actions (local `./`, `docker://`, self-repo `$/`,
+/// expression-driven) are left to the resolver, which drops them exactly as
+/// before: they can never mint a ticket.
+///
+/// On success, this batch's manifest reads are recorded on the run's resolution
+/// ledger for later waves.
 async fn enforce_declared_actions(
     state: &AppState,
     run_id: RunId,
-    declared: &BTreeSet<String>,
-    requests: &[(String, Option<String>)],
+    declared: &DeclaredActions,
+    requests: &[ActionRequest],
 ) -> Result<(), ApiError> {
-    // (batch index, owner/repo, ref) for requests naming a remote action.
-    let mut remote: Vec<(usize, String, String)> = Vec::new();
-    for (index, (action, version)) in requests.iter().enumerate() {
-        if let Some(owner_repo) = normalize_action_owner_repo(action) {
-            remote.push((index, owner_repo, version.clone().unwrap_or_default()));
-        }
-    }
-
-    let mut admitted: BTreeSet<usize> = BTreeSet::new();
-    // (`owner/repo`, `ref`) triples whose manifests may authorize nested
-    // uses: this batch's direct hits plus earlier batches' ledger.
-    let mut manifest_sources: Vec<(String, String)> = Vec::new();
-    for (index, owner_repo, git_ref) in &remote {
-        if declared.contains(owner_repo) {
-            admitted.insert(*index);
-            manifest_sources.push((owner_repo.clone(), git_ref.clone()));
-        }
-    }
-
-    // Fast path: everything directly declared — no manifest fetch needed.
-    // The transitive closure below only runs when some request is not
-    // directly declared, so ordinary job setups never pay for it.
-    let mut unadmitted: Vec<(usize, String, String)> = remote
+    let remote: Vec<RemoteRequest> = requests
         .iter()
-        .filter(|(index, _, _)| !admitted.contains(index))
-        .cloned()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            Some(RemoteRequest {
+                index,
+                scope: normalize_action_owner_repo(&request.action)?,
+                git_ref: request.version.clone().unwrap_or_default(),
+                directory: request.directory.clone(),
+            })
+        })
         .collect();
-    if !unadmitted.is_empty() {
-        // Seed cross-batch sources: nested refs arrive in later waves, after
-        // the parent's own download, so earlier batches' ledger entries must
-        // be consultable here.
-        if let Ok(ledger) = state.action_resolved_uses.lock()
-            && let Some(prior) = ledger.get(&run_id)
-        {
-            manifest_sources.extend(prior.iter().cloned());
+
+    // Directly declared requests are admitted now.
+    let mut admitted: BTreeSet<usize> = remote
+        .iter()
+        .filter(|request| declared.scopes.contains(&request.scope))
+        .map(|request| request.index)
+        .collect();
+    // Directories found named by the manifests this adjudication has read,
+    // per repository.
+    let mut named: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+    let mut sources = ManifestSources::default();
+    push_working_sources(&mut sources, &remote, &admitted, declared, &named, &[]);
+
+    // Fast path: everything directly declared, so no manifest is read here.
+    // The closure only runs when some request is not directly declared, so
+    // ordinary job setups never pay for it.
+    if remote
+        .iter()
+        .any(|request| !admitted.contains(&request.index))
+    {
+        let seeds: Vec<ManifestSource> = state
+            .action_resolved_uses
+            .lock()
+            .ok()
+            .and_then(|ledger| ledger.get(&run_id).cloned())
+            .unwrap_or_default();
+        for (scope, git_ref, directory) in &seeds {
+            sources.push(scope, git_ref, directory.clone());
         }
-        // Transitive composite closure, to a fixpoint within the batch: each
-        // newly admitted action's manifest may admit further nested actions.
-        let mut checked: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut fetches_left = MAX_MANIFEST_FETCHES_PER_ADJUDICATION;
+        let mut checked: BTreeSet<ManifestSource> = BTreeSet::new();
+        // Fixpoint: admitting a request can queue manifests whose nested uses
+        // admit further requests, so repeat until no new manifest is queued.
         loop {
-            let mut nested_union: BTreeSet<String> = BTreeSet::new();
-            let mut newly_checked = false;
-            for (owner_repo, git_ref) in &manifest_sources {
-                if !checked.insert((owner_repo.clone(), git_ref.clone())) {
-                    continue;
+            for request in &remote {
+                if !admitted.contains(&request.index) && named.contains_key(&request.scope) {
+                    admitted.insert(request.index);
                 }
-                newly_checked = true;
+            }
+            push_working_sources(&mut sources, &remote, &admitted, declared, &named, &seeds);
+            let pending: Vec<ManifestSource> = sources
+                .entries
+                .iter()
+                .filter(|source| !checked.contains(*source))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for source in pending {
+                checked.insert(source.clone());
+                let (scope, git_ref, directory) = source;
                 // `normalize_action_owner_repo` always yields `owner/repo`.
-                let (owner, repo) = owner_repo
-                    .split_once('/')
-                    .unwrap_or((owner_repo.as_str(), ""));
-                nested_union.extend(nested_action_uses(state, owner, repo, git_ref).await);
-            }
-            if !newly_checked {
-                break;
-            }
-            let mut progressed = false;
-            unadmitted.retain(|(index, owner_repo, git_ref)| {
-                if nested_union.contains(owner_repo) {
-                    admitted.insert(*index);
-                    manifest_sources.push((owner_repo.clone(), git_ref.clone()));
-                    progressed = true;
-                    false
-                } else {
-                    true
+                let (owner, repo) = scope.split_once('/').unwrap_or((scope.as_str(), ""));
+                match nested_action_uses(
+                    state,
+                    owner,
+                    repo,
+                    directory.as_deref(),
+                    &git_ref,
+                    &mut fetches_left,
+                )
+                .await
+                {
+                    Some(nested) => {
+                        for (nested_scope, nested_directory) in nested {
+                            named
+                                .entry(nested_scope)
+                                .or_default()
+                                .insert(nested_directory);
+                        }
+                    }
+                    // Past the fetch budget: this manifest is not read, so what
+                    // it names stays denied this wave.
+                    None => sources.truncated = true,
                 }
-            });
-            if !progressed {
-                break;
             }
         }
     }
 
     let denied: Vec<String> = remote
         .iter()
-        .filter(|(index, _, _)| !admitted.contains(index))
-        .map(|(_, owner_repo, git_ref)| {
-            if git_ref.is_empty() {
-                owner_repo.clone()
+        .filter(|request| !admitted.contains(&request.index))
+        .map(|request| {
+            if request.git_ref.is_empty() {
+                request.scope.clone()
             } else {
-                format!("{owner_repo}@{git_ref}")
+                format!("{}@{}", request.scope, request.git_ref)
             }
         })
         .collect();
@@ -2301,13 +2542,20 @@ async fn enforce_declared_actions(
             denied.join(", ")
         )));
     }
+    if sources.truncated {
+        warn!(
+            run_id = %run_id.0,
+            manifest_sources = sources.entries.len(),
+            "action manifest reads reached this adjudication's limits; nested actions behind unread manifests stay denied"
+        );
+    }
 
-    // Ledger this batch's admitted triples for later waves' closures.
+    // Ledger this batch's manifest reads for later waves' closures.
     if let Ok(mut ledger) = state.action_resolved_uses.lock() {
         let entry = ledger.entry(run_id).or_default();
-        for (index, owner_repo, git_ref) in &remote {
-            if admitted.contains(index) && !entry.contains(&(owner_repo.clone(), git_ref.clone())) {
-                entry.push((owner_repo.clone(), git_ref.clone()));
+        for source in &sources.entries {
+            if !entry.contains(source) {
+                entry.push(source.clone());
             }
         }
         if entry.len() > crate::state::MAX_RESOLVED_USES_PER_RUN {
@@ -2318,13 +2566,105 @@ async fn enforce_declared_actions(
     Ok(())
 }
 
-fn collect_runnerresolve_requests(
-    value: &serde_json::Value,
-    requests: &mut Vec<(String, Option<String>)>,
+/// Queue the manifest reads this adjudication needs.
+///
+/// An admitted request reads the directory it names. A request naming none
+/// reads the root and every directory the workflow declares for its repository.
+/// Every directory found in a manifest read so far is read at each ref the run
+/// works with, the admitted requests' refs and the ledger's, so a subdirectory
+/// named by a manifest is read for any later wave that needs it.
+fn push_working_sources(
+    sources: &mut ManifestSources,
+    remote: &[RemoteRequest],
+    admitted: &BTreeSet<usize>,
+    declared: &DeclaredActions,
+    named: &BTreeMap<String, BTreeSet<Option<String>>>,
+    seeds: &[ManifestSource],
 ) {
+    for request in remote
+        .iter()
+        .filter(|request| admitted.contains(&request.index))
+    {
+        let (scope, git_ref) = (request.scope.as_str(), request.git_ref.as_str());
+        match &request.directory {
+            RequestedDirectory::Subpath(directory) => {
+                sources.push(scope, git_ref, Some(directory.clone()));
+            }
+            RequestedDirectory::Root => sources.push(scope, git_ref, None),
+            RequestedDirectory::Unspecified => {
+                sources.push(scope, git_ref, None);
+                for directory in declared.directories_for(scope).into_iter().flatten() {
+                    sources.push_fanout(scope, git_ref, directory.clone());
+                }
+            }
+        }
+        for directory in named.get(scope).into_iter().flatten() {
+            sources.push_fanout(scope, git_ref, directory.clone());
+        }
+    }
+    for (scope, git_ref, _) in seeds {
+        for directory in named.get(scope).into_iter().flatten() {
+            sources.push_fanout(scope, git_ref, directory.clone());
+        }
+    }
+}
+
+/// The manifests one adjudication reads: deduplicated, and bounded by the
+/// run's ledger. Fan-out subdirectories are also capped per repository and ref
+/// (see [`MAX_MANIFEST_DIRECTORIES_PER_REF`]). A request's own directory, the
+/// root and ledger seeds are not, so a batch naming more subdirectories of one
+/// repository than the fan-out limit still reads each of them.
+#[derive(Default)]
+struct ManifestSources {
+    seen: BTreeSet<ManifestSource>,
+    entries: Vec<ManifestSource>,
+    /// Fan-out subdirectories queued, per repository and ref.
+    fanout_per_ref: BTreeMap<(String, String), usize>,
+    /// A source was dropped by a limit.
+    truncated: bool,
+}
+
+impl ManifestSources {
+    /// Queue a manifest a request, the root, or the ledger names.
+    fn push(&mut self, scope: &str, git_ref: &str, directory: Option<String>) {
+        self.insert(scope, git_ref, directory, false);
+    }
+
+    /// Queue a subdirectory a workflow declares or a manifest names for a
+    /// repository a request admits.
+    fn push_fanout(&mut self, scope: &str, git_ref: &str, directory: Option<String>) {
+        self.insert(scope, git_ref, directory, true);
+    }
+
+    fn insert(&mut self, scope: &str, git_ref: &str, directory: Option<String>, fanout: bool) {
+        let source: ManifestSource = (scope.to_owned(), git_ref.to_owned(), directory);
+        if self.seen.contains(&source) {
+            return;
+        }
+        if self.entries.len() >= crate::state::MAX_RESOLVED_USES_PER_RUN {
+            self.truncated = true;
+            return;
+        }
+        if fanout && source.2.is_some() {
+            let queued = self
+                .fanout_per_ref
+                .entry((scope.to_owned(), git_ref.to_owned()))
+                .or_default();
+            if *queued >= MAX_MANIFEST_DIRECTORIES_PER_REF {
+                self.truncated = true;
+                return;
+            }
+            *queued += 1;
+        }
+        self.seen.insert(source.clone());
+        self.entries.push(source);
+    }
+}
+
+fn collect_runnerresolve_requests(value: &serde_json::Value, requests: &mut Vec<ActionRequest>) {
     match value {
         serde_json::Value::String(raw) => {
-            requests.push((raw.to_owned(), None));
+            requests.push(ActionRequest::new(raw.to_owned(), None));
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -2344,7 +2684,10 @@ fn collect_runnerresolve_requests(
                 .or_else(|| map.get("reference"))
                 .and_then(|v| v.as_str());
             if let Some(action) = action {
-                requests.push((action.to_owned(), version.map(str::to_owned)));
+                requests.push(ActionRequest::new(
+                    action.to_owned(),
+                    version.map(str::to_owned),
+                ));
             }
 
             for nested in map.values() {
@@ -3040,13 +3383,31 @@ jobs:
     uses: octo-org/octo-repo/.github/workflows/ci.yml@v1
 "#;
         let declared = direct_declared_actions(yaml, &BTreeMap::new(), "MyOrg/MyRepo");
-        assert!(declared.contains("actions/checkout"), "{declared:?}");
-        assert!(declared.contains("actions/setup-node"), "{declared:?}");
-        assert!(declared.contains("owner/repo"), "{declared:?}");
-        assert!(declared.contains("octo-org/octo-repo"), "{declared:?}");
+        assert!(declared.scopes.contains("actions/checkout"), "{declared:?}");
+        assert!(
+            declared.scopes.contains("actions/setup-node"),
+            "{declared:?}"
+        );
+        assert!(declared.scopes.contains("owner/repo"), "{declared:?}");
+        assert!(
+            declared.scopes.contains("octo-org/octo-repo"),
+            "{declared:?}"
+        );
         // The workflow's own repo: `$/path` self-references resolve to it.
-        assert!(declared.contains("myorg/myrepo"), "{declared:?}");
-        assert_eq!(declared.len(), 5, "{declared:?}");
+        assert!(declared.scopes.contains("myorg/myrepo"), "{declared:?}");
+        assert_eq!(declared.scopes.len(), 5, "{declared:?}");
+        // A subpath composite keeps the directory that holds its manifest,
+        // and a repository used at its root keeps the root entry too.
+        assert_eq!(
+            declared.directories.get("owner/repo"),
+            Some(&BTreeSet::from([Some("sub/dir".to_owned())])),
+            "{declared:?}"
+        );
+        assert_eq!(
+            declared.directories.get("actions/checkout"),
+            Some(&BTreeSet::from([None])),
+            "{declared:?}"
+        );
     }
 
     /// A corrupt stored workflow fails closed: nothing is declared, so no
@@ -3054,7 +3415,7 @@ jobs:
     #[test]
     fn direct_declared_actions_fails_closed_on_unparseable_yaml() {
         let declared = direct_declared_actions("not: [valid", &BTreeMap::new(), "o/r");
-        assert!(declared.is_empty(), "{declared:?}");
+        assert!(declared.scopes.is_empty(), "{declared:?}");
     }
 
     /// Reusable callees contribute their own steps' actions, transitively.
@@ -3078,11 +3439,11 @@ jobs:
         reusables.insert("reusable/ci.yml".to_string(), callee.to_string());
         let declared = direct_declared_actions(root, &reusables, "o/r");
         assert!(
-            declared.contains("docker/build-push-action"),
+            declared.scopes.contains("docker/build-push-action"),
             "{declared:?}"
         );
-        assert!(declared.contains("o/r"), "{declared:?}");
-        assert_eq!(declared.len(), 2, "{declared:?}");
+        assert!(declared.scopes.contains("o/r"), "{declared:?}");
+        assert_eq!(declared.scopes.len(), 2, "{declared:?}");
     }
 
     /// A caller `top` and five reusable workflows `l1` to `l5` below it, each
@@ -3109,7 +3470,7 @@ jobs:
     fn direct_declared_actions_follow_the_parser_depth() {
         let (top, reusable) = reusable_chain("      - uses: deep/action@v1\n");
         let declared = direct_declared_actions(&top, &reusable, "o/r");
-        assert!(declared.contains("deep/action"), "{declared:?}");
+        assert!(declared.scopes.contains("deep/action"), "{declared:?}");
     }
 
     /// `manifest_nested_uses` extracts nested `uses:` only from composite
@@ -3124,7 +3485,20 @@ jobs:
             "name: composite\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n    - run: echo hi\n",
         );
         let nested = manifest_nested_uses(&composite);
-        assert_eq!(nested, BTreeSet::from(["actions/checkout".to_string()]));
+        assert_eq!(
+            nested,
+            BTreeSet::from([("actions/checkout".to_string(), None)])
+        );
+
+        // A nested subpath composite keeps the directory of its manifest, so
+        // the next wave reads `tools/setup/action.yml`.
+        let nested_subpath = contents_body(
+            "name: composite\nruns:\n  using: composite\n  steps:\n    - uses: b/tools/setup@v1\n",
+        );
+        assert_eq!(
+            manifest_nested_uses(&nested_subpath),
+            BTreeSet::from([("b/tools".to_string(), Some("setup".to_string()))])
+        );
 
         let node = contents_body("name: node\nruns:\n  using: node20\n  main: dist/index.js\n");
         assert!(manifest_nested_uses(&node).is_empty());
@@ -3136,6 +3510,42 @@ jobs:
         assert!(
             manifest_nested_uses(&serde_json::json!({"content": "!!!not-base64!!!"})).is_empty()
         );
+    }
+
+    /// A nested reference cannot smuggle a manifest path out of the
+    /// repository it names: every unsafe segment makes the directory `None`,
+    /// so the fetch falls back to the root manifest instead of an arbitrary
+    /// path, and the reference still names only `b/tools`.
+    #[test]
+    fn nested_reference_directories_cannot_escape_the_repository() {
+        for uses in [
+            "b/tools/../../escape@v1",
+            "b/tools/./x@v1",
+            "b/tools//x@v1",
+            "b/tools/a\\b@v1",
+        ] {
+            // Single-quote the scalar: `${{` would otherwise start a flow
+            // mapping and the whole manifest would fail to parse.
+            let yaml = format!("runs:\n  using: composite\n  steps:\n    - uses: '{uses}'\n");
+            let (nested, _) = manifest_nested_uses_from_yaml(yaml.as_bytes());
+            assert_eq!(
+                nested,
+                BTreeSet::from([("b/tools".to_owned(), None)]),
+                "{uses} must name the repository root"
+            );
+        }
+        // A dynamic directory names no fixed repository path, so the remote
+        // reference is not declared at all: nothing is admitted for it.
+        let dynamic =
+            "runs:\n  using: composite\n  steps:\n    - uses: 'b/tools/${{ matrix.dir }}@v1'\n";
+        assert!(
+            manifest_nested_uses_from_yaml(dynamic.as_bytes())
+                .0
+                .is_empty()
+        );
+        // A NUL cannot travel through YAML at all, so the manifest read fails
+        // closed; the helper itself also refuses the segment.
+        assert_eq!(manifest_directory_from_path("x\0y"), None);
     }
 
     /// Commit `files` as one snapshot and mirror it into a fresh engine state,
@@ -3226,6 +3636,35 @@ jobs:
         format!("runs:\n  using: composite\n  steps:\n{steps}")
     }
 
+    /// A declared allowlist built from remote actions, keeping the manifest
+    /// directory each one was named at.
+    fn scopes(declared: &BTreeSet<ManifestAction>) -> DeclaredActions {
+        let mut declared_actions = DeclaredActions::default();
+        for (scope, directory) in declared {
+            declared_actions.insert(scope.clone(), directory.clone());
+        }
+        declared_actions
+    }
+
+    /// Whether `actions` names `scope` at any manifest directory.
+    fn declares(actions: &BTreeSet<ManifestAction>, scope: &str) -> bool {
+        actions.iter().any(|(action, _)| action == scope)
+    }
+
+    /// A request batch from `(action, ref)` pairs, deriving any subpath the
+    /// action reference itself carries.
+    fn requests(pairs: &[(&str, Option<&str>)]) -> Vec<ActionRequest> {
+        pairs
+            .iter()
+            .map(|(action, version)| {
+                ActionRequest::new((*action).to_owned(), version.map(str::to_owned))
+            })
+            .collect()
+    }
+
+    /// The ref a test's nested action arrives with.
+    const NESTED_REF: &str = "739bfe42ca9233c5e6aca07c1a25a9d34aca49b0";
+
     /// A local composite's remote dependency is read from the immutable
     /// checked-out tree and admitted, while an unrelated action remains
     /// forbidden. This exercises the same allowlist used by runnerresolve.
@@ -3252,23 +3691,29 @@ jobs:
         .await
         .actions;
         assert!(
-            declared.contains("dtolnay/rust-toolchain"),
+            declares(&declared, "dtolnay/rust-toolchain"),
             "local composite dependency must enter the declared set: {declared:?}"
         );
 
-        let allowed = vec![(
-            "dtolnay/rust-toolchain".to_owned(),
-            Some("stable".to_owned()),
-        )];
-        enforce_declared_actions(&state, RunId(uuid::Uuid::new_v4()), &declared, &allowed)
-            .await
-            .expect("local composite dependency should be authorized");
+        let allowed = requests(&[("dtolnay/rust-toolchain", Some("stable"))]);
+        enforce_declared_actions(
+            &state,
+            RunId(uuid::Uuid::new_v4()),
+            &scopes(&declared),
+            &allowed,
+        )
+        .await
+        .expect("local composite dependency should be authorized");
 
-        let denied = vec![("attacker/unlisted".to_owned(), Some("main".to_owned()))];
-        let error =
-            enforce_declared_actions(&state, RunId(uuid::Uuid::new_v4()), &declared, &denied)
-                .await
-                .expect_err("an action absent from workflow and manifests must be denied");
+        let denied = requests(&[("attacker/unlisted", Some("main"))]);
+        let error = enforce_declared_actions(
+            &state,
+            RunId(uuid::Uuid::new_v4()),
+            &scopes(&declared),
+            &denied,
+        )
+        .await
+        .expect_err("an action absent from workflow and manifests must be denied");
         assert_eq!(error.status(), StatusCode::FORBIDDEN);
     }
 
@@ -3309,7 +3754,7 @@ jobs:
         .actions;
         for expected in ["root/inner", "beside/dep", "root/action-dep"] {
             assert!(
-                declared.contains(expected),
+                declares(&declared, expected),
                 "{expected} must enter the declared set: {declared:?}"
             );
         }
@@ -3368,7 +3813,7 @@ jobs:
         .await
         .actions;
         assert!(
-            declared.contains("deep/dep"),
+            declares(&declared, "deep/dep"),
             "deep/dep must enter the declared set: {declared:?}"
         );
     }
@@ -3390,7 +3835,7 @@ jobs:
         snapshot: &crate::snapshots::WorkspaceSnapshot,
         workflow: &str,
         reusable: &BTreeMap<String, String>,
-    ) -> BTreeSet<String> {
+    ) -> BTreeSet<ManifestAction> {
         local_composite_declared_actions(
             &state.shared(),
             LocalManifests::Snapshot(snapshot),
@@ -3412,7 +3857,10 @@ jobs:
         )
         .await;
         let declared = snapshot_declared(&state, &snapshot, SETUP_WORKFLOW, &BTreeMap::new()).await;
-        assert!(declared.contains("dtolnay/rust-toolchain"), "{declared:?}");
+        assert!(
+            declares(&declared, "dtolnay/rust-toolchain"),
+            "{declared:?}"
+        );
     }
 
     /// An action directory that is a symlink to another directory is read where
@@ -3426,7 +3874,10 @@ jobs:
         )
         .await;
         let declared = snapshot_declared(&state, &snapshot, SETUP_WORKFLOW, &BTreeMap::new()).await;
-        assert!(declared.contains("dtolnay/rust-toolchain"), "{declared:?}");
+        assert!(
+            declares(&declared, "dtolnay/rust-toolchain"),
+            "{declared:?}"
+        );
     }
 
     /// A manifest link that resolves outside its action directory is one the
@@ -3475,7 +3926,10 @@ jobs:
         )
         .await;
         let declared = snapshot_declared(&state, &snapshot, SETUP_WORKFLOW, &BTreeMap::new()).await;
-        assert!(declared.contains("dtolnay/rust-toolchain"), "{declared:?}");
+        assert!(
+            declares(&declared, "dtolnay/rust-toolchain"),
+            "{declared:?}"
+        );
     }
 
     /// `uses:` paths are literal: a glob names no entry, so nothing is read.
@@ -3521,7 +3975,7 @@ jobs:
             local_snapshot_fixture(&[(".github/actions/deep/action.yml", setup.as_str())]).await;
         let (top, reusable) = reusable_chain("      - uses: ./.github/actions/deep\n");
         let declared = snapshot_declared(&state, &snapshot, &top, &reusable).await;
-        assert!(declared.contains("deep/action"), "{declared:?}");
+        assert!(declares(&declared, "deep/action"), "{declared:?}");
     }
 
     /// A snapshot made by the production `create_workspace_snapshot` (the one a
@@ -3611,7 +4065,7 @@ jobs:
             "actions/cache",
         ] {
             assert!(
-                declared.actions.contains(expected),
+                declares(&declared.actions, expected),
                 "real snapshot {} must admit {expected}: {:?} complete={}",
                 snapshot.repository,
                 declared.actions,
@@ -3919,7 +4373,7 @@ jobs:
     }
 
     /// The declared set a forge run of `FORGE_WORKFLOW` reaches at `SHA`.
-    async fn forge_declared(shared: &SharedState) -> BTreeSet<String> {
+    async fn forge_declared(shared: &SharedState) -> BTreeSet<ManifestAction> {
         local_composite_declared_actions(
             shared,
             LocalManifests::Forge {
@@ -3953,28 +4407,25 @@ jobs:
         let shared = &fixture.shared;
         let declared = forge_declared(shared).await;
         assert!(
-            declared.contains("dtolnay/rust-toolchain"),
+            declares(&declared, "dtolnay/rust-toolchain"),
             "local composite dependency must enter the declared set: {declared:?}"
         );
 
-        let allowed = vec![(
-            "dtolnay/rust-toolchain".to_owned(),
-            Some("stable".to_owned()),
-        )];
+        let allowed = requests(&[("dtolnay/rust-toolchain", Some("stable"))]);
         enforce_declared_actions(
             &shared.state,
             RunId(uuid::Uuid::new_v4()),
-            &declared,
+            &scopes(&declared),
             &allowed,
         )
         .await
         .expect("local composite dependency should be authorized");
 
-        let denied = vec![("attacker/unlisted".to_owned(), Some("main".to_owned()))];
+        let denied = requests(&[("attacker/unlisted", Some("main"))]);
         let error = enforce_declared_actions(
             &shared.state,
             RunId(uuid::Uuid::new_v4()),
-            &declared,
+            &scopes(&declared),
             &denied,
         )
         .await
@@ -4069,7 +4520,7 @@ jobs:
         assert_eq!(from_forge, from_snapshot);
         for expected in ["root/inner", "beside/dep", "root/action-dep"] {
             assert!(
-                from_forge.contains(expected),
+                declares(&from_forge, expected),
                 "{expected} must enter the declared set: {from_forge:?}"
             );
         }
@@ -4079,6 +4530,469 @@ jobs:
             assert!(!path.contains(".."), "read escaped the tree: {path}");
             assert_eq!(git_ref, &snapshot.commit_sha);
         }
+    }
+
+    /// A composite action stored in a subdirectory (`owner/repo/path@ref`)
+    /// keeps that path when its manifest is fetched. The router's
+    /// `TanStack/config/.github/setup@ref` names its pnpm and Node setup
+    /// steps there; reading the repository root instead 404s and denied both
+    /// nested actions at download time. The download request names only
+    /// `owner/repo`, so the directory must come from the workflow's declared
+    /// `uses:` line.
+    #[tokio::test]
+    async fn subpath_composite_dependency_is_admitted_from_its_directory() {
+        let setup = composite_manifest(&[
+            "pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0",
+            "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+        ]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[(".github/setup/action.yml", setup.as_str())]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let mut declared = DeclaredActions::default();
+        declared.insert(
+            "tanstack/config".to_owned(),
+            Some(".github/setup".to_owned()),
+        );
+
+        // The parent downloads in one wave. The request names the repository
+        // only; the workflow supplies the manifest directory.
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("TanStack/config", Some(SHA))]),
+        )
+        .await
+        .expect("the subpath composite itself is directly declared");
+
+        // Its nested actions arrive in a later wave; the ledger entry must
+        // fetch `.github/setup/action.yml`, not only the repository root.
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[
+                ("pnpm/action-setup", Some(NESTED_REF)),
+                (
+                    "actions/setup-node",
+                    Some("48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e"),
+                ),
+            ]),
+        )
+        .await
+        .expect("nested actions of a subpath composite must be admitted");
+
+        let contents = fixture.stub.contents.lock().clone();
+        assert!(
+            contents
+                .iter()
+                .any(|(path, git_ref, _)| path == ".github/setup/action.yml" && git_ref == SHA),
+            "the subpath manifest must be read: {contents:?}"
+        );
+
+        // Keeping the directory must not widen the allowlist: an action the
+        // workflow and the subpath manifest never name stays denied.
+        let error = enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("attacker/unlisted", Some(SHA))]),
+        )
+        .await
+        .expect_err("an action in neither the workflow nor the manifest must stay denied");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Without the directory the workflow carries, the subpath composite's
+    /// manifest is read from the repository root, where none exists — the
+    /// failure this change fixes. Pinning it keeps the regression test honest:
+    /// the admitted waves above depend on the directory, not on some other
+    /// widening of the allowlist.
+    #[tokio::test]
+    async fn subpath_composite_without_its_directory_stays_denied() {
+        let setup =
+            composite_manifest(&["pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0"]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[(".github/setup/action.yml", setup.as_str())]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        // The base branch's knowledge: the scope, with no manifest directory.
+        let declared = DeclaredActions::from(BTreeSet::from(["tanstack/config".to_owned()]));
+
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("TanStack/config", Some(SHA))]),
+        )
+        .await
+        .expect("the composite itself is declared");
+
+        let error = enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("pnpm/action-setup", Some(NESTED_REF))]),
+        )
+        .await
+        .expect_err("the nested action of a subpath composite is denied without its directory");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+        assert!(
+            fixture
+                .stub
+                .contents
+                .lock()
+                .iter()
+                .all(|(path, _, _)| path == "action.yml" || path == "action.yaml"),
+            "only the repository root is consulted without a directory"
+        );
+    }
+
+    /// Three waves of subpath composites. `a/outer`'s root manifest names
+    /// `b/tools/setup@v1`; that manifest names `c/dependency@v1`. The second
+    /// wave must read `b/tools/setup/action.yml` — the directory the parent
+    /// manifest named — or the third wave is denied.
+    #[tokio::test]
+    async fn nested_subpath_composite_keeps_its_directory_across_waves() {
+        let outer = composite_manifest(&["b/tools/setup@v1"]);
+        let child = composite_manifest(&["c/dependency@v1"]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[
+                    ("action.yml", outer.as_str()),
+                    ("setup/action.yml", child.as_str()),
+                ]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let mut declared = DeclaredActions::default();
+        declared.insert("a/outer".to_owned(), None);
+
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("a/outer", Some("v1"))]),
+        )
+        .await
+        .expect("the root composite is declared");
+
+        // The official reference carries `path: setup`; the request below
+        // omits it, so the directory has to come from the parent manifest.
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("b/tools", Some("v1"))]),
+        )
+        .await
+        .expect("the nested subpath composite is admitted from its parent");
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("c/dependency", Some("v1"))]),
+        )
+        .await
+        .expect("the third wave is admitted through the subpath manifest");
+
+        let contents = fixture.stub.contents.lock().clone();
+        assert!(
+            contents
+                .iter()
+                .any(|(path, git_ref, _)| path == "setup/action.yml" && git_ref == "v1"),
+            "the nested subpath manifest must be read: {contents:?}"
+        );
+    }
+
+    /// A workflow that names one repository at its root and at a subpath keeps
+    /// both manifests: the root composite's nested actions must still be
+    /// admitted when only the subpath's directory would otherwise be recorded.
+    #[tokio::test]
+    async fn root_and_subpath_manifests_of_one_repository_both_authorize() {
+        let root = composite_manifest(&["actions/cache@v4"]);
+        let setup = composite_manifest(&["tool/sub-only@v1"]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[
+                    ("action.yml", root.as_str()),
+                    ("setup/action.yml", setup.as_str()),
+                ]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let mut declared = DeclaredActions::default();
+        declared.insert("acme/actions".to_owned(), None);
+        declared.insert("acme/actions".to_owned(), Some("setup".to_owned()));
+
+        // Both forms of the repository download in one wave; the request
+        // names the repository only, so every declared manifest is read.
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("acme/actions", Some("v1"))]),
+        )
+        .await
+        .expect("both declared forms of the repository are admitted");
+
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("actions/cache", Some("v4"))]),
+        )
+        .await
+        .expect("the root composite's nested action is admitted");
+
+        let contents = fixture.stub.contents.lock().clone();
+        for expected in ["action.yml", "setup/action.yml"] {
+            assert!(
+                contents
+                    .iter()
+                    .any(|(path, git_ref, _)| path == expected && git_ref == "v1"),
+                "{expected} must be read: {contents:?}"
+            );
+        }
+    }
+
+    /// One adjudication fans out to at most [`MAX_MANIFEST_DIRECTORIES_PER_REF`]
+    /// subdirectories of a repository at one ref, however many subpaths the
+    /// workflow declares for it, and always reads the root as well. The
+    /// unlisted request in the same batch is what runs the closure; it stays
+    /// denied.
+    #[tokio::test]
+    async fn declared_subpath_directories_are_bounded_per_adjudication() {
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let mut declared = DeclaredActions::default();
+        for index in 0..(MAX_MANIFEST_DIRECTORIES_PER_REF + 8) {
+            declared.insert("acme/actions".to_owned(), Some(format!("sub{index}")));
+        }
+
+        let error = enforce_declared_actions(
+            &fixture.shared.state,
+            RunId(uuid::Uuid::new_v4()),
+            &declared,
+            &requests(&[
+                ("acme/actions", Some("v1")),
+                ("attacker/unlisted", Some("v1")),
+            ]),
+        )
+        .await
+        .expect_err("the unlisted request stays denied");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+
+        // Each read manifest is two contents requests (`action.yml`, then
+        // `action.yaml`), both in the same directory.
+        let directories: BTreeSet<String> = fixture
+            .stub
+            .contents
+            .lock()
+            .iter()
+            .map(|(path, _, _)| {
+                path.trim_end_matches("action.yaml")
+                    .trim_end_matches("action.yml")
+                    .trim_end_matches('/')
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            directories.len(),
+            MAX_MANIFEST_DIRECTORIES_PER_REF + 1,
+            "{directories:?}"
+        );
+    }
+
+    /// A root composite's same-repository subdirectory composite is read in the
+    /// wave after the root's own request. The first wave requests the
+    /// repository alone (the runnerresolve shape carries no path), so nothing
+    /// is read then. The second wave's nested action is admitted only if the
+    /// subdirectory's manifest, which the root's manifest names, is read.
+    #[tokio::test]
+    async fn same_repository_subdirectory_is_read_in_a_later_wave() {
+        let root = composite_manifest(&["acme/actions/setup@v1"]);
+        let setup =
+            composite_manifest(&["pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0"]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[
+                    ("action.yml", root.as_str()),
+                    ("setup/action.yml", setup.as_str()),
+                ]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let mut declared = DeclaredActions::default();
+        declared.insert("acme/actions".to_owned(), None);
+
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("acme/actions", Some("v1"))]),
+        )
+        .await
+        .expect("the root composite is declared");
+
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("pnpm/action-setup", Some(NESTED_REF))]),
+        )
+        .await
+        .expect("the nested action of the subdirectory composite must be admitted");
+
+        let contents = fixture.stub.contents.lock().clone();
+        assert!(
+            contents
+                .iter()
+                .any(|(path, git_ref, _)| path == "setup/action.yml" && git_ref == "v1"),
+            "the subdirectory manifest must be read: {contents:?}"
+        );
+    }
+
+    /// A batch may name more subdirectories of one repository and ref than the
+    /// fan-out limit. Each request names its own directory, so every one is
+    /// read, and the nested action of the last is admitted in a later wave.
+    #[tokio::test]
+    async fn requested_subdirectories_are_not_capped_by_the_fan_out_limit() {
+        let count = MAX_MANIFEST_DIRECTORIES_PER_REF + 4;
+        let last = format!("sub{}", count - 1);
+        let mut files = BTreeMap::new();
+        let mut declared = DeclaredActions::default();
+        let mut batch = Vec::new();
+        for index in 0..count {
+            let directory = format!("sub{index}");
+            let manifest = if directory == last {
+                composite_manifest(&["pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0"])
+            } else {
+                composite_manifest(&[])
+            };
+            files.insert(format!("{directory}/action.yml"), manifest);
+            declared.insert("acme/actions".to_owned(), Some(directory.clone()));
+            batch.push(ActionRequest::new(
+                format!("acme/actions/{directory}"),
+                Some("v1".to_owned()),
+            ));
+        }
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        enforce_declared_actions(&fixture.shared.state, run_id, &declared, &batch)
+            .await
+            .expect("every requested subdirectory is declared");
+
+        enforce_declared_actions(
+            &fixture.shared.state,
+            run_id,
+            &declared,
+            &requests(&[("pnpm/action-setup", Some(NESTED_REF))]),
+        )
+        .await
+        .expect("the last subdirectory's nested action must be admitted");
+
+        let contents = fixture.stub.contents.lock().clone();
+        assert!(
+            contents
+                .iter()
+                .any(|(path, git_ref, _)| path == &format!("{last}/action.yml") && git_ref == "v1"),
+            "the last requested subdirectory must be read"
+        );
+    }
+
+    /// The official `ActionDownloadInfo` reference's `path` is the composite's
+    /// manifest directory. An empty path names nothing, and an unsafe one falls
+    /// back to the root manifest alone.
+    #[test]
+    fn action_request_keeps_the_official_reference_path() {
+        let reference = |path: Option<&str>| ActionReference {
+            name_with_owner: "TanStack/config".to_owned(),
+            r#ref: "v1".to_owned(),
+            path: path.map(str::to_owned),
+        };
+        let request = ActionRequest::from_reference(reference(Some(".github/setup"))).unwrap();
+        assert_eq!(request.action, "TanStack/config");
+        assert_eq!(
+            request.directory,
+            RequestedDirectory::Subpath(".github/setup".to_owned())
+        );
+
+        for named_nothing in [None, Some("")] {
+            assert_eq!(
+                ActionRequest::from_reference(reference(named_nothing))
+                    .unwrap()
+                    .directory,
+                RequestedDirectory::Unspecified,
+                "{named_nothing:?} names no directory"
+            );
+        }
+        for unsafe_path in [
+            ".",
+            "..",
+            "../escape",
+            "a/../b",
+            "a//b",
+            "${{ matrix.dir }}",
+        ] {
+            assert_eq!(
+                ActionRequest::from_reference(reference(Some(unsafe_path)))
+                    .unwrap()
+                    .directory,
+                RequestedDirectory::Root,
+                "{unsafe_path} must fall back to the root manifest"
+            );
+        }
+
+        // A `runnerresolve` reference carries its subpath in the string.
+        assert_eq!(
+            ActionRequest::new("owner/repo/sub@v1".to_owned(), None).directory,
+            RequestedDirectory::Subpath("sub".to_owned())
+        );
+        assert_eq!(
+            ActionRequest::new("owner/repo@v1".to_owned(), None).directory,
+            RequestedDirectory::Unspecified
+        );
+        assert!(ActionRequest::from_reference(ActionReference::default()).is_none());
     }
 
     /// A failed contents read adds nothing, so the nested action stays denied.
@@ -4097,16 +5011,16 @@ jobs:
         )
         .await;
         let declared = forge_declared(&fixture.shared).await;
-        assert!(!declared.contains("dtolnay/rust-toolchain"), "{declared:?}");
+        assert!(
+            !declares(&declared, "dtolnay/rust-toolchain"),
+            "{declared:?}"
+        );
 
-        let requested = vec![(
-            "dtolnay/rust-toolchain".to_owned(),
-            Some("stable".to_owned()),
-        )];
+        let requested = requests(&[("dtolnay/rust-toolchain", Some("stable"))]);
         let error = enforce_declared_actions(
             &fixture.shared.state,
             RunId(uuid::Uuid::new_v4()),
-            &declared,
+            &scopes(&declared),
             &requested,
         )
         .await
@@ -4167,17 +5081,15 @@ jobs:
             true,
         )
         .await;
-        assert!(
-            forge_declared(&fixture.shared)
-                .await
-                .contains("dtolnay/rust-toolchain")
-        );
+        assert!(declares(
+            &forge_declared(&fixture.shared).await,
+            "dtolnay/rust-toolchain"
+        ));
         let first_read = fixture.stub.contents.lock().len();
-        assert!(
-            forge_declared(&fixture.shared)
-                .await
-                .contains("dtolnay/rust-toolchain")
-        );
+        assert!(declares(
+            &forge_declared(&fixture.shared).await,
+            "dtolnay/rust-toolchain"
+        ));
         assert_eq!(
             fixture.stub.contents.lock().len(),
             first_read,
@@ -4207,7 +5119,10 @@ jobs:
         )
         .await;
         let declared = forge_declared(&fixture.shared).await;
-        assert!(declared.contains("dtolnay/rust-toolchain"), "{declared:?}");
+        assert!(
+            declares(&declared, "dtolnay/rust-toolchain"),
+            "{declared:?}"
+        );
     }
 
     /// A head commit that is not a real commit, or a repository that is not a
