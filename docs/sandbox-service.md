@@ -30,8 +30,9 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
   client certificate), `Register` (drivers + capabilities → provider id and
   fencing generation), `Heartbeat`, `Poll` (long-poll for work), `Report` /
   `ReportExec` (fenced by generation), `Reconcile` (full inventory: lost
-  sandboxes fail, orphans are destroyed, and a `Terminating` machine that is
-  still there gets its destroy re-queued; a template's fork base is never an
+  sandboxes fail, orphans are destroyed, a `Terminating` machine that is
+  still there gets its destroy asked again unless one is in flight, and a
+  tombstone's machine is destroyed; a template's fork base is never an
   orphan, whichever provider reports it), `RenewCertificate`.
 
 Both are served with the Connect protocol, JSON codec, over one HTTPS port:
@@ -299,12 +300,15 @@ with three decisions, before any provider is placed on or caller served:
   did land, no record names it and the next reconcile destroys it as an
   orphan. The caller's retry with the same key releases the failed record and
   starts over.
-* **A sandbox left `TERMINATING` stays so.** Its destroy was decided but its
-  report died with the process; when the provider reports the machine in a
-  `Reconcile`, the service re-queues the destroy (bounded: three attempts,
-  after which the record is dropped and the machine is reaped as an orphan).
-  When the machine is missing from the inventory the record is dropped
-  immediately, so it stops holding a slot.
+* **A sandbox left `TERMINATING` stays so until its machine is gone.** A destroy
+  in flight is awaited however long it takes. When a destroy fails, or the
+  provider is lost with it, the next `Reconcile` asks again while the provider
+  still reports the machine. After three such failures the record becomes a
+  `GONE` tombstone instead of being dropped: `Reconcile` destroys its machine
+  directly, because the record still proves the machine is the service's. The
+  tombstone is removed once the provider stops reporting the machine. It holds
+  no capacity slot, so the pool may start one machine more than its slots until
+  that reclaim lands.
 
 Stop, start, pause, resume and snapshot are operations, not record states: the
 record moves only when their report lands, so a restart leaves the last settled
