@@ -8,9 +8,11 @@ use std::time::Duration;
 
 use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink};
 use preloop_sandbox::api::*;
+use preloop_sandbox::driver::TransferChunk;
 use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::error::message;
 use preloop_sandbox::server::{Auth, router};
+use preloop_sandbox::service::TransferSide;
 use preloop_sandbox::store::{self, Kind, Store};
 use preloop_sandbox::{Code, Driver, SandboxClient, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -87,7 +89,7 @@ async fn harness_with_host_access(
     caps: Capabilities,
     access: HostAccess,
 ) -> Harness {
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     config.acquire_wait = Duration::from_secs(10);
     harness_with_host_config_access(store, dir, host, caps, access, config).await
 }
@@ -114,7 +116,7 @@ async fn harness_with_host_config_access(
 ) -> Harness {
     let service = Service::open(store, config).await.unwrap();
     let fake = Arc::new(FakeDriver::new("fake", host, caps));
-    let mut agent_config = AgentConfig::new("host-a", dir.path().join("scratch"));
+    let mut agent_config = AgentConfig::new("host-a");
     agent_config.reconcile = Duration::from_millis(300);
     // Placement reads a provider silent past `provider_timeout` as offline.
     // The default heartbeat (10 s) leaves little room on a loaded runner;
@@ -678,12 +680,7 @@ async fn expired_lease_destroys_and_preserve_holds_until_ttl() {
             .state,
         SandboxState::Preserved
     );
-    wait_for(|| {
-        h.service
-            .get(&short.sandbox.id, &short.lease.id)
-            .is_err()
-    })
-    .await;
+    wait_for(|| h.service.get(&short.sandbox.id, &short.lease.id).is_err()).await;
     // The long window outlived it: the short sandbox ended by its TTL, not
     // by reconcile.
     assert_eq!(
@@ -899,9 +896,7 @@ async fn state_survives_restart_from_sqlite() {
     }
     let store = store::open(db.to_str().unwrap()).await.unwrap();
     assert_eq!(store.load(Kind::Leases).await.unwrap().len(), 1);
-    let restored = Service::open(store, ServiceConfig::new(dir.path().join("blobs2")))
-        .await
-        .unwrap();
+    let restored = Service::open(store, ServiceConfig::new()).await.unwrap();
     assert_eq!(restored.list_pools().len(), 1);
     assert_eq!(restored.list_templates().len(), 1);
     assert_eq!(restored.list().len(), 1);
@@ -939,7 +934,7 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
     // test sends, so their effect is deterministic.
     let service = Service::open(
         store::open(db.to_str().unwrap()).await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs2")),
+        ServiceConfig::new(),
     )
     .await
     .unwrap();
@@ -1026,7 +1021,7 @@ async fn remote_agent_and_client_over_connect() {
     let agent = Agent::new(
         Arc::new(link),
         vec![fake as Arc<dyn Driver>],
-        AgentConfig::new("remote-host", dir.join("scratch")),
+        AgentConfig::new("remote-host"),
     );
     tokio::spawn(agent.run(t.shutdown_token()));
 
@@ -1161,7 +1156,7 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
         dir.join("host"),
         FakeDriver::full_capabilities(),
     ));
-    let mut agent_config = AgentConfig::new("remote-host", dir.join("scratch"));
+    let mut agent_config = AgentConfig::new("remote-host");
     agent_config.heartbeat = Duration::from_millis(50);
     let link = t.enroll("remote-host").await;
     let agent = Agent::new(Arc::new(link), vec![fake as Arc<dyn Driver>], agent_config);
@@ -1494,14 +1489,14 @@ async fn restored_leases_re_inject_their_files() {
 
 #[tokio::test]
 async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
-    let dir = tempfile::tempdir().unwrap();
+    let _dir = tempfile::tempdir().unwrap();
     // `Acquire` only places on a provider the service still considers
     // online. A ghost that never reports would be read as already gone if
     // the acquire ran more than `provider_timeout` after it registered, so
     // the test refreshes its liveness itself and stops the heartbeats to
     // make the host lose it.
     let provider_timeout = Duration::from_secs(1);
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     config.provider_timeout = provider_timeout;
     config.provider_lost_factor = 1;
     config.acquire_wait = Duration::from_millis(200);
@@ -1871,7 +1866,7 @@ async fn a_restored_sandbox_without_its_lease_is_failed_not_zombied() {
     }
     let restored = Service::open(
         store::open(db.to_str().unwrap()).await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs2")),
+        ServiceConfig::new(),
     )
     .await
     .unwrap();
@@ -2346,13 +2341,10 @@ async fn drain_releases_idle_pool_members_and_keeps_leases() {
 async fn connect_unary_bodies_are_capped_at_four_mib() {
     use preloop_sandbox::server::CONNECT_BODY_LIMIT;
     use tower::ServiceExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
+    let _dir = tempfile::tempdir().unwrap();
+    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+        .await
+        .unwrap();
     let response = router(service, Auth::new("test-token"))
         .oneshot(
             axum::http::Request::builder()
@@ -2368,10 +2360,9 @@ async fn connect_unary_bodies_are_capped_at_four_mib() {
 }
 
 #[tokio::test]
-async fn blob_upload_cap_rejects_and_removes_the_partial_file() {
+async fn blob_upload_cap_rejects_and_consumes_the_ticket() {
     let dir = tempfile::tempdir().unwrap();
-    let blobs = dir.path().join("blobs");
-    let mut config = ServiceConfig::new(blobs.clone());
+    let mut config = ServiceConfig::new();
     config.blob_max_bytes = 1024;
     let service = Service::open(store::open("memory:").await.unwrap(), config)
         .await
@@ -2385,7 +2376,7 @@ async fn blob_upload_cap_rejects_and_removes_the_partial_file() {
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![fake as Arc<dyn Driver>],
-        AgentConfig::new("host-a", dir.path().join("scratch")),
+        AgentConfig::new("host-a"),
     );
     tokio::spawn(agent.run(shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -2424,8 +2415,526 @@ async fn blob_upload_cap_rejects_and_removes_the_partial_file() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(!blobs.join(format!("{ticket_id}.tar")).exists());
+    // The rejected transfer is consumed: a retry cannot find the ticket, so
+    // no truncated archive can be delivered later.
+    assert!(
+        service
+            .claim_caller(&ticket_id, &ticket.token, TransferSide::Consumer)
+            .is_err()
+    );
     shutdown.cancel();
+}
+
+/// A driver wrapper that holds an in-flight copy open, so a test can inspect
+/// every directory while bytes are moving rather than only after the fact.
+struct GatedDriver {
+    inner: Arc<FakeDriver>,
+    copy_in_entered: Arc<tokio::sync::Notify>,
+    copy_in_release: Arc<tokio::sync::Notify>,
+    copy_out_entered: Arc<tokio::sync::Notify>,
+    copy_out_release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Driver for GatedDriver {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn create(&self, work: &CreateWork) -> preloop_sandbox::Result<String> {
+        self.inner.create(work).await
+    }
+
+    async fn destroy(&self, native_ref: &str) -> preloop_sandbox::Result<()> {
+        self.inner.destroy(native_ref).await
+    }
+
+    async fn exec(
+        &self,
+        native_ref: &str,
+        exec_id: &str,
+        request: &ExecRequest,
+        output: tokio::sync::mpsc::Sender<ExecEvent>,
+    ) -> preloop_sandbox::Result<i32> {
+        self.inner.exec(native_ref, exec_id, request, output).await
+    }
+
+    async fn cancel_exec(&self, native_ref: &str, exec_id: &str) -> preloop_sandbox::Result<()> {
+        self.inner.cancel_exec(native_ref, exec_id).await
+    }
+
+    async fn copy_in(
+        &self,
+        native_ref: &str,
+        guest_dir: &str,
+        tar: tokio::sync::mpsc::Receiver<TransferChunk>,
+    ) -> preloop_sandbox::Result<()> {
+        self.copy_in_entered.notify_one();
+        self.copy_in_release.notified().await;
+        self.inner.copy_in(native_ref, guest_dir, tar).await
+    }
+
+    async fn copy_out(
+        &self,
+        native_ref: &str,
+        guest_path: &str,
+        tar: tokio::sync::mpsc::Sender<TransferChunk>,
+    ) -> preloop_sandbox::Result<()> {
+        self.copy_out_entered.notify_one();
+        self.copy_out_release.notified().await;
+        self.inner.copy_out(native_ref, guest_path, tar).await
+    }
+
+    async fn inventory(&self) -> preloop_sandbox::Result<Vec<Observed>> {
+        self.inner.inventory().await
+    }
+}
+
+/// Any tar under `root`, including the service's former blob directory and
+/// the agent's former scratch directory.
+fn staging_artifacts(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "tar") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+fn assert_no_staging(state: &std::path::Path) {
+    let found = staging_artifacts(state);
+    assert!(found.is_empty(), "staging files left behind: {found:?}");
+    assert!(
+        !state.join("blobs").exists(),
+        "service blob directory exists"
+    );
+    assert!(
+        !state.join("scratch").exists(),
+        "agent scratch directory exists"
+    );
+}
+
+fn tar_entry_bytes(tar_path: &std::path::Path, wanted: &str) -> Vec<u8> {
+    let file = std::fs::File::open(tar_path).unwrap();
+    let mut archive = tar::Archive::new(file);
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().to_string_lossy() == wanted {
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+            return data;
+        }
+    }
+    panic!("{wanted} missing from {}", tar_path.display());
+}
+
+#[tokio::test]
+async fn transfers_stream_without_staging_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+        .await
+        .unwrap();
+    let entered_in = Arc::new(tokio::sync::Notify::new());
+    let release_in = Arc::new(tokio::sync::Notify::new());
+    let entered_out = Arc::new(tokio::sync::Notify::new());
+    let release_out = Arc::new(tokio::sync::Notify::new());
+    let fake = Arc::new(FakeDriver::new(
+        "fake",
+        dir.path().join("host"),
+        FakeDriver::full_capabilities(),
+    ));
+    let gated = Arc::new(GatedDriver {
+        inner: fake.clone(),
+        copy_in_entered: entered_in.clone(),
+        copy_in_release: release_in.clone(),
+        copy_out_entered: entered_out.clone(),
+        copy_out_release: release_out.clone(),
+    });
+    let mut agent_config = AgentConfig::new("host-a");
+    agent_config.reconcile = Duration::from_millis(300);
+    agent_config.heartbeat = Duration::from_secs(1);
+    let shutdown = CancellationToken::new();
+    tokio::spawn(
+        Agent::new(
+            Arc::new(service.clone()) as Arc<dyn ProviderLink>,
+            vec![gated as Arc<dyn Driver>],
+            agent_config,
+        )
+        .run(shutdown.clone()),
+    );
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    wait_for_registered(&service).await;
+    service.put_template(template("alpine")).await.unwrap();
+
+    let source = tempfile::tempdir().unwrap();
+    let payload = source.path().join("payload");
+    std::fs::create_dir_all(&payload).unwrap();
+    std::fs::write(payload.join("hello.txt"), b"streamed\n").unwrap();
+    std::fs::write(payload.join("bulk.bin"), vec![0x5a_u8; 2 * 1024 * 1024]).unwrap();
+    let input = source.path().join("in.tar");
+    {
+        let file = std::fs::File::create(&input).unwrap();
+        let mut builder = tar::Builder::new(file);
+        builder.append_dir_all("payload", &payload).unwrap();
+        builder.finish().unwrap();
+    }
+
+    let lease = service
+        .acquire(AcquireRequest {
+            idempotency_key: "stream".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let sandbox_id = lease.sandbox.id.clone();
+    let lease_id = lease.lease.id.clone();
+
+    let upload = {
+        let service = service.clone();
+        let sandbox_id = sandbox_id.clone();
+        let lease_id = lease_id.clone();
+        let input = input.clone();
+        tokio::spawn(async move {
+            Service::upload_path(&service, &sandbox_id, &lease_id, "/work", &input).await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered_in.notified())
+        .await
+        .expect("copy_in did not start");
+    assert_no_staging(dir.path());
+    release_in.notify_one();
+    upload.await.unwrap().unwrap();
+
+    let output = source.path().join("out.tar");
+    let download = {
+        let service = service.clone();
+        let sandbox_id = sandbox_id.clone();
+        let lease_id = lease_id.clone();
+        let output = output.clone();
+        tokio::spawn(async move {
+            Service::download_path(&service, &sandbox_id, &lease_id, "/work/payload", &output).await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered_out.notified())
+        .await
+        .expect("copy_out did not start");
+    assert_no_staging(dir.path());
+    release_out.notify_one();
+    download.await.unwrap().unwrap();
+    assert_eq!(tar_entry_bytes(&output, "payload/hello.txt"), b"streamed\n");
+
+    let injected = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .acquire(AcquireRequest {
+                    idempotency_key: "inject-stream".into(),
+                    template: "alpine".into(),
+                    inject: buffa::MessageField::some(Inject {
+                        files: vec![FileSpec {
+                            path: "injected/secret.txt".into(),
+                            data: b"never on disk\n".to_vec(),
+                            mode: 0o600,
+                            ..FileSpec::default()
+                        }],
+                        ..Inject::default()
+                    }),
+                    ..AcquireRequest::default()
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered_in.notified())
+        .await
+        .expect("inject copy_in did not start");
+    assert_no_staging(dir.path());
+    release_in.notify_one();
+    let injected = injected.await.unwrap().unwrap();
+    // The inject gate is still armed; let the verification download through.
+    release_out.notify_one();
+    let injected_tar = source.path().join("injected.tar");
+    Service::download_path(
+        &service,
+        &injected.sandbox.id,
+        &injected.lease.id,
+        "/injected",
+        &injected_tar,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tar_entry_bytes(&injected_tar, "injected/secret.txt"),
+        b"never on disk\n"
+    );
+
+    assert_no_staging(dir.path());
+    shutdown.cancel();
+}
+
+/// A link whose fetch drops the transfer after one chunk: the shape of an
+/// agent that dies mid-upload.
+struct BrokenFetch {
+    inner: Arc<Service>,
+    ticket: std::sync::Mutex<Option<String>>,
+    session: std::sync::Mutex<Option<(String, u64)>>,
+}
+
+#[async_trait::async_trait]
+impl ProviderLink for BrokenFetch {
+    async fn register(
+        &self,
+        request: RegisterRequest,
+    ) -> preloop_sandbox::Result<RegisterResponse> {
+        Service::register(&self.inner, request).await
+    }
+    async fn heartbeat(&self, request: HeartbeatRequest) -> preloop_sandbox::Result<()> {
+        Service::heartbeat(&self.inner, request)
+    }
+    async fn poll(&self, request: PollRequest) -> preloop_sandbox::Result<PollResponse> {
+        Service::poll(&self.inner, request).await
+    }
+    async fn report(&self, request: ReportRequest) -> preloop_sandbox::Result<()> {
+        Service::report(&self.inner, request).await
+    }
+    async fn report_exec(&self, request: ReportExecRequest) -> preloop_sandbox::Result<()> {
+        Service::report_exec(&self.inner, request).await
+    }
+    async fn reconcile(
+        &self,
+        request: ReconcileRequest,
+    ) -> preloop_sandbox::Result<ReconcileResponse> {
+        Service::reconcile(&self.inner, request).await
+    }
+    async fn fetch_blob(
+        &self,
+        id: &ProviderSession,
+        ticket: &str,
+    ) -> preloop_sandbox::Result<tokio::sync::mpsc::Receiver<TransferChunk>> {
+        let mut claim = self.inner.claim_agent(
+            &id.provider_id,
+            id.generation,
+            ticket,
+            TransferSide::Consumer,
+        )?;
+        self.inner.wait_peer(&mut claim).await?;
+        *self.ticket.lock().unwrap() = Some(ticket.to_owned());
+        *self.session.lock().unwrap() = Some((id.provider_id.clone(), id.generation));
+        // Dropping the service consumer below makes the producer's next send
+        // fail, exactly as a vanished agent does.
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            let _ = tx.send(TransferChunk::Data(b"partial".to_vec())).await;
+            let _ = tx
+                .send(TransferChunk::Failed("agent disconnected".into()))
+                .await;
+        });
+        Ok(rx)
+    }
+    async fn put_blob(
+        &self,
+        id: &ProviderSession,
+        ticket: &str,
+        tar: tokio::sync::mpsc::Receiver<TransferChunk>,
+    ) -> preloop_sandbox::Result<()> {
+        <Arc<Service> as ProviderLink>::put_blob(&self.inner, id, ticket, tar).await
+    }
+}
+
+#[tokio::test]
+async fn an_agent_that_disappears_mid_transfer_fails_the_caller_and_consumes_the_ticket() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+        .await
+        .unwrap();
+    let link = Arc::new(BrokenFetch {
+        inner: service.clone(),
+        ticket: std::sync::Mutex::new(None),
+        session: std::sync::Mutex::new(None),
+    });
+    let fake = Arc::new(FakeDriver::new(
+        "fake",
+        dir.path().join("host"),
+        FakeDriver::full_capabilities(),
+    ));
+    let mut agent_config = AgentConfig::new("host-a");
+    agent_config.reconcile = Duration::from_millis(300);
+    agent_config.heartbeat = Duration::from_secs(1);
+    let shutdown = CancellationToken::new();
+    tokio::spawn(
+        Agent::new(
+            link.clone() as Arc<dyn ProviderLink>,
+            vec![fake as Arc<dyn Driver>],
+            agent_config,
+        )
+        .run(shutdown.clone()),
+    );
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    wait_for_registered(&service).await;
+    service.put_template(template("alpine")).await.unwrap();
+    let lease = service
+        .acquire(AcquireRequest {
+            idempotency_key: "broken-transfer".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let source = tempfile::tempdir().unwrap();
+    let input = source.path().join("in.tar");
+    std::fs::write(&input, b"any bytes; the fake driver never sees a tar").unwrap();
+    let error = Service::upload_path(
+        &service,
+        &lease.sandbox.id,
+        &lease.lease.id,
+        "/work",
+        &input,
+    )
+    .await
+    .unwrap_err();
+    let message = message(&error).to_owned();
+    assert!(
+        message.contains("agent disconnected")
+            || message.contains("consumer went away")
+            || message.contains("copy_in"),
+        "unexpected error: {message}"
+    );
+    assert_no_staging(dir.path());
+
+    let ticket = link
+        .ticket
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("ticket recorded");
+    let (provider, generation) = link.session.lock().unwrap().clone().expect("session");
+    let error = service
+        .claim_agent(&provider, generation, &ticket, TransferSide::Consumer)
+        .unwrap_err();
+    assert_eq!(error.code, Code::NotFound);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_ticket_is_single_use_and_direction_bound() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "ticket-once".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let ticket = h
+        .service
+        .open_stream(OpenStreamRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            kind: StreamKind::Upload.into(),
+            path: "/work".into(),
+            ..OpenStreamRequest::default()
+        })
+        .unwrap();
+    let id = ticket.url.rsplit('/').next().unwrap().to_owned();
+
+    assert_eq!(
+        h.service
+            .claim_caller(&id, "wrong", TransferSide::Producer)
+            .unwrap_err()
+            .code,
+        Code::Unauthenticated
+    );
+    let mut claim = h
+        .service
+        .claim_caller(&id, &ticket.token, TransferSide::Producer)
+        .unwrap();
+    assert!(claim.take_producer().is_some());
+    let error = h
+        .service
+        .claim_caller(&id, &ticket.token, TransferSide::Producer)
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    // A download claim cannot use an upload ticket.
+    let error = h
+        .service
+        .claim_caller(&id, &ticket.token, TransferSide::Consumer)
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    h.service.remove_ticket(&id);
+    assert_eq!(
+        h.service
+            .claim_caller(&id, &ticket.token, TransferSide::Consumer)
+            .unwrap_err()
+            .code,
+        Code::NotFound
+    );
+}
+
+#[tokio::test]
+async fn a_large_transfer_round_trips() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "large-transfer".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let payload = source.path().join("payload");
+    std::fs::create_dir_all(&payload).unwrap();
+    let big: Vec<u8> = (0..32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(payload.join("big.bin"), &big).unwrap();
+    let input = source.path().join("in.tar");
+    {
+        let file = std::fs::File::create(&input).unwrap();
+        let mut builder = tar::Builder::new(file);
+        builder.append_dir_all("payload", &payload).unwrap();
+        builder.finish().unwrap();
+    }
+    Service::upload_path(
+        &h.service,
+        &lease.sandbox.id,
+        &lease.lease.id,
+        "/big",
+        &input,
+    )
+    .await
+    .unwrap();
+    let output = source.path().join("out.tar");
+    Service::download_path(
+        &h.service,
+        &lease.sandbox.id,
+        &lease.lease.id,
+        "/big/payload",
+        &output,
+    )
+    .await
+    .unwrap();
+    let round_tripped = tar_entry_bytes(&output, "payload/big.bin");
+    assert_eq!(round_tripped.len(), big.len());
+    assert_eq!(round_tripped, big);
 }
 
 #[tokio::test]
@@ -2501,24 +3010,6 @@ async fn list_pagination_round_trips_across_250_items() {
     assert_eq!(client.list_templates().await.unwrap().len(), 250);
 }
 
-#[tokio::test]
-async fn boot_sweeps_orphaned_blob_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let blobs = dir.path().join("blobs");
-    std::fs::create_dir_all(blobs.join("keep-dir")).unwrap();
-    std::fs::write(blobs.join("tkt-stale.tar"), b"partial upload").unwrap();
-    std::fs::write(blobs.join("inject-stale.tar"), b"staged files").unwrap();
-    let _service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(blobs.clone()),
-    )
-    .await
-    .unwrap();
-    assert!(!blobs.join("tkt-stale.tar").exists());
-    assert!(!blobs.join("inject-stale.tar").exists());
-    assert!(blobs.join("keep-dir").exists());
-}
-
 /// A restart fences every agent session that survived the previous process:
 /// the generation was bumped and persisted, the old session is `aborted` on
 /// its next call, and the agent re-registering gets a fresh generation this
@@ -2533,7 +3024,7 @@ async fn restart_fences_the_agent_and_it_re_registers() {
     let (provider_id, generation) = {
         let service = Service::open(
             store::open(db.to_str().unwrap()).await.unwrap(),
-            ServiceConfig::new(dir.path().join("blobs")),
+            ServiceConfig::new(),
         )
         .await
         .unwrap();
@@ -2557,7 +3048,7 @@ async fn restart_fences_the_agent_and_it_re_registers() {
     // session above can no longer poll, report or heartbeat.
     let restored = Service::open(
         store::open(db.to_str().unwrap()).await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
+        ServiceConfig::new(),
     )
     .await
     .unwrap();
@@ -2621,7 +3112,7 @@ async fn a_creating_record_is_failed_after_restart() {
     let sandbox_id = {
         let service = Service::open(
             store::open(db.to_str().unwrap()).await.unwrap(),
-            ServiceConfig::new(dir.path().join("blobs")),
+            ServiceConfig::new(),
         )
         .await
         .unwrap();
@@ -2670,7 +3161,7 @@ async fn a_creating_record_is_failed_after_restart() {
     };
     let restored = Service::open(
         store::open(db.to_str().unwrap()).await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs2")),
+        ServiceConfig::new(),
     )
     .await
     .unwrap();
@@ -2786,7 +3277,7 @@ async fn a_lost_provider_releases_its_leases() {
     // test declares it lost by: otherwise a scheduling pause between
     // registration and `Acquire` reads as a dead host.
     let provider_timeout = Duration::from_secs(1);
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     config.provider_timeout = provider_timeout;
     config.provider_lost_factor = 1;
     config.acquire_wait = Duration::from_secs(10);
@@ -2797,7 +3288,7 @@ async fn a_lost_provider_releases_its_leases() {
         FakeDriver::full_capabilities(),
     ));
     let shutdown = CancellationToken::new();
-    let mut agent_config = AgentConfig::new("host-a", dir.path().join("scratch"));
+    let mut agent_config = AgentConfig::new("host-a");
     agent_config.heartbeat = provider_timeout / 20;
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -2949,13 +3440,10 @@ impl Store for FailingStore {
 /// restart source that will be behind.
 #[tokio::test]
 async fn store_write_failures_keep_the_rpc_successful() {
-    let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        Arc::new(FailingStore),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
+    let _dir = tempfile::tempdir().unwrap();
+    let service = Service::open(Arc::new(FailingStore), ServiceConfig::new())
+        .await
+        .unwrap();
     let created = service
         .put_template(template("alpine"))
         .await
@@ -3037,17 +3525,16 @@ impl ProviderLink for LossyLink {
         &self,
         id: &ProviderSession,
         ticket: &str,
-        dest: &std::path::Path,
-    ) -> preloop_sandbox::Result<()> {
-        <Arc<Service> as ProviderLink>::fetch_blob(&self.inner, id, ticket, dest).await
+    ) -> preloop_sandbox::Result<tokio::sync::mpsc::Receiver<TransferChunk>> {
+        <Arc<Service> as ProviderLink>::fetch_blob(&self.inner, id, ticket).await
     }
     async fn put_blob(
         &self,
         id: &ProviderSession,
         ticket: &str,
-        src: &std::path::Path,
+        tar: tokio::sync::mpsc::Receiver<TransferChunk>,
     ) -> preloop_sandbox::Result<()> {
-        <Arc<Service> as ProviderLink>::put_blob(&self.inner, id, ticket, src).await
+        <Arc<Service> as ProviderLink>::put_blob(&self.inner, id, ticket, tar).await
     }
 }
 
@@ -3057,7 +3544,7 @@ async fn lossy_harness(
     retry_backoff: Duration,
 ) -> (Harness, Arc<Lossy>) {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     config.acquire_wait = Duration::from_secs(10);
     configure(&mut config);
     let service = Service::open(store::open("memory:").await.unwrap(), config)
@@ -3073,7 +3560,7 @@ async fn lossy_harness(
         inner: service.clone(),
         lossy: lossy.clone(),
     });
-    let mut agent_config = AgentConfig::new("host-a", dir.path().join("scratch"));
+    let mut agent_config = AgentConfig::new("host-a");
     agent_config.reconcile = Duration::from_millis(300);
     agent_config.retry_backoff = retry_backoff;
     let shutdown = CancellationToken::new();
@@ -3103,7 +3590,7 @@ async fn manual_service(
     Arc<dyn Store>,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     configure(&mut config);
     let store = store::open("memory:").await.unwrap();
     let service = Service::open(store.clone(), config).await.unwrap();
@@ -3324,7 +3811,7 @@ async fn report_exec_orders_by_sequence_and_closes_on_exit() {
 async fn exec_without_a_timeout_gets_the_service_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let host = dir.path().join("host");
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     config.exec_timeout = Duration::from_secs(1);
     let h = harness_with_host_config(
         store::open("memory:").await.unwrap(),
@@ -3576,7 +4063,7 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
     let agent = Agent::new(
         Arc::new(link),
         vec![fake.clone() as Arc<dyn Driver>],
-        AgentConfig::new("remote-host", dir.join("scratch")),
+        AgentConfig::new("remote-host"),
     );
     tokio::spawn(agent.run(t.shutdown_token()));
     let client = t.client();
