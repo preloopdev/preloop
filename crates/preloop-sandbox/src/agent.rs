@@ -1419,6 +1419,7 @@ mod tests {
         let error = agent
             .run_work(
                 &session(),
+                &CancellationToken::new(),
                 WorkItem {
                     id: "wrk-test".into(),
                     copy: Some(CopyWork {

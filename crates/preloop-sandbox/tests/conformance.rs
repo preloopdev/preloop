@@ -3044,7 +3044,7 @@ async fn lossy_harness(
     agent_config.retry_backoff = retry_backoff;
     let shutdown = CancellationToken::new();
     let agent = Agent::new(link, vec![fake.clone() as Arc<dyn Driver>], agent_config);
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     wait_for_registered(&service).await;
     (
