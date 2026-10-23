@@ -126,6 +126,139 @@ async fn join_tokens_are_single_use() {
     assert!(message.contains("join token"), "{message}");
 }
 
+fn enroll_request(token: &str, name: &str, csr_pem: &str) -> EnrollRequest {
+    EnrollRequest {
+        token: token.into(),
+        name: name.into(),
+        csr_pem: csr_pem.into(),
+        ..EnrollRequest::default()
+    }
+}
+
+#[tokio::test]
+async fn a_lost_enroll_response_can_be_retried_with_the_same_csr() {
+    let t = TestService::start().await;
+    let token = t.join_token(Duration::from_secs(60)).await;
+    let (_key, csr) = preloop_sandbox::tls::generate_csr("host-a").unwrap();
+    let anonymous = anonymous_providers(&t.base, &t.ca_pem());
+    let request = enroll_request(&token, "host-a", &csr);
+    // The service accepted and signed, but the response never reached the
+    // agent. The retry presents the identical token and CSR.
+    let first = anonymous
+        .enroll(request.clone())
+        .await
+        .unwrap()
+        .into_owned();
+    let second = anonymous.enroll(request).await.unwrap().into_owned();
+    assert!(!first.cert_pem.is_empty());
+    assert_eq!(first.cert_pem, second.cert_pem);
+    assert_eq!(first.expires_at, second.expires_at);
+    assert_eq!(first.ca_pem, second.ca_pem);
+}
+
+#[tokio::test]
+async fn a_used_token_with_a_different_request_is_refused() {
+    let t = TestService::start().await;
+    let token = t.join_token(Duration::from_secs(60)).await;
+    let (_key, csr) = preloop_sandbox::tls::generate_csr("host-a").unwrap();
+    let anonymous = anonymous_providers(&t.base, &t.ca_pem());
+    anonymous
+        .enroll(enroll_request(&token, "host-a", &csr))
+        .await
+        .unwrap();
+
+    // Same token, different CSR: a different key is not the retry of the
+    // request the service already signed.
+    let (_other_key, other_csr) = preloop_sandbox::tls::generate_csr("host-a").unwrap();
+    let error = anonymous
+        .enroll(enroll_request(&token, "host-a", &other_csr))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Unauthenticated);
+    assert_eq!(
+        preloop_sandbox::error::message(&error),
+        "join token already used"
+    );
+
+    // Same token and CSR under a different name is also a different
+    // request.
+    let error = anonymous
+        .enroll(enroll_request(&token, "host-b", &csr))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Unauthenticated);
+    assert_eq!(
+        preloop_sandbox::error::message(&error),
+        "join token already used"
+    );
+}
+
+#[tokio::test]
+async fn a_join_token_ttl_above_one_day_is_rejected() {
+    let t = TestService::start().await;
+    let error = t
+        .service
+        .create_join_token(Duration::from_secs(24 * 60 * 60 + 1), "")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(
+        preloop_sandbox::error::message(&error).contains("24h"),
+        "{}",
+        preloop_sandbox::error::message(&error)
+    );
+    // The maximum itself is accepted.
+    let response = t
+        .service
+        .create_join_token(Duration::from_secs(24 * 60 * 60), "")
+        .await
+        .unwrap();
+    assert!(!response.token.is_empty());
+}
+
+#[tokio::test]
+async fn enroll_retries_reuse_the_pending_key_and_csr() {
+    let t = TestService::start().await;
+    let token = t.join_token(Duration::from_secs(60)).await;
+    let parts: Vec<&str> = token.split('.').collect();
+    // A well-formed token with a valid CA pin but the wrong secret: the
+    // service rejects it at `Enroll`, after the agent has already committed
+    // its key and CSR.
+    let bad = format!("{}.{}.{}.{}", parts[0], parts[1], "ab".repeat(32), parts[3]);
+    let identity_dir = t.dir.path().join("retry-identity");
+    let error = RemoteLink::enroll(&t.base, &bad, &identity_dir, "host-a")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Unauthenticated);
+    let pending_key = std::fs::read_to_string(identity_dir.join("pending-key.pem")).unwrap();
+    let pending_csr = std::fs::read_to_string(identity_dir.join("pending-csr.pem")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for file in ["pending-key.pem", "pending-csr.pem"] {
+            let mode = std::fs::metadata(identity_dir.join(file))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{file}");
+        }
+    }
+    // A later attempt (in practice a restarted agent) reuses that material:
+    // the certificate is issued for the same key the first request carried.
+    let token = t.join_token(Duration::from_secs(60)).await;
+    let link = RemoteLink::enroll(&t.base, &token, &identity_dir, "host-a")
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(identity_dir.join("key.pem")).unwrap(),
+        pending_key
+    );
+    assert!(!pending_csr.is_empty());
+    assert!(!identity_dir.join("pending-key.pem").exists());
+    assert!(!identity_dir.join("pending-csr.pem").exists());
+    link.register(register("host-a")).await.unwrap();
+}
+
 #[tokio::test]
 async fn expired_join_tokens_are_rejected() {
     let t = TestService::start().await;

@@ -107,6 +107,14 @@ pub const DEFAULT_PAGE_SIZE: u32 = 100;
 /// Largest accepted `ListRequest.page_size`.
 pub const MAX_PAGE_SIZE: u32 = 1000;
 
+/// Default lifetime of a join token when `Enroll` is asked for none.
+pub const DEFAULT_JOIN_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Longest accepted join-token lifetime. A token is a bearer credential for
+/// one enrollment; a day is long enough for an operator to hand it to a
+/// host and short enough that a leaked token stops working.
+pub const MAX_JOIN_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Default cap for one blob upload: 8 GiB.
 pub const DEFAULT_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -377,6 +385,25 @@ struct JoinTokenRecord {
     provider_name: String,
 }
 
+/// What a successfully used join token issued.
+///
+/// Kept in memory only, until the token's original expiry: a client that
+/// lost the `Enroll` response retries with the same token and CSR and gets
+/// this certificate back instead of "join token already used". A restart
+/// forgets it (the token is gone from the store too), so a retry after a
+/// restart fails as it did before retries were idempotent.
+#[derive(Debug, Clone)]
+struct UsedJoinToken {
+    secret_sha256: String,
+    /// SHA-256 of the exact CSR PEM that was signed.
+    csr_sha256: String,
+    provider_name: String,
+    cert_pem: String,
+    cert_expires_at: i64,
+    /// The token's expiry; past it the record is pruned.
+    expires_at: i64,
+}
+
 /// The caller's exec response: the event stream plus the end of a oneshot
 /// that tells the disconnect watcher the caller is gone.
 ///
@@ -511,6 +538,9 @@ struct State {
     injected: HashSet<String>,
     providers: BTreeMap<String, ProviderRec>,
     join_tokens: BTreeMap<String, JoinTokenRecord>,
+    /// Used tokens and what they issued, so an enrollment retry with the
+    /// same CSR is idempotent until the token expires. Memory-only.
+    used_join_tokens: HashMap<String, UsedJoinToken>,
     pending: HashMap<String, PendingWork>,
     execs: HashMap<String, Exec>,
     blobs: HashMap<String, Blob>,
@@ -949,6 +979,9 @@ impl Service {
                 state.join_tokens.remove(&id);
                 ops.push(self.remove(Kind::JoinTokens, &id));
             }
+            // Used-token records live only until the token would have
+            // expired; past that there is nothing a retry can match.
+            state.used_join_tokens.retain(|_, used| used.expires_at > t);
             let mut pruned = Vec::new();
             for rec in state.providers.values_mut() {
                 let before = rec.provider.certificates.len();
@@ -3237,10 +3270,16 @@ impl Service {
             validate_name("provider", provider_name)?;
         }
         let ttl = if ttl.is_zero() {
-            Duration::from_secs(3600)
+            DEFAULT_JOIN_TOKEN_TTL
         } else {
             ttl
         };
+        if ttl > MAX_JOIN_TOKEN_TTL {
+            return Err(Error::invalid_argument(format!(
+                "join token ttl must be at most {}h",
+                MAX_JOIN_TOKEN_TTL.as_secs() / 3600
+            )));
+        }
         let id = new_id("jt");
         let secret = tls::random_hex(32);
         let seconds = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
@@ -3292,8 +3331,16 @@ impl Service {
     /// CSR does not burn a valid token; a token that reaches the store lookup
     /// is removed whether or not binding the provider then succeeds.
     ///
-    /// Every token-validation failure — malformed, issued for another CA,
-    /// unknown or used, expired, wrong secret — returns the same
+    /// A successful enrollment keeps an in-memory record — token id, CSR
+    /// hash, certificate and provider name — until the token's own expiry.
+    /// Repeating the call with the same token, CSR and name returns that
+    /// certificate, so a response lost on the wire can be retried; reusing
+    /// the token with anything else is refused with "join token already
+    /// used". The record is not persisted: a restart forgets it (and the
+    /// token), so then a retry fails exactly as before.
+    ///
+    /// Every other token-validation failure — malformed, issued for another
+    /// CA, unknown or used, expired, wrong secret — returns the same
     /// `Unauthenticated` error, so this endpoint cannot be used as an oracle
     /// for which component of a token is wrong; the specific reason is only
     /// logged. Name-binding failures are authorization errors about an
@@ -3312,24 +3359,52 @@ impl Service {
             return Err(invalid("join token was issued for a different CA"));
         }
         validate_name("provider", &request.name)?;
-        let signed = ca.sign_client(&request.csr_pem, &request.name, tls::CLIENT_CERT_LIFETIME)?;
-        let ops = {
+        let csr_sha256 = tls::sha256_hex(request.csr_pem.as_bytes());
+        let secret_sha256 = tls::sha256_hex(parts.secret.as_bytes());
+        let (signed, ops) = {
             let mut state = self.state.lock();
             let t = now();
-            let record = state
-                .join_tokens
-                .get(parts.id)
-                .ok_or_else(|| invalid("unknown or used join token"))?;
-            if record.expires_at <= t {
-                return Err(invalid("join token expired"));
+            // Retry of an enrollment that was already accepted: same token,
+            // same CSR and same name gets the same certificate back. A
+            // different CSR or name is a different request and is refused.
+            // The secret is re-checked so knowing the token id is not enough
+            // to learn anything or fetch the certificate.
+            if let Some(used) = state.used_join_tokens.get(parts.id) {
+                if used.expires_at <= t {
+                    state.used_join_tokens.remove(parts.id);
+                } else {
+                    if !constant_time_eq(used.secret_sha256.as_bytes(), secret_sha256.as_bytes()) {
+                        return Err(invalid("bad join token"));
+                    }
+                    if used.csr_sha256 == csr_sha256 && used.provider_name == request.name {
+                        return Ok(EnrollResponse {
+                            cert_pem: used.cert_pem.clone(),
+                            ca_pem: ca.pem().to_owned(),
+                            expires_at: used.cert_expires_at,
+                            ..EnrollResponse::default()
+                        });
+                    }
+                    warn!(
+                        reason = "join token reused with a different CSR or provider name",
+                        provider = %request.name,
+                        "enroll rejected"
+                    );
+                    return Err(Error::new(Code::Unauthenticated, "join token already used"));
+                }
             }
-            if !constant_time_eq(
-                record.secret_sha256.as_bytes(),
-                tls::sha256_hex(parts.secret.as_bytes()).as_bytes(),
-            ) {
-                return Err(invalid("bad join token"));
-            }
-            let bound_name = record.provider_name.clone();
+            let (bound_name, token_expires_at) = {
+                let record = state
+                    .join_tokens
+                    .get(parts.id)
+                    .ok_or_else(|| invalid("unknown or used join token"))?;
+                if record.expires_at <= t {
+                    return Err(invalid("join token expired"));
+                }
+                if !constant_time_eq(record.secret_sha256.as_bytes(), secret_sha256.as_bytes()) {
+                    return Err(invalid("bad join token"));
+                }
+                (record.provider_name.clone(), record.expires_at)
+            };
             let existing = state
                 .providers
                 .values()
@@ -3354,7 +3429,23 @@ impl Service {
                      a join token bound to that name",
                 ));
             }
+            // Sign before consuming: a malformed CSR must not burn the
+            // token. Persisting the used record below keeps this
+            // certificate available to a retry until the token expires.
+            let signed =
+                ca.sign_client(&request.csr_pem, &request.name, tls::CLIENT_CERT_LIFETIME)?;
             state.join_tokens.remove(parts.id);
+            state.used_join_tokens.insert(
+                parts.id.to_owned(),
+                UsedJoinToken {
+                    secret_sha256,
+                    csr_sha256,
+                    provider_name: request.name.clone(),
+                    cert_pem: signed.cert_pem.clone(),
+                    cert_expires_at: signed.expires_at,
+                    expires_at: token_expires_at,
+                },
+            );
             let mut ops = vec![self.remove(Kind::JoinTokens, parts.id)];
             let id = existing.unwrap_or_else(|| new_id("prv"));
             // Take the previous record out: everything it held carries
@@ -3408,7 +3499,7 @@ impl Service {
             );
             wake.notify_waiters();
             ops.push(self.put(Kind::Providers, &id, &provider));
-            ops
+            (signed, ops)
         };
         self.persist(ops).await;
         self.changed.notify_waiters();
@@ -4292,5 +4383,62 @@ mod tests {
         };
         let error = paginate("sandbox", items(3), &request).unwrap_err();
         assert_eq!(error.code, Code::InvalidArgument);
+    }
+
+    async fn enrollment_service() -> (Arc<Service>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(
+            crate::tls::ServiceCa::load_or_create(&dir.path().join("ca")).expect("service CA"),
+        );
+        let mut config = ServiceConfig::new(dir.path().join("blobs"));
+        config.ca = Some(ca);
+        let service = Service::open(crate::store::open("memory:").await.unwrap(), config)
+            .await
+            .unwrap();
+        (service, dir)
+    }
+
+    fn enroll_request(token: &str, csr_pem: &str) -> EnrollRequest {
+        EnrollRequest {
+            token: token.to_owned(),
+            name: "host-a".into(),
+            csr_pem: csr_pem.to_owned(),
+            ..EnrollRequest::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_used_join_token_is_forgotten_at_expiry() {
+        let (service, _dir) = enrollment_service().await;
+        let token = service
+            .create_join_token(Duration::from_secs(60), "")
+            .await
+            .unwrap()
+            .token;
+        let (_key, csr) = crate::tls::generate_csr("host-a").unwrap();
+
+        let first = service.enroll(enroll_request(&token, &csr)).await.unwrap();
+        assert_eq!(service.state.lock().used_join_tokens.len(), 1);
+        // While the token's TTL lasts, the same request gets the same cert.
+        let second = service.enroll(enroll_request(&token, &csr)).await.unwrap();
+        assert_eq!(first.cert_pem, second.cert_pem);
+
+        // Expire the record; maintenance drops it, so the retry falls back
+        // to "unknown or used" and the memory does not grow.
+        let id = crate::tls::parse_join_token(&token).unwrap().id.to_owned();
+        service
+            .state
+            .lock()
+            .used_join_tokens
+            .get_mut(&id)
+            .expect("used record")
+            .expires_at = 0;
+        service.maintain().await;
+        assert!(service.state.lock().used_join_tokens.is_empty());
+        let error = service
+            .enroll(enroll_request(&token, &csr))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Unauthenticated);
     }
 }
