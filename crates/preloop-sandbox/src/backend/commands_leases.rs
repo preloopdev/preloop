@@ -400,7 +400,7 @@ pub(crate) async fn acquire(store: &SqlStore, command: AcquireCommand) -> Result
                 // is capped: provisioning may legitimately outlast a short
                 // requested TTL, and the caller must not lose a machine it
                 // is still waiting for.
-                let unclaimed_ttl = command.unclaimed_ttl_secs.max(1);
+                let unclaimed_ttl = command.unclaimed_ttl_secs;
                 let initial_ttl = ttl_secs.min(unclaimed_ttl);
                 let sandbox_id = if let Some(pool) = &pool {
                     let pool_name = pool.text("name")?.to_owned();
@@ -940,15 +940,30 @@ pub(crate) async fn release_lease(
     let failed = sandbox
         .as_ref()
         .is_some_and(|sandbox| sandbox.state.known() == SandboxState::Failed);
-    if preserve
-        && !failed
-        && sandbox.as_ref().is_some_and(|sandbox| {
-            matches!(
-                sandbox.state.known(),
-                SandboxState::Leased | SandboxState::Preserved
-            )
-        })
-    {
+    if preserve {
+        let state = sandbox
+            .as_ref()
+            .map(|sandbox| sandbox.state.known())
+            .unwrap_or(SandboxState::SandboxStateUnspecified);
+        let preservable = !failed
+            && matches!(
+                state,
+                SandboxState::Leased
+                    | SandboxState::Preserved
+                    | SandboxState::Paused
+                    | SandboxState::Stopped
+            );
+        if !preservable {
+            let state_name = if sandbox.is_some() {
+                format!("{state:?}")
+            } else {
+                "gone".to_owned()
+            };
+            return Err(Error::failed_precondition(format!(
+                "sandbox {sandbox_id} cannot be preserved from state {state_name}; \
+                 release with DESTROY to give it up"
+            )));
+        }
         let ttl = if preserve_ttl_secs == 0 {
             default_preserve_secs
         } else {
@@ -956,9 +971,12 @@ pub(crate) async fn release_lease(
         };
         let until = now_secs() + i64::try_from(ttl).unwrap_or(i64::MAX);
         let version = bump_version(tx).await?;
+        // A paused or stopped sandbox keeps its power state; the preserve
+        // window only extends how long the debug capability stays usable.
         tx.execute(
-            "UPDATE sandboxes SET state = 'preserved', preserve_until = $2, version = $3 \
-             WHERE id = $1",
+            "UPDATE sandboxes SET state = CASE WHEN state IN ('leased', 'ready') \
+                        THEN 'preserved' ELSE state END, \
+                    preserve_until = $2, version = $3 WHERE id = $1",
             &[sandbox_id.as_str().into(), until.into(), version.into()],
         )
         .await?;

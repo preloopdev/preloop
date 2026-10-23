@@ -452,6 +452,28 @@ pub(crate) async fn delete_template(store: &SqlStore, name: &str) -> Result<()> 
                     .next()
                     .ok_or_else(|| Error::not_found(format!("template `{name}` not found")))?;
                 let template = rows::template_from_row(&row)?;
+                // A live sandbox was created from this template: deleting
+                // the logical template must not strand the running clone's
+                // identity (its spec is immutable and still names the
+                // template). Refuse until the clone is gone.
+                let live = tx
+                    .query(
+                        "SELECT p.template_json FROM sandboxes s \
+                         JOIN sandbox_specs p ON p.id = s.id \
+                         WHERE s.state NOT IN ('gone', 'failed')",
+                        &[],
+                    )
+                    .await?;
+                for spec in live {
+                    let used: Template =
+                        rows::json(spec.text("template_json")?, "sandbox template")?;
+                    if used.spec.as_option().is_some_and(|used| used.name == name) {
+                        return Err(Error::failed_precondition(format!(
+                            "template `{name}` is in use by a live sandbox; \
+                             release the clone first"
+                        )));
+                    }
+                }
                 let version = bump_version(tx).await?;
                 tx.execute(
                     "DELETE FROM templates WHERE name = $1",

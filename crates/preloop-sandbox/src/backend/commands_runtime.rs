@@ -55,6 +55,13 @@ pub(crate) async fn create_exec(
                     env.extend(request.env.clone());
                     merged.env = env;
                 }
+                for key in merged.env.keys() {
+                    if !crate::driver::env_key_is_identifier(key) {
+                        return Err(Error::invalid_argument(format!(
+                            "invalid environment variable name `{key}`"
+                        )));
+                    }
+                }
                 merged.lease_id.clear();
                 let timeout = timeout_secs.max(1);
                 let deadline = now_secs() + i64::try_from(timeout).unwrap_or(i64::MAX);
@@ -464,6 +471,7 @@ pub(crate) async fn create_ticket(
     expires_at: i64,
     owner: &Owner,
 ) -> Result<()> {
+    logic::validate_guest_path(guest_path)?;
     store
         .run_tx(|tx| {
             let id = id.to_owned();

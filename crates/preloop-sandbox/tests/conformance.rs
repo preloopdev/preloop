@@ -6021,12 +6021,13 @@ async fn restart_keeps_the_requested_lease_ttl() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("sandbox.db");
     {
-        let service = Service::open(
-            backend::open(db.to_str().unwrap()).await.unwrap(),
-            ServiceConfig::new(),
-        )
-        .await
-        .unwrap();
+        // The unclaimed window caps an undelivered lease; it must not be
+        // tighter than the TTL the caller asked for, or this measures the cap.
+        let mut config = ServiceConfig::new();
+        config.unclaimed_lease_ttl = Duration::from_secs(7200);
+        let service = Service::open(backend::open(db.to_str().unwrap()).await.unwrap(), config)
+            .await
+            .unwrap();
         service
             .register(RegisterRequest {
                 name: "host-a".into(),
@@ -6063,6 +6064,11 @@ async fn restart_keeps_the_requested_lease_ttl() {
     }
     // The caller's TTL is durable state, not a default applied at hand-out:
     // the row that survived the restart still carries the hour it was given.
+    assert_eq!(
+        query_int(&db, "SELECT requested_ttl_secs FROM leases"),
+        3600,
+        "the requested TTL is persisted"
+    );
     let expires = query_int(&db, "SELECT expires_at FROM leases");
     let remaining = expires - unix_now();
     assert!(
@@ -6112,6 +6118,11 @@ async fn leases_persisted_before_requested_ttls_are_treated_as_delivered() {
     execute_bound(
         &db,
         "UPDATE leases SET request_hash = '' WHERE id = ?1",
+        &lease_id,
+    );
+    execute_bound(
+        &db,
+        "UPDATE leases SET requested_ttl_secs = 0 WHERE id = ?1",
         &lease_id,
     );
     let service = Service::open(

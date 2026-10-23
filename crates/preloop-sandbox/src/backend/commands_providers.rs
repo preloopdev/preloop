@@ -1486,7 +1486,10 @@ pub(crate) async fn reconcile(
                         continue;
                     }
                     if *attempts >= super::commands_runtime::MAX_DESTROY_ATTEMPTS {
-                        purge_sandbox(tx, id).await?;
+                        // The machine is still reported. Keep the tombstone:
+                        // it still proves the machine is the service's, and
+                        // reconcile reclaims it once the provider stops
+                        // reporting it.
                         continue;
                     }
                     tx.execute(
@@ -1546,8 +1549,6 @@ pub(crate) async fn reconcile(
                         });
                     let foreign = all_records.iter().any(|row| {
                         row.text("provider_id").ok() != Some(request.provider_id.as_str())
-                            && row.text("state").ok() != Some("gone")
-                            && row.text("state").ok() != Some("failed")
                             && (row.text("native_ref").ok() == Some(item.native_ref.as_str())
                                 || (!item.sandbox_id.is_empty()
                                     && row.text("id").ok() == Some(item.sandbox_id.as_str())))

@@ -143,6 +143,16 @@ pub fn sandbox_meets(provider: Option<&Provider>, driver: &str, requires: &Requi
         .is_some_and(|info| driver_meets(info, requires))
 }
 
+/// Guest paths name files inside one sandbox; a legitimate one never needs a
+/// `..` component, and a `..` is exactly how a path escapes the sandbox on a
+/// driver that resolves paths on the host. Both separator spellings count.
+pub fn validate_guest_path(path: &str) -> Result<()> {
+    if path.split(['/', '\\']).any(|component| component == "..") {
+        return Err(Error::invalid_argument("guest path must not contain `..`"));
+    }
+    Ok(())
+}
+
 /// Whether a sandbox state can serve a caller.
 pub fn usable(sandbox: &Sandbox) -> Result<()> {
     match sandbox.state.known() {
