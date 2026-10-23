@@ -204,6 +204,18 @@ fn new_id(prefix: &str) -> String {
     )
 }
 
+/// Guest paths name files inside one sandbox; a legitimate one never
+/// needs a `..` component, and a `..` is exactly how a path escapes the
+/// sandbox on a driver that resolves paths on the host. Reject it at the
+/// service, before any driver sees the path. Both separator spellings
+/// count: a Windows guest path is `\`-separated.
+fn validate_guest_path(path: &str) -> Result<()> {
+    if path.split(['/', '\\']).any(|component| component == "..") {
+        return Err(Error::invalid_argument("guest path must not contain `..`"));
+    }
+    Ok(())
+}
+
 /// Copy a blob without blocking a Tokio worker for the length of the I/O.
 async fn copy_off_runtime(from: PathBuf, to: PathBuf, what: &str) -> Result<()> {
     tokio::task::spawn_blocking(move || std::fs::copy(&from, &to))
@@ -514,8 +526,20 @@ struct Blob {
     token: String,
     expires_at: i64,
     path: PathBuf,
-    /// Set by the first `claim_ticket`: a ticket is a single-use capability.
+    /// Minted by the service itself to stage a provider copy (a caller
+    /// upload's second leg, lease injection, `download_path`). Internal
+    /// blobs are reachable only through the provider link, whose caller is
+    /// authenticated by its client certificate and fenced to the owning
+    /// provider; they are never claimable on the caller data plane.
+    internal: bool,
+    /// A caller data-plane transfer has claimed this ticket. The claim is
+    /// the single use: it is marked in the same lock hold that validates
+    /// the ticket, so a second claim finds nothing.
     claimed: bool,
+    /// A provider upload is streaming into the blob path right now, so a
+    /// second provider write for the same ticket is refused instead of
+    /// splicing one spool file between two writers.
+    writing: bool,
 }
 
 /// Per-sandbox creation parameters kept for (re)provisioning and audit.
@@ -2912,6 +2936,7 @@ impl Service {
         if !request.path.starts_with('/') && !windows_absolute {
             return Err(Error::invalid_argument("path must be absolute"));
         }
+        validate_guest_path(&request.path)?;
         let mut state = self.state.lock();
         let sandbox = state
             .sandboxes
@@ -2931,7 +2956,9 @@ impl Service {
                 token: token.clone(),
                 expires_at,
                 path: self.config.blob_dir.join(format!("{ticket}.tar")),
+                internal: false,
                 claimed: false,
+                writing: false,
             },
         );
         Ok(Ticket {
@@ -2942,26 +2969,35 @@ impl Service {
         })
     }
 
-    /// Validate and consume a client ticket; returns `(kind, blob path)`.
-    /// The claim is atomic: two concurrent transfers cannot share (and
-    /// truncate) one destination.
+    /// Claim a client ticket for its single transfer; returns
+    /// `(kind, blob path)`.
+    ///
+    /// The claim is atomic: validation and the claim mark happen in one
+    /// lock hold, so two concurrent claims cannot both stream through the
+    /// ticket's one spool path — the loser finds the ticket gone. Internal
+    /// staging tickets (minted by the service itself for provider
+    /// copies) are not claimable here at all, and an empty token never
+    /// authenticates: the stream handlers default a missing
+    /// `Authorization` header to `""`, which must match nothing.
+    ///
+    /// Expiry is enforced at claim time, not mid-transfer: a successful
+    /// claim extends the ticket to a full fresh TTL, so the sweeper
+    /// cannot delete a claimed transfer's bytes before it finishes.
     pub fn claim_ticket(&self, ticket: &str, token: &str) -> Result<(StreamKind, PathBuf)> {
         let mut state = self.state.lock();
-        let blob = state
-            .blobs
-            .get(ticket)
-            .filter(|blob| blob.expires_at > now())
-            .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
-        // In-process blobs have no token: never let a tokenless request
-        // match them. The comparison stays constant-time.
-        if blob.token.is_empty() || !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
+        let Some(blob) = state.blobs.get_mut(ticket) else {
+            return Err(Error::not_found("ticket not found or expired"));
+        };
+        if blob.internal || blob.claimed || blob.expires_at <= now() {
+            return Err(Error::not_found("ticket not found or expired"));
+        }
+        if token.is_empty() || !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
             return Err(Error::new(Code::Unauthenticated, "bad ticket token"));
         }
-        let blob = state.blobs.get_mut(ticket).expect("ticket looked up above");
-        if blob.claimed {
-            return Err(Error::not_found("ticket already claimed"));
-        }
         blob.claimed = true;
+        blob.expires_at = blob
+            .expires_at
+            .max(now() + self.config.ticket_ttl.as_secs() as i64);
         Ok((blob.kind, blob.path.clone()))
     }
 
@@ -3024,6 +3060,7 @@ impl Service {
 
     /// Copy a staged tar to a fresh agent ticket and extract it in the guest.
     async fn stage_upload(&self, sandbox_id: &str, guest_dir: &str, tar: &Path) -> Result<()> {
+        validate_guest_path(guest_dir)?;
         let ticket = new_id("tkt");
         let path = self.config.blob_dir.join(format!("{ticket}.tar"));
         copy_off_runtime(tar.to_owned(), path.clone(), "stage upload").await?;
@@ -3033,10 +3070,12 @@ impl Service {
                 sandbox_id: sandbox_id.to_owned(),
                 kind: StreamKind::Upload,
                 guest_path: guest_dir.to_owned(),
-                token: String::new(),
+                token: uuid::Uuid::new_v4().simple().to_string(),
                 expires_at: now() + self.config.ticket_ttl.as_secs() as i64,
                 path: path.clone(),
+                internal: true,
                 claimed: false,
+                writing: false,
             },
         );
         let result = self
@@ -3055,6 +3094,7 @@ impl Service {
         dest: &Path,
     ) -> Result<()> {
         self.check_lease(sandbox_id, lease_id)?;
+        validate_guest_path(guest_path)?;
         let ticket = new_id("tkt");
         let path = self.config.blob_dir.join(format!("{ticket}.tar"));
         self.state.lock().blobs.insert(
@@ -3063,10 +3103,12 @@ impl Service {
                 sandbox_id: sandbox_id.to_owned(),
                 kind: StreamKind::Download,
                 guest_path: guest_path.to_owned(),
-                token: String::new(),
+                token: uuid::Uuid::new_v4().simple().to_string(),
                 expires_at: now() + self.config.ticket_ttl.as_secs() as i64,
                 path: path.clone(),
+                internal: true,
                 claimed: false,
+                writing: false,
             },
         );
         let result = self
@@ -3090,6 +3132,15 @@ impl Service {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock();
+            // A copy may legitimately run until the work timeout, which is
+            // longer than a ticket's TTL: keep the blob alive for the
+            // copy's own bound so the sweeper cannot delete it
+            // mid-transfer.
+            if let Some(blob) = state.blobs.get_mut(ticket) {
+                blob.expires_at = blob
+                    .expires_at
+                    .max(now() + self.config.work_timeout.as_secs() as i64);
+            }
             let sandbox = state
                 .sandboxes
                 .get(sandbox_id)
@@ -3141,6 +3192,62 @@ impl Service {
             ));
         }
         Ok(blob.path.clone())
+    }
+
+    /// Begin a provider upload into a ticket's blob: the fencing and
+    /// ownership checks of [`Service::agent_blob`], plus the write is
+    /// marked in progress so a second provider write for the same ticket
+    /// is refused instead of splicing the one spool file between two
+    /// writers. Pair with [`Service::end_agent_write`].
+    pub fn begin_agent_write(
+        &self,
+        provider_id: &str,
+        generation: u64,
+        ticket: &str,
+    ) -> Result<PathBuf> {
+        let mut state = self.state.lock();
+        self.fence(&state, provider_id, generation)?;
+        let (sandbox_id, path) = {
+            let blob = state
+                .blobs
+                .get(ticket)
+                .ok_or_else(|| Error::not_found("ticket not found"))?;
+            (blob.sandbox_id.clone(), blob.path.clone())
+        };
+        let owner = state
+            .sandboxes
+            .get(&sandbox_id)
+            .map(|s| s.provider_id.as_str());
+        if owner != Some(provider_id) {
+            return Err(Error::new(
+                Code::PermissionDenied,
+                "ticket belongs to another provider",
+            ));
+        }
+        let blob = state
+            .blobs
+            .get_mut(ticket)
+            .ok_or_else(|| Error::not_found("ticket not found"))?;
+        if blob.writing {
+            return Err(Error::new(
+                Code::AlreadyExists,
+                "blob transfer already in progress",
+            ));
+        }
+        blob.writing = true;
+        Ok(path)
+    }
+
+    /// End a provider upload begun with [`Service::begin_agent_write`]:
+    /// the write is over, so the mark is released. The mark is purely a
+    /// concurrency guard — a later sequential rewrite (a redelivered
+    /// copy whose report was lost) truncates and rewrites the same
+    /// bytes, as it did before the guard existed.
+    pub fn end_agent_write(&self, ticket: &str) {
+        let mut state = self.state.lock();
+        if let Some(blob) = state.blobs.get_mut(ticket) {
+            blob.writing = false;
+        }
     }
 
     // ─── Snapshot / pause / resume ─────────────────────────────────
@@ -4847,6 +4954,158 @@ mod tests {
         assert_eq!(error.code, Code::InvalidArgument);
     }
 
+    async fn blob_test_service(
+        ticket_ttl: Duration,
+        work_timeout: Duration,
+    ) -> (Arc<Service>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ServiceConfig::new(dir.path().join("blobs"));
+        config.ticket_ttl = ticket_ttl;
+        config.work_timeout = work_timeout;
+        let service = Service::open(crate::store::open("memory:").await.unwrap(), config)
+            .await
+            .unwrap();
+        (service, dir)
+    }
+
+    fn insert_blob(service: &Service, ticket: &str, token: &str, internal: bool, expires_at: i64) {
+        service.state.lock().blobs.insert(
+            ticket.to_owned(),
+            Blob {
+                sandbox_id: "sbx-test".into(),
+                kind: StreamKind::Upload,
+                guest_path: "/work".into(),
+                token: token.to_owned(),
+                expires_at,
+                path: PathBuf::from("/nonexistent.tar"),
+                internal,
+                claimed: false,
+                writing: false,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_tickets_are_not_claimable_on_the_data_plane() {
+        let (service, _dir) =
+            blob_test_service(Duration::from_secs(30), Duration::from_secs(2)).await;
+        insert_blob(&service, "tkt-stage", "staging-token", true, now() + 60);
+        // Not with an absent token (the original bypass: staging records
+        // carried an empty token, and the handlers default a missing
+        // `Authorization` header to "")…
+        let error = service.claim_ticket("tkt-stage", "").unwrap_err();
+        assert_eq!(error.code, Code::NotFound, "{error}");
+        // …and not even with the ticket's own token: a staging blob is
+        // the provider link's, authenticated by client certificate.
+        let error = service
+            .claim_ticket("tkt-stage", "staging-token")
+            .unwrap_err();
+        assert_eq!(error.code, Code::NotFound, "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_token_never_authenticates_a_ticket() {
+        let (service, _dir) =
+            blob_test_service(Duration::from_secs(30), Duration::from_secs(2)).await;
+        insert_blob(&service, "tkt-1", "real-token", false, now() + 60);
+        let error = service.claim_ticket("tkt-1", "").unwrap_err();
+        assert_eq!(error.code, Code::Unauthenticated, "{error}");
+        let error = service.claim_ticket("tkt-1", "wrong-token").unwrap_err();
+        assert_eq!(error.code, Code::Unauthenticated, "{error}");
+        // A failed attempt does not consume the ticket.
+        assert!(service.claim_ticket("tkt-1", "real-token").is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_ticket_claims_exactly_once() {
+        let (service, _dir) =
+            blob_test_service(Duration::from_secs(30), Duration::from_secs(2)).await;
+        insert_blob(&service, "tkt-1", "tok", false, now() + 60);
+        let (kind, _) = service.claim_ticket("tkt-1", "tok").unwrap();
+        assert_eq!(kind, StreamKind::Upload);
+        // The claim is the single use, marked as it is handed out: a
+        // second claim — even with the right token — finds nothing, so
+        // two transfers can never share the ticket's spool path.
+        let error = service.claim_ticket("tkt-1", "tok").unwrap_err();
+        assert_eq!(error.code, Code::NotFound, "{error}");
+    }
+
+    #[tokio::test]
+    async fn expiry_is_enforced_at_claim_and_a_claim_gets_a_full_ttl() {
+        let (service, _dir) =
+            blob_test_service(Duration::from_secs(30), Duration::from_secs(2)).await;
+        // Expired before the claim: rejected at claim time, and the
+        // sweeper still reaps the unclaimed record.
+        insert_blob(&service, "tkt-old", "tok", false, now() - 1);
+        let error = service.claim_ticket("tkt-old", "tok").unwrap_err();
+        assert_eq!(error.code, Code::NotFound, "{error}");
+        service.maintain().await;
+        assert!(!service.state.lock().blobs.contains_key("tkt-old"));
+        // Claimed just before expiry: the claim extends the ticket by a
+        // full TTL, so the sweeper cannot delete the in-flight
+        // transfer's bytes from under it.
+        insert_blob(&service, "tkt-live", "tok", false, now() + 1);
+        service.claim_ticket("tkt-live", "tok").unwrap();
+        let expires_at = service.state.lock().blobs["tkt-live"].expires_at;
+        assert!(
+            expires_at >= now() + 29,
+            "claim must extend the ticket to a full TTL, expires_at={expires_at}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_keeps_its_blob_alive_for_the_work_timeout() {
+        let (service, _dir) =
+            blob_test_service(Duration::from_secs(30), Duration::from_secs(2)).await;
+        {
+            let mut state = service.state.lock();
+            state.sandboxes.insert(
+                "sbx-test".into(),
+                Sandbox {
+                    id: "sbx-test".into(),
+                    provider_id: "prv-test".into(),
+                    ..Sandbox::default()
+                },
+            );
+            state.providers.insert(
+                "prv-test".into(),
+                ProviderRec {
+                    provider: Provider {
+                        id: "prv-test".into(),
+                        ..Provider::default()
+                    },
+                    seen: Instant::now(),
+                    queue: VecDeque::new(),
+                    in_flight: HashMap::new(),
+                    wake: Arc::new(Notify::new()),
+                    host: None,
+                    host_sampled_at: None,
+                    sandbox_stats: HashMap::new(),
+                },
+            );
+        }
+        // The staging blob is already past its ticket TTL when the copy
+        // is enqueued; the copy's own bound is what must govern it.
+        insert_blob(&service, "tkt-copy", "tok", true, now() - 5);
+        let service2 = service.clone();
+        let copy = tokio::spawn(async move {
+            service2
+                .copy_work("sbx-test", "tkt-copy", "/work", StreamKind::Upload)
+                .await
+        });
+        let mut bumped = false;
+        for _ in 0..100 {
+            if service.state.lock().blobs["tkt-copy"].expires_at > now() {
+                bumped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(bumped, "enqueueing a copy must extend its blob's life");
+        // Nobody reports the copy; it ends at the work timeout.
+        assert!(copy.await.unwrap().is_err());
+    }
+
     fn ready_member(id: &str, created_at: i64) -> Sandbox {
         Sandbox {
             id: id.into(),
@@ -4959,7 +5218,9 @@ mod tests {
                 token: String::new(),
                 expires_at: now() + 60,
                 path: dir.path().join("blob.tar"),
+                internal: false,
                 claimed: false,
+                writing: false,
             },
         );
         let error = service.claim_ticket("tkt-internal", "").unwrap_err();
