@@ -1357,6 +1357,7 @@ async fn split_listeners_expose_only_their_route_families() {
     .unwrap();
     let response = http
         .post(format!("{client_base}/preloop.sandbox.v1.Sandboxes/List"))
+        .header("content-type", "application/json")
         .bearer_auth("client")
         .body("{}")
         .send()
@@ -1365,6 +1366,7 @@ async fn split_listeners_expose_only_their_route_families() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let response = http
         .post(format!("{client_base}/preloop.sandbox.v1.Providers/Enroll"))
+        .header("content-type", "application/json")
         .body("{}")
         .send()
         .await
@@ -1372,6 +1374,7 @@ async fn split_listeners_expose_only_their_route_families() {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     let response = http
         .post(format!("{agent_base}/preloop.sandbox.v1.Sandboxes/List"))
+        .header("content-type", "application/json")
         .body("{}")
         .send()
         .await
@@ -1387,6 +1390,7 @@ async fn split_listeners_expose_only_their_route_families() {
         .post(format!(
             "{agent_base}/preloop.sandbox.v1.Providers/Register"
         ))
+        .header("content-type", "application/json")
         .body("{}")
         .send()
         .await

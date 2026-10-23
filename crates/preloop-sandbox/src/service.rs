@@ -2630,7 +2630,7 @@ impl Service {
             }
             let mut header = tar::Header::new_gnu();
             header.set_size(spec.data.len() as u64);
-            header.set_mode(if spec.mode == 0 { 0o644 } else { spec.mode });
+            header.set_mode(if spec.mode == 0 { 0o600 } else { spec.mode });
             header.set_mtime(now() as u64);
             header.set_cksum();
             builder

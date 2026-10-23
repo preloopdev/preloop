@@ -87,10 +87,11 @@ instead of queueing behind a full pool.
 Exec work is the one redelivery that must not replay: an exec is a command,
 and running it twice is a side effect, not a retry. The agent records every
 exec it starts in a durable started-set beside its identity state
-(`started-execs/` in its scratch directory) *before* running it, and refuses
-a redelivery of an exec id already in the set, reporting it as a failed
-attempt; the service closes the caller's stream with that error rather than
-a phantom second run. The service counts each delivery on the exec record,
+(`started-execs/` in its scratch directory; the CLI pins that directory to
+`<state>/sandbox-agent`, so a restart reuses it) *before* running it, and
+refuses a redelivery of an exec id already in the set, reporting it as a
+failed attempt; the service closes the caller's stream with that error rather
+than a phantom second run. The service counts each delivery on the exec record,
 so redeliveries are visible where the exec lives. The fence is host-local
 and lasts as long as the agent's scratch directory does: wiping the scratch,
 or redelivering the exec to a different host, reopens the window — and an
@@ -314,7 +315,8 @@ certificate is used as-is.
 Authentication and authorization are separate. Handlers first verify the
 existing bearer token, provider certificate, or ticket token, then call the
 replaceable `Authorizer` seam with a named `Principal` and coarse `Action`.
-`PRELOOP_SANDBOX_AUTHORIZER` is unset or `builtin` today; the built-in policy
+`PRELOOP_SANDBOX_AUTHORIZER` is unset or `builtin` today; any other value
+refuses startup and names the setting. The built-in policy
 allows every authenticated principal to use every action on its surface, so
 the default behavior is unchanged. Roles, namespaces, and per-caller
 credentials are follow-up work in #777/#792.

@@ -574,6 +574,110 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// True while `pid` names a live (not zombie) process.
+    #[cfg(unix)]
+    fn running(pid: u32) -> bool {
+        // `ps` is portable where /proc is not, and still reports `Z` for a
+        // zombie, so a killed-but-unreaped process does not count as alive.
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|state| state != 'Z' && state != 'X')
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        for _ in 0..200 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Pentest W4-F7: `destroy` used to only delete the directory,
+    /// leaving the sandbox's exec processes running on the host under a
+    /// native ref the service had already forgotten. Destroy now
+    /// cancels the sandbox's execs and waits for their process groups —
+    /// children included — to die before removing the directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destroy_kills_the_sandboxes_running_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(FakeDriver::new(
+            "fake",
+            dir.path().join("host"),
+            FakeDriver::full_capabilities(),
+        ));
+        let native = driver
+            .create(&CreateWork {
+                sandbox_id: "sbx-destroy".into(),
+                driver: "fake".into(),
+                ..CreateWork::default()
+            })
+            .await
+            .unwrap();
+        // The pid files live outside the sandbox root, which destroy
+        // deletes: the shell records itself and a background child.
+        let child_pid_file = dir.path().join("child.pid");
+        let shell_pid_file = dir.path().join("shell.pid");
+        let script = format!(
+            "sleep 60 & echo $! > {}; echo $$ > {}; wait",
+            child_pid_file.display(),
+            shell_pid_file.display()
+        );
+        let (tx, _rx) = mpsc::channel(64);
+        let exec_driver = driver.clone();
+        let exec_native = native.clone();
+        let exec = tokio::spawn(async move {
+            exec_driver
+                .exec(
+                    &exec_native,
+                    "exe-destroy",
+                    &ExecRequest {
+                        argv: vec!["sh".into(), "-c".into(), script],
+                        ..ExecRequest::default()
+                    },
+                    tx,
+                )
+                .await
+        });
+        let read_pid = |path: &Path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+        };
+        wait_until(
+            || read_pid(&child_pid_file).is_some() && read_pid(&shell_pid_file).is_some(),
+            "the exec to start",
+        )
+        .await;
+        let child_pid = read_pid(&child_pid_file).unwrap();
+        let shell_pid = read_pid(&shell_pid_file).unwrap();
+        assert!(running(child_pid) && running(shell_pid));
+
+        driver.destroy(&native).await.unwrap();
+
+        assert!(!running(shell_pid), "the shell survived destroy");
+        assert!(!running(child_pid), "the shell's child survived destroy");
+        tokio::time::timeout(Duration::from_secs(5), exec)
+            .await
+            .expect("the exec task outlived destroy")
+            .unwrap()
+            .unwrap();
+        assert!(!driver.dir(&native).unwrap().exists());
+    }
+
     #[test]
     fn guest_paths_are_confined_to_the_sandbox_root() {
         let root = Path::new("/sandboxes/ref-1");

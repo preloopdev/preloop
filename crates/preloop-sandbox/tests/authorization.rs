@@ -49,10 +49,22 @@ impl Authorizer for RecordingAuthorizer {
     }
 }
 
+/// A syntactically valid digest-pinned artifact for the fake driver, which
+/// boots nothing: this test exercises the authorization seam, not a registry.
+const TEST_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
 fn template(name: &str) -> TemplateSpec {
     TemplateSpec {
         name: name.into(),
         os: "linux".into(),
+        artifacts: vec![Artifact {
+            format: Artifact::OCI_IMAGE.into(),
+            arch: host_arch().into(),
+            r#ref: format!("ghcr.io/preloop/alpine@{TEST_DIGEST}"),
+            digest: TEST_DIGEST.into(),
+            size_bytes: 0,
+            ..Artifact::default()
+        }],
         ..TemplateSpec::default()
     }
 }
@@ -123,6 +135,7 @@ async fn every_client_and_provider_surface_reaches_the_authorizer() {
     let _ = client
         .exec_collect(ExecRequest {
             sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
             argv: vec!["true".into()],
             ..ExecRequest::default()
         })

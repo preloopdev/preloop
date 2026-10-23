@@ -362,9 +362,12 @@ impl ProvidersService {
         let peer = ctx
             .extensions()
             .get::<ConnectInfo<PeerIdentity>>()
-            .map(|info| &info.0)
-            .ok_or_else(|| Error::unauthenticated("a client certificate is required"))?;
-        let fingerprint = peer.fingerprint()?.to_owned();
+            .ok_or_else(missing_client_certificate)?;
+        let fingerprint = peer
+            .0
+            .fingerprint()
+            .map_err(|_| missing_client_certificate())?
+            .to_owned();
         let identity = self.service.provider_identity(&fingerprint)?;
         authorize(
             &*self.authorizer,

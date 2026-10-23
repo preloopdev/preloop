@@ -91,9 +91,24 @@ fn service_config(_state: &Path) -> anyhow::Result<ServiceConfig> {
     Ok(config)
 }
 
+/// Refuse to start when the selected authorization policy is unknown.
+///
+/// A policy is configuration, not availability: unlike a listener that
+/// cannot bind, an unsupported `PRELOOP_SANDBOX_AUTHORIZER` must stop the
+/// process instead of leaving it running without the intended policy.
+fn ensure_authorizer_config() -> anyhow::Result<()> {
+    preloop_sandbox::authz::from_config()
+        .map(|_| ())
+        .map_err(anyhow::Error::msg)
+}
+
 /// Agent tuning: defaults overridden by the documented environment.
-fn sandbox_agent_config(name: impl Into<String>) -> AgentConfig {
-    let mut config = AgentConfig::new(name);
+///
+/// The scratch directory lives under the state directory, not the system
+/// temp dir: it holds the durable started-exec fence, which only works if
+/// a restart reopens the same directory.
+fn sandbox_agent_config(state: &Path, name: impl Into<String>) -> AgentConfig {
+    let mut config = AgentConfig::new(name).with_scratch(state.join("sandbox-agent"));
     if let Some(value) = env_nonempty("PRELOOP_SANDBOX_AGENT_CONCURRENCY")
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -225,6 +240,7 @@ impl LocalSandboxes {
         observability: preloop_observability::Observability,
     ) -> anyhow::Result<Self> {
         let state = home.join("state");
+        ensure_authorizer_config()?;
         // One destructive authority per state directory: a bake or a second
         // engine must not load and reap a running service's leases.
         let lock = ServiceLock::acquire(&state)?;
@@ -275,7 +291,8 @@ impl LocalSandboxes {
             access.allow_mounts(pool.sandbox_mount_prefixes());
             access.allow_sockets(pool.sandbox_socket_prefixes());
         }
-        let mut agent_config = sandbox_agent_config(local_provider_name()).with_access(access);
+        let mut agent_config =
+            sandbox_agent_config(&state, local_provider_name()).with_access(access);
         agent_config.metrics = metrics;
         let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -1829,6 +1846,7 @@ async fn serve_standalone(
 ) -> anyhow::Result<()> {
     let home = crate::preloop_home();
     let state = home.join("state");
+    ensure_authorizer_config()?;
     let _lock = ServiceLock::acquire(&state)?;
     let store_url = args
         .store
@@ -1850,7 +1868,7 @@ async fn serve_standalone(
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {
-        let mut agent_config = sandbox_agent_config(local_provider_name());
+        let mut agent_config = sandbox_agent_config(&state, local_provider_name());
         agent_config.metrics = metrics;
         let agent = Agent::try_new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
@@ -1887,7 +1905,9 @@ async fn serve_standalone(
         listener_tls,
     )
     .await?;
-    shutdown.cancel();
+    // The listeners run in their own tasks; keep this process alive until a
+    // signal cancels them, or `serve` would return as soon as it has bound.
+    shutdown.cancelled().await;
     Ok(())
 }
 
@@ -1927,7 +1947,7 @@ async fn run_agent(
     // An existing identity owns the name it was enrolled under.
     let name = link.name().unwrap_or(initial_name);
     let base = link.base().to_owned();
-    let mut agent_config = sandbox_agent_config(name).with_access(HostAccess::from_env());
+    let mut agent_config = sandbox_agent_config(&state, name).with_access(HostAccess::from_env());
     agent_config.metrics =
         preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     let agent = Agent::try_new(
@@ -2075,6 +2095,13 @@ async fn run_driver(command: DriverCommand) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_scratch_is_pinned_under_the_state_directory() {
+        let state = Path::new("/var/lib/preloop/state");
+        let config = sandbox_agent_config(state, "host-a");
+        assert_eq!(config.scratch, state.join("sandbox-agent"));
+    }
 
     #[test]
     fn driver_conformance_parses_repeated_artifacts() {
