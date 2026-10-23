@@ -2,12 +2,13 @@
 //! provider enrollment, join tokens and agent identities.
 //!
 //! One CA per service lives in `<state>/sandbox-ca/` (`ca.pem`, `ca.key`,
-//! mode 0600) and is reused across restarts. It signs the server certificate
-//! (SANs from `PRELOOP_SANDBOX_TLS_SANS`) and every provider's client
-//! certificate (issued from a CSR at enrollment, 24h validity, renewed by the
-//! agent before it expires). Providers authenticate with that certificate:
-//! the service looks the leaf's SHA-256 fingerprint up in its store, so no
-//! X.509 parsing is needed past the TLS handshake.
+//! mode 0600) and is reused across restarts. Generated server certificates
+//! use the configured SAN set; supplied certificates are loaded as-is. The CA
+//! signs every provider's client certificate (issued from a CSR at enrollment,
+//! 24h validity, renewed by the agent before it expires).
+//! Providers authenticate with that certificate: the service looks the leaf's
+//! SHA-256 fingerprint up in its store, so no X.509 parsing is needed past the
+//! TLS handshake.
 //!
 //! Join tokens (`plj1.<id>.<secret>.<ca_sha256>`) are single use and bound to
 //! this CA: the agent verifies that the CA it fetches hashes to the token's
@@ -396,13 +397,29 @@ pub struct ServerTls {
 impl ServerTls {
     /// Load or create the CA under `state/sandbox-ca`, then configure TLS.
     ///
-    /// `cert`/`key` override the server certificate; both must be set
-    /// together.
+    /// The compatibility listener accepts a missing client certificate at the
+    /// TLS layer because enrollment and CA retrieval are unauthenticated.
     pub fn load_or_create(
         state: &Path,
         sans: Vec<String>,
         cert: Option<&Path>,
         key: Option<&Path>,
+    ) -> Result<Arc<Self>> {
+        Self::load_or_create_with_client_auth(state, sans, cert, key, true)
+    }
+
+    /// Load or create TLS with optional client-certificate verification.
+    ///
+    /// `client_auth = false` is for the caller listener. The agent listener
+    /// uses the service CA and keeps verification optional at the handshake so
+    /// `Enroll` and `ca.pem` remain reachable; the handlers require a
+    /// certificate for every other agent operation.
+    pub fn load_or_create_with_client_auth(
+        state: &Path,
+        sans: Vec<String>,
+        cert: Option<&Path>,
+        key: Option<&Path>,
+        client_auth: bool,
     ) -> Result<Arc<Self>> {
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -417,25 +434,28 @@ impl ServerTls {
             (None, None) => ca.issue_server(&sans)?,
             _ => {
                 return Err(Error::invalid(
-                    "PRELOOP_SANDBOX_TLS_CERT and PRELOOP_SANDBOX_TLS_KEY must be set together",
+                    "PRELOOP_SANDBOX_CLIENT_TLS_CERT and PRELOOP_SANDBOX_CLIENT_TLS_KEY must be set together",
                 ));
             }
         };
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(ca.der().clone())
-            .map_err(|e| tls_error(format!("CA certificate: {e}")))?;
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-            // Certificates are optional at the TLS layer: `Enroll` and the
-            // data plane use other credentials. The RPC handler is what
-            // requires a client certificate for the Providers API.
-            .allow_unauthenticated()
-            .build()
-            .map_err(|e| tls_error(format!("client verifier: {e}")))?;
-        let config = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(chain, key_der)
-            .map_err(|e| tls_error(format!("server certificate: {e}")))?;
+        let config = if client_auth {
+            let mut roots = RootCertStore::empty();
+            roots
+                .add(ca.der().clone())
+                .map_err(|e| tls_error(format!("CA certificate: {e}")))?;
+            let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+                .allow_unauthenticated()
+                .build()
+                .map_err(|e| tls_error(format!("client verifier: {e}")))?;
+            rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(chain, key_der)
+        } else {
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(chain, key_der)
+        }
+        .map_err(|e| tls_error(format!("server certificate: {e}")))?;
         Ok(Arc::new(Self {
             ca,
             acceptor: TlsAcceptor::from(Arc::new(config)),
@@ -585,6 +605,13 @@ impl Listener for TlsListener {
 impl<'a> Connected<IncomingStream<'a, TlsListener>> for PeerIdentity {
     fn connect_info(stream: IncomingStream<'a, TlsListener>) -> Self {
         stream.remote_addr().peer.clone()
+    }
+}
+
+/// Plain HTTP listeners have no peer certificate.
+impl<'a> Connected<IncomingStream<'a, TcpListener>> for PeerIdentity {
+    fn connect_info(_: IncomingStream<'a, TcpListener>) -> Self {
+        Self::default()
     }
 }
 

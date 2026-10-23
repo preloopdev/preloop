@@ -153,6 +153,11 @@ async fn provider_calls_without_a_client_certificate_are_denied() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
+    assert!(
+        error.message.contains("raw TCP") && error.message.contains("TLS termination"),
+        "{}",
+        error.message
+    );
     let error = anonymous
         .unary::<_, Empty>(
             "preloop.sandbox.v1.Providers/Heartbeat",

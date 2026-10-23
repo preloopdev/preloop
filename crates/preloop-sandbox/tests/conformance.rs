@@ -9,8 +9,9 @@ use std::time::Duration;
 use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink};
 use preloop_sandbox::api::*;
 use preloop_sandbox::drivers::fake::FakeDriver;
+use preloop_sandbox::server::{Auth, HostAllowlist, ListenerSurface, serve_with_options};
 use preloop_sandbox::store::{self, Kind, Store};
-use preloop_sandbox::{Code, Driver, SandboxClient, Service, ServiceConfig};
+use preloop_sandbox::{Code, Driver, SandboxClient, ServerTls, Service, ServiceConfig, tls};
 use tokio_util::sync::CancellationToken;
 
 struct Harness {
@@ -683,6 +684,103 @@ async fn remote_agent_and_client_over_connect() {
     wait_for(|| Service::list(&service).is_empty()).await;
 }
 
+#[tokio::test]
+async fn split_listeners_expose_only_their_route_families() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let agent_tls = ServerTls::load_or_create_with_client_auth(
+        &state,
+        vec!["127.0.0.1".into(), "localhost".into()],
+        None,
+        None,
+        true,
+    )
+    .unwrap();
+    let client_tls = ServerTls::load_or_create_with_client_auth(
+        &state,
+        vec!["127.0.0.1".into(), "localhost".into()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    config.ca = Some(agent_tls.ca.clone());
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let agent_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_base = format!("https://{}", client_listener.local_addr().unwrap());
+    let agent_base = format!("https://{}", agent_listener.local_addr().unwrap());
+    let shutdown = CancellationToken::new();
+    tokio::spawn(serve_with_options(
+        client_listener,
+        service.clone(),
+        Auth::new("client"),
+        Some(client_tls),
+        ListenerSurface::Client,
+        HostAllowlist::disabled(),
+        shutdown.clone(),
+    ));
+    tokio::spawn(serve_with_options(
+        agent_listener,
+        service,
+        Auth::new(""),
+        Some(agent_tls),
+        ListenerSurface::Agent,
+        HostAllowlist::disabled(),
+        shutdown.clone(),
+    ));
+    let http = tls::http_client(
+        &std::fs::read_to_string(state.join("sandbox-ca/ca.pem")).unwrap(),
+        None,
+    )
+    .unwrap();
+    let response = http
+        .post(format!("{client_base}/preloop.sandbox.v1.Sandboxes/List"))
+        .bearer_auth("client")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response = http
+        .post(format!("{client_base}/preloop.sandbox.v1.Providers/Enroll"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    let response = http
+        .post(format!("{agent_base}/preloop.sandbox.v1.Sandboxes/List"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    let response = http
+        .get(format!("{agent_base}/sandbox/v1/ca.pem"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response = http
+        .post(format!(
+            "{agent_base}/preloop.sandbox.v1.Providers/Register"
+        ))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("raw TCP") && body.contains("TLS termination"),
+        "{body}"
+    );
+    shutdown.cancel();
+}
 #[tokio::test]
 async fn loopback_auth_requires_a_token_and_a_loopback_host() {
     let dir = tempfile::tempdir().unwrap();

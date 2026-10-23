@@ -1,10 +1,11 @@
-//! HTTP surface: Connect routes for both services plus the ticketed data plane.
+//! HTTP surface: Connect routes for the client and agent listeners plus the
+//! ticketed data plane.
 //!
-//! Everything is served over TLS. Callers hold the one client bearer token;
-//! capacity owners authenticate with a client certificate issued by the
-//! service CA (see [`crate::tls`]), except for `Enroll` which is authenticated
-//! by a single-use join token.
+//! TLS is used by default. Callers hold the one client bearer token; capacity
+//! owners authenticate with a client certificate issued by the service CA
+//! (see [`crate::tls`]), except for `Enroll` which uses a single-use join token.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
@@ -23,6 +24,126 @@ use crate::api::*;
 use crate::connect::{self, Code, Error};
 use crate::service::{ProviderIdentity, Service};
 use crate::tls::{PeerIdentity, ServerTls, TlsListener};
+
+/// Which part of the Sandbox Service a listener exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerSurface {
+    /// Caller RPCs and caller data-plane streams.
+    Client,
+    /// Provider RPCs, enrollment, CA retrieval and provider blobs.
+    Agent,
+    /// The compatibility mode where one listener exposes both surfaces.
+    Combined,
+}
+
+/// Host names accepted by the client listener's DNS-rebinding guard.
+#[derive(Debug, Clone, Default)]
+pub struct HostAllowlist {
+    bound: Option<IpAddr>,
+    patterns: Vec<HostPattern>,
+    enforced: bool,
+}
+
+#[derive(Debug, Clone)]
+enum HostPattern {
+    Exact(String),
+    Wildcard(String),
+}
+
+impl HostAllowlist {
+    /// Disable Host checking.
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// Build a policy from the bound address and comma-separated setting.
+    ///
+    /// The setting is considered explicit when `raw` is `Some`, including an
+    /// empty value. Loopback listeners are guarded even without the setting.
+    pub fn from_config(
+        bound: SocketAddr,
+        raw: Option<&str>,
+        extra_exact: impl IntoIterator<Item = String>,
+    ) -> Result<Self, String> {
+        let mut patterns = Vec::new();
+        if let Some(raw) = raw {
+            for value in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                patterns.push(parse_host_pattern(value)?);
+            }
+        }
+        for value in extra_exact {
+            patterns.push(HostPattern::Exact(normalize_host(&value)?));
+        }
+        Ok(Self {
+            bound: (!bound.ip().is_unspecified()).then_some(bound.ip()),
+            patterns,
+            enforced: raw.is_some() || bound.ip().is_loopback(),
+        })
+    }
+
+    /// Whether this policy accepts a Host header value.
+    pub fn accepts(&self, value: &str) -> bool {
+        let Some(host) = host_without_port(value.trim()).map(normalize_host_lossy) else {
+            return false;
+        };
+        if host == "localhost"
+            || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            || self
+                .bound
+                .is_some_and(|ip| host.parse::<IpAddr>() == Ok(ip))
+        {
+            return true;
+        }
+        self.patterns.iter().any(|pattern| match pattern {
+            HostPattern::Exact(expected) => host == *expected,
+            HostPattern::Wildcard(suffix) => host
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains('.')),
+        })
+    }
+
+    /// Whether this policy should be applied to requests.
+    pub fn enforced(&self) -> bool {
+        self.enforced
+    }
+}
+
+fn normalize_host(value: &str) -> Result<String, String> {
+    let host = host_without_port(value.trim())
+        .ok_or_else(|| format!("invalid host in PRELOOP_SANDBOX_ALLOWED_HOSTS: `{value}`"))?
+        .trim_end_matches('.');
+    if host.is_empty()
+        || host == "*"
+        || host.contains('*')
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains(' ')
+        || host.parse::<IpAddr>().is_err() && host.contains(':')
+    {
+        return Err(format!(
+            "invalid host in PRELOOP_SANDBOX_ALLOWED_HOSTS: `{value}`"
+        ));
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+fn normalize_host_lossy(value: &str) -> String {
+    value.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn parse_host_pattern(value: &str) -> Result<HostPattern, String> {
+    if let Some(suffix) = value.strip_prefix("*.") {
+        let suffix = normalize_host(suffix)?;
+        if suffix.is_empty() {
+            return Err(format!(
+                "invalid host in PRELOOP_SANDBOX_ALLOWED_HOSTS: `{value}`"
+            ));
+        }
+        Ok(HostPattern::Wildcard(format!(".{suffix}")))
+    } else {
+        Ok(HostPattern::Exact(normalize_host(value)?))
+    }
+}
 
 /// Bearer token for `Sandboxes` callers plus the optional loopback Host guard.
 ///
@@ -59,6 +180,7 @@ impl Auth {
 struct AppState {
     service: Arc<Service>,
     auth: Auth,
+    hosts: HostAllowlist,
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -86,7 +208,7 @@ fn host_without_port(value: &str) -> Option<&str> {
 }
 
 /// Accept only names that reach a listener on this machine: `localhost`, any
-/// `127.0.0.0/8` address, or `::1`.
+/// loopback address, the bound address and configured names.
 fn loopback_host(value: &str) -> bool {
     let Some(host) = host_without_port(value.trim()) else {
         return false;
@@ -94,22 +216,35 @@ fn loopback_host(value: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-fn check_host(loopback_only: bool, headers: &HeaderMap) -> Result<(), Error> {
-    if !loopback_only {
+fn check_host(
+    policy: &HostAllowlist,
+    legacy_loopback_only: bool,
+    headers: &HeaderMap,
+) -> Result<(), Error> {
+    if !policy.enforced() && !legacy_loopback_only {
         return Ok(());
     }
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| Error::new(Code::PermissionDenied, "Host header is required"))?;
-    if !loopback_host(host) {
+    let accepted = if policy.enforced() {
+        policy.accepts(host)
+    } else {
+        loopback_host(host)
+    };
+    if !accepted {
+        let setting = if policy.enforced() {
+            "PRELOOP_SANDBOX_ALLOWED_HOSTS"
+        } else {
+            "the loopback Host policy"
+        };
         return Err(Error::new(
             Code::PermissionDenied,
-            format!("Host `{host}` is not a loopback address"),
+            format!("Host `{host}` is not allowed; change {setting}"),
         ));
     }
     Ok(())
@@ -134,31 +269,50 @@ fn check(expected: &str, headers: &HeaderMap) -> Result<(), Error> {
     }
 }
 
-/// Build the router.
-///
-/// `Providers` reads the peer certificate from `ConnectInfo<PeerIdentity>`, so
-/// serve it with [`serve`] (or `Router::into_make_service_with_connect_info`).
+/// Build the compatibility router exposing both surfaces.
 pub fn router(service: Arc<Service>, auth: Auth) -> Router {
-    Router::new()
-        .route("/preloop.sandbox.v1.Sandboxes/{method}", post(sandboxes))
-        .route("/preloop.sandbox.v1.Providers/{method}", post(providers))
-        .route(
-            "/sandbox/v1/streams/{ticket}",
-            get(stream_download).put(stream_upload),
-        )
-        .route(
-            "/sandbox/v1/agent/blobs/{ticket}",
-            get(agent_blob_get).put(agent_blob_put),
-        )
-        .route("/sandbox/v1/ca.pem", get(ca_pem))
-        .route("/sandbox/v1/healthz", get(|| async { "ok" }))
-        .with_state(AppState { service, auth })
+    router_with_options(
+        service,
+        auth,
+        ListenerSurface::Combined,
+        HostAllowlist::disabled(),
+    )
 }
 
-/// Serve the API over TLS until `shutdown`.
-///
-/// Each connection completes a handshake first; the peer's certificate (when
-/// presented) becomes [`ConnectInfo<PeerIdentity>`] for the handlers.
+/// Build a router for one listener surface.
+pub fn router_with_options(
+    service: Arc<Service>,
+    auth: Auth,
+    surface: ListenerSurface,
+    hosts: HostAllowlist,
+) -> Router {
+    let mut router = Router::new();
+    if matches!(surface, ListenerSurface::Client | ListenerSurface::Combined) {
+        router = router
+            .route("/preloop.sandbox.v1.Sandboxes/{method}", post(sandboxes))
+            .route(
+                "/sandbox/v1/streams/{ticket}",
+                get(stream_download).put(stream_upload),
+            )
+            .route("/sandbox/v1/healthz", get(|| async { "ok" }));
+    }
+    if matches!(surface, ListenerSurface::Agent | ListenerSurface::Combined) {
+        router = router
+            .route("/preloop.sandbox.v1.Providers/{method}", post(providers))
+            .route(
+                "/sandbox/v1/agent/blobs/{ticket}",
+                get(agent_blob_get).put(agent_blob_put),
+            )
+            .route("/sandbox/v1/ca.pem", get(ca_pem));
+    }
+    router.with_state(AppState {
+        service,
+        auth,
+        hosts,
+    })
+}
+
+/// Serve the compatibility API over TLS until `shutdown`.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     service: Arc<Service>,
@@ -166,13 +320,44 @@ pub async fn serve(
     tls: Arc<ServerTls>,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let app = router(service, auth);
-    axum::serve(
-        TlsListener::new(listener, tls.acceptor.clone()),
-        app.into_make_service_with_connect_info::<PeerIdentity>(),
+    serve_with_options(
+        listener,
+        service,
+        auth,
+        Some(tls),
+        ListenerSurface::Combined,
+        HostAllowlist::disabled(),
+        shutdown,
     )
-    .with_graceful_shutdown(async move { shutdown.cancelled().await })
     .await
+}
+
+/// Serve one listener surface over TLS or plain HTTP.
+pub async fn serve_with_options(
+    listener: tokio::net::TcpListener,
+    service: Arc<Service>,
+    auth: Auth,
+    tls: Option<Arc<ServerTls>>,
+    surface: ListenerSurface,
+    hosts: HostAllowlist,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let app = router_with_options(service, auth, surface, hosts);
+    if let Some(tls) = tls {
+        axum::serve(
+            TlsListener::new(listener, tls.acceptor.clone()),
+            app.into_make_service_with_connect_info::<PeerIdentity>(),
+        )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+    } else {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<PeerIdentity>(),
+        )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+    }
 }
 
 /// The service CA, for agents that pin it before enrolling.
@@ -194,7 +379,7 @@ async fn sandboxes(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = check_host(app.auth.loopback_only, &headers) {
+    if let Err(error) = check_host(&app.hosts, app.auth.loopback_only, &headers) {
         return error.into_response();
     }
     if let Err(error) = check(&app.auth.client_token, &headers) {
@@ -300,6 +485,14 @@ async fn sandboxes(
     }
 }
 
+fn missing_client_certificate() -> Error {
+    Error::new(
+        Code::Unauthenticated,
+        "no client certificate was presented; the agent listener must be exposed as raw TCP \
+         behind a proxy or tunnel, not through TLS termination (see docs/sandbox-service.md#deployment)",
+    )
+}
+
 fn require_identity(identity: &ProviderIdentity, provider_id: &str) -> Result<(), Error> {
     if provider_id != identity.provider_id {
         return Err(Error::new(
@@ -319,7 +512,7 @@ async fn providers(
 ) -> Response {
     // Providers authenticate by client certificate; the loopback Host guard
     // still applies to the enrollment call, which carries no certificate.
-    if let Err(error) = check_host(app.auth.loopback_only, &headers) {
+    if let Err(error) = check_host(&app.hosts, app.auth.loopback_only, &headers) {
         return error.into_response();
     }
     let service = app.service;
@@ -334,9 +527,9 @@ async fn providers(
     }
     let fingerprint = match peer.fingerprint() {
         Ok(fingerprint) => fingerprint.to_owned(),
-        Err(error) => {
+        Err(_) => {
             warn!(method = %method, "providers: call without a client certificate");
-            return error.into_response();
+            return missing_client_certificate().into_response();
         }
     };
     let identity = match service.provider_identity(&fingerprint) {
@@ -446,7 +639,7 @@ async fn stream_upload(
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
     let result = async {
-        check_host(app.auth.loopback_only, &headers)?;
+        check_host(&app.hosts, app.auth.loopback_only, &headers)?;
         let (kind, path) = app.service.claim_ticket(&ticket, token)?;
         if kind != StreamKind::Upload {
             return Err(Error::invalid("ticket is not an upload"));
@@ -481,7 +674,7 @@ async fn stream_download(
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
     let result = async {
-        check_host(app.auth.loopback_only, &headers)?;
+        check_host(&app.hosts, app.auth.loopback_only, &headers)?;
         let (kind, _) = app.service.claim_ticket(&ticket, token)?;
         if kind != StreamKind::Download {
             return Err(Error::invalid("ticket is not a download"));
@@ -516,8 +709,11 @@ async fn agent_blob_get(
     headers: HeaderMap,
 ) -> Response {
     let result = async {
-        check_host(app.auth.loopback_only, &headers)?;
-        let identity = app.service.provider_identity(peer.fingerprint()?)?;
+        check_host(&app.hosts, app.auth.loopback_only, &headers)?;
+        let identity = app.service.provider_identity(
+            peer.fingerprint()
+                .map_err(|_| missing_client_certificate())?,
+        )?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
         let path = app.service.agent_blob(&id, generation, &ticket)?;
@@ -535,8 +731,11 @@ async fn agent_blob_put(
     body: Body,
 ) -> Response {
     let result = async {
-        check_host(app.auth.loopback_only, &headers)?;
-        let identity = app.service.provider_identity(peer.fingerprint()?)?;
+        check_host(&app.hosts, app.auth.loopback_only, &headers)?;
+        let identity = app.service.provider_identity(
+            peer.fingerprint()
+                .map_err(|_| missing_client_certificate())?,
+        )?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
         let path = app.service.agent_blob(&id, generation, &ticket)?;
@@ -584,5 +783,41 @@ mod tests {
         ] {
             assert!(!loopback_host(host), "{host} must be rejected");
         }
+    }
+
+    #[test]
+    fn allowlist_matches_exact_wildcard_ports_and_bound_address() {
+        let policy = HostAllowlist::from_config(
+            "192.0.2.10:9191".parse().unwrap(),
+            Some("api.example.test,*.svc.example.test,[2001:db8::10]"),
+            std::iter::empty(),
+        )
+        .unwrap();
+        for host in [
+            "API.EXAMPLE.TEST:9191",
+            "worker.svc.example.test.",
+            "192.0.2.10:1",
+            "[2001:db8::10]:9191",
+            "localhost.",
+            "127.0.0.42",
+            "[::1]:9191",
+        ] {
+            assert!(policy.accepts(host), "{host} must be accepted");
+        }
+        for host in [
+            "evil.example.test",
+            "worker.deep.svc.example.test",
+            "api.example.test.evil",
+        ] {
+            assert!(!policy.accepts(host), "{host} must be rejected");
+        }
+        assert!(
+            HostAllowlist::from_config(
+                "127.0.0.1:9191".parse().unwrap(),
+                Some("*"),
+                std::iter::empty(),
+            )
+            .is_err()
+        );
     }
 }
