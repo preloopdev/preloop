@@ -667,7 +667,7 @@ enum SandboxCommand {
 enum TokenCommand {
     /// Mint a single-use join token for `sandbox agent`.
     Create {
-        /// Lifetime (`30s`, `10m`, `1h`, `2d`).
+        /// Lifetime (`30s`, `10m`, `1h`); default 1h, maximum 24h.
         #[arg(long, default_value = "1h")]
         ttl: String,
         /// Bind the token to this provider name. A bound token enrolls
