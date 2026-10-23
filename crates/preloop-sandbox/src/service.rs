@@ -2084,6 +2084,7 @@ impl Service {
                 };
                 sandbox.preserve_until = now() + ttl as i64;
                 ops.push(self.put(Kind::Sandboxes, &lease.sandbox_id, &*sandbox));
+                self.config.metrics.record_lease_transition("preserved");
                 return;
             }
         }

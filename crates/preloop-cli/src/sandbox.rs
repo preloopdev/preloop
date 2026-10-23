@@ -1536,7 +1536,17 @@ mod tests {
     async fn the_service_starts_only_for_a_pool() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        assert!(start_if_pool(None, &home).await.unwrap().is_none());
+        assert!(
+            start_if_pool(
+                false,
+                &home,
+                None,
+                preloop_observability::Observability::noop()
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
         assert!(
             !home.exists(),
             "no pool must not open the store or touch the state directory"

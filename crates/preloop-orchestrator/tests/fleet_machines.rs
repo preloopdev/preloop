@@ -547,6 +547,9 @@ impl SandboxApi for FlakyRelease {
     async fn resume(&self, sandbox_id: &str, lease_id: &str) -> preloop_sandbox::Result<()> {
         self.inner.resume(sandbox_id, lease_id).await
     }
+    async fn stats(&self) -> preloop_sandbox::Result<preloop_sandbox::api::StatsResponse> {
+        self.inner.stats().await
+    }
 }
 
 #[tokio::test]

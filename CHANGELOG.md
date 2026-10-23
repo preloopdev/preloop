@@ -42,9 +42,20 @@ Releases before v0.27.0 predate the changelog.
   `VmTelemetryRegistry`, `VmRuntimeInfo`, and `build_fleet_snapshot` are
   removed; the runner pool no longer pushes VM identities into telemetry.
 
+### Fixed
+
+- **Sandbox telemetry is shareable and bounded.** `Stats` carries aggregates
+  only — host process names, PIDs and data-directory paths stay on the
+  provider that measured them — the live-sandbox gauge records zero when a
+  `(state, provider, template)` combination drains, a `Heartbeat` caps its
+  per-sandbox runtime report at 512 entries (most recently active first) and
+  counts what it drops, and an unavailable `Stats` read reports the engine
+  fleet as unknown instead of empty.
+
 ## [0.35.6] - 2026-10-21
 
 ### Added
+
 - **Code-scanning SARIF ingestion.** `github/codeql-action/upload-sarif` now
   completes on an engine-hosted run: the GitHub shim serves the legacy
   `POST /api/v3/repos/{owner}/{repo}/code-scanning/sarifs` upload, the
@@ -69,16 +80,6 @@ Releases before v0.27.0 predate the changelog.
   `2026102101`). Re-uploads dedupe on a content fingerprint over the
   repository, commit, ref, tool and sorted finding fingerprints — not on raw
   bytes — so the same analysis is returned instead of stored twice.
-
-### Changed
-
-- **CI's `/api/v1/status` `vms` section and host-memory-pressure conditions
-  now come from the Sandbox Service.** They are built from the service's
-  `Stats` inventory — sandboxes across registered providers, plus the pool
-  provider's latest host sample and sample age — instead of sampling the
-  engine process and reading a pool-fed VM telemetry registry.
-  `VmTelemetryRegistry`, `VmRuntimeInfo`, and `build_fleet_snapshot` are
-  removed; the runner pool no longer pushes VM identities into telemetry.
 
 ### Security
 
