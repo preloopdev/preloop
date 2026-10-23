@@ -3497,8 +3497,8 @@ fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Resu
     Ok(detached)
 }
 
-/// Marker file the Sandbox Service's SmolVM driver writes into a machine's
-/// data directory for a sandbox the CI pool does not own (see
+/// Marker file the Sandbox Service's SmolVM driver writes into the data
+/// directory of every machine it creates (see
 /// [`SmolvmDriver`](super::SmolvmDriver)).
 ///
 /// The purge sees only the boot-config path of a hypervisor, never the
@@ -3546,10 +3546,10 @@ pub enum OrphanPurge {
     /// Every hypervisor whose argv names this Preloop home's data root,
     /// except machines the Sandbox Service owns.
     ///
-    /// Only safe where nothing *of the pool's* can be running: pool startup,
-    /// after the stale machines have been deleted, and shutdown. A Sandbox
-    /// Service sandbox the CI pool does not own may still be leased to
-    /// another caller at those moments — its machine is marked and spared.
+    /// Only safe where no unmarked machine of this home can be in flight: pool
+    /// startup, after the stale machines have been released through the
+    /// service, and shutdown. A Sandbox Service sandbox may still be leased at
+    /// those moments; its machine is marked and spared, whatever its name.
     All,
     /// Only hypervisors whose machine data directory is already gone — the
     /// directory the `boot-config.json` in their argv names no longer exists.
@@ -3582,10 +3582,10 @@ pub enum OrphanPurge {
 ///
 /// `scope` decides which of those processes may be killed; see
 /// [`OrphanPurge`]. A machine whose data directory carries
-/// [`SANDBOX_OWNER_MARKER`] belongs to a Sandbox Service sandbox the CI pool
-/// does not own and is never killed, whatever the scope. Called at pool
-/// startup (crash recovery, `All`) and on an interval while the pool serves
-/// (`RemovedDataDir`). Returns the number of processes killed.
+/// [`SANDBOX_OWNER_MARKER`] belongs to a Sandbox Service sandbox and is never
+/// killed, whatever the scope. Called at pool startup (crash recovery, `All`)
+/// and on an interval while the pool serves (`RemovedDataDir`). Returns the
+/// number of processes killed.
 ///
 /// Both host tools it runs (`ps`, `kill`) are bounded by [`PROBE_DEADLINE`]:
 /// this is called from the pool's reconcile loop, where a wedged `ps` on a
@@ -3606,10 +3606,9 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
             continue;
         }
         let dirs = boot_config_dirs(line, &roots);
-        // A Sandbox Service sandbox the CI pool does not own is not this
-        // purge's to kill, even under `All`: it may be leased to another
-        // caller right now, and the service's own delete path escalates to a
-        // targeted kill when smolvm refuses.
+        // A Sandbox Service sandbox is not this purge's to kill, even under
+        // `All`: it may be leased right now, and the service's own delete path
+        // escalates to a targeted kill when smolvm refuses.
         if dirs.iter().any(|dir| is_sandbox_owned(dir)) {
             continue;
         }
@@ -4924,8 +4923,8 @@ mod tests {
     }
 
     /// A machine the Sandbox Service marked as its own is never killed, even
-    /// under `All`: it may be a sandbox leased to a caller the CI pool knows
-    /// nothing about, and the service destroys it through the driver.
+    /// under `All`: it may be a sandbox leased to a caller, pool or not, and
+    /// the service destroys it through the driver.
     #[test]
     fn all_purge_spares_a_marked_sandbox_service_machine() {
         let _guard = PRELOOP_HOME_LOCK.lock();
