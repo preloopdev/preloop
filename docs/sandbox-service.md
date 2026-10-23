@@ -402,6 +402,42 @@ Conversely, ordinary work results (create, snapshot, power, copy) are
 persisted before any waiter observes success, so a lost response is answered
 from the durable result rather than repeated.
 
+### Read cache
+
+Template and pool payloads may be served from an optional cache; the database
+remains authoritative for membership, ordering and version. A `ListTemplates`
+or `ListPools` page first reads ids and authoritative row versions from SQL,
+then fetches each immutable payload from the cache or from an exact-version
+SQL read. Pages themselves are never cached, so a template or pool created,
+deleted or renamed is visible on the next request even with a warm cache.
+
+Cache keys are `(namespace, resource kind, id, row version)`. Versions come
+from the database's monotonic sequence and are never reused across
+delete/recreate, and a payload is only cached under the version its read
+observed. A delayed fill of an older version is therefore a different key and
+cannot shadow a newer read. TTL bounds occupancy and unused entries; it is not
+a freshness guarantee. Invalidation is exact-key and advisory.
+
+Never cached: leases, tickets, tokens, `Lease.env`/`ExecRequest.env`,
+certificates, provider identity/generation or fencing, live capacity,
+allocation counts, work claims, authorization decisions, exec output and
+transfer bytes. Mutation and placement paths do not read cached payloads.
+
+The default is a bounded in-process cache; `none` sends every read to SQL.
+Every cache call has a bounded deadline. A miss, slow backend, failure or
+flush falls back to SQL with a rate-limited warning and never fails an RPC;
+cache population is asynchronous and never runs inside a database transaction
+or makes a mutation wait. Flushing, disabling or replacing the cache cannot
+change lease ownership, state transitions, allocation counts, provider
+generations or work claims.
+
+Embedders can supply any `Arc<dyn SharedCache>` through a `CacheGateway` when
+constructing the service; nothing downcasts to the in-process implementation.
+The object-safe async trait makes a Redis/Valkey or other network cache
+implementable with the same get/put/invalidate/clear contract, absolute
+expiry and transport deadlines. No network cache is built in and no extra
+service is required.
+
 ## Restart and failure
 
 Only the database survives a process, and it survives every replica the same
@@ -567,6 +603,13 @@ when `machine delete` refuses.
 | `PRELOOP_SANDBOX_SEAL_KEY` | 64-hex lease/exec env envelope key shared by replicas (default: a 0600 `<state>/sandbox-seal.key`) |
 | `PRELOOP_SANDBOX_CA_DIR` | shared CA directory for replicas that must trust each other's client certificates |
 | `PRELOOP_SANDBOX_PG_POOL` | Postgres connection pool ceiling (default 8) |
+| `PRELOOP_SANDBOX_STATE_CACHE` | versioned read cache: `none` or `memory` (default `memory`) |
+| `PRELOOP_SANDBOX_STATE_CACHE_MAX_BYTES` | cached payload capacity in bytes (default 64 MiB) |
+| `PRELOOP_SANDBOX_STATE_CACHE_MAX_ENTRIES` | cached entry-count ceiling (default 8192) |
+| `PRELOOP_SANDBOX_STATE_CACHE_MAX_ENTRY_BYTES` | per-entry admission limit (default 1 MiB) |
+| `PRELOOP_SANDBOX_STATE_CACHE_TTL_SECS` | cached payload lifetime (default 30) |
+| `PRELOOP_SANDBOX_STATE_CACHE_TIMEOUT_MS` | deadline for one cache call (default 50) |
+| `PRELOOP_SANDBOX_STATE_CACHE_WARN_INTERVAL_SECS` | minimum gap between cache outage warnings (default 30) |
 | `PRELOOP_SANDBOX_NODE_ID` | this replica's node id (default: hostname; unique per serving process) |
 | `PRELOOP_SANDBOX_NODE_CREDENTIAL` | inter-node credential this replica presents on the internal hop |
 | `PRELOOP_SANDBOX_PEER_URL` | this replica's base URL as other replicas reach it |

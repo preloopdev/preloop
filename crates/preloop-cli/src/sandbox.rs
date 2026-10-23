@@ -68,6 +68,10 @@ fn placement_from_env() -> anyhow::Result<Arc<dyn Placement>> {
 /// Service tuning: defaults overridden by the documented environment.
 fn service_config(_state: &Path) -> anyhow::Result<ServiceConfig> {
     let mut config = ServiceConfig::new();
+    let cache = preloop_sandbox::cache::CacheSettings::from_env()
+        .context("sandbox state cache configuration")?;
+    config.cache_ttl = cache.ttl;
+    config.cache = cache.gateway().context("build sandbox state cache")?;
     config.peers = ServiceConfig::peers_from_env()?;
     if let Some(value) = env_nonempty("PRELOOP_SANDBOX_NODE_ID") {
         config.node_id = value;
