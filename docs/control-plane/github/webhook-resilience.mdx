@@ -3,6 +3,11 @@ title: "Webhook resilience"
 description: "Understand durable webhook delivery, recovery layers, breaker behavior, and operator repair commands."
 ---
 
+> The queue, retry and detection design that supersedes the parts of this page
+> is in
+> [GitHub resiliency](https://github.com/preloopdev/preloop/blob/main/docs/github-resiliency.md);
+> the layers here remain the backstop.
+
 GitHub does not automatically retry a failed webhook response. Preloop commits the raw delivery before acknowledging it, then uses a worker queue, watchdog, circuit breaker, health monitor, and operator API to recover failures that happen after the acknowledgement.
 
 ## Delivery boundary
