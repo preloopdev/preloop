@@ -1320,6 +1320,14 @@ impl SmolVmProvider {
         }
     }
 
+    /// True when both handles guard the same lifecycle: an adapter and the
+    /// driver it points at must share one lock and fork census, never hold
+    /// separate ones.
+    pub fn shares_lifecycle_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lifecycle_lock, &other.lifecycle_lock)
+            && Arc::ptr_eq(&self.forked_machines, &other.forked_machines)
+    }
+
     /// Override the child-wait deadlines (see [`WaitDeadlines`]).
     ///
     /// Every runtime call kills its child at the matching deadline, so this is
@@ -2836,31 +2844,22 @@ impl VmProvider for SmolVmProvider {
                 if message.contains("stop or delete the clones first") =>
             {
                 // SmolVM's registry knows live clones this process's
-                // in-memory map does not (the map is rebuilt per engine
-                // start, so clones leaked by an earlier session are
-                // invisible here). Delete them so the golden can re-freeze;
-                // `delete` retries transient registry-lock contention.
+                // in-memory map does not: they may belong to a live lease in
+                // another process or service. Never delete machines this
+                // process cannot prove it owns; fail closed and let the
+                // caller decide.
+                let clones = extract_dependent_clones(&message);
                 warn!(
                     golden = golden.as_str(),
-                    clones = extract_dependent_clones(&message).join(", "),
-                    "re-arm blocked by clones unknown to this session; removing them"
+                    clones = clones.join(", "),
+                    "re-arm blocked by dependent clones; refusing to delete them"
                 );
-                for clone in extract_dependent_clones(&message) {
-                    if let Ok(name) = MachineName::new(clone) {
-                        let _ = self.delete(&name).await;
-                    }
-                }
-                self.concurrent(
-                    "stop",
-                    &[
-                        "machine".into(),
-                        "stop".into(),
-                        "--name".into(),
-                        golden.as_str().into(),
-                    ],
-                    self.deadlines.control,
-                )
-                .await?;
+                return Err(VmError::InvalidSpec(format!(
+                    "fork base `{}` still has dependent clones ({}); refusing to delete machines \
+                     this process does not own",
+                    golden.as_str(),
+                    clones.join(", ")
+                )));
             }
             Err(error) => return Err(error),
         }
@@ -5375,6 +5374,48 @@ mod tests {
         assert!(extract_dependent_clones("vm not found: preloop-runner-golden").is_empty());
         assert!(extract_dependent_clones("").is_empty());
         assert!(extract_dependent_clones("database is locked").is_empty());
+    }
+
+    /// A re-arm must fail closed when the registry names clones this process
+    /// does not know: they may belong to a live lease in another process.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rearm_refuses_to_delete_clones_it_does_not_own() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        let log = scratch.path().join("delete.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$1 $2\" in\n\
+             \"machine stop\")\n\
+               echo \"machine 'preloop-runner-golden' is the fork base for 1 live clone(s) \
+             (pool-runner-9-1); stop or delete the clones first\" >&2\n\
+               exit 1 ;;\n\
+             \"machine delete\")\n\
+               echo delete >> '{}'\n\
+               exit 0 ;;\n\
+             esac\n\
+             exit 0\n",
+            log.display()
+        );
+        let binary = fake_smolvm(scratch.path(), &script);
+        let provider = super::SmolVmProvider::new(&binary);
+        let golden = MachineName::new("preloop-runner-golden").unwrap();
+        let error = provider
+            .rearm_fork_base(&golden, None)
+            .await
+            .expect_err("a base with unknown clones must not be re-armed");
+        assert!(
+            error.to_string().contains("refusing to delete"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !log.exists(),
+            "re-arm deleted a clone it could not prove it owned"
+        );
     }
 
     #[test]

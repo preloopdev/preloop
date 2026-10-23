@@ -52,15 +52,17 @@ impl SmolvmDriver {
         self
     }
 
+    /// The typed lifecycle primitive behind this driver. Callers that also
+    /// need host-side operations must clone this provider rather than build a
+    /// second one, so both share the lifecycle lock and fork census.
+    pub fn provider(&self) -> &SmolVmProvider {
+        &self.provider
+    }
+
     fn adopts(&self, name: &str) -> bool {
         self.named_prefix
             .as_deref()
             .is_some_and(|prefix| name.starts_with(prefix))
-    }
-
-    /// The underlying CLI provider.
-    pub fn provider(&self) -> &SmolVmProvider {
-        &self.provider
     }
 }
 
@@ -263,7 +265,7 @@ impl Driver for SmolvmDriver {
         output: mpsc::Sender<ExecEvent>,
     ) -> Result<i32> {
         let name = machine(native_ref)?;
-        let argv = crate::driver::posix_exec_argv(request);
+        let argv = crate::driver::posix_exec_argv(request)?;
         let (tx, mut rx) = mpsc::channel::<OutputChunk>(64);
         let forward = tokio::spawn(async move {
             while let Some(chunk) = rx.recv().await {

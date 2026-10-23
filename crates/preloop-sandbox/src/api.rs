@@ -351,7 +351,8 @@ pub struct FileSpec {
     /// Contents.
     #[serde(with = "b64")]
     pub data: Vec<u8>,
-    /// Octal mode (0 = 0644).
+    /// Octal mode (0 = 0600: only the guest owner reads it). Set an explicit
+    /// mode when a non-root guest user must read the file.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub mode: u32,
 }
@@ -456,12 +457,22 @@ pub struct Sandbox {
     /// Preserved sandboxes expire at this Unix second (0 = n/a).
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub preserve_until: i64,
+    /// State before `Pause`/`Stop`; `Resume`/`Start` restores it.
+    #[serde(skip_serializing_if = "is_unspecified_state")]
+    pub prior_state: SandboxState,
+    /// Pool + template configuration this warm member was built for.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub pool_revision: String,
     /// Configured size, for capacity accounting.
     pub shape: Shape,
 }
 
 fn is_zero_i64(value: &i64) -> bool {
     *value == 0
+}
+
+fn is_unspecified_state(state: &SandboxState) -> bool {
+    *state == SandboxState::SandboxStateUnspecified
 }
 
 /// A lease on a sandbox.
@@ -479,6 +490,10 @@ pub struct Lease {
     pub idempotency_key: String,
     /// Unix seconds.
     pub expires_at: i64,
+    /// TTL the caller asked for. A lease persisted before this field existed
+    /// has 0 and is already delivered: its expiry is left alone.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub requested_ttl_secs: u64,
     /// Environment merged into every exec on this lease.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
