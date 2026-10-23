@@ -37,6 +37,8 @@ use futures::StreamExt as _;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::authz::{Action, Authorizer, Principal, PrincipalKind, TokenAuthorizer};
+
 use crate::api::*;
 use crate::driver::TransferChunk;
 use crate::error::{Error, Result};
@@ -205,6 +207,8 @@ struct AppState {
     service: Arc<Service>,
     auth: Auth,
     hosts: HostAllowlist,
+    authorizer: Arc<dyn Authorizer>,
+}
 }
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -288,19 +292,23 @@ struct SandboxesService {
     service: Arc<Service>,
     auth: Auth,
     hosts: HostAllowlist,
+    authorizer: Arc<dyn Authorizer>,
 }
 
 impl SandboxesService {
-    fn authorize(&self, ctx: &RequestContext) -> Result<()> {
+    /// Verify the caller's Host and bearer token, then ask the policy
+    /// whether this credential may perform `action`.
+    fn authorize(&self, ctx: &RequestContext, action: Action) -> Result<()> {
         check_host(&self.hosts, self.auth.loopback_only, ctx.headers())?;
         let token = ctx
             .header(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "));
         match token {
-            Some(token) if token_eq(token, &self.auth.client_token) => Ok(()),
-            _ => Err(Error::unauthenticated("missing or bad bearer token")),
+            Some(token) if token_eq(token, &self.auth.client_token) => {}
+            _ => return Err(Error::unauthenticated("missing or bad bearer token")),
         }
+        authorize(&*self.authorizer, client_principal(), action)
     }
 }
 
@@ -310,6 +318,40 @@ struct ProvidersService {
     /// Reject RPCs whose `Host` is not loopback; see [`Auth::loopback_only`].
     loopback_only: bool,
     hosts: HostAllowlist,
+    authorizer: Arc<dyn Authorizer>,
+}
+
+fn authorize(
+    authorizer: &dyn Authorizer,
+    principal: Principal,
+    action: Action,
+) -> Result<(), Error> {
+    authorizer.authorize(&principal, action)
+}
+
+fn client_principal() -> Principal {
+    Principal {
+        kind: PrincipalKind::Client,
+        name: "client".to_owned(),
+    }
+}
+
+fn anonymous_principal() -> Principal {
+    Principal {
+        kind: PrincipalKind::Anonymous,
+        name: "anonymous".to_owned(),
+    }
+}
+
+fn provider_principal(identity: &ProviderIdentity) -> Principal {
+    Principal {
+        kind: PrincipalKind::Provider,
+        name: if identity.name.is_empty() {
+            "provider".to_owned()
+        } else {
+            identity.name.clone()
+        },
+    }
 }
 
 impl ProvidersService {
@@ -324,6 +366,11 @@ impl ProvidersService {
             .ok_or_else(|| Error::unauthenticated("a client certificate is required"))?;
         let fingerprint = peer.fingerprint()?.to_owned();
         let identity = self.service.provider_identity(&fingerprint)?;
+        authorize(
+            &*self.authorizer,
+            provider_principal(&identity),
+            Action::Provider,
+        )?;
         Ok((identity, fingerprint))
     }
 
@@ -356,7 +403,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             RpcResponse::ok(
                 self.service
                     .put_template(request.template.into_option().unwrap_or_default())
@@ -375,7 +422,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Read)?;
             RpcResponse::ok(self.service.list_templates_page(&request)?)
         }
     }
@@ -389,7 +436,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             self.service.delete_template(&request.name).await?;
             RpcResponse::ok(Empty::default())
         }
@@ -404,7 +451,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             RpcResponse::ok(
                 self.service
                     .put_pool(request.pool.into_option().unwrap_or_default())
@@ -423,7 +470,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Read)?;
             RpcResponse::ok(self.service.list_pools_page(&request)?)
         }
     }
@@ -437,7 +484,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             self.service.delete_pool(&request.name).await?;
             RpcResponse::ok(Empty::default())
         }
@@ -453,7 +500,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             RpcResponse::ok(self.service.acquire(request).await?)
         }
     }
@@ -467,7 +514,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             RpcResponse::ok(self.service.renew(request).await?)
         }
     }
@@ -481,7 +528,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             self.service.release(request).await?;
             RpcResponse::ok(Empty::default())
         }
@@ -496,7 +543,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Read)?;
             let request = request;
             RpcResponse::ok(self.service.get(&request.sandbox_id, &request.lease_id)?)
         }
@@ -512,7 +559,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Read)?;
             RpcResponse::ok(self.service.list_page(&request)?)
         }
     }
@@ -545,7 +592,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Exec)?;
             RpcResponse::ok(self.service.open_stream(request)?)
         }
     }
@@ -559,7 +606,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             RpcResponse::ok(self.service.snapshot(request).await?)
         }
     }
@@ -573,7 +620,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             let request = request;
             self.service
                 .stop(&request.sandbox_id, &request.lease_id)
@@ -591,7 +638,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             let request = request;
             self.service
                 .start(&request.sandbox_id, &request.lease_id, request.forkable)
@@ -609,7 +656,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             let request = request;
             self.service
                 .pause(&request.sandbox_id, &request.lease_id)
@@ -627,7 +674,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Write)?;
             let request = request;
             self.service
                 .resume(&request.sandbox_id, &request.lease_id)
@@ -646,7 +693,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Read)?;
             RpcResponse::ok(self.service.list_providers_page(&request)?)
         }
     }
@@ -660,7 +707,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Admin)?;
             RpcResponse::ok(
                 self.service
                     .set_provider_cordon(&request.name, true)
@@ -678,7 +725,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Admin)?;
             RpcResponse::ok(
                 self.service
                     .set_provider_cordon(&request.name, false)
@@ -697,7 +744,7 @@ impl Sandboxes for SandboxesService {
     + use<'a> {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Admin)?;
             RpcResponse::ok(self.service.drain_provider(&request.name).await?)
         }
     }
@@ -711,7 +758,7 @@ impl Sandboxes for SandboxesService {
     > + Send
     + use<'a> {
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Read)?;
             RpcResponse::ok(self.service.stats())
         }
     }
@@ -725,7 +772,7 @@ impl Sandboxes for SandboxesService {
     + 'a {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Admin)?;
             self.service.delete_provider(&request.name).await?;
             RpcResponse::ok(Empty::default())
         }
@@ -741,7 +788,7 @@ impl Sandboxes for SandboxesService {
     + 'a {
         let request = request.to_owned_message();
         async move {
-            self.authorize(&ctx)?;
+            self.authorize(&ctx, Action::Admin)?;
             let ttl = std::time::Duration::from_secs(request.ttl_secs);
             RpcResponse::ok(
                 self.service
@@ -764,10 +811,13 @@ impl Providers for ProvidersService {
     + 'a {
         let request = request.to_owned_message();
         let loopback_only = self.loopback_only;
+        let hosts = self.hosts.clone();
+        let authorizer = self.authorizer.clone();
         async move {
             // `Enroll` is authenticated by its join token alone; the Host
             // guard still applies.
-            check_host(loopback_only, ctx.headers())?;
+            check_host(&hosts, loopback_only, ctx.headers())?;
+            authorize(&*authorizer, anonymous_principal(), Action::Enroll)?;
             RpcResponse::ok(self.service.enroll(request).await?)
         }
     }
@@ -922,6 +972,22 @@ pub fn router_with_options(
     surface: ListenerSurface,
     hosts: HostAllowlist,
 ) -> Router {
+    router_with_options_and_authorizer(service, auth, surface, hosts, Arc::new(TokenAuthorizer))
+}
+
+/// Build a router for one listener surface with an explicit policy.
+///
+/// The ConnectRPC services own the fallback; the data-plane routes are plain
+/// axum routes on the same listener. `Providers` reads the peer certificate
+/// from `ConnectInfo<PeerIdentity>`, so serve it with [`serve_with_options`]
+/// (or `Router::into_make_service_with_connect_info`).
+pub fn router_with_options_and_authorizer(
+    service: Arc<Service>,
+    auth: Auth,
+    surface: ListenerSurface,
+    hosts: HostAllowlist,
+    authorizer: Arc<dyn Authorizer>,
+) -> Router {
     let mut rpc = connectrpc::Router::new();
     let mut router = Router::new();
     if matches!(surface, ListenerSurface::Client | ListenerSurface::Combined) {
@@ -929,6 +995,7 @@ pub fn router_with_options(
             service: service.clone(),
             auth: auth.clone(),
             hosts: hosts.clone(),
+            authorizer: authorizer.clone(),
         });
         rpc = sandboxes.register(rpc);
         router = router
@@ -936,13 +1003,14 @@ pub fn router_with_options(
                 "/sandbox/v1/streams/{ticket}",
                 get(stream_download).put(stream_upload),
             )
-            .route("/sandbox/v1/healthz", get(|| async { "ok" }));
+            .route("/sandbox/v1/healthz", get(healthz));
     }
     if matches!(surface, ListenerSurface::Agent | ListenerSurface::Combined) {
         let providers = Arc::new(ProvidersService {
             service: service.clone(),
             loopback_only: auth.loopback_only,
             hosts: hosts.clone(),
+            authorizer: authorizer.clone(),
         });
         rpc = providers.register(rpc);
         router = router
@@ -962,41 +1030,10 @@ pub fn router_with_options(
         service,
         auth,
         hosts,
+        authorizer,
     })
 }
 
-/// Build a router for one listener surface.
-pub fn router_with_options(
-    service: Arc<Service>,
-    auth: Auth,
-    surface: ListenerSurface,
-    hosts: HostAllowlist,
-) -> Router {
-    let mut router = Router::new();
-    if matches!(surface, ListenerSurface::Client | ListenerSurface::Combined) {
-        router = router
-            .route("/preloop.sandbox.v1.Sandboxes/{method}", post(sandboxes))
-            .route(
-                "/sandbox/v1/streams/{ticket}",
-                get(stream_download).put(stream_upload),
-            )
-            .route("/sandbox/v1/healthz", get(|| async { "ok" }));
-    }
-    if matches!(surface, ListenerSurface::Agent | ListenerSurface::Combined) {
-        router = router
-            .route("/preloop.sandbox.v1.Providers/{method}", post(providers))
-            .route(
-                "/sandbox/v1/agent/blobs/{ticket}",
-                get(agent_blob_get).put(agent_blob_put),
-            )
-            .route("/sandbox/v1/ca.pem", get(ca_pem));
-    }
-    router.with_state(AppState {
-        service,
-        auth,
-        hosts,
-    })
-}
 
 /// Serve the compatibility API over TLS until `shutdown`.
 pub async fn serve(
@@ -1006,7 +1043,21 @@ pub async fn serve(
     tls: Arc<ServerTls>,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    serve_with_options(
+    let authorizer = crate::authz::from_config()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    serve_with_authorizer(listener, service, auth, tls, shutdown, authorizer).await
+}
+
+/// Serve the combined API with an explicitly selected authorization policy.
+pub async fn serve_with_authorizer(
+    listener: tokio::net::TcpListener,
+    service: Arc<Service>,
+    auth: Auth,
+    tls: Arc<ServerTls>,
+    shutdown: CancellationToken,
+    authorizer: Arc<dyn Authorizer>,
+) -> std::io::Result<()> {
+    serve_with_options_and_authorizer(
         listener,
         service,
         auth,
@@ -1014,6 +1065,7 @@ pub async fn serve(
         ListenerSurface::Combined,
         HostAllowlist::disabled(),
         shutdown,
+        authorizer,
     )
     .await
 }
@@ -1028,7 +1080,26 @@ pub async fn serve_with_options(
     hosts: HostAllowlist,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let app = router_with_options(service, auth, surface, hosts);
+    let authorizer = crate::authz::from_config()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    serve_with_options_and_authorizer(
+        listener, service, auth, tls, surface, hosts, shutdown, authorizer,
+    )
+    .await
+}
+
+/// Serve one listener surface with an explicitly selected policy.
+async fn serve_with_options_and_authorizer(
+    listener: tokio::net::TcpListener,
+    service: Arc<Service>,
+    auth: Auth,
+    tls: Option<Arc<ServerTls>>,
+    surface: ListenerSurface,
+    hosts: HostAllowlist,
+    shutdown: CancellationToken,
+    authorizer: Arc<dyn Authorizer>,
+) -> std::io::Result<()> {
+    let app = router_with_options_and_authorizer(service, auth, surface, hosts, authorizer);
     if let Some(tls) = tls {
         axum::serve(
             TlsListener::new(listener, tls.acceptor.clone()),
@@ -1048,6 +1119,9 @@ pub async fn serve_with_options(
 
 /// The service CA, for agents that pin it before enrolling.
 async fn ca_pem(State(app): State<AppState>) -> Response {
+    if let Err(error) = authorize(&*app.authorizer, anonymous_principal(), Action::Enroll) {
+        return error.into_response();
+    }
     match app.service.ca_pem() {
         Some(pem) => (
             StatusCode::OK,
@@ -1202,6 +1276,12 @@ async fn stream_upload(
     if let Err(error) = check_host(&app.hosts, app.auth.loopback_only, &headers) {
         return error.into_response();
     }
+    if let Err(error) = app.service.validate_ticket(&ticket, token) {
+        return error.into_response();
+    }
+    if let Err(error) = authorize(&*app.authorizer, client_principal(), Action::Transfer) {
+        return error.into_response();
+    }
     let mut claim =
         match app
             .service
@@ -1267,6 +1347,12 @@ async fn stream_download(
 ) -> Response {
     let token = bearer(&headers).unwrap_or_default();
     if let Err(error) = check_host(&app.hosts, app.auth.loopback_only, &headers) {
+        return error.into_response();
+    }
+    if let Err(error) = app.service.validate_ticket(&ticket, token) {
+        return error.into_response();
+    }
+    if let Err(error) = authorize(&*app.authorizer, client_principal(), Action::Transfer) {
         return error.into_response();
     }
     let mut claim =
@@ -1361,6 +1447,11 @@ async fn agent_blob_get(
         )?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
+        authorize(
+            &*app.authorizer,
+            provider_principal(&identity),
+            Action::Transfer,
+        )?;
         let mut claim = app.service.claim_agent(
             &id,
             generation,
@@ -1407,6 +1498,11 @@ async fn agent_blob_put(
         )?;
         let (id, generation) = provider_headers(&headers)?;
         require_identity(&identity, &id)?;
+        authorize(
+            &*app.authorizer,
+            provider_principal(&identity),
+            Action::Transfer,
+        )?;
         app.service.claim_agent(
             &id,
             generation,

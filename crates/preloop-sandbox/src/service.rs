@@ -3165,6 +3165,23 @@ impl Service {
         self.claim_locked(&mut state, ticket, side)
     }
 
+    /// Validate a caller ticket without consuming it.
+    ///
+    /// The HTTP layer uses this before authorization so a denied transfer
+    /// cannot consume a single-use ticket.
+    pub(crate) fn validate_ticket(&self, ticket: &str, token: &str) -> Result<()> {
+        let state = self.state.lock();
+        let blob = state
+            .blobs
+            .get(ticket)
+            .filter(|blob| blob.expires_at > now())
+            .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
+        if blob.token.is_empty() || !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
+            return Err(Error::new(Code::Unauthenticated, "bad ticket token"));
+        }
+        Ok(())
+    }
+
     /// Claim the agent's side of a ticket (provider must own the sandbox).
     pub fn claim_agent(
         &self,
@@ -5750,7 +5767,7 @@ mod tests {
         let ca = Arc::new(
             crate::tls::ServiceCa::load_or_create(&dir.path().join("ca")).expect("service CA"),
         );
-        let mut config = ServiceConfig::new(dir.path().join("blobs"));
+        let mut config = ServiceConfig::new();
         config.ca = Some(ca);
         let service = Service::open(crate::store::open("memory:").await.unwrap(), config)
             .await

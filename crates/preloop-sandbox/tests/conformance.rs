@@ -1255,7 +1255,7 @@ async fn split_listeners_expose_only_their_route_families() {
         false,
     )
     .unwrap();
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     config.ca = Some(agent_tls.ca.clone());
     let service = Service::open(store::open("memory:").await.unwrap(), config)
         .await
@@ -5314,7 +5314,7 @@ async fn a_restarted_agent_refuses_to_run_an_exec_twice() {
     let dir = tempfile::tempdir().unwrap();
     let host = dir.path().join("host");
     let scratch = dir.path().join("scratch");
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     config.acquire_wait = Duration::from_secs(10);
     let service = Service::open(store::open("memory:").await.unwrap(), config)
         .await

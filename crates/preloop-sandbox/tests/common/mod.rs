@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use preloop_sandbox::agent::RemoteLink;
-use preloop_sandbox::server::{Auth, serve};
+use preloop_sandbox::authz::Authorizer;
+use preloop_sandbox::server::{Auth, serve, serve_with_authorizer};
 use preloop_sandbox::store;
 use preloop_sandbox::{SandboxClient, ServerTls, Service, ServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -62,6 +63,44 @@ impl TestService {
             Auth::new(client_token.clone()),
             tls,
             shutdown.clone(),
+        ));
+        tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+        Self {
+            service,
+            base,
+            client_token,
+            dir,
+            shutdown,
+        }
+    }
+
+    /// Start a fresh service with an explicit authorization policy.
+    pub async fn start_with_authorizer(authorizer: Arc<dyn Authorizer>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let tls = ServerTls::load_or_create(
+            &state,
+            vec!["127.0.0.1".to_owned(), "localhost".to_owned()],
+            None,
+            None,
+        )
+        .expect("server tls");
+        let mut config = ServiceConfig::new();
+        config.ca = Some(tls.ca.clone());
+        let service = Service::open(store::open("memory:").await.unwrap(), config)
+            .await
+            .unwrap();
+        let client_token = "test-client-token".to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("https://{}", listener.local_addr().unwrap());
+        let shutdown = CancellationToken::new();
+        tokio::spawn(serve_with_authorizer(
+            listener,
+            service.clone(),
+            Auth::new(client_token.clone()),
+            tls,
+            shutdown.clone(),
+            authorizer,
         ));
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
         Self {

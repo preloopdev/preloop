@@ -292,6 +292,20 @@ certificate is used as-is.
   claimed transfer gets the work timeout. Their URLs are relative, so they
   inherit the `https` base.
 
+## Authorization
+
+Authentication and authorization are separate. Handlers first verify the
+existing bearer token, provider certificate, or ticket token, then call the
+replaceable `Authorizer` seam with a named `Principal` and coarse `Action`.
+`PRELOOP_SANDBOX_AUTHORIZER` is unset or `builtin` today; the built-in policy
+allows every authenticated principal to use every action on its surface, so
+the default behavior is unchanged. Roles, namespaces, and per-caller
+credentials are follow-up work in #777/#792.
+
+The action groups are `Read`, `Write`, `Admin`, `Exec`, `Transfer`, `Enroll`,
+and `Provider`; the complete route mapping lives in
+`crates/preloop-sandbox/src/authz.rs`.
+
 ## State
 
 The service keeps its working set in memory and writes through to its own
