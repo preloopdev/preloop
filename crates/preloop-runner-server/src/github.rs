@@ -219,6 +219,68 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
     resolve_repo_token(shared, repo, &permissions).await
 }
 
+/// The fields of `GET /repos/{owner}/{repo}` the OIDC mint path needs:
+/// the immutable repository and owner IDs, plus the creation date
+/// behind the immutable-subject decision.
+#[derive(Debug, Clone, Copy)]
+pub struct RepositoryMetadata {
+    pub id: u64,
+    pub owner_id: u64,
+    pub created_at: Option<i64>,
+}
+
+/// Fetch a repository's metadata from the GitHub API:
+/// `GET /repos/{owner}/{repo}`. Used by the OIDC mint path, which
+/// resolves the IDs of server-synthesized submissions (they carry none)
+/// and the creation date for immutable subject claims; the date is
+/// cached by repository ID, so this runs at most once per repository
+/// per process in the common case.
+///
+/// Fail-soft by contract: no credential, a rate-limited or erroring
+/// GitHub, a missing repository, or an unparseable body all return
+/// `None` — an OIDC mint must never fail because this lookup did.
+pub async fn fetch_repository_metadata(
+    shared: &Arc<SharedState>,
+    repo: &str,
+) -> Option<RepositoryMetadata> {
+    let mut permissions = std::collections::BTreeMap::new();
+    permissions.insert("contents".to_owned(), "read".to_owned());
+    let token = resolve_repo_token(shared, repo, &permissions).await?;
+    let bucket = check_request_bucket(shared, repo, Some(&token)).await;
+    let url = format!("{}/repos/{}", github_api_base(), repo);
+    let res = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Oidc,
+        crate::shared_http::CLIENT
+            .get(&url)
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await
+    .ok()?;
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Oidc, &res);
+    if !res.status().is_success() {
+        return None;
+    }
+    let value: Value = res.json().await.ok()?;
+    let created_at = value.get("created_at").and_then(|v| {
+        v.as_str()
+            .and_then(crate::oidc::parse_repo_created_at)
+            .or_else(|| v.as_i64())
+    });
+    Some(RepositoryMetadata {
+        id: value.get("id")?.as_u64()?,
+        owner_id: value.get("owner")?.get("id")?.as_u64()?,
+        created_at,
+    })
+}
+
 async fn send_github_check_request(
     shared: &Arc<SharedState>,
     bucket: crate::github_breaker::GithubCredentialBucket,

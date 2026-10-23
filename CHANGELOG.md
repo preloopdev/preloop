@@ -13,6 +13,14 @@ Releases before v0.27.0 predate the changelog.
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
   service.
 
+### Fixed
+
+- Run guest CA distrust edits and trust-bundle regeneration together as root
+  or through passwordless sudo. Official golden forks execute as `runner`
+  (uid 1001); editing `/etc/ca-certificates.conf` without elevation made
+  provisioning fail before the runner could register. Refused elevation
+  now leaves the configuration unchanged.
+
 ## [0.35.6] - 2026-10-21
 
 ### Added
