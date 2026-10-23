@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -35,6 +35,8 @@ pub struct FakeDriver {
     /// Exec ids currently running, per sandbox native ref, so `destroy`
     /// can stop a sandbox's commands instead of orphaning them.
     running: Mutex<HashMap<String, HashSet<String>>>,
+    /// Artificial snapshot latency (tests that need an operation in flight).
+    pub snapshot_delay_ms: AtomicU64,
 }
 
 impl FakeDriver {
@@ -51,6 +53,7 @@ impl FakeDriver {
             cancel_calls: AtomicU32::new(0),
             cancels: ExecCancels::default(),
             running: Mutex::new(HashMap::new()),
+            snapshot_delay_ms: AtomicU64::new(0),
         }
     }
 
@@ -373,6 +376,12 @@ impl Driver for FakeDriver {
     }
 
     async fn snapshot(&self, native_ref: &str, template: &str) -> Result<String> {
+        let delay = self
+            .snapshot_delay_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         let source = self.dir(native_ref)?;
         let snapshot = format!(
             "snap-{}-{}",
