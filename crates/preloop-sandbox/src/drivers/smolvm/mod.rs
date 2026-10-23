@@ -1061,7 +1061,10 @@ exit 0
     }
 
     fn driver(directory: &tempfile::TempDir) -> SmolvmDriver {
+        // Production host drivers set the prefix their caller names live in;
+        // the fork tests fork a caller-named clone (`runtime-1`).
         SmolvmDriver::new(SmolVmProvider::new(directory.path().join("smolvm")), 0)
+            .with_named_prefix("runtime")
     }
 
     #[tokio::test]
@@ -1304,7 +1307,7 @@ exit 0
 }
 
 #[cfg(test)]
-mod tests {
+mod ownership_tests {
     use super::name_is_owned;
 
     #[test]

@@ -580,15 +580,15 @@ pub struct Sandbox {
     /// Preserved sandboxes expire at this Unix second (0 = n/a).
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub preserve_until: i64,
+    /// Effective size: the request's shape with the driver's defaults for the
+    /// fields it left unset.
+    pub shape: Shape,
     /// State before `Pause`/`Stop`; `Resume`/`Start` restores it.
     #[serde(skip_serializing_if = "is_unspecified_state")]
     pub prior_state: SandboxState,
     /// Pool + template configuration this warm member was built for.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub pool_revision: String,
-    /// Effective size: the request's shape with the driver's defaults for the
-    /// fields it left unset.
-    pub shape: Shape,
 }
 
 fn is_zero_i64(value: &i64) -> bool {
