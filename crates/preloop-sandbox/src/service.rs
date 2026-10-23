@@ -8,6 +8,7 @@
 //! owner is asked of the database in one short transaction.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,8 +24,12 @@ use tracing::warn;
 use crate::api::*;
 use crate::backend::{
     self, AcquireCommand, AcquireStep, BackendConfig, ExecStatus, MaintenanceConfig, NewSandbox,
-    Owner, OwnerKind, PeerConfig, PlacementSnapshot, PowerOp, RefillOutcome, SandboxBackend,
-    SnapshotCommand, SnapshotStart, TicketAuthority, TicketSide, WorkResult,
+    Owner, OwnerKind, PeerConfig, PlacementSnapshot, PowerOp, RefillOutcome, ResourceMeta,
+    SandboxBackend, SnapshotCommand, SnapshotStart, TicketAuthority, TicketSide, WorkResult,
+};
+use crate::cache::{
+    CacheGateway, CacheKey, Namespace, ResourceKind as CacheResourceKind,
+    Versioned as CacheVersioned,
 };
 use crate::driver::{EXEC_TIMED_OUT, TRANSFER_QUEUE, TransferChunk};
 use crate::error::{Code, Error, Result};
@@ -90,6 +95,13 @@ pub struct ServiceConfig {
     pub waiter_timeout: Duration,
     /// How long an injection claim is held before another retry may claim it.
     pub injection_timeout: Duration,
+    /// Versioned read cache for immutable template/pool payloads. The
+    /// database remains authoritative; this is a deadline-bounded,
+    /// replaceable accelerator. Embedders may supply any backend through a
+    /// [`CacheGateway`]; nothing downcasts to the in-process implementation.
+    pub cache: CacheGateway,
+    /// How long a cached template/pool payload stays admissible.
+    pub cache_ttl: Duration,
 }
 
 impl std::fmt::Debug for ServiceConfig {
@@ -136,6 +148,10 @@ impl ServiceConfig {
             node_lost_after: Duration::from_secs(30),
             waiter_timeout: Duration::from_secs(30),
             injection_timeout: Duration::from_secs(60),
+            cache: crate::cache::CacheSettings::default()
+                .gateway()
+                .expect("default sandbox state cache settings are valid"),
+            cache_ttl: crate::cache::DEFAULT_TTL,
         }
     }
 
@@ -207,6 +223,37 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or_default()
+}
+
+/// How many payload keys one cached list page fetches concurrently. A warm
+/// page does no payload reads; a cold page cannot open more than this many
+/// SQL reads or cache calls at once per request.
+const CACHE_PAGE_CONCURRENCY: usize = 16;
+
+fn cache_key(kind: CacheResourceKind, id: &str, version: u64) -> Result<CacheKey> {
+    CacheKey::new(Namespace::default_namespace(), kind, id, version)
+        .map_err(|error| Error::internal(format!("invalid cache key for `{id}`: {error}")))
+}
+
+/// Collect a page's concurrent payload loads in metadata order, dropping
+/// entries deleted while the page was loading.
+async fn collect_page<T, I, F>(loads: I) -> Result<Vec<T>>
+where
+    T: Send,
+    I: IntoIterator<Item = F> + Send,
+    F: Future<Output = Result<Option<T>>> + Send,
+{
+    let results: Vec<Result<Option<T>>> = futures::stream::iter(loads)
+        .buffered(CACHE_PAGE_CONCURRENCY)
+        .collect()
+        .await;
+    let mut values = Vec::with_capacity(results.len());
+    for result in results {
+        if let Some(value) = result? {
+            values.push(value);
+        }
+    }
+    Ok(values)
 }
 
 fn now() -> i64 {
@@ -568,6 +615,12 @@ impl Service {
         &self.node
     }
 
+    /// The versioned read-cache wrapper (diagnostics and tests; service reads
+    /// never bypass it to use the backend directly).
+    pub fn cache(&self) -> &CacheGateway {
+        &self.config.cache
+    }
+
     /// Whether this node owns a live channel.
     pub fn is_local_owner(&self, owner: &Owner) -> bool {
         self.peers.is_local(owner)
@@ -729,11 +782,64 @@ impl Service {
     }
 
     /// `ListTemplates` page.
+    ///
+    /// Page membership, order and row versions come from one authoritative
+    /// SQL metadata query; only the immutable per-template payloads are
+    /// cached. A page is never cached as a whole, so a template added,
+    /// removed or renamed is visible on the next request.
     pub async fn list_templates_page(
         &self,
         request: &ListRequest,
     ) -> Result<ListTemplatesResponse> {
-        self.backend.list_templates(request).await
+        let window = backend::logic::page_window("template", request)?;
+        let (metas, has_more) = self
+            .backend
+            .template_page_meta(window.after.as_deref(), window.limit)
+            .await?;
+        let ids: Vec<String> = metas.iter().map(|meta| meta.id.clone()).collect();
+        let templates = self.cached_templates(metas).await?;
+        let next_page_token = if has_more {
+            backend::logic::next_page_token("template", &ids, ids.len(), window.limit)
+        } else {
+            String::new()
+        };
+        Ok(ListTemplatesResponse {
+            templates,
+            next_page_token,
+            ..ListTemplatesResponse::default()
+        })
+    }
+
+    /// Load one page's template payloads at their authoritative versions.
+    ///
+    /// A cache hit skips the payload read. A miss asks for exactly the
+    /// version the metadata page observed; if that version moved, the latest
+    /// atomic read is returned and cached under its own version. A template
+    /// deleted while the page is loading is omitted. Cache failures are
+    /// misses, never RPC failures.
+    async fn cached_templates(&self, metas: Vec<ResourceMeta>) -> Result<Vec<Template>> {
+        let ttl = self.config.cache_ttl;
+        let loads = metas.into_iter().map(|meta| async move {
+            let key = cache_key(CacheResourceKind::Template, &meta.id, meta.version)?;
+            let hit = self
+                .config
+                .cache
+                .load(&key, ttl, || async {
+                    let row = self.backend.template_get_at(&meta.id, meta.version).await?;
+                    Ok::<_, Error>(row.map(|row| CacheVersioned::new(row.version, row.value)))
+                })
+                .await?;
+            if let Some(template) = hit {
+                return Ok(Some(template));
+            }
+            let Some(row) = self.backend.template_get(&meta.id).await? else {
+                return Ok(None);
+            };
+            let key = cache_key(CacheResourceKind::Template, &meta.id, row.version)?;
+            self.config.cache.remember(&key, &row.value, ttl);
+            Ok(Some(row.value))
+        });
+        collect_page(loads).await
     }
 
     /// `PutPool`.
@@ -750,8 +856,52 @@ impl Service {
     }
 
     /// `ListPools` page.
+    ///
+    /// As with templates: fresh SQL page membership and versions, cached
+    /// immutable payloads only.
     pub async fn list_pools_page(&self, request: &ListRequest) -> Result<ListPoolsResponse> {
-        self.backend.list_pools(request).await
+        let window = backend::logic::page_window("pool", request)?;
+        let (metas, has_more) = self
+            .backend
+            .pool_page_meta(window.after.as_deref(), window.limit)
+            .await?;
+        let ids: Vec<String> = metas.iter().map(|meta| meta.id.clone()).collect();
+        let pools = self.cached_pools(metas).await?;
+        let next_page_token = if has_more {
+            backend::logic::next_page_token("pool", &ids, ids.len(), window.limit)
+        } else {
+            String::new()
+        };
+        Ok(ListPoolsResponse {
+            pools,
+            next_page_token,
+            ..ListPoolsResponse::default()
+        })
+    }
+
+    async fn cached_pools(&self, metas: Vec<ResourceMeta>) -> Result<Vec<PoolSpec>> {
+        let ttl = self.config.cache_ttl;
+        let loads = metas.into_iter().map(|meta| async move {
+            let key = cache_key(CacheResourceKind::Pool, &meta.id, meta.version)?;
+            let hit = self
+                .config
+                .cache
+                .load(&key, ttl, || async {
+                    let row = self.backend.pool_get_at(&meta.id, meta.version).await?;
+                    Ok::<_, Error>(row.map(|row| CacheVersioned::new(row.version, row.value)))
+                })
+                .await?;
+            if let Some(pool) = hit {
+                return Ok(Some(pool));
+            }
+            let Some(row) = self.backend.pool_get(&meta.id).await? else {
+                return Ok(None);
+            };
+            let key = cache_key(CacheResourceKind::Pool, &meta.id, row.version)?;
+            self.config.cache.remember(&key, &row.value, ttl);
+            Ok(Some(row.value))
+        });
+        collect_page(loads).await
     }
 
     /// `DeletePool`.

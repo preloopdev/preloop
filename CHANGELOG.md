@@ -25,6 +25,17 @@ Releases before v0.27.0 predate the changelog.
   request that lands elsewhere is forwarded over an authenticated internal
   node hop whose peer URLs come only from configuration; the shared service CA
   verifies it. A replica that dies fails only its own streams and leases.
+- **Sandbox Service: optional version-keyed read cache.** `ListTemplates` and
+  `ListPools` now take page membership and row versions from SQL, then serve
+  each immutable payload from an optional bounded cache (default, in-process)
+  or read that exact version from SQL. Keys include the authoritative,
+  non-reused row version, so a late fill of an old version cannot shadow a
+  newer read; pages themselves are never cached. `none` disables acceleration,
+  every call is deadline-bounded, and a miss, timeout or outage falls back to
+  SQL with a rate-limited warning. The object-safe async `SharedCache` trait
+  lets an embedder supply a Redis/Valkey or other backend without adding a
+  required dependency; leases, tokens, env, provider generations, capacity,
+  work claims, authorization and stream bytes never enter the cache.
 - **Durable exec start gate.** The agent records a started exec on its host and
   the service records the winning delivery attempt before the command runs, so
   at-least-once delivery never executes a command twice. Work the agent already
