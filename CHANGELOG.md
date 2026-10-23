@@ -11,7 +11,9 @@ Releases before v0.27.0 predate the changelog.
 
 - **Sandbox Service** (`preloop-sandbox`) replaces `preloop-vm`; the
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
-  service. The AgentENV backend moved to the private build.
+  service.
+
+## [0.35.6] - 2026-10-21
 
 ### Added
 
@@ -48,9 +50,9 @@ Releases before v0.27.0 predate the changelog.
   Actions and Rust; dependency review blocks high-severity additions; and
   OpenSSF Scorecard runs weekly. The published runner image is now signed with
   keyless cosign and has a registry-backed provenance attestation. The golden
-  scan also requires the aarch64 apt SBOM and scans it with Grype, and the
-  main ruleset no longer allows direct pushes (admins may still merge a PR),
-  and the release-tag ruleset restricts tag creation.
+  scan also requires the aarch64 apt SBOM and scans it with Grype; the main
+  ruleset blocks direct pushes while still allowing an admin PR merge, and the
+  release-tag ruleset restricts tag creation.
 
 ### Fixed
 
@@ -73,6 +75,58 @@ Releases before v0.27.0 predate the changelog.
   golden traffic is admitted on the anonymous bucket and attributed to the new
   `golden` subsystem. A one-shot CLI bake, with no engine to share a funnel
   with, keeps a private one instead of leaving a call unobserved. Behaviour: an
+  open breaker refuses the metadata lookup before it opens a connection — none
+  of its 30-second deadline is spent, and the refusal is not cached as a
+  negative tag — while the transfers keep their one-hour budget and only their
+  admission decision changes. Breaker state is keyed by service origin as well
+  as credential, so the golden hosts an operator names (`PRELOOP_GOLDEN_URL`,
+  a non-GHCR `PRELOOP_GOLDEN_OCI_REF`, a token realm) keep their own breakers:
+  a mirror's outage cannot park GitHub traffic, an open GitHub breaker cannot
+  refuse a healthy mirror, and a GHES install's anonymous calls no longer share
+  a partition with the golden path's public-GitHub calls. A golden lookup also
+  inherits an outage another credential's traffic already discovered at the same
+  origin, and the `golden` subsystem now reports the bytes it moved rather than
+  zero.
+
+- **Snapshot capture is bounded end to end, and the shared object cache has a
+  ceiling.** One run's merge attach, local workspace capture, or remote
+  checkout fetch now runs under a single 90-minute backstop; on expiry only
+  that run's unaccepted staging and run-local repositories are removed, and
+  the submission fails with an operator message instead of queueing jobs.
+  Cancelling a capture kills the whole Git process group (a hung transport or
+  `index-pack` included); the per-cache refresh lock is released when
+  `ensure_object_cache` returns, a cache pin bridges the interval until the
+  snapshot publishes its alternates, and staging cleanup waits for in-flight
+  blocking copies before removing the tree. The shared snapshot object cache
+  (`<state>/snapshot-object-cache`) is pruned oldest-first at startup and
+  after each successful capture to
+  `PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES` (default 100 GiB, `0` disables).
+  An entry is retired only under the same per-entry lock a refresh takes, and
+  never while a capture pin or an alternates reference protects it; clone
+  hardlinks make the ceiling soft.
+
+- **Strict job assignments can no longer strand a ready job.** With
+  `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` on, a job is claimable only while it has a
+  `job_assignments` or `provision_requests` row. Every path that returns a job
+  to the ready queue now derives that intent exactly as enqueue does: requeue
+  after a runner purge (or boot reconcile), deferred matrix/reusable expansion
+  legs, and an enqueue with the pool off (which previously wrote no provision
+  mark at all under strict assignments). A 10 s reaper backstop repairs any
+  ready job that still has no row and logs the count at info, so a missed path
+  can no longer stall the queue until a restart.
+
+### Fixed
+
+- **The runner pool's golden-release GitHub calls now go through the engine's
+  circuit breaker.** `resolve_latest_golden_tag` (the `/releases` listing), the
+  OCI manifest and token lookups, the `.sha256` sidecars and the golden
+  transfers were the last GitHub calls outside it: the pool had no handle on
+  the engine's `AppState` breaker registry. `RunnerPoolConfig` now carries the
+  engine's shared funnel (the registry and its per-subsystem accounting) from
+  the CLI through `bootstrap::serve` into `AppState` and the runner pool, so
+  golden traffic is admitted on the anonymous bucket and attributed to the new
+  `golden` subsystem. A one-shot CLI bake, with no engine to share a funnel
+  with, keeps its own instead of leaving a call unobserved. Behaviour: an
   open breaker refuses the metadata lookup before it opens a connection — none
   of its 30-second deadline is spent, and the refusal is not cached as a
   negative tag — while the transfers keep their one-hour budget and only their
@@ -3362,7 +3416,8 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.5...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.6...HEAD
+[0.35.6]: https://github.com/preloopdev/preloop/compare/v0.35.5...v0.35.6
 [0.35.5]: https://github.com/preloopdev/preloop/compare/v0.35.0...v0.35.5
 [0.35.0]: https://github.com/preloopdev/preloop/compare/v0.34.4...v0.35.0
 [0.33.7]: https://github.com/preloopdev/preloop/compare/v0.33.6...v0.33.7

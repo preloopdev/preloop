@@ -977,8 +977,8 @@ struct RunArgs {
     #[arg(short = 'm', long = "message")]
     message: Option<String>,
     /// Open a live debug session when a job fails. Without this flag, failed
-    /// Jobs on a state-preserving backend are cleaned up normally. SmolVM retains its historical
-    /// terminal-attached default for compatibility.
+    /// jobs are cleaned up normally; a terminal-attached run keeps the
+    /// historical debug-on-failure default.
     #[arg(long, conflicts_with = "no_debug")]
     debug: bool,
 
@@ -1388,7 +1388,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         github: None,
     };
     let payload = artifact_payload(&output, &config.base_image);
-    // The bake runs through a private, in-process sandbox service with this
+    // The bake runs through an in-process sandbox service with this
     // host's SmolVM driver: `pack` writes a portable `.smolmachine`.
     let sandboxes = crate::sandbox::LocalSandboxes::start(&preloop_home()).await?;
     RunnerPool::new(sandboxes.machines(), config)?
@@ -2225,13 +2225,17 @@ async fn cmd_engine(
     let shutdown = tokio_util::sync::CancellationToken::new();
 
     // The runner pool gets its machines from the embedded Sandbox Service.
-    let sandboxes = sandbox::LocalSandboxes::start(&home).await?;
-    let machines = sandboxes.machines();
+    // Without a pool there is nothing to place here, so do not open the
+    // service (or bind its API) at all.
+    let sandboxes = sandbox::start_if_pool(pool_config.is_some(), &home).await?;
+    let machines = sandboxes.as_ref().map(sandbox::LocalSandboxes::machines);
 
     let spawn_pool = |config: &RunnerPoolConfig,
                       pool_shutdown: tokio_util::sync::CancellationToken| {
         let config = config.clone();
-        let machines = machines.clone();
+        let machines = machines
+            .clone()
+            .expect("a configured pool always starts the sandbox service");
         tokio::spawn(async move { RunnerPool::new(machines, config)?.run(pool_shutdown).await })
     };
     // Each generation gets a fresh child token: `RunnerPool::run` cancels the
