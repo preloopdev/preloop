@@ -46,6 +46,12 @@ Releases before v0.27.0 predate the changelog.
   counts what it drops, and an unavailable `Stats` read reports the engine
   fleet as unknown instead of empty.
 
+- Run guest CA distrust edits and trust-bundle regeneration together as root
+  or through passwordless sudo. Official golden forks execute as `runner`
+  (uid 1001); editing `/etc/ca-certificates.conf` without elevation made
+  provisioning fail before the runner could register. Refused elevation
+  now leaves the configuration unchanged.
+
 ## [0.35.6] - 2026-10-21
 
 ### Added
