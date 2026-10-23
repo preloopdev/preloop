@@ -490,14 +490,20 @@ mod tests {
     /// True while `pid` names a live (not zombie) process.
     #[cfg(unix)]
     fn running(pid: u32) -> bool {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        // `ps` is portable where /proc is not, and still reports `Z` for a
+        // zombie, so a killed-but-unreaped process does not count as alive.
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
             return false;
         };
-        // The state letter follows the parenthesised command name.
-        stat.rsplit(')')
-            .next()
-            .and_then(|rest| rest.trim_start().chars().next())
-            .is_some_and(|state| state != 'Z' && state != 'X')
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|state| state != 'Z' && state != 'X')
     }
 
     async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
