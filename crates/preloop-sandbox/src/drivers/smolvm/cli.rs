@@ -6504,9 +6504,12 @@ mod tests {
     /// the runtime recovers — gets to answer.
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_timed_out_capability_probe_is_not_cached() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let _agent_rootfs = AgentRootfsGuard::set();
         let dir = tempfile::tempdir().expect("scratch");
         let tool = dir.path().join("smolvm");
         let probed = dir.path().join("probed");

@@ -82,15 +82,18 @@ are the service's.
   service generates a random token on first start into
   `<state>/sandbox-client-token` and `<state>/sandbox-provider-token` (mode
   0600) and reuses it on later starts; the local CLI and in-process agent read
-  the same files.
+  the same files. A standalone agent never generates one: it takes
+  `--provider-token` / `PRELOOP_SANDBOX_PROVIDER_TOKEN`, or reads the file on
+  the host whose service wrote it.
 * A listener bound to a loopback address rejects requests whose `Host` is not
   `localhost`, an address in `127.0.0.0/8`, or `::1`, so a DNS-rebound browser
   page cannot reach it by name. The port is ignored; the check covers the
   RPC routes and the ticket data plane.
-* The service that binds publishes its actual address to
-  `<state>/sandbox-endpoint` (mode 0600) and removes it on shutdown. A CLI
-  without an explicit `--service` uses that file and refuses to send its token
-  anywhere else.
+* The service that binds publishes its actual address and owner PID to
+  `<state>/sandbox-endpoint` (mode 0600) and removes it on shutdown. A failed
+  bind clears the file only when its owner is dead, so a live service's
+  endpoint stays usable. A CLI without an explicit `--service` uses that file
+  and refuses to send its token anywhere else.
 * Data-plane tickets are single-use, scoped to one sandbox and direction, and
   short-lived. `OpenStream` returns the stream URL and a separate `token`; the
   caller sends it as `Authorization: Bearer <token>` on the upload or download,
@@ -110,7 +113,10 @@ are the service's.
 The service keeps its working set in memory and writes through to its own
 store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
 `sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
-never references control tables.
+never references control tables. One process at a time holds
+`<state>/sandbox-service.lock` (flock): a second service, or a golden bake
+pointed at the same `PRELOOP_HOME`, fails instead of loading the store and
+reaping the running service's leases.
 
 ## How preloop uses it
 
@@ -135,7 +141,7 @@ and debug-hold strategy; the machines under it are sandboxes.
 
 ```sh
 preloop sandbox serve --listen 0.0.0.0:9191            # standalone service (+ local SmolVM)
-preloop sandbox agent --service http://hub:9191        # join as a provider
+preloop sandbox agent --service http://hub:9191        # join as a provider; off-host needs --provider-token
 # <digest> is a placeholder: substitute the image's real sha256 digest.
 preloop sandbox template put --name alpine --image alpine:3.20@sha256:<digest>
 preloop sandbox pool put --name alpine --template alpine --warm 2
@@ -146,7 +152,7 @@ preloop sandbox stop sbx-…                            # power off, keep the di
 preloop sandbox start sbx-… [--forkable]               # boot it again (bakes)
 preloop sandbox snapshot sbx-… --name golden
 preloop sandbox release lse-… [--preserve 600]
-preloop sandbox ls | providers
+preloop sandbox ls                    # and: preloop sandbox providers
 ```
 
 Without `--service` (or `PRELOOP_SANDBOX_URL`), the CLI reads

@@ -177,18 +177,24 @@ fn pool_revision(state: &State, pool: &PoolSpec) -> String {
         .get(&pool.template)
         .map(|template| template.digest.clone())
         .unwrap_or_default();
-    let canonical = serde_json::to_vec(&(pool, template)).unwrap_or_default();
+    // Scale and renewal policy do not change how a member is built: editing
+    // them must not retire every warm member.
+    let build = PoolSpec {
+        warm: 0,
+        max: 0,
+        lease_ttl_secs: 0,
+        ..pool.clone()
+    };
+    let canonical = serde_json::to_vec(&(build, template)).unwrap_or_default();
     format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
 }
 
 /// State a sandbox returns to when its Pause/Stop is undone with no lease.
 fn restored_state(sandbox: &Sandbox) -> SandboxState {
     match sandbox.prior_state {
-        // A preserved debug sandbox stays preserved (its deadline is kept).
-        SandboxState::Preserved => SandboxState::Preserved,
-        // A lease that was released while powered off: a pool member goes
-        // back to the warm set; any other sandbox stays a debug hold.
-        SandboxState::Leased if sandbox.pool.is_empty() => SandboxState::Preserved,
+        // A preserved or once-leased sandbox stays a debug hold (its
+        // deadline is kept): a used machine must never serve a new lease.
+        SandboxState::Preserved | SandboxState::Leased => SandboxState::Preserved,
         _ => SandboxState::Ready,
     }
 }
@@ -1796,7 +1802,9 @@ impl Service {
             .get(ticket)
             .filter(|blob| blob.expires_at > now())
             .ok_or_else(|| Error::not_found("ticket not found or expired"))?;
-        if !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
+        // In-process blobs have no token: never let a tokenless request
+        // match them. The comparison stays constant-time.
+        if blob.token.is_empty() || !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
             return Err(Error::new(Code::Unauthenticated, "bad ticket token"));
         }
         let blob = state.blobs.get_mut(ticket).expect("ticket looked up above");
@@ -2973,5 +2981,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(third.sandbox.id, "sbx-x");
+    }
+
+    #[tokio::test]
+    async fn an_empty_ticket_token_never_authorizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::open(
+            store::open("memory:").await.unwrap(),
+            ServiceConfig::new(dir.path().join("blobs")),
+        )
+        .await
+        .unwrap();
+        service.state.lock().blobs.insert(
+            "tkt-internal".into(),
+            Blob {
+                sandbox_id: String::new(),
+                kind: StreamKind::Download,
+                guest_path: "/work".into(),
+                token: String::new(),
+                expires_at: now() + 60,
+                path: dir.path().join("blob.tar"),
+                claimed: false,
+            },
+        );
+        let error = service.claim_ticket("tkt-internal", "").unwrap_err();
+        assert_eq!(error.code, Code::Unauthenticated);
     }
 }
