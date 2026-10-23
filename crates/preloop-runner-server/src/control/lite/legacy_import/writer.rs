@@ -990,7 +990,12 @@ pub(crate) fn write_import(
                         ),
                         fail_fast: record.job_fail_fast.get(&payload.job.base_id).copied(),
                         continue_on_error: record.job_continue_on_error.get(job_id).copied(),
-                        id_token_granted: granted,
+                        // A fork-restricted run never holds an OIDC grant
+                        // at build time; do not let a legacy record that
+                        // says otherwise resurrect one through the import.
+                        id_token_granted: granted
+                            && !crate::events::trust_tier::tier_of(&record.submission)
+                                .is_some_and(|tier| tier.is_fork_restricted()),
                         oidc_environment: oidc_environment.as_deref(),
                         oidc_job_workflow_ref: oidc_ref.as_deref(),
                         oidc_job_workflow_sha: oidc_sha.as_deref(),

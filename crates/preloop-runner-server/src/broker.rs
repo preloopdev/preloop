@@ -176,6 +176,17 @@ pub fn normalize_oidc_issuer(value: String) -> anyhow::Result<String> {
     {
         anyhow::bail!("OIDC issuer must be an absolute HTTP(S) URL without query or fragment");
     }
+    // Never claim GitHub's issuer: preloop signs with its own key, so
+    // tokens would assert `iss` = GitHub while relying parties resolve
+    // that issuer to GitHub's real discovery document and JWKS — they can
+    // never verify, and the misconfiguration only surfaces at a cloud
+    // console far from its cause. Refuse it at startup instead.
+    if issuer == "https://token.actions.githubusercontent.com" {
+        anyhow::bail!(
+            "OIDC issuer must not be GitHub's issuer (token.actions.githubusercontent.com): \
+             preloop issues tokens under its own issuer and key"
+        );
+    }
     Ok(issuer)
 }
 
@@ -1741,6 +1752,28 @@ pub async fn broker_complete_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oidc_issuer_must_not_impersonate_github() {
+        // Tokens preloop signs must never claim GitHub's issuer: relying
+        // parties pin an issuer to its discovery document, so a config
+        // naming GitHub's issuer yields tokens whose `iss` is GitHub while
+        // the keys live in GitHub's real JWKS — they can never verify, and
+        // the misconfiguration surfaces far from its cause. Refuse it (the
+        // trailing-slash spelling normalizes to the same issuer).
+        assert!(
+            normalize_oidc_issuer("https://token.actions.githubusercontent.com".to_owned())
+                .is_err()
+        );
+        assert!(
+            normalize_oidc_issuer("https://token.actions.githubusercontent.com/".to_owned())
+                .is_err()
+        );
+        assert_eq!(
+            normalize_oidc_issuer("https://oidc.example.com/".to_owned()).unwrap(),
+            "https://oidc.example.com"
+        );
+    }
 
     #[tokio::test]
     async fn runner_settings_returns_default_wire_shape() {
