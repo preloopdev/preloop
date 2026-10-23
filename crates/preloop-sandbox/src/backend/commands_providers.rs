@@ -186,7 +186,7 @@ pub(crate) async fn complete_work(
         if result.ok {
             match apply_snapshot_receipt(tx, &payload, &result).await? {
                 SnapshotApplication::Applied(template) => {
-                    result.template = Some(template);
+                    result.template = Some(*template);
                 }
                 // The source changed mid-capture: the provider's work is
                 // acknowledged (so it is not retried forever) and the
@@ -423,9 +423,13 @@ async fn save_sandbox(tx: &mut dyn SqlTx, sandbox: &Sandbox) -> Result<()> {
 }
 
 /// What a snapshot report means once checked against the live source.
+///
+/// The applied template is boxed: a `Template` is several hundred bytes and
+/// the failure arm is a short reason, so keeping it inline would make every
+/// value of the enum pay the larger size.
 enum SnapshotApplication {
     /// The capture is installed as a template.
-    Applied(Template),
+    Applied(Box<Template>),
     /// The source changed while the provider was working; the captured base
     /// is dropped and the caller gets this failure.
     Invalid(String),
@@ -571,7 +575,7 @@ async fn apply_snapshot_receipt(
     )
     .await?;
     purge_sandbox_with_reason(tx, &sandbox_id, "sandbox was snapshotted").await?;
-    Ok(SnapshotApplication::Applied(Template {
+    Ok(SnapshotApplication::Applied(Box::new(Template {
         spec: spec.into(),
         digest,
         provider_id,
@@ -579,7 +583,7 @@ async fn apply_snapshot_receipt(
         created_at: now_secs(),
         driver,
         ..Template::default()
-    }))
+    })))
 }
 
 /// Delete a sandbox record and everything that could still act on it.
@@ -954,6 +958,7 @@ pub(crate) async fn list_providers(
     let limit = i64::try_from(window.limit).unwrap_or(i64::MAX);
     store
         .run_tx(|tx| {
+            let after = after.clone();
             Box::pin(async move {
                 let rows = tx
                     .query(
@@ -1584,6 +1589,24 @@ pub(crate) async fn report(store: &SqlStore, request: ReportRequest) -> Result<(
         .await
 }
 
+/// How long after a create completes an inventory report may lag behind it.
+///
+/// A provider's report lists the machines its driver sample contained a
+/// moment earlier. The service compares that list with rows whose create
+/// report it may have processed after the sample was taken, so a machine
+/// created in that window is missing from a report that is otherwise
+/// current — and failing it would fail a live sandbox. The window is one
+/// round trip plus queueing; this bound is generous for that and short
+/// enough that a machine that really vanished is still failed promptly.
+const INVENTORY_GRACE_MS: i64 = 3_000;
+
+/// Whether a record's create is recent enough that an inventory sample may
+/// legitimately predate it. A record with no completed create work is not
+/// fresh: absence is a real loss.
+fn missing_within_grace(created_at_ms: i64, now_ms: i64) -> bool {
+    created_at_ms > 0 && now_ms.saturating_sub(created_at_ms) < INVENTORY_GRACE_MS
+}
+
 pub(crate) async fn reconcile(
     store: &SqlStore,
     request: ReconcileRequest,
@@ -1600,7 +1623,10 @@ pub(crate) async fn reconcile(
                     .collect();
                 let rows = tx
                     .query(
-                        "SELECT s.id, s.native_ref, s.state, s.delete_attempts, p.driver \
+                        "SELECT s.id, s.native_ref, s.state, s.delete_attempts, p.driver, \
+                                COALESCE((SELECT MAX(w.completed_at) FROM work_items w \
+                                          WHERE w.dedup_key = 'create:' || s.id), 0) \
+                                    AS created_at_ms \
                          FROM sandboxes s JOIN sandbox_specs p ON p.id = s.id \
                          WHERE s.provider_id = $1 AND s.state <> 'failed'",
                         &[request.provider_id.as_str().into()],
@@ -1614,16 +1640,24 @@ pub(crate) async fn reconcile(
                         row.text("state")?.to_owned(),
                         u32::try_from(row.int("delete_attempts")?).unwrap_or(0),
                         row.text("driver")?.to_owned(),
+                        row.int("created_at_ms")?,
                     ));
                 }
                 // A record the provider no longer reports is done: terminated
                 // and GONE tombstones are removed, anything else is failed.
-                for (id, native_ref, state, _attempts, _driver) in &records {
+                for (id, native_ref, state, _attempts, _driver, created_at_ms) in &records {
                     if native_ref.is_empty() || observed.contains(native_ref.as_str()) {
                         continue;
                     }
                     if state == "terminating" || state == "gone" {
                         purge_sandbox(tx, id).await?;
+                    } else if missing_within_grace(*created_at_ms, now_ms()) {
+                        // The inventory is a snapshot taken before it is sent,
+                        // so a machine whose create landed in between is
+                        // absent from a report that is otherwise current.
+                        // Absence this soon after a create proves nothing;
+                        // the next report decides.
+                        tracing::debug!(sandbox = %id, "inventory reported no machine yet; in grace");
                     } else {
                         super::commands_leases::fail_sandbox(
                             tx,
@@ -1638,7 +1672,7 @@ pub(crate) async fn reconcile(
                         .await?;
                     }
                 }
-                for (id, native_ref, state, attempts, driver) in &records {
+                for (id, native_ref, state, attempts, driver, _created_at_ms) in &records {
                     if state != "terminating"
                         || native_ref.is_empty()
                         || !observed.contains(native_ref.as_str())
@@ -1762,4 +1796,24 @@ pub(crate) async fn reconcile(
             })
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_inventory_may_lag_a_create_only_inside_the_grace() {
+        // No completed create work: absence is a real loss, not lag.
+        assert!(!missing_within_grace(0, 1_000_000));
+        // A create that landed a moment ago can be missing from a report
+        // whose sample predates it.
+        assert!(missing_within_grace(1_000_000, 1_000_000));
+        assert!(missing_within_grace(1_000_000, 1_002_999));
+        // Past the grace the report is authoritative.
+        assert!(!missing_within_grace(1_000_000, 1_003_000));
+        assert!(!missing_within_grace(1_000_000, 9_000_000));
+        // A service clock behind the recorded completion still counts fresh.
+        assert!(missing_within_grace(1_000_000, 999_000));
+    }
 }

@@ -241,6 +241,7 @@ pub(crate) async fn page_meta(
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     store
         .run_tx(|tx| {
+            let after = after.clone();
             let sql = format!(
                 "SELECT name AS id, version FROM {table} \
                  WHERE name > $1{retired} ORDER BY name LIMIT $2"
@@ -533,6 +534,7 @@ pub(crate) async fn list_templates(
     let limit = i64::try_from(window.limit).unwrap_or(i64::MAX);
     store
         .run_tx(|tx| {
+            let after = after.clone();
             Box::pin(async move {
                 let rows = tx
                     .query(
@@ -679,6 +681,7 @@ pub(crate) async fn list_pools(
     let limit = i64::try_from(window.limit).unwrap_or(i64::MAX);
     store
         .run_tx(|tx| {
+            let after = after.clone();
             Box::pin(async move {
                 let rows = tx
                     .query(

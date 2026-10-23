@@ -16,7 +16,7 @@ use tokio_postgres::{Client, NoTls, Row as PgRow};
 
 use crate::error::{Code, Error, Result};
 
-use super::engine::{Dialect, Row, SqlEngine, SqlTx, SqlValue};
+use super::engine::{Dialect, RetryableTxConflict, Row, SqlEngine, SqlTx, SqlValue};
 
 /// Postgres channel used for optional wake hints.
 pub(crate) const EVENTS_CHANNEL: &str = "sandbox_changed";
@@ -233,14 +233,10 @@ impl SqlTx for PgTx {
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
-        client.execute(sql, &refs).await.map_err(|error| {
-            let mapped = map_error(error);
-            Error::internal(format!(
-                "{} [sql: {}]",
-                mapped.message.as_deref().unwrap_or(""),
-                sql
-            ))
-        })
+        client
+            .execute(sql, &refs)
+            .await
+            .map_err(|error| statement_error(error, sql))
     }
 
     async fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
@@ -253,14 +249,10 @@ impl SqlTx for PgTx {
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
-        let rows = client.query(sql, &refs).await.map_err(|error| {
-            let mapped = map_error(error);
-            Error::internal(format!(
-                "{} [sql: {}]",
-                mapped.message.as_deref().unwrap_or(""),
-                sql
-            ))
-        })?;
+        let rows = client
+            .query(sql, &refs)
+            .await
+            .map_err(|error| statement_error(error, sql))?;
         rows.into_iter().map(decode_row).collect()
     }
 
@@ -496,6 +488,21 @@ fn pg_tls(url: &str) -> Result<Option<postgres_rustls::MakeTlsConnector>> {
     )))
 }
 
+/// Attach the failing SQL to a statement error so an operator can see which
+/// command lost the race, keeping the mapped error's retry marker: the
+/// transaction wrapper decides retries from the source, never from the text.
+fn statement_error(error: tokio_postgres::Error, sql: &str) -> Error {
+    let mapped = map_error(error);
+    let message = format!(
+        "{} [sql: {sql}]",
+        mapped.message.as_deref().unwrap_or_default()
+    );
+    match mapped.source_arc() {
+        Some(source) => Error::internal(message).with_shared_source(source),
+        None => Error::internal(message),
+    }
+}
+
 pub(crate) fn map_error(error: tokio_postgres::Error) -> Error {
     if let Some(db_error) = error.as_db_error() {
         if db_error.code().code() == "23505" {
@@ -505,7 +512,8 @@ pub(crate) fn map_error(error: tokio_postgres::Error) -> Error {
             );
         }
         if db_error.code().code() == "40001" || db_error.code().code() == "40P01" {
-            return Error::unavailable("sandbox Postgres serialization failure");
+            return Error::unavailable("sandbox Postgres serialization failure")
+                .with_shared_source(Arc::new(RetryableTxConflict));
         }
         return Error::internal(format!(
             "sandbox Postgres ({}): {}",

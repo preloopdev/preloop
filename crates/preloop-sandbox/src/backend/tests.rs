@@ -334,6 +334,92 @@ async fn acquire_create_report_release_is_authoritative() {
     assert!(backend.list_all().await.unwrap().is_empty());
 }
 
+/// A provider's inventory is a snapshot taken before the report is sent. A
+/// machine whose create landed in that window is missing from a report that
+/// is otherwise current; failing it would fail a live sandbox.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_create_is_not_lost_to_a_stale_inventory_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = backend(dir.path()).await;
+    let (template, registered) = setup(&backend).await;
+    let member = new_member(&backend, "fresh").await;
+    let command = AcquireCommand {
+        request: acquire_request("key-fresh", "fresh", 60),
+        fingerprint: "fp".into(),
+        ttl_secs: 60,
+        unclaimed_ttl_secs: 600,
+        create_timeout: Duration::from_secs(60),
+        placement: None,
+        owner: owner(),
+    };
+    assert!(matches!(
+        backend.acquire(command.clone()).await.unwrap(),
+        AcquireStep::PlacementNeeded
+    ));
+    let command = AcquireCommand {
+        placement: Some(NewSandbox { template, ..member }),
+        ..command
+    };
+    assert!(matches!(
+        backend.acquire(command.clone()).await.unwrap(),
+        AcquireStep::Wait { .. }
+    ));
+    let work = backend
+        .poll_work(
+            &registered.provider_id,
+            registered.generation,
+            8,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    let create = work
+        .iter()
+        .find(|item| matches!(item.work, Some(work_item::Work::Create(_))))
+        .expect("create work delivered");
+    backend
+        .report(ReportRequest {
+            provider_id: registered.provider_id.clone(),
+            generation: registered.generation,
+            work_id: create.id.clone(),
+            attempt: create.attempt,
+            ok: true,
+            native_ref: "native-fresh".into(),
+            ..ReportRequest::default()
+        })
+        .await
+        .unwrap();
+    let AcquireStep::Ready { sandbox, .. } = backend.acquire(command).await.unwrap() else {
+        panic!("the create report completes the acquire")
+    };
+    assert_eq!(sandbox.native_ref, "native-fresh");
+
+    // The sample the provider reports predates the machine it just created.
+    let response = backend
+        .reconcile(ReconcileRequest {
+            provider_id: registered.provider_id.clone(),
+            generation: registered.generation,
+            sandboxes: Vec::new(),
+            ..ReconcileRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(response.destroy.is_empty(), "no orphans to destroy");
+    let record = backend
+        .list_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == sandbox.id)
+        .expect("the record survives the stale sample");
+    assert_eq!(
+        record.state.known(),
+        SandboxState::Leased,
+        "a create inside the grace window is not reported as lost"
+    );
+    assert!(record.error.is_empty(), "{}", record.error);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_acquires_over_two_backends_produce_one_lease_per_key() {
     let dir = tempfile::tempdir().unwrap();

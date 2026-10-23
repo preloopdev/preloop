@@ -182,6 +182,33 @@ pub trait SqlEngine: Send + Sync {
     async fn close(&self) {}
 }
 
+/// Marks a transaction that failed with a conflict the whole transaction can
+/// win by running again: Postgres serialization failure (`40001`) or deadlock
+/// detected (`40P01`).
+///
+/// It travels as the error's [`source`](std::error::Error::source) rather than
+/// its code or message, so [`SqlStore::run_tx`](super::store::SqlStore) can
+/// tell an engine conflict from a command's own `Aborted`/`Unavailable`
+/// outcome. Re-running a command that failed for a domain reason would repeat
+/// its work; re-running one that lost a lock race is the only safe retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetryableTxConflict;
+
+impl std::fmt::Display for RetryableTxConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("transaction conflict")
+    }
+}
+
+impl std::error::Error for RetryableTxConflict {}
+
+/// Whether `error` is a transaction conflict worth re-running.
+pub(crate) fn is_retryable_conflict(error: &Error) -> bool {
+    error
+        .source_arc()
+        .is_some_and(|source| source.downcast_ref::<RetryableTxConflict>().is_some())
+}
+
 /// Rewrite canonical `$N` placeholders to SQLite's `?N`.
 pub(crate) fn sqlite_placeholders(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());

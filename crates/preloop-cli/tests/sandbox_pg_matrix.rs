@@ -765,7 +765,31 @@ async fn two_hundred_acquires_over_two_replicas_produce_fifty_leases() {
     assert_eq!(leases.len(), 50, "exactly fifty leases");
     assert_eq!(sandboxes.len(), 50, "one sandbox per lease");
     assert_eq!(native_refs.len(), 50, "distinct native references");
-    assert_eq!(live(&a.list().await.unwrap()), 50, "the listing agrees");
+    let listed = a.list().await.unwrap();
+    // Name what is not live: a failure here is a state the burst should never
+    // reach (a failed or terminating sandbox), so report its reason rather
+    // than only a count.
+    let stalled: Vec<(&str, SandboxState, &str)> = listed
+        .iter()
+        .filter(|sandbox| {
+            matches!(
+                sandbox.state.known(),
+                SandboxState::Gone | SandboxState::Failed | SandboxState::Terminating
+            )
+        })
+        .map(|sandbox| {
+            (
+                sandbox.id.as_str(),
+                sandbox.state.known(),
+                sandbox.error.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        live(&listed),
+        50,
+        "the listing agrees; not live: {stalled:?}"
+    );
     let rows = cluster
         .db_scalar("SELECT count(*) FROM sandbox.leases WHERE idempotency_key LIKE 'burst-%'");
     assert_eq!(rows, "50", "one durable lease row per key");

@@ -81,6 +81,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A conflicting sandbox command is retried, not surfaced.** On Postgres a
+  transaction that loses a lock race (serialization failure `40001` or a
+  detected deadlock `40P01`) is rolled back and the whole command is run again
+  against the winner's state, up to five attempts with a short jittered
+  backoff. The retry keys off a typed conflict marker on the engine error, so
+  a command's own failure is returned unchanged; SQLite keeps single-attempt
+  behaviour. This removes the spurious `unavailable` a concurrent `Acquire`,
+  `Report` or `Reconcile` could return under load.
+
 - **Sandbox telemetry is shareable and bounded.** `Stats` carries aggregates
   only — host process names, PIDs and data-directory paths stay on the
   provider that measured them — the live-sandbox gauge records zero when a

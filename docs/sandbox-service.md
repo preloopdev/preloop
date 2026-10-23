@@ -340,6 +340,18 @@ database) serves several replicas: each opens its own pool, claims work with
 `SKIP LOCKED`, and coordinates through conditional updates and rows, never a
 global lock. The service never references control-plane tables.
 
+Every command is one transaction that commits or rolls back whole. Two
+replicas can still collide on a row Postgres decides to abort: a serialization
+failure (`40001`) or a detected deadlock (`40P01`) rolls the loser back. The
+whole command is then run again against the state the winner left behind, up
+to five attempts with a short jittered backoff (5 ms doubling to a 200 ms
+cap). Every command closure is SQL only, so re-entering it is safe: the failed
+attempt wrote nothing, and a retry cannot repeat an effect. The decision keys
+off a typed conflict marker carried on the engine error's source, never off a
+code or message, so a command's own `aborted` or `unavailable` result is
+returned to the caller unchanged and never re-run. SQLite has a single writer
+and no conflicts of this kind; an embedded store runs each command once.
+
 The schema is greenfield v1. On an empty database it is created and its
 version and key fingerprints are recorded in `schema_meta`; replicas may
 start against it together, so schema creation takes a transaction-scoped

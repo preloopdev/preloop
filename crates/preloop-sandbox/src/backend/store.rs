@@ -11,7 +11,7 @@ use crate::api::*;
 use crate::error::{Error, Result};
 
 use super::backend::SchemaInfo;
-use super::engine::{Row, SqlEngine, SqlTx};
+use super::engine::{Row, SqlEngine, SqlTx, is_retryable_conflict};
 use super::logic;
 use super::postgres::PgEngine;
 use super::seal::SealKey;
@@ -194,9 +194,48 @@ impl SqlStore {
         }
     }
 
+    /// Run one command in a transaction, retrying the whole closure when the
+    /// engine reports a transaction conflict.
+    ///
+    /// Postgres may abort a transaction with a serialization failure
+    /// (`40001`) or a detected deadlock (`40P01`) even though every statement
+    /// was individually valid. The loser's writes are rolled back, so the only
+    /// correct recovery is to run the command again from the top against the
+    /// state the winner left behind — never to replay a partial attempt.
+    ///
+    /// The closure is [`Fn`] rather than [`FnOnce`] precisely so it can be
+    /// re-entered; commands capture their inputs by value once and clone what
+    /// each attempt moves. Only conflicts — never a command's own error —
+    /// trigger a retry, so a domain failure is returned to the caller
+    /// unchanged and its effects are not repeated.
+    ///
+    /// SQLite has a single writer and no conflicts of this kind; an embedded
+    /// store therefore runs exactly one attempt.
     pub(crate) async fn run_tx<T, F>(&self, f: F) -> Result<T>
     where
-        F: for<'a> FnOnce(
+        F: for<'a> Fn(
+            &'a mut (dyn SqlTx + 'a),
+        ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
+    {
+        let mut attempt = 1u32;
+        loop {
+            match self.run_tx_once(&f).await {
+                Err(error) if attempt < TX_ATTEMPTS && is_retryable_conflict(&error) => {
+                    tracing::debug!(
+                        attempt,
+                        "sandbox store transaction lost a conflict; retrying"
+                    );
+                    tokio::time::sleep(tx_retry_delay(attempt)).await;
+                    attempt += 1;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    async fn run_tx_once<T, F>(&self, f: &F) -> Result<T>
+    where
+        F: for<'a> Fn(
             &'a mut (dyn SqlTx + 'a),
         ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
     {
@@ -204,6 +243,31 @@ impl SqlStore {
         let outcome = f(&mut *tx).await;
         Self::finish_tx(tx, outcome).await
     }
+}
+
+/// How many times a conflicting transaction is attempted in total.
+const TX_ATTEMPTS: u32 = 5;
+
+/// Jittered exponential pause before attempt `attempt + 1`, capped low enough
+/// that a request never stalls on retries: two replicas that collided must not
+/// march back into the lock in step, so each waits somewhere in the upper half
+/// of its window. Time is used as the jitter source to avoid a dependency on
+/// an RNG for one call site.
+fn tx_retry_delay(attempt: u32) -> std::time::Duration {
+    const FIRST_MS: u64 = 5;
+    const CAP_MS: u64 = 200;
+    let window = FIRST_MS
+        .checked_shl(attempt.saturating_sub(1).min(6))
+        .unwrap_or(CAP_MS)
+        .min(CAP_MS);
+    let spread = window / 2;
+    let jitter = u64::from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or_default(),
+    );
+    std::time::Duration::from_millis(window - spread + jitter % (spread + 1))
 }
 
 /// Map a store URL to a SQLite path.
@@ -912,5 +976,200 @@ impl super::SandboxBackend for SqlStore {
         config: &super::MaintenanceConfig,
     ) -> Result<super::MaintenanceOutcome> {
         super::commands_runtime::maintain(self, config).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::backend::engine::{Dialect, RetryableTxConflict, SqlValue};
+    use crate::backend::seal::SealKey;
+    use crate::backend::sqlite::SqliteEngine;
+    use crate::error::Code;
+
+    /// A SQLite engine whose first transaction loses a lock race: its commit
+    /// rolls the attempt back and reports a Postgres serialization failure, so
+    /// the wrapper has to run the command again against a clean database.
+    struct ConflictOnce {
+        inner: SqliteEngine,
+        conflict: u32,
+        commits: Arc<AtomicU32>,
+        begins: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl SqlEngine for ConflictOnce {
+        async fn begin(&self) -> Result<Box<dyn SqlTx>> {
+            self.begins.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(ConflictTx {
+                inner: self.inner.begin().await?,
+                conflict: self.conflict,
+                commits: self.commits.clone(),
+            }))
+        }
+    }
+
+    struct ConflictTx {
+        inner: Box<dyn SqlTx>,
+        /// How many commits lose the race before one is allowed through.
+        conflict: u32,
+        commits: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl SqlTx for ConflictTx {
+        async fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+            self.inner.execute(sql, params).await
+        }
+
+        async fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+            self.inner.query(sql, params).await
+        }
+
+        async fn commit(self: Box<Self>) -> Result<()> {
+            let Self {
+                inner,
+                conflict,
+                commits,
+            } = *self;
+            if conflict > commits.fetch_add(1, Ordering::SeqCst) {
+                inner.rollback().await?;
+                return Err(Error::unavailable("sandbox Postgres serialization failure")
+                    .with_shared_source(Arc::new(RetryableTxConflict)));
+            }
+            inner.commit().await
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<()> {
+            self.inner.rollback().await
+        }
+
+        fn dialect(&self) -> Dialect {
+            self.inner.dialect()
+        }
+    }
+
+    /// A store over an in-memory SQLite schema, optionally wrapped so its
+    /// first commit is a conflict.
+    async fn store(dir: &std::path::Path, conflicts: u32) -> (SqlStore, Arc<AtomicU32>) {
+        let sqlite = SqliteEngine::open(":memory:").unwrap();
+        sqlite
+            .apply_schema(include_str!("schema.sqlite.sql"))
+            .await
+            .unwrap();
+        let begins = Arc::new(AtomicU32::new(0));
+        let engine: Arc<dyn SqlEngine> = Arc::new(ConflictOnce {
+            inner: sqlite,
+            conflict: conflicts,
+            commits: Arc::new(AtomicU32::new(0)),
+            begins: begins.clone(),
+        });
+        let seal = SealKey::load(dir, None).unwrap();
+        let store = SqlStore {
+            engine,
+            schema: SchemaInfo {
+                version: 1,
+                seal_fingerprint: seal.fingerprint().to_owned(),
+                trust_fingerprint: None,
+            },
+            seal,
+        };
+        (store, begins)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_conflicted_command_runs_its_effect_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, begins) = store(dir.path(), 1).await;
+        store
+            .run_tx(|tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "CREATE TABLE retry_effect (id INTEGER PRIMARY KEY, note TEXT NOT NULL)",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute("INSERT INTO retry_effect (note) VALUES ('once')", &[])
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        // The first attempt lost its commit and rolled back, so the row the
+        // retry inserted is the only one — no partial or doubled effect.
+        let count = store
+            .run_tx(|tx| {
+                Box::pin(async move {
+                    tx.query("SELECT COUNT(*) AS total FROM retry_effect", &[])
+                        .await?
+                        .first()
+                        .map(|row| row.int("total"))
+                        .transpose()
+                        .map(|total| total.unwrap_or_default())
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "the effect must land exactly once");
+        assert_eq!(begins.load(Ordering::SeqCst), 3, "one retry plus the read");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_domain_failure_is_returned_without_rerunning_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, begins) = store(dir.path(), 0).await;
+        let attempts = Arc::new(AtomicU32::new(0));
+        let error = store
+            .run_tx(|tx| {
+                let attempts = attempts.clone();
+                Box::pin(async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    tx.query("SELECT 1 AS one", &[]).await?;
+                    Err::<(), _>(Error::failed_precondition("no capacity"))
+                })
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::FailedPrecondition);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a command's own failure is never retried"
+        );
+        assert_eq!(begins.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retries_stop_after_the_bounded_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, begins) = store(dir.path(), u32::MAX).await;
+        let error = store
+            .run_tx(|tx| {
+                Box::pin(async move {
+                    tx.query("SELECT 1 AS one", &[]).await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("serialization failure"),
+            "the conflict is what the caller finally sees: {error:?}"
+        );
+        assert_eq!(
+            begins.load(Ordering::SeqCst),
+            TX_ATTEMPTS,
+            "a losing command gives up after {TX_ATTEMPTS} attempts"
+        );
     }
 }

@@ -554,6 +554,9 @@ pub(crate) async fn claim_ticket(
     store
         .run_tx(|tx| {
             let id = id.to_owned();
+            // The whole command re-runs after a transaction conflict, so each
+            // attempt gets its own copy of the authority it matches on.
+            let authority_owned = authority_owned.clone();
             Box::pin(async move {
                 let row = tx
                     .query(
@@ -717,6 +720,7 @@ pub(crate) async fn claim_ticket(
         .await
 }
 
+#[derive(Clone)]
 enum TicketAuthorityOwned {
     Caller(String),
     Provider(String, u64),

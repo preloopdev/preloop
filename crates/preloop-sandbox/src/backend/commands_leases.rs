@@ -1181,6 +1181,7 @@ pub(crate) async fn list(store: &SqlStore, request: &ListRequest) -> Result<List
     let limit = i64::try_from(window.limit).unwrap_or(i64::MAX);
     store
         .run_tx(|tx| {
+            let after = after.clone();
             Box::pin(async move {
                 let rows = tx
                     .query(
