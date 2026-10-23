@@ -800,6 +800,13 @@ pub struct Agent {
     permits: Arc<Semaphore>,
     /// Delivered work by id, so redelivery is not re-executed.
     work: tokio::sync::Mutex<HashMap<String, (WorkState, Instant, u64)>>,
+    /// The session the agent last registered. A fenced session that
+    /// re-registers keeps the work it already accepted, and its reports move
+    /// to the new generation instead of dying with the old one.
+    current_session: tokio::sync::Mutex<Option<Session>>,
+    /// Process-wide shutdown. Accepted work outlives a fenced session; only
+    /// the process going away cancels it.
+    work_stop: tokio::sync::Mutex<Option<CancellationToken>>,
 }
 
 impl Agent {
@@ -851,6 +858,8 @@ impl Agent {
             active: Mutex::new(HashMap::new()),
             permits,
             work: tokio::sync::Mutex::new(HashMap::new()),
+            current_session: tokio::sync::Mutex::new(None),
+            work_stop: tokio::sync::Mutex::new(None),
         }))
     }
 
@@ -886,6 +895,7 @@ impl Agent {
     /// fence its own in-flight work). After that session ends the agent
     /// registers again.
     pub async fn run(self: Arc<Self>, initial: Option<Session>, shutdown: CancellationToken) {
+        *self.work_stop.lock().await = Some(shutdown.clone());
         let mut backoff = REGISTER_BACKOFF_MIN;
         let mut pending = initial;
         while !shutdown.is_cancelled() {
@@ -908,6 +918,7 @@ impl Agent {
                 },
             };
             info!(provider = %session.provider_id, generation = session.generation, "agent registered");
+            *self.current_session.lock().await = Some(session.clone());
             backoff = REGISTER_BACKOFF_MIN;
             let error = self.clone().session(session, shutdown.clone()).await;
             if let Some(error) = error {
@@ -928,6 +939,15 @@ impl Agent {
         shutdown: CancellationToken,
     ) -> Option<Error> {
         let stop = shutdown.child_token();
+        // Polling, heartbeat and reconcile die with the session. Accepted
+        // work does not: it reports through whatever session is current and
+        // stops only when the process does.
+        let work_stop = self
+            .work_stop
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| stop.clone());
         let heartbeat = {
             let agent = self.clone();
             let session = session.clone();
@@ -985,7 +1005,8 @@ impl Agent {
                 Ok(response) => {
                     backoff = self.config.retry_backoff;
                     for item in response.work {
-                        self.dispatch(session.clone(), stop.clone(), item).await;
+                        self.dispatch(session.clone(), work_stop.clone(), item)
+                            .await;
                     }
                 }
                 Err(error) if fenced(&error) => {
@@ -1263,6 +1284,50 @@ impl Agent {
         self.report_work(&session, &stop, work_id, &outcome).await;
     }
 
+    /// The session reports should carry right now.
+    ///
+    /// A fenced session that re-registers keeps the work it already accepted;
+    /// the next report belongs to the new generation. A process that did not
+    /// re-register (for example, a stale agent replaced by another process
+    /// with the same provider name) keeps its old generation and is fenced by
+    /// the service, which is the point of the fence.
+    async fn session_now(&self, fallback: &Session) -> Session {
+        self.current_session
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    /// Wait, bounded, for the run loop to publish a newer registration.
+    ///
+    /// A fence aborts the old session's calls, but accepted work keeps
+    /// going through the re-registration: reporting again under the stale
+    /// generation cannot work, so wait for the new one. `None` means the
+    /// process is stopping or no newer session appeared (for example the
+    /// provider was deleted, so re-registration never succeeds).
+    async fn await_new_session(
+        &self,
+        stale: &Session,
+        stop: &CancellationToken,
+    ) -> Option<Session> {
+        let started = Instant::now();
+        loop {
+            if let Some(current) = self.current_session.lock().await.clone()
+                && current.generation != stale.generation
+            {
+                return Some(current);
+            }
+            if stop.is_cancelled() || started.elapsed() > Duration::from_secs(15) {
+                return None;
+            }
+            tokio::select! {
+                _ = stop.cancelled() => return None,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
     /// The latest delivery attempt observed for one work id.
     async fn current_attempt(&self, work_id: &str) -> u64 {
         self.work
@@ -1281,8 +1346,12 @@ impl Agent {
         work_id: String,
         outcome: &WorkOutcome,
     ) {
+        let mut session = self.session_now(session).await;
         let mut backoff = self.config.retry_backoff;
         loop {
+            // A re-registration may have finished while the last attempt was
+            // in flight: report under the newest session, not the stale one.
+            session = self.session_now(&session).await;
             let attempt = self.current_attempt(&work_id).await;
             match self
                 .link
@@ -1300,6 +1369,12 @@ impl Agent {
             {
                 Ok(()) => return,
                 Err(error) if fenced(&error) => {
+                    if error.code == Code::Aborted
+                        && let Some(next) = self.await_new_session(&session, stop).await
+                    {
+                        session = next;
+                        continue;
+                    }
                     debug!(%work_id, %error, "report stopped");
                     return;
                 }
@@ -1546,8 +1621,10 @@ impl Agent {
         exec_id: &str,
         work_id: &str,
     ) -> bool {
+        let mut session = self.session_now(session).await;
         let mut backoff = self.config.retry_backoff;
         loop {
+            session = self.session_now(&session).await;
             let attempt = self.current_attempt(work_id).await;
             match self
                 .link
@@ -1563,7 +1640,15 @@ impl Agent {
                 .await
             {
                 Ok(()) => return true,
-                Err(error) if fenced(&error) => return false,
+                Err(error) if fenced(&error) => {
+                    if error.code == Code::Aborted
+                        && let Some(next) = self.await_new_session(&session, stop).await
+                    {
+                        session = next;
+                        continue;
+                    }
+                    return false;
+                }
                 Err(error) => {
                     debug!(exec_id, %error, "exec start not accepted; retrying");
                     if !self.wait_backoff(stop, backoff).await {
@@ -1589,11 +1674,15 @@ impl Agent {
         if batch.is_empty() {
             return true;
         }
+        let mut session = self.session_now(session).await;
         *sequence += 1;
         let sequence = *sequence;
         let events = std::mem::take(batch);
         let mut backoff = self.config.retry_backoff;
         loop {
+            // The session may have re-registered between batches or while a
+            // failed attempt was backing off; always report under the newest.
+            session = self.session_now(&session).await;
             let attempt = self.current_attempt(work_id).await;
             match self
                 .link
@@ -1610,6 +1699,12 @@ impl Agent {
             {
                 Ok(()) => return true,
                 Err(error) if fenced(&error) => {
+                    if error.code == Code::Aborted
+                        && let Some(next) = self.await_new_session(&session, stop).await
+                    {
+                        session = next;
+                        continue;
+                    }
                     debug!(exec_id, %error, "exec output stopped");
                     return false;
                 }

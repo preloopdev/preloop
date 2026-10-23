@@ -166,10 +166,12 @@ async fn authorize(tx: &mut dyn SqlTx, sandbox: &Sandbox, lease_id: &str) -> Res
 pub(crate) async fn report_exec(
     store: &SqlStore,
     request: ReportExecRequest,
+    delivery_timeout: std::time::Duration,
 ) -> Result<ReportExecOutcome> {
     store
         .run_tx(|tx| {
             let request = request.clone();
+            let delivery_timeout = i64::try_from(delivery_timeout.as_millis()).unwrap_or(i64::MAX);
             Box::pin(async move {
                 let _ = fence_provider(tx, &request.provider_id, request.generation).await?;
                 let row = tx
@@ -214,6 +216,19 @@ pub(crate) async fn report_exec(
                     }
                     return Ok(ReportExecOutcome::Gone);
                 }
+                // A report is proof the provider is still delivering this
+                // execution. Renew the delivery window so a command that runs
+                // longer than `delivery_timeout` is not failed as if the
+                // provider had gone silent; the exec deadline still bounds it.
+                tx.execute(
+                    "UPDATE work_items SET visible_at = $2 \
+                     WHERE id = $1 AND status = 'inflight'",
+                    &[
+                        row.text("work_id")?.into(),
+                        (now_ms() + delivery_timeout).into(),
+                    ],
+                )
+                .await?;
                 if start_claim {
                     if row.bool("started")? {
                         let claimed = row.u64("started_attempt")?;

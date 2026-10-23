@@ -15,9 +15,10 @@ Releases before v0.27.0 predate the changelog.
   memory keeps only bounded live channels. SQLite is the single-node default
   and Postgres serves several replicas with `SKIP LOCKED` work claims and
   conditional-update fences. Schema v1 is greenfield: an empty store is
-  initialized, while a foreign, wrongly versioned or differently sealed store
-  is refused at open — there is no import, backfill or dual-write. Lease and
-  exec environment is sealed with AES-256-GCM from the already-locked `ring`
+  initialized (replicas may start together; schema creation takes an advisory
+  lock), while a foreign, wrongly versioned or differently sealed store is
+  refused at open — there is no import, backfill or dual-write. Lease and exec
+  environment is sealed with AES-256-GCM from the already-locked `ring`
   dependency; bearer, join and ticket tokens are stored only as hashes.
 - **Cross-replica live routing.** Exec output and transfer streams are owned by
   the replica that opened them and recorded as fenced node/session handles. A
@@ -26,8 +27,11 @@ Releases before v0.27.0 predate the changelog.
   verifies it. A replica that dies fails only its own streams and leases.
 - **Durable exec start gate.** The agent records a started exec on its host and
   the service records the winning delivery attempt before the command runs, so
-  at-least-once delivery never executes a command twice. An ambiguous outcome
-  fails the caller explicitly instead of being replayed.
+  at-least-once delivery never executes a command twice. Work the agent already
+  accepted survives a provider re-registration: a running command keeps going
+  and later reports carry the newest generation, and every accepted report
+  renews the delivery window. An ambiguous outcome fails the caller explicitly
+  instead of being replayed.
 - **Enrollment retries are durable.** A join token may be bound to one
   provider name; a replayed exchange with the same CSR and name returns the
   certificate the original enrollment issued instead of "token already used".

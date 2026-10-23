@@ -38,12 +38,34 @@ pub(crate) async fn set_trust_fingerprint(store: &SqlStore, fingerprint: &str) -
                         }
                     }
                     None => {
+                        // Replicas opening the same store register their CA
+                        // concurrently: one wins the insert, the other waits
+                        // for the row and must agree with the fingerprint
+                        // that landed.
                         tx.execute(
                             "INSERT INTO schema_meta (key, value) \
-                             VALUES ('trust_fingerprint', $1)",
-                            &[fingerprint.into()],
+                             VALUES ('trust_fingerprint', $1) \
+                             ON CONFLICT (key) DO NOTHING",
+                            &[fingerprint.clone().into()],
                         )
                         .await?;
+                        let stored = tx
+                            .query(
+                                "SELECT value FROM schema_meta \
+                                 WHERE key = 'trust_fingerprint'",
+                                &[],
+                            )
+                            .await?
+                            .first()
+                            .map(|row| row.text("value").map(str::to_owned))
+                            .transpose()?
+                            .unwrap_or_default();
+                        if !logic::constant_time_eq(stored.as_bytes(), fingerprint.as_bytes()) {
+                            return Err(Error::failed_precondition(
+                                "sandbox database is bound to a different service CA; \
+                                 every replica must share the same CA certificate",
+                            ));
+                        }
                     }
                 }
                 Ok(())

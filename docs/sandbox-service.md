@@ -341,10 +341,12 @@ database) serves several replicas: each opens its own pool, claims work with
 global lock. The service never references control-plane tables.
 
 The schema is greenfield v1. On an empty database it is created and its
-version and key fingerprints are recorded in `schema_meta`; a non-empty store
-that was not created by this service, a different schema version, or a
-different seal key is refused at open instead of being imported, upgraded or
-dual-written. There is nothing to migrate: no legacy sandbox state exists.
+version and key fingerprints are recorded in `schema_meta`; replicas may
+start against it together, so schema creation takes a transaction-scoped
+advisory lock and the key rows are inserted `ON CONFLICT` and re-read. A
+non-empty store that was not created by this service, a different schema
+version, or a different seal key is refused at open instead of being imported,
+upgraded or dual-written. There is nothing to migrate: no legacy sandbox state exists.
 `memory:` is a real in-memory SQLite database, used by tests and embedded
 single-process callers.
 
@@ -380,9 +382,13 @@ the first claim wins and output from the same execution is accepted across
 delivery attempts. A later delivery that tries to start the same exec fails
 the exec with an explicit error instead of replaying it. An ambiguous outcome
 — the command may or may not have run — fails the caller explicitly; it is
-never retried automatically. Conversely, ordinary work results (create,
-snapshot, power, copy) are persisted before any waiter observes success, so a
-lost response is answered from the durable result rather than repeated.
+never retried automatically. Every accepted report also renews the work
+item's delivery window, so an exec that keeps producing output is not failed
+by the redelivery timer; a command that reports nothing for the delivery
+timeout (120 s by default) is treated as a lost delivery and fails explicitly.
+Conversely, ordinary work results (create, snapshot, power, copy) are
+persisted before any waiter observes success, so a lost response is answered
+from the durable result rather than repeated.
 
 ## Restart and failure
 
@@ -399,7 +405,11 @@ Boot makes those decisions in SQL before serving traffic:
 * **A provider session that outlived its process is fenced** on its next call
   (`aborted`) and re-registers with a fresh generation; until it does its
   records are not placed on. Durable sandboxes, leases, pools and templates
-  are unaffected.
+  are unaffected. The same agent process carries accepted work across the
+  fence: a running exec keeps its command and reports later output under the
+  newest generation, so a registration hiccup does not turn a live command
+  into an ambiguous failure. A process that never re-registers keeps its
+  stale generation and stays fenced.
 * **A sandbox caught `PROVISIONING`** keeps its durable create work: the
   request is part of the sandbox spec row, so a replica resumes the accepted
   provisioning instead of failing it whole. The caller's retry with the same

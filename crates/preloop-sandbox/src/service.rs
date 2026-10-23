@@ -371,6 +371,30 @@ struct Runtime {
     tickets: Mutex<HashMap<String, Blob>>,
 }
 
+/// Rebuild the owning node's typed error from an internal hop's response.
+///
+/// The hop must not downgrade `aborted` (the provider was fenced and must
+/// re-register) or `not_found` (the exec is gone) into a retryable transport
+/// failure: the caller acts on the code.
+fn forwarded_error(operation: &str, node: &str, status: reqwest::StatusCode, body: &str) -> Error {
+    #[derive(serde::Deserialize)]
+    struct Wire {
+        code: String,
+        #[serde(default)]
+        message: Option<String>,
+    }
+    if let Ok(wire) = serde_json::from_str::<Wire>(body)
+        && let Ok(code) = wire.code.parse::<Code>()
+    {
+        let message = wire
+            .message
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| format!("{operation} rejected by {node}"));
+        return Error::new(code, message);
+    }
+    Error::unavailable(format!("{operation} rejected by {node} ({status}): {body}"))
+}
+
 /// Peer replicas, from configuration only.
 struct PeerDirectory {
     clients: BTreeMap<String, reqwest::Client>,
@@ -660,8 +684,7 @@ impl Service {
                     self.close_exec(&exec_id, &reason).await;
                 }
                 Ok(None) => {
-                    self.close_exec(&exec_id, "the sandbox was destroyed")
-                        .await;
+                    self.close_exec(&exec_id, "the sandbox was destroyed").await;
                 }
                 _ => {}
             }
@@ -1605,7 +1628,11 @@ impl Service {
 
     /// `ReportExec` delivered to the owning node.
     pub async fn report_exec_local(&self, request: ReportExecRequest) -> Result<()> {
-        match self.backend.report_exec(request).await? {
+        match self
+            .backend
+            .report_exec(request, self.config.delivery_timeout)
+            .await?
+        {
             backend::ReportExecOutcome::Events {
                 exec_id,
                 events,
@@ -2337,9 +2364,7 @@ impl Service {
         } else {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            Err(Error::unavailable(format!(
-                "owning node rejected ReportExec ({status}): {body}"
-            )))
+            Err(forwarded_error("ReportExec", &owner.node_id, status, &body))
         }
     }
 

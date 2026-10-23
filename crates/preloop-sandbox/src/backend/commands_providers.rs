@@ -180,9 +180,7 @@ pub(crate) async fn complete_work(
     let mut result = result;
     if kind == "snapshot" {
         let snapshot_sandbox = match &payload.work.work {
-            Some(work_item::Work::Snapshot(snapshot)) => {
-                Some(snapshot.target.sandbox_id.clone())
-            }
+            Some(work_item::Work::Snapshot(snapshot)) => Some(snapshot.target.sandbox_id.clone()),
             _ => None,
         };
         if result.ok {
@@ -307,10 +305,7 @@ pub(crate) async fn complete_work(
                     .saturating_add(1);
                 let version = bump_version(tx).await?;
                 if attempts >= super::commands_runtime::MAX_DESTROY_ATTEMPTS {
-                    let reason = format!(
-                        "destroy failed {attempts} times: {}",
-                        result.error
-                    );
+                    let reason = format!("destroy failed {attempts} times: {}", result.error);
                     tx.execute(
                         "UPDATE sandboxes SET state = 'gone', error = $2, lease_id = '', \
                          delete_attempts = $3, version = $4 WHERE id = $1",
@@ -333,8 +328,15 @@ pub(crate) async fn complete_work(
                     )
                     .await?;
                 }
-                outbox(tx, "sandbox", &target.sandbox_id, version, "destroy-failed", "{}")
-                    .await?;
+                outbox(
+                    tx,
+                    "sandbox",
+                    &target.sandbox_id,
+                    version,
+                    "destroy-failed",
+                    "{}",
+                )
+                .await?;
             }
         }
         "exec" => {
@@ -434,16 +436,15 @@ async fn apply_snapshot_receipt(
     payload: &WorkPayload,
     result: &WorkResult,
 ) -> Result<SnapshotApplication> {
-    let (sandbox_id, template_name, target_native_ref, target_driver) =
-        match &payload.work.work {
-            Some(work_item::Work::Snapshot(snapshot)) => (
-                snapshot.target.sandbox_id.clone(),
-                snapshot.template.clone(),
-                snapshot.target.native_ref.clone(),
-                snapshot.target.driver.clone(),
-            ),
-            _ => return Err(Error::internal("snapshot work has no target")),
-        };
+    let (sandbox_id, template_name, target_native_ref, target_driver) = match &payload.work.work {
+        Some(work_item::Work::Snapshot(snapshot)) => (
+            snapshot.target.sandbox_id.clone(),
+            snapshot.template.clone(),
+            snapshot.target.native_ref.clone(),
+            snapshot.target.driver.clone(),
+        ),
+        _ => return Err(Error::internal("snapshot work has no target")),
+    };
     // A release, failure or lifecycle transition while the provider worked
     // invalidates the capture: installing the template would point at a
     // machine that is being destroyed or has changed.

@@ -275,7 +275,11 @@ pub trait SandboxBackend: Send + Sync {
     ) -> Result<ExecHandle>;
 
     /// Validate a provider's output batch at the owning node.
-    async fn report_exec(&self, request: ReportExecRequest) -> Result<ReportExecOutcome>;
+    async fn report_exec(
+        &self,
+        request: ReportExecRequest,
+        delivery_timeout: std::time::Duration,
+    ) -> Result<ReportExecOutcome>;
 
     /// Record a terminal exit code (idempotent).
     async fn finish_exec(&self, exec_id: &str, code: i32) -> Result<()>;

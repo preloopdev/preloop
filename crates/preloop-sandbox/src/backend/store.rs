@@ -109,11 +109,34 @@ impl SqlStore {
                     }
                 }
                 None => {
+                    // Two replicas may reach an empty database together.
+                    // One wins the insert; the other waits on the row lock,
+                    // then must agree with the fingerprint that landed.
                     tx.execute(
-                        "INSERT INTO schema_meta (key, value) VALUES ('seal_key_fingerprint', $1)",
+                        "INSERT INTO schema_meta (key, value) VALUES ('seal_key_fingerprint', $1) \
+                         ON CONFLICT (key) DO NOTHING",
                         &[self.seal.fingerprint().into()],
                     )
                     .await?;
+                    let stored = tx
+                        .query(
+                            "SELECT value FROM schema_meta WHERE key = 'seal_key_fingerprint'",
+                            &[],
+                        )
+                        .await?
+                        .first()
+                        .map(|row| row.text("value").map(str::to_owned))
+                        .transpose()?
+                        .unwrap_or_default();
+                    if !logic::constant_time_eq(
+                        stored.as_bytes(),
+                        self.seal.fingerprint().as_bytes(),
+                    ) {
+                        return Err(Error::failed_precondition(
+                            "sandbox database was sealed with a different store key; \
+                             configure the same PRELOOP_SANDBOX_SEAL_KEY on every replica",
+                        ));
+                    }
                 }
             }
             tx.execute(
@@ -754,8 +777,12 @@ impl super::SandboxBackend for SqlStore {
         super::commands_runtime::create_exec(self, exec_id, request, timeout_secs, owner).await
     }
 
-    async fn report_exec(&self, request: ReportExecRequest) -> Result<super::ReportExecOutcome> {
-        super::commands_runtime::report_exec(self, request).await
+    async fn report_exec(
+        &self,
+        request: ReportExecRequest,
+        delivery_timeout: std::time::Duration,
+    ) -> Result<super::ReportExecOutcome> {
+        super::commands_runtime::report_exec(self, request, delivery_timeout).await
     }
 
     async fn finish_exec(&self, exec_id: &str, code: i32) -> Result<()> {

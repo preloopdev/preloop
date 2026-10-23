@@ -31,16 +31,22 @@ use tokio_util::sync::CancellationToken;
 const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const SEAL_KEY_HEX: &str = "4242424242424242424242424242424242424242424242424242424242424242";
 
-/// Skip (with a visible notice) when no Postgres server is configured.
+/// Skip (with a visible notice) when no Postgres server is configured. When
+/// `PRELOOP_TEST_REQUIRE_POSTGRES` is set the missing server is a failure: a
+/// CI leg that asks for the matrix must not silently pass without it.
 macro_rules! require_postgres {
     () => {
-        if std::env::var("PRELOOP_TEST_POSTGRES_URL").map_or(true, |url| url.is_empty()) {
+        if std::env::var("PRELOOP_TEST_POSTGRES_URL").map_or(true, |url| url.trim().is_empty()) {
+            assert!(
+                std::env::var("PRELOOP_TEST_REQUIRE_POSTGRES").is_err(),
+                "PRELOOP_TEST_POSTGRES_URL must name a Postgres server \
+                 (PRELOOP_TEST_REQUIRE_POSTGRES is set)"
+            );
             eprintln!("skipped: set PRELOOP_TEST_POSTGRES_URL to run the Postgres matrix");
             return;
         }
     };
 }
-
 
 // ── Database and SQL inspection ───────────────────────────────────
 
@@ -86,7 +92,17 @@ impl Drop for Database {
 
 fn psql(url: &str, sql: &str) -> String {
     let output = Command::new("psql")
-        .args(["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-d", url, "-c", sql])
+        .args([
+            "-X",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-d",
+            url,
+            "-c",
+            sql,
+        ])
         .output()
         .expect("psql on PATH (the Postgres matrix inspects rows with it)");
     assert!(
@@ -296,7 +312,8 @@ impl Cluster {
         let b = self.link(1, name).await;
         let host = self.root().join(format!("host-{name}"));
         let fake = Arc::new(FakeDriver::new("fake", host.clone(), caps));
-        let mut config = AgentConfig::new(name);
+        let mut config =
+            AgentConfig::new(name).with_scratch(self.root().join("agent-scratch").join(name));
         config.reconcile = Duration::from_millis(300);
         config.heartbeat = Duration::from_secs(1);
         let shutdown = CancellationToken::new();
@@ -311,7 +328,6 @@ impl Cluster {
         let task = tokio::spawn(agent.run(None, shutdown.clone()));
         let provider = Provider {
             name: name.to_owned(),
-            fake,
             host,
             shutdown,
             _task: task,
@@ -328,7 +344,8 @@ impl Drop for Cluster {
         }
         if std::thread::panicking() {
             for replica in &self.replicas {
-                let log = std::fs::read_to_string(replica.home.join("serve.log")).unwrap_or_default();
+                let log =
+                    std::fs::read_to_string(replica.home.join("serve.log")).unwrap_or_default();
                 let tail: Vec<&str> = log.lines().rev().take(40).collect();
                 eprintln!(
                     "--- {} serve.log (last lines) ---\n{}",
@@ -343,7 +360,6 @@ impl Drop for Cluster {
 /// Scripted provider: a real agent with its own enrollment, host and fake driver.
 struct Provider {
     name: String,
-    fake: Arc<FakeDriver>,
     host: PathBuf,
     shutdown: CancellationToken,
     _task: tokio::task::JoinHandle<()>,
@@ -402,7 +418,9 @@ impl ProviderLink for SplitLink {
     fn register<'life0, 'async_trait>(
         &'life0 self,
         request: RegisterRequest,
-    ) -> Pin<Box<dyn Future<Output = preloop_sandbox::Result<RegisterResponse>> + Send + 'async_trait>>
+    ) -> Pin<
+        Box<dyn Future<Output = preloop_sandbox::Result<RegisterResponse>> + Send + 'async_trait>,
+    >
     where
         'life0: 'async_trait,
         Self: 'async_trait,
@@ -452,7 +470,9 @@ impl ProviderLink for SplitLink {
     fn reconcile<'life0, 'async_trait>(
         &'life0 self,
         request: ReconcileRequest,
-    ) -> Pin<Box<dyn Future<Output = preloop_sandbox::Result<ReconcileResponse>> + Send + 'async_trait>>
+    ) -> Pin<
+        Box<dyn Future<Output = preloop_sandbox::Result<ReconcileResponse>> + Send + 'async_trait>,
+    >
     where
         'life0: 'async_trait,
         Self: 'async_trait,
@@ -540,7 +560,12 @@ fn caps(slots: u32) -> Capabilities {
 fn live(sandboxes: &[Sandbox]) -> usize {
     sandboxes
         .iter()
-        .filter(|s| !matches!(s.state.known(), SandboxState::Gone | SandboxState::Failed | SandboxState::Terminating))
+        .filter(|s| {
+            !matches!(
+                s.state.known(),
+                SandboxState::Gone | SandboxState::Failed | SandboxState::Terminating
+            )
+        })
         .count()
 }
 
@@ -555,7 +580,12 @@ fn sample_live(client: Arc<SandboxClient>, pool: &str) -> (Arc<AtomicBool>, Arc<
                 let count = listed
                     .iter()
                     .filter(|s| pool.is_empty() || s.pool == pool)
-                    .filter(|s| !matches!(s.state.known(), SandboxState::Gone | SandboxState::Failed | SandboxState::Terminating))
+                    .filter(|s| {
+                        !matches!(
+                            s.state.known(),
+                            SandboxState::Gone | SandboxState::Failed | SandboxState::Terminating
+                        )
+                    })
                     .count();
                 let mut peak = peak.lock().unwrap();
                 *peak = (*peak).max(count);
@@ -637,20 +667,23 @@ async fn acknowledged_writes_survive_sigkill_with_their_queued_destroy() {
     ));
     assert_eq!(queued, "1", "the acknowledged destroy is still queued");
     let listed = b.list().await.unwrap();
-    let state_of = |id: &str| {
-        listed
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.state.known())
-    };
+    let state_of = |id: &str| listed.iter().find(|s| s.id == id).map(|s| s.state.known());
     assert_eq!(state_of(&kept.sandbox.id), Some(SandboxState::Leased));
-    assert_eq!(state_of(&doomed.sandbox.id), Some(SandboxState::Terminating));
+    assert_eq!(
+        state_of(&doomed.sandbox.id),
+        Some(SandboxState::Terminating)
+    );
     let templates: Vec<String> = b
         .list_templates()
         .await
         .unwrap()
         .into_iter()
-        .map(|t| t.spec.as_option().map(|s| s.name.clone()).unwrap_or_default())
+        .map(|t| {
+            t.spec
+                .as_option()
+                .map(|s| s.name.clone())
+                .unwrap_or_default()
+        })
         .collect();
     assert_eq!(templates, vec!["base".to_owned()]);
 
@@ -662,7 +695,11 @@ async fn acknowledged_writes_survive_sigkill_with_their_queued_destroy() {
     // The restarted provider drains the queued destroy exactly once.
     let provider = cluster.provider("host-a", caps(0)).await;
     wait_until("the queued destroy completes", || async {
-        b.list().await.unwrap().iter().all(|s| s.id != doomed.sandbox.id)
+        b.list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.id != doomed.sandbox.id)
     })
     .await;
     assert!(!provider.native(&doomed.sandbox.id).exists());
@@ -673,7 +710,10 @@ async fn acknowledged_writes_survive_sigkill_with_their_queued_destroy() {
         b.acquire(pool_acquire("warm-2", "warm"))
     );
     let (first, second) = (first.unwrap(), second.unwrap());
-    assert_ne!(first.sandbox.id, second.sandbox.id, "a warm member was leased twice");
+    assert_ne!(
+        first.sandbox.id, second.sandbox.id,
+        "a warm member was leased twice"
+    );
     assert_ne!(first.sandbox.id, kept.sandbox.id);
     assert_ne!(second.sandbox.id, kept.sandbox.id);
 }
@@ -686,7 +726,11 @@ async fn two_hundred_acquires_over_two_replicas_produce_fifty_leases() {
     let db = Database::create();
     let cluster = Cluster::start_ready(db.url.clone(), Some(db)).await;
     let _provider = cluster.provider("host-a", caps(0)).await;
-    cluster.client(0).put_template(template("base")).await.unwrap();
+    cluster
+        .client(0)
+        .put_template(template("base"))
+        .await
+        .unwrap();
     let a = Arc::new(cluster.client(0));
     let b = Arc::new(cluster.client(1));
 
@@ -722,9 +766,8 @@ async fn two_hundred_acquires_over_two_replicas_produce_fifty_leases() {
     assert_eq!(sandboxes.len(), 50, "one sandbox per lease");
     assert_eq!(native_refs.len(), 50, "distinct native references");
     assert_eq!(live(&a.list().await.unwrap()), 50, "the listing agrees");
-    let rows = cluster.db_scalar(
-        "SELECT count(*) FROM sandbox.leases WHERE idempotency_key LIKE 'burst-%'",
-    );
+    let rows = cluster
+        .db_scalar("SELECT count(*) FROM sandbox.leases WHERE idempotency_key LIKE 'burst-%'");
     assert_eq!(rows, "50", "one durable lease row per key");
 }
 
@@ -765,8 +808,10 @@ async fn duplicate_live_name_has_exactly_one_winner() {
         })
         .await
         .unwrap();
+        // A destroy in flight still holds the live name: wait for the record
+        // to be gone, not merely terminating, or the next round races it.
         wait_until("the name is free", || async {
-            b.list().await.unwrap().iter().all(|s| s.name != "dup-name" || matches!(s.state.known(), SandboxState::Gone | SandboxState::Failed | SandboxState::Terminating))
+            b.list().await.unwrap().iter().all(|s| s.name != "dup-name")
         })
         .await;
     }
@@ -804,14 +849,39 @@ async fn driver_slots_and_pool_max_never_overshoot() {
     }
     let outcomes: Vec<_> = futures::future::join_all(calls).await;
     stop.store(true, Ordering::Release);
-    let ok = outcomes.iter().filter(|r| r.as_ref().unwrap().is_ok()).count();
-    let codes: Vec<Code> = outcomes
-        .iter()
-        .filter_map(|r| r.as_ref().unwrap().as_ref().err().map(|e| e.code))
-        .collect();
-    assert_eq!(ok, 5, "exactly the five slots are leased");
-    assert!(codes.iter().all(|code| *code == Code::ResourceExhausted), "{codes:?}");
-    assert!(*peak.lock().unwrap() <= 5, "slots overshot: {}", peak.lock().unwrap());
+    let mut winners = Vec::new();
+    for outcome in outcomes {
+        match outcome.unwrap() {
+            Ok(response) => winners.push(response),
+            Err(error) => assert_eq!(
+                error.code,
+                Code::ResourceExhausted,
+                "a full provider fails only with capacity: {error}"
+            ),
+        }
+    }
+    assert_eq!(winners.len(), 5, "exactly the five slots are leased");
+    assert!(
+        *peak.lock().unwrap() <= 5,
+        "slots overshot: {}",
+        peak.lock().unwrap()
+    );
+
+    // Free the slots so the pool phase below exercises pool.max, not the
+    // provider's five slots.
+    for winner in &winners {
+        a.release(ReleaseRequest {
+            lease_id: winner.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    }
+    wait_until("the slot leases drain", || async {
+        live(&a.list().await.unwrap()) == 0
+    })
+    .await;
 
     // Pool max: eight pool acquires against a max of three.
     let (stop, peak) = sample_live(a.clone(), "bounded");
@@ -826,9 +896,16 @@ async fn driver_slots_and_pool_max_never_overshoot() {
     }
     let outcomes: Vec<_> = futures::future::join_all(calls).await;
     stop.store(true, Ordering::Release);
-    let ok = outcomes.iter().filter(|r| r.as_ref().unwrap().is_ok()).count();
+    let ok = outcomes
+        .iter()
+        .filter(|r| r.as_ref().unwrap().is_ok())
+        .count();
     assert_eq!(ok, 3, "exactly the pool max is leased");
-    assert!(*peak.lock().unwrap() <= 3, "pool max overshot: {}", peak.lock().unwrap());
+    assert!(
+        *peak.lock().unwrap() <= 3,
+        "pool max overshot: {}",
+        peak.lock().unwrap()
+    );
 }
 
 /// Two replicas reap one expired lease concurrently; the destroy is queued once.
@@ -916,7 +993,11 @@ async fn provider_registers_on_one_replica_and_reports_through_another() {
             ..PollRequest::default()
         })
         .await;
-    assert_eq!(stale_poll.unwrap_err().code, Code::Aborted, "a stale poll is fenced");
+    assert_eq!(
+        stale_poll.unwrap_err().code,
+        Code::Aborted,
+        "a stale poll is fenced"
+    );
     let work = stale
         .poll(PollRequest {
             provider_id: provider_id.clone(),
@@ -927,7 +1008,11 @@ async fn provider_registers_on_one_replica_and_reports_through_another() {
         .await
         .unwrap()
         .work;
-    assert_eq!(work.len(), 1, "the current generation receives the queued create");
+    assert_eq!(
+        work.len(),
+        1,
+        "the current generation receives the queued create"
+    );
     let item = &work[0];
     let stale_report = stale
         .report(ReportRequest {
@@ -943,7 +1028,9 @@ async fn provider_registers_on_one_replica_and_reports_through_another() {
     assert!(stale_report.is_err(), "a stale report is refused");
     let listed = b.list().await.unwrap();
     assert!(
-        listed.iter().any(|s| s.state.known() == SandboxState::Provisioning && s.native_ref.is_empty()),
+        listed
+            .iter()
+            .any(|s| s.state.known() == SandboxState::Provisioning && s.native_ref.is_empty()),
         "the stale report changed nothing"
     );
     stale
@@ -1035,7 +1122,23 @@ async fn exec_streams_through_one_replica_while_the_provider_reports_through_ano
     let mut stdout = Vec::new();
     let mut exit = None;
     while let Some(event) = stream.next().await {
-        match event.unwrap().event {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                let row = cluster.db_scalar(
+                    "SELECT e.status || ' / ' || e.error || ' / work ' || w.status || \
+                     ' attempt ' || w.attempt || ' visible_in_ms ' || \
+                     (w.visible_at - (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint) \
+                     FROM sandbox.execs e JOIN sandbox.work_items w ON w.id = e.work_id \
+                     ORDER BY w.created_at DESC LIMIT 1",
+                );
+                panic!(
+                    "exec stream failed: {error} (db: {row}; stdout so far: {:?})",
+                    String::from_utf8_lossy(&stdout)
+                );
+            }
+        };
+        match event.event {
             Some(preloop_sandbox::api::exec_event::Event::Stdout(bytes)) => stdout.extend(bytes),
             Some(preloop_sandbox::api::exec_event::Event::ExitCode(code)) => {
                 exit = Some(code);
@@ -1045,7 +1148,11 @@ async fn exec_streams_through_one_replica_while_the_provider_reports_through_ano
         }
     }
     let expected: String = (0..8).map(|i| format!("line{i}\n")).collect();
-    assert_eq!(String::from_utf8_lossy(&stdout), expected, "no line lost or repeated");
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        expected,
+        "no line lost or repeated"
+    );
     assert_eq!(exit, Some(3));
 }
 
@@ -1070,7 +1177,9 @@ async fn transfers_across_replicas_are_byte_identical_without_staging() {
     {
         let file = std::fs::File::create(&tar_path).unwrap();
         let mut builder = tar::Builder::new(file);
-        builder.append_path_with_name(&source, "payload.bin").unwrap();
+        builder
+            .append_path_with_name(&source, "payload.bin")
+            .unwrap();
         builder.finish().unwrap();
     }
     // Producer on A (the caller), consumer on B (the provider's replica).
@@ -1150,7 +1259,10 @@ async fn killing_the_owner_fails_its_stream_and_keeps_unrelated_leases() {
         loop {
             match stream.next().await {
                 Some(Ok(event)) => {
-                    if matches!(event.event, Some(preloop_sandbox::api::exec_event::Event::ExitCode(_))) {
+                    if matches!(
+                        event.event,
+                        Some(preloop_sandbox::api::exec_event::Event::ExitCode(_))
+                    ) {
                         return Err("the stream delivered an exit after its owner died".to_owned());
                     }
                 }
@@ -1194,7 +1306,11 @@ async fn store_outage_fails_writes_and_lists_nothing_new() {
     require_postgres!();
     let db = Database::create();
     let proxy_port = free_port();
-    let server = db.admin.rsplit_once('/').expect("an admin URL names a database").0;
+    let server = db
+        .admin
+        .rsplit_once('/')
+        .expect("an admin URL names a database")
+        .0;
     let (authority, port) = server.rsplit_once(':').expect("the admin URL names a port");
     let target_port: u16 = port.parse().expect("a numeric port");
     let mut proxy = Proxy::open(proxy_port, target_port);
@@ -1208,12 +1324,24 @@ async fn store_outage_fails_writes_and_lists_nothing_new() {
     proxy.stop();
     let write = a.put_template(template("during")).await.unwrap_err();
     assert!(
-        matches!(write.code, Code::Unavailable | Code::Internal | Code::DeadlineExceeded),
+        matches!(
+            write.code,
+            Code::Unavailable | Code::Internal | Code::DeadlineExceeded
+        ),
         "a write during the outage fails with a typed error, got {:?}: {}",
         write.code,
         write.message.clone().unwrap_or_default()
     );
-    let read = b.list().await.unwrap_err();
+    let read = b.list().await.expect_err("a read during the outage fails");
+    assert!(
+        matches!(
+            read.code,
+            Code::Unavailable | Code::Internal | Code::DeadlineExceeded
+        ),
+        "a read during the outage fails with a typed error, got {:?}: {}",
+        read.code,
+        read.message.clone().unwrap_or_default()
+    );
 
     proxy.start();
     wait_until("the store is reachable again", || async {
@@ -1225,9 +1353,18 @@ async fn store_outage_fails_writes_and_lists_nothing_new() {
         .await
         .unwrap()
         .into_iter()
-        .map(|t| t.spec.as_option().map(|s| s.name.clone()).unwrap_or_default())
+        .map(|t| {
+            t.spec
+                .as_option()
+                .map(|s| s.name.clone())
+                .unwrap_or_default()
+        })
         .collect();
-    assert_eq!(names, vec!["before".to_owned()], "nothing from the outage is visible");
+    assert_eq!(
+        names,
+        vec!["before".to_owned()],
+        "nothing from the outage is visible"
+    );
     b.put_template(template("after")).await.unwrap();
 }
 
@@ -1263,6 +1400,10 @@ impl Proxy {
             while running.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((client, _)) => {
+                        // Darwin lets the accepted socket inherit the
+                        // listener's O_NONBLOCK; the relay must block or the
+                        // first read fails and the connection is torn down.
+                        let _ = client.set_nonblocking(false);
                         let Ok(server) = TcpStream::connect(("127.0.0.1", target)) else {
                             continue;
                         };
@@ -1321,7 +1462,12 @@ async fn live_pool(client: &SandboxClient, pool: &str) -> usize {
         .unwrap()
         .iter()
         .filter(|s| s.pool == pool)
-        .filter(|s| !matches!(s.state.known(), SandboxState::Gone | SandboxState::Failed | SandboxState::Terminating))
+        .filter(|s| {
+            !matches!(
+                s.state.known(),
+                SandboxState::Gone | SandboxState::Failed | SandboxState::Terminating
+            )
+        })
         .count()
 }
 

@@ -55,9 +55,30 @@ impl PgEngine {
     }
 
     /// Apply the schema on a dedicated connection.
+    ///
+    /// Replicas may all start against an empty database at once, so the DDL
+    /// runs inside one transaction-scoped advisory lock: the losers wait for
+    /// the first replica's tables instead of racing `CREATE TABLE IF NOT
+    /// EXISTS`, which can still fail on the catalog's unique index when two
+    /// sessions create the same relation concurrently. The lock is keyed on
+    /// the sandbox schema name space-wide, not per replica.
     pub(crate) async fn apply_schema(&self, schema: &str) -> Result<u64> {
         let client = self.pool.connect().await?;
-        client.batch_execute(schema).await.map_err(map_error)?;
+        client.batch_execute("BEGIN").await.map_err(map_error)?;
+        if let Err(error) = client
+            .batch_execute(
+                "SELECT pg_advisory_xact_lock(hashtext('preloop_sandbox_schema')::bigint)",
+            )
+            .await
+        {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(map_error(error));
+        }
+        if let Err(error) = client.batch_execute(schema).await {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(map_error(error));
+        }
+        client.batch_execute("COMMIT").await.map_err(map_error)?;
         let row = client
             .query_one(
                 "SELECT COALESCE((SELECT value FROM schema_meta WHERE key = 'schema_version'), '1')",
@@ -107,19 +128,38 @@ impl SqlEngine for PgEngine {
             .acquire_owned()
             .await
             .map_err(|_| Error::unavailable("sandbox Postgres pool is closed"))?;
-        let client = match self.pool.idle.lock().await.pop() {
-            Some(client) => client,
-            None => self.pool.connect().await?,
-        };
-        if let Err(error) = client.batch_execute("BEGIN").await {
-            return Err(map_error(error));
+        // An idle connection may have died while the store was unreachable
+        // (a network cut, a server restart). Drop and replace it instead of
+        // failing the caller: otherwise recovery costs one failed request per
+        // stale socket in the pool.
+        let mut stale = 0usize;
+        loop {
+            let pooled = self.pool.idle.lock().await.pop();
+            let from_idle = pooled.is_some();
+            let client = match pooled {
+                Some(client) => client,
+                None => self.pool.connect().await?,
+            };
+            if from_idle && client.is_closed() && stale < self.pool.max {
+                stale += 1;
+                continue;
+            }
+            match client.batch_execute("BEGIN").await {
+                Ok(()) => {
+                    return Ok(Box::new(PgTx {
+                        client: Some(client),
+                        pool: self.pool.clone(),
+                        permit: Some(permit),
+                        finished: false,
+                    }));
+                }
+                Err(_) if from_idle && stale < self.pool.max => {
+                    stale += 1;
+                    continue;
+                }
+                Err(error) => return Err(map_error(error)),
+            }
         }
-        Ok(Box::new(PgTx {
-            client: Some(client),
-            pool: self.pool.clone(),
-            permit: Some(permit),
-            finished: false,
-        }))
     }
 
     async fn close(&self) {
