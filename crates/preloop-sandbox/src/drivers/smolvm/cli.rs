@@ -3909,6 +3909,56 @@ fn is_sandbox_owned(dir: &Path) -> bool {
     dir.join(SANDBOX_OWNER_MARKER).is_file()
 }
 
+/// Forks running in this process, by the machine data roots they fork into. A
+/// fork boots its clone inside `machine fork`, and the driver marks the clone
+/// only after that returns, so an orphan sweep of that home meanwhile would
+/// see a live, unmarked sandbox. Another home's sweep is unaffected: a fork
+/// there cannot have booted anything this sweep would kill.
+static FORKS_IN_FLIGHT: parking_lot::Mutex<std::collections::BTreeMap<PathBuf, usize>> =
+    parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+/// Holds the roots in [`FORKS_IN_FLIGHT`] raised from before a fork until its
+/// clone is marked.
+pub(crate) struct ForkInFlight {
+    roots: Vec<PathBuf>,
+}
+
+impl ForkInFlight {
+    /// Raise the count for this home; the guard lowers it when dropped.
+    pub(crate) fn enter() -> Self {
+        let roots = machine_data_roots();
+        {
+            let mut forks = FORKS_IN_FLIGHT.lock();
+            for root in &roots {
+                *forks.entry(root.clone()).or_default() += 1;
+            }
+        }
+        Self { roots }
+    }
+}
+
+impl Drop for ForkInFlight {
+    fn drop(&mut self) {
+        let mut forks = FORKS_IN_FLIGHT.lock();
+        for root in &self.roots {
+            if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                forks.entry(root.clone())
+            {
+                *entry.get_mut() -= 1;
+                if *entry.get() == 0 {
+                    entry.remove();
+                }
+            }
+        }
+    }
+}
+
+/// Whether a fork into one of `roots` is in flight in this process.
+fn fork_in_flight(roots: &[PathBuf]) -> bool {
+    let forks = FORKS_IN_FLIGHT.lock();
+    roots.iter().any(|root| forks.contains_key(root))
+}
+
 /// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanPurge {
@@ -3962,12 +4012,22 @@ pub enum OrphanPurge {
 /// that runs out of time is reported; the next tick retries. A `ps` table the
 /// capture cap cut short is reported the same way rather than swept as if it
 /// were complete (see [`complete_inventory`]).
+///
+/// While a fork runs in this process the sweep defers with an error rather
+/// than kill anything: the fork's clone is unmarked until its fork returns.
 pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
     let roots = machine_data_roots();
     if roots.is_empty() {
         return Ok(0);
     }
     let output = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
+    // Read after the process table: a fork that began before this read is
+    // already counted, and its clone may be in the table, unmarked.
+    if fork_in_flight(&roots) {
+        return Err(VmError::Protocol(
+            "a sandbox fork is in flight in this process; the orphan sweep is deferred".to_owned(),
+        ));
+    }
     let text = complete_inventory("ps", &output)?;
     let mut killed = 0usize;
     for line in text.lines() {
@@ -4778,7 +4838,7 @@ mod tests {
     /// Serializes the tests that rewrite `PRELOOP_HOME`: `purge_orphaned_vms`
     /// resolves the Preloop home from the process environment, so two of them
     /// running concurrently would purge each other's scratch home.
-    static PRELOOP_HOME_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    use crate::drivers::smolvm::TEST_HOME_LOCK as PRELOOP_HOME_LOCK;
 
     /// Sets `PRELOOP_HOME` for the test's scope and restores it on drop.
     struct PreloopHomeGuard {

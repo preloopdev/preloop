@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use self::cli::{
-    ForkLaunch, MachineName, MachineRole, MachineSpec, MachineState, MachineUpdate,
+    ForkInFlight, ForkLaunch, MachineName, MachineRole, MachineSpec, MachineState, MachineUpdate,
     NetworkPolicy as VmNetwork, OutputChunk, SANDBOX_OWNER_MARKER, SmolVmProvider,
     SocketMount as VmSocket, VmError, VmProvider, VolumeMount, mark_sandbox_owned,
 };
@@ -734,6 +734,9 @@ impl Driver for SmolvmDriver {
         };
         let clone = machine(&name)?;
         if !work.template.native_ref.is_empty() {
+            // The clone boots inside `fork`, before it is marked below: an
+            // orphan sweep must not run in between.
+            let _forking = ForkInFlight::enter();
             let golden = machine(&work.template.native_ref)?;
             // Validate the fork before touching the provider (and before an
             // idempotent short-circuit), so a request this backend cannot
@@ -1045,6 +1048,14 @@ impl Driver for SmolvmDriver {
     }
 }
 
+/// Serializes unit tests that read or rewrite the process-wide Preloop home.
+/// A fork records its home's machine data roots for as long as it runs (an
+/// orphan sweep of that home must defer), and a test that switches
+/// `PRELOOP_HOME` must not overlap one: the fork would read the other test's
+/// scratch home and the sweep would be deferred for the wrong one.
+#[cfg(all(test, unix))]
+pub(crate) static TEST_HOME_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1212,7 +1223,12 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits: the guard records
+    // `machine_data_roots` from `PRELOOP_HOME`, and a parallel env-mutating
+    // test could otherwise hand it a scratch home mid-fork.
+    #[allow(clippy::await_holding_lock)]
     async fn a_fork_applies_network_and_mounts_to_the_clone() {
+        let _home = TEST_HOME_LOCK.lock();
         let (directory, _executable) = fake_smolvm();
         let host = directory.path().join("workspace");
         fs::create_dir_all(&host).unwrap();
@@ -1263,7 +1279,11 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits (see
+    // `a_fork_applies_network_and_mounts_to_the_clone`).
+    #[allow(clippy::await_holding_lock)]
     async fn a_public_only_fork_launches_under_the_strict_egress_floor() {
+        let _home = TEST_HOME_LOCK.lock();
         let (directory, _executable) = fake_smolvm();
         let driver = driver(&directory);
         let mut work = fork_work();
@@ -1283,7 +1303,11 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits (see
+    // `a_fork_applies_network_and_mounts_to_the_clone`).
+    #[allow(clippy::await_holding_lock)]
     async fn a_fork_refuses_settings_it_cannot_change() {
+        let _home = TEST_HOME_LOCK.lock();
         for (field, mutate) in [
             (
                 "sockets",
@@ -1328,7 +1352,11 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits (see
+    // `a_fork_applies_network_and_mounts_to_the_clone`).
+    #[allow(clippy::await_holding_lock)]
     async fn a_fork_that_matches_the_base_needs_no_reconfiguration() {
+        let _home = TEST_HOME_LOCK.lock();
         let (directory, _executable) = fake_smolvm();
         let driver = driver(&directory);
 
@@ -1344,7 +1372,11 @@ exit 0
     }
 
     #[tokio::test]
+    // The home lock must stay held across the fork's awaits (see
+    // `a_fork_applies_network_and_mounts_to_the_clone`).
+    #[allow(clippy::await_holding_lock)]
     async fn a_snapshot_capable_fork_is_itself_branchable() {
+        let _home = TEST_HOME_LOCK.lock();
         let (directory, _executable) = fake_smolvm();
         let driver = driver(&directory);
         let mut work = fork_work();

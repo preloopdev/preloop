@@ -54,6 +54,24 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A registration the store cannot keep is refused, not handed out.** Registration
+  persisted the provider's generation best-effort, so a store failure could leave a
+  restart to bump the stored generation back to one an agent already held, and that
+  session would pass the fence without registering again. Registration now fails
+  until its provider row is kept, and the agent registers again.
+
+- **An orphan sweep defers while a fork into the same home is in flight in the
+  engine process.** A fork boots its clone before the driver marks it, so an
+  `OrphanPurge::All` sweep running in that window could kill a live, unmarked
+  clone under an active lease. While such a fork is unmarked, a sweep of that
+  home returns an error and kills nothing; the next sweep retries.
+
+- **A slow or failing machine destroy no longer loses its record.** A destroy in
+  flight is awaited instead of asked again, and only completed failures count
+  toward giving up. After three of them the record becomes a `GONE` tombstone
+  that reconcile destroys the machine through, instead of being dropped: a
+  dropped record left a marked machine that nothing could reclaim.
+
 - **A second agent on one host no longer destroys a snapshot template's fork
   base.** `Reconcile` spared a golden only when the reporting provider owned
   the template, and a golden has no sandbox record: an agent sharing the same
