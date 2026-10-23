@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::api::*;
-use crate::driver::Driver;
+use crate::driver::{Driver, TransferChunk};
 use crate::error::{Code, Error, Result};
 use crate::generated::preloop::sandbox::v1 as rpc;
 use crate::service::Service;
@@ -43,10 +43,16 @@ pub trait ProviderLink: Send + Sync {
     async fn report_exec(&self, request: ReportExecRequest) -> Result<()>;
     /// `Reconcile`.
     async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse>;
-    /// Download a ticket's blob to `dest`.
-    async fn fetch_blob(&self, id: &Session, ticket: &str, dest: &Path) -> Result<()>;
-    /// Upload `src` as a ticket's blob.
-    async fn put_blob(&self, id: &Session, ticket: &str, src: &Path) -> Result<()>;
+    /// Claim a ticket's consumer side and return its byte stream.
+    async fn fetch_blob(&self, id: &Session, ticket: &str)
+    -> Result<mpsc::Receiver<TransferChunk>>;
+    /// Claim a ticket's producer side and send `tar` to the service.
+    async fn put_blob(
+        &self,
+        id: &Session,
+        ticket: &str,
+        tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<()>;
 }
 
 /// A registered agent session.
@@ -79,19 +85,63 @@ impl ProviderLink for Arc<Service> {
     async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse> {
         Service::reconcile(self, request).await
     }
-    async fn fetch_blob(&self, id: &Session, ticket: &str, dest: &Path) -> Result<()> {
-        let path = self.agent_blob(&id.provider_id, id.generation, ticket)?;
-        tokio::fs::copy(&path, dest)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::internal(format!("blob fetch: {e}")))
+    async fn fetch_blob(
+        &self,
+        id: &Session,
+        ticket: &str,
+    ) -> Result<mpsc::Receiver<TransferChunk>> {
+        let mut claim = self.claim_agent(
+            &id.provider_id,
+            id.generation,
+            ticket,
+            crate::service::TransferSide::Consumer,
+        )?;
+        self.wait_peer(&mut claim).await?;
+        claim
+            .take_consumer()
+            .ok_or_else(|| Error::internal("upload ticket has no consumer side"))
     }
-    async fn put_blob(&self, id: &Session, ticket: &str, src: &Path) -> Result<()> {
-        let path = self.agent_blob(&id.provider_id, id.generation, ticket)?;
-        tokio::fs::copy(src, &path)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::internal(format!("blob put: {e}")))
+    async fn put_blob(
+        &self,
+        id: &Session,
+        ticket: &str,
+        mut tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<()> {
+        let mut claim = self.claim_agent(
+            &id.provider_id,
+            id.generation,
+            ticket,
+            crate::service::TransferSide::Producer,
+        )?;
+        self.wait_peer(&mut claim).await?;
+        let Some(tx) = claim.take_producer() else {
+            return Err(Error::internal("download ticket has no producer side"));
+        };
+        let mut failure = None;
+        while let Some(chunk) = tar.recv().await {
+            let failed = matches!(chunk, TransferChunk::Failed(_));
+            if let TransferChunk::Failed(reason) = &chunk {
+                failure = Some(reason.clone());
+            }
+            if tx.send(chunk).await.is_err() {
+                failure = Some("transfer consumer went away".into());
+                break;
+            }
+            if failed {
+                break;
+            }
+        }
+        drop(tx);
+        match failure {
+            Some(reason) => {
+                self.abort_ticket(ticket, &reason).await;
+                Err(Error::unavailable(reason))
+            }
+            None => {
+                self.finish_ticket(ticket);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -358,51 +408,85 @@ impl ProviderLink for RemoteLink {
     async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse> {
         Ok(self.client()?.reconcile(request).await?.into_owned())
     }
-    async fn fetch_blob(&self, id: &Session, ticket: &str, dest: &Path) -> Result<()> {
+    async fn fetch_blob(
+        &self,
+        id: &Session,
+        ticket: &str,
+    ) -> Result<mpsc::Receiver<TransferChunk>> {
         use futures::StreamExt as _;
-        use tokio::io::AsyncWriteExt as _;
         let response = self
             .blob_request(reqwest::Method::GET, id, ticket)
             .send()
             .await
             .map_err(|e| Error::unavailable(format!("blob fetch: {e}")))?;
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(Error::unavailable(format!(
-                "blob fetch: HTTP {}",
-                response.status()
+                "blob fetch: HTTP {status}: {body}"
             )));
         }
-        let mut file = tokio::fs::File::create(dest)
-            .await
-            .map_err(|e| Error::internal(format!("blob fetch: {e}")))?;
-        let mut body = response.bytes_stream();
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| Error::unavailable(format!("blob fetch: {e}")))?;
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| Error::internal(format!("blob fetch: {e}")))?;
-        }
-        file.flush()
-            .await
-            .map_err(|e| Error::internal(format!("blob fetch: {e}")))
+        let (tx, rx) = mpsc::channel(crate::driver::TRANSFER_QUEUE);
+        tokio::spawn(async move {
+            let mut body = response.bytes_stream();
+            while let Some(chunk) = body.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        if tx.send(TransferChunk::Data(bytes.to_vec())).await.is_err() {
+                            // The driver stopped reading: dropping the
+                            // response aborts the HTTP request, which the
+                            // service reports as a failed copy.
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(TransferChunk::Failed(format!("blob fetch: {error}")))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(rx)
     }
-    async fn put_blob(&self, id: &Session, ticket: &str, src: &Path) -> Result<()> {
-        let file = tokio::fs::File::open(src)
-            .await
-            .map_err(|e| Error::internal(format!("blob put: {e}")))?;
-        let length = file.metadata().await.map(|m| m.len()).unwrap_or_default();
-        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+
+    async fn put_blob(
+        &self,
+        id: &Session,
+        ticket: &str,
+        tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<()> {
+        let body = reqwest::Body::wrap_stream(futures::stream::unfold(
+            (tar, false),
+            |(mut rx, done)| async move {
+                if done {
+                    return None;
+                }
+                match rx.recv().await {
+                    Some(TransferChunk::Data(bytes)) => {
+                        Some((Ok::<_, std::io::Error>(bytes), (rx, false)))
+                    }
+                    Some(TransferChunk::Failed(reason)) => {
+                        // Abort the request body: a truncated archive must not
+                        // look like a clean end-of-stream to the service.
+                        Some((Err(std::io::Error::other(reason)), (rx, true)))
+                    }
+                    None => None,
+                }
+            },
+        ));
         let response = self
             .blob_request(reqwest::Method::PUT, id, ticket)
-            .header(reqwest::header::CONTENT_LENGTH, length)
             .body(body)
             .send()
             .await
             .map_err(|e| Error::unavailable(format!("blob put: {e}")))?;
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(Error::unavailable(format!(
-                "blob put: HTTP {}",
-                response.status()
+                "blob put: HTTP {status}: {body}"
             )));
         }
         Ok(())
@@ -504,8 +588,6 @@ fn check_host_path(kind: &str, host: &str, allowed: &[PathBuf]) -> Result<()> {
 pub struct AgentConfig {
     /// Stable provider name.
     pub name: String,
-    /// Scratch directory for blobs.
-    pub scratch: PathBuf,
     /// Heartbeat period.
     pub heartbeat: Duration,
     /// Full inventory reconcile period.
@@ -524,10 +606,9 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     /// Defaults.
-    pub fn new(name: impl Into<String>, scratch: PathBuf) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            scratch,
             heartbeat: Duration::from_secs(10),
             reconcile: Duration::from_secs(60),
             access: HostAccess::default(),
@@ -710,7 +791,6 @@ impl Agent {
 
     /// Run until `shutdown`, re-registering after fencing or link failures.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
-        std::fs::create_dir_all(&self.config.scratch).ok();
         let mut backoff = REGISTER_BACKOFF_MIN;
         while !shutdown.is_cancelled() {
             let mut failed = None;
@@ -1083,28 +1163,27 @@ impl Agent {
             }
             work_item::Work::Copy(copy) => {
                 let driver = self.driver(&copy.target.driver)?;
-                let scratch = self.config.scratch.join(format!("{}.tar", copy.ticket));
-                let result = match copy.kind.as_known().unwrap_or_default() {
+                match copy.kind.as_known().unwrap_or_default() {
                     StreamKind::Upload => {
-                        self.link
-                            .fetch_blob(session, &copy.ticket, &scratch)
-                            .await?;
+                        let tar = self.link.fetch_blob(session, &copy.ticket).await?;
                         driver
-                            .copy_in(&copy.target.native_ref, &scratch, &copy.path)
-                            .await
+                            .copy_in(&copy.target.native_ref, &copy.path, tar)
+                            .await?;
                     }
                     StreamKind::Download => {
-                        driver
-                            .copy_out(&copy.target.native_ref, &copy.path, &scratch)
-                            .await?;
-                        self.link.put_blob(session, &copy.ticket, &scratch).await
+                        // The driver and the HTTP upload run concurrently: a
+                        // driver with a bounded output channel would deadlock
+                        // if it had to finish before the upload started.
+                        let (tx, rx) = mpsc::channel(crate::driver::TRANSFER_QUEUE);
+                        let copy_out = driver.copy_out(&copy.target.native_ref, &copy.path, tx);
+                        let put = self.link.put_blob(session, &copy.ticket, rx);
+                        tokio::try_join!(copy_out, put)?;
                     }
                     StreamKind::StreamKindUnspecified => {
-                        Err(Error::invalid_argument("copy kind unset"))
+                        return Err(Error::invalid_argument("copy kind unset"));
                     }
-                };
-                let _ = tokio::fs::remove_file(&scratch).await;
-                result.map(|_| String::new())
+                }
+                Ok(String::new())
             }
             work_item::Work::Snapshot(snapshot) => {
                 self.driver(&snapshot.target.driver)?
@@ -1314,6 +1393,7 @@ fn prune_work(work: &mut HashMap<String, (WorkState, Instant)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn create(mounts: Vec<Mount>, sockets: Vec<SocketMount>) -> CreateWork {
         CreateWork {
@@ -1391,10 +1471,15 @@ mod tests {
         async fn reconcile(&self, _: ReconcileRequest) -> Result<ReconcileResponse> {
             unreachable!()
         }
-        async fn fetch_blob(&self, _: &Session, _: &str, _: &Path) -> Result<()> {
+        async fn fetch_blob(&self, _: &Session, _: &str) -> Result<mpsc::Receiver<TransferChunk>> {
             unreachable!()
         }
-        async fn put_blob(&self, _: &Session, _: &str, _: &Path) -> Result<()> {
+        async fn put_blob(
+            &self,
+            _: &Session,
+            _: &str,
+            _: mpsc::Receiver<TransferChunk>,
+        ) -> Result<()> {
             unreachable!()
         }
     }
@@ -1417,7 +1502,7 @@ mod tests {
         let error = Agent::try_new(
             Arc::new(NoLink),
             vec![first, second],
-            AgentConfig::new("host", dir.path().join("scratch")),
+            AgentConfig::new("host"),
         )
         .err()
         .expect("two drivers with one name must be refused");

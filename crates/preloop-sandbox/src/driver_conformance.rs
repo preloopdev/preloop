@@ -29,7 +29,10 @@ use crate::api::{
     CreateWork, ExecEvent, ExecRequest, NetworkMode, NetworkPolicy, Observed, Shape, Template,
     exec_event,
 };
-use crate::driver::{Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, native_name, parse_native_name};
+use crate::driver::{
+    Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, TRANSFER_QUEUE, TransferChunk, native_name,
+    parse_native_name,
+};
 use crate::error::Result as DriverResult;
 use crate::error::{Code, message};
 
@@ -1118,20 +1121,39 @@ async fn case_copy_round_trip(
 
                 let input = host.path().join("in.tar");
                 build_tar(&payload, &input)?;
+                let archive = std::fs::read(&input)
+                    .map_err(|error| format!("reading input tar: {error}"))?;
+                let (tx, rx) = mpsc::channel(TRANSFER_QUEUE);
+                tx.send(TransferChunk::Data(archive))
+                    .await
+                    .map_err(|_| "copy_in receiver dropped".to_owned())?;
+                drop(tx);
                 driver
-                    .copy_in(&target.native_ref, &input, &guest_root)
+                    .copy_in(&target.native_ref, &guest_root, rx)
                     .await
                     .map_err(|error| format!("copy_in: {error}"))?;
 
                 let output = host.path().join("out.tar");
+                let (tx, mut rx) = mpsc::channel(TRANSFER_QUEUE);
                 driver
                     .copy_out(
                         &target.native_ref,
                         &format!("{guest_root}/payload"),
-                        &output,
+                        tx,
                     )
                     .await
                     .map_err(|error| format!("copy_out: {error}"))?;
+                let mut received = Vec::new();
+                while let Some(chunk) = rx.recv().await {
+                    match chunk {
+                        TransferChunk::Data(bytes) => received.extend_from_slice(&bytes),
+                        TransferChunk::Failed(reason) => {
+                            return Err(format!("copy_out stream: {reason}"));
+                        }
+                    }
+                }
+                std::fs::write(&output, received)
+                    .map_err(|error| format!("writing output tar: {error}"))?;
 
                 let expected = read_tar(&input)?;
                 let actual = read_tar(&output)?;
@@ -1465,9 +1487,10 @@ mod tests {
         async fn copy_in(
             &self,
             _native_ref: &str,
-            _tar: &Path,
             _guest_dir: &str,
+            mut tar: mpsc::Receiver<TransferChunk>,
         ) -> DriverResult<()> {
+            while tar.recv().await.is_some() {}
             Ok(())
         }
 
@@ -1475,7 +1498,7 @@ mod tests {
             &self,
             _native_ref: &str,
             _guest_path: &str,
-            _tar: &Path,
+            _tar: mpsc::Sender<TransferChunk>,
         ) -> DriverResult<()> {
             Ok(())
         }
@@ -1528,9 +1551,10 @@ mod tests {
         async fn copy_in(
             &self,
             _native_ref: &str,
-            _tar: &Path,
             _guest_dir: &str,
+            mut tar: mpsc::Receiver<TransferChunk>,
         ) -> DriverResult<()> {
+            while tar.recv().await.is_some() {}
             Ok(())
         }
 
@@ -1538,7 +1562,7 @@ mod tests {
             &self,
             _native_ref: &str,
             _guest_path: &str,
-            _tar: &Path,
+            _tar: mpsc::Sender<TransferChunk>,
         ) -> DriverResult<()> {
             Ok(())
         }

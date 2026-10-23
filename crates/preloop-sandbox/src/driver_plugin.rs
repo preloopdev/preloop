@@ -15,6 +15,7 @@ use connectrpc::{
     ConnectRpcService, Encodable, RequestContext, Response as RpcResponse, ServiceRequest,
     ServiceResult, ServiceStream,
 };
+use futures::StreamExt as _;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -25,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Driver;
 use crate::api::{Empty, ExecEvent, exec_event};
-use crate::driver::DRIVER_PROTOCOL_VERSION;
+use crate::driver::{DRIVER_PROTOCOL_VERSION, TRANSFER_QUEUE, TransferChunk};
 use crate::error::Error;
 use crate::generated::preloop::sandbox::driver::v1::{
     self as proto, Driver as DriverService, DriverServer,
@@ -184,6 +185,44 @@ impl PluginDriver {
     }
 }
 
+/// Pump a CopyIn request stream into the driver's input channel.
+///
+/// An explicit `eof` is the only clean end. A stream that stops without one
+/// (the agent process died or the transport broke) sends `Failed`, so the
+/// plugin never extracts a truncated archive.
+async fn feed_copy_in(
+    mut requests: connectrpc::InboundStream<proto::CopyInRequest>,
+    tx: mpsc::Sender<TransferChunk>,
+) -> std::result::Result<(), Error> {
+    while let Some(item) = requests.next().await {
+        let message = match item {
+            Ok(message) => message.to_owned_message(),
+            Err(error) => {
+                let _ = tx
+                    .send(TransferChunk::Failed(format!("CopyIn stream: {error}")))
+                    .await;
+                return Err(error);
+            }
+        };
+        if !message.error.is_empty() {
+            let _ = tx.send(TransferChunk::Failed(message.error)).await;
+            return Ok(());
+        }
+        if !message.data.is_empty() && tx.send(TransferChunk::Data(message.data)).await.is_err() {
+            return Ok(());
+        }
+        if message.eof {
+            return Ok(());
+        }
+    }
+    let _ = tx
+        .send(TransferChunk::Failed(
+            "CopyIn stream ended without eof".into(),
+        ))
+        .await;
+    Ok(())
+}
+
 // The response futures borrow neither the request body nor `self` beyond the
 // call, so they capture less than the trait's `use<'a, Self>` allows. That
 // narrowing is deliberate and local.
@@ -305,18 +344,40 @@ impl DriverService for PluginDriver {
     fn copy_in<'a>(
         &'a self,
         _ctx: RequestContext,
-        request: ServiceRequest<'_, proto::CopyInRequest>,
+        requests: connectrpc::InboundStream<proto::CopyInRequest>,
     ) -> impl Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>> + Send + use<'a>
     {
-        let request = request.to_owned_message();
+        let driver = Arc::clone(&self.driver);
         async move {
-            self.driver
-                .copy_in(
-                    &request.native_ref,
-                    Path::new(&request.host_tar),
-                    &request.guest_dir,
-                )
-                .await?;
+            let mut requests = requests;
+            let first = requests
+                .next()
+                .await
+                .ok_or_else(|| Error::invalid_argument("CopyIn requires a start message"))?
+                .map_err(|error| Error::invalid_argument(format!("CopyIn stream: {error}")))?
+                .to_owned_message();
+            if first.native_ref.is_empty() || first.guest_dir.is_empty() {
+                return Err(Error::invalid_argument(
+                    "CopyIn's first message requires native_ref and guest_dir",
+                ));
+            }
+            if !first.data.is_empty() || first.eof || !first.error.is_empty() {
+                return Err(Error::invalid_argument(
+                    "CopyIn's first message must only carry native_ref and guest_dir",
+                ));
+            }
+            let (tx, rx) = mpsc::channel(TRANSFER_QUEUE);
+            let feeder = tokio::spawn(feed_copy_in(requests, tx));
+            let copied = driver
+                .copy_in(&first.native_ref, &first.guest_dir, rx)
+                .await;
+            // A driver that failed early drops `rx`; the feeder's send then
+            // fails and it exits, so this join cannot wait on a dead stream.
+            let fed = feeder
+                .await
+                .map_err(|error| Error::internal(format!("CopyIn feeder: {error}")))?;
+            copied?;
+            fed?;
             Self::ok(Empty::default())
         }
     }
@@ -325,18 +386,62 @@ impl DriverService for PluginDriver {
         &'a self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, proto::CopyOutRequest>,
-    ) -> impl Future<Output = ServiceResult<impl Encodable<Empty> + Send + use<'a>>> + Send + use<'a>
+    ) -> impl Future<Output = ServiceResult<ServiceStream<proto::CopyOutResponse>>> + Send + use<'a>
     {
         let request = request.to_owned_message();
+        let driver = Arc::clone(&self.driver);
         async move {
-            self.driver
-                .copy_out(
-                    &request.native_ref,
-                    &request.guest_path,
-                    Path::new(&request.host_tar),
-                )
-                .await?;
-            Self::ok(Empty::default())
+            let (tx, rx) = mpsc::channel(TRANSFER_QUEUE);
+            let task = tokio::spawn(async move {
+                driver
+                    .copy_out(&request.native_ref, &request.guest_path, tx)
+                    .await
+            });
+            let responses = futures::stream::unfold(
+                (rx, Some(task), false),
+                |(mut rx, task, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    match rx.recv().await {
+                        Some(TransferChunk::Data(bytes)) => Some((
+                            Ok(proto::CopyOutResponse {
+                                data: bytes,
+                                ..proto::CopyOutResponse::default()
+                            }),
+                            (rx, task, false),
+                        )),
+                        Some(TransferChunk::Failed(reason)) => {
+                            if let Some(task) = task {
+                                task.abort();
+                            }
+                            Some((Err(Error::unavailable(reason)), (rx, None, true)))
+                        }
+                        None => {
+                            let result = match task {
+                                Some(task) => match task.await {
+                                    Ok(result) => result,
+                                    Err(error) => Err(Error::internal(format!(
+                                        "CopyOut driver task: {error}"
+                                    ))),
+                                },
+                                None => Ok(()),
+                            };
+                            match result {
+                                Ok(()) => Some((
+                                    Ok(proto::CopyOutResponse {
+                                        eof: true,
+                                        ..proto::CopyOutResponse::default()
+                                    }),
+                                    (rx, None, true),
+                                )),
+                                Err(error) => Some((Err(error), (rx, None, true))),
+                            }
+                        }
+                    }
+                },
+            );
+            RpcResponse::stream_ok(responses)
         }
     }
 

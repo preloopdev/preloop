@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::*;
 use crate::driver::{
-    Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, ExecCancels, native_name, parse_native_name,
+    Driver, EXEC_CANCELLED, EXEC_TIMED_OUT, ExecCancels, TransferChunk, native_name,
+    parse_native_name,
 };
 use crate::error::{Error, Result};
 
@@ -267,19 +268,41 @@ impl Driver for FakeDriver {
         Ok(())
     }
 
-    async fn copy_in(&self, native_ref: &str, tar: &Path, guest_dir: &str) -> Result<()> {
+    async fn copy_in(
+        &self,
+        native_ref: &str,
+        guest_dir: &str,
+        mut tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<()> {
         let root = self.dir(native_ref)?;
         let dest = Self::guest(&root, guest_dir);
+        // The test double buffers the archive so `tar::Archive` can read it
+        // synchronously; the real drivers stream (SmolVM) or bridge streams
+        // (plugins). Tests that assert bounded memory do not use this driver.
+        let mut archive = Vec::new();
+        while let Some(chunk) = tar.recv().await {
+            match chunk {
+                TransferChunk::Data(bytes) => archive.extend_from_slice(&bytes),
+                TransferChunk::Failed(reason) => {
+                    return Err(Error::unavailable(format!("copy_in: {reason}")));
+                }
+            }
+        }
         std::fs::create_dir_all(&dest).map_err(io("copy_in"))?;
-        let file = std::fs::File::open(tar).map_err(io("copy_in"))?;
-        tar::Archive::new(file).unpack(&dest).map_err(io("copy_in"))
+        tar::Archive::new(archive.as_slice())
+            .unpack(&dest)
+            .map_err(io("copy_in"))
     }
 
-    async fn copy_out(&self, native_ref: &str, guest_path: &str, tar: &Path) -> Result<()> {
+    async fn copy_out(
+        &self,
+        native_ref: &str,
+        guest_path: &str,
+        tar: mpsc::Sender<TransferChunk>,
+    ) -> Result<()> {
         let root = self.dir(native_ref)?;
         let source = Self::guest(&root, guest_path);
-        let file = std::fs::File::create(tar).map_err(io("copy_out"))?;
-        let mut builder = tar::Builder::new(file);
+        let mut builder = tar::Builder::new(Vec::new());
         let name = source
             .file_name()
             .map(|n| n.to_owned())
@@ -293,7 +316,13 @@ impl Driver for FakeDriver {
                 .append_path_with_name(&source, &name)
                 .map_err(io("copy_out"))?;
         }
-        builder.finish().map_err(io("copy_out"))
+        let archive = builder.into_inner().map_err(io("copy_out"))?;
+        for chunk in archive.chunks(64 * 1024) {
+            if tar.send(TransferChunk::Data(chunk.to_vec())).await.is_err() {
+                return Err(Error::unavailable("copy_out: consumer went away"));
+            }
+        }
+        Ok(())
     }
 
     async fn snapshot(&self, native_ref: &str, template: &str) -> Result<String> {

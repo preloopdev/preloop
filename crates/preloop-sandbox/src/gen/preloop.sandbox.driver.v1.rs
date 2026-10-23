@@ -1092,15 +1092,7 @@ pub struct CopyInRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub native_ref: ::buffa::alloc::string::String,
-    /// Field 2: `host_tar`
-    #[serde(
-        rename = "hostTar",
-        alias = "host_tar",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
-    )]
-    pub host_tar: ::buffa::alloc::string::String,
-    /// Field 3: `guest_dir`
+    /// Field 2: `guest_dir`
     #[serde(
         rename = "guestDir",
         alias = "guest_dir",
@@ -1108,6 +1100,27 @@ pub struct CopyInRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub guest_dir: ::buffa::alloc::string::String,
+    /// Field 3: `data`
+    #[serde(
+        rename = "data",
+        with = "::buffa::json_helpers::bytes",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_bytes"
+    )]
+    pub data: ::buffa::alloc::vec::Vec<u8>,
+    /// Field 4: `eof`
+    #[serde(
+        rename = "eof",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub eof: bool,
+    /// Field 5: `error`
+    #[serde(
+        rename = "error",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub error: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1116,8 +1129,10 @@ impl ::core::fmt::Debug for CopyInRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         f.debug_struct("CopyInRequest")
             .field("native_ref", &self.native_ref)
-            .field("host_tar", &self.host_tar)
             .field("guest_dir", &self.guest_dir)
+            .field("data", &self.data)
+            .field("eof", &self.eof)
+            .field("error", &self.error)
             .finish()
     }
 }
@@ -1151,11 +1166,17 @@ impl ::buffa::Message for CopyInRequest {
         if !self.native_ref.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.native_ref) as u64;
         }
-        if !self.host_tar.is_empty() {
-            size += 1u64 + ::buffa::types::string_encoded_len(&self.host_tar) as u64;
-        }
         if !self.guest_dir.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.guest_dir) as u64;
+        }
+        if !self.data.is_empty() {
+            size += 1u64 + ::buffa::types::bytes_encoded_len(&self.data) as u64;
+        }
+        if self.eof {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if !self.error.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.error) as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
@@ -1170,11 +1191,17 @@ impl ::buffa::Message for CopyInRequest {
         if !self.native_ref.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.native_ref, buf);
         }
-        if !self.host_tar.is_empty() {
-            ::buffa::types::put_string_field(2u32, &self.host_tar, buf);
-        }
         if !self.guest_dir.is_empty() {
-            ::buffa::types::put_string_field(3u32, &self.guest_dir, buf);
+            ::buffa::types::put_string_field(2u32, &self.guest_dir, buf);
+        }
+        if !self.data.is_empty() {
+            ::buffa::types::put_shared_bytes_field(3u32, &self.data, buf);
+        }
+        if self.eof {
+            ::buffa::types::put_bool_field(4u32, self.eof, buf);
+        }
+        if !self.error.is_empty() {
+            ::buffa::types::put_string_field(5u32, &self.error, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1201,14 +1228,28 @@ impl ::buffa::Message for CopyInRequest {
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
-                ::buffa::types::merge_string(&mut self.host_tar, buf)?;
+                ::buffa::types::merge_string(&mut self.guest_dir, buf)?;
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
-                ::buffa::types::merge_string(&mut self.guest_dir, buf)?;
+                ::buffa::types::merge_bytes(&mut self.data, buf)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.eof = ::buffa::types::decode_bool(buf)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.error, buf)?;
             }
             _ => {
                 self.__buffa_unknown_fields
@@ -1219,8 +1260,10 @@ impl ::buffa::Message for CopyInRequest {
     }
     fn clear(&mut self) {
         self.native_ref.clear();
-        self.host_tar.clear();
         self.guest_dir.clear();
+        self.data.clear();
+        self.eof = false;
+        self.error.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -1273,14 +1316,6 @@ pub struct CopyOutRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub guest_path: ::buffa::alloc::string::String,
-    /// Field 3: `host_tar`
-    #[serde(
-        rename = "hostTar",
-        alias = "host_tar",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
-    )]
-    pub host_tar: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1290,7 +1325,6 @@ impl ::core::fmt::Debug for CopyOutRequest {
         f.debug_struct("CopyOutRequest")
             .field("native_ref", &self.native_ref)
             .field("guest_path", &self.guest_path)
-            .field("host_tar", &self.host_tar)
             .finish()
     }
 }
@@ -1327,9 +1361,6 @@ impl ::buffa::Message for CopyOutRequest {
         if !self.guest_path.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.guest_path) as u64;
         }
-        if !self.host_tar.is_empty() {
-            size += 1u64 + ::buffa::types::string_encoded_len(&self.host_tar) as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1345,9 +1376,6 @@ impl ::buffa::Message for CopyOutRequest {
         }
         if !self.guest_path.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.guest_path, buf);
-        }
-        if !self.host_tar.is_empty() {
-            ::buffa::types::put_string_field(3u32, &self.host_tar, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1376,13 +1404,6 @@ impl ::buffa::Message for CopyOutRequest {
                 )?;
                 ::buffa::types::merge_string(&mut self.guest_path, buf)?;
             }
-            3u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                ::buffa::types::merge_string(&mut self.host_tar, buf)?;
-            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1393,7 +1414,6 @@ impl ::buffa::Message for CopyOutRequest {
     fn clear(&mut self) {
         self.native_ref.clear();
         self.guest_path.clear();
-        self.host_tar.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -1424,6 +1444,154 @@ pub const __COPY_OUT_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::
     type_url: "type.googleapis.com/preloop.sandbox.driver.v1.CopyOutRequest",
     to_json: ::buffa::type_registry::any_to_json::<CopyOutRequest>,
     from_json: ::buffa::type_registry::any_from_json::<CopyOutRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct CopyOutResponse {
+    /// Field 1: `data`
+    #[serde(
+        rename = "data",
+        with = "::buffa::json_helpers::bytes",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_bytes"
+    )]
+    pub data: ::buffa::alloc::vec::Vec<u8>,
+    /// Field 2: `eof`
+    #[serde(
+        rename = "eof",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub eof: bool,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for CopyOutResponse {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("CopyOutResponse")
+            .field("data", &self.data)
+            .field("eof", &self.eof)
+            .finish()
+    }
+}
+impl CopyOutResponse {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/preloop.sandbox.driver.v1.CopyOutResponse";
+}
+::buffa::impl_default_instance!(CopyOutResponse);
+impl ::buffa::MessageName for CopyOutResponse {
+    const PACKAGE: &'static str = "preloop.sandbox.driver.v1";
+    const NAME: &'static str = "CopyOutResponse";
+    const FULL_NAME: &'static str = "preloop.sandbox.driver.v1.CopyOutResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/preloop.sandbox.driver.v1.CopyOutResponse";
+}
+impl ::buffa::Message for CopyOutResponse {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.data.is_empty() {
+            size += 1u64 + ::buffa::types::bytes_encoded_len(&self.data) as u64;
+        }
+        if self.eof {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.data.is_empty() {
+            ::buffa::types::put_shared_bytes_field(1u32, &self.data, buf);
+        }
+        if self.eof {
+            ::buffa::types::put_bool_field(2u32, self.eof, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_bytes(&mut self.data, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.eof = ::buffa::types::decode_bool(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.data.clear();
+        self.eof = false;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for CopyOutResponse {
+    const PROTO_FQN: &'static str = "preloop.sandbox.driver.v1.CopyOutResponse";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for CopyOutResponse {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __COPY_OUT_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/preloop.sandbox.driver.v1.CopyOutResponse",
+    to_json: ::buffa::type_registry::any_to_json::<CopyOutResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<CopyOutResponse>,
     is_wkt: false,
 };
 #[derive(Clone, PartialEq, Default)]
@@ -4409,10 +4577,14 @@ pub mod __buffa {
         pub struct CopyInRequestView<'a> {
             /// Field 1: `native_ref`
             pub native_ref: &'a str,
-            /// Field 2: `host_tar`
-            pub host_tar: &'a str,
-            /// Field 3: `guest_dir`
+            /// Field 2: `guest_dir`
             pub guest_dir: &'a str,
+            /// Field 3: `data`
+            pub data: &'a [u8],
+            /// Field 4: `eof`
+            pub eof: bool,
+            /// Field 5: `error`
+            pub error: &'a str,
             pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
         }
         impl<'a> ::buffa::MessageView<'a> for CopyInRequestView<'a> {
@@ -4463,14 +4635,28 @@ pub mod __buffa {
                             tag,
                             ::buffa::encoding::WireType::LengthDelimited,
                         )?;
-                        view.host_tar = ::buffa::types::borrow_str(&mut cur)?;
+                        view.guest_dir = ::buffa::types::borrow_str(&mut cur)?;
                     }
                     3u32 => {
                         ::buffa::encoding::check_wire_type(
                             tag,
                             ::buffa::encoding::WireType::LengthDelimited,
                         )?;
-                        view.guest_dir = ::buffa::types::borrow_str(&mut cur)?;
+                        view.data = ::buffa::types::borrow_bytes(&mut cur)?;
+                    }
+                    4u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::Varint,
+                        )?;
+                        view.eof = ::buffa::types::decode_bool(&mut cur)?;
+                    }
+                    5u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::LengthDelimited,
+                        )?;
+                        view.error = ::buffa::types::borrow_str(&mut cur)?;
                     }
                     _ => {
                         ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
@@ -4502,8 +4688,10 @@ pub mod __buffa {
                 let _ = __buffa_src;
                 ::core::result::Result::Ok(super::super::CopyInRequest {
                     native_ref: self.native_ref.to_string(),
-                    host_tar: self.host_tar.to_string(),
                     guest_dir: self.guest_dir.to_string(),
+                    data: (self.data).to_vec(),
+                    eof: self.eof,
+                    error: self.error.to_string(),
                     __buffa_unknown_fields: self
                         .__buffa_unknown_fields
                         .to_owned()?
@@ -4524,15 +4712,20 @@ pub mod __buffa {
                             + ::buffa::types::string_encoded_len(&self.native_ref)
                                 as u64;
                 }
-                if !self.host_tar.is_empty() {
-                    size
-                        += 1u64
-                            + ::buffa::types::string_encoded_len(&self.host_tar) as u64;
-                }
                 if !self.guest_dir.is_empty() {
                     size
                         += 1u64
                             + ::buffa::types::string_encoded_len(&self.guest_dir) as u64;
+                }
+                if !self.data.is_empty() {
+                    size += 1u64 + ::buffa::types::bytes_encoded_len(&self.data) as u64;
+                }
+                if self.eof {
+                    size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+                }
+                if !self.error.is_empty() {
+                    size
+                        += 1u64 + ::buffa::types::string_encoded_len(&self.error) as u64;
                 }
                 size += self.__buffa_unknown_fields.encoded_len() as u64;
                 ::buffa::saturate_size(size)
@@ -4548,11 +4741,17 @@ pub mod __buffa {
                 if !self.native_ref.is_empty() {
                     ::buffa::types::put_string_field(1u32, &self.native_ref, buf);
                 }
-                if !self.host_tar.is_empty() {
-                    ::buffa::types::put_string_field(2u32, &self.host_tar, buf);
-                }
                 if !self.guest_dir.is_empty() {
-                    ::buffa::types::put_string_field(3u32, &self.guest_dir, buf);
+                    ::buffa::types::put_string_field(2u32, &self.guest_dir, buf);
+                }
+                if !self.data.is_empty() {
+                    ::buffa::types::put_shared_bytes_field(3u32, &self.data, buf);
+                }
+                if self.eof {
+                    ::buffa::types::put_bool_field(4u32, self.eof, buf);
+                }
+                if !self.error.is_empty() {
+                    ::buffa::types::put_string_field(5u32, &self.error, buf);
                 }
                 self.__buffa_unknown_fields.write_to(buf);
             }
@@ -4578,11 +4777,21 @@ pub mod __buffa {
                 if !::buffa::json_helpers::skip_if::is_empty_str(self.native_ref) {
                     __map.serialize_entry("nativeRef", self.native_ref)?;
                 }
-                if !::buffa::json_helpers::skip_if::is_empty_str(self.host_tar) {
-                    __map.serialize_entry("hostTar", self.host_tar)?;
-                }
                 if !::buffa::json_helpers::skip_if::is_empty_str(self.guest_dir) {
                     __map.serialize_entry("guestDir", self.guest_dir)?;
+                }
+                if !::buffa::json_helpers::skip_if::is_empty_bytes(self.data) {
+                    __map
+                        .serialize_entry(
+                            "data",
+                            &::buffa::json_helpers::BytesJson(self.data),
+                        )?;
+                }
+                if self.eof {
+                    __map.serialize_entry("eof", &self.eof)?;
+                }
+                if !::buffa::json_helpers::skip_if::is_empty_str(self.error) {
+                    __map.serialize_entry("error", self.error)?;
                 }
                 __map.end()
             }
@@ -4684,15 +4893,25 @@ pub mod __buffa {
             pub fn native_ref(&self) -> &'_ str {
                 self.0.reborrow().native_ref
             }
-            /// Field 2: `host_tar`
-            #[must_use]
-            pub fn host_tar(&self) -> &'_ str {
-                self.0.reborrow().host_tar
-            }
-            /// Field 3: `guest_dir`
+            /// Field 2: `guest_dir`
             #[must_use]
             pub fn guest_dir(&self) -> &'_ str {
                 self.0.reborrow().guest_dir
+            }
+            /// Field 3: `data`
+            #[must_use]
+            pub fn data(&self) -> &'_ [u8] {
+                self.0.reborrow().data
+            }
+            /// Field 4: `eof`
+            #[must_use]
+            pub fn eof(&self) -> bool {
+                self.0.reborrow().eof
+            }
+            /// Field 5: `error`
+            #[must_use]
+            pub fn error(&self) -> &'_ str {
+                self.0.reborrow().error
             }
         }
         impl ::core::convert::From<::buffa::OwnedView<CopyInRequestView<'static>>>
@@ -4731,8 +4950,6 @@ pub mod __buffa {
             pub native_ref: &'a str,
             /// Field 2: `guest_path`
             pub guest_path: &'a str,
-            /// Field 3: `host_tar`
-            pub host_tar: &'a str,
             pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
         }
         impl<'a> ::buffa::MessageView<'a> for CopyOutRequestView<'a> {
@@ -4785,13 +5002,6 @@ pub mod __buffa {
                         )?;
                         view.guest_path = ::buffa::types::borrow_str(&mut cur)?;
                     }
-                    3u32 => {
-                        ::buffa::encoding::check_wire_type(
-                            tag,
-                            ::buffa::encoding::WireType::LengthDelimited,
-                        )?;
-                        view.host_tar = ::buffa::types::borrow_str(&mut cur)?;
-                    }
                     _ => {
                         ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                         let span_len = before_tag.len() - cur.len();
@@ -4823,7 +5033,6 @@ pub mod __buffa {
                 ::core::result::Result::Ok(super::super::CopyOutRequest {
                     native_ref: self.native_ref.to_string(),
                     guest_path: self.guest_path.to_string(),
-                    host_tar: self.host_tar.to_string(),
                     __buffa_unknown_fields: self
                         .__buffa_unknown_fields
                         .to_owned()?
@@ -4850,11 +5059,6 @@ pub mod __buffa {
                             + ::buffa::types::string_encoded_len(&self.guest_path)
                                 as u64;
                 }
-                if !self.host_tar.is_empty() {
-                    size
-                        += 1u64
-                            + ::buffa::types::string_encoded_len(&self.host_tar) as u64;
-                }
                 size += self.__buffa_unknown_fields.encoded_len() as u64;
                 ::buffa::saturate_size(size)
             }
@@ -4871,9 +5075,6 @@ pub mod __buffa {
                 }
                 if !self.guest_path.is_empty() {
                     ::buffa::types::put_string_field(2u32, &self.guest_path, buf);
-                }
-                if !self.host_tar.is_empty() {
-                    ::buffa::types::put_string_field(3u32, &self.host_tar, buf);
                 }
                 self.__buffa_unknown_fields.write_to(buf);
             }
@@ -4901,9 +5102,6 @@ pub mod __buffa {
                 }
                 if !::buffa::json_helpers::skip_if::is_empty_str(self.guest_path) {
                     __map.serialize_entry("guestPath", self.guest_path)?;
-                }
-                if !::buffa::json_helpers::skip_if::is_empty_str(self.host_tar) {
-                    __map.serialize_entry("hostTar", self.host_tar)?;
                 }
                 __map.end()
             }
@@ -5010,11 +5208,6 @@ pub mod __buffa {
             pub fn guest_path(&self) -> &'_ str {
                 self.0.reborrow().guest_path
             }
-            /// Field 3: `host_tar`
-            #[must_use]
-            pub fn host_tar(&self) -> &'_ str {
-                self.0.reborrow().host_tar
-            }
         }
         impl ::core::convert::From<::buffa::OwnedView<CopyOutRequestView<'static>>>
         for CopyOutRequestOwnedView {
@@ -5039,6 +5232,299 @@ pub mod __buffa {
             type ViewHandle = CopyOutRequestOwnedView;
         }
         impl ::serde::Serialize for CopyOutRequestOwnedView {
+            fn serialize<__S: ::serde::Serializer>(
+                &self,
+                __s: __S,
+            ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                ::serde::Serialize::serialize(&self.0, __s)
+            }
+        }
+        #[derive(Clone, Debug, Default)]
+        pub struct CopyOutResponseView<'a> {
+            /// Field 1: `data`
+            pub data: &'a [u8],
+            /// Field 2: `eof`
+            pub eof: bool,
+            pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+        }
+        impl<'a> ::buffa::MessageView<'a> for CopyOutResponseView<'a> {
+            type Owned = super::super::CopyOutResponse;
+            fn decode_view(
+                buf: &'a [u8],
+            ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+                let __limit = ::core::cell::Cell::new(
+                    ::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT,
+                );
+                let __elem = ::core::cell::Cell::new(
+                    ::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
+                );
+                <Self as ::buffa::MessageView>::decode_view_ctx(
+                    buf,
+                    ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                        .with_element_memory(&__elem),
+                )
+            }
+            fn decode_view_with_ctx(
+                buf: &'a [u8],
+                ctx: ::buffa::DecodeContext<'_>,
+            ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+                <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+            }
+            #[inline]
+            fn merge_view_field(
+                &mut self,
+                tag: ::buffa::encoding::Tag,
+                cur: &'a [u8],
+                before_tag: &'a [u8],
+                ctx: ::buffa::DecodeContext<'_>,
+            ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+                let _ = ctx;
+                #[allow(unused_variables)]
+                let view = self;
+                let mut cur = cur;
+                match tag.field_number() {
+                    1u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::LengthDelimited,
+                        )?;
+                        view.data = ::buffa::types::borrow_bytes(&mut cur)?;
+                    }
+                    2u32 => {
+                        ::buffa::encoding::check_wire_type(
+                            tag,
+                            ::buffa::encoding::WireType::Varint,
+                        )?;
+                        view.eof = ::buffa::types::decode_bool(&mut cur)?;
+                    }
+                    _ => {
+                        ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                        let span_len = before_tag.len() - cur.len();
+                        view.__buffa_unknown_fields
+                            .push_record(before_tag, span_len, ctx)?;
+                    }
+                }
+                ::core::result::Result::Ok(cur)
+            }
+            fn to_owned_message(
+                &self,
+            ) -> ::core::result::Result<
+                super::super::CopyOutResponse,
+                ::buffa::DecodeError,
+            > {
+                self.to_owned_from_source(None)
+            }
+            #[allow(clippy::useless_conversion, clippy::needless_update)]
+            fn to_owned_from_source(
+                &self,
+                __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+            ) -> ::core::result::Result<
+                super::super::CopyOutResponse,
+                ::buffa::DecodeError,
+            > {
+                #[allow(unused_imports)]
+                use ::buffa::alloc::string::ToString as _;
+                let _ = __buffa_src;
+                ::core::result::Result::Ok(super::super::CopyOutResponse {
+                    data: (self.data).to_vec(),
+                    eof: self.eof,
+                    __buffa_unknown_fields: self
+                        .__buffa_unknown_fields
+                        .to_owned()?
+                        .into(),
+                    ..::core::default::Default::default()
+                })
+            }
+        }
+        impl<'a> ::buffa::ViewEncode<'a> for CopyOutResponseView<'a> {
+            #[allow(clippy::needless_borrow, clippy::let_and_return)]
+            fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+                #[allow(unused_imports)]
+                use ::buffa::Enumeration as _;
+                let mut size = 0u64;
+                if !self.data.is_empty() {
+                    size += 1u64 + ::buffa::types::bytes_encoded_len(&self.data) as u64;
+                }
+                if self.eof {
+                    size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+                }
+                size += self.__buffa_unknown_fields.encoded_len() as u64;
+                ::buffa::saturate_size(size)
+            }
+            #[allow(clippy::needless_borrow)]
+            fn write_to(
+                &self,
+                _cache: &mut ::buffa::SizeCache,
+                buf: &mut impl ::buffa::EncodeSink,
+            ) {
+                #[allow(unused_imports)]
+                use ::buffa::Enumeration as _;
+                if !self.data.is_empty() {
+                    ::buffa::types::put_shared_bytes_field(1u32, &self.data, buf);
+                }
+                if self.eof {
+                    ::buffa::types::put_bool_field(2u32, self.eof, buf);
+                }
+                self.__buffa_unknown_fields.write_to(buf);
+            }
+        }
+        /// Serializes this view as protobuf JSON.
+        ///
+        /// Implicit-presence fields with default values are omitted, `required`
+        /// fields are always emitted, explicit-presence (`optional`) fields are
+        /// emitted only when set, bytes fields are base64-encoded, and enum
+        /// values are their proto name strings.
+        ///
+        /// This impl uses `serialize_map(None)` because the number of emitted
+        /// fields depends on default-omission rules; serializers that require
+        /// known map lengths (e.g. `bincode`) will return a runtime error.
+        /// Use the owned message type for those formats.
+        impl<'__a> ::serde::Serialize for CopyOutResponseView<'__a> {
+            fn serialize<__S: ::serde::Serializer>(
+                &self,
+                __s: __S,
+            ) -> ::core::result::Result<__S::Ok, __S::Error> {
+                use ::serde::ser::SerializeMap as _;
+                let mut __map = __s.serialize_map(::core::option::Option::None)?;
+                if !::buffa::json_helpers::skip_if::is_empty_bytes(self.data) {
+                    __map
+                        .serialize_entry(
+                            "data",
+                            &::buffa::json_helpers::BytesJson(self.data),
+                        )?;
+                }
+                if self.eof {
+                    __map.serialize_entry("eof", &self.eof)?;
+                }
+                __map.end()
+            }
+        }
+        impl<'a> ::buffa::MessageName for CopyOutResponseView<'a> {
+            const PACKAGE: &'static str = "preloop.sandbox.driver.v1";
+            const NAME: &'static str = "CopyOutResponse";
+            const FULL_NAME: &'static str = "preloop.sandbox.driver.v1.CopyOutResponse";
+            const TYPE_URL: &'static str = "type.googleapis.com/preloop.sandbox.driver.v1.CopyOutResponse";
+        }
+        ::buffa::impl_default_view_instance!(CopyOutResponseView);
+        ::buffa::impl_view_reborrow!(CopyOutResponseView);
+        /** Self-contained, `'static` owned view of a `CopyOutResponse` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`CopyOutResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`CopyOutResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+        #[derive(Clone, Debug)]
+        pub struct CopyOutResponseOwnedView(
+            ::buffa::OwnedView<CopyOutResponseView<'static>>,
+        );
+        impl CopyOutResponseOwnedView {
+            /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+            ///
+            /// The view borrows directly from the buffer's data; the buffer is
+            /// retained inside the returned handle.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+            /// protobuf data.
+            pub fn decode(
+                bytes: ::buffa::bytes::Bytes,
+            ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+                ::core::result::Result::Ok(
+                    CopyOutResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+                )
+            }
+            /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+            /// max message size).
+            ///
+            /// # Errors
+            ///
+            /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+            /// exceeds the configured limits.
+            pub fn decode_with_options(
+                bytes: ::buffa::bytes::Bytes,
+                opts: &::buffa::DecodeOptions,
+            ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+                ::core::result::Result::Ok(
+                    CopyOutResponseOwnedView(
+                        ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+                    ),
+                )
+            }
+            /// Build from an owned message via an encode → decode round-trip.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+            /// message's encoded size exceeds the 2 GiB protobuf limit, or
+            /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+            /// somehow invalid (should not happen for well-formed messages).
+            pub fn from_owned(
+                msg: &super::super::CopyOutResponse,
+            ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+                ::core::result::Result::Ok(
+                    CopyOutResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+                )
+            }
+            /// Borrow the full [`CopyOutResponseView`] with its lifetime tied to `&self`.
+            #[must_use]
+            pub fn view(&self) -> &CopyOutResponseView<'_> {
+                self.0.reborrow()
+            }
+            /// Convert to the owned message type.
+            ///
+            /// Infallible: this type's constructors wire-decode their
+            /// buffer, and a view produced by wire decoding always
+            /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+            /// whose contract also governs handles converted from a raw
+            /// [`::buffa::OwnedView`].
+            #[must_use]
+            pub fn to_owned_message(&self) -> super::super::CopyOutResponse {
+                self.0.to_owned_message()
+            }
+            /// The underlying bytes buffer.
+            #[must_use]
+            pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+                self.0.bytes()
+            }
+            /// Consume the handle, returning the underlying bytes buffer.
+            #[must_use]
+            pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+                self.0.into_bytes()
+            }
+            /// Field 1: `data`
+            #[must_use]
+            pub fn data(&self) -> &'_ [u8] {
+                self.0.reborrow().data
+            }
+            /// Field 2: `eof`
+            #[must_use]
+            pub fn eof(&self) -> bool {
+                self.0.reborrow().eof
+            }
+        }
+        impl ::core::convert::From<::buffa::OwnedView<CopyOutResponseView<'static>>>
+        for CopyOutResponseOwnedView {
+            fn from(inner: ::buffa::OwnedView<CopyOutResponseView<'static>>) -> Self {
+                CopyOutResponseOwnedView(inner)
+            }
+        }
+        impl ::core::convert::From<CopyOutResponseOwnedView>
+        for ::buffa::OwnedView<CopyOutResponseView<'static>> {
+            fn from(wrapper: CopyOutResponseOwnedView) -> Self {
+                wrapper.0
+            }
+        }
+        impl ::core::convert::AsRef<::buffa::OwnedView<CopyOutResponseView<'static>>>
+        for CopyOutResponseOwnedView {
+            fn as_ref(&self) -> &::buffa::OwnedView<CopyOutResponseView<'static>> {
+                &self.0
+            }
+        }
+        impl ::buffa::HasMessageView for super::super::CopyOutResponse {
+            type View<'a> = CopyOutResponseView<'a>;
+            type ViewHandle = CopyOutResponseOwnedView;
+        }
+        impl ::serde::Serialize for CopyOutResponseOwnedView {
             fn serialize<__S: ::serde::Serializer>(
                 &self,
                 __s: __S,
@@ -6692,6 +7178,7 @@ pub mod __buffa {
         reg.register_json_any(super::__CANCEL_EXEC_REQUEST_JSON_ANY);
         reg.register_json_any(super::__COPY_IN_REQUEST_JSON_ANY);
         reg.register_json_any(super::__COPY_OUT_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__COPY_OUT_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__INVENTORY_REQUEST_JSON_ANY);
         reg.register_json_any(super::__INVENTORY_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__HOST_REPORT_REQUEST_JSON_ANY);
@@ -6736,6 +7223,10 @@ pub use self::__buffa::view::CopyInRequestOwnedView;
 pub use self::__buffa::view::CopyOutRequestView;
 #[doc(inline)]
 pub use self::__buffa::view::CopyOutRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::CopyOutResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::CopyOutResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::InventoryRequestView;
 #[doc(inline)]

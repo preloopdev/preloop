@@ -41,7 +41,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     config.acquire_wait = Duration::from_secs(600);
     let service = Service::open(store::open("memory:").await.unwrap(), config)
         .await
@@ -51,7 +51,7 @@ async fn smolvm_golden_fork_pool_end_to_end() {
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![driver.clone() as Arc<dyn Driver>],
-        AgentConfig::new("e2e-smolvm", dir.path().join("scratch")).with_access(HostAccess {
+        AgentConfig::new("e2e-smolvm").with_access(HostAccess {
             mounts: Vec::new(),
             // The build sandbox mounts a host socket from the temp dir.
             sockets: vec![dir.path().to_path_buf()],

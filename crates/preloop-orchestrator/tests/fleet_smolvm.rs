@@ -25,19 +25,16 @@ async fn secrets_reach_the_guest_without_entering_argv() {
         eprintln!("skipped: set PRELOOP_SANDBOX_E2E_SMOLVM=1");
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
+    let _dir = tempfile::tempdir().unwrap();
+    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let driver = Arc::new(SmolvmDriver::new(Default::default(), 0));
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![driver as Arc<dyn Driver>],
-        AgentConfig::new("e2e-secrets", dir.path().join("scratch")),
+        AgentConfig::new("e2e-secrets"),
     );
     tokio::spawn(agent.run(shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -127,19 +124,16 @@ async fn a_packed_artifact_becomes_a_runnable_machine() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(dir.path().join("blobs")),
-    )
-    .await
-    .unwrap();
+    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let provider = Arc::new(SmolVmProvider::default());
     let driver = Arc::new(SmolvmDriver::new((*provider).clone(), 0));
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![driver as Arc<dyn Driver>],
-        AgentConfig::new("e2e-pack", dir.path().join("scratch")),
+        AgentConfig::new("e2e-pack"),
     );
     tokio::spawn(agent.run(shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));

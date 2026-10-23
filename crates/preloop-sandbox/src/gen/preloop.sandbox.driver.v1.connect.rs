@@ -62,6 +62,12 @@ pub type OwnedCopyOutRequestView = ::buffa::view::OwnedView<
         'static,
     >,
 >;
+///Shorthand for `OwnedView<CopyOutResponseView<'static>>`.
+pub type OwnedCopyOutResponseView = ::buffa::view::OwnedView<
+    crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyOutResponseView<
+        'static,
+    >,
+>;
 ///Shorthand for `OwnedView<InventoryRequestView<'static>>`.
 pub type OwnedInventoryRequestView = ::buffa::view::OwnedView<
     crate::generated::preloop::sandbox::driver::v1::__buffa::view::InventoryRequestView<
@@ -162,6 +168,48 @@ impl ::connectrpc::Encodable<
 >
 for ::buffa::view::OwnedView<
     crate::generated::preloop::sandbox::driver::v1::__buffa::view::CreateResponseView<
+        'static,
+    >,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
+impl ::connectrpc::Encodable<
+    crate::generated::preloop::sandbox::driver::v1::CopyOutResponse,
+>
+for crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyOutResponseView<
+    '_,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<
+    crate::generated::preloop::sandbox::driver::v1::CopyOutResponse,
+>
+for ::buffa::view::OwnedView<
+    crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyOutResponseView<
         'static,
     >,
 > {
@@ -339,13 +387,13 @@ pub const DRIVER_CANCEL_EXEC_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serv
 /// Static [`Spec`](::connectrpc::Spec) for the `CopyIn` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const DRIVER_COPY_IN_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/preloop.sandbox.driver.v1.Driver/CopyIn",
-        ::connectrpc::StreamType::Unary,
+        ::connectrpc::StreamType::ClientStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// Static [`Spec`](::connectrpc::Spec) for the `CopyOut` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const DRIVER_COPY_OUT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/preloop.sandbox.driver.v1.Driver/CopyOut",
-        ::connectrpc::StreamType::Unary,
+        ::connectrpc::StreamType::ServerStream,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// Static [`Spec`](::connectrpc::Spec) for the `Inventory` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
@@ -569,21 +617,21 @@ pub trait Driver: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// Copy a tar archive the agent staged at `host_tar` into `guest_dir`.
-    /// The plugin runs on the same host and reads the file directly.
+    /// Extract a tar archive streamed by the agent into `guest_dir`. The first
+    /// request carries `native_ref` and `guest_dir`; the rest carry `data`. The
+    /// agent ends with `eof`, or with `error` when its source failed, so a
+    /// truncated archive is never extracted. No host file is involved.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
-    /// `request` is borrowed from the request body and is valid for the
-    /// duration of the call; message fields are read directly on it
-    /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
-    /// returned, stored, or moved into `tokio::spawn`.
+    /// Each `requests` item is a [`StreamMessage`](::connectrpc::StreamMessage):
+    /// it owns its buffer, is `Send + 'static`, and exposes zero-copy
+    /// accessor methods (`item.name()`), `.view()`, and
+    /// `.to_owned_message()`.
     fn copy_in<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
-        request: ::connectrpc::ServiceRequest<
-            '_,
+        requests: ::connectrpc::InboundStream<
             crate::generated::preloop::sandbox::driver::v1::CopyInRequest,
         >,
     ) -> impl ::std::future::Future<
@@ -593,18 +641,16 @@ pub trait Driver: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// Write a tar archive of `guest_path` to `host_tar` (created by the agent,
-    /// writable by the plugin).
-    ///
-    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    /// Stream a tar archive of `guest_path` to the agent. The stream ends after
+    /// an `eof` message; a failure is the RPC's final status.
     ///
     /// `request` is borrowed from the request body and is valid for the
-    /// duration of the call; message fields are read directly on it
-    /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
-    /// returned, stored, or moved into `tokio::spawn`.
-    fn copy_out<'a>(
-        &'a self,
+    /// duration of the call (until the response stream is returned);
+    /// message fields are read directly on it (zero-copy). Data the
+    /// returned stream needs must be copied out or converted via
+    /// `.to_owned_message()`.
+    fn copy_out(
+        &self,
         ctx: ::connectrpc::RequestContext,
         request: ::connectrpc::ServiceRequest<
             '_,
@@ -612,9 +658,11 @@ pub trait Driver: Send + Sync + 'static {
         >,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
-            impl ::connectrpc::Encodable<
-                crate::generated::preloop::sandbox::v1::Empty,
-            > + Send + use<'a, Self>,
+            ::connectrpc::ServiceStream<
+                impl ::connectrpc::Encodable<
+                    crate::generated::preloop::sandbox::driver::v1::CopyOutResponse,
+                > + Send + use<Self>,
+            >,
         >,
     > + Send;
     /// Every sandbox this plugin owns on this host.
@@ -979,62 +1027,53 @@ impl<S: Driver> DriverExt for S {
                 },
             )
             .with_spec(DRIVER_CANCEL_EXEC_SPEC)
-            .route_view(
+            .route_view_client_stream(
                 DRIVER_SERVICE_NAME,
                 "CopyIn",
-                {
+                ::connectrpc::view_client_streaming_handler_fn({
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |
-                        ctx,
-                        req: ::buffa::view::OwnedView<
-                            crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyInRequestView<
-                                'static,
-                            >,
-                        >,
-                        format|
-                    {
+                    move |ctx, req, format| {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
-                            let sreq = ::connectrpc::ServiceRequest::<
+                            let req = ::connectrpc::dispatcher::codegen::into_stream_messages::<
                                 crate::generated::preloop::sandbox::driver::v1::CopyInRequest,
-                            >::from_parts(req.reborrow(), req.bytes());
-                            svc.copy_in(ctx, sreq)
+                            >(req);
+                            svc.copy_in(ctx, req)
                                 .await?
                                 .encode::<
                                     crate::generated::preloop::sandbox::v1::Empty,
                                 >(format)
                         }
-                    })
-                },
+                    }
+                }),
             )
             .with_spec(DRIVER_COPY_IN_SPEC)
-            .route_view(
+            .route_view_server_stream::<
+                _,
+                _,
+                crate::generated::preloop::sandbox::driver::v1::CopyOutResponse,
+            >(
                 DRIVER_SERVICE_NAME,
                 "CopyOut",
-                {
+                ::connectrpc::view_streaming_handler_fn({
                     let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |
+                    move |
                         ctx,
                         req: ::buffa::view::OwnedView<
                             crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyOutRequestView<
                                 'static,
                             >,
-                        >,
-                        format|
+                        >|
                     {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
                             let sreq = ::connectrpc::ServiceRequest::<
                                 crate::generated::preloop::sandbox::driver::v1::CopyOutRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.copy_out(ctx, sreq)
-                                .await?
-                                .encode::<
-                                    crate::generated::preloop::sandbox::v1::Empty,
-                                >(format)
+                            svc.copy_out(ctx, sreq).await
                         }
-                    })
-                },
+                    }
+                }),
             )
             .with_spec(DRIVER_COPY_OUT_SPEC)
             .route_view(
@@ -1355,13 +1394,13 @@ impl<T: Driver> ::connectrpc::Dispatcher for DriverServer<T> {
             }
             "CopyIn" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::client_streaming()
                         .with_spec(DRIVER_COPY_IN_SPEC),
                 )
             }
             "CopyOut" => {
                 Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::server_streaming()
                         .with_spec(DRIVER_COPY_OUT_SPEC),
                 )
             }
@@ -1508,46 +1547,6 @@ impl<T: Driver> ::connectrpc::Dispatcher for DriverServer<T> {
                         crate::generated::preloop::sandbox::driver::v1::CancelExecRequest,
                     >::from_parts(&req, &body);
                     svc.cancel_exec(ctx, req)
-                        .await?
-                        .encode::<crate::generated::preloop::sandbox::v1::Empty>(format)
-                })
-            }
-            "CopyIn" => {
-                let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
-                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
-                        crate::generated::preloop::sandbox::driver::v1::CopyInRequest,
-                    >(request.encoded()?, format)?;
-                    let req: crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyInRequestView<
-                        '_,
-                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
-                        &body,
-                        ctx.decode_options(),
-                    )?;
-                    let req = ::connectrpc::ServiceRequest::<
-                        crate::generated::preloop::sandbox::driver::v1::CopyInRequest,
-                    >::from_parts(&req, &body);
-                    svc.copy_in(ctx, req)
-                        .await?
-                        .encode::<crate::generated::preloop::sandbox::v1::Empty>(format)
-                })
-            }
-            "CopyOut" => {
-                let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
-                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
-                        crate::generated::preloop::sandbox::driver::v1::CopyOutRequest,
-                    >(request.encoded()?, format)?;
-                    let req: crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyOutRequestView<
-                        '_,
-                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
-                        &body,
-                        ctx.decode_options(),
-                    )?;
-                    let req = ::connectrpc::ServiceRequest::<
-                        crate::generated::preloop::sandbox::driver::v1::CopyOutRequest,
-                    >::from_parts(&req, &body);
-                    svc.copy_out(ctx, req)
                         .await?
                         .encode::<crate::generated::preloop::sandbox::v1::Empty>(format)
                 })
@@ -1759,6 +1758,32 @@ impl<T: Driver> ::connectrpc::Dispatcher for DriverServer<T> {
                     )
                 })
             }
+            "CopyOut" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::generated::preloop::sandbox::driver::v1::CopyOutRequest,
+                    >(request, format)?;
+                    let req: crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyOutRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::generated::preloop::sandbox::driver::v1::CopyOutRequest,
+                    >::from_parts(&req, &body);
+                    let resp = svc.copy_out(ctx, req).await?;
+                    Ok(
+                        resp
+                            .map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<
+                                crate::generated::preloop::sandbox::driver::v1::CopyOutResponse,
+                                _,
+                                _,
+                            >(s, format)),
+                    )
+                })
+            }
             _ => ::connectrpc::dispatcher::codegen::unimplemented_streaming(path),
         }
     }
@@ -1774,6 +1799,17 @@ impl<T: Driver> ::connectrpc::Dispatcher for DriverServer<T> {
         };
         let _ = (&ctx, &requests, &format);
         match method {
+            "CopyIn" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
+                        crate::generated::preloop::sandbox::driver::v1::CopyInRequest,
+                    >(requests, format, ctx.decode_options().clone());
+                    svc.copy_in(ctx, req_stream)
+                        .await?
+                        .encode::<crate::generated::preloop::sandbox::v1::Empty>(format)
+                })
+            }
             _ => ::connectrpc::dispatcher::codegen::unimplemented_unary(path),
         }
     }
@@ -2067,9 +2103,24 @@ where
             .await
     }
     /// Call the CopyIn RPC. Sends a request to /preloop.sandbox.driver.v1.Driver/CopyIn.
+    ///
+    /// `requests` is any `Stream<Item = ...> + Send + 'static` of
+    /// request messages (the `ClientRequestStream` bound); messages
+    /// are sent as the stream yields them. It backs the request
+    /// body, so yield owned messages or feed the call from a
+    /// channel-backed stream. For a collection that is already in
+    /// hand, wrap it with `::connectrpc::stream_iter(...)`.
+    ///
+    /// Dropping the returned future cancels the call: the request
+    /// body is dropped along with it, so messages the stream had
+    /// not yet yielded are never delivered. A caller that needs the
+    /// request delivered must drive the call to completion rather
+    /// than, say, wrapping it in a `timeout`.
     pub async fn copy_in(
         &self,
-        request: crate::generated::preloop::sandbox::driver::v1::CopyInRequest,
+        requests: impl ::connectrpc::client::ClientRequestStream<
+            crate::generated::preloop::sandbox::driver::v1::CopyInRequest,
+        >,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
@@ -2078,13 +2129,28 @@ where
         >,
         ::connectrpc::ConnectError,
     > {
-        self.copy_in_with_options(request, ::connectrpc::client::CallOptions::default())
+        self.copy_in_with_options(requests, ::connectrpc::client::CallOptions::default())
             .await
     }
     /// Call the CopyIn RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    ///
+    /// `requests` is any `Stream<Item = ...> + Send + 'static` of
+    /// request messages (the `ClientRequestStream` bound); messages
+    /// are sent as the stream yields them. It backs the request
+    /// body, so yield owned messages or feed the call from a
+    /// channel-backed stream. For a collection that is already in
+    /// hand, wrap it with `::connectrpc::stream_iter(...)`.
+    ///
+    /// Dropping the returned future cancels the call: the request
+    /// body is dropped along with it, so messages the stream had
+    /// not yet yielded are never delivered. A caller that needs the
+    /// request delivered must drive the call to completion rather
+    /// than, say, wrapping it in a `timeout`.
     pub async fn copy_in_with_options(
         &self,
-        request: crate::generated::preloop::sandbox::driver::v1::CopyInRequest,
+        requests: impl ::connectrpc::client::ClientRequestStream<
+            crate::generated::preloop::sandbox::driver::v1::CopyInRequest,
+        >,
         options: ::connectrpc::client::CallOptions,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
@@ -2094,11 +2160,11 @@ where
         >,
         ::connectrpc::ConnectError,
     > {
-        ::connectrpc::client::call_unary(
+        ::connectrpc::client::call_client_stream(
                 &self.transport,
                 &self.config,
                 DRIVER_COPY_IN_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
-                request,
+                requests,
                 options,
             )
             .await
@@ -2108,9 +2174,10 @@ where
         &self,
         request: crate::generated::preloop::sandbox::driver::v1::CopyOutRequest,
     ) -> Result<
-        ::connectrpc::client::UnaryResponse<
-            ::buffa::view::OwnedView<
-                crate::generated::preloop::sandbox::v1::__buffa::view::EmptyView<'static>,
+        ::connectrpc::client::ServerStream<
+            T::ResponseBody,
+            crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyOutResponseView<
+                'static,
             >,
         >,
         ::connectrpc::ConnectError,
@@ -2124,14 +2191,15 @@ where
         request: crate::generated::preloop::sandbox::driver::v1::CopyOutRequest,
         options: ::connectrpc::client::CallOptions,
     ) -> Result<
-        ::connectrpc::client::UnaryResponse<
-            ::buffa::view::OwnedView<
-                crate::generated::preloop::sandbox::v1::__buffa::view::EmptyView<'static>,
+        ::connectrpc::client::ServerStream<
+            T::ResponseBody,
+            crate::generated::preloop::sandbox::driver::v1::__buffa::view::CopyOutResponseView<
+                'static,
             >,
         >,
         ::connectrpc::ConnectError,
     > {
-        ::connectrpc::client::call_unary(
+        ::connectrpc::client::call_server_stream(
                 &self.transport,
                 &self.config,
                 DRIVER_COPY_OUT_SPEC.with_origin(::connectrpc::SpecOrigin::Client),

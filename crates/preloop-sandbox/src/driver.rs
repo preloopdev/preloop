@@ -6,7 +6,6 @@
 //! (cold boot, fork, snapshot restore) is its own business.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::api::{Capabilities, CreateWork, ExecEvent, ExecRequest, HostReport, Observed};
 use crate::error::{Error, Result};
@@ -25,7 +24,29 @@ pub const EXEC_CANCELLED: i32 = 130;
 /// Version of the out-of-process driver protocol
 /// (`proto/preloop/sandbox/driver/v1/driver.proto`). The agent refuses a
 /// plugin whose version differs.
-pub const DRIVER_PROTOCOL_VERSION: u32 = 1;
+pub const DRIVER_PROTOCOL_VERSION: u32 = 2;
+
+/// One item of a tar stream moving into or out of a guest.
+///
+/// A clean end of stream is the channel closing after the last `Data`. The
+/// producer sends [`TransferChunk::Failed`] when its source failed (a caller
+/// disconnected, the guest exited early), so a truncated archive is never
+/// mistaken for a complete one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferChunk {
+    /// Archive bytes.
+    Data(Vec<u8>),
+    /// The producer stopped early; no more data follows.
+    Failed(String),
+}
+
+/// Bounded chunks one transfer may have in flight at each hop.
+///
+/// Backpressure is the point: a slow guest stops the agent's fetch, which
+/// stops the caller's upload, so a transfer uses a constant amount of memory
+/// regardless of archive size.
+pub const TRANSFER_QUEUE: usize = 8;
+
 /// A sandbox backend on one host (or one remote endpoint, for connectors).
 #[async_trait]
 pub trait Driver: Send + Sync {
@@ -69,11 +90,28 @@ pub trait Driver: Send + Sync {
         Err(unsupported(self.name(), "cancel_exec"))
     }
 
-    /// Extract a tar archive into `guest_dir`.
-    async fn copy_in(&self, native_ref: &str, tar: &Path, guest_dir: &str) -> Result<()>;
+    /// Extract a tar archive streamed by `tar` into the guest's `guest_dir`.
+    ///
+    /// The receiver closes cleanly at the end of the archive;
+    /// [`TransferChunk::Failed`] means the producer aborted and the extraction
+    /// must fail rather than leave a truncated tree accepted.
+    async fn copy_in(
+        &self,
+        native_ref: &str,
+        guest_dir: &str,
+        tar: mpsc::Receiver<TransferChunk>,
+    ) -> Result<()>;
 
-    /// Write a tar archive of `guest_path` to `tar`.
-    async fn copy_out(&self, native_ref: &str, guest_path: &str, tar: &Path) -> Result<()>;
+    /// Stream a tar archive of `guest_path` to `tar`.
+    ///
+    /// The driver closes the sender when the archive is complete, or sends
+    /// [`TransferChunk::Failed`] before returning the error.
+    async fn copy_out(
+        &self,
+        native_ref: &str,
+        guest_path: &str,
+        tar: mpsc::Sender<TransferChunk>,
+    ) -> Result<()>;
 
     /// Capture a snapshot-capable sandbox as a template; returns the native
     /// template reference later passed back in `CreateWork::template`.
