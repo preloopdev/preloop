@@ -3613,20 +3613,22 @@ fn hosted_runtime_init_script_at(
 /// the guest bundle before the runner registers. Idempotent: a bundle whose
 /// package already removed them is left untouched.
 fn guest_ca_distrust_script(ca_conf: &str) -> String {
+    let ca_conf = shell_quote(ca_conf);
+    let apply = run_as_root_or_sudo_strict(&format!(
+        r#"set -e
+conf={ca_conf}
+sed -i.bak \
+  -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
+  -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' \
+  "$conf"
+rm -f "$conf.bak"
+update-ca-certificates
+echo "preloop: disabled revoked eMudhra CA roots" >&2"#
+    ));
     format!(
         r#"conf={ca_conf}
 if [ -f "$conf" ] && grep -qE '^mozilla/(emSign_ECC_Root_CA_-_G3|Comodo_AAA_Services_root)\.crt$' "$conf"; then
-  sed -i.bak \
-    -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
-    -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' \
-    "$conf"
-  rm -f "$conf.bak"
-  if [ "$(id -u)" -eq 0 ]; then
-    update-ca-certificates
-  else
-    sudo -n update-ca-certificates
-  fi
-  echo "preloop: disabled revoked eMudhra CA roots" >&2
+  {apply}
 fi"#
     )
 }
@@ -10722,22 +10724,43 @@ done
         assert!(script.contains("prs_conf='/etc/resolv.conf'"), "{script}");
     }
 
-    /// The init must disable the roots revoked by the 2026-10-20 eMudhra
-    /// intermediate compromise; a golden that still anchors them lets a
-    /// forged leaf validate in every client that ignores revocation.
+    #[cfg(unix)]
     #[test]
-    fn hosted_runtime_init_disables_revoked_emudhra_roots() {
-        let script = guest_hosted_runtime_init_script(GoldenResiduePolicy::Clean);
-        for root in [
-            "mozilla/emSign_ECC_Root_CA_-_G3.crt",
-            "mozilla/Comodo_AAA_Services_root.crt",
-        ] {
-            assert!(script.contains(root), "missing {root}: {script}");
-        }
-        assert!(script.contains("update-ca-certificates"), "{script}");
+    fn ca_distrust_refused_sudo_leaves_configuration_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let conf = temp.path().join("ca-certificates.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let original = "mozilla/emSign_ECC_Root_CA_-_G3.crt\nmozilla/Other.crt\n";
+        std::fs::write(&conf, original).unwrap();
+        scratch_executable(&bin.join("id"), "#!/bin/sh\nprintf '1001\\n'\n");
+        scratch_executable(&bin.join("sudo"), "#!/bin/sh\nexit 77\n");
+
+        let script = guest_ca_distrust_script(conf.to_str().unwrap());
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-ec", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .output()
+                .unwrap()
+        };
+        let denied = run();
+        assert_eq!(denied.status.code(), Some(77));
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            original,
+            "a denied elevation must not partially change the trust configuration"
+        );
+        assert!(!conf.with_extension("conf.bak").exists());
+
+        let already_clean = "!mozilla/emSign_ECC_Root_CA_-_G3.crt\nmozilla/Other.crt\n";
+        std::fs::write(&conf, already_clean).unwrap();
+        assert!(run().status.success(), "a clean bundle needs no elevation");
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), already_clean);
+        std::fs::remove_file(&conf).unwrap();
         assert!(
-            script.contains("sudo -n update-ca-certificates"),
-            "{script}"
+            run().status.success(),
+            "a non-Debian image without a CA configuration needs no elevation"
         );
     }
 
