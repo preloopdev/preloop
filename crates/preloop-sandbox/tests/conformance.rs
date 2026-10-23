@@ -3982,16 +3982,13 @@ async fn pool_acquire_rejects_template_placement_fields() {
                 ..base()
             },
         ),
-        (
-            "options",
-            {
-                let mut request = base();
-                request
-                    .options
-                    .insert("dns".to_owned(), "8.8.8.8".to_owned());
-                request
-            },
-        ),
+        ("options", {
+            let mut request = base();
+            request
+                .options
+                .insert("dns".to_owned(), "8.8.8.8".to_owned());
+            request
+        }),
     ];
     for (field, request) in cases {
         let error = h.service.acquire(request).await.unwrap_err();
@@ -4549,7 +4546,7 @@ async fn a_snapshot_in_flight_reserves_its_source() {
                     lease_id,
                     name: "golden".into(),
                     ..SnapshotRequest::default()
-        })
+                })
                 .await
         }
     });

@@ -233,7 +233,10 @@ fn build_inject_tar(tar_path: &Path, files: &[FileSpec]) -> Result<()> {
     for spec in files {
         let path = spec.path.trim_start_matches('/');
         if path.is_empty() || path.split('/').any(|p| p == "..") {
-            return Err(Error::invalid_argument(format!("bad inject path `{}`", spec.path)));
+            return Err(Error::invalid_argument(format!(
+                "bad inject path `{}`",
+                spec.path
+            )));
         }
         let mut header = tar::Header::new_gnu();
         header.set_size(spec.data.len() as u64);
