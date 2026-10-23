@@ -21,7 +21,6 @@ const TOKEN: &str = "multi-replica-token";
 
 struct Node {
     service: Arc<Service>,
-    base: String,
     shutdown: CancellationToken,
     _dir: tempfile::TempDir,
 }
@@ -57,51 +56,6 @@ fn config(
     config.create_timeout = Duration::from_secs(30);
     config.work_timeout = Duration::from_secs(20);
     config
-}
-
-async fn start_node(
-    store_url: &str,
-    state: &std::path::Path,
-    tls: Arc<ServerTls>,
-    node_id: &str,
-    session_id: &str,
-    credential: &str,
-    peers: Vec<PeerConfig>,
-) -> Node {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("https://{}", listener.local_addr().unwrap());
-    let mut config = config(state, state, node_id, session_id, credential, &base, peers);
-    config.ca = Some(tls.ca.clone());
-    let sqlite_path = store_url.to_owned();
-    let backend = backend::open_with(BackendConfig {
-        url: sqlite_path,
-        state_dir: state.to_path_buf(),
-        seal_key: Some([42u8; 32]),
-        pool_size: 4,
-        node_id: node_id.into(),
-        session_id: session_id.into(),
-        node_credential_sha256: backend::credential_hash(credential),
-        peer_url: base.clone(),
-        node_lost_after: config.node_lost_after,
-    })
-    .await
-    .unwrap();
-    let service = Service::open(backend, config).await.unwrap();
-    let shutdown = CancellationToken::new();
-    tokio::spawn(serve(
-        listener,
-        service.clone(),
-        Auth::new(TOKEN),
-        tls,
-        shutdown.clone(),
-    ));
-    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    Node {
-        service,
-        base,
-        shutdown,
-        _dir: tempfile::tempdir().unwrap(),
-    }
 }
 
 /// Register through A, then poll/report/transfer through B.
@@ -451,7 +405,6 @@ async fn start_listener(
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     Node {
         service,
-        base: base.to_owned(),
         shutdown,
         _dir: tempfile::tempdir().unwrap(),
     }

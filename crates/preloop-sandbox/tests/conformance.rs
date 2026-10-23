@@ -967,12 +967,12 @@ async fn stats_follow_reconcile_state_changes() {
         .unwrap();
     assert_eq!(
         stats_state(&h.service, &lease.sandbox.id).await,
-        Some(SandboxState::Leased.into())
+        Some(SandboxState::Leased)
     );
     // The leased machine disappears behind the service's back.
     h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
     wait_for(|| async {
-        stats_state(&h.service, &lease.sandbox.id).await == Some(SandboxState::Failed.into())
+        stats_state(&h.service, &lease.sandbox.id).await == Some(SandboxState::Failed)
     })
     .await;
     // The count follows the state: the sandbox is still tracked, once, as
@@ -4378,7 +4378,7 @@ delegate_backend! {
     reconcile(request: ReconcileRequest) -> preloop_sandbox::Result<ReconcileResponse> => "reconcile";
     start_copy(sandbox_id: &str, ticket: &str, guest_path: &str, kind: StreamKind, owner: &Owner) -> preloop_sandbox::Result<String> => "start_copy";
     create_exec(exec_id: &str, request: ExecRequest, timeout_secs: u64, owner: &Owner) -> preloop_sandbox::Result<ExecHandle> => "create_exec";
-    report_exec(request: ReportExecRequest) -> preloop_sandbox::Result<ReportExecOutcome> => "report_exec";
+    report_exec(request: ReportExecRequest, delivery_timeout: std::time::Duration) -> preloop_sandbox::Result<ReportExecOutcome> => "report_exec";
     finish_exec(exec_id: &str, code: i32) -> preloop_sandbox::Result<()> => "finish_exec";
     fail_exec(exec_id: &str, reason: &str) -> preloop_sandbox::Result<()> => "fail_exec";
     cancel_exec(exec_id: &str, owner: &Owner) -> preloop_sandbox::Result<()> => "cancel_exec";
