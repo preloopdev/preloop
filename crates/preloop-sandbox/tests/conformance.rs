@@ -1262,6 +1262,7 @@ async fn loopback_auth_requires_a_token_and_a_loopback_host() {
         let mut request = http
             .post(format!("{base}{path}"))
             .header("Host", host)
+            .header("Content-Type", "application/json")
             .body("{}");
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
