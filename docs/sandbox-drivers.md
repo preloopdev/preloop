@@ -45,7 +45,7 @@ keeps everything that is not a VM operation:
   the plugin;
 * caller lease authorization, request validation, exec deadlines and the
   caller-facing error mapping;
-* blob transfer: `OpenStream` tickets and the agent blob endpoints. The agent
+* transfer: `OpenStream` tickets and the agent blob endpoints. The agent
   stages a tar at a host path and tells the plugin where it is; the plugin
   never receives a ticket or a service URL;
 * reconciliation: inventory is compared with the service's records, orphans
@@ -57,18 +57,19 @@ the optional power operations. It receives no service credentials (see
 
 ## Protocol
 
-All RPCs are unary except `Exec`, which is server-streaming. The service name
+All RPCs are unary except `Exec` (server-streaming), `CopyIn`
+(client-streaming) and `CopyOut` (server-streaming). The service name
 is `preloop.sandbox.driver.v1.Driver`.
 
 | RPC | Request → response | Semantics |
 |---|---|---|
-| `GetInfo` | `GetInfoRequest` → `GetInfoResponse` | Identity, protocol version, capabilities and plugin version. Called once at start and after every restart. `agentProtocolVersion` is the agent's version; return `protocolVersion = 1`. The agent refuses a mismatch. |
+| `GetInfo` | `GetInfoRequest` → `GetInfoResponse` | Identity, protocol version, capabilities and plugin version. Called once at start and after every restart. `agentProtocolVersion` is the agent's version; return `protocolVersion = 2`. The agent refuses a mismatch. |
 | `Create` | `CreateRequest{work}` → `CreateResponse{nativeRef}` | Create and start a sandbox from `CreateWork`, return its native reference. Idempotent on `work.sandboxId`. |
 | `Destroy` | `NativeRequest{nativeRef}` → `Empty` | Stop and delete the sandbox. A sandbox that is already gone is success. |
 | `Exec` | `ExecRequest{nativeRef, execId, request}` → stream of `ExecEvent` | Run the command, stream stdout/stderr, and end with exactly one `ExitCode` event. `request.timeoutSecs` is never zero; kill at the deadline and report `124`. |
 | `CancelExec` | `CancelExecRequest{nativeRef, execId}` → `Empty` | Kill a running command; report `130`. May arrive before `Exec`; remember it and refuse to start that exec. Cancelling a finished exec succeeds. |
-| `CopyIn` | `CopyInRequest{nativeRef, hostTar, guestDir}` → `Empty` | Extract the agent-staged tar at `hostTar` into `guestDir` in the guest. |
-| `CopyOut` | `CopyOutRequest{nativeRef, guestPath, hostTar}` → `Empty` | Write a tar of `guestPath` to `hostTar`. The agent created and owns that file. |
+| `CopyIn` | stream of `CopyInRequest{nativeRef, guestDir, data, eof, error}` → `Empty` | Extract the streamed tar into `guestDir`. The first message carries the target; the last carries `eof` or `error`. A stream that ends without `eof` must be refused, never extracted. |
+| `CopyOut` | `CopyOutRequest{nativeRef, guestPath}` → stream of `CopyOutResponse{data, eof}` | Stream a tar of `guestPath`; a failure is the RPC's final status. |
 | `Inventory` | `InventoryRequest` → `InventoryResponse{sandboxes}` | Every sandbox this plugin owns on this host. Each `Observed` carries `driver`, `nativeRef` and `sandboxId` (when recoverable). |
 | `HostReport` | `HostReportRequest` → `HostReport` | Best-effort host and per-sandbox runtime facts. Never fails; return an empty report when nothing can be measured. |
 | `Snapshot` | `SnapshotRequest{nativeRef, template}` → `SnapshotResponse{nativeRef}` | Capture the sandbox as a template. Only when `capabilities.snapshot`; return `failed_precondition` otherwise. |
@@ -122,8 +123,8 @@ Work delivery is **at least once**. A plugin must assume `Create`, `Destroy`,
 * **`CancelExec` is idempotent.** Record a cancel that arrives before the exec
   starts; the next `Exec` for that id must return `130` without running the
   command. Cancelling a finished or unknown exec succeeds.
-* **`CopyOut` overwrites `hostTar`.** The agent creates the file and consumes
-  it immediately.
+* **A copy has no host staging file.** Both directions stream; a producer that
+  fails sends `error`/`Failed` so the peer never accepts a truncated archive.
 * **Power operations are idempotent where the backend allows it.** Stopping a
   stopped sandbox and starting a running one should converge, not corrupt
   state.
@@ -306,7 +307,7 @@ type driver struct {
 func (d *driver) GetInfo(context.Context, *connect.Request[driverv1.GetInfoRequest]) (*connect.Response[driverv1.GetInfoResponse], error) {
 	return connect.NewResponse(&driverv1.GetInfoResponse{
 		Name:            "acme",
-		ProtocolVersion: 1,
+		ProtocolVersion: 2,
 		Capabilities: &sandboxv1.Capabilities{
 			Os:           "linux",
 			Arch:         []string{"x86_64"},
@@ -504,7 +505,7 @@ Treat it as trusted host software:
   plugins must survive the agent reconnecting without losing backend state;
   rebuild inventory from the backend after a plugin restart.
 * **Update carefully.** The protocol version is compiled into the agent
-  (`DRIVER_PROTOCOL_VERSION = 1`). A plugin reporting another version is
+  (`DRIVER_PROTOCOL_VERSION = 2`). A plugin reporting another version is
   refused at startup, so ship the plugin and the agent together and roll the
   agent only after the plugin speaks the new version.
 

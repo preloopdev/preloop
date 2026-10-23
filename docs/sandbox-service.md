@@ -41,7 +41,10 @@ Both are served with the Connect protocol, JSON codec, over one HTTPS port:
 server-streaming, so it works over HTTP/1.1 — proxies, and hosts behind NAT that
 dial out. Bulk bytes never ride inside RPCs: `OpenStream` returns a short-lived
 ticket and a tar moves with plain `PUT`/`GET` on `/sandbox/v1/streams/<ticket>`;
-agents fetch and return blobs on `/sandbox/v1/agent/blobs/<ticket>`.
+agents fetch and return the same stream on `/sandbox/v1/agent/blobs/<ticket>`.
+The ticket is a rendezvous, not a file: the caller and agent connect their
+halves and bytes flow through bounded channels with backpressure, so neither
+the service nor the agent writes the archive to disk.
 
 ### Work delivery
 
@@ -245,7 +248,9 @@ certificate. There is no plaintext mode and no loopback exemption.
   and `Get` only echoes the lease the caller already presented, so holding the
   client token alone cannot drive someone else's machine.
 * **Data-plane tickets** are single-use, scoped to one sandbox and direction,
-  and short-lived; their URLs are relative, so they inherit the `https` base.
+  and short-lived; each side (producer and consumer) is claimable once, and a
+  claimed transfer gets the work timeout. Their URLs are relative, so they
+  inherit the `https` base.
   `OpenStream` returns the stream URL and a separate `token`; the caller sends
   it as `Authorization: Bearer <token>` on the upload or download, so the URL
   alone is not enough.
@@ -288,10 +293,11 @@ certificate. There is no plaintext mode and no loopback exemption.
 ## Limits and pagination
 
 Unary Connect requests are capped at 4 MiB; bulk bytes never belong in them.
-The data-plane `PUT` routes stream to disk and stop at
-`PRELOOP_SANDBOX_BLOB_MAX_BYTES` (default 8 GiB), answering `413` and deleting
-the partial file. At boot the service deletes every file left in its blob
-directory: tickets live only in memory, so no restart can claim them.
+The data-plane `PUT` routes count bytes in flight and stop at
+`PRELOOP_SANDBOX_BLOB_MAX_BYTES` (default 8 GiB), answering `413` and aborting
+the ticket so the peer sees a failed transfer rather than a truncated archive.
+A transfer leaves no service or agent file to sweep: tickets and payloads are
+memory-only, and a caller disconnect delivers a failure to the agent's driver.
 
 `List`, `ListTemplates`, `ListPools` and `ListProviders` are paginated.
 `pageSize` defaults to 100 and is capped at 1000; `nextPageToken` from a
@@ -465,7 +471,7 @@ crash backstop. The service's own delete path escalates to a targeted kill when
 | `PRELOOP_SANDBOX_TLS_SANS` | server certificate SANs (comma list) |
 | `PRELOOP_SANDBOX_TLS_CERT` / `PRELOOP_SANDBOX_TLS_KEY` | replace the generated server certificate |
 | `PRELOOP_SANDBOX_STORE_URL` | store URL |
-| `PRELOOP_SANDBOX_BLOB_MAX_BYTES` | blob upload cap (default 8 GiB) |
+| `PRELOOP_SANDBOX_BLOB_MAX_BYTES` | per-transfer byte cap (default 8 GiB) |
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
 | `PRELOOP_SANDBOX_POOL_DRIVER` | driver the CI pool places on (default: first) |
 | `PRELOOP_SANDBOX_PLACEMENT` | placement strategy (default `least-loaded`) |
@@ -519,7 +525,8 @@ preloop sandbox provider rm host-a                     # revoke its certificates
   expiry and preservation, orphan/lost reconcile, generation fencing, SQLite
   restart, streaming exec, ticketed upload/download, lease ownership and list
   redaction, host mount/socket allowlisting, cordon/drain, pagination, request
-  and blob caps, the boot blob sweep, artifact validation, digest-verified pack
+  and transfer caps, streaming transfers with no staging files, artifact
+  validation, digest-verified pack
   materialization, cache GC, restart fencing and recovery, terminating reaping,
   lease release on provider loss, idempotency payload mismatch, poll batching,
   redelivery and report dedupe, exec deadlines and disconnect cancellation),

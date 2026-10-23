@@ -9,6 +9,17 @@ Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 ### Added
 
+- **Sandbox transfers stream without disk staging.** A caller's upload and the
+  host agent's fetch now meet on a single-use ticket rendezvous and bytes flow
+  through bounded channels — caller → service → agent → guest (or back) —
+  instead of being written to a service blob directory and an agent scratch
+  directory. `Acquire.inject` files are tarred in memory and streamed the same
+  way, so neither the service nor the agent ever writes a payload to disk, and
+  a caller or agent that disconnects fails the peer with a clear error instead
+  of leaving a truncated archive behind. The out-of-process driver protocol
+  bumps to version 2: `CopyIn` is client-streaming and `CopyOut` is
+  server-streaming with explicit `eof`/`error`. SmolVM copies stream through
+  `machine exec -i` (`tar -xf -`) and `machine exec --stream` (`tar -cf -`).
 - **Sandbox Service** (`preloop-sandbox`) replaces `preloop-vm`; the
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
   service. The AgentENV backend moved to the private build.
@@ -16,8 +27,8 @@ Releases before v0.27.0 predate the changelog.
   `CordonProvider`/`UncordonProvider`/`DrainProvider` (and
   `preloop sandbox provider …`) stop new placements and release idle pool
   members; `List*` RPCs are paginated (`pageSize` up to 1000); unary RPCs are
-  capped at 4 MiB and blob uploads at `PRELOOP_SANDBOX_BLOB_MAX_BYTES`
-  (default 8 GiB), with orphaned blobs swept at boot.
+  capped at 4 MiB and transfers at `PRELOOP_SANDBOX_BLOB_MAX_BYTES`
+  (default 8 GiB).
 
 - **The Sandbox Service owns its telemetry.** `preloop-sandbox` builds its
   `preloop.sandbox.*` instruments on the process's shared meter
