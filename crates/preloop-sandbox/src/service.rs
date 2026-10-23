@@ -933,6 +933,19 @@ impl Service {
         }
     }
 
+    /// Whether a provider's declared per-sandbox capacity can host `shape`.
+    ///
+    /// Zero on either side means "not reported" (or "driver default"), never
+    /// zero capacity: a driver that publishes no ceiling still accepts the
+    /// request rather than being rejected by placement.
+    fn fits_shape(caps: &Capabilities, shape: &Shape) -> bool {
+        let cpus_fit = caps.max_vcpus == 0 || shape.cpus == 0 || shape.cpus <= caps.max_vcpus;
+        let memory_fit = caps.max_memory_mib == 0
+            || shape.memory_mib == 0
+            || shape.memory_mib <= caps.max_memory_mib;
+        cpus_fit && memory_fit
+    }
+
     /// Pick `(provider_id, driver)`: filter on capabilities and capacity,
     /// then prefer the least-loaded owner.
     fn place(
@@ -1015,6 +1028,18 @@ impl Service {
                     ));
                     continue;
                 }
+                if !Self::fits_shape(caps, &placement.shape) {
+                    unmet.push(format!(
+                        "{}/{}: shape={}cpus/{}mib (max {}cpus/{}mib)",
+                        rec.provider.name,
+                        driver.driver,
+                        placement.shape.cpus,
+                        placement.shape.memory_mib,
+                        caps.max_vcpus,
+                        caps.max_memory_mib
+                    ));
+                    continue;
+                }
                 let live = state
                     .sandboxes
                     .values()
@@ -1060,6 +1085,7 @@ impl Service {
         ops: &mut Vec<Op>,
     ) -> Result<String> {
         let id = new_id("sbx");
+        let shape = effective_shape(state, &provider_id, &driver, placement.shape);
         let revision = if pool.is_empty() {
             String::new()
         } else {
@@ -1080,6 +1106,7 @@ impl Service {
             state: SandboxState::Provisioning,
             purpose,
             created_at: now(),
+            shape,
             pool_revision: revision,
             ..Sandbox::default()
         };
@@ -2837,6 +2864,30 @@ fn sandbox_meets(state: &State, sandbox: &Sandbox, requires: &Requirements) -> b
                 && requires.capabilities.iter().all(|c| caps.has(c))
                 && (requires.driver.is_empty() || requires.driver == driver.driver)
         })
+}
+
+/// A new sandbox's effective size: the request's fields, with the driver's
+/// advertised defaults filling the zeros.
+fn effective_shape(state: &State, provider_id: &str, driver: &str, requested: Shape) -> Shape {
+    let defaults = state
+        .providers
+        .get(provider_id)
+        .and_then(|rec| {
+            rec.provider
+                .drivers
+                .iter()
+                .find(|info| info.driver == driver)
+        })
+        .map(|info| info.capabilities.default_shape)
+        .unwrap_or_default();
+    let pick = |requested: u32, default: u32| {
+        if requested == 0 { default } else { requested }
+    };
+    Shape {
+        cpus: pick(requested.cpus, defaults.cpus),
+        memory_mib: pick(requested.memory_mib, defaults.memory_mib),
+        disk_gib: pick(requested.disk_gib, defaults.disk_gib),
+    }
 }
 
 async fn load<T: DeserializeOwned>(store: &dyn Store, kind: Kind) -> Result<Vec<T>> {

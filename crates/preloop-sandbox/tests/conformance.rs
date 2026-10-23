@@ -237,6 +237,166 @@ async fn placement_rejects_unsatisfiable_requirements_by_name() {
 }
 
 #[tokio::test]
+async fn sandbox_shape_is_the_effective_size() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    // The fake driver advertises these defaults, standing in for SmolVM's
+    // own 2 vCPU / 4096 MiB / 20 GiB.
+    let defaults = Shape {
+        cpus: 2,
+        memory_mib: 1024,
+        disk_gib: 10,
+    };
+
+    let defaulted = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "shape-defaulted".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        defaulted.sandbox.shape, defaults,
+        "an empty request reports the driver's effective size"
+    );
+
+    let explicit = Shape {
+        cpus: 4,
+        memory_mib: 2048,
+        disk_gib: 20,
+    };
+    let shaped = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "shape-explicit".into(),
+            template: "alpine".into(),
+            shape: explicit,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        shaped.sandbox.shape, explicit,
+        "a requested shape is reported verbatim"
+    );
+
+    // Unset fields still take the driver's defaults.
+    let partial = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "shape-partial".into(),
+            template: "alpine".into(),
+            shape: Shape {
+                cpus: 4,
+                ..Shape::default()
+            },
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        partial.sandbox.shape,
+        Shape {
+            cpus: 4,
+            ..defaults
+        }
+    );
+
+    // Get and List report the record's shape, not a recomputation.
+    for (id, expected) in [
+        (&defaulted.sandbox.id, defaults),
+        (&shaped.sandbox.id, explicit),
+        (
+            &partial.sandbox.id,
+            Shape {
+                cpus: 4,
+                ..defaults
+            },
+        ),
+    ] {
+        assert_eq!(h.service.get(id).unwrap().shape, expected);
+        assert_eq!(
+            h.service
+                .list()
+                .into_iter()
+                .find(|sandbox| &sandbox.id == id)
+                .unwrap()
+                .shape,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn placement_rejects_a_shape_the_provider_cannot_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut caps = FakeDriver::full_capabilities();
+    caps.max_vcpus = 2;
+    caps.max_memory_mib = 2048;
+    let h = harness_with(store::open("memory:").await.unwrap(), dir, caps).await;
+    h.service.put_template(template("alpine")).await.unwrap();
+
+    let error = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "too-many-cpus".into(),
+            template: "alpine".into(),
+            shape: Shape {
+                cpus: 4,
+                ..Shape::default()
+            },
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    assert!(
+        error.message.contains("shape=4cpus/0mib"),
+        "{}",
+        error.message
+    );
+
+    let error = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "too-much-memory".into(),
+            template: "alpine".into(),
+            shape: Shape {
+                memory_mib: 4096,
+                ..Shape::default()
+            },
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    assert!(
+        error.message.contains("shape=0cpus/4096mib"),
+        "{}",
+        error.message
+    );
+
+    // A shape inside both ceilings still places.
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "fits".into(),
+            template: "alpine".into(),
+            shape: Shape {
+                cpus: 2,
+                memory_mib: 2048,
+                ..Shape::default()
+            },
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(lease.sandbox.template, "alpine");
+}
+
+#[tokio::test]
 async fn unsupported_operations_fail_instead_of_being_emulated() {
     let dir = tempfile::tempdir().unwrap();
     let mut caps = FakeDriver::full_capabilities();

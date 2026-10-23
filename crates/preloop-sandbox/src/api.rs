@@ -105,6 +105,25 @@ pub struct Capabilities {
     /// require `multi_exec`.
     #[serde(skip_serializing_if = "is_false")]
     pub one_shot: bool,
+    /// Largest vCPU count one sandbox can be given (0 = unreported).
+    ///
+    /// Placement rejects a [`Shape`] above this instead of handing the driver
+    /// a machine it cannot boot.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub max_vcpus: u32,
+    /// Largest memory one sandbox can be given, in MiB (0 = unreported).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub max_memory_mib: u32,
+    /// Size the driver gives a sandbox whose request leaves a field unset.
+    ///
+    /// The service records the effective shape of a sandbox: the request's
+    /// fields, with these defaults filling the zeros.
+    #[serde(skip_serializing_if = "is_default_shape")]
+    pub default_shape: Shape,
+}
+
+fn is_default_shape(value: &Shape) -> bool {
+    *value == Shape::default()
 }
 
 impl Capabilities {
@@ -441,6 +460,9 @@ pub struct Sandbox {
     /// Preserved sandboxes expire at this Unix second (0 = n/a).
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub preserve_until: i64,
+    /// Effective size: the request's shape with the driver's defaults for the
+    /// fields it left unset.
+    pub shape: Shape,
     /// State before `Pause`/`Stop`; `Resume`/`Start` restores it.
     #[serde(skip_serializing_if = "is_unspecified_state")]
     pub prior_state: SandboxState,

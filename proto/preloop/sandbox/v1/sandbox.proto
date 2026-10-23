@@ -38,6 +38,9 @@ message Capabilities {
   uint32 slots = 10;                // max concurrent sandboxes on this owner
   bool native_pool = 11;            // backend keeps its own warm pool
   bool one_shot = 12;               // one command per sandbox (require `multi_exec` to avoid)
+  uint32 max_vcpus = 140;           // largest vCPU count one sandbox can be given (0 = unreported)
+  uint32 max_memory_mib = 141;      // largest memory one sandbox can be given, MiB (0 = unreported)
+  Shape default_shape = 142;        // size used for fields a create request leaves unset
 }
 
 enum NetworkMode {
@@ -165,6 +168,7 @@ message Sandbox {
   int64 preserve_until = 14;
   SandboxState prior_state = 15;    // state before Pause/Stop; Resume/Start restores it
   string pool_revision = 16;        // pool+template configuration this member was built for
+  Shape shape = 130;                // effective size: request fields + driver defaults
 }
 
 message Lease {
