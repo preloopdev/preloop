@@ -30,6 +30,11 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Prefix owned by this host's callers; the driver reports it in inventory.
+fn named_prefix() -> String {
+    env_nonempty("PRELOOP_RUNNER_NAME_PREFIX").unwrap_or_else(|| "preloop-runner".into())
+}
+
 fn smolvm_slots() -> u32 {
     env_nonempty("PRELOOP_SANDBOX_SMOLVM_SLOTS")
         .and_then(|v| v.parse().ok())
@@ -93,6 +98,8 @@ pub(crate) struct LocalSandboxes {
     pool_driver: String,
     pool_capabilities: Option<Capabilities>,
     shutdown: CancellationToken,
+    /// Held for this process's lifetime; releases the state directory.
+    _lock: ServiceLock,
 }
 
 impl LocalSandboxes {
@@ -101,6 +108,9 @@ impl LocalSandboxes {
     /// (default `127.0.0.1:9191`) can be bound.
     pub(crate) async fn start(home: &Path) -> anyhow::Result<Self> {
         let state = home.join("state");
+        // One destructive authority per state directory: a bake or a second
+        // engine must not load and reap a running service's leases.
+        let _lock = ServiceLock::acquire(&state)?;
         let store_url = env_nonempty("PRELOOP_SANDBOX_STORE_URL")
             .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
         let store = store::open(&store_url)
@@ -111,8 +121,7 @@ impl LocalSandboxes {
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
 
         let local = Arc::new(SmolVmProvider::default());
-        let prefix =
-            env_nonempty("PRELOOP_RUNNER_NAME_PREFIX").unwrap_or_else(|| "preloop-runner".into());
+        let prefix = named_prefix();
         let drivers = host_drivers(Some(&prefix), smolvm_slots(), Some((*local).clone()))?;
         let pool_driver = env_nonempty("PRELOOP_SANDBOX_POOL_DRIVER").unwrap_or_else(|| {
             drivers
@@ -179,6 +188,7 @@ impl LocalSandboxes {
             pool_driver,
             pool_capabilities,
             shutdown,
+            _lock,
         })
     }
 
@@ -280,6 +290,57 @@ pub(crate) fn resolve_token(
     Ok(token)
 }
 
+/// Exclusive claim on a state directory, held by the one process that may
+/// open the sandbox store and run maintenance against it.
+#[derive(Debug)]
+pub(crate) struct ServiceLock {
+    file: std::fs::File,
+}
+
+impl ServiceLock {
+    pub(crate) fn acquire(state: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(state).with_context(|| format!("creating {}", state.display()))?;
+        let path = state.join("sandbox-service.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            // SAFETY: the descriptor is valid for the lifetime of `file`.
+            #[allow(unsafe_code)]
+            let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if locked != 0 {
+                anyhow::bail!(
+                    "another preloop process is already serving sandbox state in {}; stop it \
+                     (or use a different PRELOOP_HOME) before starting another service or bake",
+                    state.display()
+                );
+            }
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ServiceLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            // SAFETY: closing would release the lock as well; unlocking first
+            // keeps the intent explicit.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 /// Both bearer tokens are required, whatever the listener address. Missing
 /// ones are generated into the state directory on first start.
 fn api_auth(state: &Path, addr: &SocketAddr) -> anyhow::Result<Auth> {
@@ -302,15 +363,37 @@ fn api_auth(state: &Path, addr: &SocketAddr) -> anyhow::Result<Auth> {
 /// local caller can trust it as the service it should send a token to.
 pub(crate) fn write_endpoint(state: &Path, addr: SocketAddr) -> anyhow::Result<()> {
     let path = endpoint_path(state);
-    crate::write_private_file(&path, format!("http://{addr}\n").as_bytes())
-        .with_context(|| format!("writing {}", path.display()))
+    crate::write_private_file(
+        &path,
+        format!("http://{addr}\n{}\n", std::process::id()).as_bytes(),
+    )
+    .with_context(|| format!("writing {}", path.display()))
 }
 
 fn read_endpoint(state: &Path) -> Option<String> {
     std::fs::read_to_string(endpoint_path(state))
         .ok()
-        .map(|base| base.trim().to_owned())
+        .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
         .filter(|base| !base.is_empty())
+}
+
+/// True when the process that published the endpoint is still alive.
+fn endpoint_owner_alive(state: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(endpoint_path(state)) else {
+        return false;
+    };
+    let Some(pid) = text
+        .lines()
+        .nth(1)
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+    else {
+        return false;
+    };
+    // SAFETY: `kill` with signal 0 only probes existence.
+    #[allow(unsafe_code)]
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    alive
 }
 
 /// Remove the endpoint file only while it still names `addr`: a newer
@@ -335,7 +418,13 @@ pub(crate) async fn bind_endpoint(
             Ok(listener)
         }
         Err(error) => {
-            clear_endpoint(state, addr);
+            // A live owner may legitimately hold the address (the embedded
+            // engine, or another `serve`); keep its endpoint file. Only a
+            // dead owner's stale file is removed, so a squatter cannot
+            // inherit the CLI's trust.
+            if !endpoint_owner_alive(state) {
+                clear_endpoint(state, addr);
+            }
             Err(error)
         }
     }
@@ -378,6 +467,18 @@ fn resolve_service(state: &Path, service: Option<String>) -> anyhow::Result<Stri
                 endpoint_path(state).display()
             )
         }),
+    }
+}
+
+/// An agent never generates a token: the remote service cannot know it.
+fn resolve_provider_token(configured: Option<String>, state: &Path) -> anyhow::Result<String> {
+    match configured.filter(|token| !token.trim().is_empty()) {
+        Some(token) => Ok(token),
+        None => read_token_file(&state.join("sandbox-provider-token")).context(
+            "set --provider-token (or PRELOOP_SANDBOX_PROVIDER_TOKEN) to the service's \
+             provider token, or run on the host whose service wrote \
+             state/sandbox-provider-token",
+        ),
     }
 }
 
@@ -876,6 +977,7 @@ async fn copy(client: &SandboxClient, source: &str, destination: &str) -> anyhow
 async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     let home = crate::preloop_home();
     let state = home.join("state");
+    let _lock = ServiceLock::acquire(&state)?;
     let store_url = args
         .store
         .unwrap_or_else(|| state.join("sandbox.db").display().to_string());
@@ -886,7 +988,7 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     if !args.no_local {
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
-            host_drivers(None, smolvm_slots(), None)?,
+            host_drivers(Some(&named_prefix()), smolvm_slots(), None)?,
             AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
         );
         tokio::spawn(agent.run(None, shutdown.clone()));
@@ -911,11 +1013,11 @@ async fn run_agent(service: Option<String>, args: AgentArgs) -> anyhow::Result<(
     let name = args.name.unwrap_or_else(local_provider_name);
     let state = crate::preloop_home().join("state");
     let service = resolve_service(&state, service)?;
-    let provider_token = resolve_token(args.provider_token, &state, "sandbox-provider-token")?;
+    let provider_token = resolve_provider_token(args.provider_token, &state)?;
     let scratch = state.join("sandbox-agent");
     let agent = Agent::new(
         Arc::new(RemoteLink::new(&service, Some(provider_token))),
-        host_drivers(None, args.slots, None)?,
+        host_drivers(Some(&named_prefix()), args.slots, None)?,
         AgentConfig::new(name, scratch),
     );
     let shutdown = CancellationToken::new();
@@ -977,14 +1079,33 @@ mod tests {
         assert_eq!(read_endpoint(state), Some(format!("http://{addr}")));
         assert_eq!(mode(&endpoint_path(state)), 0o600);
 
-        // The port is still held: the second bind fails and must not leave
-        // an endpoint naming the address behind for a caller to trust.
+        // The port is still held by a live owner: a second bind fails but
+        // must not delete the endpoint other CLI calls depend on.
+        let error = bind_endpoint(state, addr).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(read_endpoint(state), Some(format!("http://{addr}")));
+
+        // A stale file owned by a dead process is removed on failed bind.
+        crate::write_private_file(
+            &endpoint_path(state),
+            format!("http://{addr}\n{}\n", u32::MAX).as_bytes(),
+        )
+        .unwrap();
         let error = bind_endpoint(state, addr).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
         assert_eq!(read_endpoint(state), None);
 
         drop(listener);
-        clear_endpoint(state, addr);
+    }
+
+    #[test]
+    fn the_state_directory_admits_one_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ServiceLock::acquire(dir.path()).unwrap();
+        let error = ServiceLock::acquire(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("already serving"), "{error}");
+        drop(first);
+        ServiceLock::acquire(dir.path()).unwrap();
     }
 
     #[test]
@@ -1010,6 +1131,23 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         write_endpoint(other.path(), "127.0.0.1:9191".parse().unwrap()).unwrap();
         assert!(resolve_client(other.path(), None, None).is_err());
+    }
+
+    #[test]
+    fn an_agent_never_invents_a_provider_token() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_provider_token(None, dir.path()).is_err());
+        assert!(!dir.path().join("sandbox-provider-token").exists());
+        crate::write_private_file(&dir.path().join("sandbox-provider-token"), b"service-token")
+            .unwrap();
+        assert_eq!(
+            resolve_provider_token(None, dir.path()).unwrap(),
+            "service-token"
+        );
+        assert_eq!(
+            resolve_provider_token(Some("given".into()), dir.path()).unwrap(),
+            "given"
+        );
     }
 
     #[tokio::test]

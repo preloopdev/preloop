@@ -169,7 +169,7 @@ preloop sandbox stop sbx-…                            # power off, keep the di
 preloop sandbox start sbx-… [--forkable]               # boot it again (bakes)
 preloop sandbox snapshot sbx-… --name golden
 preloop sandbox release lse-… [--preserve 600]
-preloop sandbox ls | providers
+preloop sandbox ls                    # and: preloop sandbox providers
 preloop sandbox provider cordon host-a               # no new placements
 preloop sandbox provider drain host-a                # cordon + release idle pool members
 preloop sandbox provider uncordon host-a
