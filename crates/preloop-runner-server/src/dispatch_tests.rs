@@ -21,6 +21,31 @@ use super::*;
 
 const TEST_API_TOKEN: &str = "dispatch-test-token";
 
+/// Upload budgets for in-process webhook deliveries.
+///
+/// The ingress gate charges elapsed wall time from admission, while a test
+/// client hands the router a body that is already in memory. The production
+/// ten-second ingest and three-second idle budgets therefore measure only how
+/// long a loaded machine took to schedule the handler — a delivery these
+/// tests expect to be accepted can spend them before the handler is polled
+/// once. Two minutes is twelve times the production ingest budget, so no
+/// loaded runner reaches it, while a delivery whose completion signal is
+/// genuinely lost still fails the test instead of hanging the suite. Tests
+/// that exercise the gate itself live in `routes` and keep the production
+/// values.
+const IN_PROCESS_UPLOAD_BUDGET: Duration = Duration::from_secs(120);
+
+/// The test-API router with upload budgets sized for an in-process client.
+fn webhook_test_router(state: AppState) -> Router {
+    crate::routes::app_with_test_api_and_upload_budgets(
+        state,
+        CancellationToken::new(),
+        TEST_API_TOKEN,
+        IN_PROCESS_UPLOAD_BUDGET,
+        IN_PROCESS_UPLOAD_BUDGET,
+    )
+}
+
 /// Workflow with declared workflow_dispatch inputs (string required, number
 /// with default, choice with options).
 const DISPATCH_WORKFLOW: &str = r#"
@@ -1151,7 +1176,7 @@ async fn webhook_signer_is_bound_to_the_claimed_repository() {
     state.webhook_secret = Some("legacy-secret".to_owned());
     let (registry, _) = two_app_registry();
     state.github_apps = Some(registry);
-    let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
+    let app = webhook_test_router(state.clone());
 
     let ping = |repo: &str| json!({ "repository": { "full_name": repo } });
 
@@ -1231,7 +1256,7 @@ async fn a_secret_an_app_claims_is_bound_to_its_installations() {
     registry.apps[0].webhook_secret = Some("default-secret".to_owned());
     state.webhook_secret = Some("default-secret".to_owned());
     state.github_apps = Some(registry);
-    let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
+    let app = webhook_test_router(state.clone());
 
     let ping = |repo: &str| json!({ "repository": { "full_name": repo } });
 
@@ -2344,7 +2369,7 @@ async fn webhook_coverage_fixture() -> (tempfile::TempDir, AppState, Router) {
     registry.apps[0].webhook_secret = Some("default-secret".to_owned());
     state.webhook_secret = Some("legacy-secret".to_owned());
     state.github_apps = Some(registry);
-    let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
+    let app = webhook_test_router(state.clone());
     (temp, state, app)
 }
 

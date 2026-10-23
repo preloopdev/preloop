@@ -2,7 +2,7 @@
 
 Preloop gets every VM from a Sandbox Service: a generic service that hands out
 running machines from pluggable backends. The CI runner pool is one client;
-`preloop sandbox …` The contract is
+the `preloop sandbox …` CLI is another. The contract is
 `proto/preloop/sandbox/v1/sandbox.proto` (in the repository root);
 the implementation is `crates/preloop-sandbox`, which never depends on the CI
 control plane.
@@ -32,8 +32,9 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
   service does not speak is `failed_precondition` naming both versions),
   `Heartbeat`, `Poll` (long-poll for work), `Report` /
   `ReportExec` (fenced by generation), `Reconcile` (full inventory: lost
-  sandboxes fail, orphans are destroyed, and a `Terminating` machine that is
-  still there gets its destroy re-queued; a template's fork base is never an
+  sandboxes fail, orphans are destroyed, a `Terminating` machine that is
+  still there gets its destroy asked again unless one is in flight, and a
+  tombstone's machine is destroyed; a template's fork base is never an
   orphan, whichever provider reports it), `RenewCertificate`.
 
 Both are served with the Connect protocol, JSON codec, over one HTTPS port:
@@ -191,7 +192,6 @@ that exec).
 | `smolvm` | public | CLI. Golden-fork: a build sandbox starts `--branchable`; `Snapshot` keeps it as the fork base; sandboxes from the snapshot template are `machine branch` clones. |
 | `fake` | public | Process-backed, for tests and conformance. |
 | `external` | public | A plugin process speaking `preloop.sandbox.driver.v1.Driver` over a Unix socket, in any language. |
-| Private drivers | private build | See the private repository for driver-specific implementations. |
 
 A clone inherits the fork base's full configuration, so a fork request is a
 delta: the `smolvm` driver applies network, mounts, shape, overlay size and
@@ -312,7 +312,10 @@ in-process and network APIs still return complete lists.
 The service keeps its working set in memory and writes through to its own
 store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
 `sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
-never references control tables. Writes are best-effort in the project's
+never references control tables. One process at a time holds
+`<state>/sandbox-service.lock` (flock): a second service, or a golden bake
+pointed at the same `PRELOOP_HOME`, fails instead of loading the store and
+reaping the running service's leases. Writes are best-effort in the project's
 sense: in-memory state is authoritative, so a store failure is logged at error
 level with the record kind and never fails the caller's RPC.
 
@@ -339,12 +342,15 @@ with three decisions, before any provider is placed on or caller served:
   did land, no record names it and the next reconcile destroys it as an
   orphan. The caller's retry with the same key releases the failed record and
   starts over.
-* **A sandbox left `TERMINATING` stays so.** Its destroy was decided but its
-  report died with the process; when the provider reports the machine in a
-  `Reconcile`, the service re-queues the destroy (bounded: three attempts,
-  after which the record is dropped and the machine is reaped as an orphan).
-  When the machine is missing from the inventory the record is dropped
-  immediately, so it stops holding a slot.
+* **A sandbox left `TERMINATING` stays so until its machine is gone.** A destroy
+  in flight is awaited however long it takes. When a destroy fails, or the
+  provider is lost with it, the next `Reconcile` asks again while the provider
+  still reports the machine. After three such failures the record becomes a
+  `GONE` tombstone instead of being dropped: `Reconcile` destroys its machine
+  directly, because the record still proves the machine is the service's. The
+  tombstone is removed once the provider stops reporting the machine. It holds
+  no capacity slot, so the pool may start one machine more than its slots until
+  that reclaim lands.
 
 Stop, start, pause, resume and snapshot are operations, not record states: the
 record moves only when their report lands, so a restart leaves the last settled
@@ -456,11 +462,14 @@ template instead of silently reusing the old one.
 The engine also sweeps orphaned SmolVM hypervisors under its home at pool
 startup and teardown (`OrphanPurge::All`). Those sweeps only see a machine's
 data directory, so the SmolVM driver writes an ownership marker into every
-machine it serves for a caller that is not the CI pool; the sweeps spare
-marked machines. Another caller's leased sandbox therefore survives an engine
-restart or stop, while pool machines stay unmarked and the sweep remains their
-crash backstop. The service's own delete path escalates to a targeted kill when
-`machine delete` refuses.
+machine it creates, pool machines included, and the sweeps spare marked
+machines. Another caller's leased sandbox therefore survives an engine restart
+or stop. The pool has no sweep backstop for its own machines: it deletes them
+through the service on teardown, and its startup cleanup releases leftovers
+through the service. A pool that the guest-agent guard disables starts no
+service and runs no cleanup, so its leftover runners keep running until the
+pool next starts. The service's own delete path escalates to a targeted kill
+when `machine delete` refuses.
 
 | Variable | Effect |
 |---|---|
@@ -515,6 +524,10 @@ preloop sandbox provider drain host-a                # cordon + release idle poo
 preloop sandbox provider uncordon host-a
 preloop sandbox provider rm host-a                     # revoke its certificates
 ```
+
+Without `--service` (or `PRELOOP_SANDBOX_URL`), the CLI reads
+`<home>/state/sandbox-endpoint`, which the local service writes when it binds,
+and refuses to send its bearer token to any other address.
 
 ## Verification
 

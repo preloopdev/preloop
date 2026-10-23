@@ -11,6 +11,7 @@ use preloop_sandbox::api::*;
 use preloop_sandbox::driver::TransferChunk;
 use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::error::message;
+use preloop_sandbox::placement::{Candidate, CandidateId, Placement, PlacementRequest};
 use preloop_sandbox::server::{Auth, router};
 use preloop_sandbox::service::TransferSide;
 use preloop_sandbox::store::{self, Kind, Store};
@@ -128,7 +129,7 @@ async fn harness_with_host_config_access(
         vec![fake.clone() as Arc<dyn Driver>],
         agent_config.with_access(access),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     wait_for_registered(&service).await;
     Harness {
@@ -741,11 +742,12 @@ async fn reconcile_destroys_orphans_and_fails_lost_sandboxes() {
         })
         .await
         .unwrap();
-    // An orphan the service never created appears on the host.
+    // A stale copy of one of our own sandboxes (a native ref no record
+    // names) appears on the host; reconcile may reap it.
     let orphan = h
         .fake
         .create(&CreateWork {
-            sandbox_id: "sbx-orphan".into(),
+            sandbox_id: lease.sandbox.id.clone(),
             driver: "fake".into(),
             ..CreateWork::default()
         })
@@ -1023,7 +1025,7 @@ async fn remote_agent_and_client_over_connect() {
         vec![fake as Arc<dyn Driver>],
         AgentConfig::new("remote-host"),
     );
-    tokio::spawn(agent.run(t.shutdown_token()));
+    tokio::spawn(agent.run(None, t.shutdown_token()));
 
     // A wrong caller token is rejected, over the same TLS endpoint.
     let ca = t.ca_pem();
@@ -1160,7 +1162,7 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
     agent_config.heartbeat = Duration::from_millis(50);
     let link = t.enroll("remote-host").await;
     let agent = Agent::new(Arc::new(link), vec![fake as Arc<dyn Driver>], agent_config);
-    tokio::spawn(agent.run(t.shutdown_token()));
+    tokio::spawn(agent.run(None, t.shutdown_token()));
 
     let client = t.client();
     wait_for(|| !Service::list_providers(&service).is_empty()).await;
@@ -1229,6 +1231,99 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn loopback_auth_requires_a_token_and_a_loopback_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let tls = preloop_sandbox::ServerTls::load_or_create(
+        &state,
+        vec!["127.0.0.1".to_owned(), "localhost".to_owned()],
+        None,
+        None,
+    )
+    .unwrap();
+    let mut config = ServiceConfig::new();
+    config.ca = Some(tls.ca.clone());
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    let http = preloop_sandbox::tls::http_client(tls.ca.pem(), None).unwrap();
+    let list = "/preloop.sandbox.v1.Sandboxes/List";
+
+    async fn status(
+        http: &reqwest::Client,
+        base: &str,
+        host: &str,
+        path: &str,
+        bearer: Option<&str>,
+    ) -> u16 {
+        let mut request = http
+            .post(format!("{base}{path}"))
+            .header("Host", host)
+            .header("Content-Type", "application/json")
+            .body("{}");
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        request.send().await.unwrap().status().as_u16()
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("https://{addr}");
+    let shutdown = CancellationToken::new();
+    tokio::spawn(preloop_sandbox::server::serve(
+        listener,
+        service.clone(),
+        preloop_sandbox::server::Auth::for_listener("client-secret", addr),
+        tls.clone(),
+        shutdown.clone(),
+    ));
+
+    // No bearer: rejected.
+    assert_eq!(status(&http, &base, "127.0.0.1", list, None).await, 401);
+    // DNS rebinding: the bearer is valid, the Host is not.
+    assert_eq!(
+        status(&http, &base, "evil.example", list, Some("client-secret")).await,
+        403
+    );
+    // Loopback names and ports are fine.
+    for host in [
+        "127.0.0.1",
+        "127.0.0.1:9191",
+        "localhost:9191",
+        "[::1]:9191",
+    ] {
+        assert_eq!(
+            status(&http, &base, host, list, Some("client-secret")).await,
+            200,
+            "Host {host} must be accepted"
+        );
+    }
+    shutdown.cancel();
+
+    // An empty token never authorizes: the listener fails closed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("https://{addr}");
+    let shutdown = CancellationToken::new();
+    tokio::spawn(preloop_sandbox::server::serve(
+        listener,
+        service,
+        preloop_sandbox::server::Auth {
+            client_token: String::new(),
+            loopback_only: true,
+        },
+        tls,
+        shutdown.clone(),
+    ));
+    assert_eq!(
+        status(&http, &base, "127.0.0.1", list, Some("anything")).await,
+        401
+    );
+    shutdown.cancel();
 }
 
 #[tokio::test]
@@ -1563,6 +1658,12 @@ async fn a_lost_provider_fails_its_sandboxes_instead_of_hanging_leases() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::DeadlineExceeded);
+    // Non-vacuous: the host held exactly one sandbox, still provisioning.
+    let before = service.list();
+    assert!(
+        before.len() == 1 && before[0].state == SandboxState::Provisioning,
+        "{before:?}"
+    );
     // The host stops answering: wait past the timeout the service declares
     // it lost by, not past the last heartbeat.
     alive.cancel();
@@ -1697,14 +1798,42 @@ async fn reconcile_never_destroys_another_providers_machine() {
     let response = h
         .service
         .reconcile(ReconcileRequest {
-            provider_id: other.provider_id,
+            provider_id: other.provider_id.clone(),
             generation: other.generation,
             sandboxes: observed,
             ..ReconcileRequest::default()
         })
         .await
         .unwrap();
-    assert!(response.destroy.iter().any(|w| w.native_ref == orphan));
+    assert!(
+        !response.destroy.iter().any(|w| w.native_ref == orphan),
+        "an unknown machine was reaped: {:?}",
+        response.destroy
+    );
+
+    // A machine reported under a sandbox id we own is ours even when its
+    // native reference is unknown: a stale copy of one of our sandboxes must
+    // be reaped rather than left running.
+    let stale = "sbx-stale-machine".to_owned();
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id.clone(),
+            generation: other.generation,
+            sandboxes: vec![Observed {
+                driver: "fake".into(),
+                native_ref: stale.clone(),
+                sandbox_id: sandbox_id.clone(),
+                ..Observed::default()
+            }],
+            ..ReconcileRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        response.destroy.iter().any(|w| w.native_ref == stale),
+        "a stale copy of our own sandbox must be reaped"
+    );
 }
 
 /// A golden is a template's fork base, not a sandbox: it has no record, so
@@ -2378,7 +2507,7 @@ async fn blob_upload_cap_rejects_and_consumes_the_ticket() {
         vec![fake as Arc<dyn Driver>],
         AgentConfig::new("host-a"),
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     wait_for(|| !service.list_providers().is_empty()).await;
     service.put_template(template("alpine")).await.unwrap();
@@ -2574,7 +2703,7 @@ async fn transfers_stream_without_staging_files() {
             vec![gated as Arc<dyn Driver>],
             agent_config,
         )
-        .run(shutdown.clone()),
+        .run(None, shutdown.clone()),
     );
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     wait_for_registered(&service).await;
@@ -2781,7 +2910,7 @@ async fn an_agent_that_disappears_mid_transfer_fails_the_caller_and_consumes_the
             vec![fake as Arc<dyn Driver>],
             agent_config,
         )
-        .run(shutdown.clone()),
+        .run(None, shutdown.clone()),
     );
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     wait_for_registered(&service).await;
@@ -3265,6 +3394,379 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
     );
 }
 
+/// One record as the service holds it, whatever its state. `Get` requires the
+/// caller's live lease, and these tests follow a released record.
+fn sandbox_record(h: &Harness, sandbox_id: &str) -> Option<Sandbox> {
+    h.service
+        .list()
+        .into_iter()
+        .find(|sandbox| sandbox.id == sandbox_id)
+}
+
+/// Releases a sandbox with every destroy failing, and reconciles the way the
+/// agent does, until its record is a tombstone. The machine is still on the
+/// host when this returns.
+async fn release_until_tombstoned(h: &Harness, lease_id: &str, sandbox_id: &str) {
+    h.fake
+        .fail_destroys
+        .store(1000, std::sync::atomic::Ordering::Release);
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease_id.into(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    let provider = h.service.list_providers().remove(0);
+    for _ in 0..200 {
+        let sandboxes = h.fake.inventory().await.unwrap();
+        h.service
+            .reconcile(ReconcileRequest {
+                provider_id: provider.id.clone(),
+                generation: provider.generation,
+                sandboxes,
+                ..ReconcileRequest::default()
+            })
+            .await
+            .unwrap();
+        match sandbox_record(h, sandbox_id) {
+            Some(sandbox) if sandbox.state == SandboxState::Gone => return,
+            Some(sandbox) => assert_eq!(
+                sandbox.state,
+                SandboxState::Terminating,
+                "the record holds until the third failure"
+            ),
+            None => panic!("the record was dropped before its machine was destroyed"),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the destroy never reached its third failure");
+}
+
+/// A destroy that outlasts several reconcile rounds keeps its record: each
+/// round finds it in flight and leaves it alone, so it is neither asked again
+/// nor counted toward giving up, and the record completes once the machine is
+/// gone.
+#[tokio::test]
+async fn a_slow_destroy_keeps_its_record_until_it_reports() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let sandbox_id = lease.sandbox.id.clone();
+    h.fake
+        .destroy_delay_ms
+        .store(1500, std::sync::atomic::Ordering::Release);
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    let provider = h.service.list_providers().remove(0);
+    for _ in 0..4 {
+        let sandboxes = h.fake.inventory().await.unwrap();
+        h.service
+            .reconcile(ReconcileRequest {
+                provider_id: provider.id.clone(),
+                generation: provider.generation,
+                sandboxes,
+                ..ReconcileRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            sandbox_record(&h, &sandbox_id).unwrap().state,
+            SandboxState::Terminating,
+            "a destroy in flight keeps its record"
+        );
+    }
+    wait_for(|| sandbox_record(&h, &sandbox_id).is_none()).await;
+    // Let any destroy asked a second time run before counting the calls.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        h.fake
+            .destroy_calls
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the slow destroy was never asked again"
+    );
+    let machines = h.fake.inventory().await.unwrap();
+    assert!(
+        machines
+            .iter()
+            .all(|observed| observed.native_ref != lease.sandbox.native_ref),
+        "the machine is gone once its destroy reports"
+    );
+}
+
+/// A destroy that keeps failing leaves its machine reclaimable: the record
+/// holds through the first two failures, becomes a tombstone at the third, and
+/// once the service restarts the new agent's first reconcile destroys the
+/// machine.
+#[tokio::test]
+async fn a_destroy_that_fails_three_times_leaves_the_machine_reclaimable_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let host = dir.path().join("host");
+    let (sandbox_id, native_ref) = {
+        let h = harness_with_host(
+            store::open(db.to_str().unwrap()).await.unwrap(),
+            tempfile::tempdir().unwrap(),
+            host.clone(),
+            FakeDriver::full_capabilities(),
+        )
+        .await;
+        h.service.put_template(template("alpine")).await.unwrap();
+        let lease = h
+            .service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                template: "alpine".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
+        let record = sandbox_record(&h, &lease.sandbox.id).unwrap();
+        assert_eq!(record.state, SandboxState::Gone);
+        assert!(
+            record.error.contains("destroy failed 3 times"),
+            "{}",
+            record.error
+        );
+        // Every destroy failed, the agent's own orphan destroys included, so
+        // the machine is still on the host when the service goes down.
+        assert!(
+            h.fake
+                .inventory()
+                .await
+                .unwrap()
+                .iter()
+                .any(|observed| observed.native_ref == lease.sandbox.native_ref),
+            "the machine is still on the host"
+        );
+        (lease.sandbox.id.clone(), lease.sandbox.native_ref.clone())
+    };
+    // Restart: the tombstone comes back from the store, and the new agent's
+    // first reconcile destroys the machine it still reports.
+    let h = harness_with_host(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        tempfile::tempdir().unwrap(),
+        host,
+        FakeDriver::full_capabilities(),
+    )
+    .await;
+    for _ in 0..200 {
+        if h.fake
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .all(|observed| observed.native_ref != native_ref)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        h.fake
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .all(|observed| observed.native_ref != native_ref),
+        "the restarted agent reclaims the machine"
+    );
+    // Once the provider no longer reports the machine, the tombstone is done.
+    let provider = h.service.list_providers().remove(0);
+    let sandboxes = h.fake.inventory().await.unwrap();
+    h.service
+        .reconcile(ReconcileRequest {
+            provider_id: provider.id.clone(),
+            generation: provider.generation,
+            sandboxes,
+            ..ReconcileRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        sandbox_record(&h, &sandbox_id).is_none(),
+        "the tombstone is removed once its machine is gone"
+    );
+}
+
+/// A tombstone keeps its machine provably the service's when the provider
+/// reports it without the sandbox id, as a caller-named machine is reported:
+/// reconcile hands the machine back for destruction.
+#[tokio::test]
+async fn a_tombstoned_machine_is_reclaimed_when_reported_without_its_id() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
+    let provider = h.service.list_providers().remove(0);
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: provider.id.clone(),
+            generation: provider.generation,
+            sandboxes: vec![Observed {
+                driver: "fake".into(),
+                native_ref: lease.sandbox.native_ref.clone(),
+                sandbox_id: String::new(),
+                ..Observed::default()
+            }],
+            ..ReconcileRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        response
+            .destroy
+            .iter()
+            .any(|work| work.native_ref == lease.sandbox.native_ref),
+        "a tombstone's machine is reclaimed without its id: {:?}",
+        response.destroy
+    );
+}
+
+/// A tombstone belongs to the provider that created its machine. Another agent
+/// on the same host reports that machine too, and must leave it alone.
+#[tokio::test]
+async fn a_tombstone_is_not_reaped_by_another_provider() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
+    let other = h
+        .service
+        .register(RegisterRequest {
+            name: "host-b".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities().into(),
+                ..DriverInfo::default()
+            }],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
+        })
+        .await
+        .unwrap();
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id.clone(),
+            generation: other.generation,
+            sandboxes: h.fake.inventory().await.unwrap(),
+            ..ReconcileRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        response
+            .destroy
+            .iter()
+            .all(|work| work.native_ref != lease.sandbox.native_ref),
+        "another provider reaped a tombstone it does not own: {:?}",
+        response.destroy
+    );
+    assert_eq!(
+        sandbox_record(&h, &lease.sandbox.id).unwrap().state,
+        SandboxState::Gone,
+        "the owning provider still holds the tombstone"
+    );
+}
+
+/// A store that refuses provider rows, as a full or read-only disk would.
+struct RefusesProviderRows(Arc<dyn Store>);
+
+#[async_trait::async_trait]
+impl Store for RefusesProviderRows {
+    async fn put(
+        &self,
+        kind: Kind,
+        id: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), preloop_sandbox::Error> {
+        if kind == Kind::Providers {
+            return Err(preloop_sandbox::Error::internal("disk full"));
+        }
+        self.0.put(kind, id, value).await
+    }
+
+    async fn delete(&self, kind: Kind, id: &str) -> Result<(), preloop_sandbox::Error> {
+        self.0.delete(kind, id).await
+    }
+
+    async fn load(&self, kind: Kind) -> Result<Vec<serde_json::Value>, preloop_sandbox::Error> {
+        self.0.load(kind).await
+    }
+}
+
+/// A generation counts only once the store has kept it. A restart bumps the
+/// stored generation, so a generation handed out and then lost can be issued
+/// again, and the session that still holds it would pass `fence` without
+/// re-registering.
+#[tokio::test]
+async fn a_generation_the_store_cannot_keep_is_never_handed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = store::open("memory:").await.unwrap();
+    let service = Service::open(
+        Arc::new(RefusesProviderRows(inner)),
+        ServiceConfig::new(),
+    )
+    .await
+    .unwrap();
+    let request = || RegisterRequest {
+        name: "host-a".into(),
+        drivers: vec![DriverInfo {
+            driver: "fake".into(),
+            capabilities: FakeDriver::full_capabilities().into(),
+            ..DriverInfo::default()
+        }],
+        protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+        ..RegisterRequest::default()
+    };
+    for _ in 0..2 {
+        let Err(error) = service.register(request()).await else {
+            panic!("a generation the store refused was handed to the agent");
+        };
+        assert_eq!(
+            error.code,
+            Code::Unavailable,
+            "{}",
+            error.message.as_deref().unwrap_or_default()
+        );
+    }
+}
+
 /// A lease on a host that stopped answering is released, not held to its TTL:
 /// the caller learns it is gone, and the machine is left for reconcile.
 #[tokio::test]
@@ -3295,7 +3797,7 @@ async fn a_lost_provider_releases_its_leases() {
         vec![fake as Arc<dyn Driver>],
         agent_config,
     );
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     wait_for(|| !service.list_providers().is_empty()).await;
     service.put_template(template("alpine")).await.unwrap();
     let lease = service
@@ -3565,7 +4067,7 @@ async fn lossy_harness(
     agent_config.retry_backoff = retry_backoff;
     let shutdown = CancellationToken::new();
     let agent = Agent::new(link, vec![fake.clone() as Arc<dyn Driver>], agent_config);
-    tokio::spawn(agent.run(shutdown.clone()));
+    tokio::spawn(agent.run(None, shutdown.clone()));
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     wait_for_registered(&service).await;
     (
@@ -4065,7 +4567,7 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
         vec![fake.clone() as Arc<dyn Driver>],
         AgentConfig::new("remote-host"),
     );
-    tokio::spawn(agent.run(t.shutdown_token()));
+    tokio::spawn(agent.run(None, t.shutdown_token()));
     let client = t.client();
     wait_for(|| !service.list_providers().is_empty()).await;
     client.put_template(template("alpine")).await.unwrap();
@@ -4101,4 +4603,1070 @@ async fn dropping_a_remote_exec_stream_cancels_the_command() {
         .await
         .unwrap();
     assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn a_configured_placement_ranks_the_candidates() {
+    struct Busiest;
+
+    impl Placement for Busiest {
+        fn name(&self) -> &'static str {
+            "busiest"
+        }
+
+        fn rank(&self, _request: &PlacementRequest, candidates: &[Candidate]) -> Vec<CandidateId> {
+            let mut ranked: Vec<CandidateId> =
+                candidates.iter().map(|candidate| candidate.id).collect();
+            ranked.sort_by_key(|id| std::cmp::Reverse(candidates[id.0].live));
+            ranked
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ServiceConfig::new();
+    config.acquire_wait = Duration::from_secs(10);
+    config.placement = Arc::new(Busiest);
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    let add_host = |name: &str| {
+        let fake = Arc::new(FakeDriver::new(
+            "fake",
+            dir.path().join(name),
+            FakeDriver::full_capabilities(),
+        ));
+        let agent = Agent::new(
+            Arc::new(service.clone()) as Arc<dyn ProviderLink>,
+            vec![fake as Arc<dyn Driver>],
+            AgentConfig::new(name),
+        );
+        tokio::spawn(agent.run(None, shutdown.clone()));
+    };
+    add_host("host-a");
+    wait_for(|| service.list_providers().len() == 1).await;
+    service.put_template(template("alpine")).await.unwrap();
+    // The only host, so the first lease lands there and loads it.
+    let first = service
+        .acquire(AcquireRequest {
+            idempotency_key: "k1".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .expect("first acquire");
+    add_host("host-b");
+    wait_for(|| service.list_providers().len() == 2).await;
+    let second = service
+        .acquire(AcquireRequest {
+            idempotency_key: "k2".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .expect("second acquire");
+    // `least-loaded` would have taken the empty host; the configured placement
+    // wins, and the service still admits the loaded candidate.
+    assert_eq!(second.sandbox.provider_id, first.sandbox.provider_id);
+    assert_ne!(second.sandbox.id, first.sandbox.id);
+}
+
+#[tokio::test]
+async fn reconcile_spares_foreign_orphans_and_fails_lost_sandboxes() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    // An orphan the service never created appears on the host.
+    let orphan = h
+        .fake
+        .create(&CreateWork {
+            sandbox_id: "sbx-orphan".into(),
+            driver: "fake".into(),
+            ..CreateWork::default()
+        })
+        .await
+        .unwrap();
+    // The leased machine disappears behind the service's back.
+    h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
+    wait_for(|| {
+        h.service
+            .get(&lease.sandbox.id, &lease.lease.id)
+            .is_ok_and(|s| s.state == SandboxState::Failed)
+    })
+    .await;
+    // The orphan is not ours (another service sharing this host registry may
+    // have created it), so reconcile must leave it alone.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        h.fake
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .any(|o| o.native_ref == orphan),
+        "a foreign machine was reaped"
+    );
+}
+
+#[tokio::test]
+async fn exec_rejects_a_shell_metacharacter_env_key() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "env-key".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let marker = h._dir.path().join("pwned");
+    let key = format!("A; touch {}", marker.display());
+    let error = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: lease.sandbox.id.clone(),
+            lease_id: lease.lease.id.clone(),
+            argv: vec!["true".into()],
+            env: [(key, "1".into())].into_iter().collect(),
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(!marker.exists(), "the env key injected a command");
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+async fn unclaimed_service(dir: &tempfile::TempDir, unclaimed: Duration) -> Arc<Service> {
+    let mut config = ServiceConfig::new();
+    config.unclaimed_lease_ttl = unclaimed;
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    service
+        .register(RegisterRequest {
+            name: "host-a".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities().into(),
+                ..DriverInfo::default()
+            }],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
+        })
+        .await
+        .unwrap();
+    service.put_template(template("alpine")).await.unwrap();
+    service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    service
+}
+
+#[tokio::test]
+async fn pool_acquire_rejects_template_placement_fields() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let base = || AcquireRequest {
+        idempotency_key: "k".into(),
+        pool: "p".into(),
+        ..AcquireRequest::default()
+    };
+    let cases: Vec<(&str, AcquireRequest)> = vec![
+        (
+            "shape",
+            AcquireRequest {
+                shape: Shape {
+                    cpus: 2,
+                    ..Shape::default()
+                }
+                .into(),
+                ..base()
+            },
+        ),
+        (
+            "network",
+            AcquireRequest {
+                network: NetworkPolicy {
+                    mode: NetworkMode::UNRESTRICTED.into(),
+                    ..NetworkPolicy::default()
+                }
+                .into(),
+                ..base()
+            },
+        ),
+        (
+            "mounts",
+            AcquireRequest {
+                mounts: vec![Mount {
+                    host: "/tmp".into(),
+                    guest: "/mnt".into(),
+                    readonly: true,
+                    ..Mount::default()
+                }],
+                ..base()
+            },
+        ),
+        (
+            "sockets",
+            AcquireRequest {
+                sockets: vec![SocketMount {
+                    host: "/tmp/sock".into(),
+                    guest: "/run/sock".into(),
+                    ..SocketMount::default()
+                }],
+                ..base()
+            },
+        ),
+        ("options", {
+            let mut request = base();
+            request
+                .options
+                .insert("dns".to_owned(), "8.8.8.8".to_owned());
+            request
+        }),
+    ];
+    for (field, request) in cases {
+        let error = h.service.acquire(request).await.unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument);
+        assert!(message(&error).contains(field), "{}", message(&error));
+        assert!(
+            message(&error).contains("set these on the pool, or acquire from the template"),
+            "{}",
+            message(&error)
+        );
+    }
+    assert!(h.service.list().is_empty(), "nothing was created");
+}
+
+#[tokio::test]
+async fn abandoned_unclaimed_lease_is_released_after_the_unclaimed_ttl() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = unclaimed_service(&dir, Duration::ZERO).await;
+    let error = service
+        .acquire(AcquireRequest {
+            idempotency_key: "abandoned".into(),
+            pool: "p".into(),
+            wait_secs: Some(0),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::DeadlineExceeded);
+    assert_eq!(service.list().len(), 1, "the lease is provisioning");
+    service.maintain().await;
+    assert!(
+        service.list().is_empty(),
+        "the abandoned lease was released"
+    );
+}
+
+#[tokio::test]
+async fn waiting_acquire_keeps_its_lease_past_the_unclaimed_ttl() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = unclaimed_service(&dir, Duration::ZERO).await;
+    let handle = tokio::spawn({
+        let service = service.clone();
+        async move {
+            service
+                .acquire(AcquireRequest {
+                    idempotency_key: "waiting".into(),
+                    pool: "p".into(),
+                    ..AcquireRequest::default()
+                })
+                .await
+        }
+    });
+    wait_for(|| service.list().len() == 1).await;
+    service.maintain().await;
+    assert_eq!(service.list().len(), 1, "a waiting caller keeps its lease");
+    handle.abort();
+    let _ = handle.await;
+    service.maintain().await;
+    assert!(
+        service.list().is_empty(),
+        "once no caller waits the lease expires"
+    );
+}
+
+#[tokio::test]
+async fn delivered_lease_gets_the_full_ttl() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let response = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "delivered".into(),
+            pool: "p".into(),
+            ttl_secs: 3600,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.lease.requested_ttl_secs, 3600);
+    let remaining = response.lease.expires_at - unix_now();
+    assert!(
+        remaining > 3000,
+        "delivery restores the full TTL, got {remaining}s"
+    );
+}
+
+#[tokio::test]
+async fn injected_files_default_to_owner_only_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = dir.path().join("host");
+    let h = harness_with_host(
+        store::open("memory:").await.unwrap(),
+        tempfile::tempdir().unwrap(),
+        host.clone(),
+        FakeDriver::full_capabilities(),
+    )
+    .await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let mut request = AcquireRequest {
+        idempotency_key: "mode".into(),
+        template: "alpine".into(),
+        ..AcquireRequest::default()
+    };
+    request.inject.get_or_insert_default().files.push(FileSpec {
+        path: "/run/secret".into(),
+        data: b"token".to_vec(),
+        mode: 0,
+        ..FileSpec::default()
+    });
+    let lease = h.service.acquire(request).await.unwrap();
+    let path = host
+        .join("sandboxes")
+        .join(&lease.sandbox.native_ref)
+        .join("run/secret");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "injected files are owner-only by default");
+}
+
+#[tokio::test]
+async fn restart_keeps_the_requested_lease_ttl() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    {
+        let mut config = ServiceConfig::new();
+        config.unclaimed_lease_ttl = Duration::from_secs(5);
+        let service = Service::open(store::open(db.to_str().unwrap()).await.unwrap(), config)
+            .await
+            .unwrap();
+        service
+            .register(RegisterRequest {
+                name: "host-a".into(),
+                drivers: vec![DriverInfo {
+                    driver: "fake".into(),
+                    capabilities: FakeDriver::full_capabilities().into(),
+                    ..DriverInfo::default()
+                }],
+                protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+                ..RegisterRequest::default()
+            })
+            .await
+            .unwrap();
+        service.put_template(template("alpine")).await.unwrap();
+        service
+            .put_pool(PoolSpec {
+                name: "p".into(),
+                template: "alpine".into(),
+                ..PoolSpec::default()
+            })
+            .await
+            .unwrap();
+        let error = service
+            .acquire(AcquireRequest {
+                idempotency_key: "kept".into(),
+                pool: "p".into(),
+                ttl_secs: 3600,
+                wait_secs: Some(0),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::DeadlineExceeded);
+    }
+    let store = store::open(db.to_str().unwrap()).await.unwrap();
+    let leases: Vec<Lease> = store
+        .load(Kind::Leases)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].requested_ttl_secs, 3600);
+    let remaining = leases[0].expires_at - unix_now();
+    assert!(
+        remaining <= 6,
+        "an unclaimed lease expires in the short window, got {remaining}s"
+    );
+    let restored = Service::open(store, ServiceConfig::new())
+        .await
+        .unwrap();
+    assert_eq!(restored.list().len(), 1);
+}
+
+#[tokio::test]
+async fn leases_persisted_before_requested_ttls_are_treated_as_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    let expires = unix_now() + 100;
+    {
+        let store = store::open(db.to_str().unwrap()).await.unwrap();
+        store
+            .put(
+                Kind::Leases,
+                "lse-old",
+                &serde_json::json!({
+                    "id": "lse-old",
+                    "sandboxId": "sbx-old",
+                    "idempotencyKey": "legacy",
+                    "expiresAt": expires,
+                }),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                Kind::Sandboxes,
+                "sbx-old",
+                &serde_json::json!({
+                    "id": "sbx-old",
+                    "template": "alpine",
+                    "pool": "p",
+                    "providerId": "prv-x",
+                    "driver": "fake",
+                    "state": "LEASED",
+                    "leaseId": "lse-old",
+                    "createdAt": unix_now(),
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let service = Service::open(
+        store::open(db.to_str().unwrap()).await.unwrap(),
+        ServiceConfig::new(),
+    )
+    .await
+    .unwrap();
+    let response = service
+        .acquire(AcquireRequest {
+            idempotency_key: "legacy".into(),
+            template: "gone".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.lease.id, "lse-old");
+    assert_eq!(response.lease.requested_ttl_secs, 0);
+    assert_eq!(
+        response.lease.expires_at, expires,
+        "a pre-change lease keeps its expiry"
+    );
+}
+
+#[tokio::test]
+async fn replayed_acquire_of_a_failed_sandbox_persists_its_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sandbox.db");
+    {
+        let h = harness_with(
+            store::open(db.to_str().unwrap()).await.unwrap(),
+            tempfile::tempdir().unwrap(),
+            FakeDriver::full_capabilities(),
+        )
+        .await;
+        h.service.put_template(template("alpine")).await.unwrap();
+        h.fake
+            .fail_creates
+            .store(1, std::sync::atomic::Ordering::Release);
+        let error = h
+            .service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                template: "alpine".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::Unavailable);
+    }
+    // The replay's failure path removed the lease in memory. That removal
+    // must reach the store, or a restart resurrects a dead key.
+    let store = store::open(db.to_str().unwrap()).await.unwrap();
+    assert!(
+        store.load(Kind::Leases).await.unwrap().is_empty(),
+        "the failed replay's lease release was not persisted"
+    );
+    assert!(
+        store.load(Kind::Sandboxes).await.unwrap().is_empty(),
+        "the failed replay's sandbox delete was not persisted"
+    );
+}
+
+#[tokio::test]
+async fn a_preserved_pool_member_never_returns_to_the_warm_set() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            warm: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .any(|s| s.pool == "p" && s.state == SandboxState::Ready)
+    })
+    .await;
+    let idle = h.service.list()[0].clone();
+    // Idle members carry no lease: without the capability there is nothing
+    // to pause, so an unleased caller is refused outright.
+    let error = h.service.pause(&idle.id, "").await.unwrap_err();
+    assert_eq!(error.code, Code::PermissionDenied);
+
+    let lease = h.service.acquire(acquire("k", "p")).await.unwrap();
+    let id = lease.sandbox.id.clone();
+    h.service.pause(&id, &lease.lease.id).await.unwrap();
+    h.service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Preserve.into(),
+            preserve_ttl_secs: 60,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    let paused = h.service.get(&id, &lease.lease.id).unwrap();
+    assert_eq!(
+        paused.state,
+        SandboxState::Paused,
+        "PRESERVE kept power state"
+    );
+    assert!(paused.preserve_until > unix_now());
+    h.service.resume(&id, &lease.lease.id).await.unwrap();
+    let resumed = h.service.get(&id, &lease.lease.id).unwrap();
+    assert_eq!(
+        resumed.state,
+        SandboxState::Preserved,
+        "a machine that held a lease must never rejoin the warm set"
+    );
+    assert!(resumed.preserve_until > unix_now());
+    h.service.maintain().await;
+    assert_eq!(
+        h.service.get(&id, &lease.lease.id).unwrap().state,
+        SandboxState::Preserved,
+        "the preserved member must not be swept before its deadline"
+    );
+    // The next acquire gets a clean machine, not the used one.
+    let fresh = h.service.acquire(acquire("k2", "p")).await.unwrap();
+    assert_ne!(fresh.sandbox.id, id);
+}
+
+#[tokio::test]
+async fn paused_and_stopped_debug_sandboxes_expire_from_the_preserve_window() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let mut request = AcquireRequest {
+        idempotency_key: "pause".into(),
+        template: "alpine".into(),
+        ..AcquireRequest::default()
+    };
+    let paused = h.service.acquire(request.clone()).await.unwrap();
+    h.service
+        .pause(&paused.sandbox.id, &paused.lease.id)
+        .await
+        .unwrap();
+    h.service
+        .release(ReleaseRequest {
+            lease_id: paused.lease.id.clone(),
+            mode: ReleaseMode::Preserve.into(),
+            preserve_ttl_secs: 1,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.service
+            .get(&paused.sandbox.id, &paused.lease.id)
+            .unwrap()
+            .state,
+        SandboxState::Paused
+    );
+
+    request.idempotency_key = "stop".into();
+    let stopped = h.service.acquire(request).await.unwrap();
+    h.service
+        .stop(&stopped.sandbox.id, &stopped.lease.id)
+        .await
+        .unwrap();
+    h.service
+        .release(ReleaseRequest {
+            lease_id: stopped.lease.id.clone(),
+            mode: ReleaseMode::Preserve.into(),
+            preserve_ttl_secs: 1,
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.service
+            .get(&stopped.sandbox.id, &stopped.lease.id)
+            .unwrap()
+            .state,
+        SandboxState::Stopped
+    );
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    h.service.maintain().await;
+    wait_for(|| h.service.get(&paused.sandbox.id, &paused.lease.id).is_err()).await;
+    wait_for(|| {
+        h.service
+            .get(&stopped.sandbox.id, &stopped.lease.id)
+            .is_err()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn renew_keeps_the_acquired_ttl() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ttl_secs: 120,
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let renewed = h
+        .service
+        .renew(RenewRequest {
+            lease_id: lease.lease.id.clone(),
+            ttl_secs: 0,
+            ..RenewRequest::default()
+        })
+        .await
+        .unwrap();
+    let now = unix_now();
+    assert_eq!(renewed.requested_ttl_secs, 120);
+    assert!(
+        renewed.expires_at >= now + 115 && renewed.expires_at <= now + 125,
+        "renew without a TTL used the service default: {}",
+        renewed.expires_at - now
+    );
+
+    // A pool lease keeps the pool's TTL.
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            lease_ttl_secs: 90,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let pooled = h.service.acquire(acquire("pooled", "p")).await.unwrap();
+    let renewed = h
+        .service
+        .renew(RenewRequest {
+            lease_id: pooled.lease.id.clone(),
+            ttl_secs: 0,
+            ..RenewRequest::default()
+        })
+        .await
+        .unwrap();
+    let now = unix_now();
+    assert!(
+        renewed.expires_at >= now + 85 && renewed.expires_at <= now + 95,
+        "renew lost the pool TTL: {}",
+        renewed.expires_at - now
+    );
+}
+
+#[tokio::test]
+async fn delete_template_refuses_while_a_clone_is_live() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let source = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "source".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    h.service
+        .snapshot(SnapshotRequest {
+            sandbox_id: source.sandbox.id.clone(),
+            lease_id: source.lease.id.clone(),
+            name: "golden".into(),
+            ..SnapshotRequest::default()
+        })
+        .await
+        .unwrap();
+    let clone = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "clone".into(),
+            template: "golden".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let error = h.service.delete_template("golden").await.unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    assert!(
+        message(&error).contains(&clone.sandbox.id),
+        "{}",
+        message(&error)
+    );
+    h.service
+        .release(ReleaseRequest {
+            lease_id: clone.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap();
+    wait_for(|| h.service.list().is_empty()).await;
+    h.service.delete_template("golden").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_snapshot_in_flight_reserves_its_source() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let id = lease.sandbox.id.clone();
+    h.fake
+        .snapshot_delay_ms
+        .store(300, std::sync::atomic::Ordering::Release);
+    let snapshot = tokio::spawn({
+        let service = h.service.clone();
+        let id = id.clone();
+        let lease_id = lease.lease.id.clone();
+        async move {
+            service
+                .snapshot(SnapshotRequest {
+                    sandbox_id: id,
+                    lease_id,
+                    name: "golden".into(),
+                    ..SnapshotRequest::default()
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // A second snapshot and a release must fail while the first is in flight.
+    let second = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: id.clone(),
+            lease_id: lease.lease.id.clone(),
+            name: "other".into(),
+            ..SnapshotRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(second.code, Code::FailedPrecondition);
+    let release = h
+        .service
+        .release(ReleaseRequest {
+            lease_id: lease.lease.id.clone(),
+            mode: ReleaseMode::Destroy.into(),
+            ..ReleaseRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(release.code, Code::FailedPrecondition);
+
+    // A lifecycle change (pause) during the capture invalidates the result.
+    h.service.pause(&id, &lease.lease.id).await.unwrap();
+    let error = snapshot.await.unwrap().unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", message(&error));
+    assert!(
+        h.service
+            .list_templates()
+            .iter()
+            .all(|t| t.spec.name != "golden")
+    );
+}
+
+#[tokio::test]
+async fn a_reconfigured_pool_never_serves_an_old_warm_member() {
+    let h = harness().await;
+    h.service.put_template(template("one")).await.unwrap();
+    h.service.put_template(template("two")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "one".into(),
+            warm: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .any(|s| s.state == SandboxState::Ready && s.template == "one")
+    })
+    .await;
+    let old = h.service.list()[0].id.clone();
+
+    // Scaling the pool does not change how members are built.
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "one".into(),
+            warm: 2,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    h.service.maintain().await;
+    assert!(
+        h.service.list().iter().any(|s| s.id == old),
+        "a warm-count change retired the warm member"
+    );
+
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "two".into(),
+            warm: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    h.service.maintain().await;
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .any(|s| s.state == SandboxState::Ready && s.template == "two")
+    })
+    .await;
+    assert!(
+        h.service.list().iter().all(|s| s.id != old),
+        "the old-revision warm member was not retired"
+    );
+    let lease = h.service.acquire(acquire("k", "p")).await.unwrap();
+    assert_eq!(lease.sandbox.template, "two");
+}
+
+#[tokio::test]
+async fn replayed_acquire_of_a_stopped_sandbox_returns_it() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    h.service
+        .stop(&lease.sandbox.id, &lease.lease.id)
+        .await
+        .unwrap();
+    let replay = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(replay.sandbox.id, lease.sandbox.id);
+    assert_eq!(replay.sandbox.state, SandboxState::Stopped);
+}
+
+#[tokio::test]
+async fn pool_acquire_rejects_a_build_purpose() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "p".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    let error = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "k".into(),
+            pool: "p".into(),
+            purpose: Purpose::Build.into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(message(&error).contains("build"), "{}", message(&error));
+}
+
+#[tokio::test]
+async fn reconcile_protects_snapshot_bases_from_any_provider() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let source = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "source".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let golden = h
+        .service
+        .snapshot(SnapshotRequest {
+            sandbox_id: source.sandbox.id.clone(),
+            lease_id: source.lease.id.clone(),
+            name: "golden".into(),
+            ..SnapshotRequest::default()
+        })
+        .await
+        .unwrap();
+    let other = h
+        .service
+        .register(RegisterRequest {
+            name: "host-b".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities: FakeDriver::full_capabilities().into(),
+                ..DriverInfo::default()
+            }],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
+        })
+        .await
+        .unwrap();
+    let response = h
+        .service
+        .reconcile(ReconcileRequest {
+            provider_id: other.provider_id,
+            generation: other.generation,
+            sandboxes: vec![Observed {
+                driver: "fake".into(),
+                native_ref: golden.native_ref.clone(),
+                sandbox_id: String::new(),
+                ..Observed::default()
+            }],
+            ..ReconcileRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        response.destroy.is_empty(),
+        "another provider reaped the snapshot base: {:?}",
+        response.destroy
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_key_acquires_inject_once() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let request = AcquireRequest {
+        idempotency_key: "same".into(),
+        template: "alpine".into(),
+        inject: Inject {
+            files: vec![FileSpec {
+                path: "/work/value".into(),
+                data: b"injected".to_vec(),
+                mode: 0,
+                ..FileSpec::default()
+            }],
+            ..Inject::default()
+        }
+        .into(),
+        ..AcquireRequest::default()
+    };
+    let (first, second) = tokio::join!(
+        h.service.acquire(request.clone()),
+        h.service.acquire(request)
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.sandbox.id, second.sandbox.id);
+    let (code, stdout, _) = h
+        .service
+        .exec_collect(ExecRequest {
+            sandbox_id: first.sandbox.id.clone(),
+            lease_id: first.lease.id.clone(),
+            argv: vec!["cat".into(), "work/value".into()],
+            ..ExecRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, b"injected");
 }

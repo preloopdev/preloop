@@ -479,8 +479,12 @@ pub(super) fn on_job_enqueued(
         .map_err(db)?;
         return Ok(());
     }
-    if pool_enabled {
-        // No free runner: mark pool-pending so provisioning sees it.
+    if pool_enabled || require_assignments {
+        // No free runner: mark pool-pending so provisioning sees it. Under
+        // strict assignments the mark is also the job's claim visa after the
+        // binding TTL, so it must be written even with the pool off —
+        // otherwise the job is ready with no intent row and no runner may
+        // ever claim it.
         tx.prepare_cached(
             "INSERT INTO provision_requests (run_id, job_id, namespace_id, pool_key, labels) \
              VALUES (?1, ?2, ?3, ?4, ?5) \

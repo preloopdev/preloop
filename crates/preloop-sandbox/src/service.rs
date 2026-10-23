@@ -33,6 +33,10 @@ use crate::tls;
 pub struct ServiceConfig {
     /// Default lease TTL.
     pub lease_ttl: Duration,
+    /// How long an acquired-but-never-returned lease (one whose `Acquire` is
+    /// still provisioning, or timed out) may live before maintenance releases
+    /// it. A waiting `Acquire` keeps its lease past this window.
+    pub unclaimed_lease_ttl: Duration,
     /// Default time `Acquire` waits for a ready sandbox.
     pub acquire_wait: Duration,
     /// A provider silent this long is not placed on.
@@ -77,6 +81,7 @@ impl ServiceConfig {
     pub fn new() -> Self {
         Self {
             lease_ttl: Duration::from_secs(3600),
+            unclaimed_lease_ttl: Duration::from_secs(600),
             acquire_wait: Duration::from_secs(900),
             provider_timeout: Duration::from_secs(45),
             create_timeout: Duration::from_secs(1800),
@@ -113,11 +118,11 @@ pub const MAX_PAGE_SIZE: u32 = 1000;
 /// Default cap for one blob upload: 8 GiB.
 pub const DEFAULT_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// How often `Reconcile` re-queues a destroy for a `Terminating` record whose
-/// machine is still in the provider's inventory. A provider that keeps
-/// reporting the machine alive is not making progress: after this many
-/// attempts the record is dropped and the machine becomes an orphan the same
-/// reconcile destroys.
+/// Unsuccessful destroy attempts after which the service stops queueing
+/// destroys for a `Terminating` record. The record is kept as a `Gone`
+/// tombstone that `Reconcile` destroys the machine through (see
+/// `tombstone_locked`): the machine stays reclaimable, and the record stops
+/// holding a pool slot.
 const MAX_DESTROY_ATTEMPTS: u32 = 3;
 
 /// How long after its deadline an exec is swept. The driver enforces the
@@ -172,6 +177,19 @@ pub(crate) async fn await_copy(
         .map_err(|_| Error::unavailable("provider did not report the copy"))?
         .map_err(|_| Error::unavailable("provider dropped the copy"))?
         .map(|_| ())
+}
+
+/// Exec env keys become shell assignments in argv-only drivers; reject
+/// anything that is not a POSIX identifier before it reaches a driver.
+fn validate_env(env: &buffa::__private::HashMap<String, String>) -> Result<()> {
+    for key in env.keys() {
+        if !crate::driver::env_key_is_identifier(key) {
+            return Err(Error::invalid_argument(format!(
+                "invalid environment variable name `{key}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn new_id(prefix: &str) -> String {
@@ -265,6 +283,51 @@ fn acquire_fingerprint(request: &AcquireRequest) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
 }
 
+/// Revision of a pool's full placement: its configuration plus the template
+/// digest it references. A warm member built for another revision must not
+/// serve a new acquire.
+fn pool_revision(state: &State, pool: &PoolSpec) -> String {
+    let template = state
+        .templates
+        .get(&pool.template)
+        .map(|template| template.digest.clone())
+        .unwrap_or_default();
+    // Scale and renewal policy do not change how a member is built: editing
+    // them must not retire every warm member.
+    let build = PoolSpec {
+        warm: 0,
+        max: 0,
+        lease_ttl_secs: 0,
+        ..pool.clone()
+    };
+    let canonical = serde_json::to_vec(&(build, template)).unwrap_or_default();
+    format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
+}
+
+/// State a sandbox returns to when its Pause/Stop is undone with no lease.
+fn restored_state(sandbox: &Sandbox) -> SandboxState {
+    match sandbox.prior_state.known() {
+        // A preserved or once-leased sandbox stays a debug hold (its
+        // deadline is kept): a used machine must never serve a new lease.
+        SandboxState::Preserved | SandboxState::Leased => SandboxState::Preserved,
+        _ => SandboxState::Ready,
+    }
+}
+
+/// State a powered-off sandbox returns to when it is started or resumed.
+/// A sandbox still inside its preserve window stays a debug hold even while
+/// its lease survives, so powering a used machine on cannot put it back in
+/// the warm set.
+fn resumed_state(sandbox: &Sandbox) -> SandboxState {
+    if sandbox.preserve_until > 0 {
+        SandboxState::Preserved
+    } else if sandbox.lease_id.is_empty() {
+        restored_state(sandbox)
+    } else {
+        SandboxState::Leased
+    }
+}
+
 #[derive(Debug)]
 enum Pending {
     Create {
@@ -285,19 +348,27 @@ enum Pending {
     },
     Pause {
         sandbox_id: String,
+        lease_id: String,
+        expected: SandboxState,
         reply: oneshot::Sender<Result<String>>,
     },
     Stop {
         sandbox_id: String,
+        lease_id: String,
+        expected: SandboxState,
         reply: oneshot::Sender<Result<String>>,
     },
     Start {
         sandbox_id: String,
+        lease_id: String,
+        expected: SandboxState,
         forkable: bool,
         reply: oneshot::Sender<Result<String>>,
     },
     Resume {
         sandbox_id: String,
+        lease_id: String,
+        expected: SandboxState,
         reply: oneshot::Sender<Result<String>>,
     },
 }
@@ -546,6 +617,22 @@ fn close_execs(state: &mut State, sandbox_id: &str, reason: &str) {
     }
 }
 
+/// A lifecycle completion is applied only to the same sandbox record, under
+/// the same lease and in the state the operation expected to leave behind.
+fn still_in_state(state: &State, sandbox_id: &str, lease_id: &str, expected: SandboxState) -> bool {
+    state
+        .sandboxes
+        .get(sandbox_id)
+        .is_some_and(|sandbox| sandbox.lease_id == lease_id && sandbox.state == expected)
+}
+
+/// Whether a destroy for `sandbox_id` is queued on a provider or running.
+fn destroy_in_flight(state: &State, sandbox_id: &str) -> bool {
+    state.pending.values().any(|work| {
+        matches!(&work.kind, Pending::Destroy { sandbox_id: id } if id.as_str() == sandbox_id)
+    })
+}
+
 #[derive(Default)]
 struct State {
     templates: BTreeMap<String, Template>,
@@ -554,6 +641,9 @@ struct State {
     created_at: HashMap<String, Instant>,
     leases: BTreeMap<String, Lease>,
     lease_by_key: HashMap<String, String>,
+    /// In-process `Acquire` calls waiting for a lease, by idempotency key.
+    /// Maintenance must not expire a lease while its caller is still waiting.
+    waiting: HashMap<String, usize>,
     injected: HashSet<String>,
     providers: BTreeMap<String, ProviderRec>,
     join_tokens: BTreeMap<String, JoinTokenRecord>,
@@ -562,8 +652,11 @@ struct State {
     blobs: HashMap<String, Blob>,
     /// Last creation failure per pool, to back off refills.
     pool_backoff: HashMap<String, Instant>,
-    /// Destroy re-queued for a `Terminating` record, per sandbox.
+    /// Unsuccessful destroy attempts per `Terminating` record.
     destroy_attempts: HashMap<String, u32>,
+    /// Sandboxes with a snapshot in flight: release must not destroy their
+    /// base, and a second snapshot is rejected.
+    busy: HashSet<String>,
 }
 
 /// The service.
@@ -578,6 +671,42 @@ pub struct Service {
     persisted: tokio::sync::Mutex<HashMap<(Kind, String), u64>>,
 }
 
+/// An `Acquire` call waiting in this process, keyed by idempotency key.
+///
+/// Maintenance skips an expired lease while its waiter is alive: a boot or a
+/// golden unpack can outlast the unclaimed lease window.
+struct AcquireWaiter {
+    service: Arc<Service>,
+    key: String,
+}
+
+impl AcquireWaiter {
+    fn register(service: &Arc<Service>, key: &str) -> Self {
+        *service
+            .state
+            .lock()
+            .waiting
+            .entry(key.to_owned())
+            .or_default() += 1;
+        Self {
+            service: service.clone(),
+            key: key.to_owned(),
+        }
+    }
+}
+
+impl Drop for AcquireWaiter {
+    fn drop(&mut self) {
+        let mut state = self.service.state.lock();
+        if let Some(count) = state.waiting.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.waiting.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// One store write, stamped with the order it was decided in.
 ///
 /// Ops are built while the state lock is held but written after it is
@@ -588,6 +717,19 @@ struct Op {
     kind: Kind,
     id: String,
     value: Option<serde_json::Value>,
+}
+
+/// Holds a sandbox in the service's busy set while a snapshot is in flight,
+/// and releases it however the call exits.
+struct SnapshotBusy<'a> {
+    service: &'a Service,
+    sandbox_id: String,
+}
+
+impl Drop for SnapshotBusy<'_> {
+    fn drop(&mut self) {
+        self.service.state.lock().busy.remove(&self.sandbox_id);
+    }
 }
 
 impl Service {
@@ -606,7 +748,9 @@ impl Service {
         }
         for lease in load::<Lease>(&*store, Kind::Leases).await? {
             // A preserved lease outlives its idempotency key, which release
-            // cleared; only live keys map back to leases.
+            // cleared; only live keys map back to leases. A lease persisted
+            // before `requested_ttl_secs` existed has 0 and counts as
+            // delivered: `claim` will not rewrite its expiry.
             if !lease.idempotency_key.is_empty() {
                 state
                     .lease_by_key
@@ -785,12 +929,21 @@ impl Service {
     }
 
     async fn persist(&self, ops: Vec<Op>) {
+        let _ = self.persist_checked(ops).await;
+    }
+
+    /// [`Self::persist`], reporting a provider row the store refused. A
+    /// generation counts only once it is durable: a restart bumps the stored
+    /// generation, so one handed out and then lost can be issued again, and a
+    /// session still holding it would pass `fence` without re-registering.
+    async fn persist_checked(&self, ops: Vec<Op>) -> Result<()> {
         if ops.is_empty() {
-            return;
+            return Ok(());
         }
         // Serialized so a record's writes land in decision order; a stale
         // snapshot is dropped rather than overwriting newer truth.
         let mut persisted = self.persisted.lock().await;
+        let mut provider_refused = None;
         for op in ops {
             let key = (op.kind, op.id.clone());
             if persisted.get(&key).is_some_and(|seq| *seq > op.seq) {
@@ -807,13 +960,25 @@ impl Service {
                 // Best-effort store: in-memory state stays authoritative, so
                 // the RPC succeeds. The lost write is visible here, with the
                 // record kind, for the restart it will cost.
-                Err(cause) => error!(
-                    kind = ?op.kind,
-                    id = %op.id,
-                    error = %cause,
-                    "sandbox store write failed; the record is not durable"
-                ),
+                Err(cause) => {
+                    error!(
+                        kind = ?op.kind,
+                        id = %op.id,
+                        error = %cause,
+                        "sandbox store write failed; the record is not durable"
+                    );
+                    if op.kind == Kind::Providers && provider_refused.is_none() {
+                        provider_refused = Some(Error::unavailable(format!(
+                            "provider `{}` was not persisted; register again: {cause}",
+                            op.id
+                        )));
+                    }
+                }
             }
+        }
+        match provider_refused {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -836,11 +1001,19 @@ impl Service {
             let mut ops = Vec::new();
             let mut expired_tickets = Vec::new();
             let t = now();
-            // Expired leases and preservation windows.
+            // Expired leases and preservation windows. A lease whose caller is
+            // still waiting in this process is not expired: a real boot or a
+            // golden unpack can outlast the unclaimed window.
+            let waiting = &state.waiting;
             let expired: Vec<String> = state
                 .leases
                 .values()
-                .filter(|lease| lease.expires_at <= t)
+                .filter(|lease| {
+                    lease.expires_at <= t && !waiting.contains_key(&lease.idempotency_key)
+                })
+                // A snapshot in flight still owns the base: do not destroy it
+                // from under the provider.
+                .filter(|lease| !state.busy.contains(&lease.sandbox_id))
                 .map(|lease| lease.id.clone())
                 .collect();
             for lease_id in expired {
@@ -848,12 +1021,23 @@ impl Service {
                 self.release_locked(&mut state, &lease_id, ReleaseMode::Destroy, 0, &mut ops);
                 self.config.metrics.record_lease_transition("expired");
             }
-            // A stopped sandbox holds no host capacity, but it does hold
-            // disk: the create sweep below still applies to its record.
+            // Stop deliberately keeps the lease; a stopped sandbox holds no
+            // host capacity, but it does hold disk: the create sweep below
+            // still applies to its record. Paused/stopped sandboxes whose
+            // lease was preserved (or that were preserved before pausing)
+            // expire with the same window.
             let preserved: Vec<String> = state
                 .sandboxes
                 .values()
-                .filter(|s| s.state == SandboxState::Preserved && s.preserve_until <= t)
+                .filter(|s| {
+                    s.lease_id.is_empty()
+                        && matches!(
+                            s.state.known(),
+                            SandboxState::Preserved | SandboxState::Paused | SandboxState::Stopped
+                        )
+                        && s.preserve_until > 0
+                        && s.preserve_until <= t
+                })
                 .map(|s| s.id.clone())
                 .collect();
             for id in preserved {
@@ -937,13 +1121,17 @@ impl Service {
             for id in &stranded_sandboxes {
                 self.detach_lease_locked(&mut state, id, &mut ops);
             }
+            // A `Terminating` record on a silent provider already has its
+            // destroy with that provider. The stranded work below settles it as
+            // a failed attempt, and the record waits for that provider's next
+            // `Reconcile` instead of being failed and re-queued at a host that
+            // is not answering.
             let orphaned: Vec<String> = stranded_sandboxes
                 .into_iter()
                 .filter(|id| {
-                    state
-                        .sandboxes
-                        .get(id)
-                        .is_some_and(|s| !s.state.is_terminal())
+                    state.sandboxes.get(id).is_some_and(|s| {
+                        !s.state.is_terminal() && s.state != SandboxState::Terminating
+                    })
                 })
                 .collect();
             for id in orphaned {
@@ -1046,6 +1234,25 @@ impl Service {
         {
             return;
         }
+        // Retire idle members built for an older pool/template revision: they
+        // no longer satisfy the configuration a new acquire expects.
+        let revision = pool_revision(state, pool);
+        let stale: Vec<String> = state
+            .sandboxes
+            .values()
+            .filter(|s| {
+                s.pool == pool.name
+                    && s.lease_id.is_empty()
+                    && s.state != SandboxState::Terminating
+                    && !s.state.is_terminal()
+                    && s.pool_revision != revision
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in stale {
+            info!(sandbox = %id, pool = %pool.name, "retiring a warm member built for an older pool revision");
+            self.destroy_locked(state, &id, ops);
+        }
         let members: Vec<&Sandbox> = state
             .sandboxes
             .values()
@@ -1055,6 +1262,7 @@ impl Service {
             .iter()
             .filter(|s| {
                 s.lease_id.is_empty()
+                    && s.pool_revision == revision
                     && matches!(
                         s.state.known(),
                         SandboxState::Ready | SandboxState::Provisioning
@@ -1149,6 +1357,18 @@ impl Service {
                 return Err(Error::failed_precondition(format!(
                     "template `{name}` is used by pool `{}`",
                     pool.name
+                )));
+            }
+            // A fork base must outlive every clone: deleting it while a
+            // sandbox still starts from it invalidates that machine.
+            if let Some(sandbox) = state
+                .sandboxes
+                .values()
+                .find(|sandbox| sandbox.template == name && !sandbox.state.is_terminal())
+            {
+                return Err(Error::failed_precondition(format!(
+                    "template `{name}` is still used by sandbox `{}`",
+                    sandbox.id
                 )));
             }
             let template = state
@@ -1523,6 +1743,15 @@ impl Service {
     ) -> Result<String> {
         let id = new_id("sbx");
         let shape = effective_shape(state, &provider_id, &driver, &placement.shape);
+        let revision = if pool.is_empty() {
+            String::new()
+        } else {
+            state
+                .pools
+                .get(pool)
+                .map(|spec| pool_revision(state, spec))
+                .unwrap_or_default()
+        };
         let sandbox = Sandbox {
             id: id.clone(),
             name: name.to_owned(),
@@ -1534,6 +1763,7 @@ impl Service {
             purpose: purpose.into(),
             created_at: now(),
             shape: shape.into(),
+            pool_revision: revision,
             ..Sandbox::default()
         };
         let sandbox_driver = driver.clone();
@@ -1734,22 +1964,20 @@ impl Service {
             )
             .is_err()
         {
-            // Provider gone: reconcile on re-registration destroys it.
-            state.sandboxes.remove(id);
-            state.created_at.remove(id);
-            state.destroy_attempts.remove(id);
-            ops.push(self.remove(Kind::Sandboxes, id));
+            // The provider is not registered, so nothing can destroy the
+            // machine now. Keep it as a tombstone: it is still on the host, and
+            // reconcile reclaims it once the provider reports it.
+            self.tombstone_locked(state, id, "the provider is not registered", ops);
         }
     }
 
-    /// Ask the provider to destroy a `Terminating` record's machine again,
-    /// bounding how many times a reconcile can do so. Returns `false` when the
-    /// retries are spent: the caller drops the record so the machine becomes
-    /// an orphan the same reconcile destroys.
-    fn requeue_destroy_locked(&self, state: &mut State, id: &str) -> bool {
-        let attempts = state.destroy_attempts.get(id).copied().unwrap_or(0);
-        if attempts >= MAX_DESTROY_ATTEMPTS {
-            return false;
+    /// Queue a destroy for a `Terminating` record whose machine the provider
+    /// still reports. Nothing is queued while a destroy for the record is
+    /// queued or running: a slow delete is awaited, not asked again. Returns
+    /// `false` only when the provider cannot take the work.
+    fn ask_destroy_locked(&self, state: &mut State, id: &str) -> bool {
+        if destroy_in_flight(state, id) {
+            return true;
         }
         let Some(sandbox) = state.sandboxes.get(id).cloned() else {
             return false;
@@ -1769,14 +1997,28 @@ impl Service {
             )
             .is_ok();
         if queued {
-            state.destroy_attempts.insert(id.to_owned(), attempts + 1);
             warn!(
                 sandbox = id,
-                attempt = attempts + 1,
-                "terminating sandbox is still on the provider; destroy re-queued"
+                "terminating sandbox is still on the provider; destroy asked again"
             );
         }
         queued
+    }
+
+    /// Stop queueing destroys for a `Terminating` record the service cannot
+    /// finish, and keep the record as a `Gone` tombstone. The record is what
+    /// lets `Reconcile` prove the machine is ours and destroy it directly. A
+    /// tombstone holds no capacity slot, and it is removed once the provider
+    /// stops reporting the machine.
+    fn tombstone_locked(&self, state: &mut State, id: &str, reason: &str, ops: &mut Vec<Op>) {
+        state.destroy_attempts.remove(id);
+        state.created_at.remove(id);
+        let Some(sandbox) = state.sandboxes.get_mut(id) else {
+            return;
+        };
+        sandbox.state = SandboxState::Gone.into();
+        sandbox.error = reason.to_owned();
+        ops.push(self.put(Kind::Sandboxes, id, &*sandbox));
     }
 
     fn fail_locked(&self, state: &mut State, id: &str, reason: &str, ops: &mut Vec<Op>) {
@@ -1834,13 +2076,18 @@ impl Service {
             .is_some_and(|s| s.state == SandboxState::Failed);
         // Preservation is the one way a lease outlives `Release`: the id keeps
         // working as the debugging capability until the window closes. A
-        // second preserve extends that window instead of destroying.
+        // second preserve extends that window instead of destroying. A paused
+        // or stopped debugging machine keeps its power state (and must not be
+        // woken or destroyed just because it is no longer `Leased`).
         if preserve
             && !failed
             && state.sandboxes.get(&lease.sandbox_id).is_some_and(|s| {
                 matches!(
                     s.state.known(),
-                    SandboxState::Leased | SandboxState::Preserved
+                    SandboxState::Leased
+                        | SandboxState::Paused
+                        | SandboxState::Stopped
+                        | SandboxState::Preserved
                 )
             })
         {
@@ -1851,7 +2098,9 @@ impl Service {
             };
             let until = now() + ttl as i64;
             if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
-                sandbox.state = SandboxState::Preserved.into();
+                if sandbox.state == SandboxState::Leased {
+                    sandbox.state = SandboxState::Preserved.into();
+                }
                 sandbox.preserve_until = until;
                 ops.push(self.put(Kind::Sandboxes, &lease.sandbox_id, &*sandbox));
             }
@@ -1873,6 +2122,32 @@ impl Service {
         ops.push(self.remove(Kind::Leases, lease_id));
         if let Some(sandbox) = state.sandboxes.get_mut(&lease.sandbox_id) {
             sandbox.lease_id.clear();
+            // PRESERVE keeps the current power state: a paused or stopped
+            // debugging machine must not be woken, and must not be destroyed
+            // just because its state is no longer `Leased`.
+            if preserve
+                && !failed
+                && matches!(
+                    sandbox.state.known(),
+                    SandboxState::Leased
+                        | SandboxState::Paused
+                        | SandboxState::Stopped
+                        | SandboxState::Preserved
+                )
+            {
+                if sandbox.state == SandboxState::Leased {
+                    sandbox.state = SandboxState::Preserved.into();
+                }
+                let ttl = if preserve_ttl == 0 {
+                    self.config.preserve_ttl.as_secs()
+                } else {
+                    preserve_ttl
+                };
+                sandbox.preserve_until = now() + ttl as i64;
+                ops.push(self.put(Kind::Sandboxes, &lease.sandbox_id, &*sandbox));
+                self.config.metrics.record_lease_transition("preserved");
+                return;
+            }
         }
         // Failed sandboxes may still hold a native machine: destroy_locked
         // handles both cases.
@@ -1910,6 +2185,42 @@ impl Service {
                 "exactly one of pool or template is required",
             ));
         }
+        if !request.pool.is_empty() {
+            // The pool path uses the pool's placement; silently dropping these
+            // would hand back a sandbox that ignores what the caller asked for.
+            let mut ignored = Vec::new();
+            if *request.shape != Shape::default() {
+                ignored.push("shape");
+            }
+            if *request.network != NetworkPolicy::default() {
+                ignored.push("network");
+            }
+            if !request.mounts.is_empty() {
+                ignored.push("mounts");
+            }
+            if !request.sockets.is_empty() {
+                ignored.push("sockets");
+            }
+            if !request.options.is_empty() {
+                ignored.push("options");
+            }
+            if !ignored.is_empty() {
+                return Err(Error::invalid_argument(format!(
+                    "pool acquires cannot set {}; set these on the pool, or acquire from the template",
+                    ignored.join(", ")
+                )));
+            }
+            // A build sandbox must be started snapshot-capable, and a pool
+            // placement is fixed: take build sandboxes from the template.
+            if request.purpose == Purpose::Build {
+                return Err(Error::invalid_argument(
+                    "pool acquires cannot be build sandboxes; acquire from the template",
+                ));
+            }
+        }
+        // From here until the response is returned this call counts as a
+        // waiter, so maintenance will not expire the lease it is provisioning.
+        let _waiter = AcquireWaiter::register(self, &request.idempotency_key);
         let wait = match request.wait_secs {
             None => self.config.acquire_wait,
             // An explicit zero means "report the current state, do not block".
@@ -1927,6 +2238,7 @@ impl Service {
                 Step::Ready(ready) => {
                     let (lease, sandbox) = *ready;
                     self.inject(&lease, &sandbox, &request.inject).await?;
+                    let lease = self.claim(&lease).await?;
                     return Ok(AcquireResponse {
                         lease: lease.into(),
                         sandbox: sandbox.into(),
@@ -1946,15 +2258,17 @@ impl Service {
 
     async fn try_acquire(&self, request: &AcquireRequest, fingerprint: &str) -> Result<Step> {
         let mut ops = Vec::new();
+        // A failed replay releases its lease while holding the lock; those
+        // writes must reach the store before the error is returned.
         let step = {
             let mut state = self.state.lock();
-            self.try_acquire_locked(&mut state, request, fingerprint, &mut ops)?
+            self.try_acquire_locked(&mut state, request, fingerprint, &mut ops)
         };
         if !ops.is_empty() {
             self.persist(ops).await;
             self.changed.notify_waiters();
         }
-        Ok(step)
+        step
     }
 
     fn try_acquire_locked(
@@ -1987,9 +2301,10 @@ impl Service {
                 .cloned()
                 .ok_or_else(|| Error::not_found("leased sandbox is gone"))?;
             return match sandbox.state.known() {
-                SandboxState::Leased | SandboxState::Paused | SandboxState::Preserved => {
-                    Ok(Step::Ready(Box::new((lease, sandbox))))
-                }
+                SandboxState::Leased
+                | SandboxState::Paused
+                | SandboxState::Stopped
+                | SandboxState::Preserved => Ok(Step::Ready(Box::new((lease, sandbox)))),
                 SandboxState::Provisioning => Ok(Step::Wait(None)),
                 _ => {
                     // Failed/gone: release so a retry with the same key can
@@ -2032,15 +2347,20 @@ impl Service {
                 state.pools.get(&request.pool).cloned().ok_or_else(|| {
                     Error::not_found(format!("pool `{}` not found", request.pool))
                 })?;
+            let revision = pool_revision(state, &pool);
             let warm = state
                 .sandboxes
                 .values()
                 .filter(|s| {
-                    s.pool == pool.name && s.lease_id.is_empty() && s.state == SandboxState::Ready
+                    s.pool == pool.name
+                        && s.lease_id.is_empty()
+                        && s.pool_revision == revision
+                        && s.state == SandboxState::Ready
                 })
                 .filter(|s| sandbox_meets(state, s, &request.requires))
-                .map(|s| s.id.clone())
-                .next();
+                // Oldest first, so warm members rotate and none goes stale.
+                .min_by_key(|s| (s.created_at, s.id.as_str()))
+                .map(|s| s.id.clone());
             match warm {
                 Some(id) => id,
                 None => {
@@ -2054,6 +2374,7 @@ impl Service {
                     let booting = state.sandboxes.values().any(|s| {
                         s.pool == pool.name
                             && s.lease_id.is_empty()
+                            && s.pool_revision == revision
                             && s.state == SandboxState::Provisioning
                             && sandbox_meets(state, s, &request.requires)
                     });
@@ -2116,7 +2437,10 @@ impl Service {
             sandbox_id: sandbox_id.clone(),
             pool: request.pool.clone(),
             idempotency_key: request.idempotency_key.clone(),
-            expires_at: now() + ttl as i64,
+            // Until the lease reaches a caller it may only live for the
+            // unclaimed window; delivery restores the requested TTL.
+            expires_at: now() + ttl.min(self.config.unclaimed_lease_ttl.as_secs()) as i64,
+            requested_ttl_secs: ttl,
             env: request.inject.env.clone(),
             request_hash: fingerprint.to_owned(),
             ..Lease::default()
@@ -2146,18 +2470,42 @@ impl Service {
         })
     }
 
+    /// Mark a lease delivered when `Acquire` returns it: its expiry becomes
+    /// the caller's full TTL. A lease persisted before `requested_ttl_secs`
+    /// existed has 0 and is already delivered, so its expiry is left alone.
+    async fn claim(&self, lease: &Lease) -> Result<Lease> {
+        let (claimed, ops) = {
+            let mut state = self.state.lock();
+            let Some(current) = state.leases.get_mut(&lease.id) else {
+                return Ok(lease.clone());
+            };
+            if current.requested_ttl_secs == 0 {
+                return Ok(current.clone());
+            }
+            current.expires_at = now() + current.requested_ttl_secs as i64;
+            let current = current.clone();
+            let op = self.put(Kind::Leases, &current.id, &current);
+            (current, vec![op])
+        };
+        self.persist(ops).await;
+        Ok(claimed)
+    }
+
     async fn inject(
         self: &Arc<Self>,
         lease: &Lease,
         sandbox: &Sandbox,
         inject: &Inject,
     ) -> Result<()> {
-        if inject.files.is_empty() || self.state.lock().injected.contains(&lease.id) {
+        if inject.files.is_empty() {
             return Ok(());
         }
         // Build the tar in memory: the files arrived in the unary request and
         // are already capped by the Connect body limit, so there is no reason
         // to stage a copy anywhere. Extraction is at `/`.
+        if self.state.lock().injected.contains(&lease.id) {
+            return Ok(());
+        }
         let mut builder = tar::Builder::new(Vec::new());
         for spec in &inject.files {
             let path = spec.path.trim_start_matches('/');
@@ -2223,11 +2571,17 @@ impl Service {
                 .leases
                 .get_mut(&request.lease_id)
                 .ok_or_else(|| Error::not_found("lease not found"))?;
-            let ttl = if request.ttl_secs == 0 {
-                self.config.lease_ttl.as_secs()
-            } else {
+            let ttl = if request.ttl_secs > 0 {
                 request.ttl_secs
+            } else if lease.requested_ttl_secs > 0 {
+                // A zero TTL means "keep the lease alive at the TTL it was
+                // acquired with", not the service default.
+                lease.requested_ttl_secs
+            } else {
+                // A lease persisted before `requested_ttl_secs` existed.
+                self.config.lease_ttl.as_secs()
             };
+            lease.requested_ttl_secs = ttl;
             lease.expires_at = now() + ttl as i64;
             let lease = lease.clone();
             let ops = vec![self.put(Kind::Leases, &lease.id, &lease)];
@@ -2243,8 +2597,13 @@ impl Service {
     pub async fn release(&self, request: ReleaseRequest) -> Result<()> {
         let ops = {
             let mut state = self.state.lock();
-            if !state.leases.contains_key(&request.lease_id) {
+            let Some(lease) = state.leases.get(&request.lease_id) else {
                 return Err(Error::not_found("lease not found"));
+            };
+            if state.busy.contains(&lease.sandbox_id) {
+                return Err(Error::failed_precondition(
+                    "a snapshot is in progress; release after it completes",
+                ));
             }
             let mut ops = Vec::new();
             self.release_locked(
@@ -2421,6 +2780,7 @@ impl Service {
         if request.argv.is_empty() {
             return Err(Error::invalid_argument("argv is required"));
         }
+        validate_env(&request.env)?;
         let mut state = self.state.lock();
         let sandbox = state
             .sandboxes
@@ -2431,6 +2791,7 @@ impl Service {
         Self::usable(&sandbox)?;
         let mut merged = request.clone();
         if let Some(lease) = state.leases.get(&request.lease_id) {
+            validate_env(&lease.env)?;
             let mut env = lease.env.clone();
             env.extend(request.env.clone());
             merged.env = env;
@@ -2665,7 +3026,9 @@ impl Service {
         if blob.expires_at <= now() {
             return Err(Error::not_found("ticket not found or expired"));
         }
-        if !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
+        // In-process tickets have no token: never let a tokenless request
+        // match them. The comparison stays constant-time.
+        if blob.token.is_empty() || !constant_time_eq(blob.token.as_bytes(), token.as_bytes()) {
             return Err(Error::new(Code::Unauthenticated, "bad ticket token"));
         }
         let expected = match side {
@@ -3021,8 +3384,27 @@ impl Service {
                     "only a leased sandbox can be snapshotted",
                 ));
             }
-            let caps = self.driver_caps(&state, &sandbox)?;
+            if !state.busy.insert(sandbox.id.clone()) {
+                return Err(Error::failed_precondition(
+                    "a snapshot of this sandbox is already in progress",
+                ));
+            }
+            if state.templates.contains_key(&request.name) {
+                state.busy.remove(&sandbox.id);
+                return Err(Error::new(
+                    Code::AlreadyExists,
+                    format!("template `{}` already exists", request.name),
+                ));
+            }
+            let caps = match self.driver_caps(&state, &sandbox) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    state.busy.remove(&sandbox.id);
+                    return Err(error);
+                }
+            };
             if !caps.snapshot {
+                state.busy.remove(&sandbox.id);
                 return Err(Error::failed_precondition(format!(
                     "{}: snapshot unsupported",
                     sandbox.driver
@@ -3044,13 +3426,23 @@ impl Service {
                     .into(),
                 ),
             );
-            self.enqueue(
+            if let Err(error) = self.enqueue(
                 &mut state,
                 &sandbox.provider_id,
                 work,
                 Pending::Snapshot { reply: tx },
-            )?;
+            ) {
+                state.busy.remove(&sandbox.id);
+                return Err(error);
+            }
             (sandbox, source_template)
+        };
+        // The set is guarded from here on, including every error path. It is
+        // created after the state lock is released so its drop never
+        // re-enters the mutex.
+        let _busy = SnapshotBusy {
+            service: self,
+            sandbox_id: sandbox.id.clone(),
         };
         let native_ref = tokio::time::timeout(self.config.work_timeout, rx)
             .await
@@ -3075,6 +3467,22 @@ impl Service {
         };
         let ops = {
             let mut state = self.state.lock();
+            // A release, failure or another lifecycle transition while the
+            // provider was working invalidates the capture: installing the
+            // template would point at a machine that is being destroyed.
+            let still_valid = state.sandboxes.get(&sandbox.id).is_some_and(|source| {
+                source.state == SandboxState::Leased && source.lease_id == sandbox.lease_id
+            });
+            if !still_valid {
+                warn!(
+                    sandbox = %sandbox.id,
+                    "snapshot finished after its source changed; discarding the base"
+                );
+                self.drop_snapshot_locked(&mut state, &template);
+                return Err(Error::failed_precondition(
+                    "the sandbox changed while its snapshot was in flight; result discarded",
+                ));
+            }
             let mut ops = vec![self.put(Kind::Templates, &template.spec.name, &template)];
             let replaced = state
                 .templates
@@ -3166,12 +3574,25 @@ impl Service {
                     sandbox.driver
                 )));
             }
+            if matches!(op, PowerOp::Stop)
+                && !sandbox.pool.is_empty()
+                && sandbox.lease_id.is_empty()
+                && sandbox.state == SandboxState::Ready
+            {
+                return Err(Error::failed_precondition(
+                    "an idle pool member cannot be stopped; acquire it first",
+                ));
+            }
             let target = Self::target(&sandbox);
+            let expected = sandbox.state.known();
+            let lease_id = sandbox.lease_id.clone();
             let (work, kind) = match op {
                 PowerOp::Stop => (
                     WorkItem::new(new_id("wrk"), work_item::Work::Stop(target.into())),
                     Pending::Stop {
                         sandbox_id: id.to_owned(),
+                        lease_id,
+                        expected,
                         reply: tx,
                     },
                 ),
@@ -3189,6 +3610,8 @@ impl Service {
                     ),
                     Pending::Start {
                         sandbox_id: id.to_owned(),
+                        lease_id,
+                        expected,
                         forkable,
                         reply: tx,
                     },
@@ -3230,12 +3653,25 @@ impl Service {
                     sandbox.driver
                 )));
             }
+            if pause
+                && !sandbox.pool.is_empty()
+                && sandbox.lease_id.is_empty()
+                && sandbox.state == SandboxState::Ready
+            {
+                return Err(Error::failed_precondition(
+                    "an idle pool member cannot be paused; acquire it first",
+                ));
+            }
             let target = Self::target(&sandbox);
+            let expected = sandbox.state.known();
+            let lease_id = sandbox.lease_id.clone();
             let (work, kind) = if pause {
                 (
                     WorkItem::new(new_id("wrk"), work_item::Work::Pause(target.into())),
                     Pending::Pause {
                         sandbox_id: id.to_owned(),
+                        lease_id,
+                        expected,
                         reply: tx,
                     },
                 )
@@ -3244,6 +3680,8 @@ impl Service {
                     WorkItem::new(new_id("wrk"), work_item::Work::Resume(target.into())),
                     Pending::Resume {
                         sandbox_id: id.to_owned(),
+                        lease_id,
+                        expected,
                         reply: tx,
                     },
                 )
@@ -3484,7 +3922,7 @@ impl Service {
             )
         };
         info!(provider = %response.provider_id, generation = response.generation, "provider registered");
-        self.persist(ops).await;
+        self.persist_checked(ops).await?;
         self.changed.notify_waiters();
         Ok(response)
     }
@@ -3948,17 +4386,38 @@ impl Service {
                     self.fail_locked(state, &sandbox_id, crate::error::message(&error), ops);
                 }
             },
-            Pending::Destroy { sandbox_id } => {
-                // A failed destroy still drops the record: the machine is
-                // then an orphan the next reconcile removes.
-                if let Err(error) = &result {
-                    warn!(%sandbox_id, %error, "destroy failed; reconcile will retry");
+            Pending::Destroy { sandbox_id } => match result {
+                Ok(_) => {
+                    state.destroy_attempts.remove(&sandbox_id);
+                    if state.sandboxes.remove(&sandbox_id).is_some() {
+                        ops.push(self.remove(Kind::Sandboxes, &sandbox_id));
+                    }
                 }
-                state.destroy_attempts.remove(&sandbox_id);
-                if state.sandboxes.remove(&sandbox_id).is_some() {
-                    ops.push(self.remove(Kind::Sandboxes, &sandbox_id));
+                Err(error) => {
+                    // No record: a destroy queued for a late create. There is
+                    // no `Terminating` record to count against or keep.
+                    if state.sandboxes.contains_key(&sandbox_id) {
+                        let attempts = {
+                            let count = state
+                                .destroy_attempts
+                                .entry(sandbox_id.clone())
+                                .or_default();
+                            *count += 1;
+                            *count
+                        };
+                        if attempts < MAX_DESTROY_ATTEMPTS {
+                            warn!(%sandbox_id, attempts, %error, "destroy failed; the next reconcile asks again");
+                        } else {
+                            warn!(%sandbox_id, attempts, %error, "destroy failed too often; keeping the record so reconcile can reclaim the machine");
+                            let reason = format!(
+                                "destroy failed {attempts} times: {}",
+                                error.message.as_deref().unwrap_or_default()
+                            );
+                            self.tombstone_locked(state, &sandbox_id, &reason, ops);
+                        }
+                    }
                 }
-            }
+            },
             Pending::Exec { exec_id } => {
                 // Success is signalled by the exit event (`ReportExec`); a
                 // failed exec work ends the stream with the error.
@@ -3969,62 +4428,130 @@ impl Service {
                     let _ = exec.tx.try_send(Err(error));
                 }
             }
-            Pending::Copy { reply } | Pending::Snapshot { reply } => {
+            Pending::Copy { reply } => {
                 let _ = reply.send(result);
             }
-            Pending::Pause { sandbox_id, reply } => {
-                if result.is_ok()
-                    && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
-                {
-                    sandbox.state = SandboxState::Paused.into();
-                    ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                }
+            Pending::Snapshot { reply, .. } => {
+                // Validity is checked when the template is installed (the
+                // snapshot call still owns the source at this point).
                 let _ = reply.send(result);
             }
-            Pending::Stop { sandbox_id, reply } => {
-                if result.is_ok()
-                    && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
-                {
-                    sandbox.state = SandboxState::Stopped.into();
-                    ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                }
+            Pending::Pause {
+                sandbox_id,
+                lease_id,
+                expected,
+                reply,
+            } => {
+                let result = match result {
+                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
+                        let sandbox = state
+                            .sandboxes
+                            .get_mut(&sandbox_id)
+                            .expect("state checked above");
+                        sandbox.prior_state = sandbox.state;
+                        sandbox.state = SandboxState::Paused.into();
+                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
+                        Ok(String::new())
+                    }
+                    Ok(_) => Err(Error::failed_precondition(
+                        "the sandbox changed while the pause was in flight",
+                    )),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Pending::Stop {
+                sandbox_id,
+                lease_id,
+                expected,
+                reply,
+            } => {
+                let result = match result {
+                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
+                        let sandbox = state
+                            .sandboxes
+                            .get_mut(&sandbox_id)
+                            .expect("state checked above");
+                        sandbox.prior_state = sandbox.state;
+                        sandbox.state = SandboxState::Stopped.into();
+                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
+                        Ok(String::new())
+                    }
+                    Ok(_) => Err(Error::failed_precondition(
+                        "the sandbox changed while the stop was in flight",
+                    )),
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Pending::Start {
                 sandbox_id,
+                lease_id,
+                expected,
                 forkable,
                 reply,
             } => {
-                if result.is_ok()
-                    && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
-                {
-                    sandbox.state = if sandbox.lease_id.is_empty() {
-                        SandboxState::Ready
-                    } else {
-                        SandboxState::Leased
+                let result = match result {
+                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
+                        let sandbox = state
+                            .sandboxes
+                            .get_mut(&sandbox_id)
+                            .expect("state checked above");
+                        let next = resumed_state(sandbox);
+                        self.restore_locked(sandbox, next);
+                        if forkable {
+                            sandbox.error.clear();
+                        }
+                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
+                        Ok(String::new())
                     }
-                    .into();
-                    if forkable {
-                        sandbox.error.clear();
-                    }
-                    ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                }
+                    Ok(_) => Err(Error::failed_precondition(
+                        "the sandbox changed while the start was in flight",
+                    )),
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
-            Pending::Resume { sandbox_id, reply } => {
-                if result.is_ok()
-                    && let Some(sandbox) = state.sandboxes.get_mut(&sandbox_id)
-                {
-                    sandbox.state = if sandbox.lease_id.is_empty() {
-                        SandboxState::Preserved
-                    } else {
-                        SandboxState::Leased
+            Pending::Resume {
+                sandbox_id,
+                lease_id,
+                expected,
+                reply,
+            } => {
+                let result = match result {
+                    Ok(_) if still_in_state(state, &sandbox_id, &lease_id, expected) => {
+                        let sandbox = state
+                            .sandboxes
+                            .get_mut(&sandbox_id)
+                            .expect("state checked above");
+                        let next = resumed_state(sandbox);
+                        self.restore_locked(sandbox, next);
+                        ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
+                        Ok(String::new())
                     }
-                    .into();
-                    ops.push(self.put(Kind::Sandboxes, &sandbox_id, &*sandbox));
-                }
+                    Ok(_) => Err(Error::failed_precondition(
+                        "the sandbox changed while the resume was in flight",
+                    )),
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
+        }
+    }
+
+    /// Apply a restored power state and its preservation bookkeeping.
+    fn restore_locked(&self, sandbox: &mut Sandbox, next: SandboxState) {
+        sandbox.state = next.into();
+        sandbox.prior_state = SandboxState::SandboxStateUnspecified.into();
+        match next {
+            SandboxState::Preserved => {
+                if sandbox.preserve_until == 0 {
+                    sandbox.preserve_until = now() + self.config.preserve_ttl.as_secs() as i64;
+                }
+            }
+            // Resuming or starting a preserved sandbox ends its debugging
+            // window; only an explicitly preserved sandbox holds one open.
+            _ => sandbox.preserve_until = 0,
         }
     }
 
@@ -4140,11 +4667,11 @@ impl Service {
                     }
                 }
             }
-            // Terminating records whose machine is still on the host: the
-            // destroy that was in flight died with the previous process (or
-            // its report was lost), so ask again. Bounded: a provider that
-            // keeps the machine while reporting it alive is not making
-            // progress, and the record must stop holding a slot.
+            // Terminating records whose machine the provider still reports,
+            // with no destroy queued or running: the previous destroy died with
+            // its process, or its report was lost, so ask again. A destroy
+            // already in flight is awaited however long it takes; only
+            // completed failures count toward giving up (`complete_locked`).
             let stuck: Vec<String> = state
                 .sandboxes
                 .values()
@@ -4157,23 +4684,40 @@ impl Service {
                 .map(|s| s.id.clone())
                 .collect();
             for id in stuck {
-                if !self.requeue_destroy_locked(&mut state, &id) {
-                    warn!(
-                        sandbox = %id,
-                        attempts = MAX_DESTROY_ATTEMPTS,
-                        "terminating sandbox out of destroy retries; dropping the record so the machine is reaped as an orphan"
+                if !self.ask_destroy_locked(&mut state, &id) {
+                    self.tombstone_locked(
+                        &mut state,
+                        &id,
+                        "the provider cannot take a destroy",
+                        &mut ops,
                     );
-                    state.sandboxes.remove(&id);
-                    state.created_at.remove(&id);
-                    state.destroy_attempts.remove(&id);
-                    ops.push(self.remove(Kind::Sandboxes, &id));
                 }
             }
-            // Machines no record owns (orphans).
+            // A tombstone whose machine this provider no longer reports is
+            // finished: there is nothing left to reclaim.
+            let finished: Vec<String> = state
+                .sandboxes
+                .values()
+                .filter(|s| {
+                    s.provider_id == request.provider_id
+                        && s.state == SandboxState::Gone
+                        && !s.native_ref.is_empty()
+                        && !observed.contains(s.native_ref.as_str())
+                })
+                .map(|s| s.id.clone())
+                .collect();
+            for id in finished {
+                state.sandboxes.remove(&id);
+                state.created_at.remove(&id);
+                ops.push(self.remove(Kind::Sandboxes, &id));
+            }
+            // Machines no record owns (orphans, stale incarnations).
             //
             // A template's `native_ref` is its fork base (SmolVM's golden):
             // a live machine with no sandbox record. It is never an orphan,
-            // whichever provider reports it. Two agents can share one host's
+            // whichever provider reports it, so snapshot bases are protected
+            // service-wide: any provider may report the inventory, but a base
+            // belongs to the template record. Two agents can share one host's
             // engine home and each lists every machine there, and the base
             // belongs to the template rather than to the agent that happened
             // to create it. Reaping it wedges every later fork ("cannot be
@@ -4195,38 +4739,56 @@ impl Service {
                 if goldens.contains(item.native_ref.as_str()) {
                     continue;
                 }
+                // A tombstone no longer owns its machine: reconcile reclaims it.
                 let owned = state.sandboxes.values().any(|s| {
-                    s.provider_id == request.provider_id && s.native_ref == item.native_ref
+                    s.provider_id == request.provider_id
+                        && s.native_ref == item.native_ref
+                        && s.state != SandboxState::Gone
                 });
-                let provisioning = (!item.sandbox_id.is_empty()
-                    && state
-                        .sandboxes
-                        .get(&item.sandbox_id)
-                        .is_some_and(|s| s.state == SandboxState::Provisioning))
+                // Proof this service created the machine: its id is one of
+                // ours (the driver encodes it in the native name), or a
+                // caller-named create we dispatched. Machines from another
+                // service sharing this host registry carry neither. A
+                // tombstone proves it by its native reference alone: a
+                // caller-named machine is reported without an id.
+                let ours = (!item.sandbox_id.is_empty()
+                    && state.sandboxes.contains_key(&item.sandbox_id))
                     || state.sandboxes.values().any(|s| {
                         s.provider_id == request.provider_id
                             && s.state == SandboxState::Provisioning
                             && !s.name.is_empty()
                             && s.name == item.native_ref
+                    })
+                    || state.sandboxes.values().any(|s| {
+                        s.provider_id == request.provider_id
+                            && s.state == SandboxState::Gone
+                            && !s.native_ref.is_empty()
+                            && s.native_ref == item.native_ref
                     });
                 // Another provider's machine (two agents on one host, or a
                 // hand-created VM registered elsewhere) is never ours to
                 // reap: only orphans this provider could have created.
-                let foreign = state.sandboxes.values().any(|s| {
-                    s.provider_id != request.provider_id
-                        && !s.state.is_terminal()
-                        && (s.native_ref == item.native_ref
-                            || (!s.id.is_empty()
-                                && !item.sandbox_id.is_empty()
-                                && s.id == item.sandbox_id))
-                });
-                if !owned && !provisioning && !foreign {
+                // A tombstone claims its machine for its own provider's
+                // reclaim, so it is foreign here as well.
+                let foreign = !item.native_ref.is_empty()
+                    && state.sandboxes.values().any(|s| {
+                        s.provider_id != request.provider_id
+                            && (!s.state.is_terminal() || s.state == SandboxState::Gone)
+                            && s.native_ref == item.native_ref
+                    });
+                if !owned && ours && !foreign {
                     destroy.push(SandboxWork {
                         sandbox_id: item.sandbox_id.clone(),
                         driver: item.driver.clone(),
                         native_ref: item.native_ref.clone(),
                         ..SandboxWork::default()
                     });
+                } else if !foreign {
+                    warn!(
+                        native_ref = %item.native_ref,
+                        driver = %item.driver,
+                        "inventory entry was not created by this service; leaving it alone"
+                    );
                 }
             }
             self.config
@@ -4390,6 +4952,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store;
 
     fn items(count: usize) -> Vec<(String, usize)> {
         (0..count)
@@ -4503,5 +5066,128 @@ mod tests {
         };
         let error = paginate("sandbox", items(3), &request).unwrap_err();
         assert_eq!(error.code, Code::InvalidArgument);
+    }
+
+    fn ready_member(id: &str, created_at: i64) -> Sandbox {
+        Sandbox {
+            id: id.into(),
+            template: "alpine".into(),
+            pool: "p".into(),
+            state: SandboxState::Ready.into(),
+            created_at,
+            ..Sandbox::default()
+        }
+    }
+
+    fn with_current_pool_revision(state: &State, sandbox: &mut Sandbox) {
+        if let Some(pool) = state.pools.get(&sandbox.pool) {
+            sandbox.pool_revision = pool_revision(state, pool);
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_members_rotate_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::open(
+            store::open("memory:").await.unwrap(),
+            ServiceConfig::new(),
+        )
+        .await
+        .unwrap();
+        {
+            let mut state = service.state.lock();
+            state.templates.insert(
+                "alpine".into(),
+                Template {
+                    spec: TemplateSpec {
+                        name: "alpine".into(),
+                        ..TemplateSpec::default()
+                    }
+                    .into(),
+                    ..Template::default()
+                },
+            );
+            state.pools.insert(
+                "p".into(),
+                PoolSpec {
+                    name: "p".into(),
+                    template: "alpine".into(),
+                    ..PoolSpec::default()
+                },
+            );
+            // Insert the newer member first: map order must not decide.
+            let mut newer = ready_member("sbx-newer", 200);
+            with_current_pool_revision(&state, &mut newer);
+            state.sandboxes.insert("sbx-newer".into(), newer);
+            let mut older = ready_member("sbx-older", 100);
+            with_current_pool_revision(&state, &mut older);
+            state.sandboxes.insert("sbx-older".into(), older);
+        }
+        let first = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k1".into(),
+                pool: "p".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.sandbox.id, "sbx-older");
+        let second = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k2".into(),
+                pool: "p".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.sandbox.id, "sbx-newer");
+        // Equal ages break the tie by id.
+        {
+            let mut state = service.state.lock();
+            let mut y = ready_member("sbx-y", 300);
+            with_current_pool_revision(&state, &mut y);
+            state.sandboxes.insert("sbx-y".into(), y);
+            let mut x = ready_member("sbx-x", 300);
+            with_current_pool_revision(&state, &mut x);
+            state.sandboxes.insert("sbx-x".into(), x);
+        }
+        let third = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k3".into(),
+                pool: "p".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(third.sandbox.id, "sbx-x");
+    }
+
+    #[tokio::test]
+    async fn an_empty_ticket_token_never_authorizes() {
+        let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(TRANSFER_QUEUE);
+        let (status, _) = watch::channel(TransferStatus::Open);
+        service.state.lock().blobs.insert(
+            "tkt-internal".into(),
+            Blob {
+                sandbox_id: String::new(),
+                kind: StreamKind::Download,
+                guest_path: "/work".into(),
+                token: String::new(),
+                expires_at: now() + 60,
+                producer_claimed: false,
+                consumer_claimed: false,
+                status,
+                control: Some(tx.clone()),
+                tx: Some(tx),
+                rx: Some(rx),
+            },
+        );
+        let error = service
+            .claim_caller("tkt-internal", "", TransferSide::Consumer)
+            .unwrap_err();
+        assert_eq!(error.code, Code::Unauthenticated);
     }
 }

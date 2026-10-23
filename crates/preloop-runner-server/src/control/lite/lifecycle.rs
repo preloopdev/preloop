@@ -63,6 +63,7 @@ fn runner_caps(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunnerCapabilities> 
 /// head of the ready queue.
 pub(super) fn requeue_claimed(
     tx: &Transaction<'_>,
+    backend: &LiteBackend,
     run_id: RunId,
     job_id: &JobId,
     retired: &mut Vec<uuid::Uuid>,
@@ -91,6 +92,13 @@ pub(super) fn requeue_claimed(
         .map_err(db)?
         .execute(params![run, job_id.0])
         .map_err(db)?;
+    // Back on the ready queue: derive the same dispatch intent enqueue would
+    // have. The bare delete above leaves nothing behind, and under strict
+    // assignments a ready job with no assignment/provision row is
+    // unclaimable forever (only the boot rebuild repairs it).
+    if let Some(job) = jobs::job(tx, run_id, job_id)? {
+        promote::on_job_enqueued(tx, backend, &job)?;
+    }
     Ok(true)
 }
 
@@ -249,12 +257,6 @@ pub(super) fn append_event_tx(
 /// `pair_runner_tx` (pg lifecycle.rs) + the trait doc: release stale or
 /// dead-runner bindings back to the pool waitlist, then bind the oldest
 /// pool-pending ready job this runner can serve.
-///
-/// Two deliberate divergences from the pg text, both required by the trait
-/// doc for `pair_runner` ("mark the runner pool-proven" and "re-marked
-/// pool-pending at `now`"): the runner's `pool_proven` column is stamped,
-/// and released bindings gain a `provision_requests` row so they remain
-/// pairable. Pg only clears `runner_id`, which would strand the job.
 fn pair_runner_tx(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
@@ -309,7 +311,7 @@ fn pair_runner_tx(
         .map_err(db)?
         .execute(params![run, job])
         .map_err(db)?;
-        if pool_assignments {
+        if pool_assignments || require_assignments {
             tx.prepare_cached(
                 "INSERT INTO provision_requests (run_id, job_id, namespace_id, \
                  pool_key, labels, requested_at) \
@@ -381,7 +383,11 @@ fn pair_runner_tx(
 /// `runner_sessions.runner_id` carries no FK (a declared id may precede
 /// registration), so the sessions are deleted explicitly — a revoked
 /// long-poll must find no session and get `Forbidden`.
-fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<Vec<uuid::Uuid>, ControlError> {
+fn purge_runner_tx(
+    tx: &Transaction<'_>,
+    backend: &LiteBackend,
+    runner_id: i64,
+) -> Result<Vec<uuid::Uuid>, ControlError> {
     let requeue: Vec<(String, String)> = {
         let mut stmt = tx
             .prepare_cached(
@@ -450,7 +456,7 @@ fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<Vec<uuid::Uui
         .map_err(db)?;
     let mut retired = Vec::new();
     for (run, job) in requeue {
-        requeue_claimed(tx, codec::run_id(&run), &JobId(job), &mut retired)?;
+        requeue_claimed(tx, backend, codec::run_id(&run), &JobId(job), &mut retired)?;
     }
     let now = now_us();
     for (run, job) in unclaimed {
@@ -470,6 +476,56 @@ fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<Vec<uuid::Uui
         .map_err(db)?;
     }
     Ok(retired)
+}
+
+/// Derive dispatch intent for bound-less ready jobs. `only_missing` narrows
+/// the sweep to jobs with neither a `job_assignments` nor a
+/// `provision_requests` row (the reaper backstop); the boot rebuild visits
+/// every ready job and re-stamps a stale pool-pending row at now. Both paths
+/// run the enqueue derivation itself, so they cannot drift from promotion.
+fn derive_dispatch_intent(
+    tx: &Transaction<'_>,
+    backend: &LiteBackend,
+    only_missing: bool,
+) -> Result<usize, ControlError> {
+    let (pool_assignments, require_assignments, _) = backend.config();
+    if !pool_assignments && !require_assignments {
+        if !only_missing {
+            tx.prepare_cached("DELETE FROM job_assignments")
+                .map_err(db)?
+                .execute([])
+                .map_err(db)?;
+            tx.prepare_cached("DELETE FROM provision_requests")
+                .map_err(db)?
+                .execute([])
+                .map_err(db)?;
+        }
+        return Ok(0);
+    }
+    let candidates = if only_missing {
+        jobs::ready_jobs_missing_intent(tx)?
+    } else {
+        jobs::ready_jobs(tx)?
+    };
+    let mut repaired = 0usize;
+    for job in candidates {
+        let exists = tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM job_assignments \
+                 WHERE run_id = ?1 AND job_id = ?2)",
+            )
+            .map_err(db)?
+            .query_row(params![codec::run_key(job.run_id), job.job_id.0], |row| {
+                row.get::<_, bool>(0)
+            })
+            .map_err(db)?;
+        if exists {
+            continue;
+        }
+        promote::on_job_enqueued(tx, backend, &job)?;
+        repaired += 1;
+    }
+    Ok(repaired)
 }
 
 impl LiteBackend {
@@ -838,7 +894,7 @@ impl LiteBackend {
         &self,
         runner_id: i64,
     ) -> Result<Vec<uuid::Uuid>, ControlError> {
-        self.write(|tx| purge_runner_tx(tx, runner_id))
+        self.write(|tx| purge_runner_tx(tx, self, runner_id))
     }
 
     /// `purge_runner_guarded` (pg lifecycle.rs): apply `guard`, then purge.
@@ -883,7 +939,7 @@ impl LiteBackend {
             if !allowed {
                 return Ok(None);
             }
-            purge_runner_tx(tx, runner_id).map(Some)
+            purge_runner_tx(tx, self, runner_id).map(Some)
         })
     }
 
@@ -1303,7 +1359,13 @@ impl LiteBackend {
             // retired identities are not reported.
             let mut retired = Vec::new();
             for (run, job) in &orphaned {
-                if requeue_claimed(tx, codec::run_id(run), &JobId(job.clone()), &mut retired)? {
+                if requeue_claimed(
+                    tx,
+                    self,
+                    codec::run_id(run),
+                    &JobId(job.clone()),
+                    &mut retired,
+                )? {
                     recovered += 1;
                 } else {
                     failed += 1;
@@ -1332,36 +1394,19 @@ impl LiteBackend {
     /// pair every unbound ready job, or clear bindings when assignments
     /// are off.
     pub(crate) async fn rebuild_dispatch_intent(&self) -> Result<(), ControlError> {
-        self.write(|tx| {
-            let (pool_assignments, require_assignments, _) = self.config();
-            if !pool_assignments && !require_assignments {
-                tx.prepare_cached("DELETE FROM job_assignments")
-                    .map_err(db)?
-                    .execute([])
-                    .map_err(db)?;
-                tx.prepare_cached("DELETE FROM provision_requests")
-                    .map_err(db)?
-                    .execute([])
-                    .map_err(db)?;
-                return Ok(());
-            }
-            for job in jobs::ready_jobs(tx)? {
-                let exists = tx
-                    .prepare_cached(
-                        "SELECT EXISTS(SELECT 1 FROM job_assignments \
-                         WHERE run_id = ?1 AND job_id = ?2)",
-                    )
-                    .map_err(db)?
-                    .query_row(params![codec::run_key(job.run_id), job.job_id.0], |row| {
-                        row.get::<_, bool>(0)
-                    })
-                    .map_err(db)?;
-                if !exists {
-                    promote::on_job_enqueued(tx, self, &job)?;
-                }
-            }
-            Ok(())
-        })
+        self.write(|tx| derive_dispatch_intent(tx, self, false).map(|_| ()))
+    }
+
+    /// `reconcile_dispatch_intent`: the reaper's periodic backstop for ready
+    /// jobs a path leaked with no assignment and no pool-pending row. Only
+    /// those jobs are re-derived; existing rows are never re-stamped.
+    pub(crate) async fn reconcile_dispatch_intent(&self) -> Result<usize, ControlError> {
+        let (pool_assignments, require_assignments, _) = self.config();
+        if !pool_assignments && !require_assignments {
+            // Nothing enqueue writes under this policy, so nothing can leak.
+            return Ok(0);
+        }
+        self.write(|tx| derive_dispatch_intent(tx, self, true))
     }
 
     /// `set_fork_approval`: write the run's fork-PR hold stamps. Scoped to

@@ -790,23 +790,38 @@ impl Agent {
     }
 
     /// Run until `shutdown`, re-registering after fencing or link failures.
-    pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
+    ///
+    /// `initial` is a session the caller already registered (so a process
+    /// that needs the provider id before serving does not register twice and
+    /// fence its own in-flight work). After that session ends the agent
+    /// registers again.
+    pub async fn run(self: Arc<Self>, initial: Option<Session>, shutdown: CancellationToken) {
         let mut backoff = REGISTER_BACKOFF_MIN;
+        let mut pending = initial;
         while !shutdown.is_cancelled() {
             let mut failed = None;
-            match self.register().await {
-                Ok(session) => {
-                    info!(provider = %session.provider_id, generation = session.generation, "agent registered");
-                    backoff = REGISTER_BACKOFF_MIN;
-                    let error = self.clone().session(session, shutdown.clone()).await;
-                    if let Some(error) = error {
-                        warn!(%error, "agent session ended; re-registering");
+            let session = match pending.take() {
+                Some(session) => session,
+                None => match self.register().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        warn!(%error, "agent registration failed");
+                        failed = Some(error);
+                        let delay = registration_delay(backoff, failed.as_ref());
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        backoff = (backoff * 2).min(REGISTER_BACKOFF_MAX);
+                        continue;
                     }
-                }
-                Err(error) => {
-                    warn!(%error, "agent registration failed");
-                    failed = Some(error);
-                }
+                },
+            };
+            info!(provider = %session.provider_id, generation = session.generation, "agent registered");
+            backoff = REGISTER_BACKOFF_MIN;
+            let error = self.clone().session(session, shutdown.clone()).await;
+            if let Some(error) = error {
+                warn!(%error, "agent session ended; re-registering");
             }
             let delay = registration_delay(backoff, failed.as_ref());
             tokio::select! {
@@ -1393,7 +1408,107 @@ fn prune_work(work: &mut HashMap<String, (WorkState, Instant)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use crate::api::{PollResponse, ReconcileResponse, ReportExecRequest, ReportRequest};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct TestLink {
+        registers: AtomicUsize,
+        abort_polls: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ProviderLink for TestLink {
+        async fn register(&self, _request: RegisterRequest) -> Result<RegisterResponse> {
+            let generation = self.registers.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            Ok(RegisterResponse {
+                provider_id: "prv-test".into(),
+                generation,
+                ..RegisterResponse::default()
+            })
+        }
+        async fn heartbeat(&self, _request: HeartbeatRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn poll(&self, _request: PollRequest) -> Result<PollResponse> {
+            if self.abort_polls.swap(false, Ordering::SeqCst) {
+                return Err(Error::aborted("fenced"));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(PollResponse::default())
+        }
+        async fn report(&self, _request: ReportRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn report_exec(&self, _request: ReportExecRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn reconcile(&self, _request: ReconcileRequest) -> Result<ReconcileResponse> {
+            Ok(ReconcileResponse::default())
+        }
+        async fn fetch_blob(
+            &self,
+            _id: &Session,
+            _ticket: &str,
+        ) -> Result<mpsc::Receiver<TransferChunk>> {
+            Ok(mpsc::channel(crate::driver::TRANSFER_QUEUE).1)
+        }
+        async fn put_blob(
+            &self,
+            _id: &Session,
+            _ticket: &str,
+            _tar: mpsc::Receiver<TransferChunk>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn agent(link: Arc<TestLink>) -> Arc<Agent> {
+        Agent::new(
+            link as Arc<dyn ProviderLink>,
+            Vec::new(),
+            AgentConfig::new("test"),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_initial_session_is_not_registered_twice() {
+        let link = Arc::new(TestLink::default());
+        let agent = agent(link.clone()).await;
+        let initial = agent.register().await.unwrap();
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(agent.run(Some(initial), shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(link.registers.load(Ordering::SeqCst), 1);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fenced_session_registers_again() {
+        let link = Arc::new(TestLink::default());
+        let agent = agent(link.clone()).await;
+        let initial = agent.register().await.unwrap();
+        link.abort_polls.store(true, Ordering::SeqCst);
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(agent.run(Some(initial), shutdown.clone()));
+        for _ in 0..100 {
+            if link.registers.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            link.registers.load(Ordering::SeqCst) >= 2,
+            "the agent must re-register after a fenced session"
+        );
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+    }
 
     fn create(mounts: Vec<Mount>, sockets: Vec<SocketMount>) -> CreateWork {
         CreateWork {
