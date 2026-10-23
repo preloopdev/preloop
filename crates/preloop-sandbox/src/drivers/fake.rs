@@ -37,6 +37,12 @@ pub struct FakeDriver {
     running: Mutex<HashMap<String, HashSet<String>>>,
     /// Artificial snapshot latency (tests that need an operation in flight).
     pub snapshot_delay_ms: AtomicU64,
+    /// Fail the next N destroys (tests).
+    pub fail_destroys: AtomicU32,
+    /// Artificial destroy latency (tests that need a destroy in flight).
+    pub destroy_delay_ms: AtomicU64,
+    /// Destroys attempted, failed or not (tests).
+    pub destroy_calls: AtomicU32,
 }
 
 impl FakeDriver {
@@ -54,6 +60,9 @@ impl FakeDriver {
             cancels: ExecCancels::default(),
             running: Mutex::new(HashMap::new()),
             snapshot_delay_ms: AtomicU64::new(0),
+            fail_destroys: AtomicU32::new(0),
+            destroy_delay_ms: AtomicU64::new(0),
+            destroy_calls: AtomicU32::new(0),
         }
     }
 
@@ -280,6 +289,25 @@ impl Driver for FakeDriver {
     }
 
     async fn destroy(&self, native_ref: &str) -> Result<()> {
+        self.destroy_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let delay = self
+            .destroy_delay_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        if self
+            .fail_destroys
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(Error::unavailable("injected destroy failure"));
+        }
         // Stop the sandbox's commands before removing anything: destroy
         // used to only delete the directory, leaving the exec processes
         // running on the host, orphaned, with their working directory
