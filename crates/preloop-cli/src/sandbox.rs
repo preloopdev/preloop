@@ -102,7 +102,6 @@ fn sandbox_agent_config(name: impl Into<String>) -> AgentConfig {
     }
     config
 }
-
 /// Drivers attached to this host: `PRELOOP_SANDBOX_DRIVERS`, comma-separated
 /// (default `smolvm`). An `external:<spec>` entry starts a driver plugin (see
 /// [`ExternalSpec`]); `runtime_dir` holds their sockets. `named_prefix` lets

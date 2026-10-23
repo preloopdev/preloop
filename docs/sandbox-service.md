@@ -199,6 +199,23 @@ takes any `Placement` implementation; `PRELOOP_SANDBOX_PLACEMENT` selects a
 built-in one by name (default `least-loaded`) for `preloop sandbox serve` and
 the engine, and an unknown name is a startup error naming the valid values.
 
+## Placement
+
+Placement is split in two. The service filters: it drops offline providers
+(and, for a snapshot template, every provider that does not hold the snapshot)
+and every provider/driver pair that misses a required capability or is at its
+slot cap, leaving a candidate list. A `Placement`
+(`crates/preloop-sandbox/src/placement.rs`) then ranks those candidates by
+preference, and the service takes the first one. A placement therefore orders
+the candidates the service proved eligible; it can neither admit a pair the
+filter rejected nor widen a request.
+
+`LeastLoaded` is the default: fewest live sandboxes first, ties in candidate
+order (provider id, then the provider's driver order). `ServiceConfig::placement`
+takes any `Placement` implementation; `PRELOOP_SANDBOX_PLACEMENT` selects a
+built-in one by name (default `least-loaded`) for `preloop sandbox serve` and
+the engine, and an unknown name is a startup error naming the valid values.
+
 ## Drivers
 
 A driver is the host-side interface a host agent drives
