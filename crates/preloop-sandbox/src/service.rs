@@ -2427,7 +2427,7 @@ impl Service {
                     } else {
                         sandbox.error.clone()
                     };
-                    self.release_locked(state, &lease_id, ReleaseMode::Destroy, 0, ops);
+                    let _ = self.release_locked(state, &lease_id, ReleaseMode::Destroy, 0, ops);
                     Err(crate::error::from_reported(error))
                 }
             };
@@ -5523,9 +5523,10 @@ mod tests {
         assert!(copy.is_ok(), "the copy is enqueued");
         let expires_at = service.state.lock().blobs["tkt-copy"].expires_at;
         assert!(
-            expires_at >= now() + 1,
+            expires_at > now(),
             "enqueueing a copy must extend its ticket's life, expires_at={expires_at}"
         );
+    }
 
     /// Every delivery of an exec's work item is counted on the exec record,
     /// so a redelivery — the attempt that must never become a second
@@ -5533,7 +5534,6 @@ mod tests {
     /// fenced by the agent's durable started-set; see `agent.rs`.)
     #[tokio::test]
     async fn exec_deliveries_are_counted_on_the_exec_record() {
-        let dir = tempfile::tempdir().unwrap();
         let mut config = ServiceConfig::new();
         config.delivery_timeout = Duration::from_millis(50);
         let service = Service::open(crate::store::open("memory:").await.unwrap(), config)
@@ -5658,13 +5658,9 @@ mod tests {
 
     #[tokio::test]
     async fn warm_members_rotate_oldest_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = Service::open(
-            store::open("memory:").await.unwrap(),
-            ServiceConfig::new(),
-        )
-        .await
-        .unwrap();
+        let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+            .await
+            .unwrap();
         {
             let mut state = service.state.lock();
             state.templates.insert(

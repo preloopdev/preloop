@@ -574,37 +574,6 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    /// True while `pid` names a live (not zombie) process.
-    #[cfg(unix)]
-    fn running(pid: u32) -> bool {
-        // `ps` is portable where /proc is not, and still reports `Z` for a
-        // zombie, so a killed-but-unreaped process does not count as alive.
-        let Ok(output) = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-        else {
-            return false;
-        };
-        output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
-                .trim_start()
-                .chars()
-                .next()
-                .is_some_and(|state| state != 'Z' && state != 'X')
-    }
-
-    async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
-        for _ in 0..200 {
-            if condition() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        panic!("timed out waiting for {what}");
-    }
-
     #[test]
     fn guest_paths_are_confined_to_the_sandbox_root() {
         let root = Path::new("/sandboxes/ref-1");

@@ -340,10 +340,10 @@ async fn provider_calls_without_a_client_certificate_are_denied() {
     let anonymous = anonymous_providers(&t.base, &t.ca_pem());
     let error = anonymous.register(register("ghost")).await.unwrap_err();
     assert_eq!(error.code, Code::Unauthenticated);
+    let message = preloop_sandbox::error::message(&error);
     assert!(
-        error.message.contains("raw TCP") && error.message.contains("TLS termination"),
-        "{}",
-        error.message
+        message.contains("raw TCP") && message.contains("TLS termination"),
+        "{message}"
     );
     let error = anonymous
         .heartbeat(HeartbeatRequest {

@@ -53,7 +53,6 @@ fn template(name: &str) -> TemplateSpec {
     TemplateSpec {
         name: name.into(),
         os: "linux".into(),
-        image: Some("alpine:3.20".into()),
         ..TemplateSpec::default()
     }
 }
@@ -96,7 +95,7 @@ async fn every_client_and_provider_surface_reaches_the_authorizer() {
     let agent = Agent::new(
         Arc::new(link),
         vec![fake as Arc<dyn Driver>],
-        AgentConfig::new("host-a", t.dir.path().join("scratch")),
+        AgentConfig::new("host-a").with_scratch(t.dir.path().join("scratch")),
     );
     tokio::spawn(agent.run(None, t.shutdown_token()));
 
@@ -144,16 +143,16 @@ async fn every_client_and_provider_surface_reaches_the_authorizer() {
         builder.finish().unwrap();
     }
     client
-        .upload(&lease.sandbox.id, "/work", &source)
+        .upload(&lease.sandbox.id, &lease.lease.id, "/work", &source)
         .await
         .unwrap();
     let destination = t.dir.path().join("output.tar");
     client
-        .download(&lease.sandbox.id, "/work", &destination)
+        .download(&lease.sandbox.id, &lease.lease.id, "/work", &destination)
         .await
         .unwrap();
 
-    client.create_join_token(60).await.unwrap();
+    client.create_join_token(60, "").await.unwrap();
     let calls = authorizer.calls();
     assert!(has_call(
         &calls,

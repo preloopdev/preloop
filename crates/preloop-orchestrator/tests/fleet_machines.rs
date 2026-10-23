@@ -581,12 +581,9 @@ async fn a_failed_release_keeps_the_entry_for_the_retry() {
         dir.path().join("host"),
         FakeDriver::full_capabilities(),
     ));
-    let service = Service::open(
-        store::open("memory:").await.unwrap(),
-        ServiceConfig::new(),
-    )
-    .await
-    .unwrap();
+    let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,

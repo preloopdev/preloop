@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -609,6 +609,10 @@ fn check_host_path(kind: &str, host: &str, allowed: &[PathBuf]) -> Result<()> {
 pub struct AgentConfig {
     /// Stable provider name.
     pub name: String,
+    /// Durable agent state: started-exec records that fence a redelivered
+    /// work item from running twice. Transfer bytes never touch this
+    /// directory; tickets stream through memory.
+    pub scratch: std::path::PathBuf,
     /// Heartbeat period.
     pub heartbeat: Duration,
     /// Full inventory reconcile period.
@@ -628,8 +632,22 @@ pub struct AgentConfig {
 impl AgentConfig {
     /// Defaults.
     pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         Self {
-            name: name.into(),
+            scratch: std::env::temp_dir()
+                .join("preloop-sandbox-agents")
+                .join(safe),
+            name,
             heartbeat: Duration::from_secs(10),
             reconcile: Duration::from_secs(60),
             access: HostAccess::default(),
@@ -637,6 +655,12 @@ impl AgentConfig {
             concurrency: 32,
             retry_backoff: Duration::from_millis(500),
         }
+    }
+
+    /// Use `scratch` for durable started-exec records.
+    pub fn with_scratch(mut self, scratch: impl Into<std::path::PathBuf>) -> Self {
+        self.scratch = scratch.into();
+        self
     }
 
     /// Set the host access allowlist.
@@ -1569,6 +1593,7 @@ mod tests {
     use super::*;
     use crate::api::{PollResponse, ReconcileResponse, ReportExecRequest, ReportRequest};
     use async_trait::async_trait;
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]

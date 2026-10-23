@@ -41,7 +41,7 @@ use crate::authz::{Action, Authorizer, Principal, PrincipalKind, TokenAuthorizer
 
 use crate::api::*;
 use crate::driver::TransferChunk;
-use crate::error::{Error, Result};
+use crate::error::{Code, Error, Result};
 use crate::generated::preloop::sandbox::v1::{
     Empty, Providers, ProvidersExt, Sandboxes, SandboxesExt,
 };
@@ -209,7 +209,7 @@ struct AppState {
     hosts: HostAllowlist,
     authorizer: Arc<dyn Authorizer>,
 }
-}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -575,7 +575,7 @@ impl Sandboxes for SandboxesService {
         let request = request.to_owned_message();
         // Authorize before the future is built: the stream is `'static`, so
         // the response borrows neither the request nor `self`.
-        let allowed = self.authorize(&ctx);
+        let allowed = self.authorize(&ctx, Action::Exec);
         let service = self.service.clone();
         async move {
             allowed?;
@@ -941,12 +941,6 @@ impl Providers for ProvidersService {
     }
 }
 
-#[derive(Clone)]
-struct AppState {
-    service: Arc<Service>,
-    auth: Auth,
-}
-
 /// Build the compatibility router exposing both surfaces.
 ///
 /// This is the single-listener deployment mode: caller and agent routes share
@@ -1034,7 +1028,6 @@ pub fn router_with_options_and_authorizer(
     })
 }
 
-
 /// Serve the compatibility API over TLS until `shutdown`.
 pub async fn serve(
     listener: tokio::net::TcpListener,
@@ -1089,6 +1082,7 @@ pub async fn serve_with_options(
 }
 
 /// Serve one listener surface with an explicitly selected policy.
+#[allow(clippy::too_many_arguments)]
 async fn serve_with_options_and_authorizer(
     listener: tokio::net::TcpListener,
     service: Arc<Service>,
@@ -1114,6 +1108,31 @@ async fn serve_with_options_and_authorizer(
         )
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
+    }
+}
+
+/// Liveness for the caller listener; it carries no identity, so the policy
+/// sees an anonymous read.
+async fn healthz(State(app): State<AppState>) -> Response {
+    match authorize(&*app.authorizer, anonymous_principal(), Action::Read) {
+        Ok(()) => "ok".into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Reject an RPC body above [`CONNECT_BODY_LIMIT`] with `413`.
+///
+/// The generated dispatch reads the body itself and would answer a body over
+/// its own limit with a Connect `resource_exhausted`; this middleware keeps
+/// the service's documented HTTP answer and bounds buffering before dispatch.
+async fn cap_rpc_body(request: axum::extract::Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    match axum::body::to_bytes(body, CONNECT_BODY_LIMIT).await {
+        Ok(bytes) => {
+            let request = axum::extract::Request::from_parts(parts, Body::from(bytes));
+            next.run(request).await
+        }
+        Err(_) => payload_too_large(CONNECT_BODY_LIMIT as u64),
     }
 }
 

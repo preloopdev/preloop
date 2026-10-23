@@ -12,9 +12,7 @@ use preloop_sandbox::driver::TransferChunk;
 use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::error::message;
 use preloop_sandbox::placement::{Candidate, CandidateId, Placement, PlacementRequest};
-use preloop_sandbox::server::{
-    Auth, HostAllowlist, ListenerSurface, router, serve_with_options,
-};
+use preloop_sandbox::server::{Auth, HostAllowlist, ListenerSurface, router, serve_with_options};
 use preloop_sandbox::service::TransferSide;
 use preloop_sandbox::store::{self, Kind, Store};
 use preloop_sandbox::{Code, Driver, SandboxClient, ServerTls, Service, ServiceConfig, tls};
@@ -327,7 +325,7 @@ async fn a_configured_placement_ranks_the_candidates() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let mut config = ServiceConfig::new(dir.path().join("blobs"));
+    let mut config = ServiceConfig::new();
     config.acquire_wait = Duration::from_secs(10);
     config.placement = Arc::new(Busiest);
     let service = Service::open(store::open("memory:").await.unwrap(), config)
@@ -344,7 +342,7 @@ async fn a_configured_placement_ranks_the_candidates() {
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             vec![fake as Arc<dyn Driver>],
-            AgentConfig::new(name, dir.path().join(format!("{name}-scratch"))),
+            AgentConfig::new(name).with_scratch(dir.path().join(format!("{name}-scratch"))),
         );
         tokio::spawn(agent.run(None, shutdown.clone()));
     };
@@ -4101,14 +4099,10 @@ impl Store for RefusesProviderRows {
 /// re-registering.
 #[tokio::test]
 async fn a_generation_the_store_cannot_keep_is_never_handed_out() {
-    let dir = tempfile::tempdir().unwrap();
     let inner = store::open("memory:").await.unwrap();
-    let service = Service::open(
-        Arc::new(RefusesProviderRows(inner)),
-        ServiceConfig::new(),
-    )
-    .await
-    .unwrap();
+    let service = Service::open(Arc::new(RefusesProviderRows(inner)), ServiceConfig::new())
+        .await
+        .unwrap();
     let request = || RegisterRequest {
         name: "host-a".into(),
         drivers: vec![DriverInfo {
@@ -5401,7 +5395,7 @@ async fn a_restarted_agent_refuses_to_run_an_exec_twice() {
     let agent1 = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![fake1 as Arc<dyn Driver>],
-        AgentConfig::new("host-a", scratch.clone()),
+        AgentConfig::new("host-a").with_scratch(scratch.clone()),
     );
     let agent1_shutdown = CancellationToken::new();
     tokio::spawn(agent1.run(None, agent1_shutdown.clone()));
@@ -5445,7 +5439,7 @@ async fn a_restarted_agent_refuses_to_run_an_exec_twice() {
     let agent2 = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,
         vec![fake2 as Arc<dyn Driver>],
-        AgentConfig::new("host-a", scratch.clone()),
+        AgentConfig::new("host-a").with_scratch(scratch.clone()),
     );
     let agent2_shutdown = CancellationToken::new();
     tokio::spawn(agent2.run(None, agent2_shutdown.clone()));
@@ -5474,73 +5468,6 @@ async fn a_restarted_agent_refuses_to_run_an_exec_twice() {
     assert_eq!(runs, 1, "the redelivered exec executed again");
     agent2_shutdown.cancel();
     shutdown.cancel();
-}
-
-#[tokio::test]
-async fn a_configured_placement_ranks_the_candidates() {
-    struct Busiest;
-
-    impl Placement for Busiest {
-        fn name(&self) -> &'static str {
-            "busiest"
-        }
-
-        fn rank(&self, _request: &PlacementRequest, candidates: &[Candidate]) -> Vec<CandidateId> {
-            let mut ranked: Vec<CandidateId> =
-                candidates.iter().map(|candidate| candidate.id).collect();
-            ranked.sort_by_key(|id| std::cmp::Reverse(candidates[id.0].live));
-            ranked
-        }
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = ServiceConfig::new();
-    config.acquire_wait = Duration::from_secs(10);
-    config.placement = Arc::new(Busiest);
-    let service = Service::open(store::open("memory:").await.unwrap(), config)
-        .await
-        .unwrap();
-    let shutdown = CancellationToken::new();
-    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
-    let add_host = |name: &str| {
-        let fake = Arc::new(FakeDriver::new(
-            "fake",
-            dir.path().join(name),
-            FakeDriver::full_capabilities(),
-        ));
-        let agent = Agent::new(
-            Arc::new(service.clone()) as Arc<dyn ProviderLink>,
-            vec![fake as Arc<dyn Driver>],
-            AgentConfig::new(name),
-        );
-        tokio::spawn(agent.run(None, shutdown.clone()));
-    };
-    add_host("host-a");
-    wait_for(|| service.list_providers().len() == 1).await;
-    service.put_template(template("alpine")).await.unwrap();
-    // The only host, so the first lease lands there and loads it.
-    let first = service
-        .acquire(AcquireRequest {
-            idempotency_key: "k1".into(),
-            template: "alpine".into(),
-            ..AcquireRequest::default()
-        })
-        .await
-        .expect("first acquire");
-    add_host("host-b");
-    wait_for(|| service.list_providers().len() == 2).await;
-    let second = service
-        .acquire(AcquireRequest {
-            idempotency_key: "k2".into(),
-            template: "alpine".into(),
-            ..AcquireRequest::default()
-        })
-        .await
-        .expect("second acquire");
-    // `least-loaded` would have taken the empty host; the configured placement
-    // wins, and the service still admits the loaded candidate.
-    assert_eq!(second.sandbox.provider_id, first.sandbox.provider_id);
-    assert_ne!(second.sandbox.id, first.sandbox.id);
 }
 
 #[tokio::test]
@@ -5625,7 +5552,7 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-async fn unclaimed_service(dir: &tempfile::TempDir, unclaimed: Duration) -> Arc<Service> {
+async fn unclaimed_service(_dir: &tempfile::TempDir, unclaimed: Duration) -> Arc<Service> {
     let mut config = ServiceConfig::new();
     config.unclaimed_lease_ttl = unclaimed;
     let service = Service::open(store::open("memory:").await.unwrap(), config)
@@ -5912,9 +5839,7 @@ async fn restart_keeps_the_requested_lease_ttl() {
         remaining <= 6,
         "an unclaimed lease expires in the short window, got {remaining}s"
     );
-    let restored = Service::open(store, ServiceConfig::new())
-        .await
-        .unwrap();
+    let restored = Service::open(store, ServiceConfig::new()).await.unwrap();
     assert_eq!(restored.list().len(), 1);
 }
 

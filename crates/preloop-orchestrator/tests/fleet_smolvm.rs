@@ -23,7 +23,7 @@ async fn secrets_reach_the_guest_without_entering_argv() {
         eprintln!("skipped: set PRELOOP_SANDBOX_E2E_SMOLVM=1");
         return;
     }
-    let _dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let service = Service::open(store::open("memory:").await.unwrap(), ServiceConfig::new())
         .await
         .unwrap();
