@@ -12,73 +12,84 @@ pub struct OidcTokenResponse {
     pub value: String,
 }
 
-/// `GET /runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken`
-///
-/// Mints a GitHub-compatible RS256-signed OIDC id-token JWT. Looks up the
-/// originating workflow run to populate claims, and enforces `id-token: write`.
-/// Read the persisted repository `created_at` cache (keyed by
-/// repository ID) from node-local state.
+/// Read the in-memory repository `created_at` cache (keyed by
+/// repository ID). The cache lives only for the process lifetime: a
+/// restart starts empty and re-fetches, which is safe because an ID's
+/// creation date never changes.
 async fn cached_repo_created_at(shared: &Arc<SharedState>, repository_id: &str) -> Option<i64> {
     let inner = shared.state.inner.lock().await;
     inner.oidc_repo_created_at.get(repository_id).copied()
 }
 
-/// Record a repository `created_at` in the cache and persist it,
-/// mirroring the artifact-v2 registry's state-dir pattern. Best-effort:
-/// a failed write only costs a repeat lookup later.
+/// Record a repository `created_at` in the in-memory cache.
 async fn cache_repo_created_at(shared: &Arc<SharedState>, repository_id: &str, created_at: i64) {
-    let snapshot = {
-        let mut inner = shared.state.inner.lock().await;
-        if inner.oidc_repo_created_at.get(repository_id) == Some(&created_at) {
-            return;
-        }
-        inner
-            .oidc_repo_created_at
-            .insert(repository_id.to_owned(), created_at);
-        inner.oidc_repo_created_at.clone()
-    };
-    if let Ok(content) = serde_json::to_string(&snapshot) {
-        let _ = tokio::fs::write(
-            shared.state.state_dir.join("oidc_repo_created_at.json"),
-            content,
-        )
-        .await;
-    }
+    let mut inner = shared.state.inner.lock().await;
+    inner
+        .oidc_repo_created_at
+        .insert(repository_id.to_owned(), created_at);
 }
 
-/// Resolve whether this mint uses GitHub's immutable (ID-embedded)
-/// subject form. The creation date comes from, in order: the run
-/// submission's webhook payload, the persisted cache keyed by
-/// repository ID, and the GitHub API (whose result is cached — an ID's
-/// creation date never changes). Fail-soft throughout: unknown IDs or an
+/// Resolve the repository identity this mint speaks for: the numeric
+/// repository and owner IDs (used for both the subject decision and the
+/// token's `repository_id` / `repository_owner_id` claims) and whether
+/// the subject uses GitHub's immutable (ID-embedded) form.
+///
+/// IDs come from the run submission's webhook payload when it carries
+/// them. Server-synthesized submissions (workflow_dispatch, schedules,
+/// repository_dispatch) carry none, so missing IDs are resolved from
+/// the GitHub API by repository name — GitHub's own record, as
+/// authoritative as its webhook payload. The creation date comes from,
+/// in order: the payload, the in-memory cache keyed by repository ID,
+/// and that same API lookup (whose result is cached — an ID's creation
+/// date never changes). Fail-soft throughout: unresolvable IDs or an
 /// undeterminable date mean the historical name-based form, and no
 /// failure here ever fails the mint.
-async fn resolve_immutable_subject(
+async fn resolve_repo_identity(
     shared: &Arc<SharedState>,
     repository: &str,
-    repository_id: &str,
-    repository_owner_id: &str,
+    payload_id: String,
+    payload_owner_id: String,
     payload_created_at: Option<i64>,
-) -> bool {
-    if repository_id.is_empty() || repository_owner_id.is_empty() {
-        return false;
+) -> (String, String, bool) {
+    let mut repository_id = payload_id;
+    let mut repository_owner_id = payload_owner_id;
+    let mut created_at = payload_created_at;
+    if created_at.is_none() && !repository_id.is_empty() {
+        created_at = cached_repo_created_at(shared, &repository_id).await;
     }
-    if let Some(forced) = shared.state.oidc_immutable_subject_claims {
-        return forced;
-    }
-    let cached = cached_repo_created_at(shared, repository_id).await;
-    let created_at = match payload_created_at.or(cached) {
-        Some(created_at) => Some(created_at),
-        None => crate::github::fetch_repository_created_at(shared, repository).await,
-    };
-    if let Some(created_at) = created_at
-        && cached != Some(created_at)
+    if (repository_id.is_empty() || repository_owner_id.is_empty() || created_at.is_none())
+        && let Some(metadata) = crate::github::fetch_repository_metadata(shared, repository).await
     {
-        cache_repo_created_at(shared, repository_id, created_at).await;
+        if repository_id.is_empty() {
+            repository_id = metadata.id.to_string();
+        }
+        if repository_owner_id.is_empty() {
+            repository_owner_id = metadata.owner_id.to_string();
+        }
+        if created_at.is_none() {
+            created_at = metadata.created_at;
+        }
     }
-    oidc::use_immutable_subject(repository_id, repository_owner_id, created_at, None)
+    if !repository_id.is_empty()
+        && let Some(created_at) = created_at
+        && cached_repo_created_at(shared, &repository_id).await != Some(created_at)
+    {
+        cache_repo_created_at(shared, &repository_id, created_at).await;
+    }
+    let immutable_subject = if repository_id.is_empty() || repository_owner_id.is_empty() {
+        false
+    } else if let Some(forced) = shared.state.oidc_immutable_subject_claims {
+        forced
+    } else {
+        oidc::use_immutable_subject(&repository_id, &repository_owner_id, created_at, None)
+    };
+    (repository_id, repository_owner_id, immutable_subject)
 }
 
+/// `GET /runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken`
+///
+/// Mints a GitHub-compatible RS256-signed OIDC id-token JWT. Looks up the
+/// originating workflow run to populate claims, and enforces `id-token: write`.
 pub async fn oidc_token_run_service(
     State(shared): State<Arc<SharedState>>,
     Path((_orchestration_id, plan_id, job_id)): Path<(String, String, String)>,
@@ -230,13 +241,17 @@ pub async fn oidc_token(
         .to_owned();
     // Extract the repository creation date when the webhook payload
     // carries it — the first source for the immutable-subject decision
-    // (see `resolve_immutable_subject`).
+    // (see `resolve_repo_identity`). Most events carry an RFC 3339
+    // string, but push payloads carry a Unix integer; accept both.
     let repository_created_at = submission
         .payload
         .get("repository")
         .and_then(|r| r.get("created_at"))
-        .and_then(|v| v.as_str())
-        .and_then(oidc::parse_repo_created_at);
+        .and_then(|v| {
+            v.as_str()
+                .and_then(oidc::parse_repo_created_at)
+                .or_else(|| v.as_i64())
+        });
 
     let workflow_name = parse_workflow(&submission.workflow_yaml)
         .ok()
@@ -286,11 +301,11 @@ pub async fn oidc_token(
             .or_else(|| job_workflow_ref.as_ref().map(|_| sha.clone()))
     });
 
-    let immutable_subject = resolve_immutable_subject(
+    let (repository_id, repository_owner_id, immutable_subject) = resolve_repo_identity(
         &shared,
         &submission.repository,
-        &repository_id,
-        &repository_owner_id,
+        repository_id,
+        repository_owner_id,
         repository_created_at,
     )
     .await;
@@ -662,15 +677,18 @@ mod tests {
 
     // -- immutable subject claims, end to end through the mint ------------
 
-    /// Decode a minted JWT's `sub` claim (the test inspects the payload
+    /// Decode a minted JWT's claims (the test inspects the payload
     /// segment only; signature verification is covered elsewhere).
-    fn decoded_sub(jwt: &str) -> String {
+    fn decoded_claims(jwt: &str) -> serde_json::Value {
         let segment = jwt.split('.').nth(1).expect("a JWT has a payload segment");
         let bytes =
             base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, segment)
                 .expect("the payload segment is base64url");
-        let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        claims["sub"]
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn decoded_sub(jwt: &str) -> String {
+        decoded_claims(jwt)["sub"]
             .as_str()
             .expect("the token carries a sub")
             .to_owned()
@@ -727,5 +745,121 @@ mod tests {
         .await;
         let jwt = job.mint().await;
         assert_eq!(decoded_sub(&jwt), "repo:owner/repo:ref:refs/heads/main");
+    }
+
+    /// Push payloads carry `repository.created_at` as a Unix integer,
+    /// not the RFC 3339 string other events use; the mint must read it
+    /// either way.
+    #[tokio::test]
+    async fn mint_numeric_created_at_uses_immutable_subject() {
+        let job = OidcJob::submit_with_payload(serde_json::json!({
+            "repository": {
+                "id": 1285198891,
+                "owner": { "id": 297229730 },
+                // 2026-08-01T00:00:00Z as a Unix integer, as push sends it.
+                "created_at": 1_785_542_400,
+                "visibility": "private"
+            }
+        }))
+        .await;
+        let jwt = job.mint().await;
+        assert_eq!(
+            decoded_sub(&jwt),
+            "repo:owner@297229730/repo@1285198891:ref:refs/heads/main"
+        );
+    }
+
+    /// The payload shape `dispatch.rs` synthesizes for workflow_dispatch
+    /// (and the scheduler / repository_dispatch build likewise):
+    /// `repository` carries a name and a default branch, but no IDs.
+    fn synthesized_payload() -> serde_json::Value {
+        serde_json::json!({
+            "ref": "refs/heads/main",
+            "ref_type": "branch",
+            "inputs": {},
+            "repository": {
+                "full_name": "owner/repo",
+                "default_branch": "main"
+            },
+            "sender": { "login": "preloop-system" }
+        })
+    }
+
+    /// Start a stub GitHub API on a loopback port; returns the base URL.
+    async fn spawn_github_stub(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        base
+    }
+
+    /// Pin PAT-mode GitHub env at a stub for a test, holding the
+    /// process-wide env lock. The lock guard is the LAST tuple field on
+    /// purpose: tuple fields drop in declaration order, so the env vars
+    /// are restored before the lock is released (see the same pattern in
+    /// `environment_resolver`'s tests).
+    async fn pin_github_stub(
+        base: &str,
+    ) -> (
+        crate::state::TestEnvVar,
+        crate::state::TestEnvVar,
+        tokio::sync::MutexGuard<'static, ()>,
+    ) {
+        let lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
+        let api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", base);
+        (token, api, lock)
+    }
+
+    /// A synthesized submission has no IDs for the mint to read; the
+    /// mint resolves them (and the creation date) from the GitHub API by
+    /// repository name, and the resolved IDs land in both the subject
+    /// and the token's ID claims.
+    #[tokio::test]
+    async fn mint_synthesized_payload_resolves_ids_from_github_metadata() {
+        let router = axum::Router::new().route(
+            "/repos/owner/repo",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "id": 1285198891,
+                    "owner": { "id": 297229730 },
+                    "created_at": "2026-08-01T00:00:00Z"
+                }))
+            }),
+        );
+        let base = spawn_github_stub(router).await;
+        let _env = pin_github_stub(&base).await;
+
+        let job = OidcJob::submit_with_payload(synthesized_payload()).await;
+        let jwt = job.mint().await;
+        assert_eq!(
+            decoded_sub(&jwt),
+            "repo:owner@297229730/repo@1285198891:ref:refs/heads/main"
+        );
+        let claims = decoded_claims(&jwt);
+        assert_eq!(claims["repository_id"], "1285198891");
+        assert_eq!(claims["repository_owner_id"], "297229730");
+    }
+
+    /// When GitHub cannot resolve the repository (here: a 404), a
+    /// synthesized submission mints exactly what it minted before this
+    /// resolution existed: the name-based subject and empty ID claims.
+    #[tokio::test]
+    async fn mint_synthesized_payload_unresolvable_repo_falls_back_to_name_based() {
+        let router = axum::Router::new().route(
+            "/repos/owner/repo",
+            axum::routing::get(|| async { axum::http::StatusCode::NOT_FOUND }),
+        );
+        let base = spawn_github_stub(router).await;
+        let _env = pin_github_stub(&base).await;
+
+        let job = OidcJob::submit_with_payload(synthesized_payload()).await;
+        let jwt = job.mint().await;
+        assert_eq!(decoded_sub(&jwt), "repo:owner/repo:ref:refs/heads/main");
+        let claims = decoded_claims(&jwt);
+        assert_eq!(claims["repository_id"], "");
+        assert_eq!(claims["repository_owner_id"], "");
     }
 }

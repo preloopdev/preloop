@@ -1462,17 +1462,10 @@ impl AppState {
         } else {
             (BTreeMap::new(), 0)
         };
-        let oidc_created_at_path = state_dir.join("oidc_repo_created_at.json");
-        let oidc_repo_created_at: BTreeMap<String, i64> =
-            std::fs::read_to_string(&oidc_created_at_path)
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok())
-                .unwrap_or_default();
         let mut config = crate::config::load_config_from(&config_path)?;
         let inner = InnerState {
             agent_keypair: Some(keypair),
             artifact_v2_registry: registry,
-            oidc_repo_created_at,
             next_artifact_v2_id: next_id,
             oidc_keypair: Some(oidc_keypair),
             session_last_seen: BTreeMap::new(),
@@ -2333,11 +2326,12 @@ pub struct InnerState {
     /// Artifact v2 finalized registry: registry_key → metadata.
     pub artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
     /// OIDC repository `created_at` cache: repository ID → creation time
-    /// (Unix seconds), persisted to `oidc_repo_created_at.json` in the
-    /// state dir. Keyed by ID, never by name: a deleted-and-recreated
-    /// repository gets a new ID and must never inherit its predecessor's
-    /// cached date. An ID's creation date never changes, so entries never
-    /// expire; the map is a pure cache (a miss costs one GitHub API call).
+    /// (Unix seconds). In-memory only, per process: a restart starts
+    /// empty and simply re-fetches, which is safe because an ID's
+    /// creation date never changes. Keyed by ID, never by name: a
+    /// deleted-and-recreated repository gets a new ID and must never
+    /// inherit its predecessor's cached date. Entries never expire; the
+    /// map is a pure cache (a miss costs one GitHub API call).
     pub oidc_repo_created_at: BTreeMap<String, i64>,
     /// Monotonic artifact v2 ID counter.
     pub next_artifact_v2_id: u64,
