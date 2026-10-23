@@ -274,7 +274,7 @@ async fn external_driver_carries_the_agent_flow() {
     let mut config = AgentConfig::new("external-host", service.dir.path().join("scratch"));
     config.heartbeat = Duration::from_millis(50);
     let agent = Agent::new(Arc::new(link), vec![Arc::clone(&driver)], config);
-    tokio::spawn(agent.run(service.shutdown_token()));
+    tokio::spawn(agent.run(None, service.shutdown_token()));
 
     wait_for(|| !Service::list_providers(&service.service).is_empty()).await;
 

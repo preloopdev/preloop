@@ -977,8 +977,8 @@ struct RunArgs {
     #[arg(short = 'm', long = "message")]
     message: Option<String>,
     /// Open a live debug session when a job fails. Without this flag, failed
-    /// Jobs on a state-preserving backend are cleaned up normally. SmolVM retains its historical
-    /// terminal-attached default for compatibility.
+    /// jobs are cleaned up normally; a terminal-attached run keeps the
+    /// historical debug-on-failure default.
     #[arg(long, conflicts_with = "no_debug")]
     debug: bool,
 
@@ -1388,7 +1388,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         github: None,
     };
     let payload = artifact_payload(&output, &config.base_image);
-    // The bake runs through a private, in-process sandbox service with this
+    // The bake runs through an in-process sandbox service with this
     // host's SmolVM driver: `pack` writes a portable `.smolmachine`.
     let sandboxes = crate::sandbox::LocalSandboxes::start(
         &preloop_home(),
@@ -2235,19 +2235,31 @@ async fn cmd_engine(
     let shutdown = tokio_util::sync::CancellationToken::new();
 
     // The runner pool gets its machines from the embedded Sandbox Service.
-    let sandboxes =
-        sandbox::LocalSandboxes::start(&home, pool_config.as_ref(), observability.clone()).await?;
-    // Publish the service (and the provider whose host sample is this
-    // engine's host) to the already-running server for status and host
-    // metrics.
-    let (sandbox_api, sandbox_provider_id) = sandboxes.api_and_provider_id();
-    sandbox_handle.set(sandbox_api, sandbox_provider_id);
-    let machines = sandboxes.machines();
+    // The runner pool gets its machines from the embedded Sandbox Service.
+    // Without a pool there is nothing to place here, so do not open the
+    // service (or bind its API) at all.
+    let sandboxes = sandbox::start_if_pool(
+        pool_config.is_some(),
+        &home,
+        pool_config.as_ref(),
+        observability.clone(),
+    )
+    .await?;
+    if let Some(sandboxes) = &sandboxes {
+        // Publish the service (and the provider whose host sample is this
+        // engine's host) to the already-running server for status and host
+        // metrics.
+        let (sandbox_api, sandbox_provider_id) = sandboxes.api_and_provider_id();
+        sandbox_handle.set(sandbox_api, sandbox_provider_id);
+    }
+    let machines = sandboxes.as_ref().map(sandbox::LocalSandboxes::machines);
 
     let spawn_pool = |config: &RunnerPoolConfig,
                       pool_shutdown: tokio_util::sync::CancellationToken| {
         let config = config.clone();
-        let machines = machines.clone();
+        let machines = machines
+            .clone()
+            .expect("a configured pool always starts the sandbox service");
         tokio::spawn(async move { RunnerPool::new(machines, config)?.run(pool_shutdown).await })
     };
     // Each generation gets a fresh child token: `RunnerPool::run` cancels the
@@ -2442,9 +2454,9 @@ async fn settle_pool<P>(
 ///
 /// The pool runs its own teardown on every path it reaches; this is the
 /// backstop for the paths it does not. Both steps are safe against a live
-/// machine: the purge keys on this home's boot-config paths, spares machines
-/// the Sandbox Service marked as owned by a sandbox the CI pool does not hold
-/// (another caller's lease outlives this process), and a mount whose
+/// machine: the purge keys on this home's boot-config paths, spares every
+/// machine the Sandbox Service marked (a leased sandbox outlives this process,
+/// and the pool releases its own through the service), and a mount whose
 /// hypervisor still exists is skipped.
 struct VmTeardownOnExit;
 
@@ -2457,16 +2469,17 @@ impl Drop for VmTeardownOnExit {
 /// Kill the detached hypervisors and layer mounts nothing can reach any more.
 ///
 /// Two callers: the exit backstop above, and the startup path where the
-/// guest-agent guard disables the runner pool. The second is the case this
-/// sweep exists for — a guest agent the resolved smolvm cannot stop refused
-/// every `machine stop`, so the machines of the previous engine are still
-/// running when the next one starts, and disabling the pool means
-/// `RunnerPool::run` never gets to run its own startup cleanup.
+/// guest-agent guard disables the runner pool. In the second, a guest agent
+/// the resolved smolvm cannot stop refused every `machine stop`, so the
+/// machines of the previous engine are still running when the next one
+/// starts, and disabling the pool means `RunnerPool::run` never gets to run
+/// its own startup cleanup. Those runners are marked like every Sandbox
+/// Service machine, so this sweep leaves them running: the pool releases them
+/// through the service when it next starts.
 ///
 /// Both steps are safe against a live machine: the purge keys on this home's
-/// boot-config paths and spares Sandbox Service machines the CI pool does not
-/// own (see `OrphanPurge::All`), and a mount whose hypervisor still exists is
-/// skipped.
+/// boot-config paths and spares every Sandbox Service machine (see
+/// `OrphanPurge::All`), and a mount whose hypervisor still exists is skipped.
 fn purge_stuck_vms() {
     match preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms(
         preloop_sandbox::drivers::smolvm::cli::OrphanPurge::All,

@@ -29,16 +29,25 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use preloop_sandbox::Driver as _;
-    use preloop_sandbox::api::{CreateWork, Template, TemplateSpec};
+    use preloop_sandbox::Driver;
+    use preloop_sandbox::agent::{Agent, AgentConfig, ProviderLink};
+    use preloop_sandbox::api::{
+        AcquireRequest, CreateWork, Requirements, SandboxState, Template, TemplateSpec,
+        template_spec,
+    };
     use preloop_sandbox::drivers::smolvm::SmolvmDriver;
     use preloop_sandbox::drivers::smolvm::cli::{
         ExecOutput, GuestVolume, MachineRole, MachineSpec, MachineState, NetworkPolicy,
-        SANDBOX_OWNER_MARKER, SmolVmProvider, SocketMount, VmProvider, VolumeMount,
+        OrphanPurge, SANDBOX_OWNER_MARKER, SmolVmProvider, SocketMount, VmProvider, VolumeMount,
+        machine_data_root, purge_orphaned_vms,
     };
+    use preloop_sandbox::{Service, ServiceConfig, store};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     use preloop_sandbox::api::{ExecEvent, ExecRequest};
 
@@ -1495,11 +1504,11 @@ exit 0
         }
     }
 
-    /// The Sandbox Service marks every machine it serves for a caller outside
-    /// the CI pool so the engine's `OrphanPurge::All` sweep spares it. On a
-    /// real host `machine create` does not create the machine data directory —
-    /// smolvm only materialises the hash-derived path in `machine start` — so
-    /// the marker write must create it, or every driver create fails.
+    /// The Sandbox Service marks every machine it creates so the engine's
+    /// `OrphanPurge::All` sweep spares it. On a real host `machine create` does
+    /// not create the machine data directory — smolvm only materialises the
+    /// hash-derived path in `machine start` — so the marker write must create
+    /// it, or every driver create fails.
     #[tokio::test]
     async fn the_driver_marks_a_machine_before_its_data_dir_exists() {
         let _env_guard = TEST_ENV_MUTEX.lock().await;
@@ -1638,5 +1647,163 @@ exit 0
             log.contains("/var/tmp/.psbx-exec-exe-cancel.pid"),
             "the kill does not target this exec: {log:?}"
         );
+    }
+
+    /// Spawns a process whose argv names `boot_config` the way an orphaned
+    /// `_boot-vm` does, so the sweep attributes it to that machine.
+    fn spawn_boot_vm(boot_config: &Path) -> std::process::Child {
+        std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & wait", "_boot-vm"])
+            .arg(boot_config)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the fake _boot-vm")
+    }
+
+    /// Restores the environment variables a test changed, when it ends.
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                // SAFETY: the test holds TEST_ENV_MUTEX until this drop runs.
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    /// A caller may name a sandbox inside the pool's prefix. While its lease
+    /// is live, the engine's `OrphanPurge::All` sweep must spare its
+    /// hypervisor: the service marks every machine it creates, so the sweep
+    /// keys on the marker rather than the name. An unmarked hypervisor under
+    /// the same home is the control, and the sweep still reaps it.
+    #[tokio::test]
+    async fn a_caller_named_sandbox_with_a_live_lease_survives_the_all_sweep() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let _env_guard = TEST_ENV_MUTEX.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        write_agent_rootfs(&directory.path().join("agent-rootfs"), "1.30.1", true);
+        let keys = ["PRELOOP_HOME", "SMOLVM_DATA_DIR", "SMOLVM_AGENT_ROOTFS"];
+        let _restore = EnvRestore(keys.map(|key| (key, std::env::var_os(key))).into());
+        // SAFETY: TEST_ENV_MUTEX serializes the environment-mutating tests.
+        unsafe {
+            std::env::set_var("PRELOOP_HOME", directory.path().join("home"));
+            std::env::remove_var("SMOLVM_DATA_DIR");
+            std::env::remove_var("SMOLVM_AGENT_ROOTFS");
+        }
+        let vms = machine_data_root().expect("this home resolves to a data root");
+        let marked_dir = vms.join("0123456789abcdef");
+        let control_dir = vms.join("fedcba9876543210");
+        fs::create_dir_all(&control_dir).unwrap();
+        fs::write(control_dir.join("boot-config.json"), b"{}").unwrap();
+
+        // The fake lists the machine only once `machine create` has run, as
+        // smolvm does, so no reconcile can see it before the service does.
+        let created = directory.path().join("created");
+        let executable = directory.path().join("smolvm");
+        write_executable(
+            &executable,
+            &format!(
+                r##"#!/bin/sh
+if [ "${{1-}}" = "--version" ]; then
+  printf 'smolvm 1.30.1\n'
+fi
+case "${{1-}}:${{2-}}" in
+  machine:create) touch '{created}' ;;
+  machine:data-dir) printf '%s\n' '{dir}' ;;
+  machine:ls)
+    if [ -e '{created}' ]; then
+      printf '%s\n' '[{{"name":"preloop-runner-7-1"}}]'
+    else
+      printf '%s\n' '[]'
+    fi ;;
+esac
+exit 0
+"##,
+                created = created.display(),
+                dir = marked_dir.display()
+            ),
+        );
+
+        let driver = Arc::new(
+            SmolvmDriver::new(SmolVmProvider::new(&executable), 0)
+                .with_named_prefix("preloop-runner"),
+        );
+        let shutdown = CancellationToken::new();
+        let service = Service::open(
+            store::open("memory:").await.unwrap(),
+            ServiceConfig::new(directory.path().join("blobs")),
+        )
+        .await
+        .unwrap();
+        let agent = Agent::new(
+            Arc::new(service.clone()) as Arc<dyn ProviderLink>,
+            vec![driver as Arc<dyn Driver>],
+            AgentConfig::new("host-a", directory.path().join("scratch")),
+        );
+        tokio::spawn(agent.run(None, shutdown.clone()));
+        while service.list_providers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        service
+            .put_template(TemplateSpec {
+                name: "alpine".into(),
+                os: "linux".into(),
+                source: Some(template_spec::Source::Recipe("image:alpine:3.20".into())),
+                requires: Requirements {
+                    driver: "smolvm".into(),
+                    ..Requirements::default()
+                }
+                .into(),
+                ..TemplateSpec::default()
+            })
+            .await
+            .unwrap();
+        let lease = service
+            .acquire(AcquireRequest {
+                idempotency_key: "live".into(),
+                template: "alpine".into(),
+                name: "preloop-runner-7-1".into(),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(lease.sandbox.native_ref, "preloop-runner-7-1");
+        assert_eq!(
+            service
+                .get(&lease.sandbox.id, &lease.lease.id)
+                .unwrap()
+                .state,
+            SandboxState::Leased,
+            "the caller-named sandbox holds a live lease"
+        );
+        assert!(
+            marked_dir.join(SANDBOX_OWNER_MARKER).is_file(),
+            "a machine named inside the pool's prefix is marked like any other"
+        );
+
+        let mut live = spawn_boot_vm(&marked_dir.join("boot-config.json"));
+        let mut control = spawn_boot_vm(&control_dir.join("boot-config.json"));
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            1,
+            "only the unmarked hypervisor is reaped"
+        );
+        assert!(
+            live.try_wait().expect("poll the live hypervisor").is_none(),
+            "a caller-named sandbox with a live lease must survive the All sweep"
+        );
+        let status = control.wait().expect("reap the control hypervisor");
+        assert_eq!(status.signal(), Some(9), "the control was SIGKILLed");
+
+        let _ = live.kill();
+        let _ = live.wait();
+        shutdown.cancel();
     }
 }
