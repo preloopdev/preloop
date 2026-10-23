@@ -2015,7 +2015,7 @@ impl Service {
         let Some(sandbox) = state.sandboxes.get_mut(id) else {
             return;
         };
-        sandbox.state = SandboxState::Gone;
+        sandbox.state = SandboxState::Gone.into();
         sandbox.error = reason.to_owned();
         ops.push(self.put(Kind::Sandboxes, id, &*sandbox));
     }
@@ -4188,8 +4188,10 @@ impl Service {
                             warn!(%sandbox_id, attempts, %error, "destroy failed; the next reconcile asks again");
                         } else {
                             warn!(%sandbox_id, attempts, %error, "destroy failed too often; keeping the record so reconcile can reclaim the machine");
-                            let reason =
-                                format!("destroy failed {attempts} times: {}", error.message);
+                            let reason = format!(
+                                "destroy failed {attempts} times: {}",
+                                error.message.as_deref().unwrap_or_default()
+                            );
                             self.tombstone_locked(state, &sandbox_id, &reason, ops);
                         }
                     }

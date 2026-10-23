@@ -1874,9 +1874,11 @@ exit 0
                     name: "alpine".into(),
                     os: "linux".into(),
                     ..TemplateSpec::default()
-                },
+                }
+                .into(),
                 ..Template::default()
-            },
+            }
+            .into(),
             ..CreateWork::default()
         };
         let driver = Arc::new(SmolvmDriver::new(SmolVmProvider::new(&executable), 0));

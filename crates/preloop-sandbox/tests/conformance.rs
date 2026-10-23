@@ -2917,7 +2917,7 @@ async fn release_until_tombstoned(h: &Harness, lease_id: &str, sandbox_id: &str)
     h.service
         .release(ReleaseRequest {
             lease_id: lease_id.into(),
-            mode: ReleaseMode::Destroy,
+            mode: ReleaseMode::Destroy.into(),
             ..ReleaseRequest::default()
         })
         .await
@@ -2930,6 +2930,7 @@ async fn release_until_tombstoned(h: &Harness, lease_id: &str, sandbox_id: &str)
                 provider_id: provider.id.clone(),
                 generation: provider.generation,
                 sandboxes,
+                ..ReconcileRequest::default()
             })
             .await
             .unwrap();
@@ -2971,7 +2972,7 @@ async fn a_slow_destroy_keeps_its_record_until_it_reports() {
     h.service
         .release(ReleaseRequest {
             lease_id: lease.lease.id.clone(),
-            mode: ReleaseMode::Destroy,
+            mode: ReleaseMode::Destroy.into(),
             ..ReleaseRequest::default()
         })
         .await
@@ -2984,6 +2985,7 @@ async fn a_slow_destroy_keeps_its_record_until_it_reports() {
                 provider_id: provider.id.clone(),
                 generation: provider.generation,
                 sandboxes,
+                ..ReconcileRequest::default()
             })
             .await
             .unwrap();
@@ -3098,6 +3100,7 @@ async fn a_destroy_that_fails_three_times_leaves_the_machine_reclaimable_after_r
             provider_id: provider.id.clone(),
             generation: provider.generation,
             sandboxes,
+            ..ReconcileRequest::default()
         })
         .await
         .unwrap();
@@ -3134,7 +3137,9 @@ async fn a_tombstoned_machine_is_reclaimed_when_reported_without_its_id() {
                 driver: "fake".into(),
                 native_ref: lease.sandbox.native_ref.clone(),
                 sandbox_id: String::new(),
+                ..Observed::default()
             }],
+            ..ReconcileRequest::default()
         })
         .await
         .unwrap();
@@ -3170,8 +3175,11 @@ async fn a_tombstone_is_not_reaped_by_another_provider() {
             name: "host-b".into(),
             drivers: vec![DriverInfo {
                 driver: "fake".into(),
-                capabilities: FakeDriver::full_capabilities(),
+                capabilities: FakeDriver::full_capabilities().into(),
+                ..DriverInfo::default()
             }],
+            protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+            ..RegisterRequest::default()
         })
         .await
         .unwrap();
@@ -3181,6 +3189,7 @@ async fn a_tombstone_is_not_reaped_by_another_provider() {
             provider_id: other.provider_id.clone(),
             generation: other.generation,
             sandboxes: h.fake.inventory().await.unwrap(),
+            ..ReconcileRequest::default()
         })
         .await
         .unwrap();
@@ -3243,14 +3252,22 @@ async fn a_generation_the_store_cannot_keep_is_never_handed_out() {
         name: "host-a".into(),
         drivers: vec![DriverInfo {
             driver: "fake".into(),
-            capabilities: FakeDriver::full_capabilities(),
+            capabilities: FakeDriver::full_capabilities().into(),
+            ..DriverInfo::default()
         }],
+        protocol_version: preloop_sandbox::PROTOCOL_VERSION,
+        ..RegisterRequest::default()
     };
     for _ in 0..2 {
         let Err(error) = service.register(request()).await else {
             panic!("a generation the store refused was handed to the agent");
         };
-        assert_eq!(error.code, Code::Unavailable, "{}", error.message);
+        assert_eq!(
+            error.code,
+            Code::Unavailable,
+            "{}",
+            error.message.as_deref().unwrap_or_default()
+        );
     }
 }
 
