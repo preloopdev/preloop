@@ -105,7 +105,7 @@ impl SqlEngine for SqliteEngine {
             .acquire_owned()
             .await
             .map_err(|_| Error::unavailable("sandbox SQLite engine is closed"))?;
-        let mut connection = self.take_connection()?;
+        let connection = self.take_connection()?;
         run_blocking(move || match connection.execute_batch("BEGIN IMMEDIATE") {
             Ok(()) => Ok(Box::new(SqliteTx {
                 connection: Some(connection),
@@ -118,14 +118,6 @@ impl SqlEngine for SqliteEngine {
             }
         })
         .await
-    }
-
-    fn dialect(&self) -> Dialect {
-        Dialect::Sqlite
-    }
-
-    fn label(&self) -> &'static str {
-        "sqlite"
     }
 
     async fn close(&self) {

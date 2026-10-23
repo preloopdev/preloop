@@ -13,9 +13,7 @@ use preloop_sandbox::backend::{self, BackendConfig, PeerConfig};
 use preloop_sandbox::driver::{TransferChunk, native_name};
 use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::server::{Auth, serve};
-use preloop_sandbox::{
-    Driver, SandboxApi, SandboxClient, ServerTls, Service, ServiceConfig,
-};
+use preloop_sandbox::{Driver, SandboxApi, SandboxClient, ServerTls, Service, ServiceConfig};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -72,15 +70,7 @@ async fn start_node(
 ) -> Node {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("https://{}", listener.local_addr().unwrap());
-    let mut config = config(
-        state,
-        state,
-        node_id,
-        session_id,
-        credential,
-        &base,
-        peers,
-    );
+    let mut config = config(state, state, node_id, session_id, credential, &base, peers);
     config.ca = Some(tls.ca.clone());
     let sqlite_path = store_url.to_owned();
     let backend = backend::open_with(BackendConfig {
@@ -122,7 +112,10 @@ struct SplitLink {
 
 #[async_trait]
 impl ProviderLink for SplitLink {
-    async fn register(&self, request: RegisterRequest) -> preloop_sandbox::Result<RegisterResponse> {
+    async fn register(
+        &self,
+        request: RegisterRequest,
+    ) -> preloop_sandbox::Result<RegisterResponse> {
         self.a.register(request).await
     }
     async fn heartbeat(&self, request: HeartbeatRequest) -> preloop_sandbox::Result<()> {
@@ -222,7 +215,7 @@ async fn provider_reports_exec_and_transfers_through_the_other_replica() {
         &base_a,
     )
     .await;
-    let node_b = start_listener(
+    let _node_b = start_listener(
         listener_b,
         &store_url,
         &state,
@@ -238,7 +231,8 @@ async fn provider_reports_exec_and_transfers_through_the_other_replica() {
     )
     .await;
 
-    let client = SandboxClient::with_tls(&base_a, Some(TOKEN.to_owned()), &tls.ca.pem(), None).unwrap();
+    let client =
+        SandboxClient::with_tls(&base_a, Some(TOKEN.to_owned()), tls.ca.pem(), None).unwrap();
     client.put_template(template("base")).await.unwrap();
 
     // Enroll through A, then present the same certificate to B.
@@ -276,7 +270,11 @@ async fn provider_reports_exec_and_transfers_through_the_other_replica() {
             .service
             .list_providers()
             .await
-            .map(|providers| providers.iter().any(|provider| !provider.drivers.is_empty()))
+            .map(|providers| {
+                providers
+                    .iter()
+                    .any(|provider| !provider.drivers.is_empty())
+            })
             .unwrap_or(false)
     })
     .await;
@@ -384,7 +382,8 @@ async fn provider_reports_exec_and_transfers_through_the_other_replica() {
         })
         .await;
     // The caller still has A's URL; use B directly for the surviving replica.
-    let client_b = SandboxClient::with_tls(&base_b, Some(TOKEN.to_owned()), &tls.ca.pem(), None).unwrap();
+    let client_b =
+        SandboxClient::with_tls(&base_b, Some(TOKEN.to_owned()), tls.ca.pem(), None).unwrap();
     let renewed = if renewed.is_err() {
         client_b
             .renew(RenewRequest {

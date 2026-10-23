@@ -23,6 +23,7 @@ use crate::service::ProviderIdentity;
 use super::types::*;
 
 /// Durable sandbox state.
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     /// Schema version and fingerprints this backend opened with.
@@ -79,12 +80,14 @@ pub trait SandboxBackend: Send + Sync {
 
     /// The template payload at exactly `version`, or `None` when that version
     /// no longer exists (the caller re-reads metadata).
-    async fn template_get_at(&self, name: &str, version: u64)
-    -> Result<Option<Versioned<Template>>>;
+    async fn template_get_at(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Versioned<Template>>>;
 
     /// The pool payload at exactly `version`.
-    async fn pool_get_at(&self, name: &str, version: u64)
-    -> Result<Option<Versioned<PoolSpec>>>;
+    async fn pool_get_at(&self, name: &str, version: u64) -> Result<Option<Versioned<PoolSpec>>>;
 
     // ── Templates and pools ───────────────────────────────────────
 

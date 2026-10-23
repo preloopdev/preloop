@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::api::*;
-use crate::error::{Code, Error};
+use crate::error::Error;
 
 /// A row payload paired with its authoritative version.
 ///
@@ -183,6 +183,7 @@ pub struct AcquireCommand {
 }
 
 /// What `Acquire` decided.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum AcquireStep {
     /// The lease is ready; no injection is owed.
@@ -221,6 +222,7 @@ pub enum AcquireStep {
 }
 
 /// Outcome of one pool-refill create.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum RefillOutcome {
     /// A member was created and its create work queued.
@@ -406,6 +408,7 @@ pub enum EnrollOutcome {
 }
 
 /// Outcome of starting a snapshot request.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum SnapshotStart {
     /// The work was queued (or is already in flight); wait for its result.
@@ -503,12 +506,4 @@ pub struct ProviderStatsRow {
     pub host_sample_age_secs: i64,
     /// Latest per-sandbox runtime facts.
     pub sandbox_stats: Vec<SandboxRuntimeStats>,
-}
-
-/// Error for a database operation, preserving uniqueness classification.
-pub(crate) fn unique_violation(error: &str) -> Error {
-    Error::new(
-        Code::AlreadyExists,
-        format!("durable sandbox state conflict: {error}"),
-    )
 }

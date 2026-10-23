@@ -3,31 +3,25 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Notify;
 
 use crate::api::*;
 use crate::error::{Error, Result};
 
-use super::engine::{Dialect, Row, SqlEngine, SqlTx, SqlValue};
+use super::backend::SchemaInfo;
+use super::engine::{Row, SqlEngine, SqlTx};
 use super::logic;
 use super::postgres::PgEngine;
 use super::seal::SealKey;
 use super::sqlite::SqliteEngine;
-use super::backend::SchemaInfo;
 use super::types::{BackendConfig, EnrollOutcome};
 use super::{backend_kind, validate_url};
 
 pub(crate) struct SqlStore {
     pub(crate) engine: Arc<dyn SqlEngine>,
     pub(crate) seal: SealKey,
-    pub(crate) node_id: String,
-    pub(crate) session_id: String,
-    pub(crate) credential_sha256: String,
-    pub(crate) peer_url: String,
-    pub(crate) node_lost_after: Duration,
-    pub(crate) notify: Arc<Notify>,
     pub(crate) schema: SchemaInfo,
 }
 
@@ -61,7 +55,9 @@ impl SqlStore {
             "sqlite" => {
                 let path = sqlite_path(&config.url);
                 let sqlite = SqliteEngine::open(&path)?;
-                sqlite.apply_schema(include_str!("schema.sqlite.sql")).await?;
+                sqlite
+                    .apply_schema(include_str!("schema.sqlite.sql"))
+                    .await?;
                 Arc::new(sqlite)
             }
             _ => {
@@ -74,12 +70,6 @@ impl SqlStore {
         let store = Arc::new(Self {
             engine,
             seal,
-            node_id: config.node_id.clone(),
-            session_id: config.session_id.clone(),
-            credential_sha256: config.node_credential_sha256.clone(),
-            peer_url: config.peer_url.clone(),
-            node_lost_after: config.node_lost_after,
-            notify,
             schema: SchemaInfo {
                 version: 1,
                 seal_fingerprint: String::new(),
@@ -142,7 +132,10 @@ impl SqlStore {
                 .map(|row| row.text("value").map(str::to_owned))
                 .transpose()?;
             let version = match tx
-                .query("SELECT value FROM schema_meta WHERE key = 'schema_version'", &[])
+                .query(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                    &[],
+                )
                 .await?
                 .first()
             {
@@ -160,10 +153,12 @@ impl SqlStore {
     }
 
     /// Commit on `Ok`, roll back on `Err`.
-    pub(crate) async fn finish_tx<T>(
-        tx: Box<dyn SqlTx>,
-        outcome: Result<T>,
-    ) -> Result<T> {
+    ///
+    /// Domain failures that must persist cleanup are returned as `Ok`
+    /// outcomes by the command itself, never through this wrapper's `Err`:
+    /// rolling back a failed acquire's cleanup would recreate the bug fixed
+    /// in #619.
+    pub(crate) async fn finish_tx<T>(tx: Box<dyn SqlTx>, outcome: Result<T>) -> Result<T> {
         match outcome {
             Ok(value) => {
                 tx.commit().await?;
@@ -185,10 +180,6 @@ impl SqlStore {
         let mut tx = self.engine.begin().await?;
         let outcome = f(&mut *tx).await;
         Self::finish_tx(tx, outcome).await
-    }
-
-    pub(crate) fn dialect(&self) -> Dialect {
-        self.engine.dialect()
     }
 }
 
@@ -300,7 +291,10 @@ pub(crate) async fn provider_by_name(tx: &mut dyn SqlTx, name: &str) -> Result<O
     }
 }
 
-async fn certificates_for(tx: &mut dyn SqlTx, provider_id: &str) -> Result<Vec<ProviderCertificate>> {
+async fn certificates_for(
+    tx: &mut dyn SqlTx,
+    provider_id: &str,
+) -> Result<Vec<ProviderCertificate>> {
     let rows = tx
         .query(
             "SELECT sha256, expires_at FROM provider_certificates WHERE provider_id = $1",
@@ -335,10 +329,7 @@ pub(crate) async fn fence_provider(
     Ok(provider)
 }
 
-pub(crate) async fn provider_id_for(
-    tx: &mut dyn SqlTx,
-    reference: &str,
-) -> Result<String> {
+pub(crate) async fn provider_id_for(tx: &mut dyn SqlTx, reference: &str) -> Result<String> {
     if reference.is_empty() {
         return Err(Error::invalid_argument("provider name is required"));
     }
@@ -355,10 +346,7 @@ pub(crate) async fn provider_id_for(
         .ok_or_else(|| Error::not_found(format!("provider `{reference}` not found")))
 }
 
-pub(crate) async fn sandbox_by_id(
-    tx: &mut dyn SqlTx,
-    id: &str,
-) -> Result<Option<Sandbox>> {
+pub(crate) async fn sandbox_by_id(tx: &mut dyn SqlTx, id: &str) -> Result<Option<Sandbox>> {
     let row = tx
         .query(
             "SELECT s.id, s.name, s.state, s.lease_id, s.native_ref, s.error, s.provider_id, \
@@ -371,15 +359,6 @@ pub(crate) async fn sandbox_by_id(
         .into_iter()
         .next();
     row.as_ref().map(super::rows::sandbox_from_row).transpose()
-}
-
-pub(crate) async fn sandbox_version(tx: &mut dyn SqlTx, id: &str) -> Result<Option<u64>> {
-    Ok(tx
-        .query("SELECT version FROM sandboxes WHERE id = $1", &[id.into()])
-        .await?
-        .first()
-        .map(|row| row.u64("version"))
-        .transpose()?)
 }
 
 pub(crate) async fn lease_by_id(
@@ -430,7 +409,10 @@ pub(crate) async fn node_alive(tx: &mut dyn SqlTx, owner: &super::types::Owner) 
         .query(
             "SELECT 1 AS present FROM nodes \
              WHERE node_id = $1 AND session_id = $2 AND alive = TRUE",
-            &[owner.node_id.as_str().into(), owner.session_id.as_str().into()],
+            &[
+                owner.node_id.as_str().into(),
+                owner.session_id.as_str().into(),
+            ],
         )
         .await?;
     Ok(!rows.is_empty())
@@ -458,17 +440,6 @@ pub(crate) async fn touch_provider(tx: &mut dyn SqlTx, provider_id: &str) -> Res
     )
     .await?;
     Ok(())
-}
-
-pub(crate) async fn work_exists(tx: &mut dyn SqlTx, work_id: &str) -> Result<bool> {
-    Ok(!tx
-        .query("SELECT 1 AS present FROM work_items WHERE id = $1", &[work_id.into()])
-        .await?
-        .is_empty())
-}
-
-pub(crate) fn json_param<T: serde::Serialize>(value: &T) -> SqlValue {
-    SqlValue::Text(serde_json::to_string(value).unwrap_or_default())
 }
 
 // ── The trait implementation: every method is one command ─────────
@@ -511,11 +482,7 @@ impl super::SandboxBackend for SqlStore {
         super::commands_templates::driver_get(self, provider_id, driver).await
     }
 
-    async fn resource_version(
-        &self,
-        kind: super::ResourceKind,
-        id: &str,
-    ) -> Result<Option<u64>> {
+    async fn resource_version(&self, kind: super::ResourceKind, id: &str) -> Result<Option<u64>> {
         super::commands_templates::resource_version(self, kind, id).await
     }
 
@@ -599,21 +566,11 @@ impl super::SandboxBackend for SqlStore {
         super::commands_leases::create_pool_member(self, member, create_timeout).await
     }
 
-    async fn finish_injection(
-        &self,
-        lease_id: &str,
-        owner: &super::Owner,
-        ok: bool,
-    ) -> Result<()> {
+    async fn finish_injection(&self, lease_id: &str, owner: &super::Owner, ok: bool) -> Result<()> {
         super::commands_leases::finish_injection(self, lease_id, owner, ok).await
     }
 
-    async fn renew(
-        &self,
-        lease_id: &str,
-        ttl_secs: u64,
-        default_ttl_secs: u64,
-    ) -> Result<Lease> {
+    async fn renew(&self, lease_id: &str, ttl_secs: u64, default_ttl_secs: u64) -> Result<Lease> {
         super::commands_leases::renew(self, lease_id, ttl_secs, default_ttl_secs).await
     }
 
@@ -691,7 +648,10 @@ impl super::SandboxBackend for SqlStore {
         super::commands_providers::list_providers_all(self).await
     }
 
-    async fn provider_identity(&self, fingerprint_sha256: &str) -> Result<crate::service::ProviderIdentity> {
+    async fn provider_identity(
+        &self,
+        fingerprint_sha256: &str,
+    ) -> Result<crate::service::ProviderIdentity> {
         super::commands_providers::provider_identity(self, fingerprint_sha256).await
     }
 
@@ -757,14 +717,8 @@ impl super::SandboxBackend for SqlStore {
         batch: usize,
         delivery_timeout: std::time::Duration,
     ) -> Result<Vec<WorkItem>> {
-        super::commands_providers::poll_work(
-            self,
-            provider_id,
-            generation,
-            batch,
-            delivery_timeout,
-        )
-        .await
+        super::commands_providers::poll_work(self, provider_id, generation, batch, delivery_timeout)
+            .await
     }
 
     async fn work_result(&self, work_id: &str) -> Result<Option<super::WorkResult>> {
@@ -787,8 +741,7 @@ impl super::SandboxBackend for SqlStore {
         kind: StreamKind,
         owner: &super::Owner,
     ) -> Result<String> {
-        super::commands_runtime::start_copy(self, sandbox_id, ticket, guest_path, kind, owner)
-            .await
+        super::commands_runtime::start_copy(self, sandbox_id, ticket, guest_path, kind, owner).await
     }
 
     async fn create_exec(
@@ -801,10 +754,7 @@ impl super::SandboxBackend for SqlStore {
         super::commands_runtime::create_exec(self, exec_id, request, timeout_secs, owner).await
     }
 
-    async fn report_exec(
-        &self,
-        request: ReportExecRequest,
-    ) -> Result<super::ReportExecOutcome> {
+    async fn report_exec(&self, request: ReportExecRequest) -> Result<super::ReportExecOutcome> {
         super::commands_runtime::report_exec(self, request).await
     }
 
@@ -918,24 +868,15 @@ impl super::SandboxBackend for SqlStore {
         session_id: &str,
         credential_sha256: &str,
     ) -> Result<bool> {
-        super::commands_runtime::node_authenticate(
-            self,
-            node_id,
-            session_id,
-            credential_sha256,
-        )
-        .await
+        super::commands_runtime::node_authenticate(self, node_id, session_id, credential_sha256)
+            .await
     }
 
     async fn node_close(&self, node_id: &str, session_id: &str) -> Result<()> {
         super::commands_runtime::node_close(self, node_id, session_id).await
     }
 
-    async fn owner_of(
-        &self,
-        kind: super::OwnerKind,
-        id: &str,
-    ) -> Result<Option<super::Owner>> {
+    async fn owner_of(&self, kind: super::OwnerKind, id: &str) -> Result<Option<super::Owner>> {
         super::commands_runtime::owner_of(self, kind, id).await
     }
 

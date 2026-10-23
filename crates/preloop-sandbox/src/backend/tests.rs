@@ -8,8 +8,8 @@ use crate::api::*;
 use crate::error::Code;
 
 use super::backend::SnapshotCommand;
-use super::types::SnapshotStart;
 use super::logic;
+use super::types::SnapshotStart;
 use super::types::*;
 use super::{SandboxBackend, open_embedded};
 
@@ -144,7 +144,10 @@ fn owner() -> Owner {
 
 async fn setup(backend: &Arc<dyn SandboxBackend>) -> (Template, RegisterResponse) {
     let template = backend.put_template(template("base")).await.unwrap();
-    let registered = backend.register(provider("host-a"), None, &owner()).await.unwrap();
+    let registered = backend
+        .register(provider("host-a"), None, &owner())
+        .await
+        .unwrap();
     (template, registered)
 }
 
@@ -156,9 +159,7 @@ async fn new_member(backend: &Arc<dyn SandboxBackend>, name: &str) -> NewSandbox
         pool_revision: 0,
         purpose: Purpose::Runner,
         name: name.into(),
-        provider_id: backend.list_providers_all().await.unwrap()[0]
-            .id
-            .clone(),
+        provider_id: backend.list_providers_all().await.unwrap()[0].id.clone(),
         driver: "fake".into(),
         shape: Shape::default(),
         network: NetworkPolicy::default(),
@@ -177,7 +178,13 @@ async fn template_and_pool_reads_are_versioned_and_aba_safe() {
     let put = backend.put_template(template("base")).await.unwrap();
     assert_eq!(put.spec.name, "base");
     let first = backend.template_get("base").await.unwrap().unwrap();
-    assert_eq!(backend.resource_version(ResourceKind::Template, "base").await.unwrap(), Some(first.version));
+    assert_eq!(
+        backend
+            .resource_version(ResourceKind::Template, "base")
+            .await
+            .unwrap(),
+        Some(first.version)
+    );
     let again = backend.put_template(template("base")).await.unwrap();
     assert_eq!(again.digest, put.digest);
     assert_eq!(
@@ -189,8 +196,17 @@ async fn template_and_pool_reads_are_versioned_and_aba_safe() {
     assert!(backend.template_get("base").await.unwrap().is_none());
     backend.put_template(template("base")).await.unwrap();
     let recreated = backend.template_get("base").await.unwrap().unwrap();
-    assert!(recreated.version > first.version, "a delete/recreate never reuses a version");
-    assert!(backend.template_get_at("base", first.version).await.unwrap().is_none());
+    assert!(
+        recreated.version > first.version,
+        "a delete/recreate never reuses a version"
+    );
+    assert!(
+        backend
+            .template_get_at("base", first.version)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let (meta, more) = backend.template_page_meta(None, 10).await.unwrap();
     assert_eq!(meta.len(), 1);
     assert!(!more);
@@ -221,6 +237,7 @@ async fn acquire_create_report_release_is_authoritative() {
         request: acquire_request("key-1", "one", 60),
         fingerprint: "fp".into(),
         ttl_secs: 60,
+        unclaimed_ttl_secs: 600,
         create_timeout: Duration::from_secs(60),
         placement: None,
         owner: owner(),
@@ -239,7 +256,12 @@ async fn acquire_create_report_release_is_authoritative() {
     let step = backend.acquire(command.clone()).await.unwrap();
     assert!(matches!(step, AcquireStep::Wait { .. }), "{step:?}");
     let work = backend
-        .poll_work(&registered.provider_id, registered.generation, 8, Duration::from_secs(30))
+        .poll_work(
+            &registered.provider_id,
+            registered.generation,
+            8,
+            Duration::from_secs(30),
+        )
         .await
         .unwrap();
     let create = work
@@ -285,7 +307,12 @@ async fn acquire_create_report_release_is_authoritative() {
         .await
         .unwrap();
     let destroy = backend
-        .poll_work(&registered.provider_id, registered.generation, 8, Duration::from_secs(30))
+        .poll_work(
+            &registered.provider_id,
+            registered.generation,
+            8,
+            Duration::from_secs(30),
+        )
         .await
         .unwrap();
     let destroy = destroy
@@ -347,6 +374,7 @@ async fn concurrent_acquires_over_two_backends_produce_one_lease_per_key() {
                 request: acquire_request(&key, "", 60),
                 fingerprint: "fp".into(),
                 ttl_secs: 60,
+                unclaimed_ttl_secs: 600,
                 create_timeout: Duration::from_secs(60),
                 placement: None,
                 owner: owner(),
@@ -385,11 +413,9 @@ async fn a_live_name_has_one_winner() {
                 request: acquire_request(&format!("name-key-{index}"), "same", 60),
                 fingerprint: "fp".into(),
                 ttl_secs: 60,
+                unclaimed_ttl_secs: 600,
                 create_timeout: Duration::from_secs(60),
-                placement: Some(NewSandbox {
-                    template,
-                    ..member
-                }),
+                placement: Some(NewSandbox { template, ..member }),
                 owner: owner(),
             };
             backend.acquire(command).await
@@ -421,6 +447,7 @@ async fn snapshot_receipt_survives_source_consumption_and_is_replayable() {
         request: acquire_request("snap-key", "", 60),
         fingerprint: "fp".into(),
         ttl_secs: 60,
+        unclaimed_ttl_secs: 600,
         create_timeout: Duration::from_secs(60),
         placement: Some(NewSandbox {
             template,
@@ -432,7 +459,12 @@ async fn snapshot_receipt_survives_source_consumption_and_is_replayable() {
         panic!("expected wait");
     };
     let work = backend
-        .poll_work(&registered.provider_id, registered.generation, 8, Duration::from_secs(30))
+        .poll_work(
+            &registered.provider_id,
+            registered.generation,
+            8,
+            Duration::from_secs(30),
+        )
         .await
         .unwrap();
     let create = work
@@ -469,7 +501,12 @@ async fn snapshot_receipt_survives_source_consumption_and_is_replayable() {
         panic!("expected queued");
     };
     let work = backend
-        .poll_work(&registered.provider_id, registered.generation, 8, Duration::from_secs(30))
+        .poll_work(
+            &registered.provider_id,
+            registered.generation,
+            8,
+            Duration::from_secs(30),
+        )
         .await
         .unwrap();
     let snapshot = work
@@ -488,8 +525,14 @@ async fn snapshot_receipt_survives_source_consumption_and_is_replayable() {
         })
         .await
         .unwrap();
-    assert!(backend.list_all().await.unwrap().is_empty(), "source consumed");
-    assert!(backend.lease_env(&lease.id).await.is_err(), "lease consumed");
+    assert!(
+        backend.list_all().await.unwrap().is_empty(),
+        "source consumed"
+    );
+    assert!(
+        backend.lease_env(&lease.id).await.is_err(),
+        "lease consumed"
+    );
     let replay = backend
         .snapshot_start(SnapshotCommand {
             sandbox_id: lease.sandbox_id.clone(),
@@ -507,7 +550,12 @@ async fn snapshot_receipt_survives_source_consumption_and_is_replayable() {
     assert_eq!(template.spec.name, "snap");
     assert_eq!(template.native_ref, "snapshot-native");
     assert_eq!(
-        backend.work_result(&work_id).await.unwrap().unwrap().native_ref,
+        backend
+            .work_result(&work_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .native_ref,
         "snapshot-native"
     );
     let wrong_capability = backend
@@ -550,6 +598,7 @@ async fn sealed_env_and_ticket_tokens_are_not_plaintext() {
         request,
         fingerprint: "fp".into(),
         ttl_secs: 60,
+        unclaimed_ttl_secs: 600,
         create_timeout: Duration::from_secs(60),
         placement: Some(NewSandbox {
             template,
@@ -561,7 +610,12 @@ async fn sealed_env_and_ticket_tokens_are_not_plaintext() {
         panic!("expected wait");
     };
     let work = backend
-        .poll_work(&registered.provider_id, registered.generation, 8, Duration::from_secs(30))
+        .poll_work(
+            &registered.provider_id,
+            registered.generation,
+            8,
+            Duration::from_secs(30),
+        )
         .await
         .unwrap();
     let create = work
@@ -583,11 +637,15 @@ async fn sealed_env_and_ticket_tokens_are_not_plaintext() {
     let AcquireStep::Ready { lease, .. } = backend.acquire(command).await.unwrap() else {
         panic!("expected ready");
     };
-    assert_eq!(backend.lease_env(&lease.id).await.unwrap().get("TOKEN"), Some(&"super-secret".to_owned()));
+    assert_eq!(
+        backend.lease_env(&lease.id).await.unwrap().get("TOKEN"),
+        Some(&"super-secret".to_owned())
+    );
     // The durable file never contains the plaintext value.
     let raw = std::fs::read(dir.path().join("sandbox.db")).unwrap();
     assert!(
-        !raw.windows(b"super-secret".len()).any(|window| window == b"super-secret"),
+        !raw.windows(b"super-secret".len())
+            .any(|window| window == b"super-secret"),
         "sealed env must not appear in the database file"
     );
     let ticket_id = "tkt-1";
@@ -689,19 +747,17 @@ async fn node_credentials_are_hashed_and_fenced() {
     let session = "session-a";
     let credential = logic::token_hash("node-secret");
     backend
-        .node_register(
-            &BackendConfig {
-                url: "sqlite::memory:".into(),
-                state_dir: dir.path().to_path_buf(),
-                seal_key: None,
-                pool_size: 1,
-                node_id: node_id.into(),
-                session_id: session.into(),
-                node_credential_sha256: credential.clone(),
-                peer_url: "https://127.0.0.1:9".into(),
-                node_lost_after: Duration::from_secs(5),
-            },
-        )
+        .node_register(&BackendConfig {
+            url: "sqlite::memory:".into(),
+            state_dir: dir.path().to_path_buf(),
+            seal_key: None,
+            pool_size: 1,
+            node_id: node_id.into(),
+            session_id: session.into(),
+            node_credential_sha256: credential.clone(),
+            peer_url: "https://127.0.0.1:9".into(),
+            node_lost_after: Duration::from_secs(5),
+        })
         .await
         .unwrap();
     assert!(

@@ -7,7 +7,7 @@
 use sha2::{Digest as _, Sha256};
 
 use crate::api::*;
-use crate::error::{Code, Error, Result};
+use crate::error::{Error, Result};
 
 use super::types::NewSandbox;
 
@@ -99,21 +99,21 @@ pub fn pool_revision(pool: &PoolSpec, template_digest: &str) -> u64 {
 /// reported", never "zero capacity".
 pub fn fits_shape(caps: &Capabilities, shape: &Shape) -> bool {
     let cpus_fit = caps.max_vcpus == 0 || shape.cpus == 0 || shape.cpus <= caps.max_vcpus;
-    let memory_fit =
-        caps.max_memory_mib == 0 || shape.memory_mib == 0 || shape.memory_mib <= caps.max_memory_mib;
+    let memory_fit = caps.max_memory_mib == 0
+        || shape.memory_mib == 0
+        || shape.memory_mib <= caps.max_memory_mib;
     cpus_fit && memory_fit
 }
 
 /// The effective shape: requested fields with the driver's defaults filling
 /// the zeros.
 pub fn effective_shape(caps: Option<&Capabilities>, requested: &Shape) -> Shape {
-    let defaults = caps.map(|caps| &caps.default_shape).cloned().unwrap_or_default();
+    let defaults = caps
+        .map(|caps| &caps.default_shape)
+        .cloned()
+        .unwrap_or_default();
     let pick = |requested: u32, default: u32| {
-        if requested == 0 {
-            default
-        } else {
-            requested
-        }
+        if requested == 0 { default } else { requested }
     };
     Shape {
         cpus: pick(requested.cpus, defaults.cpus),
@@ -172,11 +172,6 @@ pub fn validate_name(kind: &str, name: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-/// Delivery identity for one work attempt.
-pub fn delivery_id(work_id: &str, attempt: u64) -> String {
-    format!("{work_id}@{attempt}")
 }
 
 /// Split a delivery identity back into `(work_id, attempt)`. A plain id is
@@ -254,11 +249,6 @@ pub fn validate_new_sandbox(member: &NewSandbox) -> Result<()> {
     Ok(())
 }
 
-/// Whether a state is terminal.
-pub fn terminal(state: &str) -> bool {
-    matches!(state, "gone" | "failed")
-}
-
 /// The provider's driver record.
 pub fn provider_driver<'a>(provider: &'a Provider, driver: &str) -> Option<&'a DriverInfo> {
     provider.drivers.iter().find(|info| info.driver == driver)
@@ -267,9 +257,4 @@ pub fn provider_driver<'a>(provider: &'a Provider, driver: &str) -> Option<&'a D
 /// Error for a provider that is gone.
 pub fn provider_gone(id: &str) -> Error {
     Error::unavailable(format!("provider {id} is gone"))
-}
-
-/// Whether a failure is a uniqueness conflict.
-pub fn is_conflict(error: &Error) -> bool {
-    error.code == Code::AlreadyExists
 }

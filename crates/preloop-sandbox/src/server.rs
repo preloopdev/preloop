@@ -549,7 +549,11 @@ impl Sandboxes for SandboxesService {
         async move {
             self.authorize(&ctx, Action::Read)?;
             let request = request;
-            RpcResponse::ok(self.service.get(&request.sandbox_id, &request.lease_id).await?)
+            RpcResponse::ok(
+                self.service
+                    .get(&request.sandbox_id, &request.lease_id)
+                    .await?,
+            )
         }
     }
 
@@ -797,7 +801,8 @@ impl Sandboxes for SandboxesService {
             RpcResponse::ok(
                 self.service
                     .create_join_token(ttl, &request.provider_name)
-                    .await?,            )
+                    .await?,
+            )
         }
     }
 }
@@ -1335,15 +1340,14 @@ async fn stream_upload(
         Ok(StreamRoute::Local) => {}
         Err(response) => return response,
     }
-    let mut claim =
-        match app
-            .service
-            .claim_caller(&ticket, &token, crate::service::TransferSide::Producer)
-            .await
-        {
-            Ok(claim) => claim,
-            Err(error) => return error.into_response(),
-        };
+    let mut claim = match app
+        .service
+        .claim_caller(&ticket, &token, crate::service::TransferSide::Producer)
+        .await
+    {
+        Ok(claim) => claim,
+        Err(error) => return error.into_response(),
+    };
     if content_length(&headers).is_some_and(|length| length > max_bytes) {
         app.service
             .abort_ticket(&ticket, "blob exceeds the size limit")
@@ -1424,15 +1428,14 @@ async fn stream_download(
         Ok(StreamRoute::Local) => {}
         Err(response) => return response,
     }
-    let mut claim =
-        match app
-            .service
-            .claim_caller(&ticket, &token, crate::service::TransferSide::Consumer)
-            .await
-        {
-            Ok(claim) => claim,
-            Err(error) => return error.into_response(),
-        };
+    let mut claim = match app
+        .service
+        .claim_caller(&ticket, &token, crate::service::TransferSide::Consumer)
+        .await
+    {
+        Ok(claim) => claim,
+        Err(error) => return error.into_response(),
+    };
     if let Err(error) = app
         .service
         .start_copy(&claim.sandbox_id, &ticket, &claim.guest_path, claim.kind)
@@ -1684,6 +1687,7 @@ enum StreamRoute {
 }
 
 /// Resolve a ticket's owner, or 404 when the durable row is gone.
+#[allow(clippy::result_large_err)]
 async fn ticket_owner(
     service: &Service,
     ticket: &str,
@@ -1870,7 +1874,9 @@ async fn caller_upload(
     match pump_upload(body, tx, max_bytes).await {
         Ok(()) => {
             service.finish_ticket(ticket).await;
-            let result = service.await_work(&work_id, service.config().work_timeout).await;
+            let result = service
+                .await_work(&work_id, service.config().work_timeout)
+                .await;
             service.remove_ticket(ticket).await;
             match result {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1878,17 +1884,15 @@ async fn caller_upload(
             }
         }
         Err(error) => {
-            service.abort_ticket(ticket, "upload did not complete").await;
+            service
+                .abort_ticket(ticket, "upload did not complete")
+                .await;
             error.into_response()
         }
     }
 }
 
-async fn caller_download(
-    service: &Arc<Service>,
-    ticket: &str,
-    headers: &HeaderMap,
-) -> Response {
+async fn caller_download(service: &Arc<Service>, ticket: &str, headers: &HeaderMap) -> Response {
     let token = bearer(headers).unwrap_or_default().to_owned();
     let mut claim = match service
         .claim_caller(ticket, &token, crate::service::TransferSide::Consumer)

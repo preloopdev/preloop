@@ -45,9 +45,12 @@ async fn fixture(dir: &tempfile::TempDir) -> Fixture {
 }
 
 async fn fixture_with_driver(_dir: &tempfile::TempDir, driver: Arc<dyn Driver>) -> Fixture {
-    let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
-        .await
-        .unwrap();
+    let service = Service::open(
+        backend::open("memory:").await.unwrap(),
+        ServiceConfig::new(),
+    )
+    .await
+    .unwrap();
     let shutdown = CancellationToken::new();
     let agent = Agent::new(
         Arc::new(service.clone()) as Arc<dyn ProviderLink>,

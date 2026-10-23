@@ -5,8 +5,6 @@
 //! SQLite), locking clauses and DDL. Rows are decoded by column name.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 
 use async_trait::async_trait;
 
@@ -180,10 +178,6 @@ pub trait SqlTx: Send {
 pub trait SqlEngine: Send + Sync {
     /// Begin one transaction.
     async fn begin(&self) -> Result<Box<dyn SqlTx>>;
-    /// Dialect.
-    fn dialect(&self) -> Dialect;
-    /// Engine label for logs.
-    fn label(&self) -> &'static str;
     /// Stop background listeners and close pooled connections.
     async fn close(&self) {}
 }
@@ -209,24 +203,4 @@ pub(crate) fn sqlite_placeholders(sql: &str) -> String {
         }
     }
     out
-}
-
-/// Run `f` inside a transaction, committing on `Ok` and rolling back on
-/// `Err`. Domain failures that must persist cleanup are returned as `Ok`
-/// outcomes by the command itself, never through this wrapper's `Err`.
-pub(crate) async fn with_tx<T, F>(engine: &dyn SqlEngine, f: F) -> Result<T>
-where
-    F: for<'a> FnOnce(&'a mut (dyn SqlTx + 'a)) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
-{
-    let mut tx = engine.begin().await?;
-    match f(&mut *tx).await {
-        Ok(value) => {
-            tx.commit().await?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = tx.rollback().await;
-            Err(error)
-        }
-    }
 }

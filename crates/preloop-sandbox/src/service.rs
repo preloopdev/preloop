@@ -129,8 +129,7 @@ impl ServiceConfig {
                     .unwrap_or_else(|| "sandbox-node".to_owned())
             }),
             node_session: String::new(),
-            node_credential: std::env::var("PRELOOP_SANDBOX_NODE_CREDENTIAL")
-                .unwrap_or_default(),
+            node_credential: std::env::var("PRELOOP_SANDBOX_NODE_CREDENTIAL").unwrap_or_default(),
             peer_url: std::env::var("PRELOOP_SANDBOX_PEER_URL").unwrap_or_default(),
             peers: Vec::new(),
             node_lost_after: Duration::from_secs(30),
@@ -229,18 +228,6 @@ pub fn template_digest(spec: &TemplateSpec) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
 }
 
-/// Wait for a provider report, bounded by the service's work timeout.
-pub(crate) async fn await_copy(
-    reply: oneshot::Receiver<Result<String>>,
-    timeout: Duration,
-) -> Result<()> {
-    tokio::time::timeout(timeout, reply)
-        .await
-        .map_err(|_| Error::unavailable("provider did not report the copy"))?
-        .map_err(|_| Error::unavailable("provider dropped the copy"))?
-        .map(|_| ())
-}
-
 /// Per-sandbox placement inputs.
 #[derive(Clone)]
 struct PlacementSpec {
@@ -259,7 +246,11 @@ impl PlacementSpec {
         let template = &self.template;
         let requires = &self.requires;
         let os = if requires.os.is_empty() {
-            template.spec.as_option().map(|spec| spec.os.clone()).unwrap_or_default()
+            template
+                .spec
+                .as_option()
+                .map(|spec| spec.os.clone())
+                .unwrap_or_default()
         } else {
             requires.os.clone()
         };
@@ -269,7 +260,11 @@ impl PlacementSpec {
             requires.driver.clone()
         };
         PlacementRequest {
-            template: template.spec.as_option().map(|spec| spec.name.clone()).unwrap_or_default(),
+            template: template
+                .spec
+                .as_option()
+                .map(|spec| spec.name.clone())
+                .unwrap_or_default(),
             driver,
             os,
             arch: requires.arch.clone(),
@@ -386,12 +381,10 @@ struct PeerDirectory {
 impl PeerDirectory {
     fn build(config: &ServiceConfig) -> Result<Self> {
         let mut clients = BTreeMap::new();
-        if !config.peers.is_empty() {
-            if config.ca.is_none() {
-                return Err(Error::failed_precondition(
-                    "multi-replica routing requires the shared service CA",
-                ));
-            }
+        if !config.peers.is_empty() && config.ca.is_none() {
+            return Err(Error::failed_precondition(
+                "multi-replica routing requires the shared service CA",
+            ));
         }
         for peer in &config.peers {
             if peer.node_id == config.node_id {
@@ -401,9 +394,7 @@ impl PeerDirectory {
             let parsed = reqwest::Url::parse(url).map_err(|error| {
                 Error::invalid_argument(format!("invalid peer URL for {}: {error}", peer.node_id))
             })?;
-            if parsed.scheme() != "https"
-                || parsed.username() != ""
-                || parsed.password().is_some()
+            if parsed.scheme() != "https" || parsed.username() != "" || parsed.password().is_some()
             {
                 return Err(Error::invalid_argument(format!(
                     "peer URL for {} must be an https:// base URL without credentials",
@@ -430,9 +421,9 @@ impl PeerDirectory {
     }
 
     fn client(&self, node_id: &str) -> Result<&reqwest::Client> {
-        self.clients.get(node_id).ok_or_else(|| {
-            Error::unavailable(format!("peer node `{node_id}` is not configured"))
-        })
+        self.clients
+            .get(node_id)
+            .ok_or_else(|| Error::unavailable(format!("peer node `{node_id}` is not configured")))
     }
 
     fn auth_headers(&self) -> [(&'static str, String); 2] {
@@ -457,7 +448,10 @@ pub struct Service {
 impl Service {
     /// Construct the service over a durable backend. No state is loaded into
     /// memory: every read and mutation is authoritative SQL.
-    pub async fn open(backend: Arc<dyn SandboxBackend>, mut config: ServiceConfig) -> Result<Arc<Self>> {
+    pub async fn open(
+        backend: Arc<dyn SandboxBackend>,
+        mut config: ServiceConfig,
+    ) -> Result<Arc<Self>> {
         if config.node_session.is_empty() {
             config.node_session = uuid::Uuid::new_v4().simple().to_string();
         }
@@ -528,10 +522,7 @@ impl Service {
     /// Headers proving this node's registered session and credential.
     pub fn node_auth_headers(&self) -> Vec<(&'static str, String)> {
         let mut headers = self.peers.auth_headers().to_vec();
-        headers.push((
-            "x-preloop-node-credential",
-            self.peers.credential.clone(),
-        ));
+        headers.push(("x-preloop-node-credential", self.peers.credential.clone()));
         headers
     }
 
@@ -550,7 +541,9 @@ impl Service {
         {
             Ok(())
         } else {
-            Err(Error::unauthenticated("unknown or stale service node credential"))
+            Err(Error::unauthenticated(
+                "unknown or stale service node credential",
+            ))
         }
     }
 
@@ -611,7 +604,8 @@ impl Service {
             self.close_exec(exec_id, reason).await;
         }
         for ticket in &outcome.aborted_tickets {
-            self.abort_local_ticket(ticket, "transfer ticket expired").await;
+            self.abort_local_ticket(ticket, "transfer ticket expired")
+                .await;
         }
         for deficit in &outcome.pool_deficits {
             self.fill_pool(deficit).await;
@@ -653,7 +647,10 @@ impl Service {
     }
 
     /// `ListTemplates` page.
-    pub async fn list_templates_page(&self, request: &ListRequest) -> Result<ListTemplatesResponse> {
+    pub async fn list_templates_page(
+        &self,
+        request: &ListRequest,
+    ) -> Result<ListTemplatesResponse> {
         self.backend.list_templates(request).await
     }
 
@@ -716,7 +713,10 @@ impl Service {
 
     async fn pool_placement_check(&self, pool: &PoolSpec) -> Result<()> {
         let snapshot = self.backend.placement_snapshot().await?;
-        match self.pool_placement(pool, &Requirements::default(), &snapshot).await {
+        match self
+            .pool_placement(pool, &Requirements::default(), &snapshot)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(error) if error.code == Code::FailedPrecondition => {
                 if snapshot.providers.is_empty() {
@@ -783,7 +783,8 @@ impl Service {
         let now = now();
         for provider in &snapshot.providers {
             if require_online
-                && now.saturating_sub(provider.last_seen) > self.config.provider_timeout.as_secs() as i64
+                && now.saturating_sub(provider.last_seen)
+                    > self.config.provider_timeout.as_secs() as i64
             {
                 continue;
             }
@@ -832,10 +833,12 @@ impl Service {
                 {
                     reasons.push(format!("network={mode:?}"));
                 }
-                if template_spec.recipe().is_some() && template.native_ref.is_empty() {
-                    if requires.driver.is_empty() && template_spec.requires.driver.is_empty() {
-                        reasons.push("recipe templates must set requires.driver".into());
-                    }
+                if template_spec.recipe().is_some()
+                    && template.native_ref.is_empty()
+                    && requires.driver.is_empty()
+                    && template_spec.requires.driver.is_empty()
+                {
+                    reasons.push("recipe templates must set requires.driver".into());
                 }
                 if !reasons.is_empty() {
                     if !is_cordoned {
@@ -937,11 +940,7 @@ impl Service {
                 .await?
                 .ok_or_else(|| Error::not_found(format!("pool `{}` not found", request.pool)))?
                 .value;
-            let revision = self
-                .backend
-                .pool_revision(&pool.name)
-                .await?
-                .unwrap_or(0);
+            let revision = self.backend.pool_revision(&pool.name).await?.unwrap_or(0);
             let (spec, provider, driver) = self
                 .pool_placement(&pool, &request.requires, snapshot)
                 .await?;
@@ -949,7 +948,10 @@ impl Service {
                 template: spec.template,
                 pool: pool.name.clone(),
                 pool_revision: revision,
-                purpose: request.purpose.as_known().unwrap_or(Purpose::PurposeUnspecified),
+                purpose: request
+                    .purpose
+                    .as_known()
+                    .unwrap_or(Purpose::PurposeUnspecified),
                 name: String::new(),
                 provider_id: provider,
                 driver,
@@ -972,7 +974,12 @@ impl Service {
                 .value;
             let template_spec = template.spec.as_option().cloned().unwrap_or_default();
             let spec = PlacementSpec {
-                requires: template_spec.requires.as_option().cloned().unwrap_or_default().merged(&request.requires),
+                requires: template_spec
+                    .requires
+                    .as_option()
+                    .cloned()
+                    .unwrap_or_default()
+                    .merged(&request.requires),
                 template,
                 shape: request.shape.as_option().cloned().unwrap_or_default(),
                 network: request.network.as_option().cloned().unwrap_or_default(),
@@ -986,7 +993,10 @@ impl Service {
                 template: spec.template,
                 pool: String::new(),
                 pool_revision: 0,
-                purpose: request.purpose.as_known().unwrap_or(Purpose::PurposeUnspecified),
+                purpose: request
+                    .purpose
+                    .as_known()
+                    .unwrap_or(Purpose::PurposeUnspecified),
                 name: request.name.clone(),
                 provider_id: provider,
                 driver,
@@ -1039,7 +1049,9 @@ impl Service {
             {
                 Ok(placement) => placement,
                 Err(_) => {
-                    self.config.metrics.record_pool_refill_failure(&deficit.pool);
+                    self.config
+                        .metrics
+                        .record_pool_refill_failure(&deficit.pool);
                     self.pool_backoff
                         .lock()
                         .insert(deficit.pool.clone(), Instant::now());
@@ -1098,7 +1110,9 @@ impl Service {
             .instrument(span)
             .await;
         let reason = result.as_ref().err().map(|error| error.code.as_str());
-        self.config.metrics.record_acquire(started.elapsed(), reason);
+        self.config
+            .metrics
+            .record_acquire(started.elapsed(), reason);
         result
     }
 
@@ -1173,7 +1187,10 @@ impl Service {
                                 .await?;
                         }
                         Err(error) => {
-                            let _ = self.backend.finish_injection(&lease.id, &self.node, false).await;
+                            let _ = self
+                                .backend
+                                .finish_injection(&lease.id, &self.node, false)
+                                .await;
                             self.clear_waiter_if_any(&request.idempotency_key, waiter_for.take())
                                 .await;
                             return Err(error);
@@ -1190,9 +1207,8 @@ impl Service {
                         .as_ref()
                         .is_some_and(|error| error.code == Code::ResourceExhausted)
                     {
-                        let capacity_at = *capacity_deadline.get_or_insert(
-                            Instant::now() + self.config.acquire_capacity_wait,
-                        );
+                        let capacity_at = *capacity_deadline
+                            .get_or_insert(Instant::now() + self.config.acquire_capacity_wait);
                         if Instant::now() >= capacity_at {
                             break Err(last.unwrap_or_else(|| {
                                 Error::new(Code::ResourceExhausted, "no capacity")
@@ -1210,13 +1226,16 @@ impl Service {
                         let _ = self.backend.register_waiter(waiter).await;
                         waiter_for = Some(request.idempotency_key.clone());
                     }
-                    let wait_until = deadline.min(Instant::now() + retry_after.max(Duration::from_millis(25)));
-                    if tokio::time::timeout_at(wait_until.into(), changed).await.is_err() {
-                        if Instant::now() >= deadline {
-                            break Err(last.unwrap_or_else(|| {
-                                Error::new(Code::DeadlineExceeded, "sandbox not ready in time")
-                            }));
-                        }
+                    let wait_until =
+                        deadline.min(Instant::now() + retry_after.max(Duration::from_millis(25)));
+                    if tokio::time::timeout_at(wait_until.into(), changed)
+                        .await
+                        .is_err()
+                        && Instant::now() >= deadline
+                    {
+                        break Err(last.unwrap_or_else(|| {
+                            Error::new(Code::DeadlineExceeded, "sandbox not ready in time")
+                        }));
                     }
                 }
                 AcquireStep::PlacementNeeded => {
@@ -1261,7 +1280,12 @@ impl Service {
         }
     }
 
-    async fn inject(self: &Arc<Self>, lease: &Lease, sandbox: &Sandbox, inject: &Inject) -> Result<()> {
+    async fn inject(
+        self: &Arc<Self>,
+        lease: &Lease,
+        sandbox: &Sandbox,
+        inject: &Inject,
+    ) -> Result<()> {
         if inject.files.is_empty() {
             return Ok(());
         }
@@ -1338,7 +1362,10 @@ impl Service {
     }
 
     /// `ListProviders` page.
-    pub async fn list_providers_page(&self, request: &ListRequest) -> Result<ListProvidersResponse> {
+    pub async fn list_providers_page(
+        &self,
+        request: &ListRequest,
+    ) -> Result<ListProvidersResponse> {
         self.backend.list_providers(request).await
     }
 
@@ -1456,9 +1483,12 @@ impl Service {
                 events,
                 terminal,
             } => {
-                let exec = self.runtime.execs.lock().get(&exec_id).map(|exec| {
-                    (exec.tx.clone(), exec.finished.clone())
-                });
+                let exec = self
+                    .runtime
+                    .execs
+                    .lock()
+                    .get(&exec_id)
+                    .map(|exec| (exec.tx.clone(), exec.finished.clone()));
                 let Some((tx, finished)) = exec else {
                     if terminal {
                         return Ok(());
@@ -1514,9 +1544,7 @@ impl Service {
         if !request.path.starts_with('/') && !windows_absolute {
             return Err(Error::invalid_argument("path must be absolute"));
         }
-        let sandbox = self
-            .get(&request.sandbox_id, &request.lease_id)
-            .await?;
+        let sandbox = self.get(&request.sandbox_id, &request.lease_id).await?;
         backend::logic::usable(&sandbox)?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let ticket_id = new_id("tkt");
@@ -1705,19 +1733,13 @@ impl Service {
         if let Some(blob) = self.runtime.tickets.lock().get_mut(ticket) {
             blob.control.take();
         }
-        let _ = self
-            .backend
-            .finish_ticket(ticket, "done", "")
-            .await;
+        let _ = self.backend.finish_ticket(ticket, "done", "").await;
     }
 
     /// Abort a transfer.
     pub async fn abort_ticket(&self, ticket: &str, reason: &str) {
         self.abort_local_ticket(ticket, reason).await;
-        let _ = self
-            .backend
-            .finish_ticket(ticket, "aborted", reason)
-            .await;
+        let _ = self.backend.finish_ticket(ticket, "aborted", reason).await;
     }
 
     async fn abort_local_ticket(&self, ticket: &str, reason: &str) {
@@ -1796,14 +1818,23 @@ impl Service {
     where
         S: futures::Stream<Item = TransferChunk> + Send + Unpin,
     {
-        let mut claim = self.open_internal(sandbox_id, lease_id, StreamKind::Upload, guest_dir).await?;
+        let mut claim = self
+            .open_internal(sandbox_id, lease_id, StreamKind::Upload, guest_dir)
+            .await?;
         let ticket = claim.ticket.clone();
         let work_id = self
             .backend
-            .start_copy(sandbox_id, &ticket, guest_dir, StreamKind::Upload, &self.node)
+            .start_copy(
+                sandbox_id,
+                &ticket,
+                guest_dir,
+                StreamKind::Upload,
+                &self.node,
+            )
             .await?;
         if let Err(error) = self.wait_peer(&mut claim).await {
-            self.abort_ticket(&ticket, crate::error::message(&error)).await;
+            self.abort_ticket(&ticket, crate::error::message(&error))
+                .await;
             return Err(error);
         }
         let Some(tx) = claim.take_producer() else {
@@ -1924,17 +1955,16 @@ impl Service {
         let expires_at = now() + self.config.ticket_ttl.as_secs() as i64;
         self.backend
             .create_ticket(
-                &ticket,
-                sandbox_id,
-                lease_id,
-                kind,
-                guest_path,
-                "",
-                expires_at,
-                &self.node,
+                &ticket, sandbox_id, lease_id, kind, guest_path, "", expires_at, &self.node,
             )
             .await?;
-        self.insert_ticket(&ticket, sandbox_id.to_owned(), kind, guest_path.to_owned(), expires_at);
+        self.insert_ticket(
+            &ticket,
+            sandbox_id.to_owned(),
+            kind,
+            guest_path.to_owned(),
+            expires_at,
+        );
         let side = match kind {
             StreamKind::Upload => TransferSide::Producer,
             StreamKind::Download => TransferSide::Consumer,
@@ -2029,9 +2059,9 @@ impl Service {
                 if !result.ok {
                     return Err(crate::error::from_reported(result.error));
                 }
-                result.template.ok_or_else(|| {
-                    Error::internal("snapshot completed without a template receipt")
-                })
+                result
+                    .template
+                    .ok_or_else(|| Error::internal("snapshot completed without a template receipt"))
             }
         }
     }
@@ -2077,7 +2107,9 @@ impl Service {
         request: RegisterRequest,
         provider_id: &str,
     ) -> Result<RegisterResponse> {
-        self.backend.register(request, Some(provider_id), &self.node).await
+        self.backend
+            .register(request, Some(provider_id), &self.node)
+            .await
     }
 
     /// `Heartbeat`.
@@ -2134,25 +2166,29 @@ impl Service {
         }
     }
 
-    async fn forward_report_exec(
-        &self,
-        owner: &Owner,
-        request: &ReportExecRequest,
-    ) -> Result<()> {
+    async fn forward_report_exec(&self, owner: &Owner, request: &ReportExecRequest) -> Result<()> {
         let client = self.peers.client(&owner.node_id)?;
         let url = self
             .config
             .peers
             .iter()
             .find(|peer| peer.node_id == owner.node_id)
-            .map(|peer| format!("{}/sandbox/v1/internal/report-exec", peer.url.trim_end_matches('/')))
+            .map(|peer| {
+                format!(
+                    "{}/sandbox/v1/internal/report-exec",
+                    peer.url.trim_end_matches('/')
+                )
+            })
             .ok_or_else(|| Error::unavailable("owning peer is not configured"))?;
         let mut builder = client.post(url).json(request);
         for (name, value) in self.node_auth_headers() {
             builder = builder.header(name, value);
         }
         let response = builder.send().await.map_err(|error| {
-            Error::unavailable(format!("forwarding ReportExec to {}: {error}", owner.node_id))
+            Error::unavailable(format!(
+                "forwarding ReportExec to {}: {error}",
+                owner.node_id
+            ))
         })?;
         if response.status().is_success() {
             Ok(())
@@ -2263,10 +2299,8 @@ impl Service {
         };
         let parts =
             tls::parse_join_token(&request.token).map_err(|_| invalid("malformed join token"))?;
-        if !backend::logic::constant_time_eq(
-            parts.ca_sha256.as_bytes(),
-            ca.sha256_hex().as_bytes(),
-        ) {
+        if !backend::logic::constant_time_eq(parts.ca_sha256.as_bytes(), ca.sha256_hex().as_bytes())
+        {
             return Err(invalid("join token was issued for a different CA"));
         }
         backend::logic::validate_name("provider", &request.name)?;

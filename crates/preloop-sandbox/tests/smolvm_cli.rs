@@ -1736,9 +1736,12 @@ exit 0
                 .with_named_prefix("preloop-runner"),
         );
         let shutdown = CancellationToken::new();
-        let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
-            .await
-            .unwrap();
+        let service = Service::open(
+            backend::open("memory:").await.unwrap(),
+            ServiceConfig::new(),
+        )
+        .await
+        .unwrap();
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             vec![driver as Arc<dyn Driver>],

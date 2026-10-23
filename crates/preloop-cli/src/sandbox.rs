@@ -20,6 +20,7 @@ use preloop_orchestrator::RunnerPoolConfig;
 use preloop_orchestrator::fleet::SandboxMachines;
 use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink, RemoteLink};
 use preloop_sandbox::api::*;
+use preloop_sandbox::backend::{BackendConfig, SandboxBackend};
 use preloop_sandbox::driver_conformance::ConformanceOptions;
 use preloop_sandbox::drivers::external::{ExternalDriver, ExternalSpec};
 use preloop_sandbox::drivers::fake::FakeDriver;
@@ -31,7 +32,6 @@ use preloop_sandbox::{
     Driver, LeastLoaded, Placement, SandboxApi, SandboxClient, ServerTls, Service, ServiceConfig,
     backend, tls,
 };
-use preloop_sandbox::backend::{BackendConfig, SandboxBackend};
 use tokio_util::sync::CancellationToken;
 
 /// Default address of the engine's sandbox API.
@@ -379,11 +379,16 @@ impl LocalSandboxes {
         // Wait for the local agent so the pool's first acquire can place.
         // An enrollment record (no drivers yet) does not count.
         for _ in 0..200 {
-            if service
+            let registered = service
                 .list_providers()
-                .iter()
-                .any(|provider| !provider.drivers.is_empty())
-            {
+                .await
+                .map(|providers| {
+                    providers
+                        .iter()
+                        .any(|provider| !provider.drivers.is_empty())
+                })
+                .unwrap_or(false);
+            if registered {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

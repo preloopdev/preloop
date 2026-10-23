@@ -6,17 +6,15 @@ use crate::api::*;
 use crate::error::{Code, Error, Result};
 
 use super::backend::Waiter;
+use super::commands_providers::purge_sandbox;
 use super::engine::SqlTx;
 use super::logic;
 use super::rows;
 use super::store::{
     SqlStore, active_lease, bump_version, lease_by_id, lease_row, now_ms, now_secs, outbox,
-    provider_by_id, sandbox_by_id, sandbox_version,
+    provider_by_id, sandbox_by_id,
 };
-use super::commands_providers::purge_sandbox;
-use super::types::{
-    AcquireCommand, AcquireStep, NewSandbox, Owner, RefillOutcome,
-};
+use super::types::{AcquireCommand, AcquireStep, NewSandbox, Owner, RefillOutcome};
 
 /// Insert one immutable spec plus its mutable sandbox row and create work.
 /// `None` means capacity or the pool revision moved; the caller re-evaluates.
@@ -39,20 +37,17 @@ pub(crate) async fn create_member(
         .await?
         .into_iter()
         .next()
-        .ok_or_else(|| {
-            Error::unavailable(format!("provider {} is gone", member.provider_id))
-        })?;
+        .ok_or_else(|| Error::unavailable(format!("provider {} is gone", member.provider_id)))?;
     let _ = provider_row;
     let provider = provider_by_id(tx, &member.provider_id)
         .await?
         .ok_or_else(|| logic::provider_gone(&member.provider_id))?;
-    let driver = logic::provider_driver(&provider, &member.driver)
-        .ok_or_else(|| {
-            Error::failed_precondition(format!(
-                "provider `{}` no longer advertises driver `{}`",
-                provider.name, member.driver
-            ))
-        })?;
+    let driver = logic::provider_driver(&provider, &member.driver).ok_or_else(|| {
+        Error::failed_precondition(format!(
+            "provider `{}` no longer advertises driver `{}`",
+            provider.name, member.driver
+        ))
+    })?;
     if !logic::fits_shape(&driver.capabilities, &member.shape) {
         return Ok(None);
     }
@@ -61,7 +56,10 @@ pub(crate) async fn create_member(
             "SELECT COUNT(*) AS live FROM sandboxes s JOIN sandbox_specs p ON p.id = s.id \
              WHERE s.provider_id = $1 AND p.driver = $2 \
                AND s.state NOT IN ('gone', 'failed', 'terminating')",
-            &[member.provider_id.as_str().into(), member.driver.as_str().into()],
+            &[
+                member.provider_id.as_str().into(),
+                member.driver.as_str().into(),
+            ],
         )
         .await?
         .first()
@@ -136,10 +134,7 @@ pub(crate) async fn create_member(
         }
     }
     let sandbox_id = format!("sbx-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
-    let shape = logic::effective_shape(
-        Some(&driver.capabilities),
-        &member.shape,
-    );
+    let shape = logic::effective_shape(Some(&driver.capabilities), &member.shape);
     let spec_json = serde_json::to_string(&member.template).unwrap_or_default();
     let shape_json = serde_json::to_string(&shape).unwrap_or_default();
     let network_json = serde_json::to_string(&member.network).unwrap_or_default();
@@ -165,7 +160,9 @@ pub(crate) async fn create_member(
             member.snapshot_capable.into(),
             rows::purpose_label(member.purpose).into(),
             member.pool.as_str().into(),
-            i64::try_from(member.pool_revision).unwrap_or(i64::MAX).into(),
+            i64::try_from(member.pool_revision)
+                .unwrap_or(i64::MAX)
+                .into(),
             member.driver.as_str().into(),
             now_secs().into(),
         ],
@@ -247,10 +244,7 @@ pub(crate) async fn create_pool_member(
         .await
 }
 
-pub(crate) async fn acquire(
-    store: &SqlStore,
-    command: AcquireCommand,
-) -> Result<AcquireStep> {
+pub(crate) async fn acquire(store: &SqlStore, command: AcquireCommand) -> Result<AcquireStep> {
     if command.request.idempotency_key.is_empty() {
         return Err(Error::invalid_argument("idempotencyKey is required"));
     }
@@ -291,7 +285,7 @@ pub(crate) async fn acquire(
                             &request.idempotency_key,
                         )));
                     }
-                    let Some(mut sandbox) = sandbox_by_id(tx, &sandbox_id).await? else {
+                    let Some(sandbox) = sandbox_by_id(tx, &sandbox_id).await? else {
                         release_lease(tx, &lease_id, ReleaseMode::Destroy, 0, 0).await?;
                         return Ok(AcquireStep::Failed(Error::not_found(
                             "leased sandbox is gone",
@@ -411,13 +405,8 @@ pub(crate) async fn acquire(
                 let sandbox_id = if let Some(pool) = &pool {
                     let pool_name = pool.text("name")?.to_owned();
                     let revision = pool.u64("revision")?;
-                    let warm = find_warm_member(
-                        tx,
-                        &pool_name,
-                        revision,
-                        &request.requires,
-                    )
-                    .await?;
+                    let warm =
+                        find_warm_member(tx, &pool_name, revision, &request.requires).await?;
                     match warm {
                         Some(id) => {
                             let claim_version = bump_version(tx).await?;
@@ -445,13 +434,8 @@ pub(crate) async fn acquire(
                             id
                         }
                         None => {
-                            if provisioning_member(
-                                tx,
-                                &pool_name,
-                                revision,
-                                &request.requires,
-                            )
-                            .await?
+                            if provisioning_member(tx, &pool_name, revision, &request.requires)
+                                .await?
                             {
                                 release_key(tx, &request.idempotency_key).await?;
                                 return Ok(AcquireStep::Wait {
@@ -614,7 +598,10 @@ pub(crate) async fn acquire(
                     &[
                         sandbox_id.as_str().into(),
                         rows::purpose_label(
-                            request.purpose.as_known().unwrap_or(Purpose::PurposeUnspecified),
+                            request
+                                .purpose
+                                .as_known()
+                                .unwrap_or(Purpose::PurposeUnspecified),
                         )
                         .into(),
                     ],
@@ -627,8 +614,7 @@ pub(crate) async fn acquire(
                 let sandbox = sandbox_by_id(tx, &sandbox_id)
                     .await?
                     .ok_or_else(|| Error::internal("inserted sandbox vanished"))?;
-                if inject_state == "pending"
-                    && sandbox.state.known() != SandboxState::Provisioning
+                if inject_state == "pending" && sandbox.state.known() != SandboxState::Provisioning
                 {
                     if claim_injection(tx, &lease_id, &owner, Duration::from_secs(60)).await? {
                         Ok(AcquireStep::Inject { lease, sandbox })
@@ -678,7 +664,10 @@ async fn deliver_lease(
         .await?
         .into_iter()
         .next();
-    let requested = row.map(|row| row.u64("requested_ttl_secs")).transpose()?.unwrap_or(0);
+    let requested = row
+        .map(|row| row.u64("requested_ttl_secs"))
+        .transpose()?
+        .unwrap_or(0);
     if requested > 0 {
         let version = bump_version(tx).await?;
         tx.execute(
@@ -703,7 +692,9 @@ async fn seal_env(
         return Ok(None);
     }
     let bytes = serde_json::to_vec(env).unwrap_or_default();
-    Ok(Some(seal.seal(&bytes, rows::lease_aad(lease_id).as_bytes())?))
+    Ok(Some(
+        seal.seal(&bytes, rows::lease_aad(lease_id).as_bytes())?,
+    ))
 }
 
 async fn find_warm_member(
@@ -718,7 +709,10 @@ async fn find_warm_member(
              JOIN sandbox_specs p ON p.id = s.id \
              WHERE p.pool = $1 AND p.pool_revision = $2 AND s.lease_id = '' \
                AND s.state = 'ready' ORDER BY s.created_at, s.id",
-            &[pool.into(), i64::try_from(revision).unwrap_or(i64::MAX).into()],
+            &[
+                pool.into(),
+                i64::try_from(revision).unwrap_or(i64::MAX).into(),
+            ],
         )
         .await?;
     for row in rows {
@@ -742,7 +736,10 @@ async fn provisioning_member(
              JOIN sandbox_specs p ON p.id = s.id \
              WHERE p.pool = $1 AND p.pool_revision = $2 AND s.lease_id = '' \
                AND s.state = 'provisioning'",
-            &[pool.into(), i64::try_from(revision).unwrap_or(i64::MAX).into()],
+            &[
+                pool.into(),
+                i64::try_from(revision).unwrap_or(i64::MAX).into(),
+            ],
         )
         .await?;
     for row in rows {
@@ -791,10 +788,7 @@ pub(crate) async fn finish_injection(
             Box::pin(async move {
                 let state = if ok { "done" } else { "pending" };
                 let (owner_node, owner_session) = if ok {
-                    (
-                        owner.node_id.clone(),
-                        owner.session_id.clone(),
-                    )
+                    (owner.node_id.clone(), owner.session_id.clone())
                 } else {
                     (String::new(), String::new())
                 };
@@ -907,7 +901,10 @@ pub(crate) async fn release(
             let lease_id = lease_id.to_owned();
             Box::pin(async move {
                 let exists = tx
-                    .query("SELECT 1 AS present FROM leases WHERE id = $1", &[lease_id.as_str().into()])
+                    .query(
+                        "SELECT 1 AS present FROM leases WHERE id = $1",
+                        &[lease_id.as_str().into()],
+                    )
                     .await?;
                 if exists.is_empty() {
                     return Err(Error::not_found("lease not found"));
@@ -1009,8 +1006,11 @@ pub(crate) async fn detach_lease(tx: &mut dyn SqlTx, sandbox_id: &str) -> Result
     };
     let lease_id = row.text("id")?.to_owned();
     let key = row.text("idempotency_key")?.to_owned();
-    tx.execute("DELETE FROM leases WHERE id = $1", &[lease_id.as_str().into()])
-        .await?;
+    tx.execute(
+        "DELETE FROM leases WHERE id = $1",
+        &[lease_id.as_str().into()],
+    )
+    .await?;
     if !key.is_empty() {
         release_key(tx, &key).await?;
     }
@@ -1063,11 +1063,7 @@ pub(crate) async fn destroy_sandbox(tx: &mut dyn SqlTx, sandbox_id: &str) -> Res
 }
 
 /// Fail a sandbox and close every durable handle attached to it.
-pub(crate) async fn fail_sandbox(
-    tx: &mut dyn SqlTx,
-    sandbox_id: &str,
-    reason: &str,
-) -> Result<()> {
+pub(crate) async fn fail_sandbox(tx: &mut dyn SqlTx, sandbox_id: &str, reason: &str) -> Result<()> {
     let Some(sandbox) = sandbox_by_id(tx, sandbox_id).await? else {
         return Ok(());
     };
@@ -1077,11 +1073,7 @@ pub(crate) async fn fail_sandbox(
     let version = bump_version(tx).await?;
     tx.execute(
         "UPDATE sandboxes SET state = 'failed', error = $2, version = $3 WHERE id = $1",
-        &[
-            sandbox_id.into(),
-            reason.into(),
-            version.into(),
-        ],
+        &[sandbox_id.into(), reason.into(), version.into()],
     )
     .await?;
     tx.execute(
@@ -1136,10 +1128,7 @@ async fn authorize(tx: &mut dyn SqlTx, sandbox: &Sandbox, lease_id: &str) -> Res
     }
 }
 
-pub(crate) async fn list(
-    store: &SqlStore,
-    request: &ListRequest,
-) -> Result<ListSandboxesResponse> {
+pub(crate) async fn list(store: &SqlStore, request: &ListRequest) -> Result<ListSandboxesResponse> {
     let window = logic::page_window("sandbox", request)?;
     let after = window.after.clone().unwrap_or_default();
     let limit = i64::try_from(window.limit).unwrap_or(i64::MAX);
@@ -1159,7 +1148,10 @@ pub(crate) async fn list(
                 let has_more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
                 let mut sandboxes = Vec::new();
                 let mut ids = Vec::new();
-                for row in rows.iter().take(usize::try_from(limit).unwrap_or(usize::MAX)) {
+                for row in rows
+                    .iter()
+                    .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                {
                     ids.push(row.text("id")?.to_owned());
                     let mut sandbox = rows::sandbox_from_row(row)?;
                     sandbox.lease_id.clear();
@@ -1248,11 +1240,7 @@ pub(crate) async fn register_waiter(store: &SqlStore, waiter: Waiter) -> Result<
         .await
 }
 
-pub(crate) async fn clear_waiter(
-    store: &SqlStore,
-    key: &str,
-    owner: &Owner,
-) -> Result<()> {
+pub(crate) async fn clear_waiter(store: &SqlStore, key: &str, owner: &Owner) -> Result<()> {
     store
         .run_tx(|tx| {
             let key = key.to_owned();
@@ -1288,14 +1276,4 @@ pub(crate) async fn expire_lease_if_unwaited(tx: &mut dyn SqlTx, lease_id: &str)
     }
     release_lease(tx, lease_id, ReleaseMode::Destroy, 0, 0).await?;
     Ok(true)
-}
-
-/// The version of a sandbox's mutable row, for callers that need it.
-pub(crate) async fn version(store: &SqlStore, sandbox_id: &str) -> Result<Option<u64>> {
-    store
-        .run_tx(|tx| {
-            let sandbox_id = sandbox_id.to_owned();
-            Box::pin(async move { sandbox_version(tx, &sandbox_id).await })
-        })
-        .await
 }

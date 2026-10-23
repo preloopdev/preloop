@@ -3,13 +3,11 @@
 use crate::api::*;
 use crate::error::{Error, Result};
 
+use super::backend::SchemaInfo;
 use super::engine::SqlTx;
 use super::logic;
 use super::rows;
-use super::store::{
-    SqlStore, bump_version, now_ms, outbox, provider_by_id,
-};
-use super::backend::SchemaInfo;
+use super::store::{SqlStore, bump_version, now_ms, outbox, provider_by_id};
 use super::types::{PlacementSnapshot, ResourceKind, ResourceMeta, Versioned};
 
 pub(crate) async fn schema_info(store: &SqlStore) -> Result<SchemaInfo> {
@@ -119,20 +117,16 @@ pub(crate) async fn pool_get(store: &SqlStore, name: &str) -> Result<Option<Vers
         .await
 }
 
-pub(crate) async fn pool_build_revision(
-    store: &SqlStore,
-    name: &str,
-) -> Result<Option<u64>> {
+pub(crate) async fn pool_build_revision(store: &SqlStore, name: &str) -> Result<Option<u64>> {
     store
         .run_tx(|tx| {
             let name = name.to_owned();
             Box::pin(async move {
-                Ok(tx
-                    .query("SELECT revision FROM pools WHERE name = $1", &[name.into()])
+                tx.query("SELECT revision FROM pools WHERE name = $1", &[name.into()])
                     .await?
                     .first()
                     .map(|row| row.u64("revision"))
-                    .transpose()?)
+                    .transpose()
             })
         })
         .await
@@ -185,21 +179,21 @@ pub(crate) async fn resource_version(
         ),
         ResourceKind::Pool => ("SELECT version FROM pools WHERE name = $1", id),
         ResourceKind::Sandbox => ("SELECT version FROM sandboxes WHERE id = $1", id),
-        ResourceKind::Provider | ResourceKind::Driver => {
-            ("SELECT generation AS version FROM providers WHERE id = $1", id)
-        }
+        ResourceKind::Provider | ResourceKind::Driver => (
+            "SELECT generation AS version FROM providers WHERE id = $1",
+            id,
+        ),
     };
     store
         .run_tx(|tx| {
             let sql = sql.to_owned();
             let id = id.to_owned();
             Box::pin(async move {
-                Ok(tx
-                    .query(&sql, &[id.into()])
+                tx.query(&sql, &[id.into()])
                     .await?
                     .first()
                     .map(|row| row.u64("version"))
-                    .transpose()?)
+                    .transpose()
             })
         })
         .await
@@ -359,7 +353,7 @@ pub(crate) async fn put_template(store: &SqlStore, spec: TemplateSpec) -> Result
                     && row.text("digest")? == digest
                     && !row.bool("retired")?
                 {
-                    return Ok(rows::template_from_row(row)?);
+                    return rows::template_from_row(row);
                 }
                 if let Some(row) = &existing {
                     let native_ref = row.text("native_ref")?.to_owned();
@@ -408,7 +402,9 @@ pub(crate) async fn put_template(store: &SqlStore, spec: TemplateSpec) -> Result
                             artifact.arch.as_str().into(),
                             artifact.digest.as_str().into(),
                             artifact.r#ref.as_str().into(),
-                            i64::try_from(artifact.size_bytes).unwrap_or(i64::MAX).into(),
+                            i64::try_from(artifact.size_bytes)
+                                .unwrap_or(i64::MAX)
+                                .into(),
                         ],
                     )
                     .await?;
@@ -504,7 +500,10 @@ pub(crate) async fn list_templates(
                 let has_more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
                 let mut templates = Vec::new();
                 let mut ids = Vec::new();
-                for row in rows.iter().take(usize::try_from(limit).unwrap_or(usize::MAX)) {
+                for row in rows
+                    .iter()
+                    .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                {
                     ids.push(row.text("name")?.to_owned());
                     templates.push(rows::template_from_row(row)?);
                 }
@@ -596,7 +595,10 @@ pub(crate) async fn delete_pool(store: &SqlStore, name: &str) -> Result<()> {
             let name = name.clone();
             Box::pin(async move {
                 let existing = tx
-                    .query("SELECT 1 AS present FROM pools WHERE name = $1", &[name.as_str().into()])
+                    .query(
+                        "SELECT 1 AS present FROM pools WHERE name = $1",
+                        &[name.as_str().into()],
+                    )
                     .await?;
                 if existing.is_empty() {
                     return Err(Error::not_found(format!("pool `{name}` not found")));
@@ -643,7 +645,10 @@ pub(crate) async fn list_pools(
                 let has_more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
                 let mut pools = Vec::new();
                 let mut ids = Vec::new();
-                for row in rows.iter().take(usize::try_from(limit).unwrap_or(usize::MAX)) {
+                for row in rows
+                    .iter()
+                    .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                {
                     ids.push(row.text("name")?.to_owned());
                     pools.push(rows::pool_from_row(row)?);
                 }
@@ -729,21 +734,14 @@ pub(crate) async fn retire_snapshot(
         "INSERT INTO snapshot_bases (native_ref, provider_id, driver, drop_pending) \
          VALUES ($1, $2, $3, TRUE) \
          ON CONFLICT (native_ref) DO UPDATE SET drop_pending = TRUE",
-        &[
-            native_ref.into(),
-            provider_id.into(),
-            driver.into(),
-        ],
+        &[native_ref.into(), provider_id.into(), driver.into()],
     )
     .await?;
     drop_snapshot_if_unpinned(tx, native_ref).await
 }
 
 /// Drop a retired base once no pin remains.
-pub(crate) async fn drop_snapshot_if_unpinned(
-    tx: &mut dyn SqlTx,
-    native_ref: &str,
-) -> Result<()> {
+pub(crate) async fn drop_snapshot_if_unpinned(tx: &mut dyn SqlTx, native_ref: &str) -> Result<()> {
     let pinned = tx
         .query(
             "SELECT 1 AS present FROM template_pins WHERE base_ref = $1 LIMIT 1",
@@ -767,10 +765,7 @@ pub(crate) async fn drop_snapshot_if_unpinned(
     let provider_id = base.text("provider_id")?.to_owned();
     let driver = base.text("driver")?.to_owned();
     if provider_by_id(tx, &provider_id).await?.is_some() {
-        let work_id = format!(
-            "wrk-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        );
+        let work_id = format!("wrk-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
         let target = SandboxWork {
             sandbox_id: String::new(),
             driver,

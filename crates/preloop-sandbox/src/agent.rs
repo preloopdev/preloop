@@ -91,13 +91,14 @@ impl ProviderLink for Arc<Service> {
         id: &Session,
         ticket: &str,
     ) -> Result<mpsc::Receiver<TransferChunk>> {
-        let mut claim = self.claim_agent(
-            &id.provider_id,
-            id.generation,
-            ticket,
-            crate::service::TransferSide::Consumer,
-        )
-        .await?;
+        let mut claim = self
+            .claim_agent(
+                &id.provider_id,
+                id.generation,
+                ticket,
+                crate::service::TransferSide::Consumer,
+            )
+            .await?;
         self.wait_peer(&mut claim).await?;
         claim
             .take_consumer()
@@ -109,13 +110,14 @@ impl ProviderLink for Arc<Service> {
         ticket: &str,
         mut tar: mpsc::Receiver<TransferChunk>,
     ) -> Result<()> {
-        let mut claim = self.claim_agent(
-            &id.provider_id,
-            id.generation,
-            ticket,
-            crate::service::TransferSide::Producer,
-        )
-        .await?;
+        let mut claim = self
+            .claim_agent(
+                &id.provider_id,
+                id.generation,
+                ticket,
+                crate::service::TransferSide::Producer,
+            )
+            .await?;
         self.wait_peer(&mut claim).await?;
         let Some(tx) = claim.take_producer() else {
             return Err(Error::internal("download ticket has no producer side"));

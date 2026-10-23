@@ -6,6 +6,7 @@
 //! decision. SQLite is the single-node default; Postgres serves multi-replica
 //! deployments. Both implement the same [`SandboxBackend`] contract.
 
+#[allow(clippy::module_inception)]
 mod backend;
 mod engine;
 pub(crate) mod logic;
@@ -85,10 +86,7 @@ pub(crate) fn backend_kind(url: &str) -> &'static str {
     let trimmed = url.trim();
     if trimmed.starts_with("postgres://") || trimmed.starts_with("postgresql://") {
         "postgres"
-    } else if trimmed.starts_with("sqlite:")
-        || trimmed == "memory:"
-        || !trimmed.contains("://")
-    {
+    } else if trimmed.starts_with("sqlite:") || trimmed == "memory:" || !trimmed.contains("://") {
         "sqlite"
     } else {
         "unsupported"

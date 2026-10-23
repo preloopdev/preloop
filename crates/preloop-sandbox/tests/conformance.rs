@@ -9,18 +9,19 @@ use std::time::Duration;
 
 use preloop_sandbox::agent::{Agent, AgentConfig, HostAccess, ProviderLink};
 use preloop_sandbox::api::*;
+use preloop_sandbox::backend::{
+    self, AcquireCommand, AcquireStep, BackendConfig, EnrollOutcome, ExecHandle, ExecStatus,
+    MaintenanceConfig, MaintenanceOutcome, NewSandbox, Owner, OwnerKind, PlacementSnapshot,
+    PowerOp, RefillOutcome, ReportExecOutcome, ResourceKind, ResourceMeta, SandboxBackend,
+    SchemaInfo, SnapshotCommand, SnapshotStart, TicketAuthority, TicketClaim, TicketSide,
+    Versioned, Waiter, WorkResult,
+};
 use preloop_sandbox::driver::TransferChunk;
 use preloop_sandbox::drivers::fake::FakeDriver;
 use preloop_sandbox::error::message;
 use preloop_sandbox::placement::{Candidate, CandidateId, Placement, PlacementRequest};
 use preloop_sandbox::server::{Auth, HostAllowlist, ListenerSurface, router, serve_with_options};
 use preloop_sandbox::service::TransferSide;
-use preloop_sandbox::backend::{
-    self, AcquireCommand, AcquireStep, BackendConfig, EnrollOutcome, ExecHandle, ExecStatus,
-    MaintenanceConfig, MaintenanceOutcome, NewSandbox, Owner, OwnerKind, PlacementSnapshot, PowerOp,
-    RefillOutcome, ResourceKind, ResourceMeta, SandboxBackend, SchemaInfo, SnapshotCommand,
-    SnapshotStart, TicketAuthority, TicketClaim, TicketSide, Versioned, Waiter, WorkResult,
-};
 use preloop_sandbox::{
     Code, Driver, ProviderIdentity, SandboxClient, ServerTls, Service, ServiceConfig, tls,
 };
@@ -218,18 +219,28 @@ fn execute_bound(db: &std::path::Path, sql: &str, value: &str) {
 /// One text column from a file-backed SQLite store, read outside the backend.
 fn query_text(db: &std::path::Path, sql: &str) -> String {
     let connection = rusqlite::Connection::open(db).unwrap();
-    connection
-        .query_row(sql, [], |row| row.get(0))
-        .unwrap()
+    connection.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
 /// One integer column from a file-backed SQLite store, read outside the
 /// backend.
 fn query_int(db: &std::path::Path, sql: &str) -> i64 {
     let connection = rusqlite::Connection::open(db).unwrap();
-    connection
-        .query_row(sql, [], |row| row.get(0))
+    connection.query_row(sql, [], |row| row.get(0)).unwrap()
+}
+
+/// One sandbox's state as the Stats projection reports it, `None` when the
+/// sandbox is no longer tracked.
+async fn stats_state(service: &Service, id: &str) -> Option<SandboxState> {
+    service
+        .stats()
+        .await
         .unwrap()
+        .providers
+        .into_iter()
+        .flat_map(|provider| provider.sandboxes)
+        .find(|sandbox| sandbox.sandbox.id == id)
+        .map(|sandbox| sandbox.sandbox.state.known())
 }
 
 fn acquire(key: &str, pool: &str) -> AcquireRequest {
@@ -526,12 +537,14 @@ async fn sandbox_shape_is_the_effective_size() {
         (&partial.sandbox.id, &partial.lease.id, partial_expected),
     ] {
         assert_eq!(
-            h.service.get(id, lease_id).unwrap().shape.as_option(),
+            h.service.get(id, lease_id).await.unwrap().shape.as_option(),
             Some(&expected)
         );
         assert_eq!(
             h.service
                 .list()
+                .await
+                .unwrap()
                 .into_iter()
                 .find(|sandbox| &sandbox.id == id)
                 .unwrap()
@@ -702,7 +715,12 @@ async fn snapshot_becomes_a_template_that_starts_with_the_captured_state() {
     assert!(!golden.native_ref.is_empty());
     assert_eq!(golden.spec.snapshot_of(), Some(build.sandbox.id.as_str()));
     // The source is consumed.
-    assert!(h.service.get(&build.sandbox.id, &build.lease.id).is_err());
+    assert!(
+        h.service
+            .get(&build.sandbox.id, &build.lease.id)
+            .await
+            .is_err()
+    );
     h.service
         .put_pool(PoolSpec {
             name: "from-golden".into(),
@@ -953,27 +971,23 @@ async fn stats_follow_reconcile_state_changes() {
         })
         .await
         .unwrap();
-    let state_of = |service: &Service, id: &str| {
-        service
-            .stats()
-            .providers
-            .into_iter()
-            .flat_map(|provider| provider.sandboxes)
-            .find(|sandbox| sandbox.sandbox.id == id)
-            .map(|sandbox| sandbox.sandbox.state)
-    };
     assert_eq!(
-        state_of(&h.service, &lease.sandbox.id),
+        stats_state(&h.service, &lease.sandbox.id).await,
         Some(SandboxState::Leased.into())
     );
     // The leased machine disappears behind the service's back.
     h.fake.destroy(&lease.sandbox.native_ref).await.unwrap();
-    wait_for(|| state_of(&h.service, &lease.sandbox.id) == Some(SandboxState::Failed.into())).await;
+    wait_for(|| async {
+        stats_state(&h.service, &lease.sandbox.id).await == Some(SandboxState::Failed.into())
+    })
+    .await;
     // The count follows the state: the sandbox is still tracked, once, as
     // failed.
     let sandboxes: Vec<_> = h
         .service
         .stats()
+        .await
+        .unwrap()
         .providers
         .into_iter()
         .flat_map(|provider| provider.sandboxes)
@@ -1108,6 +1122,8 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
     .unwrap();
     let provider = service
         .list_providers()
+        .await
+        .unwrap()
         .into_iter()
         .find(|provider| provider.id == sandbox.provider_id)
         .expect("the provider row is restored");
@@ -1116,9 +1132,11 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
         generation: provider.generation,
         ..HeartbeatRequest::default()
     };
-    let provider_stats = || {
+    let provider_stats = || async {
         service
             .stats()
+            .await
+            .unwrap()
             .providers
             .into_iter()
             .find(|entry| entry.provider_id == provider.id)
@@ -1126,8 +1144,8 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
     };
 
     // Never reported anything: succeeds and invents nothing.
-    Service::heartbeat(&service, old_shape()).unwrap();
-    let first = provider_stats();
+    Service::heartbeat(&service, old_shape()).await.unwrap();
+    let first = provider_stats().await;
     assert_eq!(&*first.host, &HostSample::default());
     assert_eq!(first.host_sample_age_secs, 0);
     assert_eq!(first.sandboxes.len(), 1);
@@ -1157,15 +1175,16 @@ async fn old_agent_heartbeat_without_runtime_fields_is_accepted() {
             ..HeartbeatRequest::default()
         },
     )
+    .await
     .unwrap();
-    let second = provider_stats();
+    let second = provider_stats().await;
     assert_eq!(second.host.mem_total_bytes, Some(8 << 30));
     assert_eq!(&*second.sandboxes[0].runtime, &reported);
 
     // ...and a later old-shape heartbeat clears the runtime report (it is
     // replaced wholesale) but cannot clear a host sample it did not send.
-    Service::heartbeat(&service, old_shape()).unwrap();
-    let third = provider_stats();
+    Service::heartbeat(&service, old_shape()).await.unwrap();
+    let third = provider_stats().await;
     assert_eq!(third.host.mem_total_bytes, Some(8 << 30));
     assert_eq!(
         &*third.sandboxes[0].runtime,
@@ -1199,8 +1218,10 @@ async fn remote_agent_and_client_over_connect() {
     assert_eq!(bad.list().await.unwrap_err().code, Code::Unauthenticated);
 
     let client = t.client();
-    wait_for(|| {
+    wait_for(|| async {
         Service::list_providers(&service)
+            .await
+            .unwrap()
             .iter()
             .any(|provider| provider.generation > 0 && !provider.drivers.is_empty())
     })
@@ -1331,8 +1352,10 @@ async fn remote_agent_heartbeat_feeds_the_stats_api() {
     tokio::spawn(agent.run(None, t.shutdown_token()));
 
     let client = t.client();
-    wait_for(|| !Service::list_providers(&service).is_empty()).await;
-    let provider_id = Service::list_providers(&service)[0].id.clone();
+    wait_for(|| async { !Service::list_providers(&service).await.unwrap().is_empty() }).await;
+    let provider_id = Service::list_providers(&service).await.unwrap()[0]
+        .id
+        .clone();
     client.put_template(template("alpine")).await.unwrap();
     let lease = client
         .acquire(AcquireRequest {
@@ -1615,6 +1638,7 @@ async fn destroying_a_sandbox_closes_open_exec_streams() {
             argv: vec!["sh".into(), "-c".into(), "sleep 300".into()],
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     // Give the exec work a moment to reach the agent, then destroy the
     // sandbox out from under the caller.
@@ -2329,6 +2353,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
                 argv: vec!["true".into()],
                 ..ExecRequest::default()
             })
+            .await
             .err()
             .expect("exec must be denied");
         assert_eq!(exec.code, Code::PermissionDenied, "{exec}");
@@ -2341,6 +2366,7 @@ async fn sandbox_scoped_calls_require_the_holding_lease() {
                 path: "/etc".into(),
                 ..OpenStreamRequest::default()
             })
+            .await
             .unwrap_err();
         assert_eq!(stream.code, Code::PermissionDenied, "{stream}");
         let stop = h.service.stop(&sandbox_id, lease_id).await.unwrap_err();
@@ -2430,7 +2456,7 @@ async fn list_redacts_lease_ids() {
         })
         .await
         .unwrap();
-    let listed = h.service.list();
+    let listed = h.service.list().await.unwrap();
     assert_eq!(listed.len(), 2);
     assert!(
         listed.iter().all(|sandbox| sandbox.lease_id.is_empty()),
@@ -2440,6 +2466,7 @@ async fn list_redacts_lease_ids() {
     assert_eq!(
         h.service
             .get(&first.sandbox.id, &first.lease.id)
+            .await
             .unwrap()
             .lease_id,
         first.lease.id
@@ -2447,6 +2474,7 @@ async fn list_redacts_lease_ids() {
     assert_eq!(
         h.service
             .get(&first.sandbox.id, &second.lease.id)
+            .await
             .unwrap_err()
             .code,
         Code::PermissionDenied
@@ -2657,7 +2685,7 @@ async fn cordoned_provider_receives_no_placements() {
 async fn a_pool_whose_only_capable_provider_is_cordoned_still_validates() {
     let h = harness().await;
     h.service.put_template(template("alpine")).await.unwrap();
-    let name = h.service.list_providers()[0].name.clone();
+    let name = h.service.list_providers().await.unwrap()[0].name.clone();
     h.service.set_provider_cordon(&name, true).await.unwrap();
 
     // A cordon is transient, so it must not reject the pool as impossible.
@@ -2672,7 +2700,10 @@ async fn a_pool_whose_only_capable_provider_is_cordoned_still_validates() {
         .await
         .expect("a cordoned provider is still a valid pool target");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(h.service.list().is_empty(), "no fill while cordoned");
+    assert!(
+        h.service.list().await.unwrap().is_empty(),
+        "no fill while cordoned"
+    );
 
     h.service.set_provider_cordon(&name, false).await.unwrap();
     wait_for(|| async { h.service.list().await.unwrap().len() == 1 }).await;
@@ -2694,9 +2725,11 @@ async fn drain_releases_idle_pool_members_and_keeps_leases() {
         })
         .await
         .unwrap();
-    wait_for(|| {
+    wait_for(|| async {
         h.service
             .list()
+            .await
+            .unwrap()
             .iter()
             .filter(|s| s.state == SandboxState::Ready)
             .count()
@@ -2704,16 +2737,16 @@ async fn drain_releases_idle_pool_members_and_keeps_leases() {
     })
     .await;
     let lease = h.service.acquire(acquire("drain", "linux")).await.unwrap();
-    let name = h.service.list_providers()[0].name.clone();
+    let name = h.service.list_providers().await.unwrap()[0].name.clone();
 
     let result = h.service.drain_provider(&name).await.unwrap();
     assert_eq!(result.released_pool_members, 1);
     assert_eq!(result.leased_remaining, 1);
-    assert!(h.service.list_providers()[0].cordoned);
+    assert!(h.service.list_providers().await.unwrap()[0].cordoned);
 
     // The idle member is destroyed; the leased one keeps running.
-    wait_for(|| {
-        let sandboxes = h.service.list();
+    wait_for(|| async {
+        let sandboxes = h.service.list().await.unwrap();
         sandboxes.len() == 1 && sandboxes[0].id == lease.sandbox.id
     })
     .await;
@@ -2721,7 +2754,7 @@ async fn drain_releases_idle_pool_members_and_keeps_leases() {
 
     // No refill while cordoned.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(h.service.list().len(), 1);
+    assert_eq!(h.service.list().await.unwrap().len(), 1);
 
     h.service.set_provider_cordon(&name, false).await.unwrap();
     wait_for(|| async { h.service.list().await.unwrap().len() == 2 }).await;
@@ -2732,9 +2765,12 @@ async fn connect_unary_bodies_are_capped_at_four_mib() {
     use preloop_sandbox::server::CONNECT_BODY_LIMIT;
     use tower::ServiceExt as _;
     let _dir = tempfile::tempdir().unwrap();
-    let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
-        .await
-        .unwrap();
+    let service = Service::open(
+        backend::open("memory:").await.unwrap(),
+        ServiceConfig::new(),
+    )
+    .await
+    .unwrap();
     let response = router(service, Auth::new("test-token"))
         .oneshot(
             axum::http::Request::builder()
@@ -2788,6 +2824,7 @@ async fn blob_upload_cap_rejects_and_consumes_the_ticket() {
             path: "/work".into(),
             ..OpenStreamRequest::default()
         })
+        .await
         .unwrap();
     let ticket_id = ticket.url.rsplit('/').next().unwrap().to_owned();
     let base = serve(service.clone()).await;
@@ -2810,6 +2847,7 @@ async fn blob_upload_cap_rejects_and_consumes_the_ticket() {
     assert!(
         service
             .claim_caller(&ticket_id, &ticket.token, TransferSide::Consumer)
+            .await
             .is_err()
     );
     shutdown.cancel();
@@ -2935,9 +2973,12 @@ fn tar_entry_bytes(tar_path: &std::path::Path, wanted: &str) -> Vec<u8> {
 #[tokio::test]
 async fn transfers_stream_without_staging_files() {
     let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
-        .await
-        .unwrap();
+    let service = Service::open(
+        backend::open("memory:").await.unwrap(),
+        ServiceConfig::new(),
+    )
+    .await
+    .unwrap();
     let entered_in = Arc::new(tokio::sync::Notify::new());
     let release_in = Arc::new(tokio::sync::Notify::new());
     let entered_out = Arc::new(tokio::sync::Notify::new());
@@ -3093,7 +3134,7 @@ impl ProviderLink for BrokenFetch {
         Service::register(&self.inner, request).await
     }
     async fn heartbeat(&self, request: HeartbeatRequest) -> preloop_sandbox::Result<()> {
-        Service::heartbeat(&self.inner, request)
+        Service::heartbeat(&self.inner, request).await
     }
     async fn poll(&self, request: PollRequest) -> preloop_sandbox::Result<PollResponse> {
         Service::poll(&self.inner, request).await
@@ -3115,12 +3156,15 @@ impl ProviderLink for BrokenFetch {
         id: &ProviderSession,
         ticket: &str,
     ) -> preloop_sandbox::Result<tokio::sync::mpsc::Receiver<TransferChunk>> {
-        let mut claim = self.inner.claim_agent(
-            &id.provider_id,
-            id.generation,
-            ticket,
-            TransferSide::Consumer,
-        )?;
+        let mut claim = self
+            .inner
+            .claim_agent(
+                &id.provider_id,
+                id.generation,
+                ticket,
+                TransferSide::Consumer,
+            )
+            .await?;
         self.inner.wait_peer(&mut claim).await?;
         *self.ticket.lock().unwrap() = Some(ticket.to_owned());
         *self.session.lock().unwrap() = Some((id.provider_id.clone(), id.generation));
@@ -3148,9 +3192,12 @@ impl ProviderLink for BrokenFetch {
 #[tokio::test]
 async fn an_agent_that_disappears_mid_transfer_fails_the_caller_and_consumes_the_ticket() {
     let dir = tempfile::tempdir().unwrap();
-    let service = Service::open(backend::open("memory:").await.unwrap(), ServiceConfig::new())
-        .await
-        .unwrap();
+    let service = Service::open(
+        backend::open("memory:").await.unwrap(),
+        ServiceConfig::new(),
+    )
+    .await
+    .unwrap();
     let link = Arc::new(BrokenFetch {
         inner: service.clone(),
         ticket: std::sync::Mutex::new(None),
@@ -3215,6 +3262,7 @@ async fn an_agent_that_disappears_mid_transfer_fails_the_caller_and_consumes_the
     let (provider, generation) = link.session.lock().unwrap().clone().expect("session");
     let error = service
         .claim_agent(&provider, generation, &ticket, TransferSide::Consumer)
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::NotFound);
     shutdown.cancel();
@@ -3242,12 +3290,14 @@ async fn a_ticket_is_single_use_and_direction_bound() {
             path: "/work".into(),
             ..OpenStreamRequest::default()
         })
+        .await
         .unwrap();
     let id = ticket.url.rsplit('/').next().unwrap().to_owned();
 
     assert_eq!(
         h.service
             .claim_caller(&id, "wrong", TransferSide::Producer)
+            .await
             .unwrap_err()
             .code,
         Code::Unauthenticated
@@ -3255,23 +3305,27 @@ async fn a_ticket_is_single_use_and_direction_bound() {
     let mut claim = h
         .service
         .claim_caller(&id, &ticket.token, TransferSide::Producer)
+        .await
         .unwrap();
     assert!(claim.take_producer().is_some());
     let error = h
         .service
         .claim_caller(&id, &ticket.token, TransferSide::Producer)
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::FailedPrecondition);
     // A download claim cannot use an upload ticket.
     let error = h
         .service
         .claim_caller(&id, &ticket.token, TransferSide::Consumer)
+        .await
         .unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
-    h.service.remove_ticket(&id);
+    h.service.remove_ticket(&id).await;
     assert_eq!(
         h.service
             .claim_caller(&id, &ticket.token, TransferSide::Consumer)
+            .await
             .unwrap_err()
             .code,
         Code::NotFound
@@ -3309,6 +3363,7 @@ async fn open_stream_rejects_parent_components() {
                 path: path.into(),
                 ..OpenStreamRequest::default()
             })
+            .await
             .unwrap_err();
         assert_eq!(error.code, Code::InvalidArgument, "path {path}: {error}");
     }
@@ -3322,6 +3377,7 @@ async fn open_stream_rejects_parent_components() {
                 path: path.into(),
                 ..OpenStreamRequest::default()
             })
+            .await
             .unwrap();
     }
     h.service
@@ -3373,6 +3429,7 @@ async fn concurrent_download_claims_have_exactly_one_winner() {
             path: "/data".into(),
             ..OpenStreamRequest::default()
         })
+        .await
         .unwrap();
     let base = serve(h.service.clone()).await;
     let url = format!("{base}{}", ticket.url);
@@ -3435,6 +3492,7 @@ async fn concurrent_upload_claims_have_exactly_one_winner() {
             path: "/up".into(),
             ..OpenStreamRequest::default()
         })
+        .await
         .unwrap();
     let base = serve(h.service.clone()).await;
     let url = format!("{base}{}", ticket.url);
@@ -3799,10 +3857,7 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
     let mut durable = false;
     for _ in 0..200 {
         durable = row_count(&db, "SELECT COUNT(*) FROM leases") > 0
-            && row_count(
-                &db,
-                "SELECT COUNT(*) FROM sandboxes WHERE native_ref <> ''",
-            ) > 0;
+            && row_count(&db, "SELECT COUNT(*) FROM sandboxes WHERE native_ref <> ''") > 0;
         if durable {
             break;
         }
@@ -3845,9 +3900,11 @@ async fn a_terminating_record_with_a_live_machine_is_reaped() {
 
 /// One record as the service holds it, whatever its state. `Get` requires the
 /// caller's live lease, and these tests follow a released record.
-fn sandbox_record(h: &Harness, sandbox_id: &str) -> Option<Sandbox> {
+async fn sandbox_record(h: &Harness, sandbox_id: &str) -> Option<Sandbox> {
     h.service
         .list()
+        .await
+        .unwrap()
         .into_iter()
         .find(|sandbox| sandbox.id == sandbox_id)
 }
@@ -3879,7 +3936,7 @@ async fn release_until_tombstoned(h: &Harness, lease_id: &str, sandbox_id: &str)
             })
             .await
             .unwrap();
-        match sandbox_record(h, sandbox_id) {
+        match sandbox_record(h, sandbox_id).await {
             Some(sandbox) if sandbox.state == SandboxState::Gone => return,
             Some(sandbox) => assert_eq!(
                 sandbox.state,
@@ -3922,7 +3979,7 @@ async fn a_slow_destroy_keeps_its_record_until_it_reports() {
         })
         .await
         .unwrap();
-    let provider = h.service.list_providers().remove(0);
+    let provider = h.service.list_providers().await.unwrap().remove(0);
     for _ in 0..4 {
         let sandboxes = h.fake.inventory().await.unwrap();
         h.service
@@ -3935,12 +3992,12 @@ async fn a_slow_destroy_keeps_its_record_until_it_reports() {
             .await
             .unwrap();
         assert_eq!(
-            sandbox_record(&h, &sandbox_id).unwrap().state,
+            sandbox_record(&h, &sandbox_id).await.unwrap().state,
             SandboxState::Terminating,
             "a destroy in flight keeps its record"
         );
     }
-    wait_for(|| sandbox_record(&h, &sandbox_id).is_none()).await;
+    wait_for(|| async { sandbox_record(&h, &sandbox_id).await.is_none() }).await;
     // Let any destroy asked a second time run before counting the calls.
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
@@ -3987,7 +4044,7 @@ async fn a_destroy_that_fails_three_times_leaves_the_machine_reclaimable_after_r
             .await
             .unwrap();
         release_until_tombstoned(&h, &lease.lease.id, &lease.sandbox.id).await;
-        let record = sandbox_record(&h, &lease.sandbox.id).unwrap();
+        let record = sandbox_record(&h, &lease.sandbox.id).await.unwrap();
         assert_eq!(record.state, SandboxState::Gone);
         assert!(
             record.error.contains("destroy failed 3 times"),
@@ -4511,7 +4568,7 @@ impl ProviderLink for LossyLink {
         Service::register(&self.inner, request).await
     }
     async fn heartbeat(&self, request: HeartbeatRequest) -> preloop_sandbox::Result<()> {
-        Service::heartbeat(&self.inner, request)
+        Service::heartbeat(&self.inner, request).await
     }
     async fn poll(&self, request: PollRequest) -> preloop_sandbox::Result<PollResponse> {
         let response = Service::poll(&self.inner, request).await?;
@@ -4771,6 +4828,7 @@ async fn report_exec_orders_by_sequence_and_closes_on_exit() {
             argv: vec!["true".into()],
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     let work = poll_now(&service, &provider).await;
     assert_eq!(work.len(), 1);
@@ -4900,6 +4958,7 @@ async fn a_swept_exec_reports_the_timeout_exit_not_an_error() {
             argv: vec!["sleep".into(), "30".into()],
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     // Delivered but never run: no exit report will ever arrive.
     let work = poll_now(&service, &provider).await;
@@ -4944,6 +5003,7 @@ async fn dropping_an_exec_stream_cancels_the_command() {
             argv: vec!["sh".into(), "-c".into(), "sleep 30".into()],
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     // Let the work reach the agent, then walk away.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5332,6 +5392,7 @@ async fn snapshot_closes_in_flight_execs() {
             argv: vec!["sh".into(), "-c".into(), "sleep 300".into()],
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     // Let the exec reach the agent, then snapshot the sandbox away.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5564,6 +5625,7 @@ async fn a_restarted_agent_refuses_to_run_an_exec_twice() {
             timeout_secs: 120,
             ..ExecRequest::default()
         })
+        .await
         .unwrap();
     wait_for(|| std::fs::read_to_string(&marker).is_ok_and(|content| content.contains("run")))
         .await;
@@ -6018,7 +6080,11 @@ async fn leases_persisted_before_requested_ttls_are_treated_as_delivered() {
     };
     // An older build persisted neither the requested TTL nor the request
     // hash: the row is the whole truth it left behind.
-    execute_bound(&db, "UPDATE leases SET request_hash = '' WHERE id = ?1", &lease_id);
+    execute_bound(
+        &db,
+        "UPDATE leases SET request_hash = '' WHERE id = ?1",
+        &lease_id,
+    );
     let service = Service::open(
         backend::open(db.to_str().unwrap()).await.unwrap(),
         ServiceConfig::new(),

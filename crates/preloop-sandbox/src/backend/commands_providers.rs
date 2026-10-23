@@ -187,11 +187,7 @@ pub(crate) async fn complete_work(
     tx.execute(
         "UPDATE work_items SET status = 'done', result_json = $2, completed_at = $3, \
          secret_sealed = NULL WHERE id = $1",
-        &[
-            work_id.into(),
-            result_json.as_str().into(),
-            now_ms().into(),
-        ],
+        &[work_id.into(), result_json.as_str().into(), now_ms().into()],
     )
     .await?;
     outbox(
@@ -351,9 +347,10 @@ async fn apply_snapshot_receipt(
     result: &WorkResult,
 ) -> Result<Template> {
     let (sandbox_id, template_name) = match &payload.work.work {
-        Some(work_item::Work::Snapshot(snapshot)) => {
-            (snapshot.target.sandbox_id.clone(), snapshot.template.clone())
-        }
+        Some(work_item::Work::Snapshot(snapshot)) => (
+            snapshot.target.sandbox_id.clone(),
+            snapshot.template.clone(),
+        ),
         _ => return Err(Error::internal("snapshot work has no target")),
     };
     let source = payload.source_template.clone().unwrap_or_default();
@@ -460,8 +457,11 @@ pub(crate) async fn purge_sandbox(tx: &mut dyn SqlTx, sandbox_id: &str) -> Resul
     for row in &leases {
         let lease_id = row.text("id")?.to_owned();
         let key = row.text("idempotency_key")?.to_owned();
-        tx.execute("DELETE FROM leases WHERE id = $1", &[lease_id.as_str().into()])
-            .await?;
+        tx.execute(
+            "DELETE FROM leases WHERE id = $1",
+            &[lease_id.as_str().into()],
+        )
+        .await?;
         if !key.is_empty() {
             tx.execute("DELETE FROM lease_keys WHERE key = $1", &[key.into()])
                 .await?;
@@ -489,6 +489,7 @@ pub(crate) async fn purge_sandbox(tx: &mut dyn SqlTx, sandbox_id: &str) -> Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn queue_destroy_target(
     tx: &mut dyn SqlTx,
     provider_id: &str,
@@ -550,10 +551,7 @@ pub(crate) async fn register(
             Box::pin(async move {
                 if let Some(provider_id) = &enrolled {
                     let provider = provider_by_id(tx, provider_id).await?.ok_or_else(|| {
-                        Error::new(
-                            Code::PermissionDenied,
-                            "client certificate is not enrolled",
-                        )
+                        Error::new(Code::PermissionDenied, "client certificate is not enrolled")
                     })?;
                     if provider.name != request.name {
                         return Err(Error::new(
@@ -569,7 +567,9 @@ pub(crate) async fn register(
                 let id = existing
                     .as_ref()
                     .map(|provider| provider.id.clone())
-                    .unwrap_or_else(|| format!("prv-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+                    .unwrap_or_else(|| {
+                        format!("prv-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+                    });
                 let generation = existing
                     .as_ref()
                     .map_or(1, |provider| provider.generation + 1);
@@ -640,9 +640,10 @@ pub(crate) async fn heartbeat(store: &SqlStore, request: HeartbeatRequest) -> Re
             let request = request.clone();
             Box::pin(async move {
                 let _ = fence_provider(tx, &request.provider_id, request.generation).await?;
-                let host = request.host.into_option().map(|host| {
-                    serde_json::to_string(&host).unwrap_or_default()
-                });
+                let host = request
+                    .host
+                    .into_option()
+                    .map(|host| serde_json::to_string(&host).unwrap_or_default());
                 let stats = serde_json::to_string(&request.sandboxes).unwrap_or_default();
                 tx.execute(
                     "UPDATE providers SET last_seen = $2, seen_at = $3, \
@@ -689,10 +690,7 @@ pub(crate) async fn set_cordon(
         .await
 }
 
-pub(crate) async fn drain(
-    store: &SqlStore,
-    reference: &str,
-) -> Result<DrainProviderResult> {
+pub(crate) async fn drain(store: &SqlStore, reference: &str) -> Result<DrainProviderResult> {
     store
         .run_tx(|tx| {
             let reference = reference.to_owned();
@@ -745,9 +743,9 @@ pub(crate) async fn delete_provider(store: &SqlStore, name: &str) -> Result<()> 
         .run_tx(|tx| {
             let name = name.to_owned();
             Box::pin(async move {
-                let provider = provider_by_name(tx, &name)
-                    .await?
-                    .ok_or_else(|| Error::not_found(format!("provider `{name}` is not registered")))?;
+                let provider = provider_by_name(tx, &name).await?.ok_or_else(|| {
+                    Error::not_found(format!("provider `{name}` is not registered"))
+                })?;
                 let version = bump_version(tx).await?;
                 let work = tx
                     .query(
@@ -777,8 +775,11 @@ pub(crate) async fn delete_provider(store: &SqlStore, name: &str) -> Result<()> 
                     &[provider.id.as_str().into()],
                 )
                 .await?;
-                tx.execute("DELETE FROM providers WHERE id = $1", &[provider.id.as_str().into()])
-                    .await?;
+                tx.execute(
+                    "DELETE FROM providers WHERE id = $1",
+                    &[provider.id.as_str().into()],
+                )
+                .await?;
                 outbox(tx, "provider", &provider.id, version, "delete", "{}").await?;
                 Ok(())
             })
@@ -806,7 +807,10 @@ pub(crate) async fn list_providers(
                 let has_more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
                 let mut providers = Vec::new();
                 let mut ids = Vec::new();
-                for row in rows.iter().take(usize::try_from(limit).unwrap_or(usize::MAX)) {
+                for row in rows
+                    .iter()
+                    .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                {
                     ids.push(row.text("id")?.to_owned());
                     let mut provider = rows::provider_from_row(row)?;
                     provider.certificates = tx
@@ -943,6 +947,7 @@ pub(crate) async fn create_join_token(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn enroll(
     store: &SqlStore,
     token_id: &str,
@@ -1001,10 +1006,7 @@ pub(crate) async fn enroll(
                                 expires_at: receipt.int("cert_expires_at")?,
                             });
                         }
-                        return Err(Error::new(
-                            Code::Unauthenticated,
-                            "join token already used",
-                        ));
+                        return Err(Error::new(Code::Unauthenticated, "join token already used"));
                     }
                 }
                 let row = tx
@@ -1164,7 +1166,11 @@ pub(crate) async fn renew_certificate(
                 tx.execute(
                     "INSERT INTO provider_certificates (provider_id, sha256, expires_at) \
                      VALUES ($1, $2, $3) ON CONFLICT (sha256) DO UPDATE SET expires_at = $3",
-                    &[id.as_str().into(), cert.as_str().into(), cert_expires_at.into()],
+                    &[
+                        id.as_str().into(),
+                        cert.as_str().into(),
+                        cert_expires_at.into(),
+                    ],
                 )
                 .await?;
                 tx.execute(
@@ -1228,7 +1234,10 @@ pub(crate) async fn poll_work(
                      ORDER BY created_at, id LIMIT $3"
                 };
                 let candidates = tx
-                    .query(sql, &[provider_id.as_str().into(), now.into(), batch.into()])
+                    .query(
+                        sql,
+                        &[provider_id.as_str().into(), now.into(), batch.into()],
+                    )
                     .await?;
                 let mut work = Vec::new();
                 for row in candidates {
@@ -1262,17 +1271,15 @@ pub(crate) async fn poll_work(
                         .ok_or_else(|| Error::internal("claimed work vanished"))?;
                     let mut payload: WorkPayload =
                         rows::json(payload_row.text("payload_json")?, "work payload")?;
-                    if let Some(sealed) = payload_row.opt_bytes("secret_sealed")? {
-                        if let Some(work_item::Work::Exec(exec)) = &mut payload.work.work {
-                            let plain =
-                                seal.unseal(sealed, rows::exec_aad(&exec.exec_id).as_bytes())?;
-                            let env: StringMap = rows::json(
-                                &String::from_utf8_lossy(&plain),
-                                "exec env",
-                            )?;
-                            if let Some(request) = exec.request.as_option_mut() {
-                                request.env = env;
-                            }
+                    if let Some(sealed) = payload_row.opt_bytes("secret_sealed")?
+                        && let Some(work_item::Work::Exec(exec)) = &mut payload.work.work
+                    {
+                        let plain =
+                            seal.unseal(sealed, rows::exec_aad(&exec.exec_id).as_bytes())?;
+                        let env: StringMap =
+                            rows::json(&String::from_utf8_lossy(&plain), "exec env")?;
+                        if let Some(request) = exec.request.as_option_mut() {
+                            request.env = env;
                         }
                     }
                     payload.work.id = id;
@@ -1285,11 +1292,7 @@ pub(crate) async fn poll_work(
         .await
 }
 
-async fn requeue_expired(
-    tx: &mut dyn SqlTx,
-    provider_id: &str,
-    generation: u64,
-) -> Result<()> {
+async fn requeue_expired(tx: &mut dyn SqlTx, provider_id: &str, generation: u64) -> Result<()> {
     let expired = tx
         .query(
             "SELECT w.id, w.kind, w.payload_json, e.started, e.id AS exec_id \
@@ -1348,13 +1351,8 @@ pub(crate) async fn work_result(store: &SqlStore, work_id: &str) -> Result<Optio
                     .await?
                     .into_iter()
                     .next();
-                row.map(|row| {
-                    rows::json(
-                        row.text("result_json")?,
-                        "work result",
-                    )
-                })
-                .transpose()
+                row.map(|row| rows::json(row.text("result_json")?, "work result"))
+                    .transpose()
             })
         })
         .await
@@ -1401,7 +1399,10 @@ pub(crate) async fn report(store: &SqlStore, request: ReportRequest) -> Result<(
                         return Ok(());
                     }
                     let kind = tx
-                        .query("SELECT kind FROM work_items WHERE id = $1", &[work_id.into()])
+                        .query(
+                            "SELECT kind FROM work_items WHERE id = $1",
+                            &[work_id.into()],
+                        )
                         .await?
                         .first()
                         .map(|row| row.text("kind").map(str::to_owned))

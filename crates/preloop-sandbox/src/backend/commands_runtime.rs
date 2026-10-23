@@ -7,7 +7,6 @@ use crate::api::*;
 use crate::error::{Code, Error, Result};
 
 use super::backend::{ExecStatus, SnapshotCommand};
-use super::types::SnapshotStart;
 use super::engine::SqlTx;
 use super::logic;
 use super::rows;
@@ -15,9 +14,10 @@ use super::store::{
     SqlStore, active_lease, bump_version, fence_provider, lease_by_id, node_alive, now_ms,
     now_secs, outbox, provider_by_id, sandbox_by_id,
 };
+use super::types::SnapshotStart;
 use super::types::{
-    ExecHandle, MaintenanceConfig, MaintenanceOutcome, Owner, OwnerKind, PoolDeficit,
-    PowerOp, ReportExecOutcome, TicketAuthority, TicketClaim, TicketSide, WorkResult,
+    ExecHandle, MaintenanceConfig, MaintenanceOutcome, Owner, OwnerKind, PoolDeficit, PowerOp,
+    ReportExecOutcome, TicketAuthority, TicketClaim, TicketSide, WorkResult,
 };
 
 /// Maximum destroy requeues for one terminating record.
@@ -125,7 +125,10 @@ pub(crate) async fn create_exec(
 
 async fn provider_generation(tx: &mut dyn SqlTx, provider_id: &str) -> Result<u64> {
     Ok(tx
-        .query("SELECT generation FROM providers WHERE id = $1", &[provider_id.into()])
+        .query(
+            "SELECT generation FROM providers WHERE id = $1",
+            &[provider_id.into()],
+        )
         .await?
         .first()
         .map(|row| row.u64("generation"))
@@ -229,10 +232,7 @@ pub(crate) async fn report_exec(
                     }
                     tx.execute(
                         "UPDATE execs SET started = TRUE, started_attempt = $2 WHERE id = $1",
-                        &[
-                            request.exec_id.as_str().into(),
-                            request.attempt.into(),
-                        ],
+                        &[request.exec_id.as_str().into(), request.attempt.into()],
                     )
                     .await?;
                     return Ok(ReportExecOutcome::Events {
@@ -265,12 +265,8 @@ pub(crate) async fn report_exec(
                     )
                     .await?;
                     let work_id = row.text("work_id")?.to_owned();
-                    super::commands_providers::complete_work(
-                        tx,
-                        &work_id,
-                        WorkResult::ok(""),
-                    )
-                    .await?;
+                    super::commands_providers::complete_work(tx, &work_id, WorkResult::ok(""))
+                        .await?;
                 }
                 Ok(ReportExecOutcome::Events {
                     exec_id: request.exec_id,
@@ -309,11 +305,7 @@ pub(crate) async fn fail_exec(store: &SqlStore, exec_id: &str, reason: &str) -> 
         .await
 }
 
-pub(crate) async fn fail_exec_inner(
-    tx: &mut dyn SqlTx,
-    exec_id: &str,
-    reason: &str,
-) -> Result<()> {
+pub(crate) async fn fail_exec_inner(tx: &mut dyn SqlTx, exec_id: &str, reason: &str) -> Result<()> {
     let row = tx
         .query(
             "SELECT id, sandbox_id, work_id, provider_id, status FROM execs WHERE id = $1",
@@ -340,7 +332,11 @@ pub(crate) async fn fail_exec_inner(
     tx.execute(
         "UPDATE work_items SET status = 'done', result_json = $2, completed_at = $3, \
          secret_sealed = NULL WHERE id = $1 AND status <> 'done'",
-        &[work_id.as_str().into(), result.as_str().into(), now_ms().into()],
+        &[
+            work_id.as_str().into(),
+            result.as_str().into(),
+            now_ms().into(),
+        ],
     )
     .await?;
     outbox(tx, "exec", exec_id, version, "failed", "{}").await?;
@@ -351,11 +347,7 @@ pub(crate) async fn fail_exec_inner(
 }
 
 /// Queue one `CancelExec` for a sandbox that still holds the command.
-async fn queue_cancel_exec(
-    tx: &mut dyn SqlTx,
-    sandbox_id: &str,
-    exec_id: &str,
-) -> Result<()> {
+async fn queue_cancel_exec(tx: &mut dyn SqlTx, sandbox_id: &str, exec_id: &str) -> Result<()> {
     if let Some(sandbox) = sandbox_by_id(tx, sandbox_id).await?
         && !sandbox.native_ref.is_empty()
         && sandbox.state.known() != SandboxState::Terminating
@@ -397,11 +389,7 @@ async fn queue_cancel_exec(
     Ok(())
 }
 
-pub(crate) async fn cancel_exec(
-    store: &SqlStore,
-    exec_id: &str,
-    owner: &Owner,
-) -> Result<()> {
+pub(crate) async fn cancel_exec(store: &SqlStore, exec_id: &str, owner: &Owner) -> Result<()> {
     store
         .run_tx(|tx| {
             let exec_id = exec_id.to_owned();
@@ -451,8 +439,7 @@ pub(crate) async fn exec_status(store: &SqlStore, exec_id: &str) -> Result<Optio
                 Ok(Some(match row.text("status")? {
                     "running" => ExecStatus::Running,
                     "done" => ExecStatus::Done {
-                        code: i32::try_from(row.opt_int("exit_code")?.unwrap_or(0))
-                            .unwrap_or(0),
+                        code: i32::try_from(row.opt_int("exit_code")?.unwrap_or(0)).unwrap_or(0),
                     },
                     _ => ExecStatus::Failed {
                         reason: row.text("error")?.to_owned(),
@@ -1233,11 +1220,7 @@ pub(crate) async fn node_heartbeat(
                     .execute(
                         "UPDATE nodes SET last_seen = $3 \
                          WHERE node_id = $1 AND session_id = $2 AND alive = TRUE",
-                        &[
-                            node_id.into(),
-                            session_id.into(),
-                            now_ms().into(),
-                        ],
+                        &[node_id.into(), session_id.into(), now_ms().into()],
                     )
                     .await?;
                 if changed != 1 {
@@ -1280,11 +1263,7 @@ pub(crate) async fn node_authenticate(
         .await
 }
 
-pub(crate) async fn node_close(
-    store: &SqlStore,
-    node_id: &str,
-    session_id: &str,
-) -> Result<()> {
+pub(crate) async fn node_close(store: &SqlStore, node_id: &str, session_id: &str) -> Result<()> {
     store
         .run_tx(|tx| {
             let node_id = node_id.to_owned();
@@ -1318,9 +1297,7 @@ async fn fail_node_channels(
     };
     let execs = tx
         .query(
-            &format!(
-                "SELECT id, work_id FROM execs WHERE {filter} AND status = 'running'"
-            ),
+            &format!("SELECT id, work_id FROM execs WHERE {filter} AND status = 'running'"),
             &params,
         )
         .await?;
@@ -1333,14 +1310,16 @@ async fn fail_node_channels(
             &[exec_id.as_str().into()],
         )
         .await?;
-        let result = serde_json::to_string(&WorkResult::failed(
-            "the owning node session ended",
-        ))
-        .unwrap_or_default();
+        let result = serde_json::to_string(&WorkResult::failed("the owning node session ended"))
+            .unwrap_or_default();
         tx.execute(
             "UPDATE work_items SET status = 'done', result_json = $2, completed_at = $3 \
              WHERE id = $1 AND status <> 'done'",
-            &[work_id.as_str().into(), result.as_str().into(), now_ms().into()],
+            &[
+                work_id.as_str().into(),
+                result.as_str().into(),
+                now_ms().into(),
+            ],
         )
         .await?;
     }
@@ -1376,11 +1355,7 @@ async fn fail_node_channels(
     Ok(())
 }
 
-pub(crate) async fn owner_of(
-    store: &SqlStore,
-    kind: OwnerKind,
-    id: &str,
-) -> Result<Option<Owner>> {
+pub(crate) async fn owner_of(store: &SqlStore, kind: OwnerKind, id: &str) -> Result<Option<Owner>> {
     store
         .run_tx(|tx| {
             let id = id.to_owned();

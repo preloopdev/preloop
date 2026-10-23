@@ -97,10 +97,7 @@ impl PgEngine {
 #[async_trait]
 impl SqlEngine for PgEngine {
     async fn begin(&self) -> Result<Box<dyn SqlTx>> {
-        if self
-            .closed
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::unavailable("sandbox Postgres backend is closed"));
         }
         let permit = self
@@ -123,14 +120,6 @@ impl SqlEngine for PgEngine {
             permit: Some(permit),
             finished: false,
         }))
-    }
-
-    fn dialect(&self) -> Dialect {
-        Dialect::Postgres
-    }
-
-    fn label(&self) -> &'static str {
-        "postgres"
     }
 
     async fn close(&self) {
@@ -206,7 +195,11 @@ impl SqlTx for PgTx {
             .collect();
         client.execute(sql, &refs).await.map_err(|error| {
             let mapped = map_error(error);
-            Error::internal(format!("{} [sql: {}]", mapped.message.as_deref().unwrap_or(""), sql))
+            Error::internal(format!(
+                "{} [sql: {}]",
+                mapped.message.as_deref().unwrap_or(""),
+                sql
+            ))
         })
     }
 
@@ -222,7 +215,11 @@ impl SqlTx for PgTx {
             .collect();
         let rows = client.query(sql, &refs).await.map_err(|error| {
             let mapped = map_error(error);
-            Error::internal(format!("{} [sql: {}]", mapped.message.as_deref().unwrap_or(""), sql))
+            Error::internal(format!(
+                "{} [sql: {}]",
+                mapped.message.as_deref().unwrap_or(""),
+                sql
+            ))
         })?;
         rows.into_iter().map(decode_row).collect()
     }
@@ -330,27 +327,51 @@ fn decode_row(row: PgRow) -> Result<Row> {
         let value = match *column.type_() {
             Type::INT2 => row
                 .try_get::<_, Option<i16>>(index)
-                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
+                .map_err(|error| {
+                    Error::internal(format!(
+                        "decoding column `{name}` type {column_type:?}: {error}"
+                    ))
+                })?
                 .map_or(SqlValue::Null, |value| SqlValue::Int(i64::from(value))),
             Type::INT4 => row
                 .try_get::<_, Option<i32>>(index)
-                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
+                .map_err(|error| {
+                    Error::internal(format!(
+                        "decoding column `{name}` type {column_type:?}: {error}"
+                    ))
+                })?
                 .map_or(SqlValue::Null, |value| SqlValue::Int(i64::from(value))),
             Type::INT8 => row
                 .try_get::<_, Option<i64>>(index)
-                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
+                .map_err(|error| {
+                    Error::internal(format!(
+                        "decoding column `{name}` type {column_type:?}: {error}"
+                    ))
+                })?
                 .map_or(SqlValue::Null, SqlValue::Int),
             Type::BOOL => row
                 .try_get::<_, Option<bool>>(index)
-                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
+                .map_err(|error| {
+                    Error::internal(format!(
+                        "decoding column `{name}` type {column_type:?}: {error}"
+                    ))
+                })?
                 .map_or(SqlValue::Null, SqlValue::Bool),
             Type::BYTEA => row
                 .try_get::<_, Option<Vec<u8>>>(index)
-                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
+                .map_err(|error| {
+                    Error::internal(format!(
+                        "decoding column `{name}` type {column_type:?}: {error}"
+                    ))
+                })?
                 .map_or(SqlValue::Null, SqlValue::Bytes),
             _ => row
                 .try_get::<_, Option<String>>(index)
-                .map_err(|error| Error::internal(format!("decoding column `{name}` type {column_type:?}: {error}")))?
+                .map_err(|error| {
+                    Error::internal(format!(
+                        "decoding column `{name}` type {column_type:?}: {error}"
+                    ))
+                })?
                 .map_or(SqlValue::Null, SqlValue::Text),
         };
         values.insert(name.clone(), value);
@@ -422,7 +443,9 @@ fn pg_tls(url: &str) -> Result<Option<postgres_rustls::MakeTlsConnector>> {
     }
     let mut roots = rustls::RootCertStore::empty();
     for certificate in rustls_native_certs::load_native_certs().certs {
-        roots.add(certificate).map_err(|error| Error::internal(format!("sandbox Postgres root: {error}")))?;
+        roots
+            .add(certificate)
+            .map_err(|error| Error::internal(format!("sandbox Postgres root: {error}")))?;
     }
     let mut config = crate::tls::client_config_builder()?
         .with_root_certificates(roots)

@@ -55,7 +55,11 @@ pub(crate) fn sandbox_from_row(row: &Row) -> Result<Sandbox> {
     Ok(Sandbox {
         id: row.text("id")?.to_owned(),
         name: row.text("name")?.to_owned(),
-        template: template.spec.as_option().map(|spec| spec.name.clone()).unwrap_or_default(),
+        template: template
+            .spec
+            .as_option()
+            .map(|spec| spec.name.clone())
+            .unwrap_or_default(),
         pool: row.text("pool")?.to_owned(),
         provider_id: row.text("provider_id")?.to_owned(),
         driver: row.text("driver")?.to_owned(),
@@ -184,10 +188,4 @@ pub(crate) fn ticket_from_row(row: &Row) -> Result<TicketRecord> {
             session_id: row.text("owner_session")?.to_owned(),
         },
     })
-}
-
-pub(crate) fn sandbox_state_from_wire(value: buffa::EnumValue<SandboxState>) -> SandboxState {
-    value
-        .as_known()
-        .unwrap_or(SandboxState::SandboxStateUnspecified)
 }
