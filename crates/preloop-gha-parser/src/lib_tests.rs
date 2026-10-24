@@ -1488,6 +1488,10 @@ jobs:
         "repository": "other/uv"
     });
 
+    // Baseline reproduction: parser-only expansion has no submission context,
+    // so the owner-gated expression takes its fallback branch.
+    let baseline = expand_jobs(&workflow).unwrap();
+    assert_eq!(baseline[0].runs_on, vec!["ubuntu-slim"]);
     for (github, expected) in [
         (&owner_true, "github-ubuntu-24.04-x86_64-2"),
         (&owner_false, "ubuntu-slim"),
