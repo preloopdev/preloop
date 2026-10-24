@@ -458,6 +458,52 @@ impl Drop for RunSecretsGuard<'_> {
         }
     }
 }
+/// A workspace snapshot is run-scoped until its submit commits. If expansion
+/// or validation rejects the submission after capture, remove the repository
+/// rather than leaving an orphaned checkout behind.
+struct WorkspaceSnapshotGuard {
+    state_dir: std::path::PathBuf,
+    run_id: RunId,
+    armed: bool,
+}
+
+impl WorkspaceSnapshotGuard {
+    fn new(
+        state_dir: &std::path::Path,
+        run_id: RunId,
+        snapshot: Option<&crate::snapshots::WorkspaceSnapshot>,
+    ) -> Self {
+        let armed = snapshot.is_some_and(|snapshot| {
+            matches!(
+                snapshot.source,
+                crate::snapshots::SnapshotSource::LocalWorkspace
+                    | crate::snapshots::SnapshotSource::RemoteRunScoped
+                    | crate::snapshots::SnapshotSource::SelfBuiltMerge
+            )
+        });
+        Self {
+            state_dir: state_dir.to_owned(),
+            run_id,
+            armed,
+        }
+    }
+
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkspaceSnapshotGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let state_dir = self.state_dir.clone();
+            let run_id = self.run_id;
+            tokio::spawn(async move {
+                crate::snapshots::discard_workspace_snapshot(&state_dir, run_id).await;
+            });
+        }
+    }
+}
 
 /// Outcome of PAT scope introspection.
 enum PatScopeOutcome {
@@ -1143,119 +1189,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "triggering_actor": submission.actor
     });
 
-    let dispatch_inputs_for_expand: BTreeMap<String, serde_json::Value> = submission
-        .dispatch_inputs
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let t_expand = std::time::Instant::now();
-    let expanded =
-        preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event_and_github_context(
-            &workflow,
-            &submission.reusable_workflows,
-            &submission.reusable_workflow_shas,
-            (!dispatch_inputs_for_expand.is_empty()).then_some(&dispatch_inputs_for_expand),
-            Some(submission.event.as_str()),
-            Some(&github),
-        )?;
-    let expand_ms = t_expand.elapsed().as_secs_f64() * 1000.0;
-    let mut jobs = expanded.jobs;
-    let reusable_calls = expanded.reusable_calls;
-    if !submission.dispatch_inputs.is_empty() {
-        for job in &mut jobs {
-            if job.reusable_call.is_some() {
-                // A reusable caller's `inputs` are the evaluated `with:`
-                // values destined for the callee; overwriting them with the
-                // dispatch inputs drops every input the call passes, so the
-                // callee sees empty values. The caller's own gates still
-                // need the dispatch inputs in context, so merge them
-                // underneath instead of replacing.
-                for (name, value) in &submission.dispatch_inputs {
-                    job.inputs
-                        .entry(name.clone())
-                        .or_insert_with(|| value.clone());
-                }
-            } else {
-                job.inputs = submission.dispatch_inputs.clone();
-            }
-        }
-    }
-
-    // Filter to selected jobs and their transitive needs: closure.
-    if !submission.selected_jobs.is_empty() {
-        let pairs: Vec<(String, Vec<String>)> = jobs
-            .iter()
-            .map(|job| {
-                (
-                    job.base_id.clone(),
-                    job.needs.iter().map(|n| n.0.clone()).collect(),
-                )
-            })
-            .collect();
-        // Reject the whole selection if any id is unknown. Silently dropping a
-        // typo would run a subset of the requested jobs and report success.
-        let mut selected = std::collections::BTreeSet::new();
-        let mut known: std::collections::BTreeSet<&str> =
-            pairs.iter().map(|(id, _)| id.as_str()).collect();
-        for requested in &submission.selected_jobs {
-            // A reusable caller is selected by its own (possibly
-            // matrix-suffixed) node: its callee subtree is not part of the
-            // plan anymore — it materializes at runtime after the gate passes.
-            let matched_reusable = reusable_calls.keys().any(|caller| {
-                caller.as_str() == requested
-                    || caller
-                        .strip_prefix(requested)
-                        .is_some_and(|suffix| suffix.starts_with(" ("))
-            });
-            if matched_reusable {
-                known.insert(requested);
-            }
-            selected.insert(requested.clone());
-        }
-        let unknown: Vec<&str> = submission
-            .selected_jobs
-            .iter()
-            .map(String::as_str)
-            .filter(|id| !known.contains(id))
-            .collect();
-        if !unknown.is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "unknown job(s) in selected_jobs: {}. available jobs: {}",
-                unknown.join(", "),
-                known.into_iter().collect::<Vec<_>>().join(", ")
-            )));
-        }
-        let graph = preloop_gha_parser::dag::needs_graph_from_pairs(&pairs);
-        let closure = preloop_gha_parser::dag::dependency_closure(
-            &graph,
-            &selected.into_iter().collect::<Vec<_>>(),
-        );
-        let before = jobs.len();
-        jobs.retain(|job| closure.contains(&job.base_id));
-        tracing::info!(
-            selected = ?submission.selected_jobs,
-            before,
-            after = jobs.len(),
-            "filtered jobs to dependency closure"
-        );
-    }
-
-    // Server-wide submit cap, enforced after expansion (the count above is
-    // post-matrix-expansion and post-closure-filter) but before the build
-    // loop and the insert transaction: a rejected run never opens a giant
-    // transaction, so it can never pin the writer. Webhook deliveries
-    // bypass it — like the namespace submit quotas, a push is never
-    // refused; chunked inserts bound their writer hold instead.
-    if webhook_delivery_id.is_none() {
-        let max_jobs_per_run = shared.state.max_jobs_per_run;
-        if max_jobs_per_run > 0 && jobs.len() as u64 > max_jobs_per_run {
-            return Err(ApiError::bad_request(format!(
-                "run expands to {} jobs, exceeding the server's max_jobs_per_run limit of \
-                 {max_jobs_per_run} (config `max_jobs_per_run`, env `PRELOOP_MAX_JOBS_PER_RUN`)",
-                jobs.len(),
-            )));
-        }
-    }
     // Durable before the run commits: any node may acquire its jobs later.
     // Dropped again unless the submit commits a new run.
     let run_secrets = RunSecretsGuard::put(
@@ -1353,6 +1286,8 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
         }
     };
+    let snapshot_guard =
+        WorkspaceSnapshotGuard::new(&shared.state.state_dir, run_id, workspace_snapshot.as_ref());
 
     // A push-requested submission from a dirty tree carries no explicit
     // tested tree (the client cannot know the snapshot tree in advance).
@@ -1548,6 +1483,174 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             object.insert("sha".to_owned(), serde_json::json!(sha));
         }
     }
+    // Reserve the workflow run number only after rechecking the durable
+    // delivery identity under the same state lock used for run insertion.
+    // A competing replay therefore returns before advancing the counter.
+    // Recheck the durable delivery identity against the backend before
+    // reserving the run number — a competing replay that already committed
+    // returns here instead of advancing the counter. The reservation set
+    // (above) already serializes in-flight submits for this delivery, so the
+    // committed-run check and the counter increment need no shared lock.
+    // No pre-check needed: `submit_run` dedups the delivery inside its own
+    // transaction (`SubmitOutcome::existing`), so a replay that committed
+    // while messages were built still short-circuits there.
+    // Durable run-number allocation lives in the control backend so it is
+    // atomic with the committed state and survives restarts. It is its own
+    // transaction because the number is embedded in `github.run_number`
+    // before the job messages are built; a crash between here and
+    // `submit_run` burns a number, which is acceptable.
+    // A committed run for this delivery already exists (replay observed
+    // between reservation release and here): return it without burning a
+    // run number.
+    if let Some(delivery_id) = webhook_delivery_id.as_deref()
+        && let Some(run_id) = shared
+            .state
+            .backend
+            .run_for_webhook_delivery(delivery_id, &workflow_path)
+            .await
+            .map_err(ApiError::from)?
+    {
+        let existing = shared
+            .state
+            .backend
+            .run_record(run_id)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(RunAccepted {
+            run_id,
+            run_number: existing.run_number,
+            queued_jobs: existing.jobs.len(),
+        });
+    }
+    let run_number = shared
+        .state
+        .backend
+        .allocate_run_number(
+            crate::control::types::DEFAULT_NAMESPACE,
+            &submission.repository,
+            &workflow_path,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    if let Some(object) = github.as_object_mut() {
+        object.insert(
+            "run_number".to_owned(),
+            serde_json::json!(run_number.to_string()),
+        );
+    }
+    let dispatch_inputs_for_expand: BTreeMap<String, serde_json::Value> = submission
+        .dispatch_inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let t_expand = std::time::Instant::now();
+    let expanded =
+        preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event_and_github_context(
+            &workflow,
+            &submission.reusable_workflows,
+            &submission.reusable_workflow_shas,
+            (!dispatch_inputs_for_expand.is_empty()).then_some(&dispatch_inputs_for_expand),
+            Some(submission.event.as_str()),
+            Some(&github),
+        )?;
+    let expand_ms = t_expand.elapsed().as_secs_f64() * 1000.0;
+    let mut jobs = expanded.jobs;
+    let reusable_calls = expanded.reusable_calls;
+    if !submission.dispatch_inputs.is_empty() {
+        for job in &mut jobs {
+            if job.reusable_call.is_some() {
+                // A reusable caller's `inputs` are the evaluated `with:`
+                // values destined for the callee; overwriting them with the
+                // dispatch inputs drops every input the call passes, so the
+                // callee sees empty values. The caller's own gates still
+                // need the dispatch inputs in context, so merge them
+                // underneath instead of replacing.
+                for (name, value) in &submission.dispatch_inputs {
+                    job.inputs
+                        .entry(name.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            } else {
+                job.inputs = submission.dispatch_inputs.clone();
+            }
+        }
+    }
+
+    // Filter to selected jobs and their transitive needs: closure.
+    if !submission.selected_jobs.is_empty() {
+        let pairs: Vec<(String, Vec<String>)> = jobs
+            .iter()
+            .map(|job| {
+                (
+                    job.base_id.clone(),
+                    job.needs.iter().map(|n| n.0.clone()).collect(),
+                )
+            })
+            .collect();
+        // Reject the whole selection if any id is unknown. Silently dropping a
+        // typo would run a subset of the requested jobs and report success.
+        let mut selected = std::collections::BTreeSet::new();
+        let mut known: std::collections::BTreeSet<&str> =
+            pairs.iter().map(|(id, _)| id.as_str()).collect();
+        for requested in &submission.selected_jobs {
+            // A reusable caller is selected by its own (possibly
+            // matrix-suffixed) node: its callee subtree is not part of the
+            // plan anymore — it materializes at runtime after the gate passes.
+            let matched_reusable = reusable_calls.keys().any(|caller| {
+                caller.as_str() == requested
+                    || caller
+                        .strip_prefix(requested)
+                        .is_some_and(|suffix| suffix.starts_with(" ("))
+            });
+            if matched_reusable {
+                known.insert(requested);
+            }
+            selected.insert(requested.clone());
+        }
+        let unknown: Vec<&str> = submission
+            .selected_jobs
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !known.contains(id))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "unknown job(s) in selected_jobs: {}. available jobs: {}",
+                unknown.join(", "),
+                known.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let graph = preloop_gha_parser::dag::needs_graph_from_pairs(&pairs);
+        let closure = preloop_gha_parser::dag::dependency_closure(
+            &graph,
+            &selected.into_iter().collect::<Vec<_>>(),
+        );
+        let before = jobs.len();
+        jobs.retain(|job| closure.contains(&job.base_id));
+        tracing::info!(
+            selected = ?submission.selected_jobs,
+            before,
+            after = jobs.len(),
+            "filtered jobs to dependency closure"
+        );
+    }
+
+    // Server-wide submit cap, enforced after expansion (the count above is
+    // post-matrix-expansion and post-closure-filter) but before the build
+    // loop and the insert transaction: a rejected run never opens a giant
+    // transaction, so it can never pin the writer. Webhook deliveries
+    // bypass it — like the namespace submit quotas, a push is never
+    // refused; chunked inserts bound their writer hold instead.
+    if webhook_delivery_id.is_none() {
+        let max_jobs_per_run = shared.state.max_jobs_per_run;
+        if max_jobs_per_run > 0 && jobs.len() as u64 > max_jobs_per_run {
+            return Err(ApiError::bad_request(format!(
+                "run expands to {} jobs, exceeding the server's max_jobs_per_run limit of \
+                 {max_jobs_per_run} (config `max_jobs_per_run`, env `PRELOOP_MAX_JOBS_PER_RUN`)",
+                jobs.len(),
+            )));
+        }
+    }
     let run_name = workflow.run_name.as_deref().map(|raw| {
         let inputs = if submission.dispatch_inputs.is_empty() {
             &submission.inputs
@@ -1629,61 +1732,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 )));
             }
         }
-    }
-    // Reserve the workflow run number only after rechecking the durable
-    // delivery identity under the same state lock used for run insertion.
-    // A competing replay therefore returns before advancing the counter.
-    // Recheck the durable delivery identity against the backend before
-    // reserving the run number — a competing replay that already committed
-    // returns here instead of advancing the counter. The reservation set
-    // (above) already serializes in-flight submits for this delivery, so the
-    // committed-run check and the counter increment need no shared lock.
-    // No pre-check needed: `submit_run` dedups the delivery inside its own
-    // transaction (`SubmitOutcome::existing`), so a replay that committed
-    // while messages were built still short-circuits there.
-    // Durable run-number allocation lives in the control backend so it is
-    // atomic with the committed state and survives restarts. It is its own
-    // transaction because the number is embedded in `github.run_number`
-    // before the job messages are built; a crash between here and
-    // `submit_run` burns a number, which is acceptable.
-    // A committed run for this delivery already exists (replay observed
-    // between reservation release and here): return it without burning a
-    // run number.
-    if let Some(delivery_id) = webhook_delivery_id.as_deref()
-        && let Some(run_id) = shared
-            .state
-            .backend
-            .run_for_webhook_delivery(delivery_id, &workflow_path)
-            .await
-            .map_err(ApiError::from)?
-    {
-        let existing = shared
-            .state
-            .backend
-            .run_record(run_id)
-            .await
-            .map_err(ApiError::from)?;
-        return Ok(RunAccepted {
-            run_id,
-            run_number: existing.run_number,
-            queued_jobs: existing.jobs.len(),
-        });
-    }
-    let run_number = shared
-        .state
-        .backend
-        .allocate_run_number(
-            crate::control::types::DEFAULT_NAMESPACE,
-            &submission.repository,
-            &workflow_path,
-        )
-        .await
-        .map_err(ApiError::from)?;
-    if let Some(object) = github.as_object_mut() {
-        object.insert(
-            "run_number".to_owned(),
-            serde_json::json!(run_number.to_string()),
-        );
     }
 
     // Messages, token material and OIDC contexts for the whole matrix are
@@ -2052,6 +2100,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             });
         }
 
+        snapshot_guard.keep();
         run_secrets.keep();
         // Masker cache: every value this run's jobs can see, keyed by run_id
         // (log URI scope) and by every job's agent_job_id (the runner-facing
@@ -3878,12 +3927,22 @@ pub(crate) async fn rerun_run_with_mode(
     triggering_actor: Option<String>,
     enable_debugger: Option<bool>,
 ) -> Result<RunAccepted, ApiError> {
-    let record = shared
+    let mut record = shared
         .state
         .backend
         .run_record(run_id)
         .await
         .map_err(ApiError::from)?;
+    let next_run_attempt = record.run_attempt.saturating_add(1);
+    if let Some(object) = record.github.as_object_mut() {
+        object.insert(
+            "run_attempt".to_owned(),
+            serde_json::json!(next_run_attempt),
+        );
+        if let Some(actor) = triggering_actor.as_deref() {
+            object.insert("triggering_actor".to_owned(), serde_json::json!(actor));
+        }
+    }
     let mut submission = (*record.submission).clone();
     // A rerun request may explicitly enable/disable DAP for this attempt.
     // With no override, preserve the original submission setting.

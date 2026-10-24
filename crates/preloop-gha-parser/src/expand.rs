@@ -115,6 +115,7 @@ fn resolved_job_name(
     github: Option<&Value>,
 ) -> String {
     match name {
+        Some(raw) if !raw.contains("${{") => raw.to_owned(),
         Some(raw) => {
             crate::eval::resolve_string(raw, &expression_context(matrix, inputs, None, github))
                 .unwrap_or_else(|_| raw.to_owned())
@@ -149,14 +150,16 @@ fn resolved_runs_on(
     inputs: Option<&BTreeMap<String, Value>>,
     github: Option<&Value>,
 ) -> Vec<String> {
-    let context = expression_context(matrix, inputs, None, github);
+    let mut context = None;
     let resolved: Vec<String> = labels
         .iter()
         .flat_map(|label| {
             if crate::eval::resolves_after_job_build(label) {
                 return vec![label.clone()];
             }
-            crate::eval::resolve_runs_on_label(label, &context)
+            let context =
+                context.get_or_insert_with(|| expression_context(matrix, inputs, None, github));
+            crate::eval::resolve_runs_on_label(label, context)
         })
         .filter(|label| !label.trim().is_empty())
         .collect();
@@ -674,10 +677,12 @@ fn job_plan_from_job(
                     job: job.defaults.as_ref(),
                     workflow: workflow_defaults,
                 },
-                &matrix,
-                inputs,
-                github,
-                matrix_deferred,
+                StepExpansionContext {
+                    matrix: &matrix,
+                    inputs,
+                    github,
+                    matrix_deferred,
+                },
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -845,16 +850,26 @@ pub(crate) fn coerce_value(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ExpansionInputs<'a> {
+    inputs: Option<&'a BTreeMap<String, Value>>,
+    event_name: Option<&'a str>,
+    github: Option<&'a Value>,
+}
+
 fn expand_jobs_with_reusables_internal(
     workflow: &Workflow,
     reusable_workflows: &BTreeMap<String, String>,
     reusable_workflow_shas: &BTreeMap<String, String>,
     depth: usize,
     reusable_calls: &mut BTreeMap<String, ReusableCallMetadata>,
-    inputs: Option<&BTreeMap<String, Value>>,
-    event_name: Option<&str>,
-    github: Option<&Value>,
+    context: ExpansionInputs<'_>,
 ) -> Result<Vec<JobPlan>, ParserError> {
+    let ExpansionInputs {
+        inputs,
+        event_name,
+        github,
+    } = context;
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
@@ -1265,9 +1280,11 @@ pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event_and_github_conte
         reusable_workflow_shas,
         0,
         &mut reusable_calls,
-        dispatch_inputs,
-        event_name,
-        github,
+        ExpansionInputs {
+            inputs: dispatch_inputs,
+            event_name,
+            github,
+        },
     )?;
 
     // Post-process: Rewrite needs to replace base job IDs of reusable calls with their expanded inner job IDs.
@@ -1373,9 +1390,11 @@ pub fn expand_reusable_call_with_github_context(
         reusable_workflow_shas,
         call.depth,
         &mut reusable_calls,
-        Some(&caller_plan.inputs),
-        None,
-        github,
+        ExpansionInputs {
+            inputs: Some(&caller_plan.inputs),
+            event_name: None,
+            github,
+        },
     )?;
 
     let caller_id = caller_plan.id.0.clone();
@@ -1492,16 +1511,20 @@ impl InheritedDefaults<'_> {
             .find_map(field)
     }
 }
+#[derive(Clone, Copy)]
+struct StepExpansionContext<'a> {
+    matrix: &'a IndexMap<String, Value>,
+    inputs: Option<&'a BTreeMap<String, Value>>,
+    github: Option<&'a Value>,
+    matrix_deferred: bool,
+}
 
 fn step_plan(
     job_id: &str,
     step_index: usize,
     step: Step,
     defaults: InheritedDefaults<'_>,
-    matrix: &IndexMap<String, Value>,
-    inputs: Option<&BTreeMap<String, Value>>,
-    github: Option<&Value>,
-    matrix_deferred: bool,
+    context: StepExpansionContext<'_>,
 ) -> Result<StepPlan, ParserError> {
     let step_label = step
         .name
@@ -1511,10 +1534,10 @@ fn step_plan(
         job_id,
         &step_label,
         step.timeout_minutes.as_ref(),
-        matrix,
-        inputs,
-        github,
-        matrix_deferred,
+        context.matrix,
+        context.inputs,
+        context.github,
+        context.matrix_deferred,
     )?;
     let working_directory = step
         .working_directory
@@ -1533,7 +1556,7 @@ fn step_plan(
         working_directory,
         shell,
         continue_on_error: step.continue_on_error.as_ref().map_or(Ok(None), |value| {
-            if matrix_deferred {
+            if context.matrix_deferred {
                 // Same deferral as the job-level scalars: the placeholder's
                 // matrix is empty, so expressions wait for the fan-out.
                 Ok(match value {
@@ -1541,7 +1564,14 @@ fn step_plan(
                     DeferredBool::Expression(_) => None,
                 })
             } else {
-                resolve_deferred_bool(Some(value), matrix, inputs, github, false).map(Some)
+                resolve_deferred_bool(
+                    Some(value),
+                    context.matrix,
+                    context.inputs,
+                    context.github,
+                    false,
+                )
+                .map(Some)
             }
         })?,
         timeout_in_minutes,
