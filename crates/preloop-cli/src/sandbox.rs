@@ -43,6 +43,40 @@ fn smolvm_slots() -> u32 {
         .unwrap_or(0)
 }
 
+/// Service tuning: defaults overridden by the documented environment.
+fn sandbox_service_config(blob_dir: PathBuf) -> ServiceConfig {
+    let mut config = ServiceConfig::new(blob_dir);
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_POLL_BATCH")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        config.poll_batch = value;
+    }
+    if let Some(secs) =
+        env_nonempty("PRELOOP_SANDBOX_DELIVERY_TIMEOUT_SECS").and_then(|v| v.parse::<u64>().ok())
+    {
+        config.delivery_timeout = Duration::from_secs(secs);
+    }
+    if let Some(secs) =
+        env_nonempty("PRELOOP_SANDBOX_EXEC_TIMEOUT_SECS").and_then(|v| v.parse::<u64>().ok())
+    {
+        config.exec_timeout = Duration::from_secs(secs);
+    }
+    config
+}
+
+/// Agent tuning: defaults overridden by the documented environment.
+fn sandbox_agent_config(name: impl Into<String>, scratch: PathBuf) -> AgentConfig {
+    let mut config = AgentConfig::new(name, scratch);
+    if let Some(value) = env_nonempty("PRELOOP_SANDBOX_AGENT_CONCURRENCY")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        config.concurrency = value;
+    }
+    config
+}
+
 /// Placement strategy for this process's service:
 /// `PRELOOP_SANDBOX_PLACEMENT` (default `least-loaded`).
 fn placement_from_env() -> anyhow::Result<Arc<dyn Placement>> {
@@ -122,6 +156,8 @@ impl LocalSandboxes {
         let store = store::open(&store_url)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
+        config = sandbox_service_config(state.join("sandbox-blobs"));
+        config.placement = placement_from_env()?;
         let service = Service::open(store, config).await?;
         let shutdown = CancellationToken::new();
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -142,7 +178,7 @@ impl LocalSandboxes {
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             drivers,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            sandbox_agent_config(local_provider_name(), state.join("sandbox-agent")),
         );
         // Register once here so the pool can place immediately; the agent
         // reuses this session instead of registering a second time (which
@@ -850,30 +886,22 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
                     print_json(&client.acquire(request).await?)
                 }
                 SandboxCommand::Exec(exec) => {
-                    let mut stream = client
-                        .exec(ExecRequest {
-                            sandbox_id: exec.sandbox,
-                            argv: exec.argv,
-                            env: exec.env.into_iter().collect(),
-                            workdir: exec.workdir.unwrap_or_default(),
-                            ..ExecRequest::default()
-                        })
-                        .await?;
-                    use std::io::Write as _;
-                    while let Some(event) = stream.next().await {
-                        let event = event?;
-                        if let Some(bytes) = event.stdout {
-                            std::io::stdout().write_all(&bytes)?;
-                            std::io::stdout().flush()?;
-                        }
-                        if let Some(bytes) = event.stderr {
-                            std::io::stderr().write_all(&bytes)?;
-                        }
-                        if let Some(code) = event.exit_code {
-                            std::process::exit(code);
-                        }
+                    let mut interrupt = Interrupt::install()?;
+                    let request = ExecRequest {
+                        sandbox_id: exec.sandbox,
+                        argv: exec.argv,
+                        env: exec.env.into_iter().collect(),
+                        workdir: exec.workdir.unwrap_or_default(),
+                        ..ExecRequest::default()
+                    };
+                    let stream = tokio::select! {
+                        result = client.exec(request) => result?,
+                        _ = interrupt.wait() => std::process::exit(INTERRUPTED),
+                    };
+                    match pump_exec(stream, interrupt.wait()).await? {
+                        Some(code) => std::process::exit(code),
+                        None => std::process::exit(INTERRUPTED),
                     }
-                    anyhow::bail!("exec stream ended without an exit status")
                 }
                 SandboxCommand::Cp(cp) => copy(&client, &cp.source, &cp.destination).await,
                 SandboxCommand::Stop { sandbox } => Ok(client.stop(&sandbox).await?),
@@ -912,6 +940,88 @@ fn split_sandbox(path: &str) -> Option<(&str, &str)> {
     let windows =
         guest.len() > 2 && guest.as_bytes()[0].is_ascii_alphabetic() && guest.as_bytes()[1] == b':';
     (sandbox.starts_with("sbx-") && (guest.starts_with('/') || windows)).then_some((sandbox, guest))
+}
+
+/// Exit status for an exec abandoned with Ctrl-C, following the shell's
+/// `128 + SIGINT`.
+const INTERRUPTED: i32 = 130;
+
+/// Ctrl-C listener for an exec, installed before the request is sent.
+///
+/// The process may have inherited `SIG_IGN` for SIGINT (a background job
+/// started by a non-interactive shell does), so relying on the default
+/// disposition leaves `preloop sandbox exec` alive after Ctrl-C. Registering
+/// a handler replaces that disposition; dropping the returned stream then
+/// closes the response body, which is what lets the service cancel the guest
+/// command.
+struct Interrupt {
+    #[cfg(unix)]
+    signal: tokio::signal::unix::Signal,
+}
+
+impl Interrupt {
+    fn install() -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                signal: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    async fn wait(&mut self) {
+        #[cfg(unix)]
+        {
+            // A closed signal stream cannot happen while this process lives;
+            // never resolve rather than treating it as Ctrl-C.
+            if self.signal.recv().await.is_none() {
+                std::future::pending::<()>().await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+/// Forward exec output until the exit event or `interrupt`.
+///
+/// Returns the command's exit code, or `None` when interrupted. The stream is
+/// dropped on every path, so an interrupted exec closes the response body and
+/// the service queues `CancelExec` for the guest command.
+async fn pump_exec<S, I>(mut stream: S, interrupt: I) -> anyhow::Result<Option<i32>>
+where
+    S: futures::Stream<Item = preloop_sandbox::Result<ExecEvent>> + Unpin,
+    I: Future<Output = ()>,
+{
+    use std::io::Write as _;
+    let mut interrupt = std::pin::pin!(interrupt);
+    loop {
+        let next = tokio::select! {
+            next = stream.next() => next,
+            _ = &mut interrupt => return Ok(None),
+        };
+        let Some(event) = next else {
+            anyhow::bail!("exec stream ended without an exit status");
+        };
+        let event = event?;
+        if let Some(bytes) = event.stdout {
+            std::io::stdout().write_all(&bytes)?;
+            std::io::stdout().flush()?;
+        }
+        if let Some(bytes) = event.stderr {
+            std::io::stderr().write_all(&bytes)?;
+        }
+        if let Some(code) = event.exit_code {
+            return Ok(Some(code));
+        }
+    }
 }
 
 async fn copy(client: &SandboxClient, source: &str, destination: &str) -> anyhow::Result<()> {
@@ -957,6 +1067,8 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
     config.placement = placement_from_env()?;
     let store = store::open(&store_url).await?;
+    config = sandbox_service_config(state.join("sandbox-blobs"));
+    config.placement = placement_from_env()?;
     let service = Service::open(store, config).await?;
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -964,7 +1076,7 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             host_drivers(Some(&named_prefix()), smolvm_slots(), None)?,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            sandbox_agent_config(local_provider_name(), state.join("sandbox-agent")),
         );
         tokio::spawn(agent.run(None, shutdown.clone()));
     }
@@ -993,7 +1105,7 @@ async fn run_agent(service: Option<String>, args: AgentArgs) -> anyhow::Result<(
     let agent = Agent::new(
         Arc::new(RemoteLink::new(&service, Some(provider_token))),
         host_drivers(Some(&named_prefix()), args.slots, None)?,
-        AgentConfig::new(name, scratch),
+        sandbox_agent_config(name, scratch),
     );
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
@@ -1009,6 +1121,27 @@ async fn run_agent(service: Option<String>, args: AgentArgs) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pump_exec_forwards_output_and_returns_the_exit_code() {
+        let stream = futures::stream::iter(vec![
+            Ok(ExecEvent::stdout(b"hello".to_vec())),
+            Ok(ExecEvent::stderr(b"warn".to_vec())),
+            Ok(ExecEvent::exit(7)),
+        ]);
+        let outcome = pump_exec(stream, std::future::pending::<()>())
+            .await
+            .unwrap();
+        assert_eq!(outcome, Some(7));
+    }
+
+    #[tokio::test]
+    async fn pump_exec_stops_without_an_exit_when_interrupted_while_idle() {
+        let stream = futures::stream::pending::<preloop_sandbox::Result<ExecEvent>>();
+        let outcome = pump_exec(stream, std::future::ready(())).await.unwrap();
+        assert_eq!(outcome, None);
+    }
+
     use std::os::unix::fs::PermissionsExt as _;
 
     fn mode(path: &Path) -> u32 {
