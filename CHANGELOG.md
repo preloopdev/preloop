@@ -984,7 +984,7 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
-- **Pull-request workflows that list both `pull_request` and `pull_request_target` run both events**: a `pull_request` webhook delivery projects to both events, but the webhook replay key was (delivery, workflow file), so the second event replayed the first run and its merge test never ran. The key now includes the event: `runs_delivery` is widened to (delivery, workflow path, event) by migration `V2026100509__runs_delivery_event`, which is additive and keeps existing rows. Redelivering the same delivery, workflow and event still creates no run.
+- **Pull-request workflows that list both `pull_request` and `pull_request_target` run both events**: a `pull_request` webhook delivery projects to both events, but the webhook replay key was (delivery, workflow file), so the second event replayed the first run and its merge test never ran. The key now includes the event: `runs_delivery` is widened to (delivery, workflow path, event) by migration `V2026102401__runs_delivery_event`, which is additive and keeps existing rows. Redelivering the same delivery, workflow and event still creates no run.
 
 - **Diagnostic staging directories of expired upload tokens are reaped again**: the pending-upload sweep dropped each expired token from the map before the reaper collected its `blobs/diag/<jti>` directory, so the staged bytes stayed on disk until the age-based backstop, which is disabled when `diag_staging_max_age_seconds` is 0. The reaper now collects those directories before the sweep runs.
 
