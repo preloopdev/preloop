@@ -14,16 +14,15 @@ Releases before v0.27.0 predate the changelog.
   service.
 - **Sandbox Service: provider cordon/drain, pagination and request caps.**
   `CordonProvider`/`UncordonProvider`/`DrainProvider` (and
-  `preloop sandbox provider …`) stop new placements and release idle pool
-  members; `List*` RPCs are paginated (`pageSize` up to 1000); unary RPCs are
-  capped at 4 MiB and blob uploads at `PRELOOP_SANDBOX_BLOB_MAX_BYTES`
-  (default 8 GiB), with orphaned blobs swept at boot.
+  `preloop sandbox provider …`) stop new placements and grant no new leases
+  from a provider's warm members; drain also releases idle pool members.
+  Existing leases remain usable. `List*` RPCs are paginated (`pageSize` up to
+  1000); unary RPCs are capped at 4 MiB and blob uploads at
+  `PRELOOP_SANDBOX_BLOB_MAX_BYTES` (default 8 GiB), with orphaned blobs swept
+  at boot. Sandbox clients classify oversized unary requests as
+  `resource_exhausted`.
 
 ### Fixed
-
-- Cordoned sandbox providers no longer grant new leases from their warm
-  inventory; existing leases remain usable. Sandbox clients classify oversized
-  unary RPC requests as `resource_exhausted` instead of `unknown`.
 
 - Run guest CA distrust edits and trust-bundle regeneration together as root
   or through passwordless sudo. Official golden forks execute as `runner`

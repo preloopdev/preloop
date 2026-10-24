@@ -48,10 +48,10 @@ from the `.proto` interoperates.
   refills after each claim, backing off after creation failures.
 * **Provider cordon and drain** — `CordonProvider` stops new placements on one
   provider, including new leases of warm members; its existing leases and warm
-  members keep running. `DrainProvider`
-  cordons and also destroys that provider's idle pool members, then reports
-  how many leases remain (they are not killed). The cordon is persisted on
-  the provider record and survives re-registration until `UncordonProvider`.
+  members keep running. `DrainProvider` cordons and also destroys that
+  provider's idle pool members, then reports how many leases remain (they are
+  not killed). The cordon is persisted on the provider record and survives
+  re-registration until `UncordonProvider`.
 * **Stop / Start** — `Stop` powers a machine off but keeps it and its disk
   (packing needs a stopped machine), `Start` boots it again, `--forkable` when
   it must serve forks. Both work under the same lease.
