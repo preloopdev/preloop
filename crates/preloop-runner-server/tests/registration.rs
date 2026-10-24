@@ -2191,7 +2191,9 @@ fn raw_store(temp: &tempfile::TempDir) -> rusqlite::Connection {
 
 /// `(request_id, result)` and, when the job row exists, `(status, queue_state)`
 /// of every attempt, read from the store itself.
-fn attempt_rows(temp: &tempfile::TempDir) -> Vec<(i64, Option<String>, Option<(String, String)>)> {
+type AttemptRow = (i64, Option<String>, Option<(String, String)>);
+
+fn attempt_rows(temp: &tempfile::TempDir) -> Vec<AttemptRow> {
     let db = raw_store(temp);
     let mut stmt = db
         .prepare(
@@ -2314,7 +2316,10 @@ async fn boot_closes_attempt_whose_job_row_is_gone() {
         state: state.clone(),
         shutdown,
     });
-    submit_simple_run(&app).await;
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    // Subscribe before the closure so its broadcast is observable.
+    let mut events = state.events.subscribe();
     raw_store(&temp)
         .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM jobs;")
         .unwrap();
@@ -2326,6 +2331,24 @@ async fn boot_closes_attempt_whose_job_row_is_gone() {
         run_state(&temp),
         ("completed".to_owned(), Some("failure".to_owned())),
         "a run whose last job row vanished must settle"
+    );
+    // The settlement commits the closure after a watcher may have taken its
+    // snapshot; the terminal status must be published so the stream closes
+    // now instead of idling out.
+    let mut terminal_status = None;
+    while let Ok(event) = events.try_recv() {
+        if let NdjsonEvent::RunStatus {
+            run_id: id, status, ..
+        } = event
+            && id == run_id
+        {
+            terminal_status = Some(status);
+        }
+    }
+    assert_eq!(
+        terminal_status,
+        Some(ExecutionStatus::Failure),
+        "the closure must publish its terminal RunStatus"
     );
 }
 

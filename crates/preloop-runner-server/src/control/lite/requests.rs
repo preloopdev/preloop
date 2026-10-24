@@ -585,24 +585,35 @@ impl LiteBackend {
     /// Settle an attempt whose job row is gone and close its run in the same
     /// transaction once no job remains. `summarize_run_row` keeps an empty run
     /// queued by design, so the empty case is written as a failure; a run with
-    /// other live jobs keeps its open state. Returns whether the attempt
-    /// existed.
+    /// other live jobs keeps its open state. Returns the run's status when its
+    /// row is live, for the caller's `RunStatus` fan-out; `None` when the
+    /// attempt was already settled or has no row.
     pub(crate) async fn settle_attempt_and_close_run(
         &self,
         request_id: i64,
         result: ExecutionStatus,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<Option<ClosedOrphan>, ControlError> {
         self.write(|tx| {
-            let Some(run_id) = tx
-                .prepare_cached("SELECT run_id FROM job_requests WHERE request_id = ?1")
+            // One write transaction, so the run id and the open state cannot
+            // move between these steps; only an attempt still open may close
+            // its run.
+            let Some((run_id, open)) = tx
+                .prepare_cached(
+                    "SELECT run_id, result IS NULL FROM job_requests WHERE request_id = ?1",
+                )
                 .map_err(db)?
-                .query_row([request_id], |row| row.get::<_, String>(0))
+                .query_row([request_id], |row| {
+                    let run: String = row.get(0)?;
+                    Ok((codec::run_id(&run), row.get::<_, bool>(1)?))
+                })
                 .optional()
                 .map_err(db)?
-                .map(|run| codec::run_id(&run))
             else {
-                return Ok(false);
+                return Ok(None);
             };
+            if !open {
+                return Ok(None);
+            }
             let was_completed: Option<bool> = tx
                 .prepare_cached("SELECT status = 'completed' FROM runs WHERE run_id = ?1")
                 .map_err(db)?
@@ -611,7 +622,7 @@ impl LiteBackend {
                 .map_err(db)?;
             super::dispatch::settle_request_tx(tx, request_id, result)?;
             let Some(was_completed) = was_completed else {
-                return Ok(true);
+                return Ok(Some(ClosedOrphan { run_status: None }));
             };
             let remaining: i64 = tx
                 .prepare_cached("SELECT COUNT(*) FROM jobs WHERE run_id = ?1")
@@ -643,7 +654,9 @@ impl LiteBackend {
                     serde_json::json!({"status": crate::runtime_scheduling::status_string(status)}),
                 )?;
             }
-            Ok(true)
+            Ok(Some(ClosedOrphan {
+                run_status: Some(status),
+            }))
         })
     }
 

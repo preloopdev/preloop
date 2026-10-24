@@ -1183,6 +1183,18 @@ pub(crate) fn job_event_stamp(
     }
 }
 
+/// The wire status a run row reports: `completed` takes its conclusion
+/// (`timed_out` and a missing conclusion are failures), other rows parse
+/// their status (`queued` reads as `Queued`; `Pending` is reconstructed on
+/// read from a held run's wait).
+pub(crate) fn run_status_wire(row_status: &str, row_conclusion: Option<&str>) -> ExecutionStatus {
+    match (row_status, row_conclusion) {
+        ("completed", Some("timed_out")) | ("completed", None) => ExecutionStatus::Failure,
+        ("completed", Some(conclusion)) => crate::control::types::status_parse(conclusion),
+        (status, _) => crate::control::types::status_parse(status),
+    }
+}
+
 /// [`EventStamp`] for a `RunStatus` event against the run's `status`,
 /// `conclusion` and `version`. A run held for a gate is `Pending` on the
 /// wire while its row says `queued`.
@@ -1193,11 +1205,7 @@ pub(crate) fn run_event_stamp(
     row_version: i64,
 ) -> EventStamp {
     let settled = row_status == "completed";
-    let row = match (row_status, row_conclusion) {
-        ("completed", Some("timed_out")) | ("completed", None) => ExecutionStatus::Failure,
-        ("completed", Some(conclusion)) => crate::control::types::status_parse(conclusion),
-        (status, _) => crate::control::types::status_parse(status),
-    };
+    let row = run_status_wire(row_status, row_conclusion);
     let matches =
         row == event || (row == ExecutionStatus::Queued && event == ExecutionStatus::Pending);
     if matches {

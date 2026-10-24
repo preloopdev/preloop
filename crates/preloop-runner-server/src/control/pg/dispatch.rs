@@ -24,9 +24,9 @@ use crate::control::logic::{
 use crate::control::txn_stats::RunRowOp;
 use crate::control::types::EnvironmentDeploymentRow;
 use crate::control::types::{
-    AzdoPoll, AzdoPollOutcome, CancelOutcome, ClaimedJob, CompleteOutcome, ControlError,
-    ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob, SettleJobOutcome,
-    SubmitJob, SubmitOutcome, SubmitRun, status_str,
+    AzdoPoll, AzdoPollOutcome, CancelOutcome, ClaimedJob, ClosedOrphan, CompleteOutcome,
+    ControlError, ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob,
+    SettleJobOutcome, SubmitJob, SubmitOutcome, SubmitRun, status_str,
 };
 use crate::models::{
     EnvironmentGateState, QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord,
@@ -6558,29 +6558,48 @@ impl PgBackend {
     /// Settle an attempt whose job row is gone and close its run in the same
     /// run-locked transaction once no job remains. The empty-graph aggregate
     /// would call the run a success, so it is written as a failure here; a run
-    /// with other live jobs keeps its open state. Returns whether the attempt
-    /// existed.
+    /// with other live jobs keeps its open state. Returns the run's status
+    /// when its row is live, for the caller's `RunStatus` fan-out.
     pub(super) async fn settle_attempt_and_close_run(
         &self,
         request_id: i64,
         result: ExecutionStatus,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<Option<ClosedOrphan>, ControlError> {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
+        // Read the run without a row lock so the run can be locked first:
+        // `complete_job` and `settle_job` lock the run and then the request,
+        // and taking the request first here would deadlock against a peer
+        // completing another job of the same run.
         let Some(row) = tx
             .query_opt(
-                "SELECT run_id::text FROM job_requests WHERE request_id=$1 FOR NO KEY UPDATE",
+                "SELECT run_id::text FROM job_requests WHERE request_id=$1",
                 &[&request_id],
             )
             .await
             .map_err(db)?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let run_id = codec::run_id(row.get(0))?;
         let run = run_id.0.to_string();
         let run_exists = PgBackend::lock_run(&tx, run_id).await?;
+        // A peer may have settled the attempt between the read above and the
+        // run lock; only an attempt still open may close its run.
+        let open = tx
+            .query_opt(
+                "SELECT 1 FROM job_requests WHERE request_id=$1 AND result IS NULL \
+                 FOR NO KEY UPDATE",
+                &[&request_id],
+            )
+            .await
+            .map_err(db)?
+            .is_some();
+        if !open {
+            return Ok(None);
+        }
         settle_request_tx(&tx, request_id, result).await?;
+        let mut run_status = None;
         if run_exists {
             let was_completed: bool = tx
                 .query_one(
@@ -6621,6 +6640,7 @@ impl PgBackend {
                     .map_err(db)?;
                 (row.get(0), row.get(1))
             };
+            run_status = Some(logic::run_status_wire(&status, conclusion.as_deref()));
             if !was_completed && status == "completed" {
                 release_concurrency_for_run(self, &tx, run_id).await?;
                 emit_outbox(
@@ -6635,7 +6655,7 @@ impl PgBackend {
             }
         }
         tx.commit().await.map_err(db)?;
-        Ok(true)
+        Ok(Some(ClosedOrphan { run_status }))
     }
 
     /// `settle_job`: the broker-shaped completion (attempt ownership checked

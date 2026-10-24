@@ -1508,12 +1508,32 @@ async fn close_orphaned_request(
         // The job row is gone: close the attempt and, when nothing else is
         // left to run, its run — one transaction, so a partial write cannot
         // leave the run open with no attempt for a later boot to select.
-        let attempt = shared
+        let Some(closed) = shared
             .state
             .backend
             .settle_attempt_and_close_run(request_id, ExecutionStatus::Failure)
-            .await?;
-        return Ok(attempt);
+            .await?
+        else {
+            return Ok(false);
+        };
+        // A watcher that subscribed before the closure and read its snapshot
+        // before the commit would otherwise wait for the stream's idle
+        // timeout. The committed closure is the authority, so publish its
+        // terminal status now, as the reaper does for the runs its sweep
+        // concludes.
+        if let Some(status) = closed.run_status
+            && status.is_terminal()
+        {
+            shared
+                .state
+                .emit(NdjsonEvent::RunStatus {
+                    run_id,
+                    status,
+                    reason: None,
+                })
+                .await;
+        }
+        return Ok(true);
     };
     if let Some(verdict) = concluded_verdict(&status) {
         // The job already holds a verdict; the attempt takes the same one.

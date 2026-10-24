@@ -1106,12 +1106,15 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// the same transaction once no job remains. `summarize_run_row` keeps an
     /// empty run open (and the Postgres aggregate would call it a success), so
     /// the empty case is written as `failure`; a run with other live jobs
-    /// keeps its open state. Returns whether the attempt existed.
+    /// keeps its open state. `None` when the attempt was already settled or
+    /// has no row; otherwise the run's status after the write, which the
+    /// caller publishes as a `RunStatus` so live watchers are not left waiting
+    /// for the idle timeout.
     async fn settle_attempt_and_close_run(
         &self,
         request_id: i64,
         result: ExecutionStatus,
-    ) -> Result<bool, ControlError>;
+    ) -> Result<Option<ClosedOrphan>, ControlError>;
 
     /// `jobs` row (`queue_kind`, `status`) for one logical job; `None` when
     /// absent. Boot reconcile classifies orphaned claims with it.
@@ -2954,7 +2957,7 @@ impl ControlBackend for Backend {
         &self,
         request_id: i64,
         result: ExecutionStatus,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<Option<ClosedOrphan>, ControlError> {
         match self {
             Self::Sqlite(b) => b.settle_attempt_and_close_run(request_id, result).await,
             Self::Postgres(b) => b.settle_attempt_and_close_run(request_id, result).await,

@@ -1419,6 +1419,15 @@ pub(crate) struct JobSettled {
     pub(crate) next_runs_on: Vec<String>,
 }
 
+/// What `settle_attempt_and_close_run` wrote for one orphaned attempt.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClosedOrphan {
+    /// The run's status after the settlement (and closure, when this was the
+    /// run's last job), for the caller's `RunStatus` fan-out. `None` when the
+    /// run row is not in the live table (archived or already pruned).
+    pub(crate) run_status: Option<ExecutionStatus>,
+}
+
 /// AzDO long-poll input (`poll_azdo_session`).
 #[derive(Debug, Clone)]
 pub(crate) struct AzdoPoll {

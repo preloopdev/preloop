@@ -713,7 +713,7 @@ impl ControlBackend for PgBackend {
         &self,
         request_id: i64,
         result: ExecutionStatus,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<Option<ClosedOrphan>, ControlError> {
         self.settle_attempt_and_close_run(request_id, result).await
     }
     async fn job_queue_state(
