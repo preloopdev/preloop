@@ -1645,13 +1645,7 @@ impl Service {
                         && s.state == SandboxState::Ready
                 })
                 .filter(|s| sandbox_meets(state, s, &request.requires))
-                // Cordoned providers keep their warm members but never lease them.
-                .filter(|s| {
-                    state
-                        .providers
-                        .get(&s.provider_id)
-                        .is_none_or(|rec| !rec.provider.cordoned)
-                })
+                .filter(|s| accepts_new_leases(state, s))
                 // Oldest first, so warm members rotate and none goes stale.
                 .min_by_key(|s| (s.created_at, s.id.as_str()))
                 .map(|s| s.id.clone());
@@ -1671,6 +1665,7 @@ impl Service {
                             && s.pool_revision == revision
                             && s.state == SandboxState::Provisioning
                             && sandbox_meets(state, s, &request.requires)
+                            && accepts_new_leases(state, s)
                     });
                     if booting {
                         return Ok(Step::Wait(None));
@@ -3175,6 +3170,15 @@ enum Step {
     Wait(Option<Error>),
 }
 
+/// Whether `sandbox` may take a new lease. A cordoned provider keeps its
+/// members but grants them none; a provider with no record is not cordoned.
+fn accepts_new_leases(state: &State, sandbox: &Sandbox) -> bool {
+    state
+        .providers
+        .get(&sandbox.provider_id)
+        .is_none_or(|rec| !rec.provider.cordoned)
+}
+
 fn sandbox_meets(state: &State, sandbox: &Sandbox, requires: &Requirements) -> bool {
     if requires == &Requirements::default() {
         return true;
@@ -3436,6 +3440,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(third.sandbox.id, "sbx-x");
+    }
+
+    #[tokio::test]
+    async fn cordoned_provider_does_not_hold_acquires_for_booting_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::open(
+            store::open("memory:").await.unwrap(),
+            ServiceConfig::new(dir.path().join("blobs")),
+        )
+        .await
+        .unwrap();
+        service
+            .register(RegisterRequest {
+                name: "host".into(),
+                drivers: vec![DriverInfo {
+                    driver: "fake".into(),
+                    capabilities: Capabilities::default(),
+                }],
+            })
+            .await
+            .unwrap();
+        service.set_provider_cordon("host", true).await.unwrap();
+        let provider_id = service.list_providers()[0].id.clone();
+        {
+            let mut state = service.state.lock();
+            state.templates.insert(
+                "alpine".into(),
+                Template {
+                    spec: TemplateSpec {
+                        name: "alpine".into(),
+                        ..TemplateSpec::default()
+                    },
+                    ..Template::default()
+                },
+            );
+            state.pools.insert(
+                "p".into(),
+                PoolSpec {
+                    name: "p".into(),
+                    template: "alpine".into(),
+                    ..PoolSpec::default()
+                },
+            );
+            let mut booting = Sandbox {
+                id: "sbx-booting".into(),
+                template: "alpine".into(),
+                pool: "p".into(),
+                provider_id,
+                state: SandboxState::Provisioning,
+                ..Sandbox::default()
+            };
+            with_current_pool_revision(&state, &mut booting);
+            state.sandboxes.insert(booting.id.clone(), booting);
+        }
+        // Waiting cannot help: the member would never be leased while the
+        // cordon holds, so the cordon error is reported at once.
+        let error = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                pool: "p".into(),
+                wait_secs: Some(0),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::FailedPrecondition);
+        assert!(error.message.contains("host"), "{}", error.message);
+        assert!(error.message.contains("cordoned"), "{}", error.message);
     }
 
     #[tokio::test]
