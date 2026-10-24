@@ -83,6 +83,22 @@ pub async fn run_worker(args: WorkerArgs) -> Result<()> {
 
     info!("Worker received job");
 
+    // Resolve the persisted registration before any workflow, container, or
+    // service work. This runs after the job message is accepted so the
+    // listener's dispatch succeeds and its worker-exit monitor force-fails the
+    // job visibly; returning an error here still ends the worker before
+    // `run_job` touches the workspace. `.runner` is read without the
+    // credential files — job execution needs only the plane and runner name.
+    let root = std::env::current_dir().context("resolving runner root")?;
+    let registration = crate::settings::RunnerSettings::load(&root)
+        .and_then(|settings| settings.registration())
+        .with_context(|| {
+            format!(
+                "loading runner registration metadata from {}",
+                root.join(".runner").display()
+            )
+        })?;
+
     // Create a cancellation signal channel.
     // The stdin reader sends `true` when a cancel/shutdown message arrives.
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -131,6 +147,7 @@ pub async fn run_worker(args: WorkerArgs) -> Result<()> {
     // Run the job with cancellation support.
     job_runner::run_job(
         job_body,
+        registration,
         args.via,
         cancel_rx,
         job_runner::LeaseTiming::default(),

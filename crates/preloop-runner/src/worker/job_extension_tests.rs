@@ -29,7 +29,7 @@ fn snapshot_rewrite_appends_to_workflow_supplied_git_config() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     // Workflow entry survives, snapshot entries land after it.
     assert_eq!(
@@ -71,7 +71,7 @@ fn snapshot_origin_rewrite_routes_hardcoded_forge_urls_to_the_snapshot() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
@@ -127,7 +127,7 @@ fn snapshot_rewrite_installs_its_own_extraheader_only() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     // The rewrite installs only its own snapshot header. github.com auth is
     // the checkout's own job (the broker patches the minted token into the
@@ -161,7 +161,7 @@ fn snapshot_auth_header_is_registered_as_a_mask() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("GIT_CONFIG_VALUE_2").map(String::as_str),
@@ -197,7 +197,7 @@ fn snapshot_origin_rewrite_routes_git_scheme_repository_url_to_the_snapshot() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
@@ -279,14 +279,14 @@ fn setup_workspace_derives_repo_layout_from_claim_repository() {
         let resolved = setup_workspace(&message).unwrap();
         let expected = std::env::current_dir()
             .unwrap()
-            .join("_work")
+            .join("work")
             .join(&repo)
             .join(&repo);
         assert_eq!(resolved, expected.to_string_lossy());
         assert!(resolved.contains(&repo));
-        let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("_work").join(&repo));
+        let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("work").join(&repo));
     }
-    let work_root = std::env::current_dir().unwrap().join("_work");
+    let work_root = std::env::current_dir().unwrap().join("work");
     for sibling in ["_temp", "_actions", "_tool"] {
         let _ = std::fs::remove_dir(work_root.join(sibling));
     }
@@ -402,7 +402,7 @@ fn inject_github_env_sets_core_vars() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(job.env.get("CI").unwrap(), "true");
     assert_eq!(job.env.get("GITHUB_ACTIONS").unwrap(), "true");
@@ -430,7 +430,7 @@ fn inject_github_env_stringifies_boolean_ref_protected() {
             "github": { "ref": "refs/heads/main", "ref_protected": true }
         }
     });
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
     assert_eq!(job.env.get("GITHUB_REF_PROTECTED").unwrap(), "true");
 
     let mut job = JobContext::new(
@@ -444,7 +444,7 @@ fn inject_github_env_stringifies_boolean_ref_protected() {
             "github": { "ref": "refs/heads/main", "ref_protected": false }
         }
     });
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
     assert_eq!(job.env.get("GITHUB_REF_PROTECTED").unwrap(), "false");
 }
 
@@ -494,6 +494,36 @@ fn build_step_list_parses_action_reference() {
     assert!(
         matches!(&result[0].step_type, StepType::Action { uses, .. } if uses == "actions/checkout@v4")
     );
+}
+
+#[test]
+fn container_registry_reference_selects_docker_action() {
+    let steps = [serde_json::json!({
+        "id": "container-step",
+        "reference": {
+            "type": "containerRegistry",
+            "image": "alpine:3.20"
+        }
+    })];
+    let result = build_step_list(&steps, &serde_json::json!({}));
+    assert!(
+        matches!(&result[0].step_type, StepType::Action { uses, .. } if uses == "docker://alpine:3.20"),
+        "containerRegistry must dispatch as a Docker action, not an empty repository reference"
+    );
+}
+
+#[test]
+fn malformed_container_reference_does_not_dispatch_an_empty_docker_image() {
+    for reference in [
+        serde_json::json!({"type": "containerRegistry"}),
+        serde_json::json!({"type": "containerRegistry", "image": null}),
+        serde_json::json!({"type": "containerRegistry", "image": 7}),
+        serde_json::json!({"type": "containerRegistry", "image": ""}),
+    ] {
+        let steps = [serde_json::json!({"id": "invalid-image", "reference": reference})];
+        let result = build_step_list(&steps, &serde_json::json!({}));
+        assert!(matches!(&result[0].step_type, StepType::Action { uses, .. } if uses.is_empty()));
+    }
 }
 
 #[test]
@@ -637,7 +667,7 @@ fn inject_actions_env_from_system_vss_endpoint_data() {
         }
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("ACTIONS_RUNTIME_URL").map(String::as_str),
@@ -703,7 +733,7 @@ fn injects_job_environment_variables_from_acquire_payload() {
         }]
     });
 
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     assert_eq!(
         job.env.get("MEGA_GLOBAL_ENV").map(String::as_str),
@@ -740,7 +770,7 @@ fn job_message_variables_do_not_leak_into_step_env() {
         },
         "environmentVariables": []
     });
-    inject_github_env(&mut job, &msg);
+    inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
     for leaked in [
         "system.orchestrationId",
@@ -773,6 +803,7 @@ fn github_job_falls_back_to_context_when_variable_absent() {
             "contextData": {"github": {"job": "legacy-build"}},
             "environmentVariables": []
         }),
+        crate::settings::ControlPlane::Engine,
     );
     assert_eq!(
         job.env.get("GITHUB_JOB").map(String::as_str),
@@ -814,6 +845,7 @@ runs:
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     }];
     let mut action_paths = std::collections::HashMap::new();
     action_paths.insert(
@@ -839,6 +871,12 @@ runs:
             if with.get("__preloop_entry").and_then(|v| v.as_str()) == Some("cleanup.js")
     ));
     assert_eq!(ordered[2].condition.as_deref(), Some("always()"));
+    assert_eq!(
+        ordered[2].post_of,
+        ["main-action", "__pre_main-action"],
+        "both the pre step and the main step register the post hook"
+    );
+    assert!(ordered[1].post_of.is_empty());
 }
 
 #[test]
@@ -866,6 +904,7 @@ fn lifecycle_registers_post_for_each_repeated_action_invocation() {
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     };
     let mut action_paths = std::collections::HashMap::new();
     action_paths.insert(
@@ -916,6 +955,7 @@ fn lifecycle_local_actions_skip_pre_but_retain_main_and_post() {
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     };
     let main_steps = vec![
         action_step("local", "./.github/actions/local"),
@@ -991,6 +1031,7 @@ runs:
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: Vec::new(),
     }];
     let mut action_paths = std::collections::HashMap::new();
     action_paths.insert(
@@ -1207,6 +1248,7 @@ fn lifecycle_fixture(
             env,
             raw: serde_json::json!({"generated": index, "metadata": spec.metadata}),
             is_background: index % 2 == 0,
+            post_of: Vec::new(),
         });
     }
 
@@ -1482,11 +1524,11 @@ fn test_golden_acquirejob_payloads_parsing() {
         let mut job = JobContext::new(
             "job1".into(),
             "test-job".into(),
-            serde_json::json!({}),
-            serde_json::json!({}),
+            msg.get("variables").cloned().unwrap_or_default(),
+            msg.get("contextData").cloned().unwrap_or_default(),
         );
         job.workspace = Some("_work/repo/repo".into());
-        inject_github_env(&mut job, &msg);
+        inject_github_env(&mut job, &msg, crate::settings::ControlPlane::Engine);
 
         // GITHUB_REPOSITORY must be set and not empty (from contextData.github.repository)
         let repo = job.env.get("GITHUB_REPOSITORY").map(|s| s.as_str());
@@ -1496,14 +1538,71 @@ fn test_golden_acquirejob_payloads_parsing() {
             "mismatched GITHUB_REPOSITORY in {scenario}"
         );
 
-        // GITHUB_TOKEN mirrors `github.token` only — never the engine's
-        // runtime JWT. The golden captures carry no `github.token` context,
-        // so the env is empty here (anonymous mode): exporting the JWT sent a
-        // dead credential to api.github.com on engines without an App/PAT.
+        // Token resolution is control-plane dependent (#626). On a preloop
+        // engine `system.github.token` can carry the job's runtime credential,
+        // so it must never surface as `github.token`/`GITHUB_TOKEN`. On
+        // github.com the same variable IS the job's GitHub credential — the
+        // official runner builds `github.token` from exactly this variable
+        // (`ExecutionContext.cs` `InitializeJob`).
+        let wire_token = msg
+            .get("variables")
+            .and_then(|v| v.get("system.github.token"))
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        // Engine registration: keep the fence. This branch is also the
+        // before/after control for #626 — the variable is exactly what the
+        // pre-fix runner never read, so `GITHUB_TOKEN` stayed unset and
+        // `github.token` resolved empty from this same golden message.
         let token = job.env.get("GITHUB_TOKEN").map(|s| s.as_str());
         assert_eq!(
             token, None,
-            "GITHUB_TOKEN must not export when github.token is empty ({scenario}) — the old fallback leaked the engine's runtime JWT to api.github.com"
+            "GITHUB_TOKEN must not export when registered against an engine ({scenario}) — the old fallback leaked the job's runtime credential to api.github.com"
+        );
+        let engine_ctx = job.build_expression_context();
+        assert_eq!(
+            preloop_gha_expressions::eval_expression("github.token", &engine_ctx)
+                .unwrap()
+                .as_str(),
+            Some(""),
+            "github.token must stay empty in engine mode ({scenario})"
+        );
+
+        // github.com registration: the variable the server sent is the job's
+        // real credential. Golden captures redact it, so assert it reaches
+        // the step surface byte-for-byte rather than comparing literals.
+        let mut github_job = JobContext::new(
+            "job1".into(),
+            "test-job".into(),
+            msg.get("variables").cloned().unwrap_or_default(),
+            msg.get("contextData").cloned().unwrap_or_default(),
+        );
+        github_job.workspace = job.workspace.clone();
+        inject_github_env(&mut github_job, &msg, crate::settings::ControlPlane::GitHub);
+        assert_eq!(
+            github_job.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some(wire_token.as_str()),
+            "github.com mode must export system.github.token as GITHUB_TOKEN ({scenario})"
+        );
+        let github_ctx = github_job.build_expression_context();
+        assert_eq!(
+            preloop_gha_expressions::eval_expression("github.token", &github_ctx)
+                .unwrap()
+                .as_str(),
+            Some(wire_token.as_str()),
+            "github.token must resolve from system.github.token in github.com mode ({scenario})"
+        );
+        assert_eq!(
+            preloop_gha_expressions::eval_expression("secrets.GITHUB_TOKEN", &github_ctx)
+                .unwrap()
+                .as_str(),
+            msg.get("variables")
+                .and_then(|v| v.get("github_token"))
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str()),
+            "secrets.GITHUB_TOKEN resolves from github_token in both modes ({scenario})"
         );
 
         // 3. Scenario-specific checks
@@ -1551,12 +1650,52 @@ fn golden_runner_version() -> String {
     panic!("runner_version not found in ../../versions.toml");
 }
 
+/// Golden corpus version a scenario is read from: the shipped
+/// `runner_version` when its flat capture exists, otherwise the newest corpus
+/// that has it.
+///
+/// `versions.toml`'s `runner_version` is the *shipped* runner pin, and it can
+/// move ahead of the flat capture corpus — the compatibility pin is bumped
+/// before the flows are recorded (see #710, whose `v2.337.0` directory holds
+/// only nested `gh-official/*` captures). Reading the pin blindly turns every
+/// parser test into "failed to load golden acquirejob"; falling back to the
+/// newest corpus keeps the tests running until that capture lands.
+fn golden_runner_version_for(scenario: &str) -> Option<String> {
+    let root = std::path::Path::new("../../.runner-watch/golden");
+    let has = |version: &str| {
+        root.join(format!("v{version}/{scenario}/flows.jsonl"))
+            .is_file()
+    };
+    let pinned = golden_runner_version();
+    if has(&pinned) {
+        return Some(pinned);
+    }
+    let mut versions: Vec<String> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.strip_prefix('v').map(str::to_owned))
+        .filter(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+        .filter(|version| has(version))
+        .collect();
+    versions.sort_by(|a, b| version_key(a).cmp(&version_key(b)));
+    versions.pop()
+}
+
+/// Numeric components of a `vN.N.N` corpus directory, for a version sort.
+fn version_key(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
+}
+
 fn load_golden_acquirejob(scenario: &str) -> Option<serde_json::Value> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     let path = format!(
         "../../.runner-watch/golden/v{}/{scenario}/flows.jsonl",
-        golden_runner_version()
+        golden_runner_version_for(scenario)?
     );
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -1664,4 +1803,355 @@ fn step_timeout_is_read_from_a_number_token() {
 
     assert_eq!(built.len(), 1);
     assert_eq!(built[0].timeout_minutes, Some(1));
+}
+
+/// Wire format regression: `PipelineContextData` serializes arrays as
+/// `{"t":1,"a":[…]}`. The old decoder read tag 1 as a legacy string and arrays
+/// nested inside a dictionary (e.g. `github.event.pull_request.labels`)
+/// decoded to null, so `contains(github.event.pull_request.labels.*.name, …)`
+/// was always false in runner-side evaluation.
+#[test]
+fn decode_typed_value_preserves_arrays_nested_in_wire_dicts() {
+    let github = serde_json::json!({
+        "t": 2,
+        "d": [
+            {"k": "event_name", "v": "pull_request"},
+            {"k": "event", "v": {
+                "t": 2,
+                "d": [
+                    {"k": "action", "v": "labeled"},
+                    {"k": "label", "v": {
+                        "t": 2,
+                        "d": [{"k": "name", "v": "dependencies"}]
+                    }},
+                    {"k": "pull_request", "v": {
+                        "t": 2,
+                        "d": [
+                            {"k": "labels", "v": {
+                                "t": 1,
+                                "a": [
+                                    {"t": 2, "d": [{"k": "name", "v": "dependencies"}]},
+                                    {"t": 2, "d": [{"k": "name", "v": "other"}]},
+                                ]
+                            }}
+                        ]
+                    }}
+                ]
+            }}
+        ]
+    });
+
+    let decoded = decode_typed_value(&github);
+    assert_eq!(decoded["event_name"], "pull_request");
+    assert_eq!(decoded["event"]["action"], "labeled");
+    assert_eq!(
+        decoded["event"]["pull_request"]["labels"],
+        serde_json::json!([{"name": "dependencies"}, {"name": "other"}])
+    );
+
+    // The label list must be visible to a `contains(… .labels.*.name, …)`
+    // expression, which is how a labeled-event workflow branch reads it.
+    let mut ctx = preloop_gha_expressions::Context::new();
+    ctx.insert("github", decoded);
+    assert_eq!(
+        preloop_gha_expressions::eval_expression(
+            "github.event.action == 'labeled' && \
+             github.event.label.name == 'dependencies' && \
+             contains(github.event.pull_request.labels.*.name, 'dependencies')",
+            &ctx,
+        )
+        .expect("expression evaluates"),
+        serde_json::json!(true),
+        "a labeled-event expression must see the label list for this payload"
+    );
+}
+
+/// Token the claim mints in the runtime parity tests. Shaped like a real `ghs_`
+/// installation token.
+const CLAIM_MINTED_TOKEN: &str = "ghs_ClaimMintedInstallationTokenBBBBBBBBB";
+
+/// Replay a golden acquirejob payload through the claim the broker performs:
+/// `broker::apply_minted_token_to_message` stores the minted token as the
+/// `github_token` and `system.github.token` secret variables and as the
+/// `github` context token. The result is the message `job_runner::run_job`
+/// builds the job from.
+fn golden_claimed_message(scenario: &str, token: &str) -> serde_json::Value {
+    use preloop_gha_protocol::azdo::{PipelineContextData, VariableValue};
+
+    let mut message = load_golden_acquirejob(scenario).expect("golden acquirejob payload");
+    let mut context: std::collections::BTreeMap<String, PipelineContextData> =
+        serde_json::from_value(message["contextData"].clone()).expect("typed contextData");
+    if let Some(PipelineContextData::Dict(github)) = context.get_mut("github") {
+        github.insert(
+            "token".to_owned(),
+            PipelineContextData::String(token.to_owned()),
+        );
+    }
+    message["contextData"] = serde_json::to_value(&context).expect("encode contextData");
+    for name in ["github_token", "system.github.token"] {
+        message["variables"][name] =
+            serde_json::to_value(VariableValue::secret(token.to_owned())).expect("encode variable");
+    }
+    message
+}
+
+/// The job `job_runner::run_job` builds from a claimed message.
+fn claimed_job(message: &serde_json::Value) -> JobContext {
+    JobContext::new(
+        "job1".into(),
+        "job".into(),
+        message["variables"].clone(),
+        message["contextData"].clone(),
+    )
+}
+
+/// `secrets.GITHUB_TOKEN`, `github.token`, and the `github_token` variable all
+/// read the one claim-minted token on a golden-replayed job.
+#[test]
+fn claimed_golden_job_reads_one_token_through_secrets_and_github() {
+    let message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    let job = claimed_job(&message);
+    let ctx = job.build_expression_context();
+    for expression in ["secrets.GITHUB_TOKEN", "github.token"] {
+        assert_eq!(
+            preloop_gha_expressions::eval_expression(expression, &ctx)
+                .expect("expression evaluates")
+                .as_str(),
+            Some(CLAIM_MINTED_TOKEN),
+            "`{expression}` must read the claim-minted token"
+        );
+    }
+}
+
+/// Step `with:`, `env:` and `run:` values are evaluated by the runner against
+/// the claimed job, so each spelling of the token resolves to the minted value.
+#[test]
+fn claimed_golden_job_evaluates_step_values_to_the_minted_token() {
+    let message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    let job = claimed_job(&message);
+    let ctx = job.build_expression_context();
+    let cases = [
+        ("${{ secrets.GITHUB_TOKEN }}", CLAIM_MINTED_TOKEN.to_owned()),
+        ("${{ github.token }}", CLAIM_MINTED_TOKEN.to_owned()),
+        (
+            "echo ${{ secrets.GITHUB_TOKEN }}",
+            format!("echo {CLAIM_MINTED_TOKEN}"),
+        ),
+    ];
+    for (template, expected) in cases {
+        assert_eq!(
+            crate::worker::template::evaluate_template_strict(template, &ctx)
+                .expect("step value evaluates"),
+            expected,
+            "`{template}` must resolve to the claim-minted token"
+        );
+    }
+}
+
+/// The #650 path: a local composite action receives `token: ${{ secrets.GITHUB_TOKEN }}`
+/// as an input, and both the input and `github.token` inside the composite hold
+/// the claim-minted token.
+#[tokio::test]
+async fn composite_input_from_secrets_github_token_is_the_minted_token() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let action_dir = workspace.path().join(".github/actions/token-probe");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "name: token-probe\ninputs:\n  token:\n    required: true\nruns:\n  using: composite\n  steps:\n    - run: printf '%s' \"${{ inputs.token }}\" > input-token.txt\n      shell: bash\n    - run: printf '%s' \"${{ github.token }}\" > github-token.txt\n      shell: bash\n",
+    )
+    .unwrap();
+
+    let message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    let mut job = claimed_job(&message);
+    job.workspace = Some(workspace.path().to_string_lossy().to_string());
+    let mut ctx =
+        crate::worker::execution_context::StepContext::new(&mut job, "step".into(), "Step".into());
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let manifest = crate::worker::handlers::factory::load_action_manifest(&action_dir).unwrap();
+    crate::worker::handlers::composite::run_composite_action(
+        &manifest,
+        &action_dir,
+        &serde_json::json!({"token": "${{ secrets.GITHUB_TOKEN }}"}),
+        workspace.path().to_str().unwrap(),
+        &mut ctx,
+        rx,
+    )
+    .await
+    .expect("composite action runs");
+
+    for file in ["input-token.txt", "github-token.txt"] {
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(file)).unwrap(),
+            CLAIM_MINTED_TOKEN,
+            "{file} must hold the claim-minted token"
+        );
+    }
+}
+
+/// Job `env:` that the server left as an expression (no sibling secret was
+/// resolved at acquire) is materialized by the runner and evaluated against the
+/// claimed context before each step. `GITHUB_TOKEN` mirrors `github.token`.
+#[test]
+fn unresolved_job_env_token_evaluates_to_the_minted_token_at_step_time() {
+    let mut message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    message["environmentVariables"] = serde_json::json!([{
+        "type": 2,
+        "map": [
+            {
+                "Key": {"type": 0, "lit": "VIA_SECRETS"},
+                "Value": {"type": 3, "expr": "secrets.GITHUB_TOKEN"}
+            },
+            {
+                "Key": {"type": 0, "lit": "VIA_GITHUB"},
+                "Value": {"type": 3, "expr": "github.token"}
+            }
+        ]
+    }]);
+    let mut job = claimed_job(&message);
+    job.workspace = Some("_work/repo/repo".into());
+    inject_github_env(&mut job, &message, crate::settings::ControlPlane::Engine);
+    assert_eq!(
+        job.env.get("GITHUB_TOKEN").map(String::as_str),
+        Some(CLAIM_MINTED_TOKEN),
+        "GITHUB_TOKEN mirrors the claim-minted github.token"
+    );
+
+    let ctx = job.build_expression_context();
+    for name in ["VIA_SECRETS", "VIA_GITHUB"] {
+        let raw = job
+            .env
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is materialized into the job env"));
+        assert_eq!(
+            crate::worker::template::evaluate_template_strict(raw, &ctx)
+                .expect("job env value evaluates"),
+            CLAIM_MINTED_TOKEN,
+            "job env `{name}` must evaluate to the claim-minted token"
+        );
+    }
+}
+
+/// A workflow- or job-level `env: GITHUB_TOKEN` reaches the step process as
+/// that override, but never becomes `${{ github.token }}`: the context comes
+/// from `system.github.token` (or the `github_token` alias) alone, exactly as
+/// `ExecutionContext.InitializeJob` builds it.
+#[test]
+fn job_env_github_token_override_does_not_replace_the_github_token_context() {
+    let mut message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    message["environmentVariables"] = serde_json::json!([{
+        "type": 2,
+        "map": [{
+            "Key": {"type": 0, "lit": "GITHUB_TOKEN"},
+            "Value": {"type": 0, "lit": "ghp_job_env"}
+        }]
+    }]);
+    let mut job = claimed_job(&message);
+    job.workspace = Some("_work/repo/repo".into());
+    inject_github_env(&mut job, &message, crate::settings::ControlPlane::GitHub);
+
+    assert_eq!(
+        job.env.get("GITHUB_TOKEN").map(String::as_str),
+        Some("ghp_job_env"),
+        "the workflow's `env:` override is what the step process reads"
+    );
+    let ctx = job.build_expression_context();
+    for expression in ["github.token", "secrets.GITHUB_TOKEN"] {
+        assert_eq!(
+            preloop_gha_expressions::eval_expression(expression, &ctx)
+                .expect("expression evaluates")
+                .as_str(),
+            Some(CLAIM_MINTED_TOKEN),
+            "`{expression}` must stay the job credential, not the env override"
+        );
+    }
+}
+
+/// The builder writes empty `isSecret` slots for both token aliases before the
+/// claim fills them; an empty `system.github.token` must not shadow the
+/// populated `github_token` it is paired with (nor the other way round).
+#[test]
+fn empty_system_token_slot_falls_back_to_the_github_token_alias() {
+    let token_variables = |system: &str, alias: &str| {
+        serde_json::json!({
+            "system.github.token": {"value": system, "isSecret": true},
+            "github_token": {"value": alias, "isSecret": true}
+        })
+    };
+    for (system, alias) in [("", CLAIM_MINTED_TOKEN), (CLAIM_MINTED_TOKEN, "")] {
+        // The claim patches the context token too; build the message with no
+        // context token at all so only the variable aliases can supply one.
+        let mut message = golden_claimed_message("13-composite-action", "");
+        message["variables"] = token_variables(system, alias);
+
+        let mut job = claimed_job(&message);
+        job.workspace = Some("_work/repo/repo".into());
+        inject_github_env(&mut job, &message, crate::settings::ControlPlane::GitHub);
+        assert_eq!(
+            job.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some(CLAIM_MINTED_TOKEN),
+            "the populated alias must be exported (system={system:?})"
+        );
+        assert_eq!(
+            preloop_gha_expressions::eval_expression(
+                "github.token",
+                &job.build_expression_context()
+            )
+            .expect("expression evaluates")
+            .as_str(),
+            Some(CLAIM_MINTED_TOKEN),
+            "`github.token` must read the populated alias (system={system:?})"
+        );
+
+        // Engine registration: the same variables stay off the step surface.
+        let mut engine_job = claimed_job(&message);
+        engine_job.workspace = Some("_work/repo/repo".into());
+        inject_github_env(
+            &mut engine_job,
+            &message,
+            crate::settings::ControlPlane::Engine,
+        );
+        assert_eq!(
+            engine_job.env.get("GITHUB_TOKEN").map(String::as_str),
+            None,
+            "an engine registration must not export the token variable"
+        );
+    }
+}
+
+/// `container:` and `services:` credentials are expression tokens the runner
+/// evaluates against the claimed job before the containers start.
+#[test]
+fn container_and_service_credentials_evaluate_to_the_minted_token() {
+    let message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    let job = claimed_job(&message);
+    let ctx = job.build_expression_context();
+    let container = serde_json::json!({
+        "image": "ghcr.io/owner/tools:latest",
+        "credentials": {
+            "username": "x-access-token",
+            "password": {"type": 3, "expr": "secrets.GITHUB_TOKEN"}
+        }
+    });
+    let service = serde_json::json!({
+        "image": "ghcr.io/owner/db:latest",
+        "credentials": {
+            "username": "x-access-token",
+            "password": {"type": 3, "expr": "github.token"}
+        }
+    });
+    let evaluated_container =
+        crate::worker::container_ops::evaluate_expression_tokens(&container, &ctx)
+            .expect("container credentials evaluate");
+    let evaluated_service =
+        crate::worker::container_ops::evaluate_expression_tokens(&service, &ctx)
+            .expect("service credentials evaluate");
+    assert_eq!(
+        evaluated_container["credentials"]["password"],
+        CLAIM_MINTED_TOKEN
+    );
+    assert_eq!(
+        evaluated_service["credentials"]["password"],
+        CLAIM_MINTED_TOKEN
+    );
 }

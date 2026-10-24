@@ -16,8 +16,12 @@ use crate::settings::RunnerConfig;
 /// Run the listener (main loop of `preloop-runner run`).
 pub async fn run_listener(args: RunArgs, global: &GlobalArgs) -> Result<()> {
     let root = global.runner_root();
-    let config = RunnerConfig::load(&root)
-        .context("loading runner configuration — run `preloop-runner configure` first")?;
+    let config = RunnerConfig::load(&root).with_context(|| {
+        format!(
+            "loading runner configuration from {} — run `preloop-runner configure` if this runner is not configured, or repair the invalid .runner/.credentials files",
+            root.display()
+        )
+    })?;
 
     info!(
         "Starting runner '{}' (agent {}, pool {})",

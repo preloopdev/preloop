@@ -18,7 +18,10 @@ use crate::control::backend::{
 use crate::control::types::{
     ControlError, PollOutcome, SessionProtocol, StepPatch, SubmitJob, SubmitRun,
 };
-use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
+use crate::models::{
+    QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord, WebhookDeliveryRecord,
+    WebhookDeliveryStatus,
+};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -566,6 +569,203 @@ async fn commits_wake_waiters_on_another_node() {
     assert!(
         wake.ready >= 1,
         "the hint must ask for at least one waiter, got {wake:?}"
+    );
+}
+
+/// Longest a webhook hint may take from an enqueue to another node's worker.
+/// The worker's own tick is five seconds, so a hint that lands later than this
+/// is not a wake.
+const WAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A new webhook delivery for the wake tests.
+fn webhook_record(delivery_id: &str) -> WebhookDeliveryRecord {
+    WebhookDeliveryRecord {
+        delivery_id: delivery_id.to_owned(),
+        event: "push".to_owned(),
+        payload: br#"{"installation":{"id":9},"ref":"refs/heads/main"}"#.to_vec(),
+        received_at_us: 1,
+        state: WebhookDeliveryStatus::Received,
+        attempts: 0,
+        lease_until_us: None,
+        lease_token: None,
+        signer_app_id: None,
+        last_error: None,
+    }
+}
+
+/// Let in-flight hints land, then discard them.
+async fn drain_hints(hints: &mut tokio::sync::broadcast::Receiver<String>) {
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    while hints.try_recv().is_ok() {}
+}
+
+/// Probe enqueues through `writer` until `hints`, a subscription on another
+/// node, sees one. That node's LISTEN registers asynchronously with `connect`,
+/// so early hints can be lost. The caller then starts from an empty
+/// subscription.
+async fn await_webhook_listener(
+    writer: &PgBackend,
+    hints: &mut tokio::sync::broadcast::Receiver<String>,
+) {
+    for _ in 0..50 {
+        let probe = webhook_record(&format!("probe-{}", uuid::Uuid::new_v4()));
+        assert!(writer.enqueue_webhook_delivery(&probe).await.unwrap());
+        let heard = tokio::time::timeout(PROBE_WAIT, hints.recv()).await;
+        if let Ok(Ok(_)) = heard {
+            drain_hints(hints).await;
+            return;
+        }
+    }
+    panic!("the webhook wake listener never registered");
+}
+
+/// An enqueue on one node wakes the webhook worker of another well inside its
+/// five-second tick, and the hint names the node that wrote the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enqueued_webhook_delivery_wakes_other_nodes() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let mut hints = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut hints).await;
+
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("wake"))
+        .await
+        .unwrap();
+    assert!(written);
+    let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
+        .await
+        .expect("node B must hear the enqueue well before its five-second tick")
+        .expect("the hint channel stays open");
+    assert_eq!(origin, node_a.origin(), "the hint names the writing node");
+}
+
+/// A burst of enqueues shares notifications: node B hears at least one, and far
+/// fewer than the 64 rows written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_of_webhook_enqueues_shares_notifications() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let mut hints = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut hints).await;
+
+    let records: Vec<WebhookDeliveryRecord> = (0..64)
+        .map(|i| webhook_record(&format!("burst-{i}")))
+        .collect();
+    let written = futures::future::join_all(
+        records
+            .iter()
+            .map(|record| node_a.enqueue_webhook_delivery(record)),
+    )
+    .await;
+    assert!(
+        written.iter().all(|result| matches!(result, Ok(true))),
+        "every burst row is new: {written:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut sent = 0;
+    while hints.try_recv().is_ok() {
+        sent += 1;
+    }
+    assert!(sent >= 1, "the burst must wake node B");
+    assert!(
+        sent <= 16,
+        "64 enqueues sent {sent} hints; the notifier must coalesce them"
+    );
+}
+
+/// A node's own enqueue echoes back on its own subscription carrying its own
+/// origin, which is what lets the forwarder drop the echo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_webhook_enqueue_echoes_with_the_writers_origin() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let mut own = node_a.subscribe_webhook_wakes();
+    let mut other = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut other).await;
+    await_webhook_listener(&node_b, &mut own).await;
+    drain_hints(&mut other).await;
+
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("echo"))
+        .await
+        .unwrap();
+    assert!(written);
+    for hints in [&mut own, &mut other] {
+        let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
+            .await
+            .expect("both nodes hear the enqueue")
+            .expect("the hint channel stays open");
+        assert_eq!(
+            origin,
+            node_a.origin(),
+            "the echo carries the writer's origin"
+        );
+    }
+}
+
+/// A hint is only a hint: with no subscriber on any node the enqueue still
+/// commits, and polling finds the delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhook_enqueue_is_claimable_without_any_subscriber() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("unhinted"))
+        .await
+        .unwrap();
+    assert!(written);
+    let claimed = node_b.claim_webhook_deliveries(10, 60).await.unwrap();
+    assert!(
+        claimed
+            .iter()
+            .any(|delivery| delivery.delivery_id == "unhinted"),
+        "polling must find the row even though no node took its hint"
+    );
+}
+
+/// Requeueing a finished delivery (the operator replay) wakes the other nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeued_webhook_delivery_wakes_other_nodes() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    assert!(
+        node_a
+            .enqueue_webhook_delivery(&webhook_record("replay"))
+            .await
+            .unwrap()
+    );
+    let claimed = node_a.claim_webhook_deliveries(1_000, 60).await.unwrap();
+    let token = claimed
+        .iter()
+        .find(|delivery| delivery.delivery_id == "replay")
+        .and_then(|delivery| delivery.lease_token.clone())
+        .expect("the replayed row is claimable");
+    assert!(
+        node_a
+            .complete_webhook_delivery("replay", &token)
+            .await
+            .unwrap()
+    );
+
+    let mut hints = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut hints).await;
+    assert!(node_a.requeue_webhook_delivery("replay").await.unwrap());
+    let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
+        .await
+        .expect("the requeue must wake node B well before its tick")
+        .expect("the hint channel stays open");
+    assert_eq!(
+        origin,
+        node_a.origin(),
+        "the requeue's hint names the writing node"
     );
 }
 
@@ -2112,4 +2312,231 @@ async fn claim_order_is_served_by_the_global_ready_index() {
         !plan.contains("Sort"),
         "the front read must not sort:\n{plan}"
     );
+}
+
+// ── session deadline and guards ─────────────────────────────────────────
+
+/// A TCP listener that accepts every connection and never answers: the
+/// shape of a database that is hung rather than down. Each accepted socket
+/// is held open by a task that never returns, so the peer sees a live
+/// connection that simply never speaks. Returns its port and how many
+/// connections it accepted.
+async fn silent_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepts);
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _held = socket;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    (port, accepts)
+}
+
+/// A hung database ends the session open at the deadline. Before the connect
+/// deadline, `connect_one` waited on the startup handshake forever, which is
+/// how a stalled Postgres froze engine startup and every pooled reconnect.
+///
+/// The deadline is shortened so the test proves the wait ends at *a*
+/// deadline without spending the production 10 s; the production value is
+/// covered by `the_connect_deadline_error_names_postgres_and_the_deadline`
+/// and by `pooled_sessions_carry_the_control_timeouts`.
+#[tokio::test]
+async fn a_stalled_database_ends_the_session_open_at_the_deadline() {
+    let (port, accepts) = silent_listener().await;
+    let url = format!("postgres://preloop@127.0.0.1:{port}/control");
+    let deadline = std::time::Duration::from_millis(250);
+    let started = std::time::Instant::now();
+    let error = super::connect_one_within(&url, "test-origin", deadline)
+        .await
+        .expect_err("a database that never answers must not open a session");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(200),
+        "the attempt gave up after {elapsed:?}, before the deadline: it must have waited for \
+         the answer, not failed for another reason"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the attempt ended after {elapsed:?}, not at its {deadline:?} deadline"
+    );
+    let message = format!("{error:?}");
+    for needle in ["Postgres", "connect deadline", "0.25"] {
+        assert!(message.contains(needle), "{message}");
+    }
+    assert!(
+        accepts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the TCP connect must have been accepted, so the stall was after it"
+    );
+}
+
+/// Seconds of a time-unit GUC as Postgres reports it (`30s` → 30.0), so the
+/// assertion does not depend on how Postgres prints the value. `extract`
+/// returns `numeric`, which the driver cannot deserialize into `f64` without
+/// the cast.
+async fn setting_seconds(client: &tokio_postgres::Client, name: &str) -> f64 {
+    client
+        .query_one(
+            &format!("SELECT (extract(epoch from current_setting('{name}')::interval))::float8"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// The Postgres message of a driver error. `Display` on a database error is
+/// only `db error`; the server's detail (which timeout fired) is on the
+/// `DbError`.
+fn db_message(error: &tokio_postgres::Error) -> String {
+    error
+        .as_db_error()
+        .map(|detail| detail.message().to_owned())
+        .unwrap_or_else(|| error.to_string())
+}
+
+/// Every pooled session carries the server-side guards, on both pools, at
+/// the values the module documents: a statement that gets past the connect
+/// deadline cannot then hold a runtime worker, a pooled connection and its
+/// row locks forever.
+#[tokio::test]
+async fn pooled_sessions_carry_the_control_timeouts() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        skip_no_postgres();
+        return;
+    };
+    let backend = connect(&url).await;
+    let sessions = [
+        ("writer", backend.writer().await.unwrap()),
+        ("reader", backend.reader().await.unwrap()),
+    ];
+    for (pool, client) in &sessions {
+        for (setting, expected) in [
+            ("statement_timeout", crate::store_pg::STATEMENT_TIMEOUT),
+            ("lock_timeout", crate::store_pg::LOCK_TIMEOUT),
+            (
+                "idle_in_transaction_session_timeout",
+                crate::store_pg::IDLE_IN_TRANSACTION_TIMEOUT,
+            ),
+        ] {
+            assert_eq!(
+                setting_seconds(client, setting).await,
+                expected.as_secs_f64(),
+                "{pool} session {setting}"
+            );
+        }
+    }
+}
+
+/// The statement guard turns a stuck statement into an error at the
+/// deadline. The serving 30 s would make this test take 30 s, so the same
+/// builder installs a short one: what is under test is that the guard SQL
+/// Postgres receives really cancels the statement, with the error naming the
+/// timeout.
+#[tokio::test]
+async fn the_statement_guard_kills_a_stuck_statement() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        skip_no_postgres();
+        return;
+    };
+    let backend = connect(&url).await;
+    let client = backend.writer().await.unwrap();
+    let short = std::time::Duration::from_millis(250);
+    client
+        .batch_execute(&crate::store_pg::session_timeouts_sql_with(
+            short, short, short,
+        ))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = client
+        .batch_execute("SELECT pg_sleep(10)")
+        .await
+        .expect_err("a statement past its deadline must be cancelled");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the statement ran for {elapsed:?} instead of dying at {short:?}"
+    );
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::QUERY_CANCELED),
+        "{error}"
+    );
+    assert!(
+        db_message(&error).contains("statement timeout"),
+        "{}",
+        db_message(&error)
+    );
+}
+
+/// The lock guard ends a lock wait at its own deadline and names the lock,
+/// instead of letting the command queue behind a stuck transaction — the
+/// shape of the incident this family of deadlines exists for. The serving
+/// 15 s would make this test take 15 s, so the lock deadline is shortened
+/// through the same builder.
+#[tokio::test]
+async fn the_lock_guard_kills_a_stuck_lock_wait() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        skip_no_postgres();
+        return;
+    };
+    let backend = connect(&url).await;
+    let mut holder = backend.writer().await.unwrap();
+    let waiter = backend.writer().await.unwrap();
+    holder
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS public.lock_probe (id int PRIMARY KEY); \
+             INSERT INTO public.lock_probe VALUES (1) ON CONFLICT DO NOTHING",
+        )
+        .await
+        .unwrap();
+    let held = holder.transaction().await.unwrap();
+    held.query_one(
+        "SELECT id FROM public.lock_probe WHERE id = 1 FOR NO KEY UPDATE",
+        &[],
+    )
+    .await
+    .unwrap();
+    let short = std::time::Duration::from_millis(250);
+    waiter
+        .batch_execute(&crate::store_pg::session_timeouts_sql_with(
+            std::time::Duration::from_secs(5),
+            short,
+            std::time::Duration::from_secs(5),
+        ))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = waiter
+        .execute(
+            "SELECT id FROM public.lock_probe WHERE id = 1 FOR NO KEY UPDATE",
+            &[],
+        )
+        .await
+        .expect_err("a lock wait past its deadline must be cancelled");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the lock wait ran for {elapsed:?} instead of dying at {short:?}"
+    );
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "{error}"
+    );
+    assert!(
+        db_message(&error).contains("lock timeout"),
+        "{}",
+        db_message(&error)
+    );
+    held.rollback().await.unwrap();
 }

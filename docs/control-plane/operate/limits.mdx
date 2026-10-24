@@ -1,0 +1,84 @@
+---
+title: "Retries and capacity limits"
+description: "Tune retry behavior, pool concurrency, memory ceilings, and queue limits from an operator's perspective."
+---
+
+Preloop retries transient transport and infrastructure failures, but does not retry configuration errors indefinitely. The pool also caps VM concurrency by host memory so the control plane retains headroom.
+
+## Pool memory guard
+
+The runtime reserves 2048 MiB for the host and control plane. For each VM, it uses the configured memory ceiling (at least 1 MiB):
+
+```text
+capacity  = max((host_memory_mib - 2048) / runner_memory_mib, 1)
+by_memory = max(capacity - 1, 1)   # one resident golden is reserved
+by_cpu    = max(host_cpus / max(runner_cpus, 1), 1)
+maximum   = min(by_cpu, by_memory)
+```
+
+Warm pool size is capped by `by_memory`. On-demand slots use `maximum`. If host memory cannot be read, on-demand sizing falls back to CPU and warm sizing keeps the configured pool size. A tiny host still runs one job.
+
+| Host memory | VM ceiling | Effective cap |
+|---:|---:|---:|
+| 22 GiB | 8 GiB | 1 |
+| 64 GiB | 8 GiB | 6 |
+| 32 GiB | 4 GiB | 6 |
+| 8 GiB | 8 GiB | 1 |
+| 4 GiB | 8 GiB | 1 |
+
+A second environment golden consumes another memory budget slot. When no slot is available, the engine boots that job directly from its base image instead of exceeding the cap. A failed bake releases its reservation; a registered golden retains it. Finished VMs are deleted before the next fork is created.
+
+## Capacity settings
+
+| Setting | Default | Operator action |
+|---|---:|---|
+| `PRELOOP_RUNNER_POOL_ENABLED` | `false` | Enable the microVM pool when the host is ready for it. |
+| `PRELOOP_RUNNER_POOL_SIZE` | Derived from CPU and RAM | Warm slots; memory guard still caps it. |
+| `PRELOOP_RUNNER_CPUS` | `8` | vCPUs per VM; reduce it when host CPU is oversubscribed. |
+| `PRELOOP_RUNNER_MEMORY_MIB` | `4096` | VM memory ceiling; values below 1024 fall back to the default. |
+| `PRELOOP_RUNNER_STORAGE_GB` | `80` | Sparse guest disk ceiling. |
+| `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | `20` | Free host disk reserve before starting a VM; `0` disables the reserve. |
+| `PRELOOP_GOLDEN_UNPACK_FACTOR` | `6` | Free-space multiple required while unpacking a golden; values must be at least 1. |
+| `PRELOOP_SKIP_DISK_PREFLIGHT` | off | Any nonblank value except `0` or `false` bypasses disk preflight with a warning. |
+| `PRELOOP_USE_FORK` | `true` | Fork a prepared golden instead of booting each job from scratch. |
+| `PRELOOP_RUNNER_DNS` | `8.8.8.8` | DNS resolver inside guests. |
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Reject API submissions that expand past the cap; `0` disables it. Webhook submissions bypass this guard. |
+| `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | off | Require explicit runner-job assignments when enabled. |
+
+A pool slot retries transient fork failures twice. If teardown still cannot confirm that a machine is gone after three delete attempts (1, 2, then 4 seconds), the slot continues checking with a 1-to-30-second backoff until shutdown. A later engine start sweeps leftovers.
+
+## Control-plane retries
+
+| Operation | Behavior |
+|---|---|
+| Webhook enqueue | 2 attempts within an 8-second acknowledgement budget; each attempt is capped at 4 seconds. |
+| Webhook processing | Six attempts with normal waits of 1, 5, 15, 30, and 30 seconds; see [Webhook resilience](/control-plane/github/webhook-resilience). |
+| App token mint | A `422` permission response is clamped and retried once; a token refusal is a terminal job error under the `error` policy. |
+| DAP bridge connect | 50 attempts at 200 ms, then fail. |
+| Snapshot cache lock | 25 ms polling, stale locks over 60 seconds removed, 10-second deadline. |
+| Debug verdict/event poll | 25-second server poll cap; the runner's debug wait is intentionally unbounded until a verdict arrives. |
+| Action reference resolution | Negative results cache for 60 seconds; positive results for 300 seconds. |
+| Background reaper | Runs every 10 seconds for the process lifetime. |
+| Runner HTTP POST/PUT | Three attempts with 2- and 4-second delays for transport, 429, and 5xx failures. |
+| Server-side GitHub call during push-back | Not retried by the control plane. A transport or 5xx failure is reported as a gateway error and the push-back is recorded as blocked with the upstream message; any other failure is a client error. Retry the publish from the CLI. |
+| Throttled action download (`429`) | Fails that download and trips the shared GitHub breaker at once. While the breaker is open, the next download fails fast with `503` instead of spending another request on the throttled route. |
+
+## Runner retry behavior
+
+| Area | Policy | Bound |
+|---|---|---|
+| Listener reconnect | First five errors sleep in the 15–30-second jitter range; later errors use 30–60 seconds; success resets the counter. | Unbounded until shutdown. |
+| Broker listener | Session backoff; OAuth errors use `min(attempt × 5, 60)` seconds; a deprecated protocol exits. | Unbounded until shutdown. |
+| Container service health | Exponential 2, 4, 8, 16, 32-second polls. | Unbounded; the job timeout ends it. |
+| Docker registry login | Three attempts with 5- and 10-second delays. | Bounded. |
+| First job lease renewal | Five retries with random 1–10-second waits; a 404 abandons the job. | Bounded. |
+| Lease renewal | Every 60 seconds; waits 5–15 seconds initially, then 15–30 seconds; lease expiry is `LockedUntil + 5 minutes`. | Re-acquires once on 401; cancels on 404. |
+| Live logs | Three connection attempts, random 100–500 ms waits, 30-second connect timeout. | Bounded. |
+| Debug `:retry` | At most 25 debug attempts. | Bounded. |
+| Timeline updates | Failed updates return to a 500 ms drain queue and retry on later ticks. | Unbounded wall time; CPU is bounded by the drain cadence. |
+
+An unbounded retry is intentional for a guest expected to recover, such as service health or a suspended debug session. Fix the underlying dependency or cancel the job rather than waiting for a retry count that does not exist.
+
+## Other protocol bounds
+
+The standalone runner client uses a single request with a 30-second default timeout (`PRELOOP_CLIENT_TIMEOUT_SECONDS`). The guest control bridge accepts up to 256 concurrent connections and closes idle connections after 300 seconds. Set these only when remote-runner traffic requires different limits.

@@ -3,7 +3,7 @@ use preloop_orchestrator::{
     DEBUG_MARKER_IDLE, JobVmDiskReserve, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig,
     artifact_payload, node_externals,
 };
-use preloop_vm::{
+use preloop_sandbox::drivers::smolvm::cli::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
     ProviderCapabilities, SecretSource, SocketMount, VmError, VmProvider, VolumeMount,
 };
@@ -51,7 +51,7 @@ struct RecordingVmProvider {
     state: Mutex<ProviderState>,
     run_actions: Mutex<Vec<RunAction>>,
     changed: Notify,
-    /// Whether packs are host files (SmolVM) or live server-side (AgentENV).
+    /// Whether packs are host files (SmolVM) or live server-side (a snapshot backend).
     /// A backend without host-side packs has no artifact to unpack, so its
     /// golden is baked in the guest instead.
     file_packs: bool,
@@ -82,7 +82,7 @@ impl RecordingVmProvider {
         }
     }
 
-    /// Model a backend whose packs are not host files (AgentENV): there is no
+    /// Model a backend whose packs are not host files: there is no
     /// artifact to unpack, so the pool prepares its golden in the guest.
     fn no_packs(mut self) -> Self {
         self.file_packs = false;
@@ -127,6 +127,7 @@ impl RecordingVmProvider {
             created_specs: state.created_specs.clone(),
             events: state.events.clone(),
             pack_calls: state.pack_calls,
+            run_calls: state.run_calls,
         }
     }
 
@@ -141,6 +142,8 @@ struct ProviderStateSnapshot {
     created_specs: Vec<MachineSpec>,
     events: Vec<Event>,
     pack_calls: usize,
+    /// Guest-runner `exec_stream` calls so far, cumulative across pool runs.
+    run_calls: usize,
 }
 
 fn output() -> ExecOutput {
@@ -341,12 +344,33 @@ impl VmProvider for RecordingVmProvider {
 }
 
 struct Fixture {
-    _env_guard: std::sync::MutexGuard<'static, ()>,
+    // Fields drop in declaration order, so the pins go back while the lock is
+    // still held: releasing it first lets the next test repin and then have its
+    // pins clobbered by this fixture's late restore.
     _hermetic_env: HermeticEnvGuard,
+    _lock_still_held: EnvLockStillHeld,
+    _env_guard: std::sync::MutexGuard<'static, ()>,
     root: PathBuf,
     config: RunnerPoolConfig,
     token_env: String,
     token: String,
+}
+
+/// Asserts, on drop, that `TEST_ENV_LOCK` is still held.
+///
+/// `Fixture` drops it between `HermeticEnvGuard` and the lock guard, so releasing
+/// the lock first — the order this fixture had before the fix — fails here
+/// instead of letting the next test repin under the lock and then have its pins
+/// clobbered by this fixture's late restore.
+struct EnvLockStillHeld;
+
+impl Drop for EnvLockStillHeld {
+    fn drop(&mut self) {
+        assert!(
+            TEST_ENV_LOCK.try_lock().is_err(),
+            "Fixture released TEST_ENV_LOCK before HermeticEnvGuard restored the environment"
+        );
+    }
 }
 
 /// Pins the host-sensitive environment for the fixture's lifetime and
@@ -422,6 +446,15 @@ impl Fixture {
         fs::create_dir(&bundle).unwrap();
         let externals_dir = root.join("host-externals");
         stage_fake_node_externals(&externals_dir.join("externals"));
+        // The bundle carries its own copy of the same trees — the release
+        // layout the pool mounts as-is, without the copy `ensure_host_externals`
+        // makes for an incomplete bundle. That copy runs as a child process
+        // with a regular deadline, and a test that pauses the clock drives that
+        // deadline to expiry the moment the runtime goes idle, so the copy would
+        // be killed and the pool would refuse to start. Staging both trees keeps
+        // paused-clock tests free of real process I/O; the copy path itself is
+        // covered by the crate's non-paused lifecycle tests.
+        stage_fake_node_externals(&bundle.join("externals"));
         let artifact_stem = root.join("runner-image");
         if payload_exists {
             fs::write(
@@ -472,10 +505,12 @@ impl Fixture {
             pending_registrations: None,
             preparing_signal: None,
             observability: None,
+            github: None,
         };
         Self {
-            _env_guard: env_guard,
             _hermetic_env: HermeticEnvGuard::new(&root),
+            _lock_still_held: EnvLockStillHeld,
+            _env_guard: env_guard,
             root,
             config,
             token_env,
@@ -655,8 +690,20 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
         1
     );
 
+    // The reuse pass must boot a runner of its own. Wait for one `run` call
+    // more than the first pass produced rather than for a fixed total: the
+    // first pass is cancelled the moment the pack lands, so whether it boots a
+    // runner first depends on where the pool yields between the pack and the
+    // slot's first shutdown check — not on what this test asserts.
+    let boots_before_reuse = provider.snapshot().await.run_calls;
     let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
-    run_until_cancelled(pool, &provider, CancellationToken::new(), 2).await;
+    run_until_cancelled(
+        pool,
+        &provider,
+        CancellationToken::new(),
+        boots_before_reuse + 1,
+    )
+    .await;
     let second = provider.snapshot().await;
     assert_eq!(second.pack_calls, 1);
     assert_eq!(
@@ -672,7 +719,7 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
 /// An artifact build that fails after the builder booted must not strand the
 /// builder: the pool's error path tears its machines down like every other
 /// exit. The CLI's exit guard only reaps hypervisor processes — not the
-/// layer mounts a killed hypervisor holds, and not AgentENV sandboxes.
+/// layer mounts a killed hypervisor holds, and not provider-owned sandboxes.
 #[tokio::test]
 async fn artifact_build_failure_tears_the_builder_down() {
     let fixture = Fixture::new("artifact-fail", false);
@@ -854,9 +901,10 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     assert_eq!(spec.network, NetworkPolicy::PublicOnly);
     // A packed machine reaches node through the artifact's baked symlink
     // (`<root>/externals -> /opt/preloop/bin/externals`): the externals ride
-    // the bundle mount instead of a third virtiofs mount, which the packed
-    // launcher has no IRQ budget for. Only a machine booted from a raw image
-    // carries the separate externals mount.
+    // the bundle mount instead of a third virtiofs mount, which keeps the
+    // device-heaviest launcher config at two mounts (see `runner_volumes`).
+    // Only a machine booted from a raw image carries the separate externals
+    // mount.
     assert_eq!(
         &spec.volumes,
         &vec![
@@ -887,22 +935,26 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     // to tell a controller which VM to open a shell into. The environment is
     // applied by the launcher shell that sources the image's
     // `/etc/environment`, so the argv is `sh -c <launcher>` followed by the
-    // `KEY=value` entries in the same order `env` receives them.
-    let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
+    // `KEY=value` entries in the same order `env` receives them. PATH is not
+    // one of those entries: the launcher exports the image's own PATH and only
+    // falls back to the pool's list when the image declares none.
+    let fallback = preloop_orchestrator::guest_runner_path(&config);
     let machine = format!("PRELOOP_MACHINE_NAME={runner}");
     let expected_prefix = vec![
         "sh".to_owned(),
         "-c".to_owned(),
         [
-            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "PATH=; ",
+            "if [ -r '/etc/environment' ]; then set -a; . '/etc/environment'; set +a; fi; ",
+            &format!("[ -n \"$PATH\" ] || PATH='{fallback}'; "),
+            "export PATH; ",
             "exec /usr/bin/env ",
-            &format!("'{path}' '{machine}' "),
+            &format!("'{machine}' "),
             "'PRELOOP_CONTROL_ORIGIN=https://preloop.example' ",
             "'PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock' ",
             "\"$0\" \"$@\"",
         ]
         .concat(),
-        path.clone(),
         machine.clone(),
         "PRELOOP_CONTROL_ORIGIN=https://preloop.example".to_owned(),
         "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock".to_owned(),
@@ -1028,13 +1080,13 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .map(String::as_str)
             .collect();
         let machine_name = format!("PRELOOP_MACHINE_NAME={runner}");
-        // The runner's fallback PATH is the system directories a hosted step
-        // shell sees; the launcher replaces it with the image's
-        // `/etc/environment` PATH whenever the image declares one. The deleted
-        // Rust/Go language installs (and their `/usr/local/cargo/bin` and
+        // PATH is the launcher's: it exports the image's `/etc/environment`
+        // PATH whenever the image declares one, and only falls back to the
+        // pool's system directories when it does not. The deleted Rust/Go
+        // language installs (and their `/usr/local/cargo/bin` and
         // `/usr/local/go/bin` entries) are gone.
-        let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
-        let mut entries = vec![path.clone(), machine_name.clone()];
+        let fallback = preloop_orchestrator::guest_runner_path(&config);
+        let mut entries = vec![machine_name.clone()];
         entries.extend(expected.iter().map(|entry| (*entry).to_owned()));
         let pairs = entries
             .iter()
@@ -1042,7 +1094,10 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .collect::<Vec<_>>()
             .join(" ");
         let launcher = [
-            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "PATH=; ",
+            "if [ -r '/etc/environment' ]; then set -a; . '/etc/environment'; set +a; fi; ",
+            &format!("[ -n \"$PATH\" ] || PATH='{fallback}'; "),
+            "export PATH; ",
             "exec /usr/bin/env ",
             &pairs,
             " \"$0\" \"$@\"",

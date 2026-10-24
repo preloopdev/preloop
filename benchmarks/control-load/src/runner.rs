@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use preloop_gha_protocol::crypto::{sign_jwt_ps256, AgentRsaKeypair};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde_json::{json, Value};
 
 use crate::metrics::Metrics;
@@ -32,8 +32,8 @@ pub struct JobModel {
 /// standard normal sample by Box-Muller, exponentiated. `rand_distr`'s
 /// `LogNormal` is not used because that crate is unvetted in this workspace.
 fn log_normal_seconds(rng: &mut impl Rng, mu: f64, sigma: f64) -> f64 {
-    let u1: f64 = rng.gen::<f64>().max(f64::MIN_POSITIVE);
-    let u2: f64 = rng.gen();
+    let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+    let u2: f64 = rng.random();
     let normal = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
     (mu + sigma * normal).exp()
 }
@@ -265,7 +265,7 @@ impl Runner {
             .to_owned();
 
         let duration = {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let median = self.model.median.as_secs_f64();
             Duration::from_secs_f64(
                 log_normal_seconds(&mut rng, median.ln(), self.model.sigma)
@@ -333,7 +333,7 @@ impl Runner {
                 }
             }
         }
-        let conclusion = if rand::thread_rng().gen_bool(self.model.failure_rate) {
+        let conclusion = if rand::rng().random_bool(self.model.failure_rate) {
             "failed"
         } else {
             "succeeded"

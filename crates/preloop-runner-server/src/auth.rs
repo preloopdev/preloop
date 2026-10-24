@@ -16,6 +16,23 @@ pub async fn require_protocol_bearer(
         ))
     }
 }
+/// Require the system credential or a Results job runtime token.
+///
+/// This is narrower than [`require_protocol_bearer`]: action-resolution
+/// endpoints must not admit runner-listen, registration, debug-worker, blob,
+/// or other locally signed JWT classes as bearer credentials.
+pub async fn require_results_protocol_bearer(
+    State(shared): State<Arc<SharedState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let bearer = bearer_token(&request)
+        .ok_or_else(|| ApiError::unauthorized("system or job runtime token required"))?;
+    let identity = results_identity(&shared.state, bearer)
+        .map_err(|_| ApiError::unauthorized("system or job runtime token required"))?;
+    request.extensions_mut().insert(identity);
+    Ok(next.run(request).await)
+}
 /// Require that a protocol reporting request is authenticated by the system
 /// credential or by the runtime token minted for the exact job request.
 ///
@@ -69,6 +86,33 @@ pub fn authorize_reporting_request(
             "job runtime token does not own the reporting target",
         ))
     }
+}
+
+/// [`authorize_reporting_request`] plus the liveness rule: the caller must own
+/// the target *and* the attempt must still be live.
+///
+/// A settled attempt's runtime credential is spent — the rule the Results
+/// writes ([`require_live_results_job`]), the cache and artifact writes, and
+/// the live-log ingest all apply — so it must not keep mutating the run's
+/// records (timeline records, logs, console logs) after the attempt has
+/// settled. The credential is handed to workflow code and outlives the
+/// attempt, so without this a finished job could rewrite its own step records
+/// and annotations for the rest of the token's lifetime. Reads stay available,
+/// and the system identity bypasses exactly as it does everywhere else.
+pub async fn authorize_live_reporting_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: Option<&TaskAgentJobRequestRecord>,
+) -> Result<(), ApiError> {
+    authorize_reporting_request(state, headers, request)?;
+    if system_bearer_authorized(state, headers) {
+        return Ok(());
+    }
+    let Some(record) = request else {
+        // Unresolvable targets were refused above for a non-system caller.
+        return Ok(());
+    };
+    require_live_job(state, record.agent_job_id).await
 }
 
 pub async fn require_results_bearer(
@@ -790,11 +834,26 @@ pub fn results_identity(
     Ok(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
 }
 
+/// Whether a Results path's plan segment names the token's plan. The bare plan
+/// id does, and so does the runner's `system.orchestrationId`
+/// (`{planId}.{jobId}.{suffix}`): the runner sends that value as the plan
+/// segment when it addresses its own job, with the plan id as its prefix.
+fn path_names_token_plan(path_plan: &str, token_plan: &str) -> bool {
+    !token_plan.is_empty()
+        && (path_plan == token_plan
+            || path_plan
+                .strip_prefix(token_plan)
+                .is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// Whether a job token addresses the Results target `plan_id` / `job_id`. The
+/// job UUID must match exactly, so a token never reaches another job, and the
+/// plan segment must name the token's own plan (see [`path_names_token_plan`]).
 pub fn results_identity_binds_job(identity: &ResultsIdentity, plan_id: &str, job_id: &str) -> bool {
     match identity {
         ResultsIdentity::System => true,
         ResultsIdentity::Job(identity) => {
-            identity.plan_id == plan_id
+            path_names_token_plan(plan_id, &identity.plan_id)
                 && job_id
                     .parse::<uuid::Uuid>()
                     .is_ok_and(|job| job == identity.job_id)
@@ -833,6 +892,22 @@ pub fn require_canonical_results_job_id(
         .parse::<uuid::Uuid>()
         .map(|job| job.to_string())
         .unwrap_or_else(|_| job_id.to_owned()))
+}
+
+/// The plan a Results handler must key storage by: a job token's own plan.
+///
+/// A runner may address its own job with the plan segment spelled as its
+/// `system.orchestrationId` (`{planId}.{jobId}.__default`), which
+/// `path_names_token_plan` accepts for authorization. A replay path or
+/// metadata key built from that spelling names a namespace no reader resolves
+/// (logs are read back under the plan id, `runs.rs`), so handlers that write
+/// storage use the token's own plan instead. The system identity keeps the
+/// requested segment: engine callers address opaque backend ids.
+pub fn results_storage_plan_id(identity: &ResultsIdentity, requested_plan_id: &str) -> String {
+    match identity {
+        ResultsIdentity::System => requested_plan_id.to_owned(),
+        ResultsIdentity::Job(job) => job.plan_id.clone(),
+    }
 }
 
 /// Runner identity proven by a listen token on this request.
@@ -942,7 +1017,9 @@ fn debug_session_member(path: &str, suffix: &str) -> bool {
 /// refused there. Native management and GUI API prefixes have no legitimate
 /// use from a guest.
 pub async fn runner_surface_only(mut request: Request, next: Next) -> Result<Response, ApiError> {
-    const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/", "/repos/"];
+    // `/setup/*` is the operator's browser-facing App setup. A job VM that
+    // reached it could only ever see 404s, but the socket stays fail-closed.
+    const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/", "/repos/", "/setup/"];
     let path = request.uri().path();
     let worker_debug_route = is_worker_debug_route(request.method(), path);
     let denied = DENIED_PREFIXES
@@ -1239,5 +1316,60 @@ mod job_scoped_repo_read_tests {
             &axum::http::Method::POST,
             "/api/v3/repos/o/r/tarball/main"
         ));
+    }
+}
+
+#[cfg(test)]
+mod runner_surface_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn the_guest_socket_refuses_the_browser_setup_pages() {
+        let app = axum::Router::new()
+            .route("/setup/github", axum::routing::get(|| async { "form" }))
+            .route(
+                "/setup/github/callback",
+                axum::routing::get(|| async { "callback" }),
+            )
+            .route(
+                "/runner/message",
+                axum::routing::get(|| async { "message" }),
+            )
+            .layer(axum::middleware::from_fn(runner_surface_only));
+        for path in ["/setup/github", "/setup/github/callback"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be reachable from a job VM"
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/runner/message")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the runner protocol still passes"
+        );
     }
 }

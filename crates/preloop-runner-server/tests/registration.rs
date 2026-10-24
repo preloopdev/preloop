@@ -28,7 +28,7 @@ async fn broker_claim_restates_narrowed_repository_permissions() {
             get(|| async { Json(json!([{"id": 4242, "account": {"login": "owner"}}])) }),
         )
         .route(
-            "/app/installations/:installation_id",
+            "/app/installations/{installation_id}",
             get(|Path(installation_id): Path<u64>| async move {
                 assert_eq!(installation_id, 4242);
                 Json(json!({
@@ -41,7 +41,7 @@ async fn broker_claim_restates_narrowed_repository_permissions() {
             }),
         )
         .route(
-            "/app/installations/:installation_id/access_tokens",
+            "/app/installations/{installation_id}/access_tokens",
             post({
                 let access_token_calls = access_token_calls.clone();
                 move |Path(installation_id): Path<u64>, body: Json<Value>| {
@@ -81,7 +81,7 @@ async fn broker_claim_restates_narrowed_repository_permissions() {
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -262,7 +262,7 @@ async fn a_completed_job_drops_its_deferred_token_request() {
         format!("http://127.0.0.1:{closed_port}"),
     );
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -414,7 +414,7 @@ async fn persisted_token_request_without_trust_metadata_fails_closed() {
     // Broker/mint assertion: an old request (untrusted by fail-closed
     // default) under the `pat` policy must not receive the PAT when the mint
     // fails — `local-workspace-only` fails before any network I/O.
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let mut creds = GitHubAppCredentials::for_tests("424", private_key, MintFailurePolicy::Pat);
@@ -1297,7 +1297,7 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
     // A key is needed to populate the credentials but is never exercised: a
     // `repository` with no `owner/repo` slug cannot be scoped to a repository,
     // so the mint fails before it signs anything or opens a socket.
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
 
     for policy in [MintFailurePolicy::LocalJwt, MintFailurePolicy::Error] {
         let temp = tempfile::tempdir().unwrap();
@@ -1363,7 +1363,7 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
 
     // `local-workspace-only` carries no `owner/repo` slug, so the mint fails
     // before it signs anything or opens a socket.
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -1581,7 +1581,7 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
             }),
         )
         .route(
-            "/app/installations/:installation_id/access_tokens",
+            "/app/installations/{installation_id}/access_tokens",
             post(|Path(installation_id): Path<u64>| async move {
                 assert_eq!(installation_id, 4242);
                 Json(json!({
@@ -1627,7 +1627,7 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
-        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+        RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
         MintFailurePolicy::LocalJwt,
     ));
     let shared = Arc::new(SharedState {
@@ -1742,7 +1742,7 @@ async fn app_only_server_resolves_pull_request_changed_files_with_installation_t
             }),
         )
         .route(
-            "/app/installations/:installation_id/access_tokens",
+            "/app/installations/{installation_id}/access_tokens",
             post(
                 |Path(installation_id): Path<u64>, body: Json<Value>| async move {
                     assert_eq!(installation_id, 4242);
@@ -1783,7 +1783,7 @@ async fn app_only_server_resolves_pull_request_changed_files_with_installation_t
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
-        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+        RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
         MintFailurePolicy::LocalJwt,
     ));
     let shared = Arc::new(SharedState {

@@ -31,6 +31,16 @@ pub async fn record_flows_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    // The webhook route performs its own bounded admission (see
+    // `routes::MAX_CONCURRENT_WEBHOOK_UPLOADS`) and persists each delivery
+    // separately, but this recorder sits outside that gate and reads the whole
+    // body here first — before the HMAC check — so with `--record-flows` it
+    // would buffer exactly the uploads the gate exists to bound. Let webhook
+    // deliveries through unrecorded; every other route is recorded as before.
+    if request.uri().path() == "/api/v1/github/webhooks" {
+        return next.run(request).await;
+    }
+
     let has_file = {
         let inner = state.inner.lock().await;
         inner.flows_file.is_some()

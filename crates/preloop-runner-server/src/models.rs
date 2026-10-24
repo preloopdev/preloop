@@ -666,6 +666,13 @@ pub struct WebhookDeliveryRecord {
     /// renew or finalize a lease that another worker has reclaimed.
     #[serde(default)]
     pub lease_token: Option<String>,
+    /// App id of the webhook signer whose HMAC verified this delivery.
+    ///
+    /// `None` for the legacy shared secret and for rows written before this
+    /// column existed. Processing pins credential selection to this App, so a
+    /// delivery signed by App B cannot run with App A's installation.
+    #[serde(default)]
+    pub signer_app_id: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -776,6 +783,18 @@ pub struct WebhookRedeliveryRecord {
     pub resolved_at_us: Option<i64>,
     pub last_error: Option<String>,
 }
+fn new_pending_cache_upload_lock() -> Arc<tokio::sync::Mutex<()>> {
+    Arc::new(tokio::sync::Mutex::new(()))
+}
+
+fn new_pending_cache_upload_quota() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(0))
+}
+
+fn new_pending_cache_upload_invalidated() -> Arc<std::sync::atomic::AtomicBool> {
+    Arc::new(std::sync::atomic::AtomicBool::new(false))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingCache {
     pub key: String,
@@ -796,6 +815,24 @@ pub struct PendingCache {
     /// against.
     #[serde(default)]
     pub staging_len: u64,
+    /// Serializes body streams, commits, and TTL reaping for this reservation
+    /// without holding `InnerState` during file I/O. The lock is node-local
+    /// and is recreated after any deserialization.
+    #[serde(skip, default = "new_pending_cache_upload_lock")]
+    pub upload_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Remaining per-upload byte permits. Committed bytes are forgotten from
+    /// this semaphore; failed/cancelled requests drop their permits.
+    #[serde(skip, default = "new_pending_cache_upload_quota")]
+    pub upload_quota: Arc<tokio::sync::Semaphore>,
+    /// Shared pending-byte permits for this job's reservations. `None` is used
+    /// for system-token reservations, which intentionally bypass job quotas.
+    #[serde(skip)]
+    pub job_quota: Option<Arc<tokio::sync::Semaphore>>,
+    /// Set synchronously when a cancelled request may have left an uncertain
+    /// file prefix. Commit/retry paths fail closed until the reservation is
+    /// reaped.
+    #[serde(skip, default = "new_pending_cache_upload_invalidated")]
+    pub invalidated: Arc<std::sync::atomic::AtomicBool>,
     /// Unix seconds the reservation was made. The TTL sweeper frees
     /// abandoned reservations; only `cache_commit` removed them before, so a
     /// job that never commits leaked the in-memory bytes forever.

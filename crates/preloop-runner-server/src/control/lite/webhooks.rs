@@ -82,15 +82,16 @@ impl LiteBackend {
                 .execute(
                     "INSERT INTO webhook_deliveries (delivery_id, installation_id, event, \
                          payload, received_at, state, attempts, lease_until, lease_token, \
-                         last_error) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                         signer_app_id, last_error) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                      ON CONFLICT (delivery_id) DO UPDATE SET \
                          installation_id = excluded.installation_id, \
                          event = excluded.event, \
                          payload = excluded.payload, \
                          received_at = excluded.received_at, \
                          state = 'received', attempts = 0, lease_until = NULL, \
-                         lease_token = NULL, last_error = NULL \
+                         lease_token = NULL, signer_app_id = excluded.signer_app_id, \
+                         last_error = NULL \
                      WHERE webhook_deliveries.state = 'failed'",
                     params![
                         delivery.delivery_id,
@@ -102,6 +103,7 @@ impl LiteBackend {
                         delivery.attempts as i64,
                         delivery.lease_until_us,
                         delivery.lease_token,
+                        delivery.signer_app_id,
                         delivery.last_error,
                     ],
                 )
@@ -145,7 +147,8 @@ impl LiteBackend {
                      SET state = 'processing', lease_until = ?1, attempts = attempts + 1, \
                          lease_token = ?2 \
                      WHERE delivery_id = ?3 \
-                     RETURNING delivery_id, event, payload, received_at, attempts, last_error",
+                     RETURNING delivery_id, event, payload, received_at, attempts, last_error, \
+                         signer_app_id",
                 )
                 .map_err(db)?;
             let mut claimed = Vec::with_capacity(ids.len());
@@ -162,6 +165,7 @@ impl LiteBackend {
                             row.get::<_, i64>(3)?,
                             attempts,
                             row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
                         ))
                     })
                     .map_err(db)?;
@@ -194,6 +198,7 @@ impl LiteBackend {
                     attempts: record.4.max(0) as u32,
                     lease_until_us: Some(until),
                     lease_token: Some(token),
+                    signer_app_id: record.6,
                     last_error: record.5,
                 });
             }
@@ -311,7 +316,7 @@ impl LiteBackend {
             let row = tx
                 .query_row(
                     "SELECT delivery_id, event, payload, received_at, state, attempts, \
-                         lease_until, lease_token, last_error \
+                         lease_until, lease_token, last_error, signer_app_id \
                      FROM webhook_deliveries WHERE delivery_id = ?1",
                     [delivery_id],
                     |row| {
@@ -327,6 +332,7 @@ impl LiteBackend {
                                 attempts: attempts.max(0) as u32,
                                 lease_until_us: row.get(6)?,
                                 lease_token: row.get(7)?,
+                                signer_app_id: row.get(9)?,
                                 last_error: row.get(8)?,
                             },
                             row.get::<_, String>(4)?,

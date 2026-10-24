@@ -95,6 +95,14 @@ pub(crate) async fn run_action_from_dir_nested(
 ) -> Result<()> {
     let manifest = super::factory::load_action_manifest(action_dir)?;
 
+    // The action is now running: register its post hook, exactly where the
+    // official runner does — `ActionRunner.RunAsync` registers the post job
+    // step for the Pre and the Main stage once `taskManager.LoadAction` has
+    // returned a definition. A step whose action never resolves or loads, or
+    // whose environment or file commands failed before reaching this handler,
+    // therefore registers nothing and its post hook is skipped.
+    ctx.hooks.register(&ctx.step_id);
+
     match manifest.runs_using.as_str() {
         "node12" | "node16" | "node20" | "node22" | "node24" => {
             if manifest.runs_using == "node12" || manifest.runs_using == "node16" {

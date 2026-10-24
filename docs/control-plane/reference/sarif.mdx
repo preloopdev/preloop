@@ -1,0 +1,159 @@
+---
+title: Code-scanning SARIF
+description: Upload SARIF analyses through the GitHub code-scanning shim or the native run API.
+---
+
+Preloop stores [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html)
+analyses so a GitHub-code-scanning upload step completes on an engine-hosted
+run and so a run can publish findings without GitHub at all. Every upload is
+normalized into the pieces a UI or check annotation needs — tool, rule, level,
+message, path, line range, fingerprint and suppression state — and the raw
+document is kept next to the normalized rows.
+
+Two surfaces share one store:
+
+| Surface | Purpose |
+|---|---|
+| `POST /api/v3/repos/{owner}/{repo}/code-scanning/sarifs` (and the unprefixed `/repos/...` alias) | The legacy GitHub code-scanning upload. |
+| `PUT /api/v3/repos/{owner}/{repo}/code-scanning/analysis` (and the alias) | The endpoint current `github/codeql-action` releases upload to. |
+| `GET /api/v3/repos/{owner}/{repo}/code-scanning/sarifs/{id}` | The status read `upload-sarif` polls. |
+| `GET /api/v3/repos/{owner}/{repo}/code-scanning/analyses` | The list behind `analyses_url`. |
+| `GET /api/v3/repos/{owner}/{repo}/actions/runs/{run_id}` | The Actions run read `upload-sarif` performs while deriving its analysis key. |
+| `POST /api/v1/runs/{run_id}/sarif` | Native upload: raw `application/sarif+json` or a JSON wrapper. |
+| `GET /api/v1/runs/{run_id}/sarif` | The run's stored analyses. |
+| `GET /api/v1/sarif/{analysis_id}` | Metadata plus normalized findings. |
+| `GET /api/v1/sarif/{analysis_id}/raw` | The stored SARIF document (`application/sarif+json`). |
+
+## Authentication
+
+The GitHub shim authenticates the **job runtime token** (the credential a
+workflow step receives as `GITHUB_TOKEN`): `Bearer <token>`, Octokit's
+`token <token>`, or Basic `x-access-token:<token>`. The token is resolved
+through the job → run → submission chain, so the repository and run come from
+the credential, never from the request body. A token for another repository is
+rejected with `403`.
+
+The native run API accepts the same job runtime token — it must belong to the
+`{run_id}` in the path — or the system token. Native errors keep the usual
+`{ "error": ... }` envelope; the GitHub shim answers with GitHub's
+`{ "message": ..., "documentation_url": ... }` shape.
+
+## Upload limits
+
+| Limit | Value |
+|---|---|
+| Request body (base64 + JSON envelope) | 24 MiB |
+| Compressed SARIF | 10 MiB |
+| Decompressed SARIF | 32 MiB |
+| Normalized findings per analysis | 25,000 |
+
+A payload over a limit is refused with `413`; malformed base64, gzip, JSON or
+a SARIF version other than 2.1.0 is refused with `400`.
+
+## GitHub payload
+
+The shim accepts the payload `upload-sarif` sends: `sarif` is
+`base64(gzip(SARIF))`, `commit_sha` (the legacy endpoint's name) or
+`commit_oid` (the current endpoint's name), `ref`, and optionally `tool_name`,
+`tool_names`, `checkout_uri`, `started_at`, `analysis_key`, `environment`,
+`base_ref` and `base_sha`.
+
+A successful upload answers `202`:
+
+```json
+{
+  "id": "6f0b1f9e-6c2e-4a9f-9f4f-0f1c2b3a4d5e",
+  "url": "http://127.0.0.1:9090/api/v3/repos/owner/repo/code-scanning/sarifs/6f0b1f9e-6c2e-4a9f-9f4f-0f1c2b3a4d5e"
+}
+```
+
+The status read the action polls answers
+`{"processing_status":"complete","analyses_url":…,"sarif_id":…,"errors":[]}`.
+Parsing is synchronous, so an analysis is `complete` by the time the first
+status read lands. Unknown ids and ids belonging to another repository both
+answer `404`.
+
+## Native payload
+
+`POST /api/v1/runs/{run_id}/sarif` accepts either the SARIF document itself:
+
+```bash
+curl -X POST "$PRELOOP_URL/api/v1/runs/$RUN_ID/sarif" \
+  -H "Authorization: Bearer $PRELOOP_TOKEN" \
+  -H "Content-Type: application/sarif+json" \
+  --data-binary @results.sarif
+```
+
+or a wrapper whose `sarif` field is the document object or a
+`base64(gzip(SARIF))` string. Optional wrapper fields: `commit_sha`, `ref`,
+`tool_name`, `tool_names`, `checkout_uri`, `started_at`, `analysis_key`,
+`environment`. Missing `commit_sha`/`ref` default to the run's own submission.
+A `Content-Encoding: gzip` body is decompressed before parsing.
+
+The response is `202`:
+
+```json
+{
+  "analysis_id": "6f0b1f9e-…",
+  "run_id": "…",
+  "status": "complete",
+  "finding_count": 2,
+  "deduplicated": false,
+  "url": "/api/v1/sarif/6f0b1f9e-…"
+}
+```
+
+`GET /api/v1/sarif/{analysis_id}` returns the analysis metadata and the
+findings:
+
+```json
+{
+  "analysis": { "analysis_id": "…", "tool_name": "CodeQL", "finding_count": 2, "status": "complete", "…": "…" },
+  "findings": [
+    {
+      "fingerprint": "…",
+      "tool_name": "CodeQL",
+      "rule_id": "js/sql-injection",
+      "rule_name": "…",
+      "level": "error",
+      "message": "Query built from user input",
+      "path": "src/db.js",
+      "start_line": 12,
+      "end_line": 14,
+      "start_column": 3,
+      "end_column": 20,
+      "partial_fingerprint": "primaryLocationLineHash=deadbeef:1",
+      "suppression": null
+    }
+  ]
+}
+```
+
+## Idempotency
+
+An upload is deduplicated on a content fingerprint over the repository,
+commit, ref, tool name and the sorted finding fingerprints — `partialFingerprints`
+first, then `fingerprints`, then a value derived from the location and
+message. Re-uploading the same findings for the same commit reuses the stored
+analysis (the same `id`/`analysis_id`), even when the raw bytes differ in
+formatting or result order. Findings inside one analysis are deduplicated on
+their fingerprint, so a producer that lists the same issue twice stores it
+once.
+
+## Storage
+
+Raw SARIF is gzip-compressed in `<state-dir>/sarif/<analysis-id>.sarif.gz`.
+Metadata lives in the control database (`sarif_analyses`) and normalized
+findings in `sarif_findings`, so list/read work on every node sharing the
+database; the raw-document read is served by the node whose state directory
+holds the file.
+
+## Analysis-key derivation
+
+`github/codeql-action` derives its `analysis_key` from
+`GET /repos/{owner}/{repo}/actions/runs/{run_id}` when the workflow does not
+supply one. The engine answers that read from the caller's job token (the
+segment the action sends is `NaN`, because Octokit coerces the engine's UUID
+run id) and returns the run's repository-relative workflow `path` with
+`workflow_url: null`, which is the action's documented fallback — so it does
+not make a second workflow request. Only the caller's own run is served.

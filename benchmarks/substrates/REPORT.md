@@ -32,7 +32,7 @@ preloop `0.2.0` built from this worktree, release profile.
 | Backend selection, guest-access routing for `shell`/`debug` | `crates/preloop-cli/src/main.rs` |
 | `ProviderCapabilities` + orchestrator branches | `crates/preloop-vm/src/lib.rs`, `crates/preloop-orchestrator/src/lib.rs` |
 | Contract tests against a recording fake `aenv` (16 tests) | `crates/preloop-vm/tests/agentenv_provider.rs` |
-| Design, mapping, capability gaps, host prerequisites | `docs/vm-substrates.md` |
+| Design, mapping, capability gaps, host prerequisites | `docs/control-plane/architecture/sandboxes.mdx` |
 | Benchmark harnesses + raw samples | `benchmarks/substrates/` |
 
 `PRELOOP_VM_BACKEND=smolvm|agentenv` is authoritative; unset, AgentENV is
@@ -353,7 +353,7 @@ from upstream documentation, not measurement.
 
 ## 5. What AgentENV costs operationally
 
-Discovered while integrating, all documented in `docs/vm-substrates.md`:
+Discovered while integrating, all documented in `docs/control-plane/architecture/sandboxes.mdx`:
 
 1. **No host bind mounts.** Volumes are block devices; there is no
    virtiofs/9p passthrough. `MachineSpec::volumes` is materialized by streaming

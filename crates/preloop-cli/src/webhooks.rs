@@ -68,6 +68,10 @@ pub(crate) async fn run(args: WebhooksArgs) -> anyhow::Result<()> {
 }
 
 /// Every call shares the CLI's one client, base URL and native bearer.
+///
+/// These are one-shot control reads and a requeue, so they carry
+/// [`crate::ENGINE_CONTROL_TIMEOUT`]: a wedged engine must fail the command
+/// rather than park it until the client's 600-second idle read.
 async fn get(path: &str) -> anyhow::Result<serde_json::Value> {
     request(reqwest::Method::GET, path).await
 }
@@ -79,7 +83,9 @@ async fn request(method: reqwest::Method, path: &str) -> anyhow::Result<serde_js
         base.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    let mut builder = crate::build_client().request(method, &url);
+    let client = crate::build_client();
+    let mut builder =
+        crate::engine_request(&client, method, url.clone(), crate::ENGINE_CONTROL_TIMEOUT);
     if let Some(token) = crate::api_token() {
         builder = builder.bearer_auth(token);
     }

@@ -107,7 +107,9 @@ pub async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), 
             match msg {
                 Ok(WsMessage::Text(text)) => {
                     target_sink
-                        .send(tokio_tungstenite::tungstenite::Message::Text(text))
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            bytes::Bytes::from(text).try_into()?,
+                        ))
                         .await
                         .map_err(|e| anyhow::anyhow!("target ws send: {e}"))?;
                 }
@@ -128,7 +130,7 @@ pub async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), 
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                     ws_sink
-                        .send(WsMessage::Text(text))
+                        .send(WsMessage::Text(bytes::Bytes::from(text).try_into()?))
                         .await
                         .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
                 }

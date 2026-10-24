@@ -1159,7 +1159,7 @@ async fn cancel_holder_inner(
 ) -> Result<CanceledWork, ControlError> {
     match holder {
         concurrency::Holder::Run(run_id) => {
-            let cancelled = cancel_run_tx(backend, tx, *run_id, reason).await?;
+            let (cancelled, _) = cancel_run_tx(backend, tx, *run_id, reason).await?;
             Ok(CanceledWork {
                 cancellations: cancelled,
             })
@@ -2180,7 +2180,12 @@ pub(super) async fn on_job_enqueued(
             return Ok(());
         }
     }
-    if pool_assignments {
+    if pool_assignments || require_assignments {
+        // No free runner: mark pool-pending so provisioning sees it. Under
+        // strict assignments the mark is also the job's claim visa after the
+        // binding TTL, so it must be written even with the pool off —
+        // otherwise the job is ready with no intent row and no runner may
+        // ever claim it.
         tx.execute(
             "INSERT INTO provision_requests (run_id, job_id, namespace_id, pool_key, labels) \
              VALUES ($1::text::uuid,$2,$3,$4,$5::text::jsonb) ON CONFLICT DO NOTHING",
@@ -2225,7 +2230,8 @@ pub(super) async fn clear_assignment(
 
 /// `cancel_run_inner` parity: settle every non-terminal job, queue a
 /// cancellation for in-flight attempts, retire expandable-node requests,
-/// release every concurrency presence. Returns cancellations queued.
+/// release every concurrency presence. Returns cancellations queued and
+/// whether this transaction cancelled a live run.
 ///
 /// Statements: `SELECT job_id, status FROM jobs .. FOR UPDATE`; per
 /// in-flight job one deduped `INSERT INTO job_cancellations`; one `UPDATE
@@ -2239,7 +2245,7 @@ async fn cancel_run_tx(
     tx: &Transaction<'_>,
     run_id: RunId,
     reason: Option<&str>,
-) -> Result<usize, ControlError> {
+) -> Result<(usize, bool), ControlError> {
     let _ = reason;
     // In-flight attempts get a pending cancellation the next poll delivers;
     // every other non-terminal job simply turns terminal (its runner holds
@@ -2337,7 +2343,7 @@ async fn cancel_run_tx(
         )
         .await?;
     }
-    Ok(cancellations)
+    Ok((cancellations, finalized > 0))
 }
 
 /// Cancellation bookkeeping for the cancel commands: mark a
@@ -2492,7 +2498,8 @@ impl PgBackend {
             tx.rollback().await.map_err(db)?;
             return Err(ControlError::NotFound(format!("run {run_id}")));
         }
-        let cancellations = cancel_run_tx(self, &tx, run_id, reason.as_deref()).await?;
+        let (cancellations, run_cancelled) =
+            cancel_run_tx(self, &tx, run_id, reason.as_deref()).await?;
         let (cancelled_jobs, queue_nonempty, next_runs_on, pending_cancels) =
             cancel_outcome_gauges(&tx, run_id).await?;
         let record = self
@@ -2501,6 +2508,7 @@ impl PgBackend {
             .map(|graph| graph.record);
         tx.commit().await.map_err(db)?;
         Ok(CancelOutcome {
+            run_cancelled,
             cancellations,
             run_status: record.as_ref().map(|record| record.status),
             queue_nonempty: queue_nonempty || pending_cancels,
@@ -2530,6 +2538,7 @@ impl PgBackend {
             .map(|graph| graph.record);
         tx.commit().await.map_err(db)?;
         Ok(CancelOutcome {
+            run_cancelled: false,
             cancellations,
             run_status: record.as_ref().map(|record| record.status),
             queue_nonempty: queue_nonempty || pending_cancels,
@@ -3995,6 +4004,7 @@ pub(super) async fn append_event_tx(
 /// lands in `retired` — and put the node back at the head of the ready
 /// queue (its `jobs` row goes back to `queued`/`ready`).
 pub(super) async fn requeue_claimed_tx(
+    backend: &PgBackend,
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
@@ -4032,6 +4042,13 @@ pub(super) async fn requeue_claimed_tx(
     )
     .await
     .map_err(db)?;
+    // Back on the ready queue: derive the same dispatch intent enqueue would
+    // have. The bare delete above leaves nothing behind, and under strict
+    // assignments a ready job with no assignment/provision row is
+    // unclaimable forever (only the boot rebuild repairs it).
+    if let Some(graph) = PgBackend::load_graph(backend, tx, run_id).await? {
+        on_job_enqueued(backend, tx, &graph, job_id).await?;
+    }
     // The job is requestable again: `job.requested.v1` marks the fresh
     // head-of-queue request (same transition the initial queue observed).
     emit_outbox(
@@ -4127,6 +4144,7 @@ async fn retry_attempt_tx(
     message.job_id = agent_job_id;
     message.request_id = retry;
     message.plan.plan_id = agent_job_id.to_string();
+    logic::reprefix_orchestration_id(&mut message, agent_job_id);
     message.timeline.id = timeline_id;
     PgBackend::write_node_message(tx, run_id, job_id, &message).await?;
     tx.execute(

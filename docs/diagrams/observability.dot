@@ -1,0 +1,59 @@
+digraph observability {
+  graph [rankdir=LR, bgcolor="white", splines=spline, nodesep=0.22, ranksep=0.6, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.12,0.07"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  /* ===== signal sources ===== */
+  subgraph cluster_src {
+    label="Signal sources"; fontsize=13; fontcolor="#7c3aed"; style="rounded,dashed"; color="#7c3aed"; margin=12;
+    src_http   [label="HTTP middleware\nhttp_metrics_middleware\nrequest duration, active\nW3C traceparent, spans", fillcolor="#ede9fe"];
+    src_jobs   [label="Job and broker lifecycle\npreloop.job.completed\npreloop.job.queue.wait\npreloop.broker.poll", fillcolor="#ede9fe"];
+    src_pool   [label="Runner pool\nPoolStatus snapshot\npreloop.pool.slot_failures", fillcolor="#ede9fe"];
+    src_host   [label="Host and VM telemetry\nsample_host(): RAM, swap, RSS\nVM fleet registry", fillcolor="#ede9fe"];
+    src_github [label="GitHub webhook health\nwebhook watchdog, App health\nGitHub status section", fillcolor="#ede9fe"];
+    src_logs   [label="Log events\ntracing events, export_log()\nRUST_LOG, PRELOOP_LOG_FORMAT", fillcolor="#ede9fe"];
+  }
+
+  /* ===== collection ===== */
+  subgraph cluster_coll {
+    label="preloop-observability"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    tracing [label="tracing subscriber\nfmt layer, EnvFilter\nOTel log bridge", fillcolor="#e0f2fe"];
+    tracer  [label="SdkTracerProvider\nrequest spans\nOTLP/HTTP batch exporter", fillcolor="#e0f2fe"];
+    logger  [label="SdkLoggerProvider\nlog records\nOTLP/HTTP batch exporter", fillcolor="#e0f2fe"];
+    meter   [label="SdkMeterProvider\nManualReader for /metrics\nPeriodicReader, 60 s, OTLP", fillcolor="#e0f2fe"];
+    sampler [label="State sampler, every 5 s\nOperationalSnapshot cache\npool, queue, host gauges", fillcolor="#bae6fd"];
+    { rank=same; tracing; tracer; logger; meter; sampler; }
+  }
+
+  /* ===== sinks ===== */
+  subgraph cluster_sink {
+    label="Sinks"; fontsize=13; fontcolor="#15803d"; style="rounded,dashed"; color="#22c55e"; margin=12;
+    prom   [label="/metrics\nPrometheus text 0.0.4\nnative bearer token", fillcolor="#dcfce7"];
+    status [label="/api/v1/status\nOperationalSnapshot JSON\nnative bearer token", fillcolor="#dcfce7"];
+    otlp   [label="OTLP/HTTP endpoints\nOTEL_EXPORTER_OTLP_ENDPOINT\nor per-signal *_ENDPOINT", fillcolor="#dcfce7"];
+    o2     [label="OpenObserve (optional)\ncontrib/openobserve\nlisten 127.0.0.1:5080", fillcolor="#bbf7d0"];
+    stderr [label="stderr or journald\nalways kept, even with OTLP", fillcolor="#dcfce7"];
+    { rank=same; prom; status; otlp; o2; stderr; }
+  }
+
+  src_http   -> meter  [label="metrics"];
+  src_http   -> tracer [label="spans"];
+  src_jobs   -> meter;
+  src_pool   -> sampler;
+  src_pool   -> meter  [label="slot failures"];
+  src_host   -> sampler;
+  src_github -> sampler;
+  src_logs   -> tracing;
+  src_logs   -> logger [label="export_log"];
+
+  tracing -> logger;
+  tracing -> stderr;
+  sampler -> meter   [constraint=false, label="gauges"];
+  sampler -> status;
+
+  meter  -> prom;
+  meter  -> otlp;
+  tracer -> otlp;
+  logger -> otlp;
+  otlp   -> o2 [style=dashed, constraint=false];
+}

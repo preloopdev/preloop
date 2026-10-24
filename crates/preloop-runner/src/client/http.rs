@@ -1,7 +1,7 @@
 //! Shared HTTP client with CA bundle and proxy support.
 
 use anyhow::{Context, Result};
-use rand::Rng;
+use rand::RngExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use std::path::Path;
 use std::time::Duration;
@@ -31,7 +31,7 @@ impl SessionBackoff {
         } else {
             (30_000, 60_000)
         };
-        Duration::from_millis(rand::thread_rng().gen_range(min..max))
+        Duration::from_millis(rand::rng().random_range(min..max))
     }
 
     pub(crate) fn reset(&mut self) {
@@ -46,6 +46,19 @@ impl SessionBackoff {
 
 fn is_transient_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Redact the credential segment of a `/twirp-blob/…` upload URL for logs.
+///
+/// Blob upload URLs carry their capability JWT in the path, so tracing must
+/// never render the token: keep everything through the `/twirp-blob/` marker
+/// and drop the rest. Non-blob URLs are returned byte-identical so general
+/// debuggability is unchanged.
+fn redact_blob_url(url: &str) -> std::borrow::Cow<'_, str> {
+    match url.split_once("/twirp-blob/") {
+        Some((prefix, _)) => std::borrow::Cow::Owned(format!("{prefix}/twirp-blob/<redacted>")),
+        None => std::borrow::Cow::Borrowed(url),
+    }
 }
 
 /// Shared HTTP client wrapping reqwest with CA bundle, proxy, and auth.
@@ -65,18 +78,36 @@ struct ControlTransport {
     client: reqwest::Client,
 }
 
+/// Deadline for one runner HTTP request.
+///
+/// Sized for the longest legitimate call: the message-poll endpoints hold the
+/// connection open for up to 100 s (`MESSAGE_POLL_TIMEOUT` in
+/// `client/broker.rs`, and the upstream runner's own poll window), so a
+/// shorter deadline would cut a healthy long-poll short. Per-request
+/// overrides (`get_long_poll`) still apply on top.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(100);
+
+/// Deadline for establishing one connection, so an engine or forge that
+/// accepts no TCP connection fails the call instead of parking the runner.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn build_reqwest_client(ca_pem: Option<&[u8]>, socket: Option<&Path>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(100))
-        .connect_timeout(Duration::from_secs(30))
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .user_agent(format!(
             "preloop-runner/{} (protocol-compat {})",
             crate::VERSION,
             crate::PROTOCOL_COMPAT_VERSION
         ));
-    if let Some(pem) = ca_pem {
-        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(pem)?);
-    }
+    // Verify against the workspace's in-process root set (bundled Mozilla
+    // anchors, the OS store read once with a deadline, plus the
+    // `PRELOOP_GITHUB_CA_FILE`/`SSL_CERT_FILE` bundles), with the caller's
+    // explicit `ca_bundle` merged in, instead of reqwest's default platform
+    // verifier: on macOS that verifier calls `SecTrustEvaluateWithError`
+    // inside the handshake, which asks `trustd`/`securityd` with no deadline,
+    // so a hung trust daemon would hang every runner request.
+    builder = builder.use_preconfigured_tls(preloop_observability::tls::client_config(ca_pem)?);
     if let Some(socket) = socket {
         #[cfg(unix)]
         {
@@ -314,7 +345,8 @@ impl HttpClient {
             if attempt > 0 {
                 let delay = Duration::from_secs(1 << attempt); // 2s, 4s
                 tracing::warn!(
-                    "Retrying POST {url} (attempt {}, backoff {delay:?})",
+                    "Retrying POST {} (attempt {}, backoff {delay:?})",
+                    redact_blob_url(url),
                     attempt + 1
                 );
                 tokio::time::sleep(delay).await;
@@ -509,7 +541,8 @@ impl HttpClient {
             if attempt > 0 {
                 let delay = Duration::from_secs(1 << attempt);
                 tracing::warn!(
-                    "Retrying PUT {url} (attempt {}, backoff {delay:?})",
+                    "Retrying PUT {} (attempt {}, backoff {delay:?})",
+                    redact_blob_url(url),
                     attempt + 1
                 );
                 tokio::time::sleep(delay).await;
@@ -557,7 +590,8 @@ impl HttpClient {
             if attempt > 0 {
                 let delay = Duration::from_secs(1 << attempt);
                 tracing::warn!(
-                    "Retrying PUT {url} (attempt {}, backoff {delay:?})",
+                    "Retrying PUT {} (attempt {}, backoff {delay:?})",
+                    redact_blob_url(url),
                     attempt + 1
                 );
                 tokio::time::sleep(delay).await;
@@ -819,6 +853,38 @@ mod tests {
                 assert_eq!(body, "signed url expired");
             }
         }
+    }
+
+    #[test]
+    fn blob_urls_are_redacted_in_log_lines() {
+        // The token is the credential: only the marker survives.
+        assert_eq!(
+            redact_blob_url(
+                "https://runner:8443/twirp-blob/artifact/eyJhbGciOiJIUzI1NiJ9.payload.sig"
+            ),
+            "https://runner:8443/twirp-blob/<redacted>"
+        );
+        // Query parameters ride along with the credential and are dropped too.
+        assert_eq!(
+            redact_blob_url(
+                "https://runner:8443/twirp-blob/diag/abc.def.ghi?sv=2021-08-06&sig=dummy"
+            ),
+            "https://runner:8443/twirp-blob/<redacted>"
+        );
+        // Non-blob URLs stay byte-identical for debuggability.
+        assert_eq!(
+            redact_blob_url(
+                "https://results.example.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL"
+            ),
+            "https://results.example.com/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL"
+        );
+        assert_eq!(
+            redact_blob_url(
+                "http://127.0.0.1:9090/twirp/github.actions.results.api.v1.BlobService/RefreshUploadURL"
+            ),
+            "http://127.0.0.1:9090/twirp/github.actions.results.api.v1.BlobService/RefreshUploadURL"
+        );
+        assert_eq!(redact_blob_url("not-a-url"), "not-a-url");
     }
 
     #[cfg(unix)]

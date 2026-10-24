@@ -81,7 +81,8 @@ pub async fn run(args: DapArgs, base_url: String, token: Option<String>) -> Resu
                     "command": command,
                     "arguments": arguments,
                 })
-                .to_string(),
+                .to_string()
+                .into(),
             ))
             .await
             .context("sending DAP request")?;

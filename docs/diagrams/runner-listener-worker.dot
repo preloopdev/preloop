@@ -1,0 +1,45 @@
+digraph runner_listener_worker {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.3, ranksep=0.48, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.13,0.08"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  subgraph cluster_cp {
+    label="Control plane"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    server [label="preloop-runner-server\n/runner/server/session, message, acknowledge\n/broker/{runner_id}/...", fillcolor="#bae6fd"];
+  }
+
+  subgraph cluster_listener {
+    label="Listener process (preloop-runner run)"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    oauth [label="OAuth client\nlistener/oauth.rs\nPS256 client_assertion → token", fillcolor="#fef3c7"];
+    session [label="Session and protocol choice\ncreate_session(): broker or AzDO\nRSA/AES session credentials", fillcolor="#fef3c7"];
+    poll [label="Message listener\nbroker default: 100 s client / 50 s server\n15–30 s then 30–60 s jitter; --via azdo legacy", fillcolor="#fef3c7"];
+    dispatch [label="job_dispatcher.rs\nspawn_job()\nchild worker per job", fillcolor="#fef3c7"];
+    ipc [label="stdin NDJSON IPC\nWorkerMessage: job / cancel / shutdown", fillcolor="#fef3c7"];
+  }
+
+  subgraph cluster_worker {
+    label="Worker process (preloop-runner worker)"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    job [label="job_runner.rs\nrun_job() + 60 s renew loop\njob lifecycle orchestration", fillcolor="#fef3c7"];
+    workspace [label="job_extension.rs\nsetup_workspace()\nGITHUB_* and ACTIONS_* env", fillcolor="#fef3c7"];
+    context [label="contexts.rs + execution_context.rs\nJobContext roots\nStepContext env, logs, annotations", fillcolor="#fef3c7"];
+    steps [label="steps_runner.rs\nrun_steps(), step_conditions\nforeground sequential; background concurrent", fillcolor="#fef3c7"];
+    handlers [label="handlers/\naction, composite, container, node, script\nactions + Docker lifecycle", fillcolor="#fef3c7"];
+    commands [label="commands.rs + file_commands.rs\n::name:: commands\nGITHUB_ENV / GITHUB_OUTPUT", fillcolor="#fef3c7"];
+    report [label="Reporting and completion\nstep logs via Twirp signed PUT\ncompletejob REST; failed jobs may still exit 0", fillcolor="#dcfce7"];
+    { rank=same; handlers; commands; }
+  }
+
+  server -> oauth [label="configure / run"];
+  oauth -> session [label="token"];
+  session -> poll [label="session credentials"];
+  poll -> dispatch [label="encrypted job message"];
+  dispatch -> ipc [label="spawn + write stdin"];
+  ipc -> job [label="parse job message"];
+  job -> workspace [label="setup"];
+  workspace -> context [label="build contexts"];
+  context -> steps [label="step env and conditions"];
+  steps -> handlers [label="dispatch action"];
+  steps -> commands [label="capture commands"];
+  handlers -> report [label="logs and status"];
+  commands -> report [label="file commands and annotations"];
+}

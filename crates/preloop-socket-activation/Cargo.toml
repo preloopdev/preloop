@@ -13,3 +13,4 @@ missing_docs = "warn"
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
+listenfd = "1"

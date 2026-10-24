@@ -1,0 +1,130 @@
+---
+title: Install
+description: Requirements for macOS, Linux, and WSL2, the install methods for the Preloop CLI, and how to run the engine as a background service.
+---
+
+Install the `preloop` CLI, which also runs the engine. Every job runs inside a Linux microVM, so the install also places a Linux guest runner and a SmolVM runtime. This page covers what your host needs, the install methods, and how to keep the engine running. [Quickstart](/control-plane/quickstart) then gets you to a first run.
+
+## Requirements
+
+| Platform | Requirement |
+|---|---|
+| macOS | Apple Silicon or Intel with Hypervisor.framework. `sysctl -n kern.hv_support` prints `1`. |
+| Linux | x86_64 or aarch64 with `/dev/kvm`, readable and writable by the user that runs Preloop. |
+| Windows | Not supported natively. Use WSL2 with a Linux distribution. See [Windows](#windows). |
+| Disk | About 60 GB free on the volume that holds Preloop's VM data for the official image. |
+| Git | For the repositories you run. `preloop run` reads the branch and changed files from git. |
+
+## Windows
+
+Preloop runs on Windows only inside WSL2. Install it in your Linux distribution, and follow the Linux instructions there.
+
+For microVM jobs, the distribution needs `/dev/kvm`. Enable nested virtualization in `%UserProfile%\.wslconfig`:
+
+```ini
+[wsl2]
+nestedVirtualization=true
+```
+
+Restart WSL after changing the file. If `/dev/kvm` is missing, `preloop init` fails its hypervisor check with exit code `3`.
+
+## Install the CLI
+
+### Homebrew
+
+```sh
+brew install preloopdev/tap/preloop
+```
+
+### npm
+
+```sh
+npm install -g @preloop-dev/cli
+```
+
+Homebrew and npm install the `preloop` binary from the same release. The Linux guest runner and the SmolVM runtime are separate; the [next section](#what-the-install-provides) covers them.
+
+### Installer script
+
+The script downloads the release for your platform, checks its SHA-256 checksum, and installs into `~/.local/bin`. Fetch it from the release tag, read it, then run it:
+
+```sh
+tag=$(curl -fsSL https://api.github.com/repos/preloopdev/preloop/releases/latest \
+  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$tag/install.sh" -o install.sh
+less install.sh
+sh install.sh
+```
+
+| Option | Effect |
+|---|---|
+| `--version <tag>` | Install a specific release instead of the latest. |
+| `--prefix <dir>` | Install under `<dir>/bin` instead of `~/.local`. |
+| `--runner` | Install only the standalone runner. See [Runner overview](/runner/overview). |
+
+If no release exists for your platform yet, the script builds from source instead. That path needs Git and Rust/Cargo; building the Linux guest runner also needs Zig and `cargo-zigbuild`.
+
+## What the install provides
+
+Each job runs in a microVM, which needs two pieces besides the CLI:
+
+- **The Linux guest runner**, `preloop-runner`, stored at `<prefix>/lib/preloop/runner/<triple>/preloop-runner`. The installer script places it on Linux and macOS. On macOS, `preloop update` refreshes it. On Linux with Homebrew or npm, download `preloop-runner-<triple>` from the release, save it as `preloop-runner` in a directory of your choice, and set `PRELOOP_RUNNER_BUNDLE` to that directory.
+- **A compatible SmolVM runtime**, which the installer script sets up. With Homebrew or npm, run `preloop update` once to install it.
+
+Without the guest runner, `preloop serve` still starts, but queued jobs fail after a grace period.
+
+## Check the host
+
+Run the probe. It reads the host and changes nothing:
+
+```sh
+preloop version
+preloop init --probe --json
+```
+
+The report includes `arch`, `os`, `disk_free_bytes`, `data_root`, `hypervisor`, `smolvm`, and the golden that `serve` would use. Then run [`preloop init`](/control-plane/quickstart#2-configure-the-engine) to write the configuration.
+
+Once you have configured a GitHub credential — [GitHub App](/control-plane/github/app) covers the manifest flow, engine-hosted and over SSH — `preloop doctor` checks it against GitHub:
+
+```sh
+preloop doctor --repo owner/repo
+```
+
+`doctor` needs a configuration file and reports which credentials are set. Without `--repo`, it does not call GitHub.
+
+## Run as a background service
+
+For a laptop, `preloop serve` in a terminal is enough. For a machine that should keep running, install the engine as a service. Pick a scope:
+
+### Per-user service
+
+No root is needed. The service runs as your user and keeps state in `~/.preloop`.
+
+```sh
+preloop server install --user
+```
+
+- On Linux, the unit is a systemd user service. Run `sudo loginctl enable-linger $USER` so it keeps running after you log out.
+- On macOS, the service is a LaunchAgent. It runs only while you are logged in.
+
+### System service
+
+This runs at boot, with state in `/var/lib/preloop`. It needs root. On Linux, the service runs under a dedicated `preloop` account that is added to the `kvm` group.
+
+```sh
+sudo preloop server install --public-url https://ci.example.com
+```
+
+Add `--dry-run` to print the files and commands without changing anything. `preloop init --mode service` runs the same installer as part of setup.
+
+### Remove the service
+
+```sh
+preloop server uninstall            # or: preloop server uninstall --user
+```
+
+Uninstalling keeps the state directory. Add `--purge-data` to delete it too.
+
+<Note>
+Exposing the engine to GitHub, putting it behind a proxy or tunnel, hardening the host, and upgrading a running service are covered in [Deploy](/control-plane/operate/deploy) and [Security](/control-plane/operate/security).
+</Note>

@@ -13,13 +13,17 @@
 //! enqueue. Reads return the canonical JSON bytes.
 
 use super::codec::{self, now_us, ts, us};
-use super::{PgBackend, db};
+use super::{PgBackend, Pool, db};
 use crate::control::types::ControlError;
+use crate::control::wake::WEBHOOK_CHANNEL;
 use crate::models::{
     WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
     WebhookRedeliveryRecord, WebhookRepairReason, WebhookWatchdogCursor,
 };
 use std::collections::BTreeSet;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+use tokio::sync::Notify;
 
 /// Columns selected by every full delivery read, in [`delivery_from_row`]
 /// order.
@@ -28,7 +32,7 @@ const DELIVERY_COLUMNS: &str = concat!(
     us!("received_at"),
     ", state, attempts, ",
     us!("lease_until"),
-    ", lease_token::text, last_error"
+    ", lease_token::text, last_error, signer_app_id"
 );
 
 fn delivery_from_row(row: &tokio_postgres::Row) -> Result<WebhookDeliveryRecord, ControlError> {
@@ -42,6 +46,7 @@ fn delivery_from_row(row: &tokio_postgres::Row) -> Result<WebhookDeliveryRecord,
         attempts: row.get::<_, i32>(5).max(0) as u32,
         lease_until_us: row.get(6),
         lease_token: row.get(7),
+        signer_app_id: row.get(9),
         last_error: row.get(8),
     })
 }
@@ -87,10 +92,67 @@ fn redelivery_from_row(row: &tokio_postgres::Row) -> Result<WebhookRedeliveryRec
     })
 }
 
+/// Webhook hints go out at most once per this window: a burst of enqueues
+/// inside it shares one NOTIFY. The event notifier uses the same window.
+const NOTIFY_COALESCE: Duration = Duration::from_millis(15);
+
+/// Start this node's webhook notifier. One task turns every burst of enqueue
+/// and requeue marks into one autocommit `pg_notify` on [`WEBHOOK_CHANNEL`],
+/// sent after the rows committed. It holds the writer pool weakly: dropping the
+/// backend closes the pool's connections, and the task ends with it.
+pub(super) fn spawn_webhook_notifier(writers: Weak<Pool>, origin: String, dirty: Arc<Notify>) {
+    tokio::spawn(run_webhook_notifier(writers, origin, dirty));
+}
+
+async fn run_webhook_notifier(writers: Weak<Pool>, origin: String, dirty: Arc<Notify>) {
+    loop {
+        // A bounded wait: once the backend is dropped the pool is gone, and the
+        // task ends at the next timeout.
+        if tokio::time::timeout(Duration::from_secs(60), dirty.notified())
+            .await
+            .is_err()
+        {
+            if writers.strong_count() == 0 {
+                return;
+            }
+            continue;
+        }
+        tokio::time::sleep(NOTIFY_COALESCE).await;
+        let Some(pool) = writers.upgrade() else {
+            return;
+        };
+        if let Err(error) = send_hint(&pool, &origin).await {
+            tracing::warn!(
+                ?error,
+                "webhook hint failed; workers fall back to their tick"
+            );
+        }
+    }
+}
+
+/// One autocommit NOTIFY on a pooled writer. A transaction that calls NOTIFY
+/// holds a database-wide lock until its commit, so command transactions never
+/// notify (see [`crate::control::wake`]).
+async fn send_hint(writers: &Pool, origin: &str) -> Result<(), ControlError> {
+    let client = writers.checkout().await?;
+    client
+        .execute("SELECT pg_notify($1, $2)", &[&WEBHOOK_CHANNEL, &origin])
+        .await
+        .map_err(db)?;
+    Ok(())
+}
+
 impl PgBackend {
+    /// Notifications that another node made webhook deliveries claimable
+    /// (payload: the writer's origin; empty after the listener reconnected).
+    pub(crate) fn subscribe_webhook_wakes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.webhook_wakes.subscribe()
+    }
+
     /// Durably enqueue a delivery. A new id inserts; a known id is reset to
     /// `received` only when its previous processing failed permanently
-    /// (redelivery of a dead letter). Returns whether a row was written.
+    /// (redelivery of a dead letter). Returns whether a row was written; a
+    /// written row also marks the webhook notifier for the other nodes.
     ///
     /// Statement: `INSERT INTO webhook_deliveries .. ON CONFLICT
     /// (delivery_id) DO UPDATE .. WHERE webhook_deliveries.state =
@@ -114,16 +176,17 @@ impl PgBackend {
                 concat!(
                     "INSERT INTO webhook_deliveries (delivery_id, installation_id, event, \
                      payload, received_at, state, attempts, lease_until, lease_token, \
-                     last_error) VALUES ($1, $2, $3, $4::text::jsonb, ",
+                     signer_app_id, last_error) VALUES ($1, $2, $3, $4::text::jsonb, ",
                     ts!("$5"),
                     ", $6, $7, ",
                     ts!("$8"),
-                    ", $9::text::uuid, $10) \
+                    ", $9::text::uuid, $10, $11) \
                      ON CONFLICT (delivery_id) DO UPDATE SET \
                      installation_id = EXCLUDED.installation_id, event = EXCLUDED.event, \
                      payload = EXCLUDED.payload, received_at = EXCLUDED.received_at, \
                      state = 'received', attempts = 0, lease_until = NULL, \
-                     lease_token = NULL, last_error = NULL \
+                     lease_token = NULL, signer_app_id = EXCLUDED.signer_app_id, \
+                     last_error = NULL \
                      WHERE webhook_deliveries.state = 'failed'"
                 ),
                 &[
@@ -136,11 +199,15 @@ impl PgBackend {
                     &(delivery.attempts.min(i32::MAX as u32) as i32),
                     &delivery.lease_until_us,
                     &token,
+                    &delivery.signer_app_id,
                     &delivery.last_error,
                 ],
             )
             .await
             .map_err(db)?;
+        if written > 0 {
+            self.webhook_dirty.notify_one();
+        }
         Ok(written > 0)
     }
 
@@ -178,7 +245,7 @@ impl PgBackend {
                     us!("d.received_at"),
                     ", d.state, d.attempts, ",
                     us!("d.lease_until"),
-                    ", d.lease_token::text, d.last_error"
+                    ", d.lease_token::text, d.last_error, d.signer_app_id"
                 ),
                 &[&now, &lease_until, &codec::limit(limit)],
             )
@@ -423,6 +490,7 @@ impl PgBackend {
 
     /// Operator requeue of a terminal delivery: back to `received` with a
     /// fresh attempt budget.
+    /// Marks the webhook notifier, so the other nodes' workers wake for it.
     ///
     /// Statement: `UPDATE webhook_deliveries SET state = 'received',
     /// attempts = 0, lease/error cleared WHERE delivery_id = $1 AND state IN
@@ -441,6 +509,9 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
+        if requeued > 0 {
+            self.webhook_dirty.notify_one();
+        }
         Ok(requeued > 0)
     }
 

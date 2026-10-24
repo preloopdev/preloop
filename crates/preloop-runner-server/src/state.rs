@@ -2,11 +2,67 @@ use super::*;
 
 const LOCAL_JWT_LIFETIME: Duration = Duration::from_secs(2999);
 
+/// Slack on top of a job-scoped credential's window: setup and transport
+/// either side of the job.
+const JOB_CREDENTIAL_SLACK: Duration = Duration::from_secs(5 * 60);
+
+/// Six-hour GitHub job limit plus this server's four-hour pause-credit
+/// window, with [`JOB_CREDENTIAL_SLACK`] around both. The default window for a
+/// credential that has to stay usable for as long as one attempt can last.
+const JOB_CREDENTIAL_LIFETIME: Duration = Duration::from_secs((6 + 4) * 60 * 60 + 5 * 60);
+
 /// A debug credential is acquired before the first step and remains in use
 /// through both the six-hour GitHub job limit and this server's four-hour
 /// pause-credit window. Keep a small allowance for setup and transport around
 /// those two bounded intervals.
-pub const DEBUG_WORKER_TOKEN_LIFETIME: Duration = Duration::from_secs((6 + 4) * 60 * 60 + 5 * 60);
+pub const DEBUG_WORKER_TOKEN_LIFETIME: Duration = JOB_CREDENTIAL_LIFETIME;
+
+/// The default lifetime of a job-scoped runtime token: the `SystemVssConnection`
+/// `AccessToken` the job message carries, the credential workflow code sees as
+/// `ACTIONS_RUNTIME_TOKEN`, and what the pinned checkout steps and the origin
+/// rewrite embed.
+///
+/// The attempt gets one of these and cannot be issued another while it runs:
+/// the worker's renew/complete/report calls, the cache and artifact Twirp
+/// calls, the step and job log uploads, and the snapshot fetches all present
+/// it, and the only other credential a running worker can obtain on its own is
+/// the runner listen token, which the job-lifecycle routes refuse by design
+/// (`broker::authenticated_runner_id_for_job`). Its lifetime therefore has to
+/// cover the whole job, exactly like [`DEBUG_WORKER_TOKEN_LIFETIME`] — and the
+/// job may ask for more than the default; see [`runtime_token_lifetime`].
+///
+/// Minted at the generic local-JWT lifetime it lasted 2999s, and a job that
+/// outlived that silently stopped renewing its lease (every later `renewjob`
+/// answered 401, then 403 once the worker fell back to a listen token) and was
+/// failed by the reaper while it was still running.
+pub const RUNTIME_TOKEN_LIFETIME: Duration = JOB_CREDENTIAL_LIFETIME;
+
+/// Lifetime for the runtime token of a job whose `timeout-minutes` resolved to
+/// `job_timeout_seconds` — the delivered message's `jobTimeout`.
+///
+/// [`RUNTIME_TOKEN_LIFETIME`] is the floor: GitHub's default job timeout is
+/// 360 minutes, and the same six hours plus the four-hour pause credit is what
+/// a job that declares nothing may spend. A workflow can declare more —
+/// `timeout-minutes` is validated to 1..=360 for a *step*, but any value is
+/// accepted for a *job* — so the token grows with the declared timeout instead
+/// of expiring inside a job the server is still willing to run, up to the same
+/// server ceiling the reaper and the delivered message are clamped to
+/// ([`preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS`], GitHub's own
+/// five-day maximum). A fork cannot mint an arbitrarily long credential: a
+/// `timeout-minutes` past the ceiling is worth exactly the ceiling here, and
+/// the job it would have retained runner capacity for is clamped to the same
+/// point.
+pub fn runtime_token_lifetime(job_timeout_seconds: Option<i64>) -> Duration {
+    let declared = job_timeout_seconds
+        .map(preloop_gha_parser::job_builder::clamp_job_timeout_seconds)
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .map(Duration::from_secs)
+        .unwrap_or_default();
+    let declared = declared
+        .saturating_add(crate::debug_sessions::MAX_PAUSE_CREDIT)
+        .saturating_add(JOB_CREDENTIAL_SLACK);
+    JOB_CREDENTIAL_LIFETIME.max(declared)
+}
 
 impl AppState {
     pub fn local_jwt(&self, claims: serde_json::Value) -> Result<String, ApiError> {
@@ -249,11 +305,40 @@ impl AppState {
         (subject_job == scope_job).then_some(subject_job)
     }
 
+    /// Mint the credential an attempt presents on every job-scoped route: the
+    /// `SystemVssConnection` `AccessToken` the job message carries, the value
+    /// exported to steps as `ACTIONS_RUNTIME_TOKEN`, and what the pinned
+    /// checkout steps embed.
+    ///
+    /// The default-window mint, for callers that do not hold the job message:
+    /// the submission-time snapshot pinning (which the claim re-mints) and
+    /// tests. Callers that do hold it pass the job's declared
+    /// `timeout-minutes` to [`Self::mint_runtime_token_for_job`].
     pub fn mint_runtime_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
-        self.local_jwt(json!({
-            "sub": format!("preloop-job-{job_id}"),
-            "scp": format!("Actions.Results:{plan_id}:{job_id}"),
-        }))
+        self.mint_runtime_token_for_job(plan_id, job_id, None)
+    }
+
+    /// Mint the runtime token for an attempt whose message is at hand, sized to
+    /// the job's own timeout: `job_timeout_seconds` is the message's
+    /// `jobTimeout` (its `timeout-minutes` in seconds), and a job that asked
+    /// for longer than the default window gets a token that outlives it
+    /// ([`runtime_token_lifetime`]).
+    ///
+    /// Minted once per attempt — nothing re-mints it while the job runs — so
+    /// the lifetime chosen here is the lifetime the attempt lives with.
+    pub fn mint_runtime_token_for_job(
+        &self,
+        plan_id: &str,
+        job_id: &uuid::Uuid,
+        job_timeout_seconds: Option<i64>,
+    ) -> String {
+        self.local_jwt_with_lifetime(
+            json!({
+                "sub": format!("preloop-job-{job_id}"),
+                "scp": format!("Actions.Results:{plan_id}:{job_id}"),
+            }),
+            runtime_token_lifetime(job_timeout_seconds),
+        )
         .expect("fixed local JWT claims must serialize")
     }
 
@@ -673,6 +758,32 @@ pub type ActionResolvedUses =
 /// [`ActionResolvedUses`].
 pub const MAX_RESOLVED_USES_PER_RUN: usize = 4096;
 
+/// Nested `uses:` of composite manifests read through the GitHub contents API
+/// for runs without a workspace snapshot: (`owner/repo` lowercased, commit,
+/// composite directory) → the manifest's nested references, or `None` when the
+/// commit has no readable manifest there. Only definitive reads are memoised;
+/// a transient failure is retried on the next adjudication.
+pub type LocalCompositeNestedUses = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, String, String),
+        Option<(std::collections::BTreeSet<String>, Vec<String>)>,
+    >,
+>;
+
+/// Maximum entries in [`LocalCompositeNestedUses`]. A full memo is cleared
+/// rather than evicted entry by entry; clearing only costs re-reads.
+pub const MAX_LOCAL_COMPOSITE_MEMO: usize = 4096;
+
+/// Remote actions a run's local composites reach, per run. A run's answer is
+/// fixed by its immutable commit, so a traversal that reached a definitive
+/// answer is remembered; see `local_composite_declared_for_run`.
+pub type LocalCompositeDeclared =
+    std::sync::Mutex<std::collections::HashMap<RunId, Arc<std::collections::BTreeSet<String>>>>;
+
+/// Maximum runs in [`LocalCompositeDeclared`]. A full memo is cleared, which
+/// only costs a re-traversal.
+pub const MAX_LOCAL_COMPOSITE_DECLARED_RUNS: usize = 1024;
+
 /// (slug, PAT fingerprint) → repository metadata with the instant it was
 /// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
 /// visibility) from leaking into a later anonymous lookup for the same
@@ -784,8 +895,7 @@ pub struct AppState {
     /// Per-subsystem consumption accounting for outbound GitHub traffic
     /// (requests, bytes, rate limits, breaker-blocked attempts). Only the
     /// labeled sender ([`crate::github_breaker::send_observed_labeled`])
-    /// records here; the unlabeled [`crate::github_breaker::send_observed`]
-    /// covers only pre-`AppState` bootstrap reads and records nothing.
+    /// records here.
     pub github_consumption: Arc<crate::github_breaker::GithubConsumption>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
@@ -800,6 +910,15 @@ pub struct AppState {
     /// State rather than constants so tests drive the poll without sleeping
     /// through the production budget.
     pub fresh_merge_poll: crate::github::FreshMergePoll,
+    /// Concurrent-wait slots for [`crate::github::FreshMergePoll`]: how many
+    /// webhook deliveries may park on GitHub's test merge at once (see
+    /// [`crate::github::fresh_merge_poll_capacity`]). Shared by every clone of
+    /// the state, so the bound holds across the whole worker pool.
+    pub fresh_merge_poll_slots: Arc<tokio::sync::Semaphore>,
+    /// Concurrent-probe permits for [`crate::github::FreshMergePoll`]: how many
+    /// merge-state probes may be in flight at once across the worker pool (see
+    /// [`crate::github::fresh_merge_poll_capacity`]).
+    pub fresh_merge_probe_permits: Arc<tokio::sync::Semaphore>,
     /// Observability handle (cloneable, holds heartbeat & limit registries).
     pub observability: preloop_observability::Observability,
     /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
@@ -858,6 +977,17 @@ pub struct AppState {
     /// checkouts before housekeeping deletes it. Zero discards immediately.
     /// Env: `PRELOOP_SNAPSHOT_RETENTION_SECONDS` (default 1800).
     pub snapshot_retention_seconds: u64,
+    /// Ceiling, in bytes, for the shared snapshot object cache under
+    /// `<state_dir>/snapshot-object-cache`. This cache is never garbage
+    /// collected in place (a live snapshot alternates to it), so the size
+    /// sweep is what keeps it bounded. Entries referenced by a snapshot or
+    /// locked by a capture are never evicted. `0` disables the sweep.
+    /// Env: `PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES` (default 100 GiB).
+    pub snapshot_object_cache_max_bytes: u64,
+    /// Single-flight ownership of the object-cache sweep, scoped to this
+    /// engine's state directory. Startup and post-capture sweeps share it; a
+    /// second engine (or test state) is not suppressed by this one.
+    pub snapshot_object_cache_sweep: Arc<crate::snapshots::SnapshotObjectCacheSweep>,
     /// Run/check/status retention, in days, mirroring GitHub's Actions
     /// retention setting. The retention sweep deletes terminal runs (plus
     /// their checks, statuses, artifacts, and logs) older than this.
@@ -948,6 +1078,12 @@ pub struct AppState {
     /// Per-run ledger of already-resolved (`owner/repo`, `ref`) triples;
     /// see [`ActionResolvedUses`].
     pub action_resolved_uses: Arc<ActionResolvedUses>,
+    /// Memo for composite manifests read through the GitHub contents API for
+    /// runs without a workspace snapshot; see [`LocalCompositeNestedUses`].
+    pub local_composite_nested_uses: Arc<LocalCompositeNestedUses>,
+    /// Remote actions reached through a run's local composites, per run; see
+    /// [`LocalCompositeDeclared`].
+    pub local_composite_declared: Arc<LocalCompositeDeclared>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -987,11 +1123,20 @@ pub struct AppState {
     /// to one file for its whole life and cannot be retargeted underneath
     /// itself by a later environment change.
     pub config_path: PathBuf,
+    /// Engine-hosted GitHub App setup: the one live setup session, its
+    /// one-time link, and the browser-route rate limit. Node-local and
+    /// in-memory by design: a setup lasts minutes, and a restart ends it.
+    pub github_setup: Arc<crate::github_app_setup::session::SetupSessions>,
     /// `GITHUB_TOKEN` permissions ceiling loaded from the config file at
     /// startup. `None` (absent table) = no ceiling; today's behavior is
     /// unchanged. A config change takes effect on restart, like the other
     /// policy tables in the config file.
     pub token_permissions_ceiling: Option<crate::config::TokenPermissionsCeiling>,
+    /// OIDC immutable-subject override loaded from the config file's
+    /// `[oidc]` table at startup. `None` = GitHub's creation-date rollout
+    /// policy decides the subject format. A config change takes effect on
+    /// restart, like the other policy tables in the config file.
+    pub oidc_immutable_subject_claims: Option<bool>,
     /// Fork pull-request workflow policy loaded from the config file at
     /// startup. Empty by default: fork-PR workflows run as today until the
     /// operator writes `[fork_policy]` rules. A config change takes effect
@@ -1213,7 +1358,7 @@ impl AppState {
     /// whole life, and lets tests point at a temp file without mutating
     /// process-wide environment state that other tests race against.
     pub async fn new_with_config(state_dir: PathBuf, config_path: PathBuf) -> anyhow::Result<Self> {
-        Self::new_with_store(state_dir, config_path, None).await
+        Self::new_with_store(state_dir, config_path, None, None).await
     }
 
     /// [`AppState::new_with_config`] against an explicit store URL.
@@ -1227,6 +1372,7 @@ impl AppState {
         state_dir: PathBuf,
         config_path: PathBuf,
         store_url: Option<&str>,
+        github: Option<crate::github_breaker::GithubFunnel>,
     ) -> anyhow::Result<Self> {
         // Test binaries share one process env: a sibling test mutating
         // `PRELOOP_STORE_URL` must not silently retarget a state built for a
@@ -1278,7 +1424,9 @@ impl AppState {
         };
         #[cfg(not(any(test, feature = "test-support")))]
         let system_token = {
-            let store = crate::credential_store::store_from_env(&state_dir);
+            let configured_store = crate::config::credential_store_setting(&config_path)?;
+            let store =
+                crate::credential_store::selected_store(&token_dir, configured_store.as_deref())?;
             crate::credential_store::resolve_engine_token_with_store(
                 &token_dir,
                 configured_token,
@@ -1370,23 +1518,24 @@ impl AppState {
         let max_jobs_per_run = crate::config::max_jobs_per_run(&config)?;
         let diag_staging_max_age_seconds =
             crate::config::diag_staging_max_age_hours(&config)?.saturating_mul(3600);
-        let github_apps = crate::github_app::load_from(&config)?;
+        // The process's outbound-GitHub funnel. The embedding engine supplies
+        // its own (`ServerConfig::github`) so the runner pool's golden
+        // downloads resolve through the same breakers and accounting as the
+        // webhook path; the standalone server and tests get a private one.
+        let github = github.unwrap_or_default();
+        let github_breakers = Arc::clone(&github.breakers);
+        let github_consumption = Arc::clone(&github.consumption);
+        // Attached before `github_app` is cloned from the registry, so the
+        // legacy field reports through the same breaker and accounting.
+        let github_apps = crate::github_app::load_from(&config)?
+            .map(|apps| apps.with_github_accounting(&github_breakers, &github_consumption));
         let github_app = github_apps
             .as_ref()
             .map(|registry| registry.default_app().clone());
         // Env wins over the config file, matching every other credential
         // here. An empty value in either source counts as unset: a blank
         // export must not disable signature verification silently.
-        let webhook_secret = env::var("PRELOOP_WEBHOOK_SECRET")
-            .ok()
-            .filter(|secret| !secret.is_empty())
-            .or_else(|| {
-                config
-                    .github
-                    .webhook_secret()
-                    .filter(|secret| !secret.is_empty())
-                    .map(str::to_owned)
-            });
+        let webhook_secret = crate::config::webhook_secret_from_env_or_config(&config);
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let github_pat = env::var("PRELOOP_GITHUB_TOKEN")
@@ -1574,11 +1723,17 @@ impl AppState {
             message_notify,
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
-            github_breakers: Arc::new(crate::github_breaker::GithubBreakerRegistry::default()),
-            github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
+            github_breakers,
+            github_consumption,
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             fresh_merge_poll: crate::github::FreshMergePoll::default(),
+            fresh_merge_poll_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::github::fresh_merge_poll_capacity(),
+            )),
+            fresh_merge_probe_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::github::fresh_merge_poll_capacity(),
+            )),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(
                 preloop_observability::status::OperationalSnapshot::default(),
@@ -1603,6 +1758,11 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
+            snapshot_object_cache_max_bytes: env::var("PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100 * 1024 * 1024 * 1024),
+            snapshot_object_cache_sweep: crate::snapshots::SnapshotObjectCacheSweep::new(),
             retention_days,
             max_jobs_per_run,
             diag_staging_max_age_seconds,
@@ -1637,8 +1797,16 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             action_resolved_uses: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            local_composite_nested_uses: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            local_composite_declared: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             config_path,
+            github_setup: Arc::new(crate::github_app_setup::session::SetupSessions::new()),
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
+            oidc_immutable_subject_claims: config.oidc.immutable_subject_claims,
             fork_policy: config.fork_policy.clone(),
             execution_protection: config.execution_protection.clone(),
             pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
@@ -1866,7 +2034,7 @@ pub fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
         "iss": "https://preloop.local",
         "iat": now,
         "nbf": now,
-        "exp": now + 2999,
+        "exp": now + RUNTIME_TOKEN_LIFETIME.as_secs(),
         "sub": format!("preloop-job-{job_id}"),
         "scp": format!("Actions.Results:{plan_id}:{job_id}"),
     });
@@ -2012,7 +2180,7 @@ pub fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<
         // Wrong size — regenerate.
     }
     let mut key = vec![0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+    rand::RngExt::fill(&mut rand::rng(), &mut key);
     std::fs::create_dir_all(state_dir)?;
     let temp_path = state_dir.join(format!("hmac-key.{}.tmp", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
@@ -2077,6 +2245,10 @@ pub struct InnerState {
     /// ends, instead of subscribing to a channel that will never speak again.
     /// Cleared if the same key ingests fresh lines (a retry reusing the job).
     pub live_log_closed: std::collections::BTreeSet<String>,
+    /// Monotonic epochs for `live_log_closed`. A stale-frame liveness lookup
+    /// captures the epoch before awaiting the backend and may reopen only if
+    /// no close happened during that await.
+    pub live_log_close_epochs: BTreeMap<String, u64>,
     /// Resolved plan→run secret masker cache (node-local). `plan_secret_masker`
     /// is the permanent entry once a plan maps to a concrete run;
     /// `plan_secret_masker_pending` is the negative-cache union fallback with a
@@ -2084,6 +2256,18 @@ pub struct InnerState {
     /// secrets on each log chunk.
     pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
     pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
+    /// Runtime-minted mask values (today: the OIDC `id_token`, registered at
+    /// mint by [`crate::timeline_logs::register_runtime_mask_value`]), keyed
+    /// by the same plan/run scope keys as `plan_secret_masker`. Provider
+    /// secrets never change after submit, but these arrive while the job is
+    /// already logging, so they are tracked separately and merged into every
+    /// scope write (`plan_secret_masker`/`plan_secret_masker_pending`) and
+    /// into every cold resolution — a resolution that raced a registration
+    /// must never cache a scope that predates it. Each scope holds at most
+    /// `MAX_RUNTIME_MASKS_PER_SCOPE` values (oldest dropped first: a job may
+    /// mint a token per call), and a run's entries are dropped with the run
+    /// (see `memory_caps::remove_run_everywhere`).
+    pub plan_runtime_masks: BTreeMap<String, Vec<String>>,
     /// Chunk-boundary-safe streaming log maskers for the AzDO append path,
     /// keyed by log key (`{plan_id}/{log_id}`). Each masker holds a
     /// trailing-overlap buffer so a secret split across two appends is
@@ -2094,14 +2278,14 @@ pub struct InnerState {
     /// withheld tail from the lossy in-memory preview.
     ///
     /// The masker is built from the secret list resolved at the log's first
-    /// append and never reseeded: run secrets are immutable, and the only
-    /// alternative first-append resolution (the negative-cache union) is a
-    /// superset of the real list, so the masker can only over-mask, never
-    /// under-mask.
-    pub log_stream_maskers: BTreeMap<
-        String,
-        std::sync::Arc<tokio::sync::Mutex<preloop_gha_protocol::masking::StreamingMasker>>,
-    >,
+    /// append and only widened afterward (`PlanLogMasker::extend`): run
+    /// secrets are immutable, the only alternative first-append resolution
+    /// (the negative-cache union) is a superset of the real list, and a
+    /// runtime-registered value (see `plan_runtime_masks`) rebuilds the
+    /// masker from its own source list — so the masker can only over-mask,
+    /// never under-mask.
+    pub log_stream_maskers:
+        BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<crate::timeline_logs::PlanLogMasker>>>,
     /// Reaper starvation marks (node-local): when this node
     /// first saw each ready job that no registered runner matches. Cleared
     /// once a runner matches, while a pool is preparing, or when the job
@@ -2142,6 +2326,14 @@ pub struct InnerState {
     pub diag_upload_tokens: BTreeMap<String, DiagUploadToken>,
     /// Artifact v2 finalized registry: registry_key → metadata.
     pub artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
+    /// OIDC repository `created_at` cache: repository ID → creation time
+    /// (Unix seconds). In-memory only, per process: a restart starts
+    /// empty and simply re-fetches, which is safe because an ID's
+    /// creation date never changes. Keyed by ID, never by name: a
+    /// deleted-and-recreated repository gets a new ID and must never
+    /// inherit its predecessor's cached date. Entries never expire; the
+    /// map is a pure cache (a miss costs one GitHub API call).
+    pub oidc_repo_created_at: BTreeMap<String, i64>,
     /// Monotonic artifact v2 ID counter.
     pub next_artifact_v2_id: u64,
     /// OIDC issuer URL used in the `iss` claim and discovery document.
@@ -2222,6 +2414,107 @@ mod tests {
             AppState::results_job_from_payload(&payload),
             Some(("plan".to_owned(), job))
         );
+    }
+
+    /// A job runtime token is presented by every job-scoped route — lease
+    /// renewal, completion, step and job log uploads, cache and artifact
+    /// Twirp, the pinned checkout steps — and the attempt can never be handed
+    /// a replacement, so its lifetime must cover the whole attempt. At the
+    /// generic local-JWT lifetime (2999s) it expired ~50 minutes into a job:
+    /// every later `renewjob` failed, the lease went stale, and the reaper
+    /// failed the job while it was still running.
+    #[tokio::test]
+    async fn runtime_token_outlives_the_six_hour_job_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job = uuid::Uuid::new_v4();
+        let token = state.mint_runtime_token("plan-a", &job);
+        let claims = state
+            .verify_local_jwt_claims(&token)
+            .expect("a freshly minted runtime token must verify");
+        let exp = claims["exp"].as_u64().expect("exp is minted");
+        let iat = claims["iat"].as_u64().expect("iat is minted");
+        assert_eq!(exp - iat, RUNTIME_TOKEN_LIFETIME.as_secs());
+        // The default window is the floor, and GitHub's own maximum job
+        // timeout (360 minutes) fits inside it.
+        assert_eq!(exp - iat, runtime_token_lifetime(None).as_secs());
+        assert_eq!(exp - iat, runtime_token_lifetime(Some(360 * 60)).as_secs());
+        assert!(
+            exp - iat >= 6 * 60 * 60,
+            "a runtime token must outlive the six-hour GitHub job limit"
+        );
+        assert_eq!(state.job_uuid_from_token(&token), Some(job));
+    }
+
+    /// A workflow may declare a job `timeout-minutes` above the six-hour
+    /// default — the parser caps *step* timeouts at 1..=360 but accepts any
+    /// job value, and the reaper honours it — so the one credential the
+    /// attempt can ever present has to grow with the declared timeout, or the
+    /// job outlives its token and loses its lease mid-run.
+    #[tokio::test]
+    async fn runtime_token_grows_with_a_declared_longer_job_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job = uuid::Uuid::new_v4();
+        let declared = 20 * 60 * 60;
+        let lifetime = runtime_token_lifetime(Some(declared));
+        assert!(
+            lifetime > RUNTIME_TOKEN_LIFETIME,
+            "a declared timeout above the default must extend the token"
+        );
+        assert!(
+            lifetime.as_secs() >= declared as u64 + 4 * 60 * 60,
+            "the token must outlive the declared job timeout plus the pause credit"
+        );
+        let token = state.mint_runtime_token_for_job("plan-long", &job, Some(declared));
+        let claims = state
+            .verify_local_jwt_claims(&token)
+            .expect("a longer-lived runtime token must still verify");
+        let exp = claims["exp"].as_u64().expect("exp is minted");
+        let iat = claims["iat"].as_u64().expect("iat is minted");
+        assert_eq!(exp - iat, lifetime.as_secs());
+    }
+
+    /// The runtime token grows with the declared job timeout *up to a server
+    /// ceiling*: a fork's `timeout-minutes` is untrusted input (the parser
+    /// accepts any number for a job), and an unbounded token is an unbounded
+    /// credential for runner capacity. The ceiling is GitHub's own five-day
+    /// maximum, the same value the delivered `jobTimeout` and the reaper's
+    /// deadline are clamped to, so a declaration past it buys nothing.
+    #[tokio::test]
+    async fn runtime_token_lifetime_is_capped_at_the_github_maximum() {
+        use preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS;
+
+        let ceiling = Duration::from_secs(MAX_JOB_TIMEOUT_SECONDS as u64)
+            + crate::debug_sessions::MAX_PAUSE_CREDIT
+            + JOB_CREDENTIAL_SLACK;
+        // Exactly the maximum is honoured in full.
+        assert_eq!(
+            runtime_token_lifetime(Some(MAX_JOB_TIMEOUT_SECONDS)),
+            ceiling
+        );
+        // One second past it, an hour past it, and an absurd declaration all
+        // stop at the same ceiling.
+        assert_eq!(
+            runtime_token_lifetime(Some(MAX_JOB_TIMEOUT_SECONDS + 1)),
+            ceiling
+        );
+        assert_eq!(
+            runtime_token_lifetime(Some(MAX_JOB_TIMEOUT_SECONDS * 24)),
+            ceiling
+        );
+        assert_eq!(runtime_token_lifetime(Some(i64::MAX)), ceiling);
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job = uuid::Uuid::new_v4();
+        let token = state.mint_runtime_token_for_job("plan-fork", &job, Some(i64::MAX));
+        let claims = state
+            .verify_local_jwt_claims(&token)
+            .expect("a capped runtime token must still verify");
+        let exp = claims["exp"].as_u64().expect("exp is minted");
+        let iat = claims["iat"].as_u64().expect("iat is minted");
+        assert_eq!(exp - iat, ceiling.as_secs());
     }
 }
 

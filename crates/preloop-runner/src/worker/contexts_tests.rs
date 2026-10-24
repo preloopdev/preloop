@@ -754,6 +754,198 @@ fn secrets_context_resolves_in_expressions() {
 }
 
 #[test]
+fn github_token_resolves_from_system_variable_only_on_github() {
+    // actions/runner `ExecutionContext.InitializeJob` fills `github.token`
+    // from the `system.github.token` variable, then overlays `contextData`
+    // — so on github.com the context resolves the wire credential even
+    // though contextData.github has no `token` key. On a preloop engine the
+    // same variable can carry the job's runtime credential, which must stay
+    // fenced off the step surface (#626).
+    let build = |control_plane: crate::settings::ControlPlane| {
+        let mut ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({
+                "system.github.token": {"value": "ghs_wire", "isSecret": true},
+                "github_token": {"value": "ghs_wire", "isSecret": true}
+            }),
+            serde_json::json!({"github": {"repository": "owner/repo"}}),
+        );
+        ctx.control_plane = control_plane;
+        ctx.build_expression_context()
+    };
+
+    // Engine registration (default): the variable is not projected.
+    let engine_ctx = build(crate::settings::ControlPlane::Engine);
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("github.token", &engine_ctx)
+            .unwrap()
+            .as_str(),
+        Some("")
+    );
+
+    // github.com registration: `github.token` mirrors system.github.token,
+    // independent of the GITHUB_TOKEN env var (not populated here).
+    let github_ctx = build(crate::settings::ControlPlane::GitHub);
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("github.token", &github_ctx)
+            .unwrap()
+            .as_str(),
+        Some("ghs_wire")
+    );
+}
+
+#[test]
+fn github_token_context_value_wins_over_system_variable_on_github() {
+    // Upstream overlays contextData.github on top of the variable-derived
+    // token, so an explicit context token stays authoritative.
+    let mut ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({
+            "system.github.token": {"value": "ghs_wire", "isSecret": true}
+        }),
+        serde_json::json!({"github": {"repository": "o/r", "token": "context_wins"}}),
+    );
+    ctx.control_plane = crate::settings::ControlPlane::GitHub;
+    let expr_ctx = ctx.build_expression_context();
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("github.token", &expr_ctx)
+            .unwrap()
+            .as_str(),
+        Some("context_wins")
+    );
+}
+
+#[test]
+fn job_env_github_token_override_never_rewrites_github_token() {
+    // A workflow- or job-level `env: GITHUB_TOKEN` (applied after
+    // `inject_github_env`, and any later `GITHUB_ENV` write) changes what the
+    // step process reads from the environment, but it is not the job's GitHub
+    // credential: upstream builds `github.token` from `system.github.token`
+    // and never reads the env back into the context.
+    let variables = serde_json::json!({
+        "system.github.token": {"value": "ghs_wire", "isSecret": true},
+        "github_token": {"value": "ghs_wire", "isSecret": true}
+    });
+    for control_plane in [
+        crate::settings::ControlPlane::GitHub,
+        crate::settings::ControlPlane::Engine,
+    ] {
+        let mut ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            variables.clone(),
+            serde_json::json!({"github": {"repository": "o/r"}}),
+        );
+        ctx.control_plane = control_plane;
+        ctx.env
+            .insert("GITHUB_TOKEN".to_string(), "ghp_job_env".to_string());
+        assert_eq!(
+            preloop_gha_expressions::eval_expression(
+                "github.token",
+                &ctx.build_expression_context()
+            )
+            .unwrap()
+            .as_str(),
+            if control_plane == crate::settings::ControlPlane::GitHub {
+                Some("ghs_wire")
+            } else {
+                Some("")
+            },
+            "the env override must not become `github.token` ({control_plane:?})"
+        );
+    }
+}
+
+#[test]
+fn empty_system_slot_falls_back_to_the_populated_token_alias() {
+    // The job builder writes empty `isSecret` slots for both token aliases
+    // before the claim fills them, and a legacy import can drop one of them:
+    // an empty slot must not shadow the alias that carries the credential.
+    let ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({
+            "system.github.token": {"value": "", "isSecret": true},
+            "github_token": {"value": "ghs_valid", "isSecret": true}
+        }),
+        serde_json::json!({"github": {"repository": "o/r"}}),
+    );
+    let mut ctx = ctx;
+    ctx.control_plane = crate::settings::ControlPlane::GitHub;
+    let expr_ctx = ctx.build_expression_context();
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("github.token", &expr_ctx)
+            .unwrap()
+            .as_str(),
+        Some("ghs_valid")
+    );
+
+    // Same alias ordering for the casing variant of the primary.
+    let mut ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({
+            "System.GitHub.Token": {"value": "", "isSecret": true},
+            "GITHUB_TOKEN": {"value": "ghs_valid", "isSecret": true}
+        }),
+        serde_json::json!({"github": {"repository": "o/r"}}),
+    );
+    ctx.control_plane = crate::settings::ControlPlane::GitHub;
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("github.token", &ctx.build_expression_context())
+            .unwrap()
+            .as_str(),
+        Some("ghs_valid")
+    );
+}
+
+#[test]
+fn derived_basic_header_mask_covers_every_token_alias() {
+    // `base64("x-access-token:{token}")` is the git extraheader
+    // actions/checkout persists. Resolution accepts both aliases
+    // case-insensitively, so the mask has to cover every spelling it exports.
+    // Asserted on the mask set: a plain `mask_secrets` check cannot tell the
+    // derived mask apart from `base64(token)`, which is already registered.
+    use base64::engine::Engine as _;
+    let basic = |token: &str| {
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+    };
+    for key in [
+        "system.github.token",
+        "System.GitHub.Token",
+        "github_token",
+        "GitHub_Token",
+    ] {
+        let ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({ key: {"value": "ghs_wire", "isSecret": true} }),
+            serde_json::json!({"github": {"repository": "o/r"}}),
+        );
+        assert!(
+            ctx.masks.contains(&basic("ghs_wire")),
+            "the derived Basic-header mask must cover `{key}`"
+        );
+        assert_eq!(ctx.mask_secrets(&basic("ghs_wire")), "***");
+    }
+    // A non-token secret keeps the ordinary masks only.
+    let ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({
+            "system.other.secret": {"value": "s3cr3t", "isSecret": true}
+        }),
+        serde_json::json!({}),
+    );
+    assert!(
+        !ctx.masks.contains(&basic("s3cr3t")),
+        "a non-token secret must not get the derived Basic-header mask"
+    );
+}
+
+#[test]
 fn secrets_context_excludes_system_plumbing_variables() {
     let ctx = JobContext::new(
         "job1".into(),

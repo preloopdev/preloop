@@ -351,11 +351,11 @@ pub fn expire_pat_scope_cache() {
 /// and fail every GitHub fetch the submit-time checkout routing assumed it
 /// could make. `None` when the scopes cannot be established (the PAT stays
 /// withheld, as before).
-pub async fn verified_pat_scopes(pat: &str) -> Option<Vec<String>> {
+pub async fn verified_pat_scopes(state: &crate::state::AppState, pat: &str) -> Option<Vec<String>> {
     if let Some(scopes) = cached_pat_scopes(pat) {
         return Some(scopes);
     }
-    match pat_oauth_scopes(pat).await {
+    match pat_oauth_scopes(state, pat).await {
         PatScopeOutcome::Known(scopes) => Some(scopes),
         PatScopeOutcome::Unverifiable { reason } => {
             tracing::warn!(%reason, "withholding PAT at dispatch: scopes unverifiable");
@@ -379,8 +379,8 @@ pub async fn verified_pat_scopes(pat: &str) -> Option<Vec<String>> {
 /// Failures are logged, never fatal: a server that cannot reach the GitHub API
 /// still serves, and the run path withholds the credential instead of
 /// embedding one whose bounds nobody established.
-pub async fn warm_pat_scope_cache(pat: &str) {
-    match pat_oauth_scopes(pat).await {
+pub async fn warm_pat_scope_cache(state: &crate::state::AppState, pat: &str) {
+    match pat_oauth_scopes(state, pat).await {
         PatScopeOutcome::Known(scopes) => {
             tracing::info!(
                 scope_count = scopes.len(),
@@ -476,7 +476,10 @@ enum PatScopeOutcome {
 }
 
 /// Introspect the static PAT's classic OAuth scopes via the `X-OAuth-Scopes`
-/// response header on an authenticated API-root request.
+/// response header on an authenticated API-root request, through the PAT's own
+/// breaker: while GitHub is known to be down the probe is refused instead of
+/// spending a request on a guaranteed failure, and the verdict is the same
+/// `Unverifiable` one an unreachable API gives.
 ///
 /// Returns [`PatScopeOutcome::Known`] with the scope list when GitHub answers
 /// successfully with an `X-OAuth-Scopes` header. An *absent* header is
@@ -484,7 +487,7 @@ enum PatScopeOutcome {
 /// for fine-grained PATs, so absence means the token's bounds are unknown
 /// rather than narrow. Results are cached per PAT (SHA-256 of the token) for
 /// [`PAT_SCOPE_CACHE_TTL`].
-async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
+async fn pat_oauth_scopes(state: &crate::state::AppState, pat: &str) -> PatScopeOutcome {
     use sha2::Digest as _;
     let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
     if let Ok(cache) = PAT_SCOPE_CACHE.lock()
@@ -511,12 +514,18 @@ async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
         };
     }
     let url = format!("{}/", crate::github::github_api_base());
-    let response = match crate::shared_http::CLIENT
-        .get(&url)
-        .header("Authorization", format!("Bearer {pat}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
+    let response = match crate::github_breaker::send_github(
+        state,
+        &crate::github_breaker::GithubCredential::bearer(
+            pat,
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        ),
+        crate::github_breaker::GithubSubsystem::Credentials,
+        crate::shared_http::CLIENT
+            .get(&url)
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await
     {
         Ok(response) => response,
         Err(error) => {
@@ -1282,7 +1291,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "workflow_ref": workflow_ref,
         "workflow_sha": sha,
         "repository_id": "0",
-        "triggering_actor": submission.actor
+        "triggering_actor": submission.triggering_actor.clone().unwrap_or_else(|| submission.actor.clone())
     });
 
     // Capture one immutable source per run before any job is queued. Local
@@ -1331,9 +1340,22 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // submission is validated against the mirror before anything is
         // served, and a failure is fatal — falling back to a forge checkout
         // would run the wrong tree.
-        match crate::merge_builder::attach_prebuilt_merge(shared, run_id, prebuilt).await {
-            Ok(snapshot) => Some(snapshot),
-            Err(error) => return Err(error.into_api_error()),
+        match capture_snapshot_within(
+            &shared.state.state_dir,
+            run_id,
+            SNAPSHOT_CAPTURE_TIMEOUT,
+            Box::pin(async {
+                crate::merge_builder::attach_prebuilt_merge(shared, run_id, prebuilt)
+                    .await
+                    .map_err(|error| error.into_api_error())
+            }),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            // A timeout and a capture failure are both fatal here: the commit
+            // exists only in the engine, so there is nothing to fall back to.
+            Ok(Err(error)) | Err(error) => return Err(error),
         }
     } else if let Some(workspace) = local_workspace {
         // The snapshot is a local submission's only copy of the tested tree:
@@ -1341,18 +1363,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // checkout to fall back to. Failing here reports the real reason (a
         // full disk, a publish that could not be completed) to the person who
         // submitted, instead of queueing jobs that can only die in setup.
-        match create_workspace_snapshot(
+        match capture_snapshot_within(
             &shared.state.state_dir,
-            workspace,
             run_id,
-            Some(shared),
-            shared.state.static_github_pat().as_deref(),
-            local_pull_request_merge.as_ref(),
+            SNAPSHOT_CAPTURE_TIMEOUT,
+            Box::pin(create_workspace_snapshot(
+                &shared.state.state_dir,
+                workspace,
+                run_id,
+                Some(shared),
+                shared.state.static_github_pat().as_deref(),
+                local_pull_request_merge.as_ref(),
+            )),
         )
         .await
         {
-            Ok(snapshot) => Some(snapshot),
-            Err(error) => {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            Ok(Err(error)) => {
                 error!(
                     %run_id,
                     workspace = %workspace.display(),
@@ -1361,17 +1388,36 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 );
                 return Err(error);
             }
+            // A timed-out capture has already removed this run's staging
+            // trees and carries its own operator-facing explanation.
+            Err(error) => return Err(error),
         }
     } else {
-        match create_remote_checkout_snapshot(shared, &submission, run_id, &sha).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
+        match capture_snapshot_within(
+            &shared.state.state_dir,
+            run_id,
+            SNAPSHOT_CAPTURE_TIMEOUT,
+            Box::pin(create_remote_checkout_snapshot(
+                shared,
+                &submission,
+                run_id,
+                &sha,
+            )),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => {
                 // The commit exists upstream, so jobs can still check out
                 // directly — degraded, never broken. Reported at error level
                 // because it is a full forge fetch per job, not a cache hit.
                 error!(%run_id, error = ?error, "Failed to populate remote checkout cache — jobs will fetch from the forge");
                 None
             }
+            // A capture that never finished is not a degraded cache hit: the
+            // engine cannot vouch for what the run would test, and queueing
+            // jobs silently would hide the hang. Fail the submission.
+            Err(error) => return Err(error),
         }
     };
 
@@ -1620,7 +1666,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // the PAT's classic OAuth scopes and refuse the run on mismatch;
         // an invalid PAT is refused outright, and a PAT whose bounds
         // cannot be verified is withheld rather than embedded at acquire.
-        match pat_oauth_scopes(&pat).await {
+        match pat_oauth_scopes(&shared.state, &pat).await {
             PatScopeOutcome::Known(scopes) => {
                 enforce_pat_permissions(&jobs, &submission, &scopes)?;
                 tracing::warn!(
@@ -2742,9 +2788,11 @@ pub(crate) fn build_job_artifacts(
     agent_msg.request_id = request_id;
 
     // Mint tokens outside the lock (HMAC computation).
-    let runtime_token = shared
-        .state
-        .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+    let runtime_token = shared.state.mint_runtime_token_for_job(
+        &agent_msg.plan.plan_id,
+        &agent_msg.job_id,
+        agent_msg.job_timeout,
+    );
 
     if let Some(snapshot) = workspace_snapshot {
         let redirected =
@@ -3327,10 +3375,11 @@ enum JobLogs {
 
 /// Resolve one job's logs through the tier fallback.
 ///
-/// Unfiltered requests prefer the merged upload because it is the runner's
-/// authoritative whole-job representation. A step-filtered request prefers
-/// individual step blobs when both are present; the merged upload has no
-/// recoverable boundaries and is only used to produce the explicit 409.
+/// Unfiltered requests normally prefer the merged upload. If the aggregate
+/// per-step blob size is larger, the merged scratch file may be partial, so
+/// the step blobs are used instead. A step-filtered request always prefers
+/// individual step blobs when present; the merged upload has no recoverable
+/// boundaries and is only used to produce the explicit 409.
 ///
 /// `workflow_step_ids` is the attempt's declared-step order, taken from the
 /// manifest built out of the job request message. There is deliberately no
@@ -3356,11 +3405,12 @@ async fn resolve_job_logs(
             )));
         }
     };
-    if !prefer_steps && let Some(contents) = merged {
-        return Ok(JobLogs::Merged(contents));
-    }
+    // Inspect step blobs before choosing the unfiltered source: a failed flush
+    // can leave a shorter merged upload even though per-step uploads exist.
 
     let mut step_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut step_bytes = 0u64;
+
     match tokio::fs::read_dir(results_dir).await {
         Ok(mut entries) => {
             while let Some(entry) = entries.next_entry().await.map_err(|error| {
@@ -3387,6 +3437,7 @@ async fn resolve_job_logs(
                 if !metadata.is_file() {
                     continue;
                 }
+                step_bytes = step_bytes.saturating_add(metadata.len());
                 step_files.push((step_id, entry.path()));
             }
         }
@@ -3412,7 +3463,15 @@ async fn resolve_job_logs(
             .then_with(|| left.0.cmp(&right.0))
     });
 
-    if !step_files.is_empty() {
+    // Keep the merged upload as the normal whole-job source, but do not let a
+    // shorter partial scratch file hide the larger per-step representation.
+    if !step_files.is_empty()
+        && (prefer_steps
+            || merged.is_none()
+            || merged
+                .as_ref()
+                .is_some_and(|contents| step_bytes > contents.len() as u64))
+    {
         let workflow = workflow_step_ids.filter(|ids| !ids.is_empty()).map(|ids| {
             ids.iter()
                 .map(|id| {
@@ -3686,20 +3745,24 @@ pub async fn cancel_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    cancel_run_inner(&shared, run_id).await.map(Json)
+    cancel_run_inner(&shared, run_id)
+        .await
+        .map(|(record, _)| Json(record))
 }
 
 /// Cancel a run: stop its in-flight attempts, fail its queued jobs
 /// (`cancelled`), and report the cancelled jobs' check runs in the
 /// background. Shared by the native route and the GitHub-compat shim;
-/// `NotFound` when the run does not exist. Cancelling an already-terminal run
-/// is a no-op that returns the record (the native endpoint is idempotent; the
-/// compat shim pre-checks the status and answers `409` like github.com).
+/// `NotFound` when the run does not exist. Returns the record and whether this
+/// call cancelled a live run, as decided by the backend's locked transition.
+/// The native endpoint stays idempotent; the compat shim uses that outcome
+/// to reject an already-terminal run with `409`.
 pub(crate) async fn cancel_run_inner(
     shared: &Arc<SharedState>,
     run_id: RunId,
-) -> Result<RunRecord, ApiError> {
+) -> Result<(RunRecord, bool), ApiError> {
     let crate::control::types::CancelOutcome {
+        run_cancelled,
         cancellations: cancellation_count,
         record,
         cancelled_jobs,
@@ -3746,7 +3809,7 @@ pub(crate) async fn cancel_run_inner(
             .await;
         }
     });
-    Ok(record)
+    Ok((record, run_cancelled))
 }
 
 /// Request body for approving a pending environment protection gate.
@@ -3895,6 +3958,7 @@ pub(crate) async fn rerun_run_with_mode(
     mode: crate::control::types::RerunMode,
     reused_check_run: Option<(JobId, u64)>,
     triggering_actor: Option<String>,
+    enable_debugger: Option<bool>,
 ) -> Result<RunAccepted, ApiError> {
     let record = shared
         .state
@@ -3903,6 +3967,11 @@ pub(crate) async fn rerun_run_with_mode(
         .await
         .map_err(ApiError::from)?;
     let mut submission = (*record.submission).clone();
+    // A rerun request may explicitly enable/disable DAP for this attempt.
+    // With no override, preserve the original submission setting.
+    if let Some(enable_debugger) = enable_debugger {
+        submission.enable_debugger = enable_debugger;
+    }
     // A re-run sees the values the original submission supplied; they live
     // in the provider's run tier while the run's history survives.
     let run_tier = shared
@@ -3940,7 +4009,14 @@ pub(crate) async fn rerun_run_with_mode(
     let Some(plan) = plan else {
         return match mode {
             crate::control::types::RerunMode::All => {
-                archived_rerun(shared, run_id, submission, reused_check_run).await
+                archived_rerun(
+                    shared,
+                    run_id,
+                    submission,
+                    reused_check_run,
+                    triggering_actor.clone(),
+                )
+                .await
             }
             _ => Err(ApiError::conflict(format!(
                 "run {run_id} was archived; only a full re-run (all jobs) is possible"
@@ -3981,8 +4057,21 @@ pub(crate) async fn rerun_run_with_mode(
         }
 
         if !plan.missing_templates.is_empty() {
-            let normalized_github =
+            // Rebuilt templates would otherwise keep the ORIGINAL attempt's
+            // github context: `record.github` predates the backend's
+            // triggering-actor/attempt bump, so stamp the override the same
+            // way the runner-facing messages are patched.
+            let mut normalized_github =
                 preloop_gha_parser::job_builder::normalize_github_context(&record.github);
+            if let (Some(actor), Some(map)) = (
+                triggering_actor.as_deref(),
+                normalized_github.as_object_mut(),
+            ) {
+                map.insert(
+                    "triggering_actor".to_owned(),
+                    serde_json::Value::String(actor.to_owned()),
+                );
+            }
             let base_url = runner_base_url();
             // The rerun rebuilds templates for the same workflow snapshot —
             // expansion is deterministic over the stored submission's
@@ -4056,7 +4145,7 @@ pub(crate) async fn rerun_run_with_mode(
         .rerun_run(crate::control::types::RerunRun {
             run_id,
             mode: mode.clone(),
-            triggering_actor,
+            triggering_actor: triggering_actor.clone(),
             workflow_concurrency,
             environment_rules: crate::config::EnvironmentRulesMap::default(),
             templates,
@@ -4071,7 +4160,14 @@ pub(crate) async fn rerun_run_with_mode(
         Err(crate::control::ControlError::NotFound(_)) => {
             return match mode {
                 crate::control::types::RerunMode::All => {
-                    archived_rerun(shared, run_id, submission, reused_check_run).await
+                    archived_rerun(
+                        shared,
+                        run_id,
+                        submission,
+                        reused_check_run,
+                        triggering_actor.clone(),
+                    )
+                    .await
                 }
                 _ => Err(ApiError::conflict(format!(
                     "run {run_id} was archived; only a full re-run (all jobs) is possible"
@@ -4156,9 +4252,13 @@ pub(crate) async fn rerun_run_with_mode(
 async fn archived_rerun(
     shared: &Arc<SharedState>,
     archived_run_id: RunId,
-    submission: WorkflowSubmission,
+    mut submission: WorkflowSubmission,
     reused_check_run: Option<(JobId, u64)>,
+    triggering_actor: Option<String>,
 ) -> Result<RunAccepted, ApiError> {
+    // The new run keeps `github.actor` = the original submitter; the
+    // rerequesting user only takes `github.triggering_actor`.
+    submission.triggering_actor = triggering_actor;
     let accepted = submit_run_inner(shared, submission).await?;
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
         // Guarded by the setter itself: a missing job row writes nothing.
@@ -4284,14 +4384,19 @@ impl TryFrom<&RerunRequest> for crate::control::types::RerunMode {
 pub async fn rerun_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
-    body: Option<Json<RerunRequest>>,
+    // axum 0.8 rejects a malformed or non-JSON body where `Option<Json<_>>`
+    // used to read it as absent; keep that fallback to the default rerun.
+    body: Result<Json<RerunRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<RunAccepted>, ApiError> {
-    let request = body.map(|Json(request)| request).unwrap_or(RerunRequest {
-        mode: default_rerun_mode(),
-        job_id: None,
-    });
+    let request = body
+        .ok()
+        .map(|Json(request)| request)
+        .unwrap_or(RerunRequest {
+            mode: default_rerun_mode(),
+            job_id: None,
+        });
     let mode = crate::control::types::RerunMode::try_from(&request)?;
-    rerun_run_with_mode(&shared, run_id, mode, None, None)
+    rerun_run_with_mode(&shared, run_id, mode, None, None, None)
         .await
         .map(Json)
 }
@@ -5094,7 +5199,7 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(callee_yaml.as_bytes());
         let mock = axum::Router::new()
             .route(
-                "/repos/:owner/:repo/contents/*path",
+                "/repos/{owner}/{repo}/contents/{*path}",
                 get({
                     let seen = seen_auth.clone();
                     move |headers: HeaderMap| async move {
@@ -5120,7 +5225,7 @@ mod tests {
                 }),
             )
             .route(
-                "/repos/:owner/:repo/commits/:git_ref",
+                "/repos/{owner}/{repo}/commits/{git_ref}",
                 get(|| async move {
                     Json(serde_json::json!({"sha": "c0ffee0000000000000000000000000000000000"}))
                 }),

@@ -1399,7 +1399,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let _env = pat_env(&base).await;
 
-        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let mut first = crate::github_app::GitHubAppCredentials::for_tests(
             "101",
             key.clone(),

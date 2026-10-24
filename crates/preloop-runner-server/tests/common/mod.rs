@@ -102,6 +102,8 @@ pub use preloop_runner_server::secrets_api::*;
 
 pub use preloop_runner_server::shared_http::*;
 
+pub use preloop_runner_server::sarif::*;
+
 pub use preloop_runner_server::snapshots::*;
 
 pub use preloop_runner_server::state::*;
@@ -543,7 +545,8 @@ pub async fn live_pat_scope_api(scopes: &'static str) -> crate::state::TestEnvVa
 /// time. That override must never reach a fork-restricted job: the job keeps
 /// the local job-scoped runtime token, which authenticates only against this
 /// control plane.
-// Non-asserting helper for tests that need to inspect an error response.
+///
+/// Non-asserting helper for tests that need to inspect an error response.
 pub async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     let mut builder = Request::builder().method(method).uri(uri);
     if uri.starts_with("/api/v1/")
@@ -1208,10 +1211,10 @@ pub async fn generated_server_dag_properties_1000_cases() {
         let mut seed = 20250713u64 ^ case.wrapping_mul(0x9E37_79B9);
         let count = 2 + (next(&mut seed) % 4) as usize;
         let mut needs = vec![Vec::<usize>::new(); count];
-        for (job, job_needs) in needs.iter_mut().enumerate().skip(1) {
+        for (job, needs_of_job) in needs.iter_mut().enumerate().skip(1) {
             for dependency in 0..job {
                 if next(&mut seed) & 1 == 1 {
-                    job_needs.push(dependency);
+                    needs_of_job.push(dependency);
                 }
             }
         }

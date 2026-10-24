@@ -184,8 +184,16 @@ pub struct RunResponse {
         repository_dispatch_trigger,
         list_dispatch_workflows,
         list_dispatch_runs,
+        rerun_actions_run,
+        rerun_actions_run_failed,
+        rerun_actions_job,
+        cancel_actions_run,
         github_register,
         github_callback,
+        github_setup_session_open,
+        github_setup_session_poll,
+        github_setup_form,
+        github_setup_callback,
         list_runners,
         readyz,
         status,
@@ -215,7 +223,7 @@ impl Modify for SecuritySchemes {
                     .scheme(HttpAuthScheme::Bearer)
                     .description(Some(
                         "System token (`PRELOOP_SYSTEM_TOKEN`, or a per-engine token generated \
-                         and stored in the OS credential store or private engine.token file). \
+                         and stored in the credential store or private engine.token file). \
                          Used by CLI clients, agents, and operators.",
                     ))
                     .build(),
@@ -801,6 +809,102 @@ fn list_dispatch_workflows() {}
 )]
 fn list_dispatch_runs() {}
 
+/// Re-run a workflow run (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun` — GitHub's
+/// "Re-run all jobs": a new attempt on the same run when it is still live,
+/// otherwise a new run from the recorded submission. `201 Created` on
+/// acceptance. `run_id` accepts the preloop UUID or the numeric id
+/// `GET .../actions/runs` emits.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/actions/runs/{run_id}/rerun", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("run_id" = String, Path, description = "Run UUID or github.com-shaped numeric id")
+    ),
+    responses(
+        (status = 201, description = "Re-run accepted"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository or run", body = ApiErrorResponse),
+        (status = 409, description = "Run not completed, nothing to re-run, or rerun window closed", body = ApiErrorResponse)
+    )
+)]
+fn rerun_actions_run() {}
+
+/// Re-run failed jobs of a workflow run (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs` —
+/// failed/cancelled jobs plus every job that depends on them; succeeded jobs
+/// keep their results and outputs for the new attempt. `201 Created` on
+/// acceptance, `409` when the run has nothing failed or was archived.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("run_id" = String, Path, description = "Run UUID or github.com-shaped numeric id")
+    ),
+    responses(
+        (status = 201, description = "Re-run accepted"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository or run", body = ApiErrorResponse),
+        (status = 409, description = "Run not completed, nothing failed, or run archived", body = ApiErrorResponse)
+    )
+)]
+fn rerun_actions_run_failed() {}
+
+/// Re-run a job (and its dependents) from a workflow run
+/// (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun`. `job_id` is the
+/// numeric id `stable_id("{run_uuid}:{job_id}")` — preloop does not track
+/// github.com's job database ids — or the raw preloop job id, matched against
+/// the newest terminal run of the repository. `201 Created` on acceptance.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/actions/jobs/{job_id}/rerun", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("job_id" = String, Path, description = "Synthetic numeric job id or preloop job id")
+    ),
+    responses(
+        (status = 201, description = "Re-run accepted"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository or job", body = ApiErrorResponse),
+        (status = 409, description = "Run not completed, or run archived", body = ApiErrorResponse)
+    )
+)]
+fn rerun_actions_job() {}
+
+/// Cancel a workflow run (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel` — `202
+/// Accepted` once cancellation is initiated; `409` when the run is already
+/// completed, matching github.com's refusal to cancel a finished run.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/actions/runs/{run_id}/cancel", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("run_id" = String, Path, description = "Run UUID or github.com-shaped numeric id")
+    ),
+    responses(
+        (status = 202, description = "Cancellation initiated"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository or run", body = ApiErrorResponse),
+        (status = 409, description = "Run already completed", body = ApiErrorResponse)
+    )
+)]
+fn cancel_actions_run() {}
 /// Receive a GitHub webhook event.
 ///
 /// Validates the `X-Hub-Signature-256` header, extracts the event type
@@ -858,19 +962,101 @@ fn webhook_health() {}
 /// GitHub App manifest registration page (browser-facing).
 #[utoipa::path(
     get, path = "/api/v1/github/register", tag = "GitHub",
-    responses((status = 200, content_type = "text/html", description = "Registration form", body = String))
+    responses(
+        (status = 200, content_type = "text/html", description = "Registration form", body = String),
+        (status = 404, description = "App registration is disabled")
+    )
 )]
 fn github_register() {}
 
 /// GitHub App manifest callback (browser-facing).
 ///
-/// Exchanges the one-time code from GitHub for App credentials.
+/// Exchanges the one-time code from GitHub for App credentials. Only served
+/// when `PRELOOP_ENABLE_APP_REGISTRATION` is on (404 otherwise); the `state`
+/// query value must match the cookie set by `/api/v1/github/register`
+/// (400 otherwise, before any request to GitHub).
 #[utoipa::path(
     get, path = "/api/v1/github/callback", tag = "GitHub",
-    params(("code" = String, Query, description = "GitHub manifest conversion code")),
-    responses((status = 200, content_type = "text/html", description = "App credentials page", body = String))
+    params(
+        ("code" = String, Query, description = "GitHub manifest conversion code"),
+        ("state" = String, Query, description = "Signed state issued by /api/v1/github/register")
+    ),
+    responses(
+        (status = 200, content_type = "text/html", description = "App credentials page", body = String),
+        (status = 400, description = "Missing, mismatched, or expired state, or a malformed query"),
+        (status = 404, description = "App registration is disabled"),
+        (status = 500, description = "GitHub did not return the App credentials")
+    )
 )]
 fn github_callback() {}
+
+/// Open an engine-hosted GitHub App setup session (`preloop setup github
+/// --via app` with a public URL). Returns the session handle and the one-time
+/// setup link, which works once and expires ten minutes after it is opened.
+///
+/// The body takes `public_url` (required; the engine's own origin when it has
+/// `PRELOOP_PUBLIC_URL`, https unless loopback), `org`, `app_name`, `add`
+/// (create a second App when one is already configured), and `repos`
+/// (`owner/name` slugs to verify with the new credentials, at most 16).
+#[utoipa::path(
+    post, path = "/api/v1/github/setup-sessions", tag = "GitHub",
+    request_body = JsonValue,
+    responses(
+        (status = 201, description = "Session opened; `setup_url` carries the one-time link"),
+        (status = 400, description = "public_url, org, app_name, or repos is invalid"),
+        (status = 401, description = "Missing or invalid system token"),
+        (status = 409, description = "This engine already has an App configured (pass `add`), or a setup is still in flight"),
+        (status = 500, description = "The engine's config could not be read, or its credential store could not be opened or holds credentials only for the life of the process (`PRELOOP_CREDENTIAL_STORE=memory`)")
+    ),
+    security(("native_bearer" = []))
+)]
+fn github_setup_session_open() {}
+
+/// Status of an engine-hosted App setup session: `awaiting_link`,
+/// `awaiting_approval`, `converting`, `completed`, `failed`, or `expired`.
+#[utoipa::path(
+    get, path = "/api/v1/github/setup-sessions/{session_id}", tag = "GitHub",
+    params(("session_id" = String, Path, description = "Session handle from the open response")),
+    responses(
+        (status = 200, description = "Session status; carries no key material, and the `--repo` check lines on completion"),
+        (status = 401, description = "Missing or invalid system token"),
+        (status = 404, description = "No such session; it was replaced or the engine restarted")
+    ),
+    security(("native_bearer" = []))
+)]
+fn github_setup_session_poll() {}
+
+/// Engine-hosted App setup: the App-creation form (browser-facing). Serves
+/// the form once for a live setup link; 404 otherwise.
+#[utoipa::path(
+    get, path = "/setup/github", tag = "GitHub",
+    params(("t" = String, Query, description = "One-time setup token")),
+    responses(
+        (status = 200, content_type = "text/html", description = "App-creation form that submits itself to GitHub", body = String),
+        (status = 404, description = "No live setup link matches the token"),
+        (status = 429, description = "Too many setup requests")
+    )
+)]
+fn github_setup_form() {}
+
+/// Engine-hosted App setup: GitHub's redirect (browser-facing). Converts the
+/// one-time code and stores the App's credentials on the engine.
+#[utoipa::path(
+    get, path = "/setup/github/callback", tag = "GitHub",
+    params(
+        ("code" = String, Query, description = "GitHub manifest conversion code"),
+        ("state" = String, Query, description = "State nonce from the form")
+    ),
+    responses(
+        (status = 200, content_type = "text/html", description = "Setup complete", body = String),
+        (status = 400, description = "State or code did not match the setup in progress"),
+        (status = 404, description = "No setup is awaiting this redirect"),
+        (status = 429, description = "Too many setup requests"),
+        (status = 500, description = "The App was created but its credentials could not be stored"),
+        (status = 502, description = "GitHub did not return the App credentials")
+    )
+)]
+fn github_setup_callback() {}
 
 /// Registered runners (read-only; used by the CLI to detect a dead pool).
 #[utoipa::path(

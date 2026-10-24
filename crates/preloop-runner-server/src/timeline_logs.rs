@@ -2,6 +2,16 @@ use super::*;
 
 // Timeline, logs, completion
 
+/// Most runtime-minted mask values kept per scope (a plan id and its run id).
+///
+/// A job with `id-token: write` can mint a distinct JWT per call, and every
+/// mint widens the scope, the cached resolution entries, and every live log
+/// masker — none of which is bounded by the log-memory caps. The cap bounds all
+/// of them at once; the oldest registration is dropped first, which is the value
+/// closest to its 300 s expiry (see `oidc::TOKEN_TTL_SECS`). Provider-derived
+/// values are never dropped.
+const MAX_RUNTIME_MASKS_PER_SCOPE: usize = 64;
+
 /// Whether a timeline record describes a step rather than a container.
 ///
 /// Shared by the annotation projection and the manifest reconciliation below,
@@ -251,6 +261,93 @@ pub async fn create_log(
     ))
 }
 
+/// Add `value` to `values` unless already present.
+fn push_mask_value(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_owned());
+    }
+}
+
+/// Chunk-boundary-safe streaming masker for one log key, paired with the raw
+/// values it was built from.
+///
+/// The source list stays beside the masker so a runtime registration (an OIDC
+/// `id_token` minted while the job is already logging — see
+/// [`register_runtime_mask_value`]) can widen an in-flight masker:
+/// [`extend`](Self::extend) rebuilds from `sources ∪ {value}` and carries the
+/// withheld tail over, so a secret split across the rebuild still matches on
+/// the reassembled stream.
+///
+/// `runtime` tracks which sources arrived at runtime (as opposed to the
+/// provider-derived values the masker was seeded with) so the runtime portion
+/// can be capped: the withheld tail is flushed through the *old* masker before
+/// the rebuild, so dropping the oldest runtime value never emits a byte the
+/// old masker had redacted.
+pub struct PlanLogMasker {
+    masker: preloop_gha_protocol::masking::StreamingMasker,
+    sources: Vec<String>,
+    /// Runtime-registered sources, oldest first; the ones
+    /// [`extend`](Self::extend) may drop once the cap is reached.
+    runtime: Vec<String>,
+}
+
+impl PlanLogMasker {
+    fn new(sources: Vec<String>, runtime: Vec<String>) -> Self {
+        let masker =
+            preloop_gha_protocol::masking::StreamingMasker::new(sources.iter().map(String::as_str));
+        Self {
+            masker,
+            sources,
+            runtime,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.masker.push(chunk)
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        self.masker.finish()
+    }
+
+    /// Widen the pattern set with `value`, rebuilding the masker in place.
+    ///
+    /// The old masker's withheld tail is flushed *through* the rebuilt masker
+    /// — not dropped, not emitted raw: a secret split across the rebuild is
+    /// then matched on the reassembled window exactly like any other chunk
+    /// boundary, and whatever the rebuilt masker still withholds stays
+    /// withheld. Returns the bytes that became safe to emit; the caller
+    /// appends them to the log before any later output.
+    ///
+    /// The runtime portion of the source list is capped at
+    /// [`MAX_RUNTIME_MASKS_PER_SCOPE`]: a job minting a token per call must not
+    /// grow every live masker for the run's life. The oldest runtime value goes
+    /// first — it is the one nearest its expiry — and the provider-derived
+    /// values stay whatever the cap does.
+    fn extend(&mut self, value: &str) -> Vec<u8> {
+        if value.is_empty() || self.sources.iter().any(|source| source == value) {
+            return Vec::new();
+        }
+        self.sources.push(value.to_owned());
+        self.runtime.push(value.to_owned());
+        while self.runtime.len() > MAX_RUNTIME_MASKS_PER_SCOPE {
+            let evicted = self.runtime.remove(0);
+            if let Some(position) = self.sources.iter().position(|source| source == &evicted) {
+                self.sources.remove(position);
+            }
+        }
+        let tail = self.masker.finish();
+        self.masker = preloop_gha_protocol::masking::StreamingMasker::new(
+            self.sources.iter().map(String::as_str),
+        );
+        if tail.is_empty() {
+            Vec::new()
+        } else {
+            self.masker.push(&tail)
+        }
+    }
+}
+
 /// POST append log — runner appends lines to a log file.
 pub async fn append_log(
     State(shared): State<Arc<SharedState>>,
@@ -283,19 +380,33 @@ pub async fn append_log(
     // block each other.
     let masker = {
         let mut inner = shared.state.inner.lock().await;
-        inner
-            .log_stream_maskers
-            .entry(key.clone())
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Mutex::new(
-                    preloop_gha_protocol::masking::StreamingMasker::new(
-                        secrets.iter().map(String::as_str),
-                    ),
-                ))
-            })
-            .clone()
+        if let Some(existing) = inner.log_stream_maskers.get(&key) {
+            existing.clone()
+        } else {
+            // Seed from the resolved list plus any runtime-registered values:
+            // a mint can land between the resolution above and here, and the
+            // masker must never start narrower than the scope already active.
+            let mut sources = secrets.as_ref().clone();
+            let mut runtime = Vec::new();
+            if let Some(registered) = inner.plan_runtime_masks.get(&plan_id) {
+                for value in registered {
+                    push_mask_value(&mut sources, value);
+                    push_mask_value(&mut runtime, value);
+                }
+            }
+            let handle = std::sync::Arc::new(tokio::sync::Mutex::new(PlanLogMasker::new(
+                sources, runtime,
+            )));
+            inner.log_stream_maskers.insert(key.clone(), handle.clone());
+            handle
+        }
     };
-    let masked = masker.lock().await.push(&body);
+    // Hold the per-key guard across the segment append and the preview update:
+    // a concurrent OIDC mint widens this same masker, and releasing the guard
+    // between producing the masked chunk and writing it would let the widened
+    // masker's withheld tail land before this chunk.
+    let mut guard = masker.lock().await;
+    let masked = guard.push(&body);
     if let Err(error) = shared
         .state
         .log_segments
@@ -372,7 +483,9 @@ pub fn log_key(plan_id: &str, log_id: &str) -> String {
 /// The returned list holds raw secret values; masking entry points
 /// ([`preloop_gha_protocol::masking::mask_secrets_transform_aware`],
 /// [`preloop_gha_protocol::masking::StreamingMasker`]) expand transformed
-/// variants themselves.
+/// variants themselves. The list also carries every runtime-registered value
+/// ([`register_runtime_mask_value`]) active for the plan — including ones
+/// minted while this resolution was already in flight.
 pub(crate) async fn resolve_plan_secret_list(
     shared: &Arc<SharedState>,
     plan_id: &str,
@@ -478,9 +591,20 @@ pub(crate) async fn resolve_plan_secret_list(
 
     {
         let mut inner = shared.state.inner.lock().await;
+        // Runtime-minted values (an OIDC `id_token` registered mid-job) join
+        // the scope no matter what the resolution above saw: a mint can race
+        // these backend reads, and caching a scope that predates it would
+        // under-mask every later pass.
+        let mut secrets = secrets;
+        if let Some(runtime) = inner.plan_runtime_masks.get(plan_id) {
+            for value in runtime {
+                push_mask_value(&mut secrets, value);
+            }
+        }
         let secrets = Arc::new(secrets);
         if resolved {
-            // Permanent cache: run secrets are immutable for the run's life.
+            // Permanent cache: run secrets are immutable for the run's life
+            // (runtime registrations widen the cached entry in place).
             inner
                 .plan_secret_masker
                 .insert(plan_id.to_owned(), secrets.clone());
@@ -500,6 +624,174 @@ pub(crate) async fn resolve_plan_secret_list(
     }
 }
 
+/// Register a runtime-minted secret value into the server-side mask scope
+/// that covers a job's log output.
+///
+/// Provider secrets are known at submit, but the OIDC `id_token` is minted
+/// mid-job (see [`crate::oidc_handlers::oidc_token`]): a step that echoes it
+/// into the log discloses a bearer credential just as surely as a raw
+/// secret, so the value joins the mask scope the moment it is minted —
+/// before the mint response can reach the job. It is registered under the
+/// job's plan scope (AzDO log appends, live-feed batches, replay log
+/// uploads all resolve through [`resolve_plan_secret_list`]) and under the
+/// run scope (run-keyed log URIs).
+///
+/// Everything that freezes a scope is widened here, race-free under the
+/// state lock: the runtime registry (merged into every later cache write and
+/// cold resolution), the cached resolution entries, and the streaming
+/// log maskers of the plan's live logs (rebuilt in place via
+/// [`PlanLogMasker::extend`], whose spilled tail is appended to the log so
+/// no bytes are dropped). A concurrent append either observes the value
+/// everywhere or entirely predates the mint — the value cannot exist in log
+/// content older than this call.
+///
+/// The registration is bounded: at most [`MAX_RUNTIME_MASKS_PER_SCOPE`] values
+/// per scope, oldest dropped first, in the registry, the cached entries and the
+/// live maskers alike. `id-token: write` lets a job mint a distinct JWT per
+/// call, and an unbounded set would grow with the run — and rebuild every live
+/// masker from a longer list on every mint — for as long as the server lives.
+pub(crate) async fn register_runtime_mask_value(
+    shared: &Arc<SharedState>,
+    plan_id: &str,
+    run_id: &str,
+    value: &str,
+) {
+    if value.is_empty() {
+        return;
+    }
+    let mut handles: Vec<(String, std::sync::Arc<tokio::sync::Mutex<PlanLogMasker>>)> = Vec::new();
+    let prefix = format!("{plan_id}/");
+    {
+        let mut inner = shared.state.inner.lock().await;
+        for scope in [plan_id, run_id] {
+            if scope.is_empty() {
+                continue;
+            }
+            register_scope_runtime_value(&mut inner, scope, value);
+        }
+        for (key, handle) in &inner.log_stream_maskers {
+            if key.starts_with(&prefix) {
+                handles.push((key.clone(), handle.clone()));
+            }
+        }
+    }
+    // Widen the running streaming maskers outside the state lock (their
+    // mutexes are per log key; appending the spilled tail mirrors
+    // `flush_log_stream_maskers`). The per-key guard is held across the append
+    // of the flushed tail and the preview update: an append that took the
+    // mutex first writes its whole chunk before this tail, and one that takes
+    // it later waits — a log never interleaves two writers' bytes.
+    for (key, handle) in handles {
+        let mut guard = handle.lock().await;
+        let spilled = guard.extend(value);
+        if spilled.is_empty() {
+            continue;
+        }
+        let log_id = key.strip_prefix(&prefix).unwrap_or(&key);
+        if let Err(error) = shared
+            .state
+            .log_segments
+            .append(plan_id, log_id, &spilled)
+            .await
+        {
+            warn!(?error, key = %key, "failed to flush widened masker tail to segments");
+        }
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .logs
+            .entry(key)
+            .or_default()
+            .extend_from_slice(&spilled);
+        inner.log_bytes_total = inner.log_bytes_total.saturating_add(spilled.len());
+    }
+}
+
+/// Register a runtime-minted `value` under `scope`: the runtime registry, the
+/// cached resolution entries, and (in the caller) the live log maskers.
+///
+/// The registry keeps at most [`MAX_RUNTIME_MASKS_PER_SCOPE`] values per scope
+/// and drops the oldest — a job with `id-token: write` mints a distinct JWT per
+/// call, and an uncapped list would grow for the run's whole life. An evicted
+/// value leaves the cached scope lists with it, so one bound governs every
+/// structure that holds runtime values. Values already registered are a no-op:
+/// the caches were widened when the value first arrived and every later cache
+/// write merges the registry.
+fn register_scope_runtime_value(inner: &mut InnerState, scope: &str, value: &str) {
+    let evicted = {
+        let runtime = inner
+            .plan_runtime_masks
+            .entry(scope.to_owned())
+            .or_default();
+        if runtime.iter().any(|existing| existing == value) {
+            return;
+        }
+        runtime.push(value.to_owned());
+        if runtime.len() > MAX_RUNTIME_MASKS_PER_SCOPE {
+            let evicted = runtime.remove(0);
+            warn!(
+                scope,
+                cap = MAX_RUNTIME_MASKS_PER_SCOPE,
+                "runtime mask registry at its cap; oldest registered value dropped"
+            );
+            Some(evicted)
+        } else {
+            None
+        }
+    };
+    for cached in [
+        inner.plan_secret_masker.get_mut(scope),
+        inner
+            .plan_secret_masker_pending
+            .get_mut(scope)
+            .map(|(cached, _deadline)| cached),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let cached = std::sync::Arc::make_mut(cached);
+        if let Some(evicted) = &evicted {
+            cached.retain(|existing| existing != evicted);
+        }
+        push_mask_value(cached, value);
+    }
+}
+
+/// The node-local mask values registered for `scopes` (a job's plan id and
+/// its run id), as the same union the log egresses mask with: the resolved
+/// plan-scope entries (permanent cache and negative-cache union fallback),
+/// plus the runtime registry ([`register_runtime_mask_value`]).
+///
+/// [`resolve_plan_secret_list`] serves this union to the log paths; a caller
+/// masking another surface of the same job's text (completion annotations,
+/// `environment_url`) merges it the same way, so a value minted mid-job — or
+/// an environment-tier value merged into the plan scope at claim — is
+/// redacted there too.
+pub(crate) async fn registered_mask_values(shared: &SharedState, scopes: &[&str]) -> Vec<String> {
+    let inner = shared.state.inner.lock().await;
+    let mut values = Vec::new();
+    for scope in scopes {
+        if scope.is_empty() {
+            continue;
+        }
+        if let Some(cached) = inner.plan_secret_masker.get(*scope) {
+            for value in cached.iter() {
+                push_mask_value(&mut values, value);
+            }
+        }
+        if let Some((cached, _deadline)) = inner.plan_secret_masker_pending.get(*scope) {
+            for value in cached.iter() {
+                push_mask_value(&mut values, value);
+            }
+        }
+        if let Some(runtime) = inner.plan_runtime_masks.get(*scope) {
+            for value in runtime {
+                push_mask_value(&mut values, value);
+            }
+        }
+    }
+    values
+}
+
 /// Flush the streaming-masker withheld tails for a plan's logs.
 ///
 /// [`append_log`] withholds each log's trailing overlap (bytes that could
@@ -510,10 +802,7 @@ pub(crate) async fn resolve_plan_secret_list(
 /// never fatal to job completion.
 pub(crate) async fn flush_log_stream_maskers(shared: &Arc<SharedState>, plan_id: &str) {
     let prefix = format!("{plan_id}/");
-    let handles: Vec<(
-        String,
-        std::sync::Arc<tokio::sync::Mutex<preloop_gha_protocol::masking::StreamingMasker>>,
-    )> = {
+    let handles: Vec<(String, std::sync::Arc<tokio::sync::Mutex<PlanLogMasker>>)> = {
         let mut inner = shared.state.inner.lock().await;
         let keys: Vec<String> = inner
             .log_stream_maskers
@@ -585,7 +874,9 @@ pub async fn console_log(
                 )
                 .await;
             }
-            None => crate::live_logs::record_live_log_wrapper(&shared, &plan_id, wrapper).await,
+            None => {
+                crate::live_logs::record_live_log_wrapper(&shared, &plan_id, wrapper, None).await
+            }
         }
     }
     StatusCode::OK
@@ -600,6 +891,12 @@ pub async fn console_log(
 /// masked, and dropping live lines would break the feed for a backend
 /// hiccup. Durable persistence ([`replay_results_put`](crate::blob_store::replay_results_put),
 /// [`append_log`]) fails closed instead.
+///
+/// Each line is masked on its own, so a token split by a line break — base64
+/// wrapped at 76 columns, say — is not reassembled here: neither half decodes
+/// to the secret by itself. The reassembling batch pass and the streaming
+/// masker used by `append_log` cover that case, and both run on the durable
+/// paths; this per-line pass is the cheap transient-feed filter.
 async fn mask_live_wrapper(
     shared: &Arc<SharedState>,
     plan_id: &str,
@@ -653,6 +950,7 @@ pub async fn finish_job(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(event): Json<azdo::JobCompletedEvent>,
+    authorized: Option<TaskAgentJobRequestRecord>,
 ) -> Json<serde_json::Value> {
     let status = task_result_status(event.result);
     let outputs = event
@@ -660,37 +958,52 @@ pub async fn finish_job(
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect();
-    let callback = shared
-        .state
-        .backend
-        .callback_job(&plan_id, Some(event.timeline_id), Some(event.job_id))
-        .await
-        .unwrap_or(None);
-    // Compatibility: when no request carries this callback's identifiers,
-    // fall back to the single in-flight request (old runners); failing
-    // that, a plan id that *is* a run id still completes the job record.
-    let resolved = match callback {
-        Some(callback) => Some((
-            callback.request_id,
-            callback.run_id,
-            callback.job_id,
-            Some(callback.agent_job_id),
+    // The token was already bound to `authorized` by `authorize_reporting_callback`:
+    // complete that exact request, and only it. Re-resolving here — with the
+    // `sole_inflight_request` fallback — could complete a different request
+    // than the token was authorized against. The heuristic fallbacks below
+    // remain for the system credential, which bypasses request binding.
+    let resolved = match authorized {
+        Some(request) => Some((
+            request.request_id,
+            request.run_id,
+            request.job_id,
+            Some(request.agent_job_id),
         )),
-        None => shared
-            .state
-            .backend
-            .sole_inflight_request()
-            .await
-            .unwrap_or(None)
-            .map(|(request_id, run_id, job_id, agent_job_id)| {
-                (request_id, run_id, job_id, Some(agent_job_id))
-            })
-            .or_else(|| {
-                plan_id
-                    .parse::<RunId>()
-                    .ok()
-                    .map(|run_id| (0, run_id, JobId(event.job_id.to_string()), None))
-            }),
+        None => {
+            let callback = shared
+                .state
+                .backend
+                .callback_job(&plan_id, Some(event.timeline_id), Some(event.job_id))
+                .await
+                .unwrap_or(None);
+            // Compatibility: when no request carries this callback's identifiers,
+            // fall back to the single in-flight request (old runners); failing
+            // that, a plan id that *is* a run id still completes the job record.
+            match callback {
+                Some(callback) => Some((
+                    callback.request_id,
+                    callback.run_id,
+                    callback.job_id,
+                    Some(callback.agent_job_id),
+                )),
+                None => shared
+                    .state
+                    .backend
+                    .sole_inflight_request()
+                    .await
+                    .unwrap_or(None)
+                    .map(|(request_id, run_id, job_id, agent_job_id)| {
+                        (request_id, run_id, job_id, Some(agent_job_id))
+                    })
+                    .or_else(|| {
+                        plan_id
+                            .parse::<RunId>()
+                            .ok()
+                            .map(|run_id| (0, run_id, JobId(event.job_id.to_string()), None))
+                    }),
+            }
+        }
     };
     let completion = if let Some((request_id, run_id, job_id, agent_job_id)) = resolved {
         if request_id != 0 {
@@ -865,6 +1178,7 @@ pub async fn finish_job_plan(
     State(shared): State<Arc<SharedState>>,
     Path(plan_id): Path<String>,
     Json(event): Json<serde_json::Value>,
+    authorized: Option<TaskAgentJobRequestRecord>,
 ) -> Json<serde_json::Value> {
     let result_str = event
         .get("result")
@@ -894,30 +1208,43 @@ pub async fn finish_job_plan(
         "finish_job_plan"
     );
 
-    let callback = shared
-        .state
-        .backend
-        .callback_job(&plan_id, None, None)
-        .await
-        .unwrap_or(None);
+    // The token was already bound to `authorized`: complete that exact
+    // request, never the heuristic fallback below. The fallbacks remain for
+    // the system credential, which bypasses request binding.
     // Compatibility fallback: the single in-flight request, when exactly
     // one exists (older runners correlate only by plan).
-    let resolved = match callback {
-        Some(callback) => Some((
-            callback.request_id,
-            callback.run_id,
-            callback.job_id,
-            Some(callback.agent_job_id),
+    let resolved = match authorized {
+        Some(request) => Some((
+            request.request_id,
+            request.run_id,
+            request.job_id,
+            Some(request.agent_job_id),
         )),
-        None => shared
-            .state
-            .backend
-            .sole_inflight_request()
-            .await
-            .unwrap_or(None)
-            .map(|(request_id, run_id, job_id, agent_job_id)| {
-                (request_id, run_id, job_id, Some(agent_job_id))
-            }),
+        None => {
+            let callback = shared
+                .state
+                .backend
+                .callback_job(&plan_id, None, None)
+                .await
+                .unwrap_or(None);
+            match callback {
+                Some(callback) => Some((
+                    callback.request_id,
+                    callback.run_id,
+                    callback.job_id,
+                    Some(callback.agent_job_id),
+                )),
+                None => shared
+                    .state
+                    .backend
+                    .sole_inflight_request()
+                    .await
+                    .unwrap_or(None)
+                    .map(|(request_id, run_id, job_id, agent_job_id)| {
+                        (request_id, run_id, job_id, Some(agent_job_id))
+                    }),
+            }
+        }
     };
     let completion = if let Some((request_id, run_id, job_id, agent_job_id)) = resolved {
         // Settle is a guarded UPDATE — an already-settled row keeps its
@@ -959,6 +1286,39 @@ pub async fn authorize_reporting_callback(
     plan_id: &str,
     timeline_id: Option<uuid::Uuid>,
     agent_job_id: Option<uuid::Uuid>,
+) -> Result<Option<TaskAgentJobRequestRecord>, ApiError> {
+    use crate::control::backend::RequestKey;
+    let keys = [
+        agent_job_id.map(RequestKey::AgentJobId),
+        timeline_id.map(RequestKey::TimelineId),
+        Some(RequestKey::PlanId(plan_id.to_owned())),
+    ];
+    let mut request = None;
+    for key in keys.into_iter().flatten() {
+        match shared.state.backend.request(key).await {
+            Ok(found) => {
+                request = Some(found);
+                break;
+            }
+            Err(crate::control::ControlError::NotFound(_)) => {}
+            Err(error) => return Err(ApiError::from(error)),
+        }
+    }
+    let request = request.filter(|request| request.plan_id == plan_id);
+    crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())?;
+    Ok(request)
+}
+
+/// [`authorize_reporting_callback`] for routes that *mutate* the run's
+/// records: ownership plus the liveness rule
+/// ([`crate::auth::authorize_live_reporting_request`]). A settled attempt's
+/// credential may still read its records, but it must not rewrite them.
+pub async fn authorize_live_reporting_callback(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    plan_id: &str,
+    timeline_id: Option<uuid::Uuid>,
+    agent_job_id: Option<uuid::Uuid>,
 ) -> Result<(), ApiError> {
     use crate::control::backend::RequestKey;
     let keys = [
@@ -978,7 +1338,7 @@ pub async fn authorize_reporting_callback(
         }
     }
     let request = request.filter(|request| request.plan_id == plan_id);
-    crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())
+    crate::auth::authorize_live_reporting_request(&shared.state, headers, request.as_ref()).await
 }
 
 pub async fn patch_timeline_records_authenticated(
@@ -988,7 +1348,7 @@ pub async fn patch_timeline_records_authenticated(
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_id = path.3.parse().ok();
-    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    authorize_live_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
     patch_timeline_records(State(shared), Path(path), Json(wrapper)).await
 }
 
@@ -1009,7 +1369,7 @@ pub async fn create_log_authenticated(
     headers: HeaderMap,
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    authorize_live_reporting_callback(&shared, &headers, &path.2, None, None).await?;
     create_log(State(shared), Path(path), Json(log)).await
 }
 
@@ -1019,7 +1379,7 @@ pub async fn append_log_authenticated(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    authorize_live_reporting_callback(&shared, &headers, &path.2, None, None).await?;
     Ok(append_log(State(shared), Path(path), body).await)
 }
 
@@ -1030,7 +1390,7 @@ pub async fn console_log_authenticated(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let timeline_id = path.3.parse().ok();
-    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    authorize_live_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
     Ok(console_log(State(shared), Path(path), body).await)
 }
 
@@ -1040,8 +1400,9 @@ pub async fn finish_job_authenticated(
     headers: HeaderMap,
     Json(event): Json<azdo::JobCompletedEvent>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &path.2, None, Some(event.job_id)).await?;
-    Ok(finish_job(State(shared), Path(path), Json(event)).await)
+    let request =
+        authorize_reporting_callback(&shared, &headers, &path.2, None, Some(event.job_id)).await?;
+    Ok(finish_job(State(shared), Path(path), Json(event), request).await)
 }
 
 pub async fn finish_job_plan_authenticated(
@@ -1054,8 +1415,9 @@ pub async fn finish_job_plan_authenticated(
         .get("jobId")
         .and_then(serde_json::Value::as_str)
         .and_then(|value| value.parse().ok());
-    authorize_reporting_callback(&shared, &headers, &plan_id, None, agent_job_id).await?;
-    Ok(finish_job_plan(State(shared), Path(plan_id), Json(event)).await)
+    let request =
+        authorize_reporting_callback(&shared, &headers, &plan_id, None, agent_job_id).await?;
+    Ok(finish_job_plan(State(shared), Path(plan_id), Json(event), request).await)
 }
 
 pub async fn patch_timeline_records_plan_authenticated(
@@ -1065,7 +1427,7 @@ pub async fn patch_timeline_records_plan_authenticated(
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
-    authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
+    authorize_live_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
     patch_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Json(wrapper)).await
 }
 
@@ -1086,7 +1448,7 @@ pub async fn create_log_plan_authenticated(
     headers: HeaderMap,
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    authorize_live_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
     create_log_plan(State(shared), Path(plan_id), Json(log)).await
 }
 
@@ -1096,7 +1458,7 @@ pub async fn append_log_plan_authenticated(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    authorize_live_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
     Ok(append_log_plan(State(shared), Path((plan_id, log_id)), body).await)
 }
 
@@ -1511,5 +1873,51 @@ mod tests {
             !statuses.contains(&ExecutionStatus::Success),
             "a step result must not be published as the job's status; saw {statuses:?}"
         );
+    }
+
+    /// A job with `id-token: write` can mint a distinct JWT per call; the
+    /// registrations must stay bounded per scope, with the oldest evicted first
+    /// (it is the one nearest its 300 s expiry) and provider-derived values
+    /// untouched.
+    #[test]
+    fn runtime_mask_registrations_are_capped_per_scope() {
+        let mut inner = InnerState::default();
+        let scope = "plan-1";
+        inner.plan_secret_masker.insert(
+            scope.to_owned(),
+            Arc::new(vec!["provider-secret".to_owned()]),
+        );
+        let mut newest = String::new();
+        for index in 0..MAX_RUNTIME_MASKS_PER_SCOPE + 8 {
+            newest = format!("minted-{index}");
+            register_scope_runtime_value(&mut inner, scope, &newest);
+        }
+
+        let runtime = &inner.plan_runtime_masks[scope];
+        assert_eq!(runtime.len(), MAX_RUNTIME_MASKS_PER_SCOPE);
+        assert!(
+            runtime.contains(&newest),
+            "the newest mint stays registered"
+        );
+        assert!(
+            !runtime.contains(&"minted-0".to_owned()),
+            "the oldest mint is evicted first"
+        );
+
+        let cached = &inner.plan_secret_masker[scope];
+        assert!(
+            cached.contains(&"provider-secret".to_owned()),
+            "provider values are never dropped: {cached:?}"
+        );
+        assert!(cached.contains(&newest));
+        assert!(
+            !cached.contains(&"minted-0".to_owned()),
+            "an evicted value leaves the cached scope: {cached:?}"
+        );
+
+        // Re-registering a known value is a no-op, not a second entry.
+        let before = inner.plan_runtime_masks[scope].len();
+        register_scope_runtime_value(&mut inner, scope, &newest);
+        assert_eq!(inner.plan_runtime_masks[scope].len(), before);
     }
 }

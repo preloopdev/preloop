@@ -778,6 +778,7 @@ async fn live_run_logs_native_route_rejects_uuid_from_other_run() {
             count: 1,
             value: vec!["must stay private".into()],
         },
+        None,
     )
     .await;
 
@@ -868,6 +869,7 @@ async fn live_log_stream_ends_when_job_completes() {
             count: 1,
             value: vec!["building...".into()],
         },
+        None,
     )
     .await;
 
@@ -908,6 +910,7 @@ async fn live_log_stream_for_already_completed_job_serves_snapshot_and_ends() {
             count: 1,
             value: vec!["already done".into()],
         },
+        None,
     )
     .await;
     // Complete BEFORE anyone connects — the late follower must still get the
@@ -965,6 +968,7 @@ async fn live_log_reopens_when_a_completed_job_streams_again() {
             count: 1,
             value: vec!["second attempt".into()],
         },
+        None,
     )
     .await;
 
@@ -2765,7 +2769,7 @@ async fn action_download_info_returns_batch_download_collection() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -2915,7 +2919,7 @@ async fn action_download_info_discards_malformed_or_abbreviated_sha() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async { axum::Json(serde_json::json!({"sha": "abc1234"})) }),
     );
     tokio::spawn(async move {
@@ -2977,7 +2981,7 @@ async fn action_download_info_rejects_all_zero_sha() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(
             move |axum::extract::Path(git_ref): axum::extract::Path<String>| async move {
                 if git_ref == zero_for_mock {
@@ -3051,14 +3055,14 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new()
         .route(
-            "/repos/:owner/:repo/commits/:git_ref",
+            "/repos/{owner}/{repo}/commits/{git_ref}",
             axum::routing::get({
                 let sha = sha.clone();
                 move || async move { axum::Json(serde_json::json!({"sha": sha})) }
             }),
         )
         .route(
-            "/repos/:owner/:repo/contents/*path",
+            "/repos/{owner}/{repo}/contents/{*path}",
             axum::routing::get({
                 let seen_ref = seen_ref.clone();
                 move |axum::extract::Query(
@@ -3137,7 +3141,7 @@ async fn resolve_ref_to_sha_sends_pat_to_the_configured_origin_over_http() {
     let seen_auth = std::sync::Arc::new(parking_lot::Mutex::new(None));
     let recorder = seen_auth.clone();
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(move |headers: axum::http::HeaderMap| {
             let recorder = recorder.clone();
             async move {
@@ -3200,7 +3204,7 @@ async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -3272,6 +3276,115 @@ jobs:
     );
 }
 
+/// Regression for #649, through the real handlers. A local `preloop run`
+/// submission (its snapshot is taken from the workspace by the submit path)
+/// whose workflow calls a local composite. The composite names `jdx/mise-action`,
+/// which the workflow does not declare. The runner resolves that nested action
+/// with its job's runtime token, and the plan segment it sends is the job's
+/// `system.orchestrationId` (`{planId}.{jobId}.__default`), not the bare plan id.
+/// That batch must resolve, while the same token is refused for another plan and
+/// for another job.
+#[tokio::test]
+async fn local_run_resolves_a_composites_nested_action_with_the_job_token() {
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/{owner}/{repo}/commits/{git_ref}",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let composite = workspace.join(".github/actions/common-setup/action.yml");
+    std::fs::create_dir_all(composite.parent().unwrap()).unwrap();
+    std::fs::write(
+        &composite,
+        "runs:\n  using: composite\n  steps:\n    - uses: jdx/mise-action@v4\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "test"]);
+    git(&["config", "user.email", "test@example.invalid"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "workspace"]);
+
+    let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+    state.local_workspace = Some(workspace);
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, plan_id, agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        "name: Build & Publish\non: push\njobs:\n  app:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v7\n      - uses: ./.github/actions/common-setup\n",
+    )
+    .await;
+    // The exact plan segment the runner sends: the job message's
+    // `system.orchestrationId`.
+    let orchestration = {
+        let inner = state.test_tx().await;
+        let message = queued_message_for(&inner, &run_id);
+        variable_value(&message, "system.orchestrationId")
+            .expect("the job message carries system.orchestrationId")
+            .to_owned()
+    };
+    let token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let batch = json!({"actions": [{"action": "jdx/mise-action", "version": "v4"}]});
+    let forbidden = axum::http::StatusCode::FORBIDDEN;
+
+    let runner_path =
+        format!("/actions/build/{orchestration}/jobs/{agent_job_id}/runnerresolve/actions");
+    let status =
+        request_status_with_bearer(&app, Method::POST, &runner_path, batch.clone(), &token).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "the job token must resolve its nested action on the runner's path {runner_path}"
+    );
+
+    let job_segment = orchestration
+        .split_once('.')
+        .map(|(_, rest)| rest.to_owned())
+        .expect("orchestration id carries a job segment");
+    let other_plan_path = format!(
+        "/actions/build/00000000-0000-0000-0000-000000000000.{job_segment}/jobs/{agent_job_id}/runnerresolve/actions"
+    );
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &other_plan_path, batch.clone(), &token)
+            .await,
+        forbidden,
+        "a job token must not address another plan"
+    );
+    let other_job_path = format!(
+        "/actions/build/{orchestration}/jobs/{}/runnerresolve/actions",
+        uuid::Uuid::new_v4()
+    );
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &other_job_path, batch, &token).await,
+        forbidden,
+        "a job token must not address another job"
+    );
+}
+
 /// The action-download oracle is closed: tickets are minted only for actions
 /// declared in the run's workflow `uses:`. A batch naming an undeclared
 /// `owner/repo` — alone or mixed with declared actions — is a 403 that
@@ -3286,7 +3399,7 @@ async fn action_download_info_denies_undeclared_action() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -3391,7 +3504,7 @@ async fn action_download_info_job_token_cannot_mint_undeclared() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -3461,7 +3574,7 @@ async fn runnerresolve_denies_undeclared_action() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -3549,7 +3662,7 @@ async fn action_download_allows_transitive_composite_nested() {
     let mock =
         axum::Router::new()
             .route(
-                "/repos/:owner/:repo/commits/:git_ref",
+                "/repos/{owner}/{repo}/commits/{git_ref}",
                 axum::routing::get(|| async {
                     axum::Json(
                         serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}),
@@ -3557,7 +3670,7 @@ async fn action_download_allows_transitive_composite_nested() {
                 }),
             )
             .route(
-                "/repos/:owner/:repo/contents/:manifest",
+                "/repos/{owner}/{repo}/contents/{manifest}",
                 axum::routing::get(move || {
                     let encoded = encoded.clone();
                     async move {
@@ -3857,7 +3970,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/tarball/:git_ref",
+        "/repos/{owner}/{repo}/tarball/{git_ref}",
         axum::routing::get(
             |axum::extract::Path((_owner, _repo, git_ref)): axum::extract::Path<(
                 String,
@@ -4151,5 +4264,98 @@ async fn dispatch_inputs_do_not_erase_reusable_caller_with_values() {
         caller_plan.inputs.get("dry_run"),
         Some(&json!(true)),
         "dispatch inputs must still reach the caller's own if:/name: context"
+    );
+}
+/// Action-resolution routes accept only the system credential or a Results
+/// job runtime credential, and a job credential is bound to the route target.
+/// This covers the cross-class bearer bypass and the settled-job mint path.
+#[tokio::test]
+async fn action_resolution_requires_bound_live_results_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let workflow = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#;
+    let (run_a, plan_a, job_a) = submit_run_first_job(&app, &state, workflow).await;
+    let token_a = state.mint_runtime_token(&plan_a, &job_a);
+    let sha = "abc123def456abc123def456abc123def456abc1";
+    let uri = format!("/_apis/v1/ActionDownloadInfo/scope/actions/{plan_a}");
+    let body = json!({
+        "actions": [{"nameWithOwner": "actions/checkout", "ref": sha}]
+    });
+
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body.clone(), &token_a).await,
+        StatusCode::OK,
+        "a live job token must reach action resolution"
+    );
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            &uri,
+            body.clone(),
+            DEFAULT_PRELOOP_SYSTEM_TOKEN,
+        )
+        .await,
+        StatusCode::OK,
+        "the system credential must retain control-plane access"
+    );
+
+    let blob_token = state
+        .local_jwt_with_lifetime(
+            blob_jwt_claims(
+                "artifact",
+                BLOB_OP_WRITE,
+                &job_a.to_string(),
+                &uuid::Uuid::new_v4().to_string(),
+            ),
+            SIGNED_BLOB_URL_TTL,
+        )
+        .unwrap();
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body.clone(), &blob_token).await,
+        StatusCode::UNAUTHORIZED,
+        "a blob JWT must not be repurposed as an action bearer"
+    );
+
+    let malformed_results = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{job_a}"),
+            "scp": "Actions.Results:malformed",
+        }))
+        .unwrap();
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body.clone(), &malformed_results,)
+            .await,
+        StatusCode::UNAUTHORIZED,
+        "a malformed Results token must fail closed"
+    );
+
+    let (_run_b, plan_b, job_b) = submit_run_first_job(&app, &state, workflow).await;
+    let token_b = state.mint_runtime_token(&plan_b, &job_b);
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body.clone(), &token_b).await,
+        StatusCode::FORBIDDEN,
+        "a job token must not resolve another plan"
+    );
+
+    complete_job(
+        &state,
+        run_a.parse().unwrap(),
+        "build",
+        ExecutionStatus::Success,
+    )
+    .await;
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body, &token_a).await,
+        StatusCode::FORBIDDEN,
+        "a settled job token must not mint an action ticket"
     );
 }

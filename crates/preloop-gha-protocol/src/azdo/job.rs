@@ -204,10 +204,10 @@ pub struct AgentJobRequestMessage {
     /// submission-time job runtime credential — snapshot-served checkouts
     /// and checkouts rerouted onto the engine's forge relay.
     ///
-    /// That credential is a local HMAC JWT with a ~50-minute lifetime, but a
-    /// job can sit queued (or paused in a debug session) far longer. The
-    /// broker re-mints these inputs at claim, so a queued or retried job
-    /// starts with a fresh credential.
+    /// That credential is a local HMAC JWT minted when the message is built,
+    /// and a job can sit queued (or paused in a debug session) past its
+    /// lifetime. The broker re-mints these inputs at claim, so a queued or
+    /// retried job starts with a fresh credential.
     #[serde(
         rename = "preloopSnapshotTokenSteps",
         default,

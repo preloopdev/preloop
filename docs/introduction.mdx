@@ -1,0 +1,44 @@
+---
+title: Introduction
+description: What Preloop runs, and whether you need the self-hosted control plane or the standalone runner.
+---
+
+Preloop runs GitHub Actions workflows on hardware-isolated microVMs. Your `.github/workflows` files stay unchanged. You choose where the jobs run: on your own machine, on servers you operate, or on hosts that register with GitHub.
+
+Preloop ships as two products. You can use either one on its own.
+
+![A failed step, a fix in another pane, and a re-run, all local with no push required](/demo/demo.gif)
+
+<CardGroup cols={2}>
+  <Card title="Control plane" icon="server" href="/control-plane/quickstart">
+    Run unmodified workflows locally or on your own infrastructure. `preloop run` executes a workflow against your working tree, including uncommitted files. `preloop serve` runs the engine, which can start runs from GitHub pushes and pull requests through a GitHub App, and can pause a failed job so you can debug it.
+  </Card>
+  <Card title="Runner" icon="terminal" href="/runner/overview">
+    A standalone, drop-in replacement for `actions/runner`. It registers with GitHub or a Preloop server, polls for jobs, and runs them on the host where it is installed. It needs no control plane, microVMs, or background services.
+  </Card>
+</CardGroup>
+
+![Preloop system overview: clients, the control plane, the VM pool, and microVMs](/diagrams/system-overview.svg)
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/control-plane/quickstart">
+    Install the CLI and run your first workflow locally.
+  </Card>
+  <Card title="Install" icon="download" href="/control-plane/install">
+    Requirements for macOS, Linux, and WSL2, and running the engine as a service.
+  </Card>
+  <Card title="Configuration" icon="gear" href="/control-plane/configuration">
+    The config file, GitHub credentials, and secrets.
+  </Card>
+  <Card title="CLI reference" icon="terminal" href="/control-plane/reference/cli">
+    Every command and flag.
+  </Card>
+  <Card title="Compatibility" icon="check" href="/compatibility">
+    How closely Preloop matches GitHub Actions, and where it differs.
+  </Card>
+  <Card title="Comparison" icon="scale-balanced" href="/comparison">
+    How Preloop compares with other local and self-hosted CI tools.
+  </Card>
+</CardGroup>

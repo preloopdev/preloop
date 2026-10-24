@@ -23,8 +23,10 @@ use crate::client::azdo::AzdoClient;
 use crate::client::http::{HttpClient, HttpError};
 use crate::client::results::ResultsClient;
 use crate::client::run_service::RunServiceClient;
+use crate::settings::RunnerRegistration;
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
+use preloop_gha_protocol::azdo::MaskHint;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -39,20 +41,24 @@ pub struct AzdoReportingContext {
     pub timeline_id: String,
 }
 
-/// The OAuth token the worker presents for renew/complete/reporting.
+/// The job-scoped token the worker presents for renew/complete/reporting: the
+/// `SystemVssConnection` `AccessToken` carried by the job message.
 ///
-/// The server mints runner OAuth tokens with a ~50-minute TTL
-/// (`PRELOOP_TOKEN_TTL_SECS`, default 2999s). The listener refreshes its own
-/// copy proactively, but the worker is a separate process spawned with the
-/// token frozen into the job message — so a job that runs past the TTL loses
-/// its lease the moment the token expires: renewjob 401s forever and the
-/// final completejob 401s too, leaving the run stuck `in_progress` with a
-/// pinned VM.
+/// It is minted once per attempt and cannot be exchanged for another while the
+/// job runs: the one credential the worker can re-acquire on its own — the
+/// runner listen token, through the client-credentials exchange below — is
+/// refused on the job-lifecycle routes by design (`broker.rs`
+/// `authenticated_runner_id_for_job` answers 403), so the server mints this
+/// token to outlive the attempt (the six-hour job limit plus the queue and
+/// pause allowance the server bounds jobs by). A token that expires mid-job
+/// takes the lease with it: `renewjob` 401s, the reaper fails the job three
+/// minutes later, and the still-running step's output never reaches the
+/// durable step log.
 ///
 /// The official runner renews from the listener, which holds a live token.
-/// Preloop's renew loop lives in the worker, so the worker re-acquires the
-/// token itself through the same client-credentials exchange the listener
-/// uses — the runner root it was configured from is its current directory.
+/// Preloop's renew loop lives in the worker, so the worker re-acquires a token
+/// itself through the same client-credentials exchange the listener uses — the
+/// runner root it was configured from is its current directory.
 #[derive(Clone)]
 pub struct LiveToken {
     inner: Arc<std::sync::Mutex<LiveTokenInner>>,
@@ -183,14 +189,19 @@ fn create_reporting_context(
 
 /// Execute a job from the deserialized message.
 ///
-/// Sets up the workspace, prepares actions, runs steps, and reports completion
-/// using `via`. Container and service expression tokens are evaluated against
-/// the job context before workspace setup; evaluation errors propagate.
+/// `registration` is the `.runner` state the worker validated after accepting
+/// the job and before calling this function; it supplies the control plane and
+/// `RUNNER_NAME`, so this function never re-reads runner metadata from the
+/// current directory. Sets up the workspace, prepares actions, runs steps, and
+/// reports completion using `via`. Container and service expression tokens are
+/// evaluated against the job context before workspace setup; evaluation errors
+/// propagate.
 /// Workspace setup, reporting-client creation, and completion-reporting errors
 /// also propagate. Action-preparation and step-execution failures are reported
 /// as job results, so `Ok(())` does not imply a successful job conclusion.
 pub async fn run_job(
     job_message: serde_json::Value,
+    registration: RunnerRegistration,
     via: ProtocolPath,
     cancel_rx: watch::Receiver<bool>,
     timing: LeaseTiming,
@@ -223,6 +234,25 @@ pub async fn run_job(
         variables,
         context_data,
     );
+    // Official `HostContext` registers proxy passwords as secrets before any
+    // job output, so no job log line carries them.
+    for mask in super::steps_runner::proxy_password_masks(|name| std::env::var(name).ok()) {
+        job_ctx.add_mask(&mask);
+    }
+    // Register the job message's mask hints before any step output can reach
+    // the logs: `MaskType::Regex` patterns redact spans value masking would
+    // miss, `MaskType::Variable` hints mask the named variable's current
+    // value (Worker.cs InitializeSecretMasker parity).
+    job_ctx.apply_mask_hints(&mask_hints_from_message(&job_message));
+    // The worker resolved and validated `.runner` before calling `run_job`;
+    // use that state here and everywhere downstream. Container/service
+    // expressions are evaluated before workspace setup calls
+    // `inject_github_env`, but `${{ github.token }}` has the same
+    // control-plane semantics there as it does in steps.
+    job_ctx.control_plane = registration.control_plane;
+    job_ctx
+        .env
+        .insert("RUNNER_NAME".to_owned(), registration.runner_name);
     // v2.336.0 (#4546/#4550): Announce locked dependencies in Setup Job log
     if let Some(deps) = job_message
         .get("actionsDependencies")
@@ -316,7 +346,8 @@ pub async fn run_job(
     // touches the workspace.
     let workspace = super::job_extension::setup_workspace(&job_message)?;
     job_ctx.workspace = Some(workspace.clone());
-    super::job_extension::inject_github_env(&mut job_ctx, &job_message);
+    let control_plane = job_ctx.control_plane;
+    super::job_extension::inject_github_env(&mut job_ctx, &job_message, control_plane);
     let main_steps = super::job_extension::build_step_list(&steps, &job_message);
     let action_paths =
         match prepare_remote_actions(&job_message, &workspace, &main_steps, &plan_id).await {
@@ -480,7 +511,7 @@ pub async fn run_job(
         Some(super::live_logs::LiveLogQueue::connect(
             feed_url,
             token,
-            job_ctx.live_masks.clone(),
+            job_ctx.live_mask_set(),
         ))
     } else {
         None
@@ -838,9 +869,17 @@ pub async fn run_job(
     // Upload job log (concatenation of all step logs)
     if let Some(ref rpt) = reporting {
         let mut q = queue.lock().await;
-        let all_logs = q.all_step_log_content();
+        let all_logs = match q.all_step_log_content() {
+            Ok(content) => Some(content),
+            Err(error) => {
+                warn!(%error, "Failed to assemble merged job log; skipping upload");
+                None
+            }
+        };
         drop(q);
-        if !all_logs.is_empty() {
+        if let Some(all_logs) = all_logs
+            && !all_logs.is_empty()
+        {
             upload_job_log(rpt, &all_logs).await;
         }
     }
@@ -981,11 +1020,13 @@ fn spawn_renew_loop(
                 "jobId": rpt.job_id,
             });
 
-            // The server-issued OAuth token expires mid-job (default TTL
-            // 2999s). Refresh proactively before it does; a stale token makes
-            // renewjob 401 forever and the run hangs `in_progress` with a
-            // pinned VM. A refresh failure is not fatal — renew with what we
-            // have and let the 401 path retry.
+            // Renewal is only as durable as the job runtime token's lifetime:
+            // the route accepts that token and refuses a runner listen token,
+            // and the exchange below can only obtain the latter. The server
+            // mints the runtime token to outlive the attempt for exactly this
+            // reason; the 401 path stays as a recovery for a token that was
+            // truncated some other way (and re-acquiring is still worth a try
+            // before the lease goes stale).
             if rpt.access_token.due_for_refresh() {
                 match refresh_worker_oauth_token().await {
                     Some((fresh, refresh_at)) => {
@@ -1080,7 +1121,7 @@ fn spawn_renew_loop(
                         // Sec-WebSocket-Key (random), Sec-WebSocket-Version: 13
                         use base64::Engine;
                         let mut nonce = [0u8; 16];
-                        rand::Rng::fill(&mut rand::thread_rng(), &mut nonce);
+                        rand::RngExt::fill(&mut rand::rng(), &mut nonce);
                         let ws_key = base64::engine::general_purpose::STANDARD.encode(nonce);
                         http.client_for(&results_ws)
                             .get(&results_ws)
@@ -1238,8 +1279,8 @@ async fn first_renew_gate(
                     _ = tokio::time::sleep(match timing.first_renew_backoff {
                         RenewBackoff::Fixed(delay) => delay,
                         RenewBackoff::Official => {
-                            Duration::from_secs(rand::Rng::gen_range(
-                                &mut rand::thread_rng(),
+                            Duration::from_secs(rand::RngExt::random_range(
+                                &mut rand::rng(),
                                 1..=10,
                             ))
                         }
@@ -1332,7 +1373,7 @@ fn renew_backoff(encountering_error: u32) -> Duration {
     } else {
         (5, 15)
     };
-    Duration::from_secs(rand::Rng::gen_range(&mut rand::thread_rng(), min..=max))
+    Duration::from_secs(rand::RngExt::random_range(&mut rand::rng(), min..=max))
 }
 
 fn parse_lease_deadline(value: &str) -> Option<DateTime<Utc>> {
@@ -1352,6 +1393,27 @@ fn is_job_not_found(error: &anyhow::Error) -> bool {
     )
 }
 
+/// Parse the job message's `mask` array (the wire form of
+/// `AgentJobRequestMessage::mask_hints`) into hints.
+///
+/// Malformed entries are skipped with a warning: a hint arriving on the wire
+/// must never fail or panic the job.
+fn mask_hints_from_message(job_message: &serde_json::Value) -> Vec<MaskHint> {
+    job_message
+        .get("mask")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| match serde_json::from_value(entry.clone()) {
+            Ok(hint) => Some(hint),
+            Err(error) => {
+                warn!(%error, "skipping malformed mask hint");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Whether an error is an HTTP 401 — the token the worker presents was
 /// rejected, which for a long-running job means the server-issued OAuth
 /// token expired mid-job and must be re-acquired.
@@ -1364,3 +1426,45 @@ fn is_unauthorized(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 #[path = "job_runner_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod mask_hint_tests {
+    use super::mask_hints_from_message;
+    use preloop_gha_protocol::azdo::MaskType;
+
+    #[test]
+    fn mask_hints_parse_from_job_message_wire_shape() {
+        let message = serde_json::json!({
+            "mask": [
+                { "type": "regex", "value": r"user:[^@\s]+@host" },
+                { "type": "variable", "value": "MY_SECRET" },
+            ]
+        });
+        let hints = mask_hints_from_message(&message);
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].hint_type, MaskType::Regex);
+        assert_eq!(hints[0].value, r"user:[^@\s]+@host");
+        assert_eq!(hints[1].hint_type, MaskType::Variable);
+        assert_eq!(hints[1].value, "MY_SECRET");
+    }
+
+    #[test]
+    fn mask_hints_skip_malformed_entries_without_failing() {
+        let message = serde_json::json!({
+            "mask": [
+                { "type": "regex", "value": "ok-pattern" },
+                { "type": "nonsense", "value": "x" },
+                "not-an-object",
+            ]
+        });
+        let hints = mask_hints_from_message(&message);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].value, "ok-pattern");
+    }
+
+    #[test]
+    fn mask_hints_absent_or_wrong_shape_yield_none() {
+        assert!(mask_hints_from_message(&serde_json::json!({})).is_empty());
+        assert!(mask_hints_from_message(&serde_json::json!({ "mask": "oops" })).is_empty());
+    }
+}

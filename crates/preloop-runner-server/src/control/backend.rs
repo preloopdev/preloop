@@ -260,7 +260,9 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// `NotFound` when the run does not exist (nothing is written). The
     /// outcome carries the post-transition run record, every job of the run
     /// now `Cancelled` (job-id order), and the global ready-queue depth and
-    /// front `runs-on` labels for the pool wake gauges.
+    /// front `runs-on` labels for the pool wake gauges. `run_cancelled` reports
+    /// whether this call transitioned a live run under the same lock;
+    /// cancelling an already-terminal run remains an idempotent no-op.
     async fn cancel_run(
         &self,
         run_id: RunId,
@@ -584,6 +586,43 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Upsert a finalized v1 artifact row (native uploads and imports).
     async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError>;
+
+    // ── Code-scanning SARIF ───────────────────────────────────────────
+
+    /// Persist one analysis and its normalized findings, or return the
+    /// analysis already stored under the same `(run_id, dedupe_key)`.
+    ///
+    /// `Ok((record, true))` means this call inserted the analysis;
+    /// `Ok((record, false))` means an earlier upload of the same
+    /// tool/commit/ref/findings set won and `record` is that row — the
+    /// idempotency contract for re-uploads. Findings are inserted only on a
+    /// winning insert and dedupe within the analysis on `fingerprint`.
+    async fn put_sarif_analysis(
+        &self,
+        analysis: NewSarifAnalysis,
+        findings: Vec<SarifFinding>,
+    ) -> Result<(SarifAnalysisRecord, bool), ControlError>;
+
+    /// One analysis by id, regardless of run. Authorization is the caller's.
+    async fn sarif_analysis(
+        &self,
+        analysis_id: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError>;
+
+    /// One analysis by its idempotency slot, for the pre-write dedupe check.
+    async fn sarif_analysis_by_dedupe(
+        &self,
+        run_id: RunId,
+        dedupe_key: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError>;
+
+    /// A run's analyses, newest first.
+    async fn sarif_analyses(&self, run_id: RunId)
+    -> Result<Vec<SarifAnalysisRecord>, ControlError>;
+
+    /// One analysis's normalized findings, ordered by path and line so a UI
+    /// renders a stable list across reads.
+    async fn sarif_findings(&self, analysis_id: &str) -> Result<Vec<SarifFinding>, ControlError>;
 
     // ── Live log recovery ─────────────────────────────────────────────
 
@@ -1357,6 +1396,16 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// pool-pending).
     async fn rebuild_dispatch_intent(&self) -> Result<(), ControlError>;
 
+    /// Repair leaked dispatch intent: every ready job with neither a
+    /// `job_assignments` nor a `provision_requests` row gets the same
+    /// config-gated derivation [`ControlBackend::rebuild_dispatch_intent`]
+    /// runs at boot. Unlike the boot rebuild this never re-stamps an
+    /// existing waitlist row (a refreshed `requested_at` would keep blocking
+    /// claims indefinitely), so it only touches jobs that have no row at
+    /// all. Returns the number of jobs repaired; a non-zero count means an
+    /// enqueue/requeue/promote path is still missing its intent derivation.
+    async fn reconcile_dispatch_intent(&self) -> Result<usize, ControlError>;
+
     // ── Runs and jobs ─────────────────────────────────────────────────
 
     /// Every live (non-archived) run whose repository equals `repository`
@@ -1574,6 +1623,18 @@ impl Backend {
         match self {
             Self::Sqlite(_) => None,
             Self::Postgres(b) => Some(b.subscribe_event_notifications()),
+        }
+    }
+
+    /// Webhook-queue hints from any node sharing this database (payload: the
+    /// writer's origin). `None` on SQLite: one node owns the queue and wakes
+    /// its own worker.
+    pub(crate) fn subscribe_webhook_wakes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(b) => Some(b.subscribe_webhook_wakes()),
         }
     }
 
@@ -3315,6 +3376,12 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.rebuild_dispatch_intent().await,
         }
     }
+    async fn reconcile_dispatch_intent(&self) -> Result<usize, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.reconcile_dispatch_intent().await,
+            Self::Postgres(b) => b.reconcile_dispatch_intent().await,
+        }
+    }
     async fn runs_for_repository(&self, repository: &str) -> Result<Vec<RunRecord>, ControlError> {
         match self {
             Self::Sqlite(b) => b.runs_for_repository(repository).await,
@@ -3378,6 +3445,55 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.put_artifact_catalog(row).await,
             Self::Postgres(b) => b.put_artifact_catalog(row).await,
+        }
+    }
+
+    async fn put_sarif_analysis(
+        &self,
+        analysis: NewSarifAnalysis,
+        findings: Vec<SarifFinding>,
+    ) -> Result<(SarifAnalysisRecord, bool), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.put_sarif_analysis(analysis, findings).await,
+            Self::Postgres(b) => b.put_sarif_analysis(analysis, findings).await,
+        }
+    }
+
+    async fn sarif_analysis(
+        &self,
+        analysis_id: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sarif_analysis(analysis_id).await,
+            Self::Postgres(b) => b.sarif_analysis(analysis_id).await,
+        }
+    }
+
+    async fn sarif_analysis_by_dedupe(
+        &self,
+        run_id: RunId,
+        dedupe_key: &str,
+    ) -> Result<Option<SarifAnalysisRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sarif_analysis_by_dedupe(run_id, dedupe_key).await,
+            Self::Postgres(b) => b.sarif_analysis_by_dedupe(run_id, dedupe_key).await,
+        }
+    }
+
+    async fn sarif_analyses(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<SarifAnalysisRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sarif_analyses(run_id).await,
+            Self::Postgres(b) => b.sarif_analyses(run_id).await,
+        }
+    }
+
+    async fn sarif_findings(&self, analysis_id: &str) -> Result<Vec<SarifFinding>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sarif_findings(analysis_id).await,
+            Self::Postgres(b) => b.sarif_findings(analysis_id).await,
         }
     }
 }
