@@ -1495,6 +1495,22 @@ async fn max_parallel_repark_is_retried_when_the_cohort_frees_on_another_gate() 
     assert_eq!(waiting, 0, "the admitted waiter leaves the FIFO");
 }
 
+/// Cancellation of an active cohort leg also retries a waiter re-parked on a
+/// gate whose holder was cleared by the earlier saturated promotion.
+#[tokio::test]
+async fn max_parallel_repark_is_retried_when_a_cohort_leg_is_cancelled() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let (run, _wait_id) = saturated_repark(&node).await;
+    node.cancel_job(run, &JobId("bb".to_owned())).await.unwrap();
+    assert_eq!(
+        queue_state(&node, run, "aw").await,
+        "ready",
+        "cancelling bb must free the cohort slot for aw"
+    );
+}
+
 /// The last terminal JobSet member releases the shared concurrency hold.
 #[tokio::test]
 async fn targeted_settle_releases_completed_jobset_hold() {
@@ -1985,6 +2001,57 @@ async fn max_parallel_completion_admits_the_capped_leg() {
         queue_state(&node, run, parked[0]).await,
         "ready",
         "the completion freed a slot, so the parked leg must be admitted"
+    );
+}
+
+/// Admission checks each parked leg's own max-parallel cap rather than an
+/// arbitrary sibling's cap. The rows below model an expression-valued matrix
+/// whose active leg has cap one while the parked leg has cap three.
+#[tokio::test]
+async fn max_parallel_completion_uses_the_parked_legs_cap() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    let mut submit = submit_run(
+        run,
+        vec![
+            submit_job(run, "m1", 1),
+            submit_job(run, "m2", 2),
+            submit_job(run, "m3", 3),
+        ],
+    );
+    for job in &mut submit.jobs {
+        job.queued.base_id = "m".to_owned();
+        job.queued.max_parallel = Some(1);
+    }
+    node.submit_run(submit).await.unwrap();
+    node.writer()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE job_specs SET max_parallel=3 \
+             WHERE run_id=$1::text::uuid AND job_id='m3'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap();
+    node.writer()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE jobs SET status='in_progress', queue_state='none' \
+             WHERE run_id=$1::text::uuid AND job_id='m2'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap();
+
+    complete_ok(&node, run, "m1").await;
+    assert_eq!(
+        queue_state(&node, run, "m3").await,
+        "ready",
+        "the parked leg's cap admits it even though m1's cap was one"
     );
 }
 

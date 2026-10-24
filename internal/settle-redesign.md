@@ -27,7 +27,8 @@ settle_job(run_id, job_id, status):
   5. Fail-fast siblings (when this job failed)
   6. Fold reusable callers, walking up nested callers
   7. Retry the cohort waiters that `promote_waiter` re-parked at max-parallel,
-     on each free gate holding one of the settled legs' cohort waiters (FIFO)
+     after each settled or cancelled leg frees a slot (FIFO, without locking
+     foreign runs from the already run-locked path)
   8. Refresh `remaining_needs` for the dependents of everything that just
      turned terminal (one indexed UPDATE per settled job), and check each
      settled job's cohort for a parked leg a freed slot can take; both report

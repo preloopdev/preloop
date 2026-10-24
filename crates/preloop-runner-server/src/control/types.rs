@@ -210,6 +210,17 @@ pub(crate) fn status_str(s: ExecutionStatus) -> &'static str {
     }
 }
 
+/// Completion commands may only report a terminal execution verdict.
+pub(crate) fn require_terminal_completion(status: ExecutionStatus) -> Result<(), ControlError> {
+    if status.is_terminal() {
+        return Ok(());
+    }
+    Err(ControlError::BadRequest(format!(
+        "completion status {} is not terminal",
+        status_str(status)
+    )))
+}
+
 /// Inverse of [`status_str`]; unknown strings map to `Queued`.
 pub(crate) fn status_parse(s: &str) -> ExecutionStatus {
     match s {

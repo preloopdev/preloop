@@ -26,7 +26,7 @@ use crate::control::types::EnvironmentDeploymentRow;
 use crate::control::types::{
     AzdoPoll, AzdoPollOutcome, CancelOutcome, ClaimedJob, CompleteOutcome, ControlError,
     ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob, SettleJobOutcome,
-    SubmitJob, SubmitOutcome, SubmitRun, status_str,
+    SubmitJob, SubmitOutcome, SubmitRun, require_terminal_completion, status_str,
 };
 use crate::models::{
     EnvironmentGateState, QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord,
@@ -1907,15 +1907,15 @@ async fn job_under_max_parallel(
 ///
 /// A waiter that finds its cohort saturated is re-parked at its FIFO slot and
 /// its gate's holder row is cleared, so the gate is free and nothing wakes it:
-/// only a release of that gate reaches the waiter. Once `job_id` has left its
-/// cohort's active set, every free gate holding a waiter of `base_id` in this
-/// run is retried through the normal FIFO promotion. The head keeps its
-/// `wait_id`. A gate with a live holder is left to that holder's release.
+/// only a release of that gate reaches the waiter. Once a slot is free, retry
+/// only the cohort's own FIFO head. The current run is already locked by the
+/// completion/cancellation transaction, so this path deliberately does not
+/// lock foreign runs; a foreign FIFO head remains the responsibility of that
+/// run's command.
 async fn retry_cohort_waiters(
     backend: &PgBackend,
     tx: &Transaction<'_>,
     run_id: RunId,
-    job_id: &JobId,
     base_id: &str,
 ) -> Result<(), ControlError> {
     let groups = tx
@@ -1934,23 +1934,62 @@ async fn retry_cohort_waiters(
         )
         .await
         .map_err(db)?;
-    if groups.is_empty() || !job_under_max_parallel(tx, run_id, job_id).await? {
-        return Ok(());
-    }
     for row in groups {
         let namespace: String = row.get(0);
         let key = (row.get::<_, String>(1), row.get::<_, String>(2));
-        // The order `acquire_gate` takes: foreign runs first, then the group.
-        lock_gate_runs(tx, &namespace, &key, run_id).await?;
-        // `lock_group` takes the group's mutex (a probe row). A holder that
-        // landed meanwhile keeps the gate; its release retries the cohort.
+        // `lock_group` takes the group's mutex. A holder that landed meanwhile
+        // keeps the gate; its release retries the cohort.
         let Some(group) = lock_group(tx, &namespace, &key, &run_id.0.to_string()).await? else {
             continue;
         };
         if group.holder.is_some() {
             continue;
         }
-        promote_after_release(backend, tx, &namespace, &key).await?;
+        // Preserve global FIFO: only admit this cohort when its own waiter is
+        // the head. In particular, do not promote a foreign run here.
+        let Some((wait_id, head)) = group.waiters.first() else {
+            unlock_group(tx, &namespace, &key).await?;
+            continue;
+        };
+        let concurrency::Holder::Job {
+            run_id: head_run,
+            job_id: head_job,
+        } = &head.holder
+        else {
+            unlock_group(tx, &namespace, &key).await?;
+            continue;
+        };
+        if *head_run != run_id {
+            unlock_group(tx, &namespace, &key).await?;
+            continue;
+        }
+        let head_base: Option<String> = tx
+            .query_opt(
+                "SELECT base_id FROM jobs \
+                 WHERE run_id=$1::text::uuid AND job_id=$2",
+                &[&run_id.0.to_string(), &head_job.0],
+            )
+            .await
+            .map_err(db)?
+            .map(|row| row.get(0));
+        if head_base.as_deref() != Some(base_id) {
+            unlock_group(tx, &namespace, &key).await?;
+            continue;
+        }
+        let holder = head.clone();
+        tx.execute("DELETE FROM concurrency_waits WHERE wait_id=$1", &[wait_id])
+            .await
+            .map_err(db)?;
+        promote_waiter(
+            backend,
+            tx,
+            &namespace,
+            &key,
+            *wait_id,
+            &holder.holder,
+            holder.jobset_id,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2452,7 +2491,7 @@ async fn cancel_job_tx(
     let _ = reason;
     let row = tx
         .query_opt(
-            "SELECT status, queue_state, EXISTS (SELECT 1 FROM job_specs s \
+            "SELECT status, queue_state, base_id, EXISTS (SELECT 1 FROM job_specs s \
              WHERE s.run_id = jobs.run_id AND s.job_id = jobs.job_id \
              AND ((s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null') \
                   OR (s.reusable_call IS NOT NULL AND s.reusable_call <> 'null'::jsonb))) \
@@ -2464,8 +2503,9 @@ async fn cancel_job_tx(
     let Some(row) = row else { return Ok(0) };
     let status: String = row.get(0);
     let queue_state: String = row.get(1);
+    let base_id: String = row.get(2);
     let expandable: bool =
-        row.get::<_, bool>(2) || matches!(queue_state.as_str(), "pending_expansion" | "expanding");
+        row.get::<_, bool>(3) || matches!(queue_state.as_str(), "pending_expansion" | "expanding");
     let now = now_us();
     let mut count = 0;
     // Only a running attempt can be interrupted; queued/blocked jobs simply
@@ -2504,6 +2544,9 @@ async fn cancel_job_tx(
             .await?;
         }
         release_concurrency_for_job(backend, tx, run_id, job_id).await?;
+        // Cancellation frees a cohort slot just like a completion. Retry a
+        // waiter that was re-parked on a now-free gate.
+        retry_cohort_waiters(backend, tx, run_id, &base_id).await?;
     }
     // An expanded caller owns its callee subtree (matrix legs included —
     // they carry `parent_job_id` too); a cancelled caller cancels it.
@@ -3268,29 +3311,27 @@ impl<'a> Sweep<'a> {
         run_id: RunId,
         base_id: &str,
     ) -> Result<bool, ControlError> {
-        let row = tx
+        let parked = tx
             .query_one(
-                "SELECT \
-                   EXISTS (SELECT 1 FROM jobs j \
-                     WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
-                       AND j.queue_state='blocked' AND j.remaining_needs <= 0 \
-                       AND j.status NOT IN \
-                         ('success','failure','cancelled','skipped','timed_out')), \
-                   (SELECT s.max_parallel FROM job_specs s \
-                     JOIN jobs j ON j.run_id=s.run_id AND j.job_id=s.job_id \
-                     WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
-                       AND s.max_parallel IS NOT NULL LIMIT 1), \
-                   (SELECT count(*) FROM jobs a \
-                     WHERE a.run_id=$1::text::uuid AND a.base_id=$2 \
-                       AND (a.status='in_progress' OR a.queue_state IN ('ready','claimed')))",
+                "SELECT EXISTS ( \
+                   SELECT 1 FROM jobs j \
+                   JOIN job_specs s ON s.run_id=j.run_id AND s.job_id=j.job_id \
+                   WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
+                     AND j.queue_state='blocked' AND j.remaining_needs <= 0 \
+                     AND j.status NOT IN \
+                       ('success','failure','cancelled','skipped','timed_out') \
+                     AND s.max_parallel IS NOT NULL \
+                     AND (SELECT count(*) FROM jobs a \
+                          WHERE a.run_id=j.run_id AND a.base_id=j.base_id \
+                            AND (a.status='in_progress' \
+                                 OR a.queue_state IN ('ready','claimed'))) \
+                         < s.max_parallel)",
                 &[&run_id.0.to_string(), &base_id],
             )
             .await
-            .map_err(db)?;
-        let parked: bool = row.get(0);
-        let cap: Option<i32> = row.get(1);
-        let active: i64 = row.get(2);
-        Ok(parked && cap.is_some_and(|cap| active < i64::from(cap)))
+            .map_err(db)?
+            .get::<_, bool>(0);
+        Ok(parked)
     }
 
     /// Try to fold a reusable workflow caller when one of its inner jobs
@@ -6549,19 +6590,6 @@ impl Default for SettleCoreOutcome {
     }
 }
 
-/// A completion reports a terminal verdict. `Queued`, `Pending` and
-/// `InProgress` would leave the job outside the queue with no path that
-/// promotes it again, and the attempt would finish without a result.
-fn require_terminal_completion(status: ExecutionStatus) -> Result<(), ControlError> {
-    if status.is_terminal() {
-        return Ok(());
-    }
-    Err(ControlError::BadRequest(format!(
-        "completion status {} is not terminal",
-        status_str(status)
-    )))
-}
-
 impl PgBackend {
     /// `complete_job`: settle the attempt, flip the job, propagate outputs and
     /// dependents, fail-fast siblings.
@@ -6872,8 +6900,8 @@ impl PgBackend {
         }
         // A settled leg may have freed a `max-parallel` slot that a waiter of
         // its cohort was parked for behind a gate nothing else will release.
-        for (settled, settled_base) in &settled_bases {
-            retry_cohort_waiters(self, tx, run_id, settled, settled_base).await?;
+        for (_, settled_base) in &settled_bases {
+            retry_cohort_waiters(self, tx, run_id, settled_base).await?;
         }
         // 5. Refresh the dependents' `remaining_needs` for everything that just
         // turned terminal. A dependent that is now `blocked` with zero needs left

@@ -103,6 +103,9 @@ Releases before v0.27.0 predate the changelog.
   path.
 - A completion that reports a non-terminal status is rejected with a bad
   request before anything is written.
+- Capped-cohort admission checks each parked leg's own `max-parallel`
+  expression, and cancelling a leg retries a re-parked waiter without
+  taking foreign run locks.
 
 ## [0.34.0] - 2026-10-09
 
