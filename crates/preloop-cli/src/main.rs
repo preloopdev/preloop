@@ -914,6 +914,15 @@ struct ServeArgs {
     #[arg(long, value_name = "ADDR")]
     listen: Option<String>,
 
+    /// Optional second listener for the shared job-facing surface (Git/LFS
+    /// mirror, Actions cache, artifacts, log blobs). Overrides
+    /// PRELOOP_SHARED_LISTEN.
+    ///
+    /// Keep this on a VM-private or loopback address: it serves plain HTTP and
+    /// refuses every control-plane route.
+    #[arg(long, value_name = "ADDR")]
+    shared_listen: Option<String>,
+
     /// Externally reachable base URL. Overrides PRELOOP_PUBLIC_URL.
     ///
     /// Must be the address GitHub and any remote runners can reach — a
@@ -2003,6 +2012,30 @@ async fn cmd_engine(
         .unwrap_or_else(|| "127.0.0.1:9090".to_owned())
         .parse()
         .context("--listen / PRELOOP_LISTEN must be a socket address")?;
+    // The shared job-facing surface (Git/LFS mirror, cache, artifacts, log
+    // blobs) can live on its own loopback port. When it does, jobs are told
+    // about it through `PRELOOP_SHARED_URL`, which the message builder, the
+    // Twirp signed URLs and the LFS batch hrefs all read through
+    // `broker::shared_base_url`.
+    let shared_listen: Option<std::net::SocketAddr> = args
+        .shared_listen
+        .clone()
+        .or_else(|| std::env::var("PRELOOP_SHARED_LISTEN").ok())
+        .map(|value| {
+            value
+                .parse()
+                .with_context(|| {
+                    format!("--shared-listen / PRELOOP_SHARED_LISTEN `{value}` must be a socket address")
+                })
+        })
+        .transpose()?;
+    if let Some(address) = shared_listen
+        && std::env::var("PRELOOP_SHARED_URL").is_err()
+    {
+        unsafe {
+            std::env::set_var("PRELOOP_SHARED_URL", format!("http://{address}"));
+        }
+    }
     let public_url = args
         .public_url
         .clone()
@@ -2181,6 +2214,7 @@ async fn cmd_engine(
     let mut server = tokio::spawn(preloop_runner_server::serve(
         preloop_runner_server::ServerConfig {
             listen,
+            shared_listen,
             systemd_socket_activation: systemd_socket_activation_requested(),
             unix_socket: Some(socket.clone()),
             queue_depth: Some(queue_depth.clone()),

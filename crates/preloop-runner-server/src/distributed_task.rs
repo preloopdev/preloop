@@ -227,14 +227,14 @@ async fn render_session_message(
                 );
                 endpoint.data.insert(
                     "ResultsServiceUrl".to_owned(),
-                    format!("{}/", runner_base_url()),
+                    format!("{}/", shared_base_url()),
                 );
                 endpoint
                     .data
                     .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
                 endpoint.data.insert(
                     "CacheServerUrl".to_owned(),
-                    format!("{}/", runner_base_url()),
+                    format!("{}/", shared_base_url()),
                 );
             }
         }

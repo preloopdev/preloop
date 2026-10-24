@@ -229,6 +229,77 @@ pub fn app_with_test_api(
     build_app(state, shutdown, Some(token.into()))
 }
 
+/// Path prefixes that belong to the shared job-facing infrastructure surface.
+///
+/// A positive allowlist, deliberately: the shared listener exists so a job's
+/// Git, LFS, cache, artifact and log-blob traffic can be served — and later
+/// isolated or scaled — separately from the control plane, and it must never
+/// expose the native API, the broker, runner registration, dispatch,
+/// webhooks, or administration. Anything not named here is a 404 rather than
+/// something to deny by exception, so a newly added control-plane route is
+/// private to the control listener by default instead of leaking here.
+///
+/// `/healthz` and `/readyz` are included so a load balancer can probe the
+/// listener without being handed the control plane's readiness semantics.
+pub const SHARED_INFRA_PATH_PREFIXES: &[&str] = &[
+    // Actions cache (v1 REST and v2 Twirp).
+    "/_apis/artifactcache/",
+    "/twirp/github.actions.results.api.v1.CacheService/",
+    // Artifacts: legacy pipelines API, v2 Twirp, and the blob store both
+    // upload into.
+    "/_apis/pipelines/workflows/",
+    "/twirp/github.actions.results.api.v1.ArtifactService/",
+    "/twirp/github.actions.results.api.v1.BlobService/",
+    "/twirp-blob/",
+    // Results service: step logs, summaries, and the signed blob URLs the
+    // runner uploads them to.
+    "/twirp/results.services.receiver.Receiver/",
+    "/replay/results/",
+    // Git mirror and its Git LFS endpoint.
+    "/snapshots/",
+    // The runner's own action-archive download (sanitized GitHub tarball
+    // paths), which it fetches from inside the VM.
+    "/api/v1/actions/download/",
+];
+
+/// Whether `path` is served by the shared-infrastructure listener.
+pub fn is_shared_infra_path(path: &str) -> bool {
+    path == "/healthz"
+        || path == "/readyz"
+        || SHARED_INFRA_PATH_PREFIXES
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+}
+
+/// Refuse everything outside the shared job-facing surface.
+///
+/// Applied to the shared listener only. The control listener keeps serving the
+/// whole application, so this narrows one exposure rather than changing the
+/// protocol surface any client already uses.
+pub async fn shared_infra_surface_only(
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let path = request.uri().path();
+    if !is_shared_infra_path(path) {
+        return Err(ApiError::not_found(format!(
+            "{path} not available on this endpoint"
+        )));
+    }
+    Ok(next.run(request).await)
+}
+
+/// The application router restricted to the shared job-facing surface.
+///
+/// Same routes, same authentication, same handlers as the control listener;
+/// only what is reachable differs. Sharing one router is what keeps a new
+/// shared-infrastructure route from having to be registered twice and drifting
+/// between the two listeners.
+pub fn shared_infra_router(shared: &Arc<SharedState>) -> Router {
+    build_app(shared.state.clone(), shared.shutdown.clone(), None)
+        .layer(middleware::from_fn(shared_infra_surface_only))
+}
+
 /// Build the in-process test router with webhook upload budgets sized for a
 /// test instead of for a network transfer.
 ///
@@ -1566,6 +1637,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The shared listener exists to expose the job-facing surface and nothing
+    /// else. A control-plane route that leaks here hands workflow code a
+    /// management API over a plain-HTTP VM-private port, so the deny list is a
+    /// positive allowlist and this test enumerates the routes that must stay off
+    /// it.
+    #[tokio::test]
+    async fn shared_infra_listener_serves_only_the_job_facing_surface() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shared = Arc::new(SharedState {
+            state,
+            shutdown: CancellationToken::new(),
+        });
+        let router = shared_infra_router(&shared);
+
+        let denied = [
+            "/api/v1/runs",
+            "/api/v1/runs/00000000-0000-0000-0000-000000000000",
+            "/api/v1/secrets",
+            "/api/v1/status",
+            "/api/v1/runners",
+            "/api/v1/debug/sessions",
+            "/api/v1/github/webhooks",
+            "/broker/1/acquirejob",
+            "/broker/1/completejob",
+            "/_apis/v1/Agent/1/agent",
+            "/_apis/v1/AgentSession/1/session",
+            "/_apis/v1/Message/1",
+            "/_apis/connectionData",
+            "/runner/session",
+            "/runner/message",
+            "/session",
+            "/internal/test/jobs/complete",
+            "/setup/github",
+            "/metrics",
+        ];
+        for path in denied {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be reachable on the shared-infrastructure listener"
+            );
+        }
+
+        // Probes are answered so a load balancer can use this listener.
+        for path in ["/healthz", "/readyz"] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path} must be served");
+        }
+
+        // Shared surfaces route (and then fail their own authentication or
+        // body validation), which is the distinction from a 404. Paths whose
+        // handler legitimately answers 404 for a missing resource are asserted
+        // against the allowlist instead, where "allowed" is unambiguous.
+        for (method, path) in [
+            ("POST", "/_apis/artifactcache/cache"),
+            ("POST", "/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts"),
+            ("POST", "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL"),
+            ("POST", "/snapshots/00000000-0000-0000-0000-000000000000/git-upload-pack"),
+        ] {
+            assert!(
+                is_shared_infra_path(path),
+                "{path} must be on the shared-infrastructure allowlist"
+            );
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must route on the shared-infrastructure listener"
+            );
+        }
+
+        // The runner's own action-archive download is job-facing, but its
+        // handler answers 404 for an action it does not hold, so only the
+        // allowlist can be asserted here.
+        assert!(is_shared_infra_path(
+            "/api/v1/actions/download/actions/checkout/main"
+        ));
+        for path in denied {
+            assert!(
+                !is_shared_infra_path(path),
+                "{path} must not be on the shared-infrastructure allowlist"
+            );
+        }
     }
 
     /// The production gate, with only the budget a test is about changed, so

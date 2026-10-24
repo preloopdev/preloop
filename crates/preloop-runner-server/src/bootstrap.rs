@@ -6,6 +6,15 @@ use anyhow::Context;
 pub struct ServerConfig {
     /// Address to bind.
     pub listen: SocketAddr,
+    /// Optional second listener for the shared job-facing surface (Git/LFS
+    /// mirror, Actions cache, artifacts, log blobs).
+    ///
+    /// Serves the same application behind a positive path allowlist, so a job
+    /// VM can reach shared infrastructure at an address of its own without
+    /// also reaching the control plane. `None` keeps today's single-listener
+    /// behavior; `PRELOOP_SHARED_URL` must then name the same origin as
+    /// `PRELOOP_RUNNER_URL`.
+    pub shared_listen: Option<SocketAddr>,
     /// Consume the TCP listener passed by systemd socket activation.
     pub systemd_socket_activation: bool,
     /// Optional Unix domain socket path to bind.
@@ -74,6 +83,7 @@ impl std::fmt::Debug for ServerConfig {
         // Never print a Postgres URL verbatim: it carries the password.
         f.debug_struct("ServerConfig")
             .field("listen", &self.listen)
+            .field("shared_listen", &self.shared_listen)
             .field("systemd_socket_activation", &self.systemd_socket_activation)
             .field("unix_socket", &self.unix_socket)
             .field("state_dir", &self.state_dir)
@@ -1833,6 +1843,54 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         state: state.clone(),
         shutdown: shutdown.clone(),
     });
+
+    // The shared-infrastructure listener serves the same application behind a
+    // positive path allowlist, so a job's Git/LFS, cache, artifact and log-blob
+    // traffic has an address of its own. Deliberately plain HTTP in every TLS
+    // mode: it is bound for a VM loopback bridge or a private address, exactly
+    // like `PRELOOP_RUNNER_URL`, and public TLS is terminated at the tunnel
+    // (`PRELOOP_PUBLIC_URL`) rather than here. An operator pointing it at a
+    // routable address is out of contract, so say so loudly instead of silently
+    // serving plaintext.
+    if let Some(shared_listen) = config.shared_listen {
+        if !shared_listen.ip().is_loopback()
+            && !matches!(
+                shared_listen.ip(),
+                std::net::IpAddr::V4(v4) if v4.is_private() || v4.is_link_local()
+            )
+        {
+            warn!(
+                %shared_listen,
+                "shared-infrastructure listener is bound to a non-private address; it serves plain HTTP"
+            );
+        }
+        let shared_router = crate::routes::shared_infra_router(&shared);
+        let shared_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let listener = match TcpListener::bind(shared_listen).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    // Failing the whole engine because an auxiliary listener
+                    // could not bind would turn a degraded feature into an
+                    // outage; the control listener still serves these routes.
+                    warn!(%shared_listen, %error, "could not bind shared-infrastructure listener");
+                    return;
+                }
+            };
+            info!(
+                listen = %shared_listen,
+                scheme = "http",
+                "preloop shared-infrastructure listener ready"
+            );
+            if let Err(error) = axum::serve(listener, shared_router)
+                .with_graceful_shutdown(shutdown_signal(shared_shutdown))
+                .await
+            {
+                warn!(%error, "shared-infrastructure listener stopped with an error");
+            }
+        });
+    }
+
     let check_run_sender_shared = shared.clone();
     tokio::spawn(async move {
         crate::github::run_check_run_sender(check_run_sender_shared).await;
