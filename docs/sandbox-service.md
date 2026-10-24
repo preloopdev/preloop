@@ -47,7 +47,8 @@ from the `.proto` interoperates.
   service keeps `warm` idle sandboxes per pool (the generic warm pool) and
   refills after each claim, backing off after creation failures.
 * **Provider cordon and drain** — `CordonProvider` stops new placements on one
-  provider; its existing leases and warm members keep running. `DrainProvider`
+  provider, including new leases of warm members; its existing leases and warm
+  members keep running. `DrainProvider`
   cordons and also destroys that provider's idle pool members, then reports
   how many leases remain (they are not killed). The cordon is persisted on
   the provider record and survives re-registration until `UncordonProvider`.
@@ -132,6 +133,8 @@ are the service's.
 ## Limits and pagination
 
 Unary Connect requests are capped at 4 MiB; bulk bytes never belong in them.
+Oversized requests return HTTP `413`, which `SandboxClient` classifies as
+`resource_exhausted`.
 The data-plane `PUT` routes stream to disk and stop at
 `PRELOOP_SANDBOX_BLOB_MAX_BYTES` (default 8 GiB), answering `413` and deleting
 the partial file. At boot the service deletes every file left in its blob

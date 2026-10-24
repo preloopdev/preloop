@@ -21,6 +21,10 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- Cordoned sandbox providers no longer grant new leases from their warm
+  inventory; existing leases remain usable. Sandbox clients classify oversized
+  unary RPC requests as `resource_exhausted` instead of `unknown`.
+
 - Run guest CA distrust edits and trust-bundle regeneration together as root
   or through passwordless sudo. Official golden forks execute as `runner`
   (uid 1001); editing `/etc/ca-certificates.conf` without elevation made

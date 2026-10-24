@@ -2356,6 +2356,93 @@ async fn a_pool_whose_only_capable_provider_is_cordoned_still_validates() {
 }
 
 #[tokio::test]
+async fn cordoned_matching_provider_is_distinguished_from_incompatible_providers() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let name = h.service.list_providers()[0].name.clone();
+    h.service.set_provider_cordon(&name, true).await.unwrap();
+    let mut capabilities = FakeDriver::full_capabilities();
+    capabilities.os = "macos".into();
+    h.service
+        .register(RegisterRequest {
+            name: "incompatible".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities,
+            }],
+        })
+        .await
+        .unwrap();
+
+    // Operator cordons fail fast with an actionable reason, even when
+    // another online provider has unrelated capability gaps.
+    let error = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "mixed-cordon".into(),
+            template: "alpine".into(),
+            wait_secs: Some(0),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    assert!(error.message.contains(&name), "{}", error.message);
+    assert!(error.message.contains("cordoned"), "{}", error.message);
+    assert!(!error.message.contains("incompatible"), "{}", error.message);
+    h.service
+        .put_pool(PoolSpec {
+            name: "linux".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .expect("pool validation ignores temporary cordons");
+}
+
+#[tokio::test]
+async fn cordoned_provider_keeps_warm_members_without_granting_new_leases() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "linux".into(),
+            template: "alpine".into(),
+            warm: 1,
+            max: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .any(|s| s.state == SandboxState::Ready)
+    })
+    .await;
+    let warm = h.service.list().pop().unwrap();
+    let name = h.service.list_providers()[0].name.clone();
+    h.service.set_provider_cordon(&name, true).await.unwrap();
+
+    let mut request = acquire("cordoned-warm", "linux");
+    request.wait_secs = Some(0);
+    let error = h.service.acquire(request.clone()).await.unwrap_err();
+    assert_eq!(error.code, Code::ResourceExhausted);
+    let retained = h.service.list().pop().unwrap();
+    assert_eq!(retained.id, warm.id);
+    assert_eq!(retained.state, SandboxState::Ready);
+    assert!(retained.lease_id.is_empty());
+
+    h.service.set_provider_cordon(&name, false).await.unwrap();
+    let lease = h.service.acquire(request.clone()).await.unwrap();
+    assert_eq!(lease.sandbox.id, warm.id);
+    h.service.set_provider_cordon(&name, true).await.unwrap();
+    let retry = h.service.acquire(request).await.unwrap();
+    assert_eq!(retry.lease.id, lease.lease.id);
+}
+
+#[tokio::test]
 async fn drain_releases_idle_pool_members_and_keeps_leases() {
     let h = harness().await;
     h.service.put_template(template("alpine")).await.unwrap();
@@ -2427,6 +2514,21 @@ async fn connect_unary_bodies_are_capped_at_four_mib() {
         .await
         .unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn connect_client_classifies_oversized_unary_requests() {
+    use preloop_sandbox::SandboxApi as _;
+    use preloop_sandbox::server::CONNECT_BODY_LIMIT;
+
+    let h = harness().await;
+    let base = serve(h.service.clone()).await;
+    let client = SandboxClient::new(&base, Some("client-secret".into()));
+    let mut spec = template("oversized");
+    spec.image = Some("x".repeat(CONNECT_BODY_LIMIT));
+    let error = client.put_template(spec).await.unwrap_err();
+    assert_eq!(error.code, Code::ResourceExhausted);
+    assert!(h.service.list_templates().is_empty());
 }
 
 #[tokio::test]

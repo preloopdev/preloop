@@ -79,6 +79,7 @@ impl Code {
             404 => Code::NotFound,
             409 => Code::Aborted,
             412 => Code::FailedPrecondition,
+            413 => Code::ResourceExhausted,
             429 | 502 | 503 | 504 => Code::Unavailable,
             501 => Code::Unimplemented,
             _ => Code::Unknown,
