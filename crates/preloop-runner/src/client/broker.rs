@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use rand::Rng;
+use rand::RngExt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
@@ -190,7 +190,7 @@ const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 enum ProxyIo {
     Tcp(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for ProxyIo {
@@ -201,7 +201,7 @@ impl AsyncRead for ProxyIo {
     ) -> Poll<io::Result<()>> {
         match self.as_mut().get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -214,21 +214,21 @@ impl AsyncWrite for ProxyIo {
     ) -> Poll<io::Result<usize>> {
         match self.as_mut().get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         match self.as_mut().get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         match self.as_mut().get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -273,20 +273,39 @@ pub(crate) async fn run_long_poll_websocket_probe_with_http(
     let start = Instant::now();
     let tls_config = http.websocket_tls_config();
 
+    let request = match probe_url.into_client_request() {
+        Ok(request) if matches!(request.uri().scheme_str(), Some("ws" | "wss")) => request,
+        Ok(request) => {
+            result.errors.push(format!(
+                "Unsupported websocket probe URL scheme: {}",
+                request.uri().scheme_str().unwrap_or("<missing>")
+            ));
+            result.last_close_reason = Some("error".to_owned());
+            result.total_duration_ms = start.elapsed().as_millis() as u64;
+            return result;
+        }
+        Err(error) => {
+            result.errors.push(error.to_string());
+            result.last_close_reason = Some("error".to_owned());
+            result.total_duration_ms = start.elapsed().as_millis() as u64;
+            return result;
+        }
+    };
+    drop(request);
+
     loop {
+        match cancel.try_recv() {
+            Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+
         let mut socket =
             match connect_websocket(probe_url, bearer_token, tls_config.clone(), cancel).await {
                 WebSocketConnect::Connected(socket) => *socket,
-                outcome => {
-                    // Upstream counts any connect exception — cancellation
-                    // included — as a connect failure; its `Task.Delay` then
-                    // throws immediately when cancelled.
+                WebSocketConnect::Failed => {
                     result.connect_failures += 1;
                     result.last_close_reason = Some("connect_failed".to_owned());
-                    if matches!(outcome, WebSocketConnect::Cancelled) {
-                        break;
-                    }
-                    let delay = rand::thread_rng().gen_range(
+                    let delay = rand::rng().random_range(
                         MIN_DELAY_FOR_WEBSOCKET_RECONNECT..MAX_DELAY_FOR_WEBSOCKET_RECONNECT,
                     );
                     tokio::select! {
@@ -294,6 +313,7 @@ pub(crate) async fn run_long_poll_websocket_probe_with_http(
                         _ = &mut *cancel => break,
                     }
                 }
+                WebSocketConnect::Cancelled => break,
             };
 
         result.connected = true;
@@ -324,10 +344,10 @@ pub(crate) async fn run_long_poll_websocket_probe_with_http(
                             .chunks(4096)
                             .count()
                             .max(1) as u64;
-                        info!(%text, "Runner websocket received a ping");
+                        info!(bytes = text.len(), "Runner websocket received a ping");
                         match echo_text_chunks(&mut socket, &text, cancel).await {
                             EchoTextResult::Sent => {
-                                info!(%text, "Runner replied via websocket");
+                                info!(bytes = text.len(), "Runner replied via websocket");
                             }
                             EchoTextResult::Cancelled => {
                                 result.last_close_reason = Some("job_completed".to_owned());
@@ -507,12 +527,11 @@ async fn ws_handshake(
                 .to_owned();
             let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
             let tls = connector.connect(server_name, tcp).await.map_err(|error| {
-                tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("HTTPS proxy TLS: {error}"),
-                ))
+                tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(format!(
+                    "HTTPS proxy TLS: {error}"
+                )))
             })?;
-            ProxyIo::Tls(tls)
+            ProxyIo::Tls(Box::new(tls))
         } else {
             ProxyIo::Tcp(tcp)
         };
@@ -547,9 +566,9 @@ async fn ws_handshake(
             }
             let n = socket.read(&mut response[total..]).await?;
             if n == 0 {
-                return Err(tokio_tungstenite::tungstenite::Error::Http(
+                return Err(tokio_tungstenite::tungstenite::Error::Http(Box::new(
                     tokio_tungstenite::tungstenite::http::Response::new(None),
-                ));
+                )));
             }
             total += n;
             if response[..total].windows(4).any(|w| w == b"\r\n\r\n") {
@@ -760,7 +779,7 @@ fn absorb_probe_error(
 /// frame's reason string.
 fn close_status_strings(frame: &Option<CloseFrame>) -> (String, String) {
     let Some(frame) = frame else {
-        return ("0".to_owned(), String::new());
+        return ("Empty".to_owned(), String::new());
     };
     let code = match frame.code {
         CloseCode::Normal => "NormalClosure".to_owned(),

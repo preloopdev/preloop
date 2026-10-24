@@ -339,6 +339,13 @@ pub async fn run_job(
             }
         }
     }
+    // Start the broker probe before action preparation so setup failures still
+    // report the requested ConnectivityCheck telemetry.
+    let mut ws_probe = super::job_extension::BrokerWsProbe::spawn_with_http(
+        &job_ctx,
+        reporting.as_ref().map(|rpt| rpt.token()),
+        reporting.as_ref().map(|rpt| rpt.results.http().clone()),
+    );
     // Workspace setup happens only once the lease is valid: an invalid or
     // cancelled lease must not wipe an existing checkout (`setup_workspace`
     // `remove_dir_all`s the work directory). The gate above returns early on
@@ -354,6 +361,9 @@ pub async fn run_job(
             Ok(paths) => paths,
             Err(error) => {
                 error!("Set up job failed while preparing actions: {error:#}");
+                if let (Some(probe), Some(rpt)) = (ws_probe.take(), reporting.as_ref()) {
+                    probe.finish(&rpt.connectivity_telemetry).await;
+                }
                 job_ctx.job_status = super::contexts::JobStatus::Failure;
                 report_completion(
                     &job_message,
@@ -591,17 +601,6 @@ pub async fn run_job(
         }
     });
 
-    // Temporary probe (v2.338.0): gauge websocket compatibility with the
-    // broker listener, only when run-service sends down a probe URL via the
-    // job message's `system.runner.brokerwebsocketprobeurl` variable. Uses
-    // the job's SystemVssConnection bearer; result lands in completejob
-    // telemetry at `finish` below. Never affects the job outcome.
-    let ws_probe = super::job_extension::BrokerWsProbe::spawn_with_http(
-        &job_ctx,
-        reporting.as_ref().map(|rpt| rpt.token()),
-        reporting.as_ref().map(|rpt| rpt.results.http().clone()),
-    );
-
     // Spawn job-timeout timer that trips cancel and sets the timed_out flag.
     //
     // Ticked rather than slept in one shot, so seconds spent paused at a failed
@@ -801,7 +800,7 @@ pub async fn run_job(
 
     // Collect the broker websocket probe into telemetry (official:
     // `_brokerWebSocketProbeToken.Cancel(); await _brokerWebSocketProbeTask`).
-    if let (Some(probe), Some(rpt)) = (ws_probe, reporting.as_ref()) {
+    if let (Some(probe), Some(rpt)) = (ws_probe.take(), reporting.as_ref()) {
         probe.finish(&rpt.connectivity_telemetry).await;
     }
 

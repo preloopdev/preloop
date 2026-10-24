@@ -1678,7 +1678,7 @@ fn golden_runner_version_for(scenario: &str) -> Option<String> {
         .filter(|version| version.starts_with(|c: char| c.is_ascii_digit()))
         .filter(|version| has(version))
         .collect();
-    versions.sort_by(|a, b| version_key(a).cmp(&version_key(b)));
+    versions.sort_by_key(|a| version_key(a));
     versions.pop()
 }
 
@@ -2155,9 +2155,6 @@ fn container_and_service_credentials_evaluate_to_the_minted_token() {
         CLAIM_MINTED_TOKEN
     );
 }
-    assert_eq!(built.len(), 1);
-    assert_eq!(built[0].timeout_minutes, Some(1));
-}
 
 // ---- Broker long-poll websocket probe (v2.338.0) ----
 
@@ -2255,9 +2252,11 @@ async fn ws_probe_records_connect_failure_when_unreachable() {
     )
     .unwrap();
 
+    // Let the refused loopback connection complete before cancelling. This
+    // keeps the assertion about a real connect failure distinct from the
+    // pre-start cancellation path.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let telemetry = Arc::new(Mutex::new(Vec::new()));
-    // The probe is inside its 10–300 s reconnect backoff when we cancel;
-    // `finish` must still return promptly.
     tokio::time::timeout(std::time::Duration::from_secs(5), probe.finish(&telemetry))
         .await
         .expect("probe finishes promptly once cancelled");
