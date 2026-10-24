@@ -24,9 +24,9 @@ use crate::control::logic::{
 use crate::control::txn_stats::RunRowOp;
 use crate::control::types::EnvironmentDeploymentRow;
 use crate::control::types::{
-    AzdoPoll, AzdoPollOutcome, CancelOutcome, ClaimedJob, CompleteOutcome, ControlError,
-    ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob, SettleJobOutcome,
-    SubmitJob, SubmitOutcome, SubmitRun, status_str,
+    AzdoPoll, AzdoPollOutcome, CancelOutcome, ClaimedJob, ClosedOrphan, CompleteOutcome,
+    ControlError, ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob,
+    SettleJobOutcome, SubmitJob, SubmitOutcome, SubmitRun, status_str,
 };
 use crate::models::{
     EnvironmentGateState, QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord,
@@ -6526,6 +6526,138 @@ impl PgBackend {
         })
     }
 
+    /// Whether the job is still a plain parked job: outside the queue,
+    /// without a terminal verdict, and with no bound open attempt. The
+    /// `SettleJob` precondition `require_parked` re-reads this inside the
+    /// completion transaction, so a boot-visible read that went stale cannot
+    /// fail a job a peer node has since moved (queued for a retry, claimed,
+    /// or concluded).
+    async fn parked_outside_queue(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
+        let row = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.run_id = $1::text::uuid \
+                   AND j.job_id = $2 AND j.queue_state = 'none' \
+                   AND j.kind IN ('job','matrix_leg') \
+                   AND j.status NOT IN ('success','failure','cancelled','skipped','timed_out') \
+                   AND NOT EXISTS (SELECT 1 FROM job_requests q \
+                       WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
+                         AND q.result IS NULL \
+                         AND (q.runner_id IS NOT NULL OR q.session_id IS NOT NULL)))",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        let parked: bool = row.get(0);
+        Ok(parked)
+    }
+
+    /// Settle an attempt whose job row is gone and close its run in the same
+    /// run-locked transaction once no job remains. The empty-graph aggregate
+    /// would call the run a success, so it is written as a failure here; a run
+    /// with other live jobs keeps its open state. Returns the run's status
+    /// when its row is live, for the caller's `RunStatus` fan-out.
+    pub(super) async fn settle_attempt_and_close_run(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+    ) -> Result<Option<ClosedOrphan>, ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        // Read the run without a row lock so the run can be locked first:
+        // `complete_job` and `settle_job` lock the run and then the request,
+        // and taking the request first here would deadlock against a peer
+        // completing another job of the same run.
+        let Some(row) = tx
+            .query_opt(
+                "SELECT run_id::text FROM job_requests WHERE request_id=$1",
+                &[&request_id],
+            )
+            .await
+            .map_err(db)?
+        else {
+            return Ok(None);
+        };
+        let run_id = codec::run_id(row.get(0))?;
+        let run = run_id.0.to_string();
+        let run_exists = PgBackend::lock_run(&tx, run_id).await?;
+        // A peer may have settled the attempt between the read above and the
+        // run lock; only an attempt still open may close its run.
+        let open = tx
+            .query_opt(
+                "SELECT 1 FROM job_requests WHERE request_id=$1 AND result IS NULL \
+                 FOR NO KEY UPDATE",
+                &[&request_id],
+            )
+            .await
+            .map_err(db)?
+            .is_some();
+        if !open {
+            return Ok(None);
+        }
+        settle_request_tx(&tx, request_id, result).await?;
+        let mut run_status = None;
+        if run_exists {
+            let was_completed: bool = tx
+                .query_one(
+                    "SELECT status = 'completed' FROM runs WHERE run_id=$1::text::uuid",
+                    &[&run],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            let remaining: i64 = tx
+                .query_one(
+                    "SELECT count(*) FROM jobs WHERE run_id=$1::text::uuid",
+                    &[&run],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            if remaining == 0 {
+                tx.execute(
+                    "UPDATE runs SET status='completed', conclusion='failure', \
+                     started_at=COALESCE(started_at, now()), \
+                     completed_at=COALESCE(completed_at, now()) \
+                     WHERE run_id=$1::text::uuid",
+                    &[&run],
+                )
+                .await
+                .map_err(db)?;
+            } else {
+                summarize_run_tx(&tx, run_id).await?;
+            }
+            let (status, conclusion): (String, Option<String>) = {
+                let row = tx
+                    .query_one(
+                        "SELECT status, conclusion FROM runs WHERE run_id=$1::text::uuid",
+                        &[&run],
+                    )
+                    .await
+                    .map_err(db)?;
+                (row.get(0), row.get(1))
+            };
+            run_status = Some(logic::run_status_wire(&status, conclusion.as_deref()));
+            if !was_completed && status == "completed" {
+                release_concurrency_for_run(self, &tx, run_id).await?;
+                emit_outbox(
+                    &tx,
+                    Some(run_id),
+                    "run.completed.v1",
+                    serde_json::json!({
+                        "conclusion": conclusion.unwrap_or_else(|| "failure".to_owned())
+                    }),
+                )
+                .await?;
+            }
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(Some(ClosedOrphan { run_status }))
+    }
+
     /// `settle_job`: the broker-shaped completion (attempt ownership checked
     /// against the reporting runner) returning the settled projection.
     pub(super) async fn settle_job(
@@ -6539,6 +6671,14 @@ impl PgBackend {
         let tx = client.transaction().await.map_err(db)?;
         if !PgBackend::lock_run(&tx, run_id).await? {
             return Err(ControlError::NotFound("run not found".to_owned()));
+        }
+        // Boot reconcile may only close the job it saw parked: re-read the
+        // predicate inside this transaction, or a job a peer node has since
+        // queued, claimed or concluded would be failed under it.
+        if settle.require_parked && !Self::parked_outside_queue(&tx, run_id, &job_id).await? {
+            return Err(ControlError::Conflict(
+                "job is not parked outside the queue".to_owned(),
+            ));
         }
         // Ownership: a broker completion must name an attempt this runner owns
         // (recorded owner or the session runner).

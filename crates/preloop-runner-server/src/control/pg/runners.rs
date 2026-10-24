@@ -590,6 +590,44 @@ impl PgBackend {
             .collect()
     }
 
+    /// Unbound unsettled attempts whose job is gone or has left the queue; the
+    /// same predicate as the lite backend's `unbound_orphaned_requests`.
+    ///
+    /// Statement: `SELECT q.request_id, q.run_id::text, q.job_id,
+    /// q.agent_job_id::text FROM job_requests q LEFT JOIN jobs j ON (run_id,
+    /// job_id) WHERE q.result IS NULL AND q.runner_id IS NULL AND
+    /// q.session_id IS NULL AND (j.run_id IS NULL OR (j.queue_state = 'none'
+    /// AND (j.status IN (..) OR j.kind IN ('job','matrix_leg'))))`.
+    pub(super) async fn unbound_orphaned_requests(
+        &self,
+    ) -> Result<Vec<(i64, RunId, JobId, uuid::Uuid)>, ControlError> {
+        let client = self.reader().await?;
+        client
+            .query(
+                "SELECT q.request_id, q.run_id::text, q.job_id, q.agent_job_id::text \
+                 FROM job_requests q \
+                 LEFT JOIN jobs j ON j.run_id = q.run_id AND j.job_id = q.job_id \
+                 WHERE q.result IS NULL AND q.runner_id IS NULL AND q.session_id IS NULL \
+                   AND (j.run_id IS NULL OR (j.queue_state = 'none' AND ( \
+                        j.status IN ('success','failure','cancelled','skipped','timed_out') \
+                        OR j.kind IN ('job','matrix_leg')))) \
+                 ORDER BY q.request_id",
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.get::<_, i64>(0),
+                    codec::run_id(row.get(1))?,
+                    codec::job_id(row.get(2)),
+                    codec::uuid(row.get(3))?,
+                ))
+            })
+            .collect()
+    }
+
     /// One reaper tick's inputs, read without locks: in-flight attempts
     /// (with the job's `timeout-minutes` from its message template), the
     /// ready queue in claim order, every runner's labels, whether any

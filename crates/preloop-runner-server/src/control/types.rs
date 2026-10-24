@@ -1383,6 +1383,12 @@ pub(crate) struct SettleJob {
     /// `status` must be terminal (the handler rejects anything else).
     pub(crate) completion: preloop_gha_protocol::JobCompletion,
     pub(crate) settle: Option<AttemptSettle>,
+    /// Boot reconcile closing a job it found parked outside the queue: the
+    /// completion is refused unless the job is still a plain parked job with
+    /// no bound open attempt when the completion transaction takes the run.
+    /// A peer node sharing the store can move the job after the boot-visible
+    /// read, and only the locked transaction can tell.
+    pub(crate) require_parked: bool,
 }
 
 /// What `settle_job` did.
@@ -1411,6 +1417,15 @@ pub(crate) struct JobSettled {
     pub(crate) live_log_key: String,
     /// `runs-on` of the ready-queue front job after the transition.
     pub(crate) next_runs_on: Vec<String>,
+}
+
+/// What `settle_attempt_and_close_run` wrote for one orphaned attempt.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClosedOrphan {
+    /// The run's status after the settlement (and closure, when this was the
+    /// run's last job), for the caller's `RunStatus` fan-out. `None` when the
+    /// run row is not in the live table (archived or already pruned).
+    pub(crate) run_status: Option<ExecutionStatus>,
 }
 
 /// AzDO long-poll input (`poll_azdo_session`).
