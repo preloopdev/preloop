@@ -38,6 +38,12 @@ pub trait SandboxApi: Send + Sync {
     async fn list(&self) -> Result<Vec<Sandbox>>;
     /// `ListProviders`.
     async fn list_providers(&self) -> Result<Vec<Provider>>;
+    /// `CordonProvider`: stop new placements on a provider.
+    async fn cordon_provider(&self, name: &str) -> Result<Provider>;
+    /// `UncordonProvider`: allow placements again.
+    async fn uncordon_provider(&self, name: &str) -> Result<Provider>;
+    /// `DrainProvider`: cordon, release idle pool members, report leases.
+    async fn drain_provider(&self, name: &str) -> Result<DrainProviderResult>;
     /// `Exec`.
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>>;
     /// Upload a local tar, extracted at `guest_dir`.
@@ -102,6 +108,15 @@ impl SandboxApi for InProcess {
     }
     async fn list_providers(&self) -> Result<Vec<Provider>> {
         Ok(Service::list_providers(&self.0))
+    }
+    async fn cordon_provider(&self, name: &str) -> Result<Provider> {
+        Service::set_provider_cordon(&self.0, name, true).await
+    }
+    async fn uncordon_provider(&self, name: &str) -> Result<Provider> {
+        Service::set_provider_cordon(&self.0, name, false).await
+    }
+    async fn drain_provider(&self, name: &str) -> Result<DrainProviderResult> {
+        Service::drain_provider(&self.0, name).await
     }
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         Service::exec(&self.0, request)
@@ -171,9 +186,24 @@ impl SandboxApi for SandboxClient {
             .await
     }
     async fn list_templates(&self) -> Result<Vec<Template>> {
-        self.call::<_, ListTemplatesResponse>("ListTemplates", &ListRequest {})
-            .await
-            .map(|r| r.templates)
+        let mut templates = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let page: ListTemplatesResponse = self
+                .call(
+                    "ListTemplates",
+                    &ListRequest {
+                        page_size: crate::service::MAX_PAGE_SIZE,
+                        page_token,
+                    },
+                )
+                .await?;
+            templates.extend(page.templates);
+            if page.next_page_token.is_empty() {
+                return Ok(templates);
+            }
+            page_token = page.next_page_token;
+        }
     }
     async fn delete_template(&self, name: &str) -> Result<()> {
         self.call::<_, Empty>(
@@ -189,9 +219,24 @@ impl SandboxApi for SandboxClient {
         self.call("PutPool", &PutPoolRequest { pool }).await
     }
     async fn list_pools(&self) -> Result<Vec<PoolSpec>> {
-        self.call::<_, ListPoolsResponse>("ListPools", &ListRequest {})
-            .await
-            .map(|r| r.pools)
+        let mut pools = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let page: ListPoolsResponse = self
+                .call(
+                    "ListPools",
+                    &ListRequest {
+                        page_size: crate::service::MAX_PAGE_SIZE,
+                        page_token,
+                    },
+                )
+                .await?;
+            pools.extend(page.pools);
+            if page.next_page_token.is_empty() {
+                return Ok(pools);
+            }
+            page_token = page.next_page_token;
+        }
     }
     async fn delete_pool(&self, name: &str) -> Result<()> {
         self.call::<_, Empty>(
@@ -222,14 +267,71 @@ impl SandboxApi for SandboxClient {
         .await
     }
     async fn list(&self) -> Result<Vec<Sandbox>> {
-        self.call::<_, ListSandboxesResponse>("List", &ListRequest {})
-            .await
-            .map(|r| r.sandboxes)
+        let mut sandboxes = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let page: ListSandboxesResponse = self
+                .call(
+                    "List",
+                    &ListRequest {
+                        page_size: crate::service::MAX_PAGE_SIZE,
+                        page_token,
+                    },
+                )
+                .await?;
+            sandboxes.extend(page.sandboxes);
+            if page.next_page_token.is_empty() {
+                return Ok(sandboxes);
+            }
+            page_token = page.next_page_token;
+        }
     }
     async fn list_providers(&self) -> Result<Vec<Provider>> {
-        self.call::<_, ListProvidersResponse>("ListProviders", &ListRequest {})
-            .await
-            .map(|r| r.providers)
+        let mut providers = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let page: ListProvidersResponse = self
+                .call(
+                    "ListProviders",
+                    &ListRequest {
+                        page_size: crate::service::MAX_PAGE_SIZE,
+                        page_token,
+                    },
+                )
+                .await?;
+            providers.extend(page.providers);
+            if page.next_page_token.is_empty() {
+                return Ok(providers);
+            }
+            page_token = page.next_page_token;
+        }
+    }
+    async fn cordon_provider(&self, name: &str) -> Result<Provider> {
+        self.call(
+            "CordonProvider",
+            &ProviderControlRequest {
+                name: name.to_owned(),
+            },
+        )
+        .await
+    }
+    async fn uncordon_provider(&self, name: &str) -> Result<Provider> {
+        self.call(
+            "UncordonProvider",
+            &ProviderControlRequest {
+                name: name.to_owned(),
+            },
+        )
+        .await
+    }
+    async fn drain_provider(&self, name: &str) -> Result<DrainProviderResult> {
+        self.call(
+            "DrainProvider",
+            &ProviderControlRequest {
+                name: name.to_owned(),
+            },
+        )
+        .await
     }
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         Ok(self

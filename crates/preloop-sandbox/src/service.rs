@@ -44,6 +44,8 @@ pub struct ServiceConfig {
     pub preserve_ttl: Duration,
     /// Directory for data-plane blobs.
     pub blob_dir: PathBuf,
+    /// Maximum bytes accepted for one blob upload (data plane).
+    pub blob_max_bytes: u64,
     /// How long a data-plane ticket stays valid.
     pub ticket_ttl: Duration,
     /// How long a caller waits for a provider to report a snapshot, copy,
@@ -69,6 +71,7 @@ impl ServiceConfig {
             create_timeout: Duration::from_secs(1800),
             preserve_ttl: Duration::from_secs(600),
             blob_dir,
+            blob_max_bytes: DEFAULT_BLOB_MAX_BYTES,
             ticket_ttl: Duration::from_secs(300),
             work_timeout: Duration::from_secs(900),
             provider_lost_factor: 3,
@@ -79,6 +82,15 @@ impl ServiceConfig {
 
 /// Pause between warm-pool refills after a creation failure.
 const POOL_FAILURE_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Default `ListRequest.page_size`.
+pub const DEFAULT_PAGE_SIZE: u32 = 100;
+
+/// Largest accepted `ListRequest.page_size`.
+pub const MAX_PAGE_SIZE: u32 = 1000;
+
+/// Default cap for one blob upload: 8 GiB.
+pub const DEFAULT_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Names are identifiers: they reach driver-native names, snapshot paths and
 /// pool configuration, so path separators and traversal are rejected.
@@ -100,6 +112,26 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
+}
+
+/// Remove every file a previous process left in the blob directory.
+fn sweep_blob_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!(path = %path.display(), "removed orphaned sandbox blob"),
+                Err(error) => warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not remove orphaned sandbox blob"
+                ),
+            }
+        }
+    }
 }
 
 /// Exec env keys become shell assignments in argv-only drivers; reject
@@ -172,6 +204,60 @@ fn build_inject_tar(tar_path: &Path, files: &[FileSpec]) -> Result<()> {
 pub fn template_digest(spec: &TemplateSpec) -> String {
     let canonical = serde_json::to_vec(spec).unwrap_or_default();
     format!("sha256:{}", hex::encode(Sha256::digest(&canonical)))
+}
+
+/// Page `items` (already ordered by id) as the request asks.
+///
+/// The token is the base64url encoding of `v1:<kind>:<last returned id>`:
+/// callers pass it back untouched, an id that has since disappeared still
+/// resumes at the right position, and anything else (garbage, or a token
+/// minted for another listing) is rejected rather than silently rewinding to
+/// the first page.
+fn paginate<T>(
+    kind: &str,
+    items: impl IntoIterator<Item = (String, T)>,
+    request: &ListRequest,
+) -> Result<(Vec<T>, String)> {
+    use base64::Engine as _;
+    const PREFIX: &str = "v1";
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let limit = match request.page_size {
+        0 => DEFAULT_PAGE_SIZE,
+        size => size.min(MAX_PAGE_SIZE),
+    } as usize;
+    let after = if request.page_token.is_empty() {
+        None
+    } else {
+        let decoded = engine
+            .decode(request.page_token.as_bytes())
+            .map_err(|_| Error::invalid("invalid page token"))?;
+        let decoded =
+            String::from_utf8(decoded).map_err(|_| Error::invalid("invalid page token"))?;
+        let (token_kind, id) = decoded
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .and_then(|rest| rest.split_once(':'))
+            .ok_or_else(|| Error::invalid("invalid page token"))?;
+        if token_kind != kind || id.is_empty() {
+            return Err(Error::invalid("invalid page token"));
+        }
+        Some(id.to_owned())
+    };
+    let items: Vec<(String, T)> = items.into_iter().collect();
+    let start = after
+        .as_ref()
+        .map_or(0, |after| items.partition_point(|(id, _)| id <= after));
+    let mut page = Vec::with_capacity(limit.min(items.len()));
+    let mut last = None;
+    for (id, item) in items.into_iter().skip(start) {
+        if page.len() == limit {
+            let token = last.expect("a full page has a last id");
+            return Ok((page, engine.encode(format!("{PREFIX}:{kind}:{token}"))));
+        }
+        last = Some(id);
+        page.push(item);
+    }
+    Ok((page, String::new()))
 }
 
 /// Revision of a pool's full placement: its configuration plus the template
@@ -449,6 +535,10 @@ impl Service {
     pub async fn open(store: Arc<dyn Store>, config: ServiceConfig) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&config.blob_dir)
             .map_err(|e| Error::internal(format!("blob dir: {e}")))?;
+        // Tickets are memory-only, so every file left in the blob directory
+        // belongs to a previous process: an upload interrupted by shutdown or
+        // a staging tar whose call never finished. Nothing can claim them.
+        sweep_blob_dir(&config.blob_dir);
         let mut state = State::default();
         for template in load::<Template>(&*store, Kind::Templates).await? {
             state.templates.insert(template.spec.name.clone(), template);
@@ -870,6 +960,23 @@ impl Service {
         self.state.lock().templates.values().cloned().collect()
     }
 
+    /// `ListTemplates` page, ordered by name.
+    pub fn list_templates_page(&self, request: &ListRequest) -> Result<ListTemplatesResponse> {
+        let state = self.state.lock();
+        let (templates, next_page_token) = paginate(
+            "template",
+            state
+                .templates
+                .iter()
+                .map(|(name, template)| (name.clone(), template.clone())),
+            request,
+        )?;
+        Ok(ListTemplatesResponse {
+            templates,
+            next_page_token,
+        })
+    }
+
     /// `PutPool`.
     pub async fn put_pool(&self, pool: PoolSpec) -> Result<PoolSpec> {
         validate_name("pool", &pool.name)?;
@@ -894,6 +1001,23 @@ impl Service {
     /// `ListPools`.
     pub fn list_pools(&self) -> Vec<PoolSpec> {
         self.state.lock().pools.values().cloned().collect()
+    }
+
+    /// `ListPools` page, ordered by name.
+    pub fn list_pools_page(&self, request: &ListRequest) -> Result<ListPoolsResponse> {
+        let state = self.state.lock();
+        let (pools, next_page_token) = paginate(
+            "pool",
+            state
+                .pools
+                .iter()
+                .map(|(name, pool)| (name.clone(), pool.clone())),
+            request,
+        )?;
+        Ok(ListPoolsResponse {
+            pools,
+            next_page_token,
+        })
     }
 
     /// `DeletePool`: idle members are destroyed; leased ones finish.
@@ -966,7 +1090,7 @@ impl Service {
                 if state.providers.is_empty() {
                     return Ok(());
                 }
-                self.place(state, &placement, false).map(|_| ())
+                self.place_with(state, &placement, false, false).map(|_| ())
             }
             Err(_) => Ok(()),
         }
@@ -985,6 +1109,21 @@ impl Service {
         spec: &PlacementSpec,
         require_online: bool,
     ) -> Result<(String, String)> {
+        self.place_with(state, spec, require_online, true)
+    }
+
+    /// `place`, optionally honouring cordons.
+    ///
+    /// `PutPool` validates with cordons ignored: a cordon is transient, so a
+    /// pool whose only capable provider is cordoned is still valid
+    /// configuration once that provider is uncordoned.
+    fn place_with(
+        &self,
+        state: &State,
+        spec: &PlacementSpec,
+        require_online: bool,
+        respect_cordon: bool,
+    ) -> Result<(String, String)> {
         let template = &spec.template;
         let requires = &spec.requires;
         let os = if requires.os.is_empty() {
@@ -995,6 +1134,7 @@ impl Service {
         let mut unmet = Vec::new();
         let mut full = false;
         let mut candidates: Vec<Candidate> = Vec::new();
+        let mut cordoned: Vec<&str> = Vec::new();
         for (provider_id, rec) in &state.providers {
             if require_online && rec.seen.elapsed() > self.config.provider_timeout {
                 continue;
@@ -1003,6 +1143,8 @@ impl Service {
             if !template.native_ref.is_empty() && template.provider_id != *provider_id {
                 continue;
             }
+            let is_cordoned = respect_cordon && rec.provider.cordoned;
+            let mut capable = false;
             for driver in &rec.provider.drivers {
                 let caps = &driver.capabilities;
                 let mut reasons = Vec::new();
@@ -1051,12 +1193,20 @@ impl Service {
                     }
                 }
                 if !reasons.is_empty() {
-                    unmet.push(format!(
-                        "{}/{}: {}",
-                        rec.provider.name,
-                        driver.driver,
-                        reasons.join(", ")
-                    ));
+                    // A cordoned provider's gaps did not decide the
+                    // placement, so keep them out of the unmet list.
+                    if !is_cordoned {
+                        unmet.push(format!(
+                            "{}/{}: {}",
+                            rec.provider.name,
+                            driver.driver,
+                            reasons.join(", ")
+                        ));
+                    }
+                    continue;
+                }
+                capable = true;
+                if is_cordoned {
                     continue;
                 }
                 let live = state
@@ -1081,6 +1231,9 @@ impl Service {
                     slots: caps.slots,
                 });
             }
+            if is_cordoned && capable {
+                cordoned.push(rec.provider.name.as_str());
+            }
         }
         if candidates.is_empty() {
             if full {
@@ -1088,6 +1241,14 @@ impl Service {
                     Code::ResourceExhausted,
                     "every matching provider is at capacity",
                 ));
+            }
+            // Every provider that could have taken this placement is
+            // cordoned: waiting cannot help, and "not online" is wrong.
+            if !cordoned.is_empty() {
+                return Err(Error::precondition(match cordoned.as_slice() {
+                    [name] => format!("provider {name} is cordoned"),
+                    names => format!("providers {} are cordoned", names.join(", ")),
+                }));
             }
             if unmet.is_empty() {
                 return Err(Error::unavailable(
@@ -1486,6 +1647,7 @@ impl Service {
                         && s.state == SandboxState::Ready
                 })
                 .filter(|s| sandbox_meets(state, s, &request.requires))
+                .filter(|s| accepts_new_leases(state, s))
                 // Oldest first, so warm members rotate and none goes stale.
                 .min_by_key(|s| (s.created_at, s.id.as_str()))
                 .map(|s| s.id.clone());
@@ -1505,6 +1667,7 @@ impl Service {
                             && s.pool_revision == revision
                             && s.state == SandboxState::Provisioning
                             && sandbox_meets(state, s, &request.requires)
+                            && accepts_new_leases(state, s)
                     });
                     if booting {
                         return Ok(Step::Wait(None));
@@ -1737,6 +1900,23 @@ impl Service {
         self.state.lock().sandboxes.values().cloned().collect()
     }
 
+    /// `List` page, ordered by id.
+    pub fn list_page(&self, request: &ListRequest) -> Result<ListSandboxesResponse> {
+        let state = self.state.lock();
+        let (sandboxes, next_page_token) = paginate(
+            "sandbox",
+            state
+                .sandboxes
+                .iter()
+                .map(|(id, sandbox)| (id.clone(), sandbox.clone())),
+            request,
+        )?;
+        Ok(ListSandboxesResponse {
+            sandboxes,
+            next_page_token,
+        })
+    }
+
     /// `ListProviders`.
     pub fn list_providers(&self) -> Vec<Provider> {
         self.state
@@ -1745,6 +1925,23 @@ impl Service {
             .values()
             .map(|rec| rec.provider.clone())
             .collect()
+    }
+
+    /// `ListProviders` page, ordered by provider id.
+    pub fn list_providers_page(&self, request: &ListRequest) -> Result<ListProvidersResponse> {
+        let state = self.state.lock();
+        let (providers, next_page_token) = paginate(
+            "provider",
+            state
+                .providers
+                .iter()
+                .map(|(id, rec)| (id.clone(), rec.provider.clone())),
+            request,
+        )?;
+        Ok(ListProvidersResponse {
+            providers,
+            next_page_token,
+        })
     }
 
     fn usable(sandbox: &Sandbox) -> Result<()> {
@@ -2381,6 +2578,93 @@ impl Service {
         Ok(())
     }
 
+    /// Find a provider by its registered name, falling back to its id.
+    fn provider_id_for(state: &State, reference: &str) -> Result<String> {
+        if reference.is_empty() {
+            return Err(Error::invalid("provider name is required"));
+        }
+        for (id, rec) in &state.providers {
+            if id == reference || rec.provider.name == reference {
+                return Ok(id.clone());
+            }
+        }
+        Err(Error::not_found(format!(
+            "provider `{reference}` not found"
+        )))
+    }
+
+    /// `CordonProvider` / `UncordonProvider`: stop or resume placements.
+    /// Existing leases and warm members are untouched.
+    pub async fn set_provider_cordon(&self, reference: &str, cordoned: bool) -> Result<Provider> {
+        let (provider, ops) = {
+            let mut state = self.state.lock();
+            let id = Self::provider_id_for(&state, reference)?;
+            let rec = state.providers.get_mut(&id).expect("provider looked up");
+            rec.provider.cordoned = cordoned;
+            let provider = rec.provider.clone();
+            let ops = vec![self.put(Kind::Providers, &id, &provider)];
+            (provider, ops)
+        };
+        info!(provider = %provider.id, cordoned, "provider cordon changed");
+        self.persist(ops).await;
+        self.changed.notify_waiters();
+        Ok(provider)
+    }
+
+    /// `DrainProvider`: cordon, release idle pool members, and report the
+    /// leases still running. Leased sandboxes are not killed.
+    pub async fn drain_provider(&self, reference: &str) -> Result<DrainProviderResult> {
+        let (result, ops) = {
+            let mut state = self.state.lock();
+            let id = Self::provider_id_for(&state, reference)?;
+            let rec = state.providers.get_mut(&id).expect("provider looked up");
+            rec.provider.cordoned = true;
+            let provider = rec.provider.clone();
+            let mut ops = vec![self.put(Kind::Providers, &id, &provider)];
+            let idle: Vec<String> = state
+                .sandboxes
+                .values()
+                .filter(|sandbox| {
+                    sandbox.provider_id == id
+                        && !sandbox.pool.is_empty()
+                        && sandbox.lease_id.is_empty()
+                        && sandbox.state != SandboxState::Terminating
+                        && !sandbox.state.is_terminal()
+                })
+                .map(|sandbox| sandbox.id.clone())
+                .collect();
+            let released_pool_members = idle.len() as u32;
+            for sandbox_id in idle {
+                self.destroy_locked(&mut state, &sandbox_id, &mut ops);
+            }
+            let leased_remaining = state
+                .sandboxes
+                .values()
+                .filter(|sandbox| {
+                    sandbox.provider_id == id
+                        && !sandbox.lease_id.is_empty()
+                        && !sandbox.state.is_terminal()
+                })
+                .count() as u32;
+            (
+                DrainProviderResult {
+                    released_pool_members,
+                    leased_remaining,
+                },
+                ops,
+            )
+        };
+        info!(
+            provider = %reference,
+            released = result.released_pool_members,
+            leased = result.leased_remaining,
+            "provider drained"
+        );
+        self.persist(ops).await;
+        self.changed.notify_waiters();
+        Ok(result)
+    }
+
     /// `Register`: same name → same id, next generation. In-flight work of
     /// the previous generation fails; its sandboxes wait for `Reconcile`.
     pub async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse> {
@@ -2399,12 +2683,19 @@ impl Service {
                 .providers
                 .get(&id)
                 .map_or(1, |rec| rec.provider.generation + 1);
+            // Cordon is an operator decision about the provider record: a
+            // re-registration must not clear it.
+            let cordoned = state
+                .providers
+                .get(&id)
+                .is_some_and(|rec| rec.provider.cordoned);
             let provider = Provider {
                 id: id.clone(),
                 name: request.name,
                 generation,
                 drivers: request.drivers,
                 last_seen: now(),
+                cordoned,
             };
             let wake = state
                 .providers
@@ -2881,6 +3172,15 @@ enum Step {
     Wait(Option<Error>),
 }
 
+/// Whether `sandbox` may take a new lease. A cordoned provider keeps its
+/// members but grants them none; a provider with no record is not cordoned.
+fn accepts_new_leases(state: &State, sandbox: &Sandbox) -> bool {
+    state
+        .providers
+        .get(&sandbox.provider_id)
+        .is_none_or(|rec| !rec.provider.cordoned)
+}
+
 fn sandbox_meets(state: &State, sandbox: &Sandbox, requires: &Requirements) -> bool {
     if requires == &Requirements::default() {
         return true;
@@ -2952,6 +3252,104 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::store;
+
+    fn items(count: usize) -> Vec<(String, usize)> {
+        (0..count)
+            .map(|index| (format!("id-{index:04}"), index))
+            .collect()
+    }
+
+    fn encode_token(token: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token)
+    }
+
+    #[test]
+    fn pages_are_ordered_and_carry_a_token_until_exhausted() {
+        let mut request = ListRequest::default();
+        let (page, token) = paginate("widget", items(250), &request).unwrap();
+        assert_eq!(page, (0..100usize).collect::<Vec<_>>());
+        assert!(!token.is_empty());
+        request.page_token = token;
+        let (page, token) = paginate("widget", items(250), &request).unwrap();
+        assert_eq!(page, (100..200usize).collect::<Vec<_>>());
+        assert!(!token.is_empty());
+        request.page_token = token;
+        let (page, token) = paginate("widget", items(250), &request).unwrap();
+        assert_eq!(page, (200..250usize).collect::<Vec<_>>());
+        assert!(token.is_empty());
+    }
+
+    #[test]
+    fn page_size_is_capped_and_tokens_are_validated() {
+        let request = ListRequest {
+            page_size: 5000,
+            page_token: String::new(),
+        };
+        let (page, _) = paginate("widget", items(1500), &request).unwrap();
+        assert_eq!(page.len(), MAX_PAGE_SIZE as usize);
+
+        let request = ListRequest {
+            page_token: "not base64!".into(),
+            ..ListRequest::default()
+        };
+        let error = paginate("widget", items(3), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument);
+    }
+
+    #[test]
+    fn a_bogus_page_token_is_rejected_instead_of_restarting_at_page_one() {
+        // `base64url("not-a-sandbox")`, the token the end-to-end run used.
+        let request = ListRequest {
+            page_size: 2,
+            page_token: "bm90LWEtc2FuZGJveA".into(),
+        };
+        let error = paginate("sandbox", items(4), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+
+        // A cursor minted for another listing is not a cursor for this one.
+        let first = ListRequest {
+            page_size: 2,
+            page_token: String::new(),
+        };
+        let (_, token) = paginate("template", items(4), &first).unwrap();
+        let request = ListRequest {
+            page_size: 2,
+            page_token: token,
+        };
+        let error = paginate("sandbox", items(4), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+    }
+
+    #[test]
+    fn a_token_whose_id_disappeared_still_resumes_after_it() {
+        let request = ListRequest {
+            page_size: 2,
+            page_token: String::new(),
+        };
+        let (_, token) = paginate("widget", items(4), &request).unwrap();
+        // The token names `id-0001`, which is gone by the second page.
+        let remaining: Vec<_> = items(4)
+            .into_iter()
+            .filter(|(id, _)| id != "id-0001")
+            .collect();
+        let request = ListRequest {
+            page_size: 2,
+            page_token: token,
+        };
+        let (page, _) = paginate("widget", remaining, &request).unwrap();
+        assert_eq!(page, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_page_token_with_a_missing_value_is_rejected() {
+        let request = ListRequest {
+            page_token: encode_token("v1:sandbox:"),
+            ..ListRequest::default()
+        };
+        let error = paginate("sandbox", items(3), &request).unwrap_err();
+        assert_eq!(error.code, Code::InvalidArgument);
+    }
 
     fn ready_member(id: &str, created_at: i64) -> Sandbox {
         Sandbox {
@@ -3044,6 +3442,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(third.sandbox.id, "sbx-x");
+    }
+
+    #[tokio::test]
+    async fn cordoned_provider_does_not_hold_acquires_for_booting_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::open(
+            store::open("memory:").await.unwrap(),
+            ServiceConfig::new(dir.path().join("blobs")),
+        )
+        .await
+        .unwrap();
+        service
+            .register(RegisterRequest {
+                name: "host".into(),
+                drivers: vec![DriverInfo {
+                    driver: "fake".into(),
+                    capabilities: Capabilities::default(),
+                }],
+            })
+            .await
+            .unwrap();
+        service.set_provider_cordon("host", true).await.unwrap();
+        let provider_id = service.list_providers()[0].id.clone();
+        {
+            let mut state = service.state.lock();
+            state.templates.insert(
+                "alpine".into(),
+                Template {
+                    spec: TemplateSpec {
+                        name: "alpine".into(),
+                        ..TemplateSpec::default()
+                    },
+                    ..Template::default()
+                },
+            );
+            state.pools.insert(
+                "p".into(),
+                PoolSpec {
+                    name: "p".into(),
+                    template: "alpine".into(),
+                    ..PoolSpec::default()
+                },
+            );
+            let mut booting = Sandbox {
+                id: "sbx-booting".into(),
+                template: "alpine".into(),
+                pool: "p".into(),
+                provider_id,
+                state: SandboxState::Provisioning,
+                ..Sandbox::default()
+            };
+            with_current_pool_revision(&state, &mut booting);
+            state.sandboxes.insert(booting.id.clone(), booting);
+        }
+        // Waiting cannot help: the member would never be leased while the
+        // cordon holds, so the cordon error is reported at once.
+        let error = service
+            .acquire(AcquireRequest {
+                idempotency_key: "k".into(),
+                pool: "p".into(),
+                wait_secs: Some(0),
+                ..AcquireRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::FailedPrecondition);
+        assert!(error.message.contains("host"), "{}", error.message);
+        assert!(error.message.contains("cordoned"), "{}", error.message);
     }
 
     #[tokio::test]

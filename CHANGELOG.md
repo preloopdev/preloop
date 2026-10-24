@@ -12,6 +12,15 @@ Releases before v0.27.0 predate the changelog.
 - **Sandbox Service** (`preloop-sandbox`) replaces `preloop-vm`; the
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
   service.
+- **Sandbox Service: provider cordon/drain, pagination and request caps.**
+  `CordonProvider`/`UncordonProvider`/`DrainProvider` (and
+  `preloop sandbox provider …`) stop new placements and grant no new leases
+  from a provider's warm members; drain also releases idle pool members.
+  Existing leases remain usable. `List*` RPCs are paginated (`pageSize` up to
+  1000); unary RPCs are capped at 4 MiB and blob uploads at
+  `PRELOOP_SANDBOX_BLOB_MAX_BYTES` (default 8 GiB), with orphaned blobs swept
+  at boot. Sandbox clients classify oversized unary requests as
+  `resource_exhausted`.
 
 ### Fixed
 

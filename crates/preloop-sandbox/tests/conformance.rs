@@ -2264,3 +2264,421 @@ async fn concurrent_same_key_acquires_inject_once() {
     assert_eq!(code, 0);
     assert_eq!(stdout, b"injected");
 }
+
+/// Bind the service on a loopback port and return its base URL.
+async fn serve(service: Arc<Service>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    // Both tokens are required and the loopback Host guard is on: a
+    // listener without them fails closed.
+    let app = router(
+        service,
+        Auth {
+            client_token: Some("client-secret".into()),
+            provider_token: Some("provider-secret".into()),
+            loopback_only: true,
+        },
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    base
+}
+
+#[tokio::test]
+async fn cordoned_provider_receives_no_placements() {
+    let store = store::open("memory:").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness_with(store.clone(), dir, FakeDriver::full_capabilities()).await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let name = h.service.list_providers()[0].name.clone();
+
+    let provider = h.service.set_provider_cordon(&name, true).await.unwrap();
+    assert!(provider.cordoned);
+    // The cordon is part of the persisted provider record.
+    let records = store.load(Kind::Providers).await.unwrap();
+    assert!(records[0]["cordoned"].as_bool().unwrap_or(false));
+
+    // A cordon is not transient: fail at once, naming it, rather than
+    // waiting out the window and claiming the provider is offline.
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        h.service.acquire(AcquireRequest {
+            idempotency_key: "cordoned".into(),
+            template: "alpine".into(),
+            wait_secs: Some(30),
+            ..AcquireRequest::default()
+        }),
+    )
+    .await
+    .expect("a cordoned provider must not be waited for")
+    .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition, "{}", error.message);
+    assert!(error.message.contains(&name), "{}", error.message);
+    assert!(error.message.contains("cordoned"), "{}", error.message);
+    assert!(h.fake.inventory().await.unwrap().is_empty());
+
+    let provider = h.service.set_provider_cordon(&name, false).await.unwrap();
+    assert!(!provider.cordoned);
+    let lease = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "open".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(lease.sandbox.state, SandboxState::Leased);
+}
+
+#[tokio::test]
+async fn a_pool_whose_only_capable_provider_is_cordoned_still_validates() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let name = h.service.list_providers()[0].name.clone();
+    h.service.set_provider_cordon(&name, true).await.unwrap();
+
+    // A cordon is transient, so it must not reject the pool as impossible.
+    h.service
+        .put_pool(PoolSpec {
+            name: "linux".into(),
+            template: "alpine".into(),
+            warm: 1,
+            max: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .expect("a cordoned provider is still a valid pool target");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(h.service.list().is_empty(), "no fill while cordoned");
+
+    h.service.set_provider_cordon(&name, false).await.unwrap();
+    wait_for(|| h.service.list().len() == 1).await;
+}
+
+#[tokio::test]
+async fn cordoned_matching_provider_is_distinguished_from_incompatible_providers() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    let name = h.service.list_providers()[0].name.clone();
+    h.service.set_provider_cordon(&name, true).await.unwrap();
+    let mut capabilities = FakeDriver::full_capabilities();
+    capabilities.os = "macos".into();
+    h.service
+        .register(RegisterRequest {
+            name: "incompatible".into(),
+            drivers: vec![DriverInfo {
+                driver: "fake".into(),
+                capabilities,
+            }],
+        })
+        .await
+        .unwrap();
+
+    // Operator cordons fail fast with an actionable reason, even when
+    // another online provider has unrelated capability gaps.
+    let error = h
+        .service
+        .acquire(AcquireRequest {
+            idempotency_key: "mixed-cordon".into(),
+            template: "alpine".into(),
+            wait_secs: Some(0),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::FailedPrecondition);
+    assert!(error.message.contains(&name), "{}", error.message);
+    assert!(error.message.contains("cordoned"), "{}", error.message);
+    assert!(!error.message.contains("incompatible"), "{}", error.message);
+    h.service
+        .put_pool(PoolSpec {
+            name: "linux".into(),
+            template: "alpine".into(),
+            ..PoolSpec::default()
+        })
+        .await
+        .expect("pool validation ignores temporary cordons");
+}
+
+#[tokio::test]
+async fn cordoned_provider_keeps_warm_members_without_granting_new_leases() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    h.service
+        .put_pool(PoolSpec {
+            name: "linux".into(),
+            template: "alpine".into(),
+            warm: 1,
+            max: 1,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .any(|s| s.state == SandboxState::Ready)
+    })
+    .await;
+    let warm = h.service.list().pop().unwrap();
+    let name = h.service.list_providers()[0].name.clone();
+    h.service.set_provider_cordon(&name, true).await.unwrap();
+
+    let mut request = acquire("cordoned-warm", "linux");
+    request.wait_secs = Some(0);
+    let error = h.service.acquire(request.clone()).await.unwrap_err();
+    assert_eq!(error.code, Code::ResourceExhausted);
+    let retained = h.service.list().pop().unwrap();
+    assert_eq!(retained.id, warm.id);
+    assert_eq!(retained.state, SandboxState::Ready);
+    assert!(retained.lease_id.is_empty());
+
+    h.service.set_provider_cordon(&name, false).await.unwrap();
+    let lease = h.service.acquire(request.clone()).await.unwrap();
+    assert_eq!(lease.sandbox.id, warm.id);
+    h.service.set_provider_cordon(&name, true).await.unwrap();
+    let retry = h.service.acquire(request).await.unwrap();
+    assert_eq!(retry.lease.id, lease.lease.id);
+}
+
+#[tokio::test]
+async fn drain_releases_idle_pool_members_and_keeps_leases() {
+    let h = harness().await;
+    h.service.put_template(template("alpine")).await.unwrap();
+    // `max` equals `warm`, so claiming a member leaves nothing to refill:
+    // the drain sees exactly the one idle replacement and one lease.
+    h.service
+        .put_pool(PoolSpec {
+            name: "linux".into(),
+            template: "alpine".into(),
+            warm: 2,
+            max: 2,
+            ..PoolSpec::default()
+        })
+        .await
+        .unwrap();
+    wait_for(|| {
+        h.service
+            .list()
+            .iter()
+            .filter(|s| s.state == SandboxState::Ready)
+            .count()
+            == 2
+    })
+    .await;
+    let lease = h.service.acquire(acquire("drain", "linux")).await.unwrap();
+    let name = h.service.list_providers()[0].name.clone();
+
+    let result = h.service.drain_provider(&name).await.unwrap();
+    assert_eq!(result.released_pool_members, 1);
+    assert_eq!(result.leased_remaining, 1);
+    assert!(h.service.list_providers()[0].cordoned);
+
+    // The idle member is destroyed; the leased one keeps running.
+    wait_for(|| {
+        let sandboxes = h.service.list();
+        sandboxes.len() == 1 && sandboxes[0].id == lease.sandbox.id
+    })
+    .await;
+    assert_eq!(h.fake.inventory().await.unwrap().len(), 1);
+
+    // No refill while cordoned.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.service.list().len(), 1);
+
+    h.service.set_provider_cordon(&name, false).await.unwrap();
+    wait_for(|| h.service.list().len() == 2).await;
+}
+
+#[tokio::test]
+async fn connect_unary_bodies_are_capped_at_four_mib() {
+    use preloop_sandbox::server::CONNECT_BODY_LIMIT;
+    use tower::ServiceExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let service = Service::open(
+        store::open("memory:").await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    let response = router(service, Auth::default())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/preloop.sandbox.v1.Sandboxes/PutTemplate")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(vec![b' '; CONNECT_BODY_LIMIT + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn connect_client_classifies_oversized_unary_requests() {
+    use preloop_sandbox::SandboxApi as _;
+    use preloop_sandbox::server::CONNECT_BODY_LIMIT;
+
+    let h = harness().await;
+    let base = serve(h.service.clone()).await;
+    let client = SandboxClient::new(&base, Some("client-secret".into()));
+    let mut spec = template("oversized");
+    spec.image = Some("x".repeat(CONNECT_BODY_LIMIT));
+    let error = client.put_template(spec).await.unwrap_err();
+    assert_eq!(error.code, Code::ResourceExhausted);
+    assert!(h.service.list_templates().is_empty());
+}
+
+#[tokio::test]
+async fn blob_upload_cap_rejects_and_removes_the_partial_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = dir.path().join("blobs");
+    let mut config = ServiceConfig::new(blobs.clone());
+    config.blob_max_bytes = 1024;
+    let service = Service::open(store::open("memory:").await.unwrap(), config)
+        .await
+        .unwrap();
+    let fake = Arc::new(FakeDriver::new(
+        "fake",
+        dir.path().join("host"),
+        FakeDriver::full_capabilities(),
+    ));
+    let shutdown = CancellationToken::new();
+    let agent = Agent::new(
+        Arc::new(service.clone()) as Arc<dyn ProviderLink>,
+        vec![fake as Arc<dyn Driver>],
+        AgentConfig::new("host-a", dir.path().join("scratch")),
+    );
+    tokio::spawn(agent.run(None, shutdown.clone()));
+    tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
+    wait_for(|| !service.list_providers().is_empty()).await;
+    service.put_template(template("alpine")).await.unwrap();
+    let lease = service
+        .acquire(AcquireRequest {
+            idempotency_key: "blob".into(),
+            template: "alpine".into(),
+            ..AcquireRequest::default()
+        })
+        .await
+        .unwrap();
+    let ticket = service
+        .open_stream(OpenStreamRequest {
+            sandbox_id: lease.sandbox.id,
+            kind: StreamKind::Upload,
+            path: "/work".into(),
+        })
+        .unwrap();
+    let ticket_id = ticket.url.rsplit('/').next().unwrap().to_owned();
+    let base = serve(service.clone()).await;
+
+    // A chunked body crosses the cap while streaming, so the handler has
+    // already created the file when it rejects.
+    let chunked = reqwest::Body::wrap_stream(futures::stream::iter(vec![Ok::<_, std::io::Error>(
+        bytes::Bytes::from(vec![0u8; 2048]),
+    )]));
+    let response = reqwest::Client::new()
+        .put(format!("{base}{}", ticket.url))
+        .bearer_auth(&ticket.token)
+        .body(chunked)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!blobs.join(format!("{ticket_id}.tar")).exists());
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn list_pagination_round_trips_across_250_items() {
+    use preloop_sandbox::SandboxApi as _;
+    let dir = tempfile::tempdir().unwrap();
+    let service = Service::open(
+        store::open("memory:").await.unwrap(),
+        ServiceConfig::new(dir.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    for index in 0..250 {
+        service
+            .put_template(TemplateSpec {
+                name: format!("t{index:03}"),
+                os: "linux".into(),
+                image: Some("alpine:3.20".into()),
+                ..TemplateSpec::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    // Explicit pages, ordered by id (the template name).
+    let mut request = ListRequest {
+        page_size: 100,
+        page_token: String::new(),
+    };
+    let mut names = Vec::new();
+    loop {
+        let page = service.list_templates_page(&request).unwrap();
+        assert!(page.templates.len() <= 100);
+        names.extend(page.templates.into_iter().map(|t| t.spec.name));
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        request.page_token = page.next_page_token;
+    }
+    assert_eq!(names.len(), 250);
+    assert_eq!(names[0], "t000");
+    assert_eq!(names[249], "t249");
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+
+    // A bogus token is rejected instead of silently restarting at page one.
+    let error = service
+        .list_templates_page(&ListRequest {
+            page_size: 100,
+            page_token: "bm90LWEtc2FuZGJveA".into(),
+        })
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+
+    // A token minted for another listing is not a cursor for this one.
+    let foreign = service
+        .list_templates_page(&ListRequest {
+            page_size: 100,
+            page_token: String::new(),
+        })
+        .unwrap()
+        .next_page_token;
+    let error = service
+        .list_pools_page(&ListRequest {
+            page_size: 100,
+            page_token: foreign,
+        })
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument, "{}", error.message);
+
+    // The network client follows the same tokens.
+    let base = serve(service).await;
+    let client = SandboxClient::new(&base, Some("client-secret".into()));
+    assert_eq!(client.list_templates().await.unwrap().len(), 250);
+}
+
+#[tokio::test]
+async fn boot_sweeps_orphaned_blob_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = dir.path().join("blobs");
+    std::fs::create_dir_all(blobs.join("keep-dir")).unwrap();
+    std::fs::write(blobs.join("tkt-stale.tar"), b"partial upload").unwrap();
+    std::fs::write(blobs.join("inject-stale.tar"), b"staged files").unwrap();
+    let _service = Service::open(
+        store::open("memory:").await.unwrap(),
+        ServiceConfig::new(blobs.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(!blobs.join("tkt-stale.tar").exists());
+    assert!(!blobs.join("inject-stale.tar").exists());
+    assert!(blobs.join("keep-dir").exists());
+}

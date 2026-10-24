@@ -19,7 +19,8 @@ callers ──Sandboxes API──▶ Sandbox Service ──Providers API──�
 * **Sandboxes** (callers): `PutTemplate`, `PutPool`, `Acquire` (idempotency key,
   pool or template, identity to inject), `Renew`, `Release` (destroy or
   preserve), `Exec` (server-streaming), `OpenStream` (data-plane ticket),
-  `Snapshot`, `Pause`/`Resume`, `Get`/`List`.
+  `Snapshot`, `Pause`/`Resume`, `Get`/`List`, and the provider lifecycle
+  controls `CordonProvider`, `UncordonProvider`, `DrainProvider`.
 * **Providers** (capacity owners): `Register` (drivers + capabilities →
   provider id and fencing generation), `Heartbeat`, `Poll` (long-poll for
   work), `Report` / `ReportExec` (fenced by generation), `Reconcile` (full
@@ -45,6 +46,12 @@ from the `.proto` interoperates.
 * **Pool** — template + shape + network + mounts + warm target + max. The
   service keeps `warm` idle sandboxes per pool (the generic warm pool) and
   refills after each claim, backing off after creation failures.
+* **Provider cordon and drain** — `CordonProvider` stops new placements on one
+  provider, including new leases of warm members; its existing leases and warm
+  members keep running. `DrainProvider` cordons and also destroys that
+  provider's idle pool members, then reports how many leases remain (they are
+  not killed). The cordon is persisted on the provider record and survives
+  re-registration until `UncordonProvider`.
 * **Stop / Start** — `Stop` powers a machine off but keeps it and its disk
   (packing needs a stopped machine), `Start` boots it again, `--forkable` when
   it must serve forks. Both work under the same lease.
@@ -57,7 +64,10 @@ Capabilities decide placement; nothing branches on driver names. A request no
 registered provider can satisfy fails with the unmet requirement named
 (`no provider satisfies template "mac": host/smolvm: os=macos`), and an
 operation a backend does not declare (`Pause`, `Snapshot`) fails with
-`failed_precondition` instead of being emulated. `one_shot` backends run one
+`failed_precondition` instead of being emulated. A cordon is an operator
+choice, not a lost provider: an acquire only a cordoned provider could serve
+fails at once with `failed_precondition` naming the cordon rather than waiting
+and reporting "no provider is online". `one_shot` backends run one
 command per sandbox; callers needing several execs require `multi_exec`.
 
 ## Placement
@@ -125,6 +135,24 @@ are the service's.
   per-provider identities (a follow-up); on a single-operator tailnet the
   shared token is the trust boundary, exactly like the engine token.
 
+## Limits and pagination
+
+Unary Connect requests are capped at 4 MiB; bulk bytes never belong in them.
+Oversized requests return HTTP `413`, which `SandboxClient` classifies as
+`resource_exhausted`.
+The data-plane `PUT` routes stream to disk and stop at
+`PRELOOP_SANDBOX_BLOB_MAX_BYTES` (default 8 GiB), answering `413` and deleting
+the partial file. At boot the service deletes every file left in its blob
+directory: tickets live only in memory, so no restart can claim them.
+
+`List`, `ListTemplates`, `ListPools` and `ListProviders` are paginated.
+`pageSize` defaults to 100 and is capped at 1000; `nextPageToken` from a
+response is passed back as `pageToken`. Items are ordered by id, and the token
+is an opaque encoding of the last id. A token this service did not mint (or
+one minted for a different listing) is `invalid_argument`, never a silent
+restart from the first page. `SandboxClient` follows the tokens, so the
+in-process and network APIs still return complete lists.
+
 ## State
 
 The service keeps its working set in memory and writes through to its own
@@ -158,6 +186,7 @@ and debug-hold strategy; the machines under it are sandboxes.
 | `PRELOOP_SANDBOX_LISTEN` | API address, or `off` |
 | `PRELOOP_SANDBOX_TOKEN` / `PRELOOP_SANDBOX_PROVIDER_TOKEN` | bearer tokens; generated into the state directory when unset |
 | `PRELOOP_SANDBOX_STORE_URL` | store URL |
+| `PRELOOP_SANDBOX_BLOB_MAX_BYTES` | blob upload cap (default 8 GiB) |
 | `PRELOOP_SANDBOX_DRIVERS` | drivers on this host (default `smolvm`) |
 | `PRELOOP_SANDBOX_POOL_DRIVER` | driver the CI pool places on (default: first) |
 | `PRELOOP_SANDBOX_PLACEMENT` | placement strategy (default `least-loaded`) |
@@ -179,6 +208,9 @@ preloop sandbox start sbx-… [--forkable]               # boot it again (bakes)
 preloop sandbox snapshot sbx-… --name golden
 preloop sandbox release lse-… [--preserve 600]
 preloop sandbox ls                    # and: preloop sandbox providers
+preloop sandbox provider cordon host-a               # no new placements
+preloop sandbox provider drain host-a                # cordon + release idle pool members
+preloop sandbox provider uncordon host-a
 ```
 
 Without `--service` (or `PRELOOP_SANDBOX_URL`), the CLI reads
@@ -192,7 +224,8 @@ and refuses to send its bearer token to any other address.
   (idempotency, warm pools, placement errors and configured ranking,
   unsupported operations, snapshot → template → fork, create failure, lease
   expiry and preservation, orphan/lost reconcile, generation fencing, SQLite
-  restart, streaming exec, ticketed upload/download). Set
+  restart, streaming exec, ticketed upload/download, cordon/drain, pagination,
+  request and blob caps, the boot blob sweep). Set
   `PRELOOP_SANDBOX_TEST_PG` to also run the Postgres store test.
 * `PRELOOP_SANDBOX_E2E_SMOLVM=1 cargo test -p preloop-sandbox --test smolvm_e2e`
   — real SmolVM: bake, snapshot, warm pool of branches, socket mount, files,
