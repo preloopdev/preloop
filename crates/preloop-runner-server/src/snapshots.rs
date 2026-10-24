@@ -1152,10 +1152,19 @@ async fn fetch_checkout_cache_commit(
     upstream: &str,
     commit_sha: &str,
     auth_header: Option<(&str, &str)>,
-) -> Result<(), ApiError> {
-    // A previous fetch in this repository may have been killed at its
-    // deadline, and its lock files would fail this one. The cache lock is
-    // held, so nothing else is inside the repository.
+) -> Result<preloop_git_mirror::cache::FetchProvenance, ApiError> {
+    // A commit already in the cache needs no upstream round trip. This is the
+    // only behavioural change from the pre-extraction fetch, which asked the
+    // forge again for a sha it already held.
+    if cache_holds_commit(repository, commit_sha).await {
+        return Ok(preloop_git_mirror::cache::FetchProvenance::ServedFromCache);
+    }
+    // Deliberately the server's own bounded runner rather than the crate's
+    // timeout: `preloop_observability::deadline::run_command` kills the child's
+    // whole process group at the deadline and names the dependency in the
+    // error, which is what an operator reading a stalled-fetch log needs.
+    // Refs are not written for the fetched sha either — a shared cache keeps
+    // them unreachable so releasing a run really does drop its objects.
     remove_stale_git_locks(repository, std::time::Duration::ZERO);
     let mut fetch = git_command_for(program);
     if let Some((key, value)) = auth_header {
@@ -1170,7 +1179,7 @@ async fn fetch_checkout_cache_commit(
         .arg(upstream)
         .arg(commit_sha);
     run_git_within(fetch, "fetch remote checkout snapshot", deadline).await?;
-    Ok(())
+    Ok(preloop_git_mirror::cache::FetchProvenance::FetchedFromUpstream)
 }
 
 /// Fetch a webhook run's immutable commit into the configured checkout cache.
@@ -3278,17 +3287,7 @@ struct ObjectCache {
 /// Any failure to ask counts as "does not hold it": the caller answers by
 /// fetching, which is the safe direction.
 async fn cache_holds_commit(repository: &FsPath, sha: &str) -> bool {
-    let mut command = git_command();
-    command
-        .arg("--git-dir")
-        .arg(repository)
-        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")]);
-    // Any failure — a non-zero exit, a spawn error, or an expired deadline —
-    // counts as "does not hold it": the caller answers by fetching, which is
-    // the safe direction.
-    git_output_within(command, "check cached commit", GIT_CONTROL_TIMEOUT)
-        .await
-        .is_ok_and(|output| output.status.success())
+    preloop_git_mirror::cache::cache_holds_commit(repository, sha).await
 }
 
 /// Whether a local clone can hardlink object files from the workspace.
@@ -3805,26 +3804,22 @@ async fn persist_snapshot_index(staging_index: &FsPath, destination: &FsPath) {
     }
 }
 
-/// Directory-based mutex for one cache repository. The holder refreshes a
-/// heartbeat file inside the directory while it works: without it a slow
-/// upstream fetch (past the 60s stale takeover) would have its lock stolen
-/// mid-write and share the repository with a second writer. Takeover still
-/// applies to holders that died without cleanup — their heartbeat goes stale
-/// exactly like their lock did before.
-struct CacheLock {
-    dir: PathBuf,
-    heartbeat: Option<tokio::task::JoinHandle<()>>,
-}
+/// Directory-based mutex for one cache repository.
+///
+/// The heartbeat, stale takeover, and release-on-drop behaviour live in
+/// [`preloop_git_mirror::lock`], so every consumer of a mirror serializes
+/// writers the same way.
+type CacheLock = preloop_git_mirror::lock::MirrorLock;
 
 /// Liveness marker refreshed by the lock holder. Cousin of
 /// [`RELEASED_MARKER`]: presence plus freshness means "owned", absence or
 /// age means "abandoned".
-const LOCK_HEARTBEAT: &str = "preloop-lock-heartbeat";
+const LOCK_HEARTBEAT: &str = preloop_git_mirror::lock::LOCK_HEARTBEAT;
 
 /// How long a lock may go without a heartbeat before it is treated as
 /// abandoned: takeover in [`acquire_cache_lock`], and the size sweep's
 /// permission to evict in [`prune_snapshot_object_cache`].
-const CACHE_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+const CACHE_LOCK_STALE_AFTER: std::time::Duration = preloop_git_mirror::lock::LOCK_STALE_AFTER;
 
 /// Drop a finished run's snapshot repository.
 ///
@@ -5074,35 +5069,6 @@ fn directory_bytes(path: &FsPath) -> u64 {
     total
 }
 
-impl CacheLock {
-    fn held(path: PathBuf) -> Self {
-        let heartbeat_file = path.join(LOCK_HEARTBEAT);
-        let _ = std::fs::write(&heartbeat_file, "held");
-        let heartbeat = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                if std::fs::write(&heartbeat_file, "held").is_err() {
-                    return;
-                }
-            }
-        });
-        Self {
-            dir: path,
-            heartbeat: Some(heartbeat),
-        }
-    }
-}
-
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.abort();
-        }
-        let _ = std::fs::remove_file(self.dir.join(LOCK_HEARTBEAT));
-        let _ = std::fs::remove_dir(&self.dir);
-    }
-}
-
 /// Ownership marker for one cache entry, held by a capture from the moment
 /// the cache lock is released until its snapshot's alternates file exists.
 ///
@@ -5138,42 +5104,12 @@ impl Drop for CachePin {
 /// Freshness of a lock directory: the holder's heartbeat when present, the
 /// directory itself for locks that predate heartbeats or died mid-create.
 fn lock_age(path: &FsPath) -> Option<std::time::Duration> {
-    let marker = path.join(LOCK_HEARTBEAT);
-    let target = if marker.is_file() { &marker } else { path };
-    std::fs::metadata(target)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.elapsed().ok())
+    preloop_git_mirror::lock::lock_age(path)
 }
 async fn acquire_cache_lock(path: &FsPath) -> Result<CacheLock, ApiError> {
-    let started = std::time::Instant::now();
-    loop {
-        match std::fs::create_dir(path) {
-            Ok(()) => return Ok(CacheLock::held(path.to_owned())),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Freshness comes from the holder's heartbeat, so a slow
-                // fetch is never mistaken for an abandoned lock. Only a
-                // holder that died without cleanup goes stale.
-                let stale = lock_age(path).is_some_and(|age| age > CACHE_LOCK_STALE_AFTER);
-                if stale {
-                    let _ = std::fs::remove_file(path.join(LOCK_HEARTBEAT));
-                    let _ = std::fs::remove_dir(path);
-                    continue;
-                }
-                if started.elapsed() > std::time::Duration::from_secs(10) {
-                    return Err(ApiError::internal(
-                        "timed out waiting for snapshot object cache",
-                    ));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            Err(error) => {
-                return Err(ApiError::internal(format!(
-                    "failed to lock snapshot object cache: {error}"
-                )));
-            }
-        }
-    }
+    preloop_git_mirror::lock::acquire(path)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))
 }
 
 /// Take a cache lock only if it is free, without waiting.
@@ -5182,19 +5118,7 @@ async fn acquire_cache_lock(path: &FsPath) -> Result<CacheLock, ApiError> {
 /// entry is busy right now" and the sweep moves on. A stale lock is taken
 /// over exactly like [`acquire_cache_lock`] does.
 fn try_acquire_cache_lock(path: &FsPath) -> Option<CacheLock> {
-    match std::fs::create_dir(path) {
-        Ok(()) => return Some(CacheLock::held(path.to_owned())),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return None,
-    }
-    if !lock_age(path).is_some_and(|age| age > CACHE_LOCK_STALE_AFTER) {
-        return None;
-    }
-    let _ = std::fs::remove_file(path.join(LOCK_HEARTBEAT));
-    let _ = std::fs::remove_dir(path);
-    std::fs::create_dir(path)
-        .ok()
-        .map(|()| CacheLock::held(path.to_owned()))
+    preloop_git_mirror::lock::try_acquire(path)
 }
 
 /// Split a git ident header (`Name <email> 1234567890 +0000`) into the
@@ -5812,29 +5736,13 @@ fn decode_git_request_body(
     body: &[u8],
     content_encoding: Option<&str>,
 ) -> Result<Vec<u8>, ApiError> {
-    let gzipped = content_encoding
-        .unwrap_or_default()
-        .split(',')
-        .any(|value| value.trim().eq_ignore_ascii_case("gzip"));
-    if !gzipped {
-        return Ok(body.to_vec());
-    }
-    use flate2::read::GzDecoder;
-    use std::io::Read as _;
-    let mut decoded = Vec::new();
-    // Bound decoded output, not the compressed wire size. Git already caps
-    // the request at MAX_GIT_REQUEST_BYTES before this runs; without a
-    // second cap a tiny gzip expands past the same budget in RAM.
-    let mut decoder = GzDecoder::new(body).take(MAX_GIT_REQUEST_BYTES as u64 + 1);
-    decoder.read_to_end(&mut decoded).map_err(|error| {
-        ApiError::bad_request(format!("invalid gzip Git request body: {error}"))
-    })?;
-    if decoded.len() > MAX_GIT_REQUEST_BYTES {
-        return Err(ApiError::payload_too_large(
-            "gzip Git request body exceeded size limit",
-        ));
-    }
-    Ok(decoded)
+    preloop_git_mirror::http_backend::decode_body(body, content_encoding, MAX_GIT_REQUEST_BYTES)
+        .map_err(|error| match error {
+            preloop_git_mirror::MirrorError::TooLarge(message) => {
+                ApiError::payload_too_large(message)
+            }
+            other => ApiError::bad_request(other.to_string()),
+        })
 }
 
 /// Parse the `:run_id` route segment, tolerating an optional `.git` suffix.

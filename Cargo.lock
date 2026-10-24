@@ -2790,6 +2790,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "preloop-git-mirror"
+version = "0.35.6"
+dependencies = [
+ "flate2",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "preloop-loadtest"
 version = "0.1.0"
 dependencies = [
@@ -2967,6 +2979,7 @@ dependencies = [
  "preloop-gha-expressions",
  "preloop-gha-parser",
  "preloop-gha-protocol",
+ "preloop-git-mirror",
  "preloop-observability",
  "preloop-runner",
  "preloop-socket-activation",
