@@ -139,6 +139,16 @@
         "dependencies"
       ],
       "automerge": false
+    },
+    {
+      "matchDatasources": [
+        "node-version"
+      ],
+      "matchDepNames": [
+        "node20"
+      ],
+      "allowedVersions": "/^20\\./",
+      "description": "node20_externals_version is the Node 20 runtime the official runner bundles for `using: node20` actions — actions/runner's externals.sh NODE20_VERSION, 20.20.2 on every published release. The node-version datasource is unfiltered, so without this bound Renovate offers the newest Node major (24.x) and the bump breaks check-node-pin-parity, the pinned CHECKSUMS table in crates/*/build.rs, and the lifecycle tests that read it. Keep this pin on the 20 line."
     }
   ],
   "customManagers": [
