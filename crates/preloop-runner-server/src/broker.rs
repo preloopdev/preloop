@@ -145,6 +145,23 @@ pub fn runner_base_url() -> String {
         .to_owned()
 }
 
+/// Job-facing base URL for shared infrastructure (Git/LFS mirror, Actions cache,
+/// Twirp + REST artifacts).
+///
+/// Defaults to `PRELOOP_SHARED_URL`, falling back to [`runner_base_url`].
+/// `preloop serve` binds a dedicated shared-infrastructure listener
+/// (`--shared-listen`) and sets `PRELOOP_SHARED_URL`, so a job's Git, cache and
+/// artifact traffic reaches that listener while the broker, OIDC and
+/// connection-data endpoints stay on the control origin. When it is unset the
+/// two origins are identical, which keeps single-listener deployments working
+/// unchanged.
+pub fn shared_base_url() -> String {
+    std::env::var("PRELOOP_SHARED_URL")
+        .unwrap_or_else(|_| runner_base_url())
+        .trim_end_matches('/')
+        .to_owned()
+}
+
 pub fn public_base_url() -> String {
     std::env::var("PRELOOP_PUBLIC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
@@ -1117,14 +1134,14 @@ pub async fn broker_acquire_job(
             );
             endpoint.data.insert(
                 "ResultsServiceUrl".to_owned(),
-                format!("{}/", runner_base_url()),
+                format!("{}/", shared_base_url()),
             );
             endpoint
                 .data
                 .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
             endpoint.data.insert(
                 "CacheServerUrl".to_owned(),
-                format!("{}/", runner_base_url()),
+                format!("{}/", shared_base_url()),
             );
             endpoint.data.insert(
                 "FeedStreamUrl".to_owned(),

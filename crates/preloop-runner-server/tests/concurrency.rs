@@ -1810,6 +1810,7 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
 fn server_config_debug_redacts_store_url_password() {
     let config = ServerConfig {
         listen: "127.0.0.1:9090".parse().unwrap(),
+        shared_listen: None,
         systemd_socket_activation: false,
         unix_socket: None,
         state_dir: std::path::PathBuf::from(".preloop"),

@@ -22,6 +22,11 @@ enum Command {
         /// Address to listen on.
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
+        /// Optional second listener for the shared job-facing surface
+        /// (Git/LFS mirror, Actions cache, artifacts, log blobs). Lives on a
+        /// VM-private address; the control plane stays on `--listen`.
+        #[arg(long, env = "PRELOOP_SHARED_LISTEN")]
+        shared_listen: Option<SocketAddr>,
         /// State directory.
         #[arg(long, default_value = ".preloop")]
         state_dir: PathBuf,
@@ -115,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Serve {
             listen,
+            shared_listen,
             state_dir,
             store,
             record_flows,
@@ -138,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                 next_job_runs_on: None,
                 pool_preparing: None,
                 listen,
+                shared_listen,
                 pool_status: None,
                 observability: Some(observability.clone()),
                 // The standalone server has no runner pool to share with, so

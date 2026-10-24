@@ -2610,7 +2610,11 @@ async fn lfs_batch_response(
     let request: LfsBatchRequest = serde_json::from_slice(body)
         .map_err(|error| ApiError::bad_request(format!("invalid Git LFS batch body: {error}")))?;
     let operation = request.operation.as_deref().unwrap_or("download");
-    let base = runner_base_url();
+    // LFS object transfers are shared-infrastructure traffic, like artifacts
+    // and the cache: the href points at the shared listener when one is
+    // configured, so a job's blob download does not have to reach the control
+    // plane.
+    let base = shared_base_url();
     if operation == "download" {
         populate_missing_lfs_objects(repository, &request.objects, fetch).await;
     }
