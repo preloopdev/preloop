@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-10-02T23:30:00Z",
+  "generated_at": "2026-10-24T13:24:51Z",
   "node20_version": "20.20.2",
   "node24_version": "24.19.0",
   "description": "Baseline snapshot of known upstream OSV advisories for pinned Node distributions.",
-  "total_advisories": 78,
+  "total_advisories": 79,
   "known_advisories": [
     "CVE-2024-21538",
     "CVE-2025-5889",
@@ -81,6 +81,7 @@
     "GHSA-v6h2-p8h4-qcjw",
     "GHSA-vmf3-w455-68vh",
     "GHSA-vxpw-j846-p89q",
+    "GHSA-xjj6-f33q-929c",
     "GHSA-w4pp-8pjf-rmxw",
     "GHSA-w8wr-v893-vjvp"
   ]
